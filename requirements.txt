@@ -1,0 +1,7 @@
+redis
+psutil
+paramiko
+PyYAML
+confluent-kafka
+numpy
+matplotlib

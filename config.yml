@@ -1,0 +1,27 @@
+kafka:
+  bootstrap_servers: localhost:19092
+  topic: agent_load
+  consumer_group_id: agent_group
+runtime:
+  profile: BalancedProfile
+  data_transfer: False
+  max_pending_elections: 10
+logging:
+  ## The directory in which actor should create log files.
+  ## This directory will be automatically created if it does not exist.
+  log-directory: .
+
+  ## The filename to be used for actor's log file.
+  log-file: agent
+
+  ## The default log level for actor.
+  log-level: INFO
+
+  ## actor rotates log files. You may specify how many archived log files to keep here.
+  log-retain: 5
+
+  ## actor rotates log files after they exceed a certain size.
+  ## You may specify the file size that results in a log file being rotated here.
+  log-size: 5000000
+
+  logger: agent
