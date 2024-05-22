@@ -157,7 +157,9 @@ class PBFTAgent(Agent):
                 time.sleep(5)  # Adjust the sleep duration as needed
 
                 # No more pending tasks
-                if not self.task_queue.has_pending_tasks():
+                #if not self.task_queue.has_pending_tasks():
+                #    break
+                if completed_tasks == self.task_queue.size():
                     break
 
             except Exception as e:
@@ -322,8 +324,9 @@ class PBFTAgent(Agent):
         quorum_count = (len(self.neighbor_map) + 1) / 2
 
         if proposal.commits >= quorum_count:
-            task.set_time_to_elect_leader()
             self.logger.info(f"Agent: {self.agent_id} received quorum commits for Task: {task_id} Proposal: {proposal}: Task: {task}")
+            task.set_time_to_elect_leader()
+            task.set_leader(leader_agent_id=proposal.agent_id)
             if self.outgoing_proposals.contains(task_id=task_id, p_id=proposal_id):
                 self.logger.info(f"LEADER CONSENSUS achieved for Task: {task_id} Leader: {self.agent_id}")
                 task.change_state(new_state=TaskState.READY)
@@ -351,6 +354,8 @@ class PBFTAgent(Agent):
         self.logger.info(f"Received Status from {peer_agent_id} for Task: {task_id} Proposal: {proposal_id}")
 
         task = self.task_queue.get_task(task_id=task_id)
+        task.set_leader(leader_agent_id=peer_agent_id)
+        task.set_time_to_completion()
         self.logger.info(f"Task: {task}")
         if not task or task.is_complete() or task.is_ready():
             return
@@ -443,7 +448,8 @@ class PBFTAgent(Agent):
         self.msg_processor_thread.join()
 
         tasks = self.task_queue.tasks.values()
-        completed_tasks = [t for t in tasks if t.time_to_completion is not None]
+        #completed_tasks = [t for t in tasks if t.time_to_completion is not None]
+        completed_tasks = [t for t in tasks if t.leader_agent_id is not None]
         waiting_times = [t.time_on_queue for t in tasks if t.time_on_queue is not None]
         leader_election_times = [t.time_to_elect_leader for t in tasks if t.time_to_elect_leader is not None]
         execution_times = [t.time_to_execute for t in completed_tasks if t.time_to_execute]
@@ -461,37 +467,57 @@ class PBFTAgent(Agent):
         self.logger.info(f"  Average Execution Time = {total_average_execution_time}")
         self.logger.info(f"  Average Completion Time = {total_average_completion_time}")
 
-        plt.figure(figsize=(15, 5))
-        plt.subplot(130)
-        plt.plot(waiting_times, 'ro-', label='Waiting Time - Waiting on Task Queue')
-        plt.title(f'Waiting Times (includes unfinished tasks)')
+        plt.figure(figsize=(25, 6))
+        plt.subplot(131)
+        plt.plot(waiting_times, 'ro-', label='Waiting Time - time on queue before election')
+        plt.plot(leader_election_times, 'bo-', label='Consensus Time - time for leader election ')
+        #plt.plot(completion_times, 'go-', label='Completion Time - time to completion')
+        plt.legend()
+        plt.title(f'Task Times')
         plt.xlabel('Task Index')
-        plt.ylabel('Time Units')
+        plt.ylabel('Time Units (seconds)')
         plt.grid(True)
 
-        plt.subplot(131)
-        plt.plot(leader_election_times, 'ro-', label='Consensus Time - time for leader election ')
-        plt.title(f'Consensus Times')
-        plt.xlabel('Task Index')
-        plt.ylabel('Time Units')
-        plt.grid(True)
+        tasks_per_agent = {}
+        for t in completed_tasks:
+            if t.leader_agent_id and t.leader_agent_id not in tasks_per_agent:
+                tasks_per_agent[t.leader_agent_id] = 0
+            tasks_per_agent[t.leader_agent_id] += 1
 
         plt.subplot(132)
-        plt.plot(execution_times, 'ro-', label='Execution Time - time for process execution ')
+        plt.bar(list(tasks_per_agent.keys()), list(tasks_per_agent.values()), color='blue')
+        plt.xlabel('Agent ID')
+        plt.ylabel('Number of Tasks Executed')
+        plt.title('Number of Tasks Executed by Each Agent')
+        plt.grid(axis='y', linestyle='--', linewidth=0.5)
+
+        '''
+        plt.subplot(132)
+        plt.plot(leader_election_times, 'bo-', label='Consensus Time - time for leader election ')
+        plt.title(f'Consensus Times')
+        plt.xlabel('Task Index')
+        plt.ylabel('Time Units (seconds)')
+        plt.grid(True)
+
+        
+        plt.subplot(133)
+        plt.plot(execution_times, 'go-', label='Execution Time - time for process execution ')
         plt.title(f'Execution Times')
         plt.xlabel('Task Index')
-        plt.ylabel('Time Units')
+        plt.ylabel('Time Units (seconds)')
         plt.grid(True)
-
+        
         plt.subplot(133)
-        plt.plot(completion_times, 'bo-', label='Completion Time')
+        plt.plot(completion_times, 'go-', label='Completion Time')
         plt.title(f'Completion Times')
         plt.xlabel('Task Index')
-        plt.ylabel('Time Units')
+        plt.ylabel('Time Units (seconds)')
         plt.grid(True)
+        
+        '''
 
         plt.tight_layout()
-        plt.show()
+        #plt.show()
 
         # Save the plot to the specified directory
         plot_path = os.path.join("", f'agent-{self.agent_id}.png')

@@ -80,10 +80,23 @@ class Task:
         self.time_on_queue = None
         self.time_to_execute = None
         self.time_to_completion = None
+        self.leader_agent_id = None
+
+    def get_leader_agent_id(self) -> str:
+        with self.lock:
+            return self.leader_agent_id
+
+    def set_leader(self, leader_agent_id: str):
+        with self.lock:
+            self.leader_agent_id = leader_agent_id
 
     def set_time_to_elect_leader(self):
         with self.lock:
             self.time_to_elect_leader = int(time.time() - self.time_on_queue - self.creation_time)
+
+    def reset_time_on_queue(self):
+        with self.lock:
+            self.time_on_queue = None
 
     def set_time_on_queue(self):
         with self.lock:

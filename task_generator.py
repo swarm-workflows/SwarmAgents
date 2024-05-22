@@ -74,7 +74,7 @@ if __name__ == '__main__':
                                    max_core=max_core, max_ram=max_ram, max_disk=max_disk, max_no_op=70)
 
     # Generate 1000 tasks
-    tasks = [task_generator.generate_task(x) for x in range(100)]
+    tasks = [task_generator.generate_task(x) for x in range(500)]
 
     # Serialize tasks to JSON
     tasks_json = json.dumps(tasks, indent=4)

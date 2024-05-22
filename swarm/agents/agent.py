@@ -152,7 +152,7 @@ class Agent(Observer):
         return overall_load
 
     def allocate_task(self, task: Task):
-        self.logger.info(f"KOMAL --- Executing: {task.get_task_id()} on agent: {self.agent_id}")
+        self.logger.info(f"Executing: {task.get_task_id()} on agent: {self.agent_id}")
         # Add the task to the list of allocated tasks
         self.allocated_tasks.add_task(task=task)
 
