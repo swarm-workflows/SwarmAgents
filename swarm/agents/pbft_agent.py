@@ -1,6 +1,7 @@
 import json
 import os
 import queue
+import random
 import threading
 import time
 import traceback
@@ -455,6 +456,15 @@ class PBFTAgent(Agent):
         execution_times = [t.time_to_execute for t in completed_tasks if t.time_to_execute]
         completion_times = [t.time_to_completion for t in completed_tasks if t.time_to_completion]
 
+        '''
+        leader_election_times_per_agent = {}
+        for t in tasks:
+            if t.time_to_elect_leader is not None:
+                if t.leader_agent_id and t.leader_agent_id not in leader_election_times_per_agent:
+                    leader_election_times_per_agent[t.leader_agent_id] = []
+                leader_election_times_per_agent[t.leader_agent_id].append(t.time_to_elect_leader)
+        '''
+
         total_tasks = len(tasks)
         total_average_execution_time = numpy.mean(execution_times) if execution_times else 0
         total_average_consensus_time = numpy.mean(leader_election_times) if leader_election_times else 0
@@ -471,6 +481,17 @@ class PBFTAgent(Agent):
         plt.subplot(131)
         plt.plot(waiting_times, 'ro-', label='Waiting Time - time on queue before election')
         plt.plot(leader_election_times, 'bo-', label='Consensus Time - time for leader election ')
+
+        '''
+        for agent_id, leader_election_per_agent in leader_election_times_per_agent.items():
+            # Generate a random color for each agent
+            color = "#{:06x}".format(random.randint(0, 0xFFFFFF))
+
+            # Plot with random color
+            plt.plot(leader_election_per_agent, marker='o', linestyle='-', label=f'Consensus Time for {agent_id}',
+                     color=color)
+        '''
+
         #plt.plot(completion_times, 'go-', label='Completion Time - time to completion')
         plt.legend()
         plt.title(f'Task Times')

@@ -128,46 +128,7 @@ However, it's resilient and fault tolerant.
 ```
 
  - **Scenario 2: Number of tasks: 100, Number of Agents: 5**
-   - Agent-1
-```
-2024-05-21 18:14:38,046 - agent-1 - {pbft_agent.py:458} - [MainThread]- INFO - Total Tasks = 100, Completed Tasks = 20
-2024-05-21 18:14:38,046 - agent-1 - {pbft_agent.py:459} - [MainThread]- INFO -   Average Waiting Time = 70.48
-2024-05-21 18:14:38,047 - agent-1 - {pbft_agent.py:460} - [MainThread]- INFO -   Average Consensus Time = 135.6
-2024-05-21 18:14:38,047 - agent-1 - {pbft_agent.py:461} - [MainThread]- INFO -   Average Execution Time = 32.21052631578947
-2024-05-21 18:14:38,047 - agent-1 - {pbft_agent.py:462} - [MainThread]- INFO -   Average Completion Time = 167.8
-```
-   - Agent-2
-```
-2024-05-21 18:15:09,245 - agent-2 - {pbft_agent.py:458} - [MainThread]- INFO - Total Tasks = 100, Completed Tasks = 30
-2024-05-21 18:15:09,245 - agent-2 - {pbft_agent.py:459} - [MainThread]- INFO -   Average Waiting Time = 61.32
-2024-05-21 18:15:09,245 - agent-2 - {pbft_agent.py:460} - [MainThread]- INFO -   Average Consensus Time = 157.09
-2024-05-21 18:15:09,246 - agent-2 - {pbft_agent.py:461} - [MainThread]- INFO -   Average Execution Time = 34.53333333333333
-2024-05-21 18:15:09,246 - agent-2 - {pbft_agent.py:462} - [MainThread]- INFO -   Average Completion Time = 241.8
-```
-   - Agent-3
-```
-2024-05-21 18:15:07,218 - agent-3 - {pbft_agent.py:458} - [MainThread]- INFO - Total Tasks = 100, Completed Tasks = 18
-2024-05-21 18:15:07,218 - agent-3 - {pbft_agent.py:459} - [MainThread]- INFO -   Average Waiting Time = 72.58
-2024-05-21 18:15:07,219 - agent-3 - {pbft_agent.py:460} - [MainThread]- INFO -   Average Consensus Time = 145.61
-2024-05-21 18:15:07,219 - agent-3 - {pbft_agent.py:461} - [MainThread]- INFO -   Average Execution Time = 31.27777777777778
-2024-05-21 18:15:07,219 - agent-3 - {pbft_agent.py:462} - [MainThread]- INFO -   Average Completion Time = 301.05555555555554
-```
-   - Agent-4
-```
-2024-05-21 18:14:27,900 - agent-4 - {pbft_agent.py:458} - [MainThread]- INFO - Total Tasks = 100, Completed Tasks = 14
-2024-05-21 18:14:27,900 - agent-4 - {pbft_agent.py:459} - [MainThread]- INFO -   Average Waiting Time = 54.81
-2024-05-21 18:14:27,901 - agent-4 - {pbft_agent.py:460} - [MainThread]- INFO -   Average Consensus Time = 146.95
-2024-05-21 18:14:27,901 - agent-4 - {pbft_agent.py:461} - [MainThread]- INFO -   Average Execution Time = 25.428571428571427
-2024-05-21 18:14:27,901 - agent-4 - {pbft_agent.py:462} - [MainThread]- INFO -   Average Completion Time = 289.14285714285717
-```
-   - Agent-5
-```
-2024-05-21 18:14:59,199 - agent-5 - {pbft_agent.py:458} - [MainThread]- INFO - Total Tasks = 100, Completed Tasks = 16
-2024-05-21 18:14:59,199 - agent-5 - {pbft_agent.py:459} - [MainThread]- INFO -   Average Waiting Time = 70.89
-2024-05-21 18:14:59,200 - agent-5 - {pbft_agent.py:460} - [MainThread]- INFO -   Average Consensus Time = 144.36
-2024-05-21 18:14:59,200 - agent-5 - {pbft_agent.py:461} - [MainThread]- INFO -   Average Execution Time = 33.3125
-2024-05-21 18:14:59,200 - agent-5 - {pbft_agent.py:462} - [MainThread]- INFO -   Average Completion Time = 237.0625
-```
+![](./runs/5/agent-1.png)
 
 ### Usage
 1. Setup the python environment by installing all the dependencies:
