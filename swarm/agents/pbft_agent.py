@@ -101,9 +101,10 @@ class PBFTAgent(Agent):
         while not self.shutdown_heartbeat:
             try:
                 # Send heartbeats
-                self.send_message(msg_type=MessageType.HeartBeat)
+                diff = int(time.time() - self.last_updated)
+                if diff > 30 or len(self.neighbor_map) == 0:
+                    self.send_message(msg_type=MessageType.HeartBeat)
                 time.sleep(30)
-                break
             except Exception as e:
                 self.logger.error(f"Error occurred while sending heartbeat e: {e}")
                 self.logger.error(traceback.format_exc())
@@ -343,6 +344,7 @@ class PBFTAgent(Agent):
 
         if not neighbor_load:
             return
+        self.last_updated = time.time()
 
         # Update neighbor map
         self.neighbor_map[peer_agent_id] = {
@@ -388,10 +390,10 @@ class PBFTAgent(Agent):
             #TODO hack
             self.__receive_heartbeat(incoming=incoming)
 
-            if msg_type == MessageType.HeartBeat:
-                self.__receive_heartbeat(incoming=incoming)
+            #if msg_type == MessageType.HeartBeat:
+            #    self.__receive_heartbeat(incoming=incoming)
 
-            elif msg_type == MessageType.Proposal:
+            if msg_type == MessageType.Proposal:
                 self.__receive_proposal(incoming=incoming)
 
             elif msg_type == MessageType.Prepare:
@@ -451,7 +453,7 @@ class PBFTAgent(Agent):
         self.shutdown = True
         with self.condition:
             self.condition.notify_all()
-        #self.heartbeat_thread.join()
+        self.heartbeat_thread.join()
         self.msg_processor_thread.join()
 
         tasks = self.task_queue.tasks.values()

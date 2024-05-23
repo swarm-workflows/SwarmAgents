@@ -5,7 +5,7 @@ python kafka_cleanup.py
 python task_generator.py
 
 # Define the number of agents
-num_agents=5
+num_agents=10
 base_id=0
 
 # Create an array to store PIDs

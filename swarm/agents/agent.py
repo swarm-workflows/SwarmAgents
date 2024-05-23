@@ -25,6 +25,7 @@ class Agent(Observer):
         self.task_queue = TaskQueue()
         self.allocated_tasks = TaskQueue()
         self.completed_tasks = TaskQueue()
+        self.last_updated = time.time()
         self.neighbor_map = {}  # Store neighbor information
         self.profile = None
         self.data_transfer = True
