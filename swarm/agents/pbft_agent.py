@@ -103,6 +103,7 @@ class PBFTAgent(Agent):
                 # Send heartbeats
                 self.send_message(msg_type=MessageType.HeartBeat)
                 time.sleep(30)
+                break
             except Exception as e:
                 self.logger.error(f"Error occurred while sending heartbeat e: {e}")
                 self.logger.error(traceback.format_exc())
@@ -308,7 +309,7 @@ class PBFTAgent(Agent):
         task = self.task_queue.get_task(task_id=task_id)
         self.logger.debug(f"Task: {task}")
 
-        if not task or task.is_complete() or task.is_ready() or task.is_running():
+        if not task or task.is_complete() or task.is_ready() or task.is_running() or task.leader_agent_id:
             return
 
         # Update the commit votes;
@@ -339,6 +340,9 @@ class PBFTAgent(Agent):
     def __receive_heartbeat(self, incoming: dict):
         peer_agent_id = incoming.get("agent_id")
         neighbor_load = incoming.get("load")
+
+        if not neighbor_load:
+            return
 
         # Update neighbor map
         self.neighbor_map[peer_agent_id] = {
@@ -381,6 +385,8 @@ class PBFTAgent(Agent):
             self.logger.debug(f"Consumer received message: {incoming}")
 
             msg_type = MessageType(incoming.get('msg_type'))
+            #TODO hack
+            self.__receive_heartbeat(incoming=incoming)
 
             if msg_type == MessageType.HeartBeat:
                 self.__receive_heartbeat(incoming=incoming)
@@ -445,7 +451,7 @@ class PBFTAgent(Agent):
         self.shutdown = True
         with self.condition:
             self.condition.notify_all()
-        self.heartbeat_thread.join()
+        #self.heartbeat_thread.join()
         self.msg_processor_thread.join()
 
         tasks = self.task_queue.tasks.values()
