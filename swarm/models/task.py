@@ -92,7 +92,10 @@ class Task:
 
     def set_time_to_elect_leader(self):
         with self.lock:
-            self.time_to_elect_leader = int(time.time() - self.time_on_queue - self.creation_time)
+            if self.time_on_queue and self.creation_time:
+                self.time_to_elect_leader = int(time.time() - self.time_on_queue - self.creation_time)
+            else:
+                self.time_to_elect_leader = int(time.time() - self.creation_time)
 
     def reset_time_on_queue(self):
         with self.lock:
