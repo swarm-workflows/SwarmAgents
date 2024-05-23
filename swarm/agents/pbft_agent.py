@@ -134,7 +134,7 @@ class PBFTAgent(Agent):
                         continue
 
                     if not task.is_pending():
-                        self.logger.info(f"Task: {task.task_id} State: {task.state}; skipping it!")
+                        self.logger.debug(f"Task: {task.task_id} State: {task.state}; skipping it!")
                         continue
 
                     if self.__can_become_leader(task=task):
@@ -150,10 +150,10 @@ class PBFTAgent(Agent):
 
                         # Begin election for Job leader for this task
                         task.change_state(new_state=TaskState.PRE_PREPARE)
-                        self.logger.info(
+                        self.logger.debug(
                             f"Agent: {self.agent_id} sent Proposal: {proposal} for Task: {task.task_id}!")
                     else:
-                        self.logger.info(f"Task: {task.task_id} State: {task.state} cannot be accommodated at this time:")
+                        self.logger.debug(f"Task: {task.task_id} State: {task.state} cannot be accommodated at this time:")
 
                 time.sleep(5)  # Adjust the sleep duration as needed
 
@@ -198,7 +198,7 @@ class PBFTAgent(Agent):
         least_loaded_neighbor = self.__find_neighbor_with_lowest_load()
 
         if least_loaded_neighbor and least_loaded_neighbor.get('load') < my_load:
-            self.logger.info("Can't become leader as my load is more than all of the neighbors")
+            self.logger.debug("Can't become leader as my load is more than all of the neighbors")
             return False
 
         can_accommodate = self.can_accommodate_task(task=task)
@@ -207,7 +207,7 @@ class PBFTAgent(Agent):
                 can_accommodate and \
                 my_load < 70.00:
             return can_accommodate
-        self.logger.info(f"__can_become_leader: can_accommodate: {can_accommodate} incoming:{incoming} my_load: {my_load}")
+        self.logger.debug(f"__can_become_leader: can_accommodate: {can_accommodate} incoming:{incoming} my_load: {my_load}")
         return False
 
     def __receive_proposal(self, incoming: dict):
@@ -217,7 +217,7 @@ class PBFTAgent(Agent):
         proposal_id = incoming.get("proposal_id")
         rcvd_seed = incoming.get("seed", 0)
 
-        self.logger.info(f"Received Proposal from Agent: {peer_agent_id} for Task: {task_id} "
+        self.logger.debug(f"Received Proposal from Agent: {peer_agent_id} for Task: {task_id} "
                          f"Proposal: {proposal_id} Seed: {rcvd_seed}")
 
         task = self.task_queue.get_task(task_id=task_id)
@@ -242,10 +242,10 @@ class PBFTAgent(Agent):
         #        (can_accept_task and my_current_load < neighbor_load):
         if (my_proposal and (my_proposal.prepares or my_proposal.seed < rcvd_seed)) or \
                 (peer_proposal and peer_proposal.seed < rcvd_seed):
-            self.logger.info(f"Agent {self.agent_id} rejected Proposal for Task: {task_id} from agent"
+            self.logger.debug(f"Agent {self.agent_id} rejected Proposal for Task: {task_id} from agent"
                              f" {peer_agent_id} - accepted another proposal")
         else:
-            self.logger.info(
+            self.logger.debug(
                 f"Agent {self.agent_id} accepted Proposal for Task: {task_id} from agent"
                 f" {peer_agent_id} and is now the leader")
 
@@ -268,7 +268,7 @@ class PBFTAgent(Agent):
         rcvd_seed = incoming.get("seed", 0)
 
         # Prepare for the proposal
-        self.logger.info(f"Received prepare from Agent: {peer_agent_id} for Task: {task_id}: {proposal_id}")
+        self.logger.debug(f"Received prepare from Agent: {peer_agent_id} for Task: {task_id}: {proposal_id}")
 
         task = self.task_queue.get_task(task_id=task_id)
         self.logger.debug(f"Task: {task}")
@@ -304,7 +304,7 @@ class PBFTAgent(Agent):
         proposal_id = incoming.get("proposal_id")
         rcvd_seed = incoming.get("seed", 0)
 
-        self.logger.info(f"Received commit from Agent: {peer_agent_id} for Task: {task_id} Proposal: {proposal_id}")
+        self.logger.debug(f"Received commit from Agent: {peer_agent_id} for Task: {task_id} Proposal: {proposal_id}")
         task = self.task_queue.get_task(task_id=task_id)
         self.logger.debug(f"Task: {task}")
 
@@ -345,19 +345,19 @@ class PBFTAgent(Agent):
             "agent_id": peer_agent_id,
             "load": neighbor_load,
         }
-        self.logger.info(f"Received Heartbeat from Agent: {peer_agent_id}: Neighbors: {len(self.neighbor_map)}")
+        self.logger.debug(f"Received Heartbeat from Agent: {peer_agent_id}: Neighbors: {len(self.neighbor_map)}")
 
     def __receive_task_status(self, incoming: dict):
         peer_agent_id = incoming.get("agent_id")
         task_id = incoming.get("task_id")
         proposal_id = incoming.get("proposal_id")
 
-        self.logger.info(f"Received Status from {peer_agent_id} for Task: {task_id} Proposal: {proposal_id}")
+        self.logger.debug(f"Received Status from {peer_agent_id} for Task: {task_id} Proposal: {proposal_id}")
 
         task = self.task_queue.get_task(task_id=task_id)
         task.set_leader(leader_agent_id=peer_agent_id)
         task.set_time_to_completion()
-        self.logger.info(f"Task: {task}")
+        self.logger.debug(f"Task: {task}")
         if not task or task.is_complete() or task.is_ready():
             return
 

@@ -341,7 +341,7 @@ class Task:
         return self.get_state() == TaskState.COMPLETE
 
     def change_state(self, new_state: TaskState):
-        self.logger.info(f"Transitioning task {self.task_id} from {self.state} to {new_state}")
+        self.logger.debug(f"Transitioning task {self.task_id} from {self.state} to {new_state}")
         self.set_state(state=new_state)
 
 
