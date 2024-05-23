@@ -127,8 +127,8 @@ However, it's resilient and fault tolerant.
 2024-05-21 17:53:17,443 - agent-10 - {pbft_agent.py:462} - [MainThread]- INFO -   Average Completion Time = 1742.0
 ```
 
- - **Scenario 2: Number of tasks: 100, Number of Agents: 5**
-![](./runs/5/agent-1.png)
+ - **Scenario 2: Number of tasks: 500, Number of Agents: 5**
+![Wait Time and Leader Election Time distribution across agents](./runs/5/agent-1.png)
 
 ### Usage
 1. Setup the python environment by installing all the dependencies:
