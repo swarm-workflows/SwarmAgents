@@ -51,8 +51,8 @@ services:
     depends_on:
       - zookeeper
       - broker1
-    volumes:
-      - ${KAFKA_SSL_SECRETS_DIR}:/etc/kafka/secrets
+    #volumes:
+    #  - ${KAFKA_SSL_SECRETS_DIR}:/etc/kafka/secrets
     ports:
       - 8081:8081
     environment:

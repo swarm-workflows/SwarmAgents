@@ -1,6 +1,11 @@
 import time
+
+import redis
 from confluent_kafka.admin import AdminClient, NewTopic
 from confluent_kafka import Consumer, TopicPartition
+
+from swarm.models.task import TaskRepository
+
 
 def delete_topic(admin_client, topic_name):
     """Delete the specified Kafka topic."""
@@ -36,3 +41,7 @@ if __name__ == '__main__':
     # Create the topic
     create_topic(admin_client, topic_name)
     time.sleep(5)
+
+    redis_client = redis.StrictRedis(host="127.0.0.1", port=6379, decode_responses=True)
+    task_repo = TaskRepository(redis_client=redis_client)
+    task_repo.delete_all()

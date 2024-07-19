@@ -10,6 +10,7 @@ import uuid
 from typing import Tuple, Any, List
 
 import paramiko
+import redis
 
 from swarm.models.capacities import Capacities
 from swarm.models.data_node import DataNode
@@ -24,6 +25,7 @@ class TaskState(enum.Enum):
     RUNNING = enum.auto()
     IDLE = enum.auto()
     COMPLETE = enum.auto()
+    FAILED = enum.auto()
 
 
 task = {
@@ -81,6 +83,7 @@ class Task:
         self.time_to_execute = None
         self.time_to_completion = None
         self.leader_agent_id = None
+        self.time_last_state_change = None
 
     def get_leader_agent_id(self) -> str:
         with self.lock:
@@ -152,6 +155,7 @@ class Task:
     def set_state(self, state: TaskState):
         with self.lock:
             self.state = state
+            self.time_last_state_change = time.time()
 
     def get_state(self) -> TaskState:
         return self.state
@@ -344,6 +348,48 @@ class Task:
         self.logger.debug(f"Transitioning task {self.task_id} from {self.state} to {new_state}")
         self.set_state(state=new_state)
 
+    def to_dict(self):
+        return {
+            'id': self.task_id,
+            'capacities': self.capacities.to_dict() if self.capacities else None,
+            'capacity_allocations': self.capacity_allocations,
+            'no_op': self.no_op,
+            'data_in': [data_node.to_dict() for data_node in self.data_in],
+            'data_out': [data_node.to_dict() for data_node in self.data_out],
+            'state': self.state.value,
+            'data_in_time': self.data_in_time,
+            'data_out_time': self.data_out_time,
+            'prepares': self.prepares,
+            'commits': self.commits,
+            'creation_time': self.creation_time,
+            'time_to_elect_leader': self.time_to_elect_leader,
+            'time_on_queue': self.time_on_queue,
+            'time_to_execute': self.time_to_execute,
+            'time_to_completion': self.time_to_completion,
+            'leader_agent_id': self.leader_agent_id,
+            'time_last_state_change': self.time_last_state_change
+        }
+
+    def from_dict(self, task_data: dict):
+        self.task_id = task_data['id']
+        self.capacities = Capacities.from_dict(task_data['capacities']) if task_data.get('capacities') else None
+        self.capacity_allocations = Capacities.from_dict(task_data['capacity_allocations']) if task_data.get('capacity_allocations') else None
+        self.no_op = task_data['no_op']
+        self.data_in = [DataNode.from_dict(data_in) for data_in in task_data['data_in']]
+        self.data_out = [DataNode.from_dict(data_out) for data_out in task_data['data_out']]
+        self.state = TaskState(task_data['state']) if task_data.get('state') else TaskState.PENDING
+        self.data_in_time = task_data['data_in_time'] if task_data.get('data_in_time') else None
+        self.data_out_time = task_data['data_out_time'] if task_data.get('data_out_time') else None
+        self.prepares = task_data['prepares'] if task_data.get('prepares') else 0
+        self.commits = task_data['commits'] if task_data.get('commits') else 0
+        self.creation_time = task_data['creation_time'] if task_data.get('creation_time') else time.time()
+        self.time_to_elect_leader = task_data['time_to_elect_leader'] if task_data.get('time_to_elect_leader') else None
+        self.time_on_queue = task_data['time_on_queue'] if task_data.get('time_on_queue') else None
+        self.time_to_execute = task_data['time_to_execute'] if task_data.get('time_to_execute') else None
+        self.time_to_completion = task_data['time_to_completion'] if task_data.get('time_to_completion') else None
+        self.leader_agent_id = task_data['leader_agent_id'] if task_data.get('leader_agent_id') else None
+        self.time_last_state_change = task_data['time_last_state_change'] if task_data.get('time_last_state_change') else None
+
 
 class TaskQueue:
     def __init__(self):
@@ -407,3 +453,64 @@ class TaskQueue:
             return len(self.tasks)
         finally:
             self.lock.release()
+
+
+class TaskRepository:
+    def __init__(self, redis_client):
+        self.redis = redis_client
+        self.lock = threading.Lock()
+
+    def save_task(self, task: Task):
+        if task.task_id is None:
+            raise ValueError("task_id must be set to save a task")
+        key = f"task:{task.task_id}"
+        with self.lock:
+            pipeline = self.redis.pipeline()
+            while True:
+                try:
+                    pipeline.watch(key)
+                    data = pipeline.get(key)
+                    '''
+                    if data is None:
+                        pipeline.unwatch()
+                        raise ValueError(f"Task with id {task.task_id} not found")
+                    '''
+
+                    pipeline.multi()
+                    pipeline.set(key, json.dumps(task.to_dict()))
+                    pipeline.execute()
+                    break
+                except redis.WatchError:
+                    continue
+
+    def get_task(self, task_id: str) -> Task:
+        key = f"task:{task_id}"
+        with self.lock:
+            data = self.redis.get(key)
+            if data is not None:
+                task = Task()
+                task.from_dict(json.loads(data))
+                return task
+
+    def delete_task(self, task_id: str):
+        key = f"task:{task_id}"
+        with self.lock:
+            self.redis.delete(key)
+
+    def get_all_tasks(self) -> list:
+        with self.lock:
+            task_keys = self.redis.keys('task:*')  # Assuming task keys are prefixed with 'task:'
+            tasks = []
+            for key in task_keys:
+                data = self.redis.get(key)
+                if data:
+                    task = Task()
+                    task.from_dict(json.loads(data) )  # Redis stores data as bytes, so using eval to convert back to dict
+                    tasks.append(task)
+            return tasks
+
+    def delete_all(self):
+        with self.lock:
+            task_keys = self.redis.keys('task:*')  # Assuming task keys are prefixed with 'task:'
+            for key in task_keys:
+                self.redis.delete(key)

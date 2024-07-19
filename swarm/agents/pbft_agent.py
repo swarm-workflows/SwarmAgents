@@ -121,15 +121,26 @@ class PBFTAgent(Agent):
 
                 # Filter pending tasks from the task queue
                 cnt = 0
-                for task_id, task in self.task_queue.tasks.items():
+                # Make a copy of the dictionary keys
+                task_ids = list(self.task_queue.tasks.keys())
+                for task_id in task_ids:
+                    election_timeout = random.uniform(150, 300) / 1000
+                    time.sleep(election_timeout)
+
+                    task = self.task_queue.tasks.get(task_id)
+                    if not task:
+                        continue
+                #for task_id, task in self.task_queue.tasks.items():
                     cnt += 1
 
+                    '''
                     if completed_tasks == self.task_queue.size():
                         break
 
                     if cnt > self.max_pending_elections:
                         time.sleep(5)
                         cnt = 0
+                    '''
 
                     if task.is_complete():
                         completed_tasks += 1
@@ -404,9 +415,9 @@ class PBFTAgent(Agent):
 
             elif msg_type == MessageType.TaskStatus:
                 self.__receive_task_status(incoming=incoming)
-
             else:
-                self.logger.info(f"Ignoring unsupported message: {message}")
+                if msg_type != MessageType.HeartBeat:
+                    self.logger.info(f"Ignoring unsupported message: {message}")
         except Exception as e:
             self.logger.error(f"Error while processing incoming message: {message}: {e}")
             self.logger.error(traceback.format_exc())
