@@ -131,7 +131,8 @@ class RaftAgent(Agent):
 
                     if peer and peer.get('load') < 70.00 and self.can_peer_accommodate_task(peer_agent=peer,
                                                                                             task=task):
-                        self.send_message(msg_type=MessageType.Commit, task_id=task.task_id)
+                        payload = {"dest": peer.get('agent_id')}
+                        self.send_message(msg_type=MessageType.Commit, task_id=task.task_id, payload=payload)
 
                     elif my_load < 70.00 and self.can_accommodate_task(task=task):
                         self.allocate_task(task=task)
@@ -167,6 +168,10 @@ class RaftAgent(Agent):
         self.logger.debug(f"Received Heartbeat from Agent: {peer_agent_id}: Neighbors: {len(self.neighbor_map)}")
 
     def __receive_commit(self, incoming: dict):
+        dest = incoming.get("dest")
+        if not dest or dest != self.agent_id:
+            self.logger.debug(f"Discarding incoming message: {incoming}")
+            return
         peer_agent_id = incoming.get("agent_id")
         task_id = incoming.get("task_id")
 
