@@ -305,10 +305,10 @@ class RaftAgent(Agent):
         task.change_state(new_state=TaskState.RUNNING)
         super(RaftAgent, self).allocate_task(task=task)
         self.task_repo.delete_task(task_id=task.get_task_id())
-        self.task_repo.save_task(task=task, key_prefix="allocated:")
+        self.task_repo.save_task(task=task, key_prefix="allocated")
 
     def fail_task(self, task: Task):
         task.set_leader(leader_agent_id=self.agent_id)
         task.set_time_on_queue()
         task.change_state(new_state=TaskState.FAILED)
-        self.task_repo.save_task(task=task, key_prefix="allocated:")
+        self.task_repo.save_task(task=task, key_prefix="allocated")

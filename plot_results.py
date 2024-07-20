@@ -17,7 +17,7 @@ class Plotter:
 
     def __count_tasks_by_state(self):
         state_counts = defaultdict(int)
-        tasks = self.task_repository.get_all_tasks()
+        tasks = self.task_repository.get_all_tasks(key_prefix="allocated")
         for task in tasks:
             state = task.state.value
             if state is not None:
