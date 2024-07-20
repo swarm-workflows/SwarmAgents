@@ -460,22 +460,15 @@ class TaskRepository:
         self.redis = redis_client
         self.lock = threading.Lock()
 
-    def save_task(self, task: Task):
+    def save_task(self, task: Task, key_prefix: str = "task"):
         if task.task_id is None:
             raise ValueError("task_id must be set to save a task")
-        key = f"task:{task.task_id}"
+        key = f"{key_prefix}:{task.task_id}"
         with self.lock:
             pipeline = self.redis.pipeline()
             while True:
                 try:
                     pipeline.watch(key)
-                    data = pipeline.get(key)
-                    '''
-                    if data is None:
-                        pipeline.unwatch()
-                        raise ValueError(f"Task with id {task.task_id} not found")
-                    '''
-
                     pipeline.multi()
                     pipeline.set(key, json.dumps(task.to_dict()))
                     pipeline.execute()
@@ -483,8 +476,8 @@ class TaskRepository:
                 except redis.WatchError:
                     continue
 
-    def get_task(self, task_id: str) -> Task:
-        key = f"task:{task_id}"
+    def get_task(self, task_id: str, key_prefix: str = "task") -> Task:
+        key = f"{key_prefix}:{task_id}"
         with self.lock:
             data = self.redis.get(key)
             if data is not None:
@@ -492,14 +485,14 @@ class TaskRepository:
                 task.from_dict(json.loads(data))
                 return task
 
-    def delete_task(self, task_id: str):
-        key = f"task:{task_id}"
+    def delete_task(self, task_id: str, key_prefix: str = "task"):
+        key = f"{key_prefix}:{task_id}"
         with self.lock:
             self.redis.delete(key)
 
-    def get_all_tasks(self) -> list:
+    def get_all_tasks(self, key_prefix: str = "task") -> list:
         with self.lock:
-            task_keys = self.redis.keys('task:*')  # Assuming task keys are prefixed with 'task:'
+            task_keys = self.redis.keys(f'{key_prefix}:*')  # Assuming task keys are prefixed with 'task:'
             tasks = []
             for key in task_keys:
                 data = self.redis.get(key)
@@ -509,8 +502,8 @@ class TaskRepository:
                     tasks.append(task)
             return tasks
 
-    def delete_all(self):
+    def delete_all(self, key_prefix: str = "task"):
         with self.lock:
-            task_keys = self.redis.keys('task:*')  # Assuming task keys are prefixed with 'task:'
+            task_keys = self.redis.keys(f'{key_prefix}:*')  # Assuming task keys are prefixed with 'task:'
             for key in task_keys:
                 self.redis.delete(key)

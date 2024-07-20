@@ -117,7 +117,7 @@ class RaftAgent(Agent):
         return lowest_load_neighbor
 
     def run_as_leader(self):
-        print("Running as leader")
+        self.logger.info("Running as leader")
         try:
             processed = 0
             tasks = self.task_repo.get_all_tasks()
@@ -140,8 +140,8 @@ class RaftAgent(Agent):
                     time.sleep(5)
                     processed = 0
         except Exception as e:
-            print(f"RUN Leader -- error: {e}")
-            print("Running as leader -- stop")
+            self.logger.info(f"RUN Leader -- error: {e}")
+            self.logger.info("Running as leader -- stop")
             traceback.print_exc()
 
     def __receive_heartbeat(self, incoming: dict):
@@ -280,7 +280,7 @@ class RaftAgent(Agent):
         pass
 
     def run(self):
-        print(f"Starting agent: {self}")
+        self.logger.info(f"Starting agent: {self}")
         self.message_service.register_observers(agent=self)
 
         while not self.shutdown_flag.is_set():
@@ -297,22 +297,18 @@ class RaftAgent(Agent):
                 self.logger.error(traceback.format_exc())
             time.sleep(5)  # Adjust the sleep duration as needed
 
-        print(f"Stopped agent: {self}")
-
-    def execute_task(self, task: Task):
-        super(RaftAgent, self).execute_task(task=task)
-        self.task_repo.save_task(task=task)
-        #self.task_repo.delete_task(task_id=task.get_task_id())
+        self.logger.info(f"Stopped agent: {self}")
 
     def allocate_task(self, task: Task):
         task.set_leader(leader_agent_id=self.agent_id)
         task.set_time_on_queue()
         task.change_state(new_state=TaskState.RUNNING)
         super(RaftAgent, self).allocate_task(task=task)
-        self.task_repo.save_task(task=task)
+        self.task_repo.delete_task(task_id=task.get_task_id())
+        self.task_repo.save_task(task=task, key_prefix="allocated:")
 
     def fail_task(self, task: Task):
         task.set_leader(leader_agent_id=self.agent_id)
         task.set_time_on_queue()
         task.change_state(new_state=TaskState.FAILED)
-        self.task_repo.save_task(task=task)
+        self.task_repo.save_task(task=task, key_prefix="allocated:")

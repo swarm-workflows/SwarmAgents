@@ -5,3 +5,4 @@ PyYAML
 confluent-kafka
 numpy
 matplotlib
+pyraft

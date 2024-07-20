@@ -1,3 +1,5 @@
+import os
+
 import matplotlib.pyplot as plt
 from collections import defaultdict
 import redis
@@ -32,7 +34,10 @@ class Plotter:
         plt.ylabel('Number of Tasks')
         plt.title('Number of Tasks in Different States')
         plt.xticks(states)
-        plt.show()
+        #plt.show()
+        plot_path = os.path.join("", 'raft-by-states.png')
+        plt.savefig(plot_path)
+        plt.close()
 
     def __count_tasks_by_agent(self):
         agent_counts = defaultdict(int)
@@ -53,7 +58,11 @@ class Plotter:
         plt.ylabel('Number of Tasks')
         plt.title('Number of Tasks on Different Agents')
         plt.xticks(agents)
-        plt.show()
+        #plt.show()
+        plot_path = os.path.join("", 'raft-by-agent.png')
+        plt.savefig(plot_path)
+        plt.close()
+
 
     def __get_tasks_wait_times(self):
         wait_times = {}
@@ -73,7 +82,10 @@ class Plotter:
         plt.ylabel('Time on Queue (seconds)')
         plt.title('Wait Time for Different Tasks')
         plt.xticks(rotation=90)  # Rotate x labels for better readability if there are many tasks
-        plt.show()
+        #plt.show()
+        plot_path = os.path.join("", 'raft-by-time.png')
+        plt.savefig(plot_path)
+        plt.close()
 
 
 def main():
@@ -81,6 +93,7 @@ def main():
     plotter.plot_state_counts()
     plotter.plot_agent_counts()
     plotter.plot_wait_time()
+
 
 if __name__ == '__main__':
     main()
