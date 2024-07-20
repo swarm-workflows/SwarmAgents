@@ -170,13 +170,16 @@ class RaftAgent(Agent):
         peer_agent_id = incoming.get("agent_id")
         task_id = incoming.get("task_id")
 
-        self.logger.debug(f"Received commit from Agent: {peer_agent_id} for Task: {task_id}")
+        self.logger.info(f"Received commit from Agent: {peer_agent_id} for Task: {task_id}")
         task = self.task_repo.get_task(task_id=task_id)
-        if task and self.can_accommodate_task(task=task):
-            self.allocate_task(task=task)
+        if task:
+            if self.can_accommodate_task(task=task):
+                self.allocate_task(task=task)
+            else:
+                self.logger.info(f"Agent: {self.agent_id} cannot execute Task: {task_id}")
+                self.fail_task(task=task)
         else:
-            self.logger.info(f"Agent: {self.agent_id} cannot execute task!")
-            self.fail_task(task=task)
+            self.logger.error(f"Unable to fetch task from queu: {task_id}")
 
     def send_message(self, msg_type: MessageType, task_id: str = None, payload: dict = None):
         message = {
