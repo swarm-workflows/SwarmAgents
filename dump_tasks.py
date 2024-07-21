@@ -13,4 +13,3 @@ def display_tasks(redis_host='localhost', redis_port=6379, task_list='tasks'):
 
 if __name__ == "__main__":
     display_tasks()
-
