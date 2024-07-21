@@ -44,4 +44,4 @@ if __name__ == '__main__':
 
     redis_client = redis.StrictRedis(host="127.0.0.1", port=6379, decode_responses=True)
     task_repo = TaskRepository(redis_client=redis_client)
-    task_repo.delete_all()
+    task_repo.delete_all(key_prefix="*")
