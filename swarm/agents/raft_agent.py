@@ -285,7 +285,7 @@ class RaftAgent(Agent):
         self.__enqueue(incoming=message)
 
     def run_as_follower(self):
-        pass
+        self.logger.info("Running as follower")
 
     def run(self):
         self.logger.info(f"Starting agent: {self}")
