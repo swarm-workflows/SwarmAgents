@@ -7,6 +7,7 @@ import time
 import traceback
 from queue import Queue, Empty
 
+from matplotlib import pyplot as plt
 
 from swarm.agents.agent import Agent
 from swarm.comm.message_service import MessageType
@@ -453,3 +454,44 @@ class PBFTAgent(Agent):
             self.condition.notify_all()
         self.heartbeat_thread.join()
         self.msg_processor_thread.join()
+
+    def plot_results(self):
+        if self.agent_id != "0":
+            return
+
+        tasks = self.task_queue.tasks.values()
+        completed_tasks = [t for t in tasks if t.leader_agent_id is not None]
+        waiting_times = [t.time_on_queue for t in tasks if t.time_on_queue is not None]
+        leader_election_times = [t.time_to_elect_leader for t in tasks if t.time_to_elect_leader is not None]
+        total_tasks = len(tasks)
+        tasks_per_agent = {}
+        for t in completed_tasks:
+            if t.leader_agent_id and t.leader_agent_id not in tasks_per_agent:
+                tasks_per_agent[t.leader_agent_id] = 0
+            tasks_per_agent[t.leader_agent_id] += 1
+
+        self.logger.info(f"Total Tasks = {total_tasks}, Completed Tasks = {len(completed_tasks)}")
+
+        plt.plot(waiting_times, 'ro-', label='Scheduling Latency')
+
+        plt.legend()
+        plt.title(f'Scheduling Latency')
+        plt.xlabel('Task Index')
+        plt.ylabel('Time Units (seconds)')
+        plt.grid(True)
+        plot_path = os.path.join("", 'pbft-by-time.png')
+        plt.savefig(plot_path)
+        plt.close()
+
+        plt.plot(waiting_times, 'ro-', label='Waiting Time - time on queue before election')
+        plt.plot(leader_election_times, 'bo-', label='Consensus Time - time for leader election ')
+
+        plt.bar(list(tasks_per_agent.keys()), list(tasks_per_agent.values()), color='blue')
+        plt.xlabel('Agent ID')
+        plt.ylabel('Number of Tasks Executed')
+        plt.title('Number of Tasks Executed by Each Agent')
+        plt.grid(axis='y', linestyle='--', linewidth=0.5)
+        #plt.show()
+        plot_path = os.path.join("", 'pbft-by-agent.png')
+        plt.savefig(plot_path)
+        plt.close()

@@ -74,3 +74,5 @@ if __name__ == '__main__':
     agent.run()
     distributor.stop()
     agent.stop()
+
+    agent.plot_results()
