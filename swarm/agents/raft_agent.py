@@ -128,6 +128,7 @@ class RaftAgent(Agent):
                     processed += 1
                     my_load = self.compute_overall_load()
                     peer = self.__find_neighbor_with_lowest_load()
+                    self.logger.info(f"Peer found: {peer}")
 
                     if peer and peer.get('load') < 70.00 and self.can_peer_accommodate_task(peer_agent=peer,
                                                                                             task=task):
@@ -165,7 +166,7 @@ class RaftAgent(Agent):
         if capacity_allocations:
             self.neighbor_map[peer_agent_id]["capacity_allocations"] = Capacities.from_dict(capacity_allocations)
 
-        self.logger.debug(f"Received Heartbeat from Agent: {peer_agent_id}: Neighbors: {len(self.neighbor_map)}")
+        self.logger.info(f"Received Heartbeat from Agent: {peer_agent_id}: Neighbors: {len(self.neighbor_map)}")
 
     def __receive_commit(self, incoming: dict):
         dest = incoming.get("dest")
