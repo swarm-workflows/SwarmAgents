@@ -83,7 +83,7 @@ class Task:
         self.time_to_execute = None
         self.time_to_completion = None
         self.leader_agent_id = None
-        self.time_last_state_change = None
+        self.time_last_state_change = 0
 
     def get_leader_agent_id(self) -> str:
         with self.lock:
