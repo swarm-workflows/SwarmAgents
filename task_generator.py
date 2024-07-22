@@ -1,6 +1,4 @@
 import random
-import string
-import hashlib
 import threading
 import time
 
@@ -30,8 +28,8 @@ class TaskGenerator:
         no_op = round(random.uniform(0.1, 70.0), 2)  # Random sleep time between 0.1 and 70 seconds
 
         core = round(random.uniform(0.1, 16.0), 2)  # Simulate CPU request in floating point
-        ram = round(random.uniform(0.1, 8.0), 2)  # Simulate RAM request in floating point
-        disk = round(random.uniform(0.1, 10.0), 2)  # Simulate disk request in floating point
+        ram = round(random.uniform(0.1, 4.0), 2)  # Simulate RAM request in floating point
+        disk = round(random.uniform(0.1, 4.0), 2)  # Simulate disk request in floating point
 
         remote_ips = ['192.158.2.1', '192.158.1.2', '192.158.4.2']
         input_files = ['/var/tmp/outgoing/file100M.txt', '/var/tmp/outgoing/file500M.txt', '/var/tmp/outgoing/file1G.txt']

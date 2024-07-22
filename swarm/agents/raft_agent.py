@@ -122,6 +122,7 @@ class RaftAgent(Agent):
         try:
             processed = 0
             tasks = self.task_repo.get_all_tasks()
+            self.logger.debug(f"Fetched tasks: {len(tasks)} {processed} {self.neighbor_map.values()}")
             for task in tasks:
                 if self.shutdown_flag.is_set():
                     break
