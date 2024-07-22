@@ -1,3 +1,4 @@
+import json
 import random
 import threading
 import time
@@ -85,16 +86,20 @@ class TaskGenerator:
 
         self.redis_client.close()
 
+    def generate_task_file(self, file_name: str):
+        tasks = []
+        for x in range(self.task_count):
+            task_data = self.generate_task(x)
+            tasks.append(task_data)
+
+        with open(file_name, 'w') as file:
+            json.dump(tasks, file, indent=4)
+        print(f"Tasks saved to {file_name}")
+
 
 def main():
     task_generator = TaskGenerator(task_count=100)
-
-    task_generator.start()
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        task_generator.stop()
+    task_generator.generate_task_file(file_name="tasks.json")
 
 
 if __name__ == '__main__':

@@ -1,6 +1,7 @@
 import argparse
 import json
 import random
+import sys
 import threading
 import time
 
@@ -8,7 +9,6 @@ from swarm.agents.pbft_agentv2 import PBFTAgent
 from swarm.models.capacities import Capacities
 from swarm.models.data_node import DataNode
 from swarm.models.task import Task
-from task_generator import TaskGenerator
 
 
 class TaskDistributor(threading.Thread):
@@ -53,31 +53,24 @@ def build_tasks_from_json(json_file):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="PBFT Agent")
-    parser.add_argument("--agent_id", help="Optional agent ID")
-    parser.add_argument("--task_count", default=1000, help="Optional Task Count")
+    if len(sys.argv) != 3:
+        print("Usage: python script.py <agent_id> <task_count>")
+        sys.exit(1)
 
-    args = parser.parse_args()
+    agent_id = int(sys.argv[1])
+    task_count = int(sys.argv[2])
 
-    if args.agent_id is None:
-        print("Please pass in agent id")
-        exit(-1)
+    agent = PBFTAgent(agent_id=str(agent_id), config_file="./config.yml", cycles=1000)
 
-    agent_id = str(args.agent_id)
-    task_count = args.task_count
+    task_pool = build_tasks_from_json('tasks.json')
+    tasks_per_interval = 1  # Number of tasks to add each interval
+    interval = 5  # Interval in seconds
 
-    agent = PBFTAgent(agent_id=agent_id, config_file="./config.yml", cycles=1000)
-
-    task_generator = TaskGenerator(task_count=task_count)
-    if agent_id == 0:
-        task_generator.start()
+    distributor = TaskDistributor(agents=[agent], task_pool=task_pool, tasks_per_interval=tasks_per_interval,
+                                  interval=interval)
 
     agent.start()
-
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        agent.stop()
-        if agent_id == 0:
-            task_generator.stop()
+    distributor.start()
+    agent.run()
+    distributor.stop()
+    agent.stop()
