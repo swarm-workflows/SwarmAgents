@@ -42,6 +42,7 @@ class PBFTAgent(Agent):
         self.msg_processor_thread = threading.Thread(target=self.__message_processor_main,
                                                      daemon=True, name="MsgProcessorThread")
         self.pending_messages = 0
+        self.last_msg_received_timestamp = 0
 
     def __enqueue(self, incoming):
         try:
@@ -100,7 +101,7 @@ class PBFTAgent(Agent):
         while not self.shutdown_heartbeat:
             try:
                 # Send heartbeats
-                diff = int(time.time() - self.last_updated)
+                diff = int(time.time() - self.last_msg_received_timestamp)
                 if diff > 30 or len(self.neighbor_map) == 0:
                     self.send_message(msg_type=MessageType.HeartBeat)
                 time.sleep(30)
@@ -125,6 +126,10 @@ class PBFTAgent(Agent):
                     if task.is_complete():
                         completed_tasks += 1
                         continue
+
+                    diff = int(time.time() - task.last_msg_received_timestamp)
+                    if diff > 120 and task.get_state() in [TaskState.PREPARE, TaskState.PRE_PREPARE]:
+                        task.change_state(new_state=TaskState.PENDING)
 
                     if not task.is_pending():
                         self.logger.debug(f"Task: {task.task_id} State: {task.state}; skipping it!")
@@ -343,14 +348,14 @@ class PBFTAgent(Agent):
 
         if not neighbor_load:
             return
-        self.last_updated = time.time()
+        self.last_msg_received_timestamp = time.time()
 
         # Update neighbor map
         self.neighbor_map[peer_agent_id] = {
             "agent_id": peer_agent_id,
             "load": neighbor_load,
         }
-        self.logger.debug(f"Received Heartbeat from Agent: {peer_agent_id}: Neighbors: {len(self.neighbor_map)}")
+        self.logger.info(f"Received Heartbeat from Agent: {peer_agent_id}: Neighbors: {len(self.neighbor_map)} MAP: {self.neighbor_map.values()}")
 
     def __receive_task_status(self, incoming: dict):
         peer_agent_id = incoming.get("agent_id")
