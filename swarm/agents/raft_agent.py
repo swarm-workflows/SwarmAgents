@@ -109,10 +109,10 @@ class RaftAgent(Agent):
         lowest_load_neighbor = None
 
         # Iterate through each neighbor in neighbor_map
-        for neighbor_info in self.neighbor_map:
+        for peer_agent_id, neighbor_info in self.neighbor_map.items():
             # Check if the current load is lower than the lowest load found so far
             if neighbor_info['load'] < lowest_load:
-                lowest_load = neighbor_info['load']  # Update the lowest load
+                lowest_load = neighbor_info['load'] 
                 lowest_load_neighbor = neighbor_info.copy()
 
         return lowest_load_neighbor
