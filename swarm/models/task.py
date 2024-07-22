@@ -378,17 +378,17 @@ class Task:
         self.data_in = [DataNode.from_dict(data_in) for data_in in task_data['data_in']]
         self.data_out = [DataNode.from_dict(data_out) for data_out in task_data['data_out']]
         self.state = TaskState(task_data['state']) if task_data.get('state') else TaskState.PENDING
-        self.data_in_time = task_data['data_in_time'] if task_data.get('data_in_time') else None
-        self.data_out_time = task_data['data_out_time'] if task_data.get('data_out_time') else None
+        self.data_in_time = task_data['data_in_time'] if task_data.get('data_in_time') is not None else None
+        self.data_out_time = task_data['data_out_time'] if task_data.get('data_out_time') is not None else None
         self.prepares = task_data['prepares'] if task_data.get('prepares') else 0
         self.commits = task_data['commits'] if task_data.get('commits') else 0
-        self.creation_time = task_data['creation_time'] if task_data.get('creation_time') else time.time()
-        self.time_to_elect_leader = task_data['time_to_elect_leader'] if task_data.get('time_to_elect_leader') else None
-        self.time_on_queue = task_data['time_on_queue'] if task_data.get('time_on_queue') else None
-        self.time_to_execute = task_data['time_to_execute'] if task_data.get('time_to_execute') else None
-        self.time_to_completion = task_data['time_to_completion'] if task_data.get('time_to_completion') else None
-        self.leader_agent_id = task_data['leader_agent_id'] if task_data.get('leader_agent_id') else None
-        self.time_last_state_change = task_data['time_last_state_change'] if task_data.get('time_last_state_change') else None
+        self.creation_time = task_data['creation_time'] if task_data.get('creation_time') is not None else time.time()
+        self.time_to_elect_leader = task_data['time_to_elect_leader'] if task_data.get('time_to_elect_leader') is not None else None
+        self.time_on_queue = task_data['time_on_queue'] if task_data.get('time_on_queue') is not None else None
+        self.time_to_execute = task_data['time_to_execute'] if task_data.get('time_to_execute') is not None else None
+        self.time_to_completion = task_data['time_to_completion'] if task_data.get('time_to_completion') is not None else None
+        self.leader_agent_id = task_data['leader_agent_id'] if task_data.get('leader_agent_id') is not None else None
+        self.time_last_state_change = task_data['time_last_state_change'] if task_data.get('time_last_state_change') is not None else None
 
 
 class TaskQueue:

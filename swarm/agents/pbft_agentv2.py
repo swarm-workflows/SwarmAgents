@@ -10,12 +10,11 @@ import matplotlib.pyplot as plt
 from queue import Queue, Empty
 
 import numpy as numpy
-import redis
 
 from swarm.agents.agent import Agent
 from swarm.comm.message_service import MessageType
 from swarm.models.proposal import ProposalContainer, Proposal
-from swarm.models.task import Task, TaskState, TaskRepository
+from swarm.models.task import Task, TaskState
 
 
 class IterableQueue:
@@ -31,8 +30,7 @@ class IterableQueue:
 
 
 class PBFTAgent(Agent):
-    def __init__(self, agent_id: str, config_file: str, cycles: int, redis_host: str = "127.0.0.1",
-                 redis_port: int = 6379):
+    def __init__(self, agent_id: str, config_file: str, cycles: int):
         super().__init__(agent_id, config_file, cycles)
         self.outgoing_proposals = ProposalContainer()
         self.incoming_proposals = ProposalContainer()
@@ -46,10 +44,6 @@ class PBFTAgent(Agent):
         self.msg_processor_thread = threading.Thread(target=self.__message_processor_main,
                                                      daemon=True, name="MsgProcessorThread")
         self.pending_messages = 0
-        self.main_thread = threading.Thread(target=self.run,
-                                            daemon=True, name="AgentLoop")
-        self.redis_client = redis.StrictRedis(host=redis_host, port=redis_port, decode_responses=True)
-        self.task_repo = TaskRepository(redis_client=self.redis_client)
 
     def __enqueue(self, incoming):
         try:
@@ -118,35 +112,15 @@ class PBFTAgent(Agent):
     def run(self):
         self.logger.info(f"Starting agent: {self}")
         time.sleep(10)
-
-        cycle = 0
         completed_tasks = 0
-        while cycle <= self.cycles:
+        while not self.shutdown:
             try:
-                cycle += 1
-
-                # Filter pending tasks from the task queue
-                cnt = 0
                 # Make a copy of the dictionary keys
                 task_ids = list(self.task_queue.tasks.keys())
                 for task_id in task_ids:
-                    election_timeout = random.uniform(150, 300) / 1000
-                    time.sleep(election_timeout)
-
                     task = self.task_queue.tasks.get(task_id)
                     if not task:
                         continue
-                #for task_id, task in self.task_queue.tasks.items():
-                    cnt += 1
-
-                    '''
-                    if completed_tasks == self.task_queue.size():
-                        break
-
-                    if cnt > self.max_pending_elections:
-                        time.sleep(5)
-                        cnt = 0
-                    '''
 
                     if task.is_complete():
                         completed_tasks += 1
@@ -156,8 +130,13 @@ class PBFTAgent(Agent):
                         self.logger.debug(f"Task: {task.task_id} State: {task.state}; skipping it!")
                         continue
 
+                    # Trigger leader election for a task after random sleep
+                    election_timeout = random.uniform(150, 300) / 1000
+                    time.sleep(election_timeout)
+
                     if self.__can_become_leader(task=task):
                         task.set_time_on_queue()
+
                         # Send proposal to all neighbors
                         proposal = Proposal(p_id=self.generate_id(), task_id=task.get_task_id(),
                                             agent_id=self.agent_id)
@@ -172,18 +151,13 @@ class PBFTAgent(Agent):
                         self.logger.debug(
                             f"Agent: {self.agent_id} sent Proposal: {proposal} for Task: {task.task_id}!")
                     else:
-                        self.logger.debug(f"Task: {task.task_id} State: {task.state} cannot be accommodated at this time:")
+                        self.logger.debug(
+                            f"Task: {task.task_id} State: {task.state} cannot be accommodated at this time:")
 
-                time.sleep(5)  # Adjust the sleep duration as needed
-
-                # No more pending tasks
-                #if not self.task_queue.has_pending_tasks():
-                #    break
-                if completed_tasks == self.task_queue.size():
-                    break
+                time.sleep(1)  # Adjust the sleep duration as needed
 
             except Exception as e:
-                self.logger.error(f"Error occurred while executing cycle: {cycle} e: {e}")
+                self.logger.error(f"Error occurred while executing e: {e}")
                 self.logger.error(traceback.format_exc())
 
     def __find_neighbor_with_lowest_load(self):
@@ -226,7 +200,8 @@ class PBFTAgent(Agent):
                 can_accommodate and \
                 my_load < 70.00:
             return can_accommodate
-        self.logger.debug(f"__can_become_leader: can_accommodate: {can_accommodate} incoming:{incoming} my_load: {my_load}")
+        self.logger.debug(
+            f"__can_become_leader: can_accommodate: {can_accommodate} incoming:{incoming} my_load: {my_load}")
         return False
 
     def __receive_proposal(self, incoming: dict):
@@ -239,7 +214,7 @@ class PBFTAgent(Agent):
         self.logger.debug(f"Received Proposal from Agent: {peer_agent_id} for Task: {task_id} "
                           f"Proposal: {proposal_id} Seed: {rcvd_seed}")
 
-        task = self.task_repo.get_task(task_id=task_id)
+        task = self.task_queue.get_task(task_id=task_id)
         if not task or task.is_ready() or task.is_complete() or task.is_running():
             return
 
@@ -255,14 +230,14 @@ class PBFTAgent(Agent):
         my_proposal = self.outgoing_proposals.get_proposal(task_id=task_id)
         peer_proposal = self.incoming_proposals.get_proposal(task_id=task_id)
 
-        #if (my_proposal and (my_proposal.prepares or my_proposal.seed < rcvd_seed)) or \
+        # if (my_proposal and (my_proposal.prepares or my_proposal.seed < rcvd_seed)) or \
         #        (peer_proposal and peer_proposal.seed < rcvd_seed) or \
         #        not can_accept_task or \
         #        (can_accept_task and my_current_load < neighbor_load):
         if (my_proposal and (my_proposal.prepares or my_proposal.seed < rcvd_seed)) or \
                 (peer_proposal and peer_proposal.seed < rcvd_seed):
             self.logger.debug(f"Agent {self.agent_id} rejected Proposal for Task: {task_id} from agent"
-                             f" {peer_agent_id} - accepted another proposal")
+                              f" {peer_agent_id} - accepted another proposal")
         else:
             self.logger.debug(
                 f"Agent {self.agent_id} accepted Proposal for Task: {task_id} from agent"
@@ -344,7 +319,8 @@ class PBFTAgent(Agent):
         quorum_count = (len(self.neighbor_map) + 1) / 2
 
         if proposal.commits >= quorum_count:
-            self.logger.info(f"Agent: {self.agent_id} received quorum commits for Task: {task_id} Proposal: {proposal}: Task: {task}")
+            self.logger.info(
+                f"Agent: {self.agent_id} received quorum commits for Task: {task_id} Proposal: {proposal}: Task: {task}")
             task.set_time_to_elect_leader()
             task.set_leader(leader_agent_id=proposal.agent_id)
             if self.outgoing_proposals.contains(task_id=task_id, p_id=proposal_id):
@@ -404,10 +380,10 @@ class PBFTAgent(Agent):
             self.logger.debug(f"Consumer received message: {incoming}")
 
             msg_type = MessageType(incoming.get('msg_type'))
-            #TODO hack
+            # TODO hack
             self.__receive_heartbeat(incoming=incoming)
 
-            #if msg_type == MessageType.HeartBeat:
+            # if msg_type == MessageType.HeartBeat:
             #    self.__receive_heartbeat(incoming=incoming)
 
             if msg_type == MessageType.Proposal:
@@ -427,6 +403,11 @@ class PBFTAgent(Agent):
         except Exception as e:
             self.logger.error(f"Error while processing incoming message: {message}: {e}")
             self.logger.error(traceback.format_exc())
+
+    def execute_task(self, task: Task):
+        super().execute_task(task=task)
+        self.send_message(msg_type=MessageType.TaskStatus, task_id=task.get_task_id(),
+                          status=task.state)
 
     def send_message(self, msg_type: MessageType, task_id: str = None, proposal_id: str = None,
                      status: TaskState = None, seed: float = None):
@@ -455,7 +436,6 @@ class PBFTAgent(Agent):
         self.msg_processor_thread.start()
         self.message_service.start()
         self.heartbeat_thread.start()
-        self.main_thread.start()
 
     def stop(self):
         self.shutdown_heartbeat = True
@@ -468,4 +448,3 @@ class PBFTAgent(Agent):
             self.condition.notify_all()
         self.heartbeat_thread.join()
         self.msg_processor_thread.join()
-        self.main_thread.join()
