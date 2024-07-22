@@ -115,6 +115,7 @@ class PBFTAgent(Agent):
         completed_tasks = 0
         while not self.shutdown:
             try:
+                processed = 0
                 # Make a copy of the dictionary keys
                 task_ids = list(self.task_queue.tasks.keys())
                 for task_id in task_ids:
@@ -129,6 +130,8 @@ class PBFTAgent(Agent):
                     if not task.is_pending():
                         self.logger.debug(f"Task: {task.task_id} State: {task.state}; skipping it!")
                         continue
+
+                    processed += 1
 
                     # Trigger leader election for a task after random sleep
                     election_timeout = random.uniform(150, 300) / 1000
@@ -153,6 +156,10 @@ class PBFTAgent(Agent):
                     else:
                         self.logger.debug(
                             f"Task: {task.task_id} State: {task.state} cannot be accommodated at this time:")
+
+                    if processed >= 40:
+                        time.sleep(1)
+                        processed = 0
 
                 time.sleep(1)  # Adjust the sleep duration as needed
 
