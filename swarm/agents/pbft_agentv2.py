@@ -101,10 +101,11 @@ class PBFTAgent(Agent):
         while not self.shutdown_heartbeat:
             try:
                 # Send heartbeats
-                diff = int(time.time() - self.last_msg_received_timestamp)
-                if diff > 30 or len(self.neighbor_map) == 0:
-                    self.send_message(msg_type=MessageType.HeartBeat)
-                time.sleep(30)
+                #diff = int(time.time() - self.last_msg_received_timestamp)
+                #if diff > 30 or len(self.neighbor_map) == 0:
+                    #self.send_message(msg_type=MessageType.HeartBeat)
+                self.send_message(msg_type=MessageType.HeartBeat)
+                time.sleep(10)
             except Exception as e:
                 self.logger.error(f"Error occurred while sending heartbeat e: {e}")
                 self.logger.error(traceback.format_exc())
