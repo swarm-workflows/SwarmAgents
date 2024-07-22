@@ -15,74 +15,35 @@ class Plotter:
         self.redis_client = redis.StrictRedis(host=host, port=port, decode_responses=True)
         self.task_repository = TaskRepository(self.redis_client)
 
-    def __count_tasks_by_state(self):
-        state_counts = defaultdict(int)
+    def plot_tasks_per_agent(self):
         tasks = self.task_repository.get_all_tasks(key_prefix="allocated")
-        for task in tasks:
-            state = task.state.value
-            if state is not None:
-                state_counts[state] += 1
-        return state_counts
+        tasks_per_agent = {}
+        for t in tasks:
+            if t.leader_agent_id:
+                if t.leader_agent_id not in tasks_per_agent:
+                    tasks_per_agent[t.leader_agent_id] = 0
+                tasks_per_agent[t.leader_agent_id] += 1
 
-    def plot_state_counts(self):
-        state_counts = self.__count_tasks_by_state()
-        states = list(state_counts.keys())
-        counts = list(state_counts.values())
-
-        plt.bar(states, counts, color='blue')
-        plt.xlabel('Task State')
-        plt.ylabel('Number of Tasks')
-        plt.title('Number of Tasks in Different States')
-        plt.xticks(states)
-        #plt.show()
-        plot_path = os.path.join("", 'raft-by-states.png')
-        plt.savefig(plot_path)
-        plt.close()
-
-    def __count_tasks_by_agent(self):
-        agent_counts = defaultdict(int)
-        tasks = self.task_repository.get_all_tasks()
-        for task in tasks:
-            agent_id = task.leader_agent_id
-            if agent_id is not None:
-                agent_counts[agent_id] += 1
-        return agent_counts
-
-    def plot_agent_counts(self):
-        agent_counts = self.__count_tasks_by_agent()
-        agents = list(agent_counts.keys())
-        counts = list(agent_counts.values())
-
-        plt.bar(agents, counts, color='blue')
-        plt.xlabel('Agent')
-        plt.ylabel('Number of Tasks')
-        plt.title('Number of Tasks on Different Agents')
-        plt.xticks(agents)
+        plt.bar(list(tasks_per_agent.keys()), list(tasks_per_agent.values()), color='blue')
+        plt.xlabel('Agent ID')
+        plt.ylabel('Number of Tasks Executed')
+        plt.title('Number of Tasks Executed by Each Agent')
+        plt.grid(axis='y', linestyle='--', linewidth=0.5)
         #plt.show()
         plot_path = os.path.join("", 'raft-by-agent.png')
         plt.savefig(plot_path)
         plt.close()
 
-
-    def __get_tasks_wait_times(self):
-        wait_times = {}
-        tasks = self.task_repository.get_all_tasks()
-        for task in tasks:
-            if task.time_on_queue is not None:
-                wait_times[task.get_task_id()] = task.time_on_queue
-        return wait_times
-
     def plot_wait_time(self):
-        wait_times = self.__get_tasks_wait_times()
-        tasks = list(wait_times.keys())
-        times = list(wait_times.values())
+        tasks = self.task_repository.get_all_tasks(key_prefix="allocated")
+        waiting_times = [t.time_on_queue for t in tasks if t.time_on_queue is not None]
+        plt.plot(waiting_times, 'ro-', label='Waiting Time - time to schedule')
 
-        plt.bar(tasks, times, color='blue')
-        plt.xlabel('Task ID')
-        plt.ylabel('Time on Queue (seconds)')
-        plt.title('Wait Time for Different Tasks')
-        plt.xticks(rotation=90)  # Rotate x labels for better readability if there are many tasks
-        #plt.show()
+        plt.legend()
+        plt.title(f'Task Times')
+        plt.xlabel('Task Index')
+        plt.ylabel('Time Units (seconds)')
+        plt.grid(True)
         plot_path = os.path.join("", 'raft-by-time.png')
         plt.savefig(plot_path)
         plt.close()
@@ -90,8 +51,7 @@ class Plotter:
 
 def main():
     plotter = Plotter()
-    plotter.plot_state_counts()
-    plotter.plot_agent_counts()
+    plotter.plot_tasks_per_agent()
     plotter.plot_wait_time()
 
 

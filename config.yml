@@ -1,3 +1,6 @@
+redis:
+  host: 127.0.0.1
+  port: 6379
 kafka:
   bootstrap_servers: localhost:19092
   topic: agent_load

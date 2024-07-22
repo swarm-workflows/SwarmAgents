@@ -133,10 +133,14 @@ class RaftAgent(Agent):
 
                     if peer and peer.get('load') < 70.00 and self.can_peer_accommodate_task(peer_agent=peer,
                                                                                             task=task):
+                        task.set_time_on_queue()
+                        self.task_repo.save_task(task=task)
                         payload = {"dest": peer.get('agent_id')}
                         self.send_message(msg_type=MessageType.Commit, task_id=task.task_id, payload=payload)
 
                     elif my_load < 70.00 and self.can_accommodate_task(task=task):
+                        task.set_time_on_queue()
+                        self.task_repo.save_task(task=task)
                         self.allocate_task(task=task)
 
                 if processed >= 10:
@@ -312,7 +316,7 @@ class RaftAgent(Agent):
 
     def allocate_task(self, task: Task):
         task.set_leader(leader_agent_id=self.agent_id)
-        task.set_time_on_queue()
+        #task.set_time_on_queue()
         task.change_state(new_state=TaskState.RUNNING)
         super(RaftAgent, self).allocate_task(task=task)
         self.task_repo.delete_task(task_id=task.get_task_id())
@@ -320,6 +324,6 @@ class RaftAgent(Agent):
 
     def fail_task(self, task: Task):
         task.set_leader(leader_agent_id=self.agent_id)
-        task.set_time_on_queue()
+        #task.set_time_on_queue()
         task.change_state(new_state=TaskState.FAILED)
         self.task_repo.save_task(task=task, key_prefix="allocated")
