@@ -41,6 +41,8 @@ class PBFTAgent(Agent):
                                                  daemon=True, name="HeartBeatThread")
         self.msg_processor_thread = threading.Thread(target=self.__message_processor_main,
                                                      daemon=True, name="MsgProcessorThread")
+        self.main_thread = threading.Thread(target=self.run,
+                                            daemon=True, name="AgentLoop")
         self.pending_messages = 0
         self.last_msg_received_timestamp = 0
 
@@ -446,6 +448,7 @@ class PBFTAgent(Agent):
         self.msg_processor_thread.start()
         self.message_service.start()
         self.heartbeat_thread.start()
+        self.main_thread.start()
 
     def stop(self):
         self.shutdown_heartbeat = True
@@ -454,6 +457,7 @@ class PBFTAgent(Agent):
             time.sleep(1)
         time.sleep(60)
         self.shutdown = True
+        self.main_thread.join()
         with self.condition:
             self.condition.notify_all()
         self.heartbeat_thread.join()

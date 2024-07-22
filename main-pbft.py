@@ -71,8 +71,12 @@ if __name__ == '__main__':
 
     agent.start()
     distributor.start()
-    agent.run()
-    distributor.stop()
-    agent.stop()
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        distributor.stop()
+        agent.stop()
 
     agent.plot_results()
