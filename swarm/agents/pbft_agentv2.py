@@ -347,7 +347,7 @@ class PBFTAgent(Agent):
         peer_agent_id = incoming.get("agent_id")
         neighbor_load = incoming.get("load")
 
-        if not neighbor_load:
+        if neighbor_load is None:
             return
         self.last_msg_received_timestamp = time.time()
 
@@ -356,7 +356,7 @@ class PBFTAgent(Agent):
             "agent_id": peer_agent_id,
             "load": neighbor_load,
         }
-        self.logger.info(f"Received Heartbeat from Agent: {peer_agent_id}: Neighbors: {len(self.neighbor_map)} MAP: {self.neighbor_map.values()}")
+        self.logger.info(f"Received Heartbeat from Agent: {peer_agent_id}: MAP: {self.neighbor_map.values()}")
 
     def __receive_task_status(self, incoming: dict):
         peer_agent_id = incoming.get("agent_id")
@@ -392,13 +392,11 @@ class PBFTAgent(Agent):
             self.logger.debug(f"Consumer received message: {incoming}")
 
             msg_type = MessageType(incoming.get('msg_type'))
-            # TODO hack
-            self.__receive_heartbeat(incoming=incoming)
 
-            # if msg_type == MessageType.HeartBeat:
-            #    self.__receive_heartbeat(incoming=incoming)
+            if msg_type == MessageType.HeartBeat:
+                self.__receive_heartbeat(incoming=incoming)
 
-            if msg_type == MessageType.Proposal:
+            elif msg_type == MessageType.Proposal:
                 self.__receive_proposal(incoming=incoming)
 
             elif msg_type == MessageType.Prepare:
