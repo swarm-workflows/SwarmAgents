@@ -140,7 +140,7 @@ class RaftAgent(Agent):
                         self.allocate_task(task=task)
 
                 if processed >= 10:
-                    time.sleep(5)
+                    time.sleep(1)
                     processed = 0
         except Exception as e:
             self.logger.info(f"RUN Leader -- error: {e}")
@@ -238,7 +238,7 @@ class RaftAgent(Agent):
                 if self.allocated_tasks.capacities():
                     payload["capacity_allocations"] = self.allocated_tasks.capacities().to_dict()
                 self.send_message(msg_type=MessageType.HeartBeat, payload=payload)
-                time.sleep(10)
+                time.sleep(5)
             except Exception as e:
                 print(f"Error occurred while sending heartbeat e: {e}")
                 self.logger.error(traceback.format_exc())
