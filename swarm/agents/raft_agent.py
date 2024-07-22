@@ -167,6 +167,7 @@ class RaftAgent(Agent):
             self.neighbor_map[peer_agent_id]["capacity_allocations"] = Capacities.from_dict(capacity_allocations)
 
         self.logger.info(f"Received Heartbeat from Agent: {peer_agent_id}: Neighbors: {len(self.neighbor_map)}")
+        self.logger.info(f"MAP: {self.neighbor_map.values()}")
 
     def __receive_commit(self, incoming: dict):
         dest = incoming.get("dest")
