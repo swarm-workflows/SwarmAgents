@@ -322,5 +322,5 @@ class RaftAgent(Agent):
 
     def fail_task(self, task: Task):
         task.change_state(new_state=TaskState.FAILED)
-        self.task_repo.save_task(task=task, key_prefix="allocated")
+        #self.task_repo.save_task(task=task, key_prefix="allocated")
         # TODO move it back to pending
