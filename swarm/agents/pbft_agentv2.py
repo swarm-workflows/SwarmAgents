@@ -127,7 +127,7 @@ class PBFTAgent(Agent):
                         completed_tasks += 1
                         continue
 
-                    diff = int(time.time() - task.last_msg_received_timestamp)
+                    diff = int(time.time() - task.time_last_state_change)
                     if diff > 120 and task.get_state() in [TaskState.PREPARE, TaskState.PRE_PREPARE]:
                         task.change_state(new_state=TaskState.PENDING)
 
