@@ -5,11 +5,8 @@ import random
 import threading
 import time
 import traceback
-import matplotlib.pyplot as plt
-
 from queue import Queue, Empty
 
-import numpy as numpy
 
 from swarm.agents.agent import Agent
 from swarm.comm.message_service import MessageType
@@ -98,6 +95,7 @@ class PBFTAgent(Agent):
         self.logger.info("Message Processor Stopped")
 
     def __heartbeat_main(self):
+        self.send_message(msg_type=MessageType.HeartBeat)
         while not self.shutdown_heartbeat:
             try:
                 # Send heartbeats
