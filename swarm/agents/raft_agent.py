@@ -134,16 +134,21 @@ class RaftAgent(Agent):
                     if peer and peer.get('load') < 70.00 and self.can_peer_accommodate_task(peer_agent=peer,
                                                                                             task=task):
                         task.set_time_on_queue()
-                        self.task_repo.save_task(task=task)
+                        task.set_leader(leader_agent_id=peer.get('agent_id'))
+                        self.task_repo.delete_task(task_id=task.get_task_id())
+                        self.task_repo.save_task(task=task, key_prefix="allocated")
                         payload = {"dest": peer.get('agent_id')}
                         self.send_message(msg_type=MessageType.Commit, task_id=task.task_id, payload=payload)
 
                     elif my_load < 70.00 and self.can_accommodate_task(task=task):
                         task.set_time_on_queue()
-                        self.task_repo.save_task(task=task)
+                        task.set_leader(leader_agent_id=self.agent_id)
+                        task.change_state(new_state=TaskState.RUNNING)
+                        self.task_repo.delete_task(task_id=task.get_task_id())
+                        self.task_repo.save_task(task=task, key_prefix="allocated")
                         self.allocate_task(task=task)
 
-                if processed >= 10:
+                if processed >= 40:
                     time.sleep(1)
                     processed = 0
         except Exception as e:
@@ -183,7 +188,7 @@ class RaftAgent(Agent):
         task_id = incoming.get("task_id")
 
         self.logger.info(f"Received commit from Agent: {peer_agent_id} for Task: {task_id}")
-        task = self.task_repo.get_task(task_id=task_id)
+        task = self.task_repo.get_task(task_id=task_id, key_prefix="allocated")
         if task:
             if self.can_accommodate_task(task=task):
                 self.allocate_task(task=task)
@@ -306,24 +311,15 @@ class RaftAgent(Agent):
                 else:
                     # Wait for job execution
                     self.run_as_follower()
+                    time.sleep(1)  # Adjust the sleep duration as needed
 
             except Exception as e:
                 self.logger.error(f"Error occurred e: {e}")
                 self.logger.error(traceback.format_exc())
-            time.sleep(5)  # Adjust the sleep duration as needed
 
         self.logger.info(f"Stopped agent: {self}")
 
-    def allocate_task(self, task: Task):
-        task.set_leader(leader_agent_id=self.agent_id)
-        #task.set_time_on_queue()
-        task.change_state(new_state=TaskState.RUNNING)
-        super(RaftAgent, self).allocate_task(task=task)
-        self.task_repo.delete_task(task_id=task.get_task_id())
-        self.task_repo.save_task(task=task, key_prefix="allocated")
-
     def fail_task(self, task: Task):
-        task.set_leader(leader_agent_id=self.agent_id)
-        #task.set_time_on_queue()
         task.change_state(new_state=TaskState.FAILED)
         self.task_repo.save_task(task=task, key_prefix="allocated")
+        # TODO move it back to pending

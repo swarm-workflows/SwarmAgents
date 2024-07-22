@@ -16,7 +16,7 @@ class Plotter:
         self.task_repository = TaskRepository(self.redis_client)
 
     def plot_tasks_per_agent(self):
-        tasks = self.task_repository.get_all_tasks(key_prefix="allocated")
+        tasks = self.task_repository.get_all_tasks(key_prefix="*")
         tasks_per_agent = {}
         for t in tasks:
             if t.leader_agent_id:
@@ -35,12 +35,12 @@ class Plotter:
         plt.close()
 
     def plot_wait_time(self):
-        tasks = self.task_repository.get_all_tasks(key_prefix="allocated")
+        tasks = self.task_repository.get_all_tasks(key_prefix="*")
         waiting_times = [t.time_on_queue for t in tasks if t.time_on_queue is not None]
-        plt.plot(waiting_times, 'ro-', label='Waiting Time - time to schedule')
+        plt.plot(waiting_times, 'ro-', label='Scheduling Latency')
 
         plt.legend()
-        plt.title(f'Task Times')
+        plt.title(f'Scheduling Latency')
         plt.xlabel('Task Index')
         plt.ylabel('Time Units (seconds)')
         plt.grid(True)
