@@ -11,6 +11,7 @@ from matplotlib import pyplot as plt
 
 from swarm.agents.agent import Agent
 from swarm.comm.message_service import MessageType
+from swarm.models.capacities import Capacities
 from swarm.models.proposal import ProposalContainer, Proposal
 from swarm.models.task import Task, TaskState
 
@@ -201,14 +202,20 @@ class PBFTAgent(Agent):
         :param task:
         :return: True or False
         """
-        my_load = self.compute_overall_load()
+        proposed_capacities = Capacities()
+        for task_id in self.outgoing_proposals.tasks():
+            if task_id != task.get_task_id():
+                proposed_task = self.task_queue.get_task(task_id=task_id)
+                proposed_capacities += proposed_task.get_capacities()
+
+        my_load = self.compute_overall_load(allocated=proposed_capacities)
         least_loaded_neighbor = self.__find_neighbor_with_lowest_load()
 
         if least_loaded_neighbor and least_loaded_neighbor.get('load') < my_load:
             self.logger.debug("Can't become leader as my load is more than all of the neighbors")
             return False
 
-        can_accommodate = self.can_accommodate_task(task=task)
+        can_accommodate = self.can_accommodate_task(task=task, allocated=proposed_capacities)
         incoming = self.incoming_proposals.contains(task_id=task.get_task_id())
         if not incoming and \
                 can_accommodate and \
@@ -232,8 +239,8 @@ class PBFTAgent(Agent):
         if not task or task.is_ready() or task.is_complete() or task.is_running():
             return
 
-        can_accept_task = self.can_accommodate_task(task=task)
-        my_current_load = self.compute_overall_load()
+        #can_accept_task = self.can_accommodate_task(task=task)
+        #my_current_load = self.compute_overall_load()
 
         # Reject proposal in following cases:
         # - I have initiated a proposal and either received accepts from at least 1 peer or
@@ -452,16 +459,13 @@ class PBFTAgent(Agent):
 
     def stop(self):
         self.shutdown_heartbeat = True
-        self.message_service.stop()
-        while self.pending_messages:
-            time.sleep(1)
-        time.sleep(60)
         self.shutdown = True
-        self.main_thread.join()
+        self.message_service.stop()
         with self.condition:
             self.condition.notify_all()
         self.heartbeat_thread.join()
         self.msg_processor_thread.join()
+        self.main_thread.join()
 
     def plot_results(self):
         if self.agent_id != "0":
@@ -480,26 +484,22 @@ class PBFTAgent(Agent):
 
         self.logger.info(f"Total Tasks = {total_tasks}, Completed Tasks = {len(completed_tasks)}")
 
-        plt.plot(waiting_times, 'ro-', label='Scheduling Latency')
-
         plt.legend()
         plt.title(f'Scheduling Latency')
         plt.xlabel('Task Index')
         plt.ylabel('Time Units (seconds)')
+        plt.plot(waiting_times, 'ro-', label='Waiting Time - time on queue before election')
+        plt.plot(leader_election_times, 'bo-', label='Consensus Time - time for leader election ')
         plt.grid(True)
         plot_path = os.path.join("", 'pbft-by-time.png')
         plt.savefig(plot_path)
         plt.close()
-
-        plt.plot(waiting_times, 'ro-', label='Waiting Time - time on queue before election')
-        plt.plot(leader_election_times, 'bo-', label='Consensus Time - time for leader election ')
 
         plt.bar(list(tasks_per_agent.keys()), list(tasks_per_agent.values()), color='blue')
         plt.xlabel('Agent ID')
         plt.ylabel('Number of Tasks Executed')
         plt.title('Number of Tasks Executed by Each Agent')
         plt.grid(axis='y', linestyle='--', linewidth=0.5)
-        #plt.show()
         plot_path = os.path.join("", 'pbft-by-agent.png')
         plt.savefig(plot_path)
         plt.close()

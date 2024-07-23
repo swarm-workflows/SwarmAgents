@@ -1,4 +1,5 @@
 import random
+from typing import List
 
 from swarm.models.json_field import JSONField
 
@@ -105,3 +106,6 @@ class ProposalContainer:
             for p in self.proposals_by_task_id[task_id]:
                 self.proposals_by_pid.get(p.p_id)
             self.proposals_by_task_id.pop(task_id)
+
+    def tasks(self) -> List[str]:
+        return list(self.proposals_by_task_id.keys())

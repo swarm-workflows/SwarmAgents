@@ -112,8 +112,10 @@ class Agent(Observer):
         except (socket.gaierror, socket.timeout, OSError):
             return False
 
-    def can_accommodate_task(self, task: Task):
+    def can_accommodate_task(self, task: Task, allocated: Capacities = None):
         allocated_caps = self.allocated_tasks.capacities()
+        if allocated:
+            allocated_caps += allocated
         available = self.capacities - allocated_caps
         self.logger.debug(f"Agent Total Capacities: {self.capacities}")
         self.logger.debug(f"Agent Allocated Capacities: {allocated_caps}")
@@ -138,8 +140,10 @@ class Agent(Observer):
 
         return True
 
-    def compute_overall_load(self):
+    def compute_overall_load(self, allocated: Capacities = None):
         allocated_caps = self.allocated_tasks.capacities()
+        if allocated:
+            allocated_caps += allocated
 
         core_load = (allocated_caps.core / self.capacities.core) * 100
         ram_load = (allocated_caps.ram / self.capacities.ram) * 100
