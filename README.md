@@ -45,12 +45,6 @@ NOTE: Only tasks in Pending state are picked by an agent for scheduling.
 PBFT consensus works with smaller number of agents but struggles to scale efficiently as the number of agents increases, due to its communication complexity.
 However, it's resilient and fault tolerant.
 
-- **Scenario 1: Number of tasks: 100, Number of Agents: 10**
-![Wait Time and Leader Election Time distribution across agents](./runs/10/agent-5.png)
-
- - **Scenario 2: Number of tasks: 500, Number of Agents: 5**
-![Wait Time and Leader Election Time distribution across agents](./runs/5/agent-1.png)
-
 ### Usage
 1. Setup the python environment by installing all the dependencies:
 ```
@@ -61,4 +55,27 @@ pip install -r requirements.txt
 4. Launch the agents via `sh start.sh`. User can increase the number of agents within `start.sh`
 
 ## Raft Consensus Algorithm
-**TODO** - work in progress
+### Single Leader Election:
+A single leader is chosen based on the agent's load.
+### Shared Task Queue
+Task queue is maintained in Redis
+### Job Scheduling:
+The leader agent assigns the job to other agents based on their loads.
+The leader agent schedules the job on itself if it can accommodate the job and its load is below a defined threshold.
+### Leader Down:
+If the leader fails, one of the followers assumes leadership and job scheduling continues
+### Agent Termination Handling:
+If an agent abruptly terminates while executing a job, the leader monitors the job's status.
+If a job remains in a particular state beyond a specified threshold time, it is assumed to be terminated. The leader then moves the job to a Pending state for rescheduling.
+
+### Usage
+1. Setup the python environment by installing all the dependencies:
+```
+pip install -r requirements.txt
+```
+2. Bring up the kafka cluster and redis using `docker-compose up -d`
+3. Generates `tasks.json` via `python task_generator.py`
+4. Launch the agents:
+   ```
+   python main-raft.py <agent id> <number of agents> <number of tasks>
+   ```
