@@ -7,7 +7,7 @@ import time
 import traceback
 from queue import Queue, Empty
 
-from matplotlib import pyplot as plt
+import matplotlib.pyplot as plt
 
 from swarm.agents.agent import Agent
 from swarm.comm.message_service import MessageType
@@ -496,7 +496,10 @@ class PBFTAgent(Agent):
         tasks = self.task_queue.tasks.values()
         completed_tasks = [t for t in tasks if t.leader_agent_id is not None]
         waiting_times = [t.time_on_queue for t in completed_tasks if t.time_on_queue is not None]
-        plt.plot(waiting_times, 'ro-', label='Scheduling Latency')
+        leader_election_times = [t.time_to_elect_leader for t in tasks if t.time_to_elect_leader is not None]
+
+        plt.plot(waiting_times, 'ro-', label='Waiting Time - time on queue before election')
+        plt.plot(leader_election_times, 'bo-', label='Consensus Time - time for leader election ')
 
         plt.legend()
         plt.title(f'Scheduling Latency')
@@ -510,5 +513,5 @@ class PBFTAgent(Agent):
     def plot_results(self):
         if self.agent_id != "0":
             return
-        self.plot_wait_time()
         self.plot_tasks_per_agent()
+        self.plot_wait_time()
