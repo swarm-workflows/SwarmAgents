@@ -204,11 +204,16 @@ class PBFTAgent(Agent):
         """
         proposed_capacities = Capacities()
         for task_id in self.outgoing_proposals.tasks():
-            if task_id != task.get_task_id():
+            if task_id == task.get_task_id():
                 proposed_task = self.task_queue.get_task(task_id=task_id)
                 proposed_capacities += proposed_task.get_capacities()
 
+        self.logger.info(f"Outgoing proposal capacities: {proposed_capacities}")
+        self.logger.info(f"Allocated capacities: {self.allocated_tasks.capacities()}")
+        self.logger.info(f"Total capacities: {self.capacities}")
+
         my_load = self.compute_overall_load(allocated=proposed_capacities)
+        self.logger.info(f"Overall Load: {my_load}")
         least_loaded_neighbor = self.__find_neighbor_with_lowest_load()
 
         if least_loaded_neighbor and least_loaded_neighbor.get('load') < my_load:
@@ -221,7 +226,7 @@ class PBFTAgent(Agent):
                 can_accommodate and \
                 my_load < 70.00:
             return can_accommodate
-        self.logger.debug(
+        self.logger.info(
             f"__can_become_leader: can_accommodate: {can_accommodate} incoming:{incoming} my_load: {my_load}")
         return False
 
@@ -467,39 +472,43 @@ class PBFTAgent(Agent):
         self.msg_processor_thread.join()
         self.main_thread.join()
 
-    def plot_results(self):
-        if self.agent_id != "0":
-            return
-
+    def plot_tasks_per_agent(self):
         tasks = self.task_queue.tasks.values()
         completed_tasks = [t for t in tasks if t.leader_agent_id is not None]
-        waiting_times = [t.time_on_queue for t in tasks if t.time_on_queue is not None]
-        leader_election_times = [t.time_to_elect_leader for t in tasks if t.time_to_elect_leader is not None]
-        total_tasks = len(tasks)
         tasks_per_agent = {}
         for t in completed_tasks:
-            if t.leader_agent_id and t.leader_agent_id not in tasks_per_agent:
-                tasks_per_agent[t.leader_agent_id] = 0
-            tasks_per_agent[t.leader_agent_id] += 1
-
-        self.logger.info(f"Total Tasks = {total_tasks}, Completed Tasks = {len(completed_tasks)}")
-
-        plt.legend()
-        plt.title(f'Scheduling Latency')
-        plt.xlabel('Task Index')
-        plt.ylabel('Time Units (seconds)')
-        plt.plot(waiting_times, 'ro-', label='Waiting Time - time on queue before election')
-        plt.plot(leader_election_times, 'bo-', label='Consensus Time - time for leader election ')
-        plt.grid(True)
-        plot_path = os.path.join("", 'pbft-by-time.png')
-        plt.savefig(plot_path)
-        plt.close()
+            if t.leader_agent_id:
+                if t.leader_agent_id not in tasks_per_agent:
+                    tasks_per_agent[t.leader_agent_id] = 0
+                tasks_per_agent[t.leader_agent_id] += 1
 
         plt.bar(list(tasks_per_agent.keys()), list(tasks_per_agent.values()), color='blue')
         plt.xlabel('Agent ID')
         plt.ylabel('Number of Tasks Executed')
         plt.title('Number of Tasks Executed by Each Agent')
         plt.grid(axis='y', linestyle='--', linewidth=0.5)
+        #plt.show()
         plot_path = os.path.join("", 'pbft-by-agent.png')
         plt.savefig(plot_path)
         plt.close()
+
+    def plot_wait_time(self):
+        tasks = self.task_queue.tasks.values()
+        completed_tasks = [t for t in tasks if t.leader_agent_id is not None]
+        waiting_times = [t.time_on_queue for t in completed_tasks if t.time_on_queue is not None]
+        plt.plot(waiting_times, 'ro-', label='Scheduling Latency')
+
+        plt.legend()
+        plt.title(f'Scheduling Latency')
+        plt.xlabel('Task Index')
+        plt.ylabel('Time Units (seconds)')
+        plt.grid(True)
+        plot_path = os.path.join("", 'pbft-by-time.png')
+        plt.savefig(plot_path)
+        plt.close()
+
+    def plot_results(self):
+        if self.agent_id != "0":
+            return
+        self.plot_wait_time()
+        self.plot_tasks_per_agent()
