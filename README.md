@@ -3,7 +3,7 @@
 This repository hosts code for emulating SWARM agents and investigating different consensus algorithms concerning task scheduling among the agents.
 
 ## Practical Byzantine Fault Tolerance (PBFT)
-PBFT algorithm is explored and implemented in `pbft_agent.py`. This agent works as follows:
+PBFT algorithm is explored and implemented in `pbft_agentv2.py`. This agent works as follows:
 
 - Each agent has a copy of the task Queue
 - Collaborative decision-making by agents to determine tasks for scheduling taking into account the following factors:
@@ -52,9 +52,10 @@ pip install -r requirements.txt
 ```
 2. Bring up the kafka cluster using `docker-compose up -d`
 3. Generates `tasks.json` via `python task_generator.py`
-4. Launch the agents via `sh start.sh`. User can increase the number of agents within `start.sh`
+4. Launch the agents via `python main-pbft.py <agent id> <number of tasks>`. 
 
 ## Raft Consensus Algorithm
+RAFT algorithm is explored and implemented in `raft_agentv.py`. This agent works as follows:
 ### Single Leader Election:
 A single leader is chosen based on the agent's load.
 ### Shared Task Queue

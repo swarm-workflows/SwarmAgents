@@ -98,7 +98,7 @@ class TaskGenerator:
 
 
 def main():
-    task_generator = TaskGenerator(task_count=100)
+    task_generator = TaskGenerator(task_count=500)
     task_generator.generate_task_file(file_name="tasks.json")
 
 
