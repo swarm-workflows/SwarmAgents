@@ -49,6 +49,8 @@ class PBFTAgent(Agent):
 
     def __enqueue(self, incoming):
         try:
+            if incoming.get("agent_id") == self.agent_id:
+                return
             self.message_queue.put_nowait(incoming)
             with self.condition:
                 self.condition.notify_all()
@@ -155,13 +157,13 @@ class PBFTAgent(Agent):
 
                         self.outgoing_proposals.add_proposal(proposal=proposal)
                         self.logger.info(f"Added proposal: {proposal}")
-                        self.logger.info(f"Outgoing Proposals: {self.outgoing_proposals.size()}")
-                        self.logger.info(f"Incoming Proposals: {self.incoming_proposals.size()}")
+                        #self.logger.info(f"Outgoing Proposals: {self.outgoing_proposals.size()}")
+                        #self.logger.info(f"Incoming Proposals: {self.incoming_proposals.size()}")
 
                         # Begin election for Job leader for this task
                         task.change_state(new_state=TaskState.PRE_PREPARE)
-                        self.logger.debug(
-                            f"Agent: {self.agent_id} sent Proposal: {proposal} for Task: {task.task_id}!")
+                        #self.logger.debug(
+                        #    f"Agent: {self.agent_id} sent Proposal: {proposal} for Task: {task.task_id}!")
                     else:
                         self.logger.debug(
                             f"Task: {task.task_id} State: {task.state} cannot be accommodated at this time:")
@@ -404,7 +406,7 @@ class PBFTAgent(Agent):
             peer_agent_id = incoming.get("agent_id")
             if peer_agent_id in str(self.agent_id):
                 return
-            self.logger.debug(f"Consumer received message: {incoming}")
+            #self.logger.debug(f"Consumer received message: {incoming}")
 
             msg_type = MessageType(incoming.get('msg_type'))
 
