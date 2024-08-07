@@ -52,9 +52,9 @@ class PBFTAgent(Agent):
             self.message_queue.put_nowait(incoming)
             with self.condition:
                 self.condition.notify_all()
-            self.logger.debug("Added message to queue {}".format(incoming.__class__.__name__))
+            self.logger.debug(f"Added incoming message to queue: {incoming}")
         except Exception as e:
-            self.logger.error(f"Failed to queue message: {incoming.__class__.__name__} e: {e}")
+            self.logger.debug(f"Failed to add incoming message to queue: {incoming}: e: {e}")
 
     def __dequeue(self, queue_obj: queue.Queue):
         events = []
