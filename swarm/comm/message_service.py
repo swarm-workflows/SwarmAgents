@@ -68,8 +68,8 @@ class MessageService:
             self.observers.append(agent)
 
     def produce_message(self, json_message: dict):
-        self.logger.debug(f"Message sent: {json_message}")
         message = json.dumps(json_message)
+        self.logger.debug(f"Message sent: {message}")
         self.producer.produce(self.kafka_topic, message.encode('utf-8'))
         #self.producer.flush()
 
