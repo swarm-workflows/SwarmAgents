@@ -140,10 +140,10 @@ class Agent(Observer):
 
         return True
 
-    def compute_overall_load(self, allocated: Capacities = None):
+    def compute_overall_load(self, proposed_caps: Capacities = None):
         allocated_caps = self.allocated_tasks.capacities()
-        if allocated:
-            allocated_caps += allocated
+        if proposed_caps:
+            allocated_caps += proposed_caps
 
         core_load = (allocated_caps.core / self.capacities.core) * 100
         ram_load = (allocated_caps.ram / self.capacities.ram) * 100

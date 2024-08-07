@@ -154,6 +154,9 @@ class PBFTAgent(Agent):
                                           proposal_id=proposal.p_id, seed=proposal.seed)
 
                         self.outgoing_proposals.add_proposal(proposal=proposal)
+                        self.logger.info(f"Added proposal: {proposal}")
+                        self.logger.info(f"Outgoing Proposals: {self.outgoing_proposals.size()}")
+                        self.logger.info(f"Incoming Proposals: {self.incoming_proposals.size()}")
 
                         # Begin election for Job leader for this task
                         task.change_state(new_state=TaskState.PRE_PREPARE)
@@ -206,11 +209,11 @@ class PBFTAgent(Agent):
                 proposed_task = self.task_queue.get_task(task_id=task_id)
                 proposed_capacities += proposed_task.get_capacities()
 
-        self.logger.info(f"Outgoing proposal capacities: {proposed_capacities}")
-        self.logger.info(f"Allocated capacities: {self.allocated_tasks.capacities()}")
-        self.logger.info(f"Total capacities: {self.capacities}")
+        #self.logger.info(f"Outgoing proposal capacities: {proposed_capacities}")
+        #self.logger.info(f"Allocated capacities: {self.allocated_tasks.capacities()}")
+        #self.logger.info(f"Total capacities: {self.capacities}")
 
-        my_load = self.compute_overall_load(allocated=proposed_capacities)
+        my_load = self.compute_overall_load(proposed_caps=proposed_capacities)
         self.logger.info(f"Overall Load: {my_load}")
         least_loaded_neighbor = self.__find_neighbor_with_lowest_load()
 
@@ -433,11 +436,17 @@ class PBFTAgent(Agent):
 
     def send_message(self, msg_type: MessageType, task_id: str = None, proposal_id: str = None,
                      status: TaskState = None, seed: float = None):
+        proposed_capacities = Capacities()
+        for task_id in self.outgoing_proposals.tasks():
+            proposed_task = self.task_queue.get_task(task_id=task_id)
+            proposed_capacities += proposed_task.get_capacities()
+
         message = {
             "msg_type": msg_type.value,
             "agent_id": self.agent_id,
-            "load": self.compute_overall_load()
+            "load": self.compute_overall_load(proposed_caps=proposed_capacities)
         }
+
         if task_id:
             message["task_id"] = task_id
         if proposal_id:
