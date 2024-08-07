@@ -205,16 +205,8 @@ class PBFTAgent(Agent):
         :param task:
         :return: True or False
         """
-        proposed_capacities = Capacities()
-        for task_id in self.outgoing_proposals.tasks():
-            if task_id == task.get_task_id():
-                proposed_task = self.task_queue.get_task(task_id=task_id)
-                proposed_capacities += proposed_task.get_capacities()
-
-        #self.logger.info(f"Outgoing proposal capacities: {proposed_capacities}")
-        #self.logger.info(f"Allocated capacities: {self.allocated_tasks.capacities()}")
-        #self.logger.info(f"Total capacities: {self.capacities}")
-
+        proposed_capacities = self.__get_proposed_capcities()
+        proposed_capacities += task.get_capacities()
         my_load = self.compute_overall_load(proposed_caps=proposed_capacities)
         self.logger.info(f"Overall Load: {my_load}")
         least_loaded_neighbor = self.__find_neighbor_with_lowest_load()
@@ -438,15 +430,10 @@ class PBFTAgent(Agent):
 
     def send_message(self, msg_type: MessageType, task_id: str = None, proposal_id: str = None,
                      status: TaskState = None, seed: float = None):
-        proposed_capacities = Capacities()
-        for task_id in self.outgoing_proposals.tasks():
-            proposed_task = self.task_queue.get_task(task_id=task_id)
-            proposed_capacities += proposed_task.get_capacities()
-
         message = {
             "msg_type": msg_type.value,
             "agent_id": self.agent_id,
-            "load": self.compute_overall_load(proposed_caps=proposed_capacities)
+            "load": self.compute_overall_load(proposed_caps=self.__get_proposed_capcities())
         }
 
         if task_id:
@@ -524,3 +511,10 @@ class PBFTAgent(Agent):
             return
         self.plot_tasks_per_agent()
         self.plot_wait_time()
+
+    def __get_proposed_capcities(self):
+        proposed_capacities = Capacities()
+        for task_id in self.outgoing_proposals.tasks():
+            proposed_task = self.task_queue.get_task(task_id=task_id)
+            proposed_capacities += proposed_task.get_capacities()
+        return proposed_capacities
