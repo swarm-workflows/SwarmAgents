@@ -1,9 +1,9 @@
-import argparse
 import json
 import random
 import sys
 import threading
 import time
+from typing import List
 
 from swarm.agents.pbft_agentv2 import PBFTAgent
 from swarm.models.capacities import Capacities
@@ -12,7 +12,7 @@ from swarm.models.task import Task
 
 
 class TaskDistributor(threading.Thread):
-    def __init__(self, agents, task_pool, tasks_per_interval, interval):
+    def __init__(self, agents: List[PBFTAgent], task_pool: List[Task], tasks_per_interval: int, interval: int):
         super().__init__()
         self.agents = agents
         self.task_pool = task_pool
@@ -26,8 +26,7 @@ class TaskDistributor(threading.Thread):
             for agent in self.agents:
                 for task in tasks_to_add:
                     agent.task_queue.add_task(task)
-            #time.sleep(self.interval)
-            time.sleep(random.uniform(0.1, 1.0))
+            time.sleep(random.uniform(0.1, 3.0))
 
     def stop(self):
         self.shutdown_flag.set()

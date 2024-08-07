@@ -104,9 +104,6 @@ class PBFTAgent(Agent):
         while not self.shutdown_heartbeat:
             try:
                 # Send heartbeats
-                #diff = int(time.time() - self.last_msg_received_timestamp)
-                #if diff > 30 or len(self.neighbor_map) == 0:
-                    #self.send_message(msg_type=MessageType.HeartBeat)
                 self.send_message(msg_type=MessageType.HeartBeat)
                 time.sleep(10)
             except Exception as e:
@@ -220,7 +217,7 @@ class PBFTAgent(Agent):
             self.logger.debug("Can't become leader as my load is more than all of the neighbors")
             return False
 
-        can_accommodate = self.can_accommodate_task(task=task, allocated=proposed_capacities)
+        can_accommodate = self.can_accommodate_task(task=task, proposed_caps=proposed_capacities)
         incoming = self.incoming_proposals.contains(task_id=task.get_task_id())
         if not incoming and \
                 can_accommodate and \
