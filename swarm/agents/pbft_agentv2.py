@@ -128,9 +128,10 @@ class PBFTAgent(Agent):
                         completed_tasks += 1
                         continue
 
-                    diff = int(time.time() - task.time_last_state_change)
-                    if diff > 120 and task.get_state() in [TaskState.PREPARE, TaskState.PRE_PREPARE]:
-                        task.change_state(new_state=TaskState.PENDING)
+                    # DISABLE THIS
+                    #diff = int(time.time() - task.time_last_state_change)
+                    #if diff > 120 and task.get_state() in [TaskState.PREPARE, TaskState.PRE_PREPARE]:
+                    #    task.change_state(new_state=TaskState.PENDING)
 
                     if not task.is_pending():
                         self.logger.debug(f"Task: {task.task_id} State: {task.state}; skipping it!")
