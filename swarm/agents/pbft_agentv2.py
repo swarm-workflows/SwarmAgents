@@ -209,7 +209,7 @@ class PBFTAgent(Agent):
         proposed_capacities = self.__get_proposed_capacities()
         #proposed_capacities += task.get_capacities()
         my_load = self.compute_overall_load(proposed_caps=proposed_capacities)
-        self.logger.info(f"Overall Load: {my_load}")
+        #self.logger.info(f"Overall Load: {my_load}")
         least_loaded_neighbor = self.__find_neighbor_with_lowest_load()
 
         if least_loaded_neighbor and least_loaded_neighbor.get('load') < my_load:
