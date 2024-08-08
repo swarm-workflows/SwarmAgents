@@ -213,7 +213,8 @@ class PBFTAgent(Agent):
         least_loaded_neighbor = self.__find_neighbor_with_lowest_load()
 
         if least_loaded_neighbor and least_loaded_neighbor.get('load') < my_load:
-            self.logger.debug("Can't become leader as my load is more than all of the neighbors")
+            self.logger.debug(f"Can't become leader as my load: {my_load} is more than all of "
+                              f"the neighbors: {least_loaded_neighbor}")
             return False
 
         can_accommodate = self.can_accommodate_task(task=task, proposed_caps=proposed_capacities)
