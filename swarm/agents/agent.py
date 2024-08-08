@@ -117,10 +117,10 @@ class Agent(Observer):
         if proposed_caps:
             allocated_caps += proposed_caps
         available = self.capacities - allocated_caps
-        self.logger.debug(f"Agent Total Capacities: {self.capacities}")
-        self.logger.debug(f"Agent Allocated Capacities: {allocated_caps}")
-        self.logger.debug(f"Agent Available Capacities: {available}")
-        self.logger.debug(f"Task: {task.get_task_id()} Requested capacities: {task.get_capacities()}")
+        #self.logger.debug(f"Agent Total Capacities: {self.capacities}")
+        #self.logger.debug(f"Agent Allocated Capacities: {allocated_caps}")
+        #self.logger.debug(f"Agent Available Capacities: {available}")
+        #self.logger.debug(f"Task: {task.get_task_id()} Requested capacities: {task.get_capacities()}")
 
         # Check if the agent can accommodate the given task based on its capacities
         # Compare the requested against available

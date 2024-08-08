@@ -257,8 +257,8 @@ class PBFTAgent(Agent):
         #        (peer_proposal and peer_proposal.seed < rcvd_seed) or \
         #        not can_accept_task or \
         #        (can_accept_task and my_current_load < neighbor_load):
-        if (my_proposal and (my_proposal.prepares or my_proposal.seed < rcvd_seed)) or \
-                (peer_proposal and peer_proposal.seed < rcvd_seed):
+        #if (my_proposal and (my_proposal.prepares or my_proposal.seed < rcvd_seed)) or \
+        if (my_proposal and my_proposal.seed < rcvd_seed) or (peer_proposal and peer_proposal.seed < rcvd_seed):
             self.logger.debug(f"Agent {self.agent_id} rejected Proposal for Task: {task_id} from agent"
                               f" {peer_agent_id} - accepted another proposal")
         else:
@@ -305,7 +305,7 @@ class PBFTAgent(Agent):
 
         proposal.prepares += 1
 
-        quorum_count = (len(self.neighbor_map) + 1) / 2
+        quorum_count = (len(self.neighbor_map)) / 2
         task.change_state(TaskState.PREPARE)
 
         # Check if vote count is more than quorum
@@ -341,7 +341,7 @@ class PBFTAgent(Agent):
             self.incoming_proposals.add_proposal(proposal=proposal)
 
         proposal.commits += 1
-        quorum_count = (len(self.neighbor_map) + 1) / 2
+        quorum_count = (len(self.neighbor_map)) / 2
 
         if proposal.commits >= quorum_count:
             self.logger.info(
