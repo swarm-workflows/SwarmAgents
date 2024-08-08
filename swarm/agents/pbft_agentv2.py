@@ -49,7 +49,8 @@ class PBFTAgent(Agent):
 
     def __enqueue(self, incoming):
         try:
-            if incoming.get("agent_id") == self.agent_id:
+            message = json.loads(incoming)
+            if message.get("agent_id") == self.agent_id:
                 return
             self.message_queue.put_nowait(incoming)
             with self.condition:
@@ -386,7 +387,7 @@ class PBFTAgent(Agent):
         self.incoming_proposals.remove_task(task_id=task_id)
         self.outgoing_proposals.remove_task(task_id=task_id)
 
-    def __consensus(self, message):
+    def __consensus(self, incoming):
         """
         Consensus Loop
         :param message:
@@ -394,7 +395,7 @@ class PBFTAgent(Agent):
         """
         try:
             # Parse the message as JSON
-            incoming = json.loads(message)
+            #incoming = json.loads(message)
             peer_agent_id = incoming.get("agent_id")
             if peer_agent_id in str(self.agent_id):
                 return
