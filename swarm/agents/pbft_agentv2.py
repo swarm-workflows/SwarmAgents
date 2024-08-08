@@ -329,6 +329,8 @@ class PBFTAgent(Agent):
 
         if not task or task.is_complete() or task.is_ready() or task.is_running() or task.leader_agent_id:
             self.logger.info(f"Ignoring Commit: {task}")
+            self.incoming_proposals.remove_task(task_id=task_id)
+            self.outgoing_proposals.remove_task(task_id=task_id)
             return
 
         # Update the commit votes;
@@ -353,11 +355,11 @@ class PBFTAgent(Agent):
                 self.logger.info(f"LEADER CONSENSUS achieved for Task: {task_id} Leader: {self.agent_id}")
                 task.change_state(new_state=TaskState.READY)
                 self.allocate_task(task)
-                self.outgoing_proposals.remove_proposal(p_id=proposal_id, task_id=task_id)
+                self.outgoing_proposals.remove_task(task_id=task_id)
             else:
                 self.logger.info(f"PARTICIPANT CONSENSUS achieved for Task: {task_id} Leader: {peer_agent_id}")
                 task.change_state(new_state=TaskState.COMMIT)
-                self.incoming_proposals.remove_proposal(p_id=proposal_id, task_id=task_id)
+                self.incoming_proposals.remove_task(task_id=task_id)
 
     def __receive_heartbeat(self, incoming: dict):
         peer_agent_id = incoming.get("agent_id")
