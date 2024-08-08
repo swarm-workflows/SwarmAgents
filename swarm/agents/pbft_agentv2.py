@@ -52,7 +52,7 @@ class PBFTAgent(Agent):
             message = json.loads(incoming)
             if message.get("agent_id") == self.agent_id:
                 return
-            self.message_queue.put_nowait(incoming)
+            self.message_queue.put_nowait(message)
             with self.condition:
                 self.condition.notify_all()
             self.logger.debug(f"Added incoming message to queue: {incoming}")
@@ -74,7 +74,7 @@ class PBFTAgent(Agent):
         for message in messages:
             try:
                 begin = time.time()
-                self.__consensus(message=message)
+                self.__consensus(incoming=message)
                 diff = int(time.time() - begin)
                 if diff > 0:
                     self.logger.info(f"Event {message.get('msg_type')} TIME: {diff}")
