@@ -206,8 +206,8 @@ class PBFTAgent(Agent):
         :param task:
         :return: True or False
         """
-        proposed_capacities = self.__get_proposed_capcities()
-        proposed_capacities += task.get_capacities()
+        proposed_capacities = self.__get_proposed_capacities()
+        #proposed_capacities += task.get_capacities()
         my_load = self.compute_overall_load(proposed_caps=proposed_capacities)
         self.logger.info(f"Overall Load: {my_load}")
         least_loaded_neighbor = self.__find_neighbor_with_lowest_load()
@@ -238,6 +238,7 @@ class PBFTAgent(Agent):
 
         task = self.task_queue.get_task(task_id=task_id)
         if not task or task.is_ready() or task.is_complete() or task.is_running():
+            self.logger.info(f"Ignoring Proposal: {task}")
             return
 
         #can_accept_task = self.can_accommodate_task(task=task)
@@ -289,6 +290,7 @@ class PBFTAgent(Agent):
         task = self.task_queue.get_task(task_id=task_id)
         self.logger.debug(f"Task: {task}")
         if not task or task.is_ready() or task.is_complete() or task.is_running():
+            self.logger.info(f"Ignoring Prepare: {task}")
             return
 
         # Update the prepare votes
@@ -325,6 +327,7 @@ class PBFTAgent(Agent):
         self.logger.debug(f"Task: {task}")
 
         if not task or task.is_complete() or task.is_ready() or task.is_running() or task.leader_agent_id:
+            self.logger.info(f"Ignoring Commit: {task}")
             return
 
         # Update the commit votes;
@@ -394,13 +397,6 @@ class PBFTAgent(Agent):
         :return:
         """
         try:
-            # Parse the message as JSON
-            #incoming = json.loads(message)
-            peer_agent_id = incoming.get("agent_id")
-            if peer_agent_id in str(self.agent_id):
-                return
-            #self.logger.debug(f"Consumer received message: {incoming}")
-
             msg_type = MessageType(incoming.get('msg_type'))
 
             if msg_type == MessageType.HeartBeat:
@@ -418,10 +414,9 @@ class PBFTAgent(Agent):
             elif msg_type == MessageType.TaskStatus:
                 self.__receive_task_status(incoming=incoming)
             else:
-                if msg_type != MessageType.HeartBeat:
-                    self.logger.info(f"Ignoring unsupported message: {message}")
+                self.logger.info(f"Ignoring unsupported message: {incoming}")
         except Exception as e:
-            self.logger.error(f"Error while processing incoming message: {message}: {e}")
+            self.logger.error(f"Error while processing incoming message: {incoming}: {e}")
             self.logger.error(traceback.format_exc())
 
     def execute_task(self, task: Task):
@@ -434,7 +429,7 @@ class PBFTAgent(Agent):
         message = {
             "msg_type": msg_type.value,
             "agent_id": self.agent_id,
-            "load": self.compute_overall_load(proposed_caps=self.__get_proposed_capcities())
+            "load": self.compute_overall_load(proposed_caps=self.__get_proposed_capacities())
         }
 
         if task_id:
@@ -513,9 +508,11 @@ class PBFTAgent(Agent):
         self.plot_tasks_per_agent()
         self.plot_wait_time()
 
-    def __get_proposed_capcities(self):
+    def __get_proposed_capacities(self):
         proposed_capacities = Capacities()
-        for task_id in self.outgoing_proposals.tasks():
+        tasks = self.outgoing_proposals.tasks()
+        for task_id in tasks:
             proposed_task = self.task_queue.get_task(task_id=task_id)
             proposed_capacities += proposed_task.get_capacities()
+        self.logger.debug(f"Number of outgoing proposals: {len(tasks)}")
         return proposed_capacities
