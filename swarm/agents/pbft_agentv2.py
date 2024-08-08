@@ -238,7 +238,7 @@ class PBFTAgent(Agent):
 
         task = self.task_queue.get_task(task_id=task_id)
         if not task or task.is_ready() or task.is_complete() or task.is_running():
-            self.logger.info(f"Ignoring Proposal: {task}")
+            self.logger.info(f"Ignoring Proposal: {task.get_task_id()}")
             return
 
         #can_accept_task = self.can_accommodate_task(task=task)
@@ -288,9 +288,9 @@ class PBFTAgent(Agent):
         self.logger.debug(f"Received prepare from Agent: {peer_agent_id} for Task: {task_id}: {proposal_id}")
 
         task = self.task_queue.get_task(task_id=task_id)
-        self.logger.debug(f"Task: {task}")
+        #self.logger.debug(f"Task: {task}")
         if not task or task.is_ready() or task.is_complete() or task.is_running():
-            self.logger.info(f"Ignoring Prepare: {task}")
+            self.logger.info(f"Ignoring Prepare: {task.get_task_id()}")
             return
 
         # Update the prepare votes
@@ -324,10 +324,10 @@ class PBFTAgent(Agent):
 
         self.logger.debug(f"Received commit from Agent: {peer_agent_id} for Task: {task_id} Proposal: {proposal_id}")
         task = self.task_queue.get_task(task_id=task_id)
-        self.logger.debug(f"Task: {task}")
+        #self.logger.debug(f"Task: {task}")
 
         if not task or task.is_complete() or task.is_ready() or task.is_running() or task.leader_agent_id:
-            self.logger.info(f"Ignoring Commit: {task}")
+            self.logger.info(f"Ignoring Commit: {task.get_task_id()}")
             return
 
         # Update the commit votes;
@@ -381,8 +381,9 @@ class PBFTAgent(Agent):
         task = self.task_queue.get_task(task_id=task_id)
         task.set_leader(leader_agent_id=peer_agent_id)
         task.set_time_to_completion()
-        self.logger.debug(f"Task: {task}")
+        #self.logger.debug(f"Task: {task}")
         if not task or task.is_complete() or task.is_ready():
+            self.logger.info(f"Ignoring Task Status: {task.get_task_id()}")
             return
 
         # Update the task status based on broadcast message
