@@ -112,15 +112,15 @@ class Agent(Observer):
         except (socket.gaierror, socket.timeout, OSError):
             return False
 
-    def can_accommodate_task(self, task: Task, allocated: Capacities = None):
+    def can_accommodate_task(self, task: Task, proposed_caps: Capacities = None):
         allocated_caps = self.allocated_tasks.capacities()
-        if allocated:
-            allocated_caps += allocated
+        if proposed_caps:
+            allocated_caps += proposed_caps
         available = self.capacities - allocated_caps
-        self.logger.debug(f"Agent Total Capacities: {self.capacities}")
-        self.logger.debug(f"Agent Allocated Capacities: {allocated_caps}")
-        self.logger.debug(f"Agent Available Capacities: {available}")
-        self.logger.debug(f"Task: {task.get_task_id()} Requested capacities: {task.get_capacities()}")
+        #self.logger.debug(f"Agent Total Capacities: {self.capacities}")
+        #self.logger.debug(f"Agent Allocated Capacities: {allocated_caps}")
+        #self.logger.debug(f"Agent Available Capacities: {available}")
+        #self.logger.debug(f"Task: {task.get_task_id()} Requested capacities: {task.get_capacities()}")
 
         # Check if the agent can accommodate the given task based on its capacities
         # Compare the requested against available
@@ -140,10 +140,10 @@ class Agent(Observer):
 
         return True
 
-    def compute_overall_load(self, allocated: Capacities = None):
+    def compute_overall_load(self, proposed_caps: Capacities = None):
         allocated_caps = self.allocated_tasks.capacities()
-        if allocated:
-            allocated_caps += allocated
+        if proposed_caps:
+            allocated_caps += proposed_caps
 
         core_load = (allocated_caps.core / self.capacities.core) * 100
         ram_load = (allocated_caps.ram / self.capacities.ram) * 100

@@ -68,8 +68,8 @@ class MessageService:
             self.observers.append(agent)
 
     def produce_message(self, json_message: dict):
-        self.logger.debug(f"Message sent: {json_message}")
         message = json.dumps(json_message)
+        self.logger.debug(f"Message sent: {message}")
         self.producer.produce(self.kafka_topic, message.encode('utf-8'))
         #self.producer.flush()
 
@@ -103,12 +103,12 @@ class MessageService:
                 # Calculate lag
                 lag = highwater_mark - current_offset
 
-                self.logger.debug(
-                    f"Partition {partition}: Current Offset={current_offset}, Highwater Mark={highwater_mark}, "
-                    f"Lag={lag} msg={msg.value().decode('utf-8')}")
+                #self.logger.debug(
+                #    f"Partition {partition}: Current Offset={current_offset}, Highwater Mark={highwater_mark}, "
+                #    f"Lag={lag} msg={msg.value().decode('utf-8')}")
                 begin = time.time()
                 self.notify_observers(msg=msg)
-                self.logger.debug(f"KAFKA PROCESS TIME: {time.time() - begin:.0f}")
+                #self.logger.debug(f"KAFKA PROCESS TIME: {time.time() - begin:.0f}")
 
                 if not self.enable_auto_commit:
                     msg_count += 1
@@ -131,5 +131,5 @@ class MessageService:
     def commit_completed(self, err, partitions):
         if err:
             self.logger.error(f"KAFKA: commit failure: {err}")
-        else:
-            self.logger.debug(f"KAFKA: Committed partition offsets: {partitions}")
+        #else:
+        #    self.logger.debug(f"KAFKA: Committed partition offsets: {partitions}")

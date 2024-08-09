@@ -1,3 +1,4 @@
+import csv
 import json
 import os
 import queue
@@ -49,12 +50,15 @@ class PBFTAgent(Agent):
 
     def __enqueue(self, incoming):
         try:
-            self.message_queue.put_nowait(incoming)
+            message = json.loads(incoming)
+            if message.get("agent_id") == self.agent_id:
+                return
+            self.message_queue.put_nowait(message)
             with self.condition:
                 self.condition.notify_all()
-            self.logger.debug("Added message to queue {}".format(incoming.__class__.__name__))
+            self.logger.debug(f"Added incoming message to queue: {incoming}")
         except Exception as e:
-            self.logger.error(f"Failed to queue message: {incoming.__class__.__name__} e: {e}")
+            self.logger.debug(f"Failed to add incoming message to queue: {incoming}: e: {e}")
 
     def __dequeue(self, queue_obj: queue.Queue):
         events = []
@@ -71,7 +75,7 @@ class PBFTAgent(Agent):
         for message in messages:
             try:
                 begin = time.time()
-                self.__consensus(message=message)
+                self.__consensus(incoming=message)
                 diff = int(time.time() - begin)
                 if diff > 0:
                     self.logger.info(f"Event {message.get('msg_type')} TIME: {diff}")
@@ -104,9 +108,6 @@ class PBFTAgent(Agent):
         while not self.shutdown_heartbeat:
             try:
                 # Send heartbeats
-                #diff = int(time.time() - self.last_msg_received_timestamp)
-                #if diff > 30 or len(self.neighbor_map) == 0:
-                    #self.send_message(msg_type=MessageType.HeartBeat)
                 self.send_message(msg_type=MessageType.HeartBeat)
                 time.sleep(10)
             except Exception as e:
@@ -131,9 +132,10 @@ class PBFTAgent(Agent):
                         completed_tasks += 1
                         continue
 
-                    diff = int(time.time() - task.time_last_state_change)
-                    if diff > 120 and task.get_state() in [TaskState.PREPARE, TaskState.PRE_PREPARE]:
-                        task.change_state(new_state=TaskState.PENDING)
+                    # DISABLE THIS
+                    #diff = int(time.time() - task.time_last_state_change)
+                    #if diff > 120 and task.get_state() in [TaskState.PREPARE, TaskState.PRE_PREPARE]:
+                    #    task.change_state(new_state=TaskState.PENDING)
 
                     if not task.is_pending():
                         self.logger.debug(f"Task: {task.task_id} State: {task.state}; skipping it!")
@@ -156,11 +158,14 @@ class PBFTAgent(Agent):
                                           proposal_id=proposal.p_id, seed=proposal.seed)
 
                         self.outgoing_proposals.add_proposal(proposal=proposal)
+                        self.logger.info(f"Added proposal: {proposal}")
+                        #self.logger.info(f"Outgoing Proposals: {self.outgoing_proposals.size()}")
+                        #self.logger.info(f"Incoming Proposals: {self.incoming_proposals.size()}")
 
                         # Begin election for Job leader for this task
                         task.change_state(new_state=TaskState.PRE_PREPARE)
-                        self.logger.debug(
-                            f"Agent: {self.agent_id} sent Proposal: {proposal} for Task: {task.task_id}!")
+                        #self.logger.debug(
+                        #    f"Agent: {self.agent_id} sent Proposal: {proposal} for Task: {task.task_id}!")
                     else:
                         self.logger.debug(
                             f"Task: {task.task_id} State: {task.state} cannot be accommodated at this time:")
@@ -202,25 +207,18 @@ class PBFTAgent(Agent):
         :param task:
         :return: True or False
         """
-        proposed_capacities = Capacities()
-        for task_id in self.outgoing_proposals.tasks():
-            if task_id == task.get_task_id():
-                proposed_task = self.task_queue.get_task(task_id=task_id)
-                proposed_capacities += proposed_task.get_capacities()
-
-        self.logger.info(f"Outgoing proposal capacities: {proposed_capacities}")
-        self.logger.info(f"Allocated capacities: {self.allocated_tasks.capacities()}")
-        self.logger.info(f"Total capacities: {self.capacities}")
-
-        my_load = self.compute_overall_load(allocated=proposed_capacities)
-        self.logger.info(f"Overall Load: {my_load}")
+        proposed_capacities = self.__get_proposed_capacities()
+        #proposed_capacities += task.get_capacities()
+        my_load = self.compute_overall_load(proposed_caps=proposed_capacities)
+        #self.logger.info(f"Overall Load: {my_load}")
         least_loaded_neighbor = self.__find_neighbor_with_lowest_load()
 
         if least_loaded_neighbor and least_loaded_neighbor.get('load') < my_load:
-            self.logger.debug("Can't become leader as my load is more than all of the neighbors")
+            self.logger.debug(f"Can't become leader as my load: {my_load} is more than all of "
+                              f"the neighbors: {least_loaded_neighbor}")
             return False
 
-        can_accommodate = self.can_accommodate_task(task=task, allocated=proposed_capacities)
+        can_accommodate = self.can_accommodate_task(task=task, proposed_caps=proposed_capacities)
         incoming = self.incoming_proposals.contains(task_id=task.get_task_id())
         if not incoming and \
                 can_accommodate and \
@@ -242,6 +240,7 @@ class PBFTAgent(Agent):
 
         task = self.task_queue.get_task(task_id=task_id)
         if not task or task.is_ready() or task.is_complete() or task.is_running():
+            self.logger.info(f"Ignoring Proposal: {task}")
             return
 
         #can_accept_task = self.can_accommodate_task(task=task)
@@ -291,8 +290,9 @@ class PBFTAgent(Agent):
         self.logger.debug(f"Received prepare from Agent: {peer_agent_id} for Task: {task_id}: {proposal_id}")
 
         task = self.task_queue.get_task(task_id=task_id)
-        self.logger.debug(f"Task: {task}")
+        #self.logger.debug(f"Task: {task}")
         if not task or task.is_ready() or task.is_complete() or task.is_running():
+            self.logger.info(f"Ignoring Prepare: {task}")
             return
 
         # Update the prepare votes
@@ -307,7 +307,7 @@ class PBFTAgent(Agent):
 
         proposal.prepares += 1
 
-        quorum_count = (len(self.neighbor_map) + 1) / 2
+        quorum_count = (len(self.neighbor_map)) / 2
         task.change_state(TaskState.PREPARE)
 
         # Check if vote count is more than quorum
@@ -326,9 +326,12 @@ class PBFTAgent(Agent):
 
         self.logger.debug(f"Received commit from Agent: {peer_agent_id} for Task: {task_id} Proposal: {proposal_id}")
         task = self.task_queue.get_task(task_id=task_id)
-        self.logger.debug(f"Task: {task}")
+        #self.logger.debug(f"Task: {task}")
 
         if not task or task.is_complete() or task.is_ready() or task.is_running() or task.leader_agent_id:
+            self.logger.info(f"Ignoring Commit: {task}")
+            self.incoming_proposals.remove_task(task_id=task_id)
+            self.outgoing_proposals.remove_task(task_id=task_id)
             return
 
         # Update the commit votes;
@@ -342,7 +345,7 @@ class PBFTAgent(Agent):
             self.incoming_proposals.add_proposal(proposal=proposal)
 
         proposal.commits += 1
-        quorum_count = (len(self.neighbor_map) + 1) / 2
+        quorum_count = (len(self.neighbor_map)) / 2
 
         if proposal.commits >= quorum_count:
             self.logger.info(
@@ -353,9 +356,11 @@ class PBFTAgent(Agent):
                 self.logger.info(f"LEADER CONSENSUS achieved for Task: {task_id} Leader: {self.agent_id}")
                 task.change_state(new_state=TaskState.READY)
                 self.allocate_task(task)
+                self.outgoing_proposals.remove_task(task_id=task_id)
             else:
                 self.logger.info(f"PARTICIPANT CONSENSUS achieved for Task: {task_id} Leader: {peer_agent_id}")
                 task.change_state(new_state=TaskState.COMMIT)
+                self.incoming_proposals.remove_task(task_id=task_id)
 
     def __receive_heartbeat(self, incoming: dict):
         peer_agent_id = incoming.get("agent_id")
@@ -382,8 +387,9 @@ class PBFTAgent(Agent):
         task = self.task_queue.get_task(task_id=task_id)
         task.set_leader(leader_agent_id=peer_agent_id)
         task.set_time_to_completion()
-        self.logger.debug(f"Task: {task}")
+        #self.logger.debug(f"Task: {task}")
         if not task or task.is_complete() or task.is_ready():
+            self.logger.info(f"Ignoring Task Status: {task}")
             return
 
         # Update the task status based on broadcast message
@@ -391,20 +397,13 @@ class PBFTAgent(Agent):
         self.incoming_proposals.remove_task(task_id=task_id)
         self.outgoing_proposals.remove_task(task_id=task_id)
 
-    def __consensus(self, message):
+    def __consensus(self, incoming):
         """
         Consensus Loop
         :param message:
         :return:
         """
         try:
-            # Parse the message as JSON
-            incoming = json.loads(message)
-            peer_agent_id = incoming.get("agent_id")
-            if peer_agent_id in str(self.agent_id):
-                return
-            self.logger.debug(f"Consumer received message: {incoming}")
-
             msg_type = MessageType(incoming.get('msg_type'))
 
             if msg_type == MessageType.HeartBeat:
@@ -422,10 +421,9 @@ class PBFTAgent(Agent):
             elif msg_type == MessageType.TaskStatus:
                 self.__receive_task_status(incoming=incoming)
             else:
-                if msg_type != MessageType.HeartBeat:
-                    self.logger.info(f"Ignoring unsupported message: {message}")
+                self.logger.info(f"Ignoring unsupported message: {incoming}")
         except Exception as e:
-            self.logger.error(f"Error while processing incoming message: {message}: {e}")
+            self.logger.error(f"Error while processing incoming message: {incoming}: {e}")
             self.logger.error(traceback.format_exc())
 
     def execute_task(self, task: Task):
@@ -438,8 +436,9 @@ class PBFTAgent(Agent):
         message = {
             "msg_type": msg_type.value,
             "agent_id": self.agent_id,
-            "load": self.compute_overall_load()
+            "load": self.compute_overall_load(proposed_caps=self.__get_proposed_capacities())
         }
+
         if task_id:
             message["task_id"] = task_id
         if proposal_id:
@@ -476,42 +475,107 @@ class PBFTAgent(Agent):
         tasks = self.task_queue.tasks.values()
         completed_tasks = [t for t in tasks if t.leader_agent_id is not None]
         tasks_per_agent = {}
+
         for t in completed_tasks:
             if t.leader_agent_id:
                 if t.leader_agent_id not in tasks_per_agent:
                     tasks_per_agent[t.leader_agent_id] = 0
                 tasks_per_agent[t.leader_agent_id] += 1
 
+        # Save tasks_per_agent to CSV
+        with open('tasks_per_agent.csv', 'w', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow(['Agent ID', 'Number of Tasks Executed'])
+            for agent_id, task_count in tasks_per_agent.items():
+                writer.writerow([agent_id, task_count])
+
+        # Plotting the tasks per agent as a bar chart
         plt.bar(list(tasks_per_agent.keys()), list(tasks_per_agent.values()), color='blue')
         plt.xlabel('Agent ID')
         plt.ylabel('Number of Tasks Executed')
-        plt.title('Number of Tasks Executed by Each Agent')
+
+        # Title with PBFT and number of agents
+        num_agents = len(tasks_per_agent)
+        plt.title(f'PBFT: Number of Tasks Executed by Each Agent (Total Agents: {num_agents})')
+
         plt.grid(axis='y', linestyle='--', linewidth=0.5)
-        #plt.show()
-        plot_path = os.path.join("", 'pbft-by-agent.png')
+
+        # Save the plot
+        plot_path = os.path.join("", 'tasks-per-agent.png')
         plt.savefig(plot_path)
         plt.close()
 
-    def plot_wait_time(self):
+    def plot_scheduling_latency(self):
         tasks = self.task_queue.tasks.values()
         completed_tasks = [t for t in tasks if t.leader_agent_id is not None]
-        waiting_times = [t.time_on_queue for t in completed_tasks if t.time_on_queue is not None]
-        leader_election_times = [t.time_to_elect_leader for t in tasks if t.time_to_elect_leader is not None]
 
-        plt.plot(waiting_times, 'ro-', label='Waiting Time - time on queue before election')
-        plt.plot(leader_election_times, 'bo-', label='Consensus Time - time for leader election ')
+        # Calculate scheduling latency
+        scheduling_latency = [
+            t.time_on_queue + t.time_to_elect_leader
+            for t in completed_tasks
+            if t.time_on_queue is not None and t.time_to_elect_leader is not None
+        ]
 
-        plt.legend()
-        plt.title(f'Scheduling Latency')
+        # Save scheduling latency, time_on_queue, and time_to_elect_leader as CSV
+        wait_time_data = [(t.time_on_queue,) for t in completed_tasks if t.time_on_queue is not None]
+        election_time_data = [(t.time_to_elect_leader,) for t in tasks if t.time_to_elect_leader is not None]
+        latency_data = [(latency,) for latency in scheduling_latency]
+
+        with open('wait_time.csv', 'w', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow(['time_on_queue'])
+            writer.writerows(wait_time_data)
+
+        with open('election_time.csv', 'w', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow(['time_to_elect_leader'])
+            writer.writerows(election_time_data)
+
+        with open('scheduling_latency.csv', 'w', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow(['scheduling_latency'])
+            writer.writerows(latency_data)
+
+        # Plotting scheduling latency in red
+        plt.plot(scheduling_latency, 'ro-', label='Scheduling Latency (Waiting Time + Leader Election Time)')
+
+        # Plotting wait time in blue
+        if wait_time_data:
+            wait_times = [data[0] for data in wait_time_data]
+            plt.plot(wait_times, 'bo-', label='Waiting Time')
+
+        # Plotting leader election time in green
+        if election_time_data:
+            election_times = [data[0] for data in election_time_data]
+            plt.plot(election_times, 'go-', label='Leader Election Time')
+
+        # Title with PBFT and number of agents
+        num_agents = len(set([t.leader_agent_id for t in completed_tasks]))
+        plt.title(f'PBFT: Scheduling Latency (Total Agents: {num_agents})')
+
         plt.xlabel('Task Index')
         plt.ylabel('Time Units (seconds)')
         plt.grid(True)
-        plot_path = os.path.join("", 'pbft-by-time.png')
-        plt.savefig(plot_path)
+
+        # Adjusting legend position to avoid overlapping the graph
+        plt.legend(loc='upper left', bbox_to_anchor=(1, 1))  # This places the legend outside the plot area
+
+        # Save the plot
+        plot_path = os.path.join("", 'scheduling-latency.png')
+        plt.savefig(plot_path, bbox_inches='tight')  # bbox_inches='tight' ensures that the entire plot is saved
         plt.close()
 
     def plot_results(self):
         if self.agent_id != "0":
             return
         self.plot_tasks_per_agent()
-        self.plot_wait_time()
+        self.plot_scheduling_latency()
+
+    def __get_proposed_capacities(self):
+        proposed_capacities = Capacities()
+        tasks = self.outgoing_proposals.tasks()
+        for task_id in tasks:
+            proposed_task = self.task_queue.get_task(task_id=task_id)
+            proposed_capacities += proposed_task.get_capacities()
+        self.logger.debug(f"Number of outgoing proposals: {len(tasks)}; Tasks: {tasks}")
+        return proposed_capacities

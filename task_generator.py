@@ -2,6 +2,7 @@ import json
 import random
 import threading
 import time
+import argparse
 
 import redis
 
@@ -23,12 +24,12 @@ class TaskGenerator:
         self.thread = threading.Thread(target=self.run, daemon=True, name="TaskGenerator")
 
     def generate_task(self, x):
-        #task_id = hashlib.sha256(''.join(random.choices(string.ascii_lowercase, k=8)).encode()).hexdigest()[:8]
+        # task_id = hashlib.sha256(''.join(random.choices(string.ascii_lowercase, k=8)).encode()).hexdigest()[:8]
         task_id = str(x)
 
-        no_op = round(random.uniform(0.1, 70.0), 2)  # Random sleep time between 0.1 and 70 seconds
+        no_op = round(random.uniform(0.1, 30.0), 2)  # Random sleep time between 0.1 and 70 seconds
 
-        core = round(random.uniform(0.1, 16.0), 2)  # Simulate CPU request in floating point
+        core = round(random.uniform(0.1, 4.0), 2)  # Simulate CPU request in floating point
         ram = round(random.uniform(0.1, 4.0), 2)  # Simulate RAM request in floating point
         disk = round(random.uniform(0.1, 4.0), 2)  # Simulate disk request in floating point
 
@@ -97,10 +98,13 @@ class TaskGenerator:
         print(f"Tasks saved to {file_name}")
 
 
-def main():
-    task_generator = TaskGenerator(task_count=500)
+def main(task_count: int):
+    task_generator = TaskGenerator(task_count=task_count)
     task_generator.generate_task_file(file_name="tasks.json")
 
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser(description="Generate tasks for the swarm.")
+    parser.add_argument('task_count', type=int, help="Number of tasks to generate")
+    args = parser.parse_args()
+    main(task_count=args.task_count)
