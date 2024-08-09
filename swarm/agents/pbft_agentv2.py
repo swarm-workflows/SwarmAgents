@@ -516,9 +516,10 @@ class PBFTAgent(Agent):
             if t.time_on_queue is not None and t.time_to_elect_leader is not None
         ]
 
-        # Save time_on_queue and time_to_elect_leader as CSV
+        # Save scheduling latency, time_on_queue, and time_to_elect_leader as CSV
         wait_time_data = [(t.time_on_queue,) for t in completed_tasks if t.time_on_queue is not None]
         election_time_data = [(t.time_to_elect_leader,) for t in tasks if t.time_to_elect_leader is not None]
+        latency_data = [(latency,) for latency in scheduling_latency]
 
         with open('wait_time.csv', 'w', newline='') as file:
             writer = csv.writer(file)
@@ -529,6 +530,11 @@ class PBFTAgent(Agent):
             writer = csv.writer(file)
             writer.writerow(['time_to_elect_leader'])
             writer.writerows(election_time_data)
+
+        with open('scheduling_latency.csv', 'w', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow(['scheduling_latency'])
+            writer.writerows(latency_data)
 
         # Plotting scheduling latency in red
         plt.plot(scheduling_latency, 'ro-', label='Scheduling Latency (Waiting Time + Leader Election Time)')
