@@ -501,7 +501,7 @@ class PBFTAgent(Agent):
         plt.grid(axis='y', linestyle='--', linewidth=0.5)
 
         # Save the plot
-        plot_path = os.path.join("", 'pbft-by-agent.png')
+        plot_path = os.path.join("", 'tasks-per-agent.png')
         plt.savefig(plot_path)
         plt.close()
 
@@ -549,8 +549,6 @@ class PBFTAgent(Agent):
             election_times = [data[0] for data in election_time_data]
             plt.plot(election_times, 'go-', label='Leader Election Time')
 
-        plt.legend()
-
         # Title with PBFT and number of agents
         num_agents = len(set([t.leader_agent_id for t in completed_tasks]))
         plt.title(f'PBFT: Scheduling Latency (Total Agents: {num_agents})')
@@ -558,8 +556,13 @@ class PBFTAgent(Agent):
         plt.xlabel('Task Index')
         plt.ylabel('Time Units (seconds)')
         plt.grid(True)
+
+        # Adjusting legend position to avoid overlapping the graph
+        plt.legend(loc='upper left', bbox_to_anchor=(1, 1))  # This places the legend outside the plot area
+
+        # Save the plot
         plot_path = os.path.join("", 'scheduling-latency.png')
-        plt.savefig(plot_path)
+        plt.savefig(plot_path, bbox_inches='tight')  # bbox_inches='tight' ensures that the entire plot is saved
         plt.close()
 
     def plot_results(self):
