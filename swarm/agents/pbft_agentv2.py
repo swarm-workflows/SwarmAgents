@@ -560,7 +560,7 @@ class PBFTAgent(Agent):
         if self.agent_id != "0":
             return
         self.plot_tasks_per_agent()
-        self.plot_wait_time()
+        self.plot_scheduling_latency()
 
     def __get_proposed_capacities(self):
         proposed_capacities = Capacities()
