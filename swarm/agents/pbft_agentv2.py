@@ -1,3 +1,4 @@
+import csv
 import json
 import os
 import queue
@@ -474,37 +475,84 @@ class PBFTAgent(Agent):
         tasks = self.task_queue.tasks.values()
         completed_tasks = [t for t in tasks if t.leader_agent_id is not None]
         tasks_per_agent = {}
+
         for t in completed_tasks:
             if t.leader_agent_id:
                 if t.leader_agent_id not in tasks_per_agent:
                     tasks_per_agent[t.leader_agent_id] = 0
                 tasks_per_agent[t.leader_agent_id] += 1
 
+        # Save tasks_per_agent to CSV
+        with open('tasks_per_agent.csv', 'w', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow(['Agent ID', 'Number of Tasks Executed'])
+            for agent_id, task_count in tasks_per_agent.items():
+                writer.writerow([agent_id, task_count])
+
+        # Plotting the tasks per agent as a bar chart
         plt.bar(list(tasks_per_agent.keys()), list(tasks_per_agent.values()), color='blue')
         plt.xlabel('Agent ID')
         plt.ylabel('Number of Tasks Executed')
-        plt.title('Number of Tasks Executed by Each Agent')
+
+        # Title with PBFT and number of agents
+        num_agents = len(tasks_per_agent)
+        plt.title(f'PBFT: Number of Tasks Executed by Each Agent (Total Agents: {num_agents})')
+
         plt.grid(axis='y', linestyle='--', linewidth=0.5)
-        #plt.show()
+
+        # Save the plot
         plot_path = os.path.join("", 'pbft-by-agent.png')
         plt.savefig(plot_path)
         plt.close()
 
-    def plot_wait_time(self):
+    def plot_scheduling_latency(self):
         tasks = self.task_queue.tasks.values()
         completed_tasks = [t for t in tasks if t.leader_agent_id is not None]
-        waiting_times = [t.time_on_queue for t in completed_tasks if t.time_on_queue is not None]
-        leader_election_times = [t.time_to_elect_leader for t in tasks if t.time_to_elect_leader is not None]
 
-        plt.plot(waiting_times, 'ro-', label='Waiting Time - time on queue before election')
-        plt.plot(leader_election_times, 'bo-', label='Consensus Time - time for leader election ')
+        # Calculate scheduling latency
+        scheduling_latency = [
+            t.time_on_queue + t.time_to_elect_leader
+            for t in completed_tasks
+            if t.time_on_queue is not None and t.time_to_elect_leader is not None
+        ]
+
+        # Save time_on_queue and time_to_elect_leader as CSV
+        wait_time_data = [(t.time_on_queue,) for t in completed_tasks if t.time_on_queue is not None]
+        election_time_data = [(t.time_to_elect_leader,) for t in tasks if t.time_to_elect_leader is not None]
+
+        with open('wait_time.csv', 'w', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow(['time_on_queue'])
+            writer.writerows(wait_time_data)
+
+        with open('election_time.csv', 'w', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow(['time_to_elect_leader'])
+            writer.writerows(election_time_data)
+
+        # Plotting scheduling latency in red
+        plt.plot(scheduling_latency, 'ro-', label='Scheduling Latency (Waiting Time + Leader Election Time)')
+
+        # Plotting wait time in blue
+        if wait_time_data:
+            wait_times = [data[0] for data in wait_time_data]
+            plt.plot(wait_times, 'bo-', label='Waiting Time')
+
+        # Plotting leader election time in green
+        if election_time_data:
+            election_times = [data[0] for data in election_time_data]
+            plt.plot(election_times, 'go-', label='Leader Election Time')
 
         plt.legend()
-        plt.title(f'Scheduling Latency')
+
+        # Title with PBFT and number of agents
+        num_agents = len(set([t.leader_agent_id for t in completed_tasks]))
+        plt.title(f'PBFT: Scheduling Latency (Total Agents: {num_agents})')
+
         plt.xlabel('Task Index')
         plt.ylabel('Time Units (seconds)')
         plt.grid(True)
-        plot_path = os.path.join("", 'pbft-by-time.png')
+        plot_path = os.path.join("", 'scheduling-latency.png')
         plt.savefig(plot_path)
         plt.close()
 
