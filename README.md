@@ -24,35 +24,34 @@ PBFT algorithm is explored and implemented in `pbft_agentv2.py`. This agent work
 - If quorum count of Prepares are received, agent sends Commit messages to everyone in the network indicating leader election.
 - If quorum count of Commits are received, agent finalizes leader election, at this point the task is scheduled and executed.
 
-### Task State Machine
-- The task's state transitions are influenced by message exchanges. 
-- Agents are vying to become leaders for tasks. 
-- Once a consensus is established and a leader is elected, the leading agent can proceed to execute the task. 
-- Agents may concurrently participate in leader elections for multiple tasks.
-
-NOTE: Only tasks in Pending state are picked by an agent for scheduling.
-
-#### Initiator Agent
-![Initiator Agent](./images/pbft-state-initiator.png)
-
-#### Participant Agent
-![Participant Agent](./images/pbft-state-participant.png)
-
-### Agent Architecture
-![Agent Architecture](./images/pbft-agent.png)
-
 ### Performance
 PBFT consensus works with smaller number of agents but struggles to scale efficiently as the number of agents increases, due to its communication complexity.
 However, it's resilient and fault tolerant.
 
+![Scheduling latency - 3 agents](./runs/pbft/3/scheduling-latency.png)
+![Scheduling latency - 5 agents](./runs/pbft/5/scheduling-latency.png)
+![Scheduling latency - 10 agents](./runs/pbft/10/scheduling-latency.png)
+
 ### Usage
-1. Setup the python environment by installing all the dependencies:
+- Set up the python environment by installing all the dependencies:
 ```
 pip install -r requirements.txt
 ```
-2. Bring up the kafka cluster using `docker-compose up -d`
-3. Generates `tasks.json` via `python task_generator.py`
-4. Launch the agents via `python main-pbft.py <agent id> <number of tasks>`. 
+- Bring up the kafka cluster using `docker-compose up -d`
+- Generates `tasks.json` via `python task_generator.py`
+- Start Agent 0 is started via following command:
+```
+   python3.11 main-pbft.py 0 100
+```
+- Rest of the agents can be started via following command:
+```
+    sh start.sh
+```
+NOTE: Remember to clean up the logs and kafka topic between runs via
+```
+rm -rf *.log*
+python3.11 kafka_cleanup.py
+```
 
 ## Raft Consensus Algorithm
 RAFT algorithm is explored and implemented in `raft_agentv.py`. This agent works as follows:
@@ -70,13 +69,22 @@ If an agent abruptly terminates while executing a job, the leader monitors the j
 If a job remains in a particular state beyond a specified threshold time, it is assumed to be terminated. The leader then moves the job to a Pending state for rescheduling.
 
 ### Usage
-1. Setup the python environment by installing all the dependencies:
+- Set up the python environment by installing all the dependencies:
 ```
 pip install -r requirements.txt
 ```
-2. Bring up the kafka cluster and redis using `docker-compose up -d`
-3. Generates `tasks.json` via `python task_generator.py`
-4. Launch the agents:
-   ```
-   python main-raft.py <agent id> <number of agents> <number of tasks>
-   ```
+- Bring up the kafka cluster using `docker-compose up -d`
+- Generates `tasks.json` via `python task_generator.py`
+- Start Agent 0 is started via following command:
+```
+   python3.11 main-raft.py 0 100
+```
+- Rest of the agents can be started via following command:
+```
+    sh raft-start.sh
+```
+NOTE: Remember to clean up the logs and kafka topic between runs via
+```
+rm -rf *.log*
+python3.11 kafka_cleanup.py
+```
