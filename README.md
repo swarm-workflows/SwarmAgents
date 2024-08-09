@@ -32,6 +32,7 @@ However, it's resilient and fault tolerant.
 ![Scheduling latency - 5 agents](./runs/pbft/5/scheduling-latency.png)
 ![Scheduling latency - 10 agents](./runs/pbft/10/scheduling-latency.png)
 
+![Scheduling latency comparison - Number of agents](./runs/pbft/overall-scheduling-latency.png)
 ### Usage
 - Set up the python environment by installing all the dependencies:
 ```
@@ -88,3 +89,10 @@ NOTE: Remember to clean up the logs and kafka topic between runs via
 rm -rf *.log*
 python3.11 kafka_cleanup.py
 ```
+
+### Performance
+Scales well, handling large numbers of agents effectively.
+
+Number of Agents: 10
+
+![Scheduling latency](./runs/raft/raft-by-time.png)
