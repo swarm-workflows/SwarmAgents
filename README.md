@@ -96,3 +96,8 @@ Scales well, handling large numbers of agents effectively.
 Number of Agents: 10
 
 ![Scheduling latency](./runs/raft/raft-by-time.png)
+![Scheduling latency - 3 agents](./runs/raft/3/raft-by-time.png)
+![Scheduling latency - 5 agents](./runs/raft/5/raft-by-time.png)
+![Scheduling latency - 10 agents](./runs/raft/10/raft-by-time.png)
+
+![Scheduling latency comparison - Number of agents](./runs/raft/overall-scheduling-latency.png)
