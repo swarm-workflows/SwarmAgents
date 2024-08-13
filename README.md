@@ -64,7 +64,7 @@ python3.11 kafka_cleanup.py
 ```
 
 ## SWARM Consensus (Swarm)
-SWARM algorithm extends PBFT consensus to the swarm topology. In the first version, we have changed the leader election process as described below:
+SWARM algorithm extends PBFT consensus to the swarm topology and implemented in `swarm_agent.py`. In the first version, we have changed the leader election process as described below:
 
 ### Leader Election Process
 
@@ -109,7 +109,7 @@ python3.11 kafka_cleanup.py
 ```
 
 ## Raft Consensus Algorithm
-RAFT algorithm is explored and implemented in `raft_agentv.py`. This agent works as follows:
+RAFT algorithm is explored and implemented in `raft_agent.py`. This agent works as follows:
 ### Single Leader Election:
 A single leader is chosen based on the agent's load.
 ### Shared Task Queue
