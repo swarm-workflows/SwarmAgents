@@ -140,11 +140,6 @@ class SwarmAgent(Agent):
                         completed_tasks += 1
                         continue
 
-                    # DISABLE THIS
-                    #diff = int(time.time() - task.time_last_state_change)
-                    #if diff > 120 and task.get_state() in [TaskState.PREPARE, TaskState.PRE_PREPARE]:
-                    #    task.change_state(new_state=TaskState.PENDING)
-
                     if not task.is_pending():
                         self.logger.debug(f"Task: {task.task_id} State: {task.state}; skipping it!")
                         continue
@@ -155,7 +150,7 @@ class SwarmAgent(Agent):
                     election_timeout = random.uniform(150, 300) / 1000
                     time.sleep(election_timeout)
 
-                    if self.__can_become_leader2(task=task):
+                    if self.__can_become_leader(task=task):
                         task.set_time_on_queue()
 
                         # Send proposal to all neighbors
@@ -167,13 +162,9 @@ class SwarmAgent(Agent):
 
                         self.outgoing_proposals.add_proposal(proposal=proposal)
                         self.logger.info(f"Added proposal: {proposal}")
-                        #self.logger.info(f"Outgoing Proposals: {self.outgoing_proposals.size()}")
-                        #self.logger.info(f"Incoming Proposals: {self.incoming_proposals.size()}")
 
                         # Begin election for Job leader for this task
                         task.change_state(new_state=TaskState.PRE_PREPARE)
-                        #self.logger.debug(
-                        #    f"Agent: {self.agent_id} sent Proposal: {proposal} for Task: {task.task_id}!")
                     else:
                         self.logger.debug(
                             f"Task: {task.task_id} State: {task.state} cannot be accommodated at this time:")
@@ -187,52 +178,6 @@ class SwarmAgent(Agent):
             except Exception as e:
                 self.logger.error(f"Error occurred while executing e: {e}")
                 self.logger.error(traceback.format_exc())
-
-    def __find_neighbor_with_lowest_load(self) -> Peer:
-        # Initialize variables to track the neighbor with the lowest load
-        lowest_load = float('inf')  # Initialize with positive infinity to ensure any load is lower
-        lowest_load_neighbor = None
-
-        # Iterate through each neighbor in neighbor_map
-        for peer in self.neighbor_map.values():
-            # Check if the current load is lower than the lowest load found so far
-            if peer.get_load() < lowest_load:
-                # Update lowest load and lowest load neighbor
-                lowest_load = peer.get_load()
-                lowest_load_neighbor = peer
-
-        return lowest_load_neighbor
-
-    def __can_become_leader(self, task: Task) -> bool:
-        """
-        Check if agent has enough resources to become a leader
-            - Agent has resources to executed the task
-            - Agent hasn't received a proposal from other agents for this task
-            - Agent's load is less than 70%
-        :param task:
-        :return: True or False
-        """
-        # Compute the cost of executing this job on all the agents in the network
-        # cost = load + feasibility * cost_per_requested_resource
-        proposed_caps = self.__get_proposed_capacities()
-        #proposed_capacities += task.get_capacities()
-        my_load = self.compute_overall_load(proposed_caps=proposed_caps)
-        #self.logger.info(f"Overall Load: {my_load}")
-        least_loaded_neighbor = self.__find_neighbor_with_lowest_load()
-        if least_loaded_neighbor and least_loaded_neighbor.get_load() < my_load:
-            self.logger.debug(f"Can't become leader as my load: {my_load} is more than all of "
-                              f"the neighbors: {least_loaded_neighbor}")
-            return False
-
-        can_accommodate = self.can_accommodate_task(task=task, proposed_caps=proposed_caps)
-        incoming = self.incoming_proposals.contains(task_id=task.get_task_id())
-        if not incoming and \
-                can_accommodate and \
-                my_load < 70.00:
-            return can_accommodate
-        self.logger.info(
-            f"__can_become_leader: can_accommodate: {can_accommodate} incoming:{incoming} my_load: {my_load}")
-        return False
 
     def __compute_cost_matrix(self, tasks: list) -> np.ndarray:
         """
@@ -254,7 +199,9 @@ class SwarmAgent(Agent):
         for j, task in enumerate(tasks):
             cost_of_job = self.compute_task_cost(task=task, total=self.capacities, profile=self.profile)
             feasibility = self.is_task_feasible(total=self.capacities, task=task)
-            cost_matrix[0, j] = my_load + feasibility * cost_of_job
+            cost_matrix[0, j] = float('inf')
+            if feasibility:
+                cost_matrix[0, j] = my_load + feasibility * cost_of_job
 
         # Compute costs for neighboring agents
         for i, peer in enumerate(self.neighbor_map.values(), start=1):
@@ -262,7 +209,9 @@ class SwarmAgent(Agent):
             for j, task in enumerate(tasks):
                 cost_of_job = self.compute_task_cost(task=task, total=peer.get_capacities(), profile=self.profile)
                 feasibility = self.is_task_feasible(total=peer.get_capacities(), task=task)
-                cost_matrix[i, j] = peer_load + feasibility * cost_of_job
+                cost_matrix[i, j] = float('inf')
+                if feasibility:
+                    cost_matrix[i, j] = peer_load + feasibility * cost_of_job
 
         return cost_matrix
 
@@ -281,7 +230,7 @@ class SwarmAgent(Agent):
 
         return min_cost_agents
 
-    def __can_become_leader2(self, task: Task) -> bool:
+    def __can_become_leader(self, task: Task) -> bool:
         """
         Check if agent has enough resources to become a leader
             - Agent has resources to executed the task
@@ -309,9 +258,6 @@ class SwarmAgent(Agent):
         if not task or task.is_ready() or task.is_complete() or task.is_running():
             self.logger.info(f"Ignoring Proposal: {task}")
             return
-
-        #can_accept_task = self.can_accommodate_task(task=task)
-        #my_current_load = self.compute_overall_load()
 
         # Reject proposal in following cases:
         # - I have initiated a proposal and either received accepts from at least 1 peer or
