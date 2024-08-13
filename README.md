@@ -1,6 +1,6 @@
 # SwarmAgents-Consensus
 
-This repository hosts code for emulating SWARM agents and investigating different consensus algorithms concerning task scheduling among the agents.
+This repository contains code for emulating SWARM agents and exploring multi-agent consensus for task selection. It leverages existing algorithms commonly used in blockchain and extends them, adding novel approaches tailored for SWARM and enhancing resilience.
 
 ## Practical Byzantine Fault Tolerance (PBFT)
 PBFT algorithm is explored and implemented in `pbft_agentv2.py`. This agent works as follows:
