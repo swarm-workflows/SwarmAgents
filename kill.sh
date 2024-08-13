@@ -1,3 +1,3 @@
 #!/bin/bash
-pkill -f "main.py --agent_id"
+pkill -f "main-pbft.py"
 
