@@ -79,8 +79,9 @@ Each agent utilizes a cost matrix to determine whether it should become the lead
 
 
 ### Performance
-PBFT consensus works with smaller number of agents but struggles to scale efficiently as the number of agents increases, due to its communication complexity.
-However, it's resilient and fault tolerant.
+#### Greedy Approach with Random seed and single task
+- Greedy approach with random seed used to resolve proposal collisions shows improvement over basic PBFT.
+- Job selection is triggered for only single job at a time
 
 ![Scheduling latency - 3 agents](./runs/swarm/3/scheduling-latency.png)
 ![Scheduling latency - 5 agents](./runs/swarm/5/scheduling-latency.png)
