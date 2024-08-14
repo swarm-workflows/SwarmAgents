@@ -160,3 +160,5 @@ cython_debug/
 .idea/
 .DS_Store
 agent_pids.txt
+redis-data/
+*.log*
