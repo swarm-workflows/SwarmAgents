@@ -7,6 +7,7 @@ import redis
 from pyraft.raft import RaftNode
 
 from swarm.agents.agent import Agent
+from swarm.comm.messages.heart_beat import HeartBeat
 from swarm.comm.messages.message import MessageType
 from swarm.models.capacities import Capacities
 from swarm.models.agent_info import AgentInfo
@@ -191,7 +192,8 @@ class RaftAgent(Agent):
 
                 message_type = MessageType(message.get('message_type'))
                 if message_type == MessageType.HeartBeat:
-                    self._receive_heartbeat(incoming=message)
+                    incoming = HeartBeat.from_dict(message)
+                    self._receive_heartbeat(incoming=incoming)
                 elif message_type == MessageType.Commit:
                     self.__receive_commit(incoming=message)
 

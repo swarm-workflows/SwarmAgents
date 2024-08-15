@@ -36,7 +36,25 @@ class PBFTAgent(Agent):
         for message in messages:
             try:
                 begin = time.time()
-                self.__consensus(incoming=message)
+                message_type = MessageType(message.get('message_type'))
+
+                if message_type == MessageType.HeartBeat:
+                    incoming = HeartBeat.from_dict(message)
+                    self._receive_heartbeat(incoming=incoming)
+
+                elif message_type == MessageType.ProposalInfo:
+                    self.__receive_proposal(incoming=message)
+
+                elif message_type == MessageType.Prepare:
+                    self.__receive_prepare(incoming=message)
+
+                elif message_type == MessageType.Commit:
+                    self.__receive_commit(incoming=message)
+
+                elif message_type == MessageType.TaskStatus:
+                    self.__receive_task_status(incoming=message)
+                else:
+                    self.logger.info(f"Ignoring unsupported message: {message}")
                 diff = int(time.time() - begin)
                 if diff > 0:
                     self.logger.info(f"Event {message.get('message_type')} TIME: {diff}")
@@ -300,35 +318,6 @@ class PBFTAgent(Agent):
         task.change_state(new_state=TaskState.COMPLETE)
         self.incoming_proposals.remove_task(task_id=task_id)
         self.outgoing_proposals.remove_task(task_id=task_id)
-
-    def __consensus(self, incoming: dict):
-        """
-        Consensus Loop
-        :param message:
-        :return:
-        """
-        try:
-            message_type = MessageType(incoming.get('message_type'))
-
-            if message_type == MessageType.HeartBeat:
-                self._receive_heartbeat(incoming=incoming)
-
-            elif message_type == MessageType.ProposalInfo:
-                self.__receive_proposal(incoming=incoming)
-
-            elif message_type == MessageType.Prepare:
-                self.__receive_prepare(incoming=incoming)
-
-            elif message_type == MessageType.Commit:
-                self.__receive_commit(incoming=incoming)
-
-            elif message_type == MessageType.TaskStatus:
-                self.__receive_task_status(incoming=incoming)
-            else:
-                self.logger.info(f"Ignoring unsupported message: {incoming}")
-        except Exception as e:
-            self.logger.error(f"Error while processing incoming message: {incoming}: {e}")
-            self.logger.error(traceback.format_exc())
 
     def execute_task(self, task: Task):
         super().execute_task(task=task)
