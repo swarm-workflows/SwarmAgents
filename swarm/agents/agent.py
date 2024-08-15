@@ -53,6 +53,7 @@ class Agent(Observer):
         self.capacities = self.get_system_info()
         self.message_service = MessageService(config=self.kafka_config, logger=self.logger)
         self.load_per_agent = {}
+        self.projected_load_per_agent = {}
         self.cycles = cycles
         self.message_queue = queue.Queue()
         self.condition = threading.Condition()
@@ -103,10 +104,15 @@ class Agent(Observer):
         self.logger.info(f"Received Heartbeat from Agent: MAP:: {temp}")
         self.last_msg_received_timestamp = time.time()
 
-    def _save_load_metric(self, agent_id: str, load: float):
+    def _save_load_metric(self, agent_id: str, load: float, projected_load: float = None):
         if agent_id not in self.load_per_agent:
             self.load_per_agent[agent_id] = []
         self.load_per_agent[agent_id].append(load)
+
+        if projected_load:
+            if agent_id not in self.projected_load_per_agent:
+                self.projected_load_per_agent[agent_id] = []
+            self.projected_load_per_agent[agent_id].append(projected_load)
 
     def _build_heart_beat(self):
         my_load = self.compute_overall_load()

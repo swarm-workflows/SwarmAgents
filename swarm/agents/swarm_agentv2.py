@@ -51,7 +51,7 @@ class SwarmAgent(Agent):
         my_load = self.compute_overall_load()
         projected_load = self.compute_projected_load(overall_load_actual=my_load,
                                                      proposed_caps=self.__get_proposed_capacities())
-        self._save_load_metric(self.agent_id, my_load)
+        self._save_load_metric(self.agent_id, my_load, projected_load)
         agent = AgentInfo(agent_id=self.agent_id,
                           capacities=self.capacities,
                           capacity_allocations=self.allocated_tasks.capacities(),
@@ -522,7 +522,9 @@ class SwarmAgent(Agent):
             return
         self.plot_tasks_per_agent()
         self.plot_scheduling_latency()
-        self.save_load_to_csv_and_plot()
+        self.save_load_to_csv_and_plot(self.load_per_agent)
+        self.save_load_to_csv_and_plot(self.projected_load_per_agent, csv_filename="agent_projected_loads.csv",
+                                       plot_filename="agent_projected_loads.png")
 
     def __get_proposed_capacities(self):
         proposed_capacities = Capacities()
@@ -561,30 +563,32 @@ class SwarmAgent(Agent):
                                                     profile.disk_weight)
         return cost
 
-    def save_load_to_csv_and_plot(self, csv_filename='agent_loads.csv', plot_filename='agent_loads_plot.png'):
+    @staticmethod
+    def save_load_to_csv_and_plot(load_dict: dict, csv_filename='agent_loads.csv',
+                                  plot_filename='agent_loads_plot.png'):
         # Find the maximum length of the load lists
-        max_intervals = max(len(loads) for loads in self.load_per_agent.values())
+        max_intervals = max(len(loads) for loads in load_dict.values())
 
         # Save the data to a CSV file
         with open(csv_filename, mode='w', newline='') as file:
             writer = csv.writer(file)
 
             # Write the header (agent IDs)
-            header = ['Time Interval'] + [f'Agent {agent_id}' for agent_id in self.load_per_agent.keys()]
+            header = ['Time Interval'] + [f'Agent {agent_id}' for agent_id in load_dict.keys()]
             writer.writerow(header)
 
             # Write the load data row by row
             for i in range(max_intervals):
                 row = [i]  # Start with the time interval
-                for agent_id in self.load_per_agent.keys():
+                for agent_id in load_dict.keys():
                     # Add load or empty string if not available
-                    row.append(self.load_per_agent[agent_id][i] if i < len(self.load_per_agent[agent_id]) else '')
+                    row.append(load_dict[agent_id][i] if i < len(load_dict[agent_id]) else '')
                 writer.writerow(row)
 
         # Plot the data
         plt.figure(figsize=(10, 6))
 
-        for agent_id, loads in self.load_per_agent.items():
+        for agent_id, loads in load_dict.items():
             plt.plot(loads, label=f'Agent {agent_id}')
 
         plt.xlabel('Time Interval')
