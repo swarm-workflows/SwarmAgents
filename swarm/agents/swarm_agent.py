@@ -1,21 +1,26 @@
 import csv
-import json
 import os
-import queue
 import random
-import threading
 import time
 import traceback
 from queue import Queue, Empty
+from typing import List
 
 import matplotlib.pyplot as plt
 
 from swarm.agents.agent import Agent
-from swarm.comm.message_service import MessageType
+from swarm.comm.messages.commit import Commit
+from swarm.comm.messages.heart_beat import HeartBeat
+from swarm.comm.messages.message import MessageType
+from swarm.comm.messages.message_builder import MessageBuilder
+from swarm.comm.messages.prepare import Prepare
+from swarm.comm.messages.proposal import Proposal
+from swarm.comm.messages.task_info import TaskInfo
+from swarm.comm.messages.task_status import TaskStatus
 from swarm.models.capacities import Capacities
-from swarm.models.peer import Peer
+from swarm.models.agent_info import AgentInfo
 from swarm.models.profile import Profile
-from swarm.models.proposal import ProposalContainer, Proposal
+from swarm.models.proposal_info import ProposalContainer, ProposalInfo
 from swarm.models.task import Task, TaskState
 import numpy as np
 
@@ -39,87 +44,42 @@ class SwarmAgent(Agent):
         self.incoming_proposals = ProposalContainer()
         self.shutdown = False
         self.shutdown_heartbeat = False
-        self.message_queue = queue.Queue()
-        self.thread_lock = threading.Lock()
-        self.condition = threading.Condition()
-        self.heartbeat_thread = threading.Thread(target=self.__heartbeat_main,
-                                                 daemon=True, name="HeartBeatThread")
-        self.msg_processor_thread = threading.Thread(target=self.__message_processor_main,
-                                                     daemon=True, name="MsgProcessorThread")
-        self.main_thread = threading.Thread(target=self.run,
-                                            daemon=True, name="AgentLoop")
-        self.pending_messages = 0
         self.last_msg_received_timestamp = 0
 
-    def __enqueue(self, incoming):
-        try:
-            message = json.loads(incoming)
-            if message.get("agent_id") == self.agent_id:
-                return
-            self.message_queue.put_nowait(message)
-            with self.condition:
-                self.condition.notify_all()
-            self.logger.debug(f"Added incoming message to queue: {incoming}")
-        except Exception as e:
-            self.logger.debug(f"Failed to add incoming message to queue: {incoming}: e: {e}")
+    def _build_heart_beat(self):
+        agent = AgentInfo(agent_id=self.agent_id,
+                          capacities=self.capacities,
+                          capacity_allocations=self.allocated_tasks.capacities(),
+                          load=self.compute_overall_load(proposed_caps=self.__get_proposed_capacities()))
+        return HeartBeat(agent=agent)
 
-    def __dequeue(self, queue_obj: queue.Queue):
-        events = []
-        if not queue_obj.empty():
-            try:
-                for event in IterableQueue(source_queue=queue_obj):
-                    events.append(event)
-            except Exception as e:
-                self.logger.error(f"Error while adding message to queue! e: {e}")
-                self.logger.error(traceback.format_exc())
-        return events
-
-    def __process_messages(self, *, messages: list):
+    def _process_messages(self, *, messages: List[dict]):
         for message in messages:
             try:
                 begin = time.time()
-                self.__consensus(incoming=message)
+                incoming = MessageBuilder.from_dict(message)
+
+                if isinstance(incoming, HeartBeat):
+                    self._receive_heartbeat(incoming=incoming)
+
+                elif isinstance(incoming, Proposal):
+                    self.__receive_proposal(incoming=incoming)
+
+                elif isinstance(incoming, Prepare):
+                    self.__receive_prepare(incoming=incoming)
+
+                elif isinstance(incoming, Commit):
+                    self.__receive_commit(incoming=incoming)
+
+                elif isinstance(incoming, TaskStatus):
+                    self.__receive_task_status(incoming=incoming)
+                else:
+                    self.logger.info(f"Ignoring unsupported message: {message}")
                 diff = int(time.time() - begin)
                 if diff > 0:
-                    self.logger.info(f"Event {message.get('msg_type')} TIME: {diff}")
+                    self.logger.info(f"Event {message.get('message_type')} TIME: {diff}")
             except Exception as e:
                 self.logger.error(f"Error while processing message {type(message)}, {e}")
-                self.logger.error(traceback.format_exc())
-
-    def __message_processor_main(self):
-        self.logger.info("Message Processor Started")
-        while True:
-            try:
-                with self.condition:
-                    while not self.shutdown and self.message_queue.empty():
-                        self.condition.wait()
-
-                if self.shutdown:
-                    break
-
-                messages = self.__dequeue(self.message_queue)
-                self.pending_messages = len(messages)
-                self.__process_messages(messages=messages)
-                self.pending_messages = 0
-            except Exception as e:
-                self.logger.error(f"Error occurred while processing message e: {e}")
-                self.logger.error(traceback.format_exc())
-        self.logger.info("Message Processor Stopped")
-
-    def __heartbeat_main(self):
-        self.send_message(msg_type=MessageType.HeartBeat)
-        while not self.shutdown_heartbeat:
-            try:
-                payload = {"capacities": self.capacities.to_dict()}
-                if self.allocated_tasks.capacities():
-                    allocated = self.allocated_tasks.capacities().to_dict()
-                    if allocated:
-                        payload["capacity_allocations"] = allocated
-                # Send heartbeats
-                self.send_message(msg_type=MessageType.HeartBeat, payload=payload)
-                time.sleep(5)
-            except Exception as e:
-                self.logger.error(f"Error occurred while sending heartbeat e: {e}")
                 self.logger.error(traceback.format_exc())
 
     def run(self):
@@ -154,12 +114,11 @@ class SwarmAgent(Agent):
                         task.set_time_on_queue()
 
                         # Send proposal to all neighbors
-                        proposal = Proposal(p_id=self.generate_id(), task_id=task.get_task_id(),
-                                            agent_id=self.agent_id)
+                        proposal = ProposalInfo(p_id=self.generate_id(), task_id=task.get_task_id(),
+                                                agent_id=self.agent_id)
+                        msg = Proposal(agent=AgentInfo(agent_id=self.agent_id), proposals=[proposal])
 
-                        self.send_message(msg_type=MessageType.Proposal, task_id=task.get_task_id(),
-                                          proposal_id=proposal.p_id, seed=proposal.seed)
-
+                        self.message_service.produce_message(msg.to_dict())
                         self.outgoing_proposals.add_proposal(proposal=proposal)
                         self.logger.info(f"Added proposal: {proposal}")
 
@@ -205,13 +164,12 @@ class SwarmAgent(Agent):
 
         # Compute costs for neighboring agents
         for i, peer in enumerate(self.neighbor_map.values(), start=1):
-            peer_load = peer.get_load()
             for j, task in enumerate(tasks):
-                cost_of_job = self.compute_task_cost(task=task, total=peer.get_capacities(), profile=self.profile)
-                feasibility = self.is_task_feasible(total=peer.get_capacities(), task=task)
+                cost_of_job = self.compute_task_cost(task=task, total=peer.capacities, profile=self.profile)
+                feasibility = self.is_task_feasible(total=peer.capacities, task=task)
                 cost_matrix[i, j] = float('inf')
                 if feasibility:
-                    cost_matrix[i, j] = peer_load + feasibility * cost_of_job
+                    cost_matrix[i, j] = peer.load + feasibility * cost_of_job
 
         return cost_matrix
 
@@ -245,228 +203,147 @@ class SwarmAgent(Agent):
             return True
         return False
 
-    def __receive_proposal(self, incoming: dict):
-        peer_agent_id = incoming.get("agent_id")
-        task_id = incoming.get("task_id")
-        proposal_id = incoming.get("proposal_id")
-        rcvd_seed = incoming.get("seed", 0)
+    def __receive_proposal(self, incoming: Proposal):
+        self.logger.debug(f"Received Proposal: {incoming}")
 
-        self.logger.debug(f"Received Proposal from Agent: {peer_agent_id} for Task: {task_id} "
-                          f"Proposal: {proposal_id} Seed: {rcvd_seed}")
+        for p in incoming.proposals:
+            task = self.task_queue.get_task(task_id=p.task_id)
+            if not task or task.is_ready() or task.is_complete() or task.is_running():
+                self.logger.info(f"Ignoring Proposal: {task}")
+                return
 
-        task = self.task_queue.get_task(task_id=task_id)
-        if not task or task.is_ready() or task.is_complete() or task.is_running():
-            self.logger.info(f"Ignoring Proposal: {task}")
-            return
+            # Reject proposal in following cases:
+            # - I have initiated a proposal and either received accepts from at least 1 peer or
+            #   my proposal's seed is smaller than the incoming proposal
+            # - Received and accepted proposal from another agent
+            # - can't accommodate this task
+            # - can accommodate task and neighbor's load is more than mine
+            my_proposal = self.outgoing_proposals.get_proposal(task_id=p.task_id)
+            peer_proposal = self.incoming_proposals.get_proposal(task_id=p.task_id)
 
-        # Reject proposal in following cases:
-        # - I have initiated a proposal and either received accepts from at least 1 peer or
-        #   my proposal's seed is smaller than the incoming proposal
-        # - Received and accepted proposal from another agent
-        # - can't accommodate this task
-        # - can accommodate task and neighbor's load is more than mine
-        my_proposal = self.outgoing_proposals.get_proposal(task_id=task_id)
-        peer_proposal = self.incoming_proposals.get_proposal(task_id=task_id)
+            # if (my_proposal and (my_proposal.prepares or my_proposal.seed < rcvd_seed)) or \
+            #        (peer_proposal and peer_proposal.seed < rcvd_seed) or \
+            #        not can_accept_task or \
+            #        (can_accept_task and my_current_load < neighbor_load):
+            if (my_proposal and (my_proposal.prepares or my_proposal.seed < p.seed)) or \
+                    (peer_proposal and peer_proposal.seed < p.seed):
+                self.logger.debug(f"Agent {self.agent_id} rejected Proposal for Task: {p.task_id} from agent"
+                                  f" {p.agent_id} - accepted another proposal")
+            else:
+                self.logger.debug(
+                    f"Agent {self.agent_id} accepted Proposal for Task: {p.task_id} from agent"
+                    f" {p.agent_id} and is now the leader")
 
-        # if (my_proposal and (my_proposal.prepares or my_proposal.seed < rcvd_seed)) or \
-        #        (peer_proposal and peer_proposal.seed < rcvd_seed) or \
-        #        not can_accept_task or \
-        #        (can_accept_task and my_current_load < neighbor_load):
-        if (my_proposal and (my_proposal.prepares or my_proposal.seed < rcvd_seed)) or \
-                (peer_proposal and peer_proposal.seed < rcvd_seed):
-            self.logger.debug(f"Agent {self.agent_id} rejected Proposal for Task: {task_id} from agent"
-                              f" {peer_agent_id} - accepted another proposal")
-        else:
-            self.logger.debug(
-                f"Agent {self.agent_id} accepted Proposal for Task: {task_id} from agent"
-                f" {peer_agent_id} and is now the leader")
+                proposal = ProposalInfo(p_id=p.p_id, task_id=p.task_id, seed=p.seed,
+                                        agent_id=p.agent_id)
+                if my_proposal:
+                    self.outgoing_proposals.remove_proposal(p_id=my_proposal.p_id, task_id=p.task_id)
+                if peer_proposal:
+                    self.incoming_proposals.remove_proposal(p_id=peer_proposal.p_id, task_id=p.task_id)
+                task.set_time_on_queue()
 
-            proposal = Proposal(p_id=proposal_id, task_id=task_id, seed=rcvd_seed,
-                                agent_id=peer_agent_id)
-            if my_proposal:
-                self.outgoing_proposals.remove_proposal(p_id=my_proposal.p_id, task_id=task_id)
-            if peer_proposal:
-                self.incoming_proposals.remove_proposal(p_id=peer_proposal.p_id, task_id=task_id)
-            task.set_time_on_queue()
+                self.incoming_proposals.add_proposal(proposal=proposal)
+                msg = Prepare(agent=AgentInfo(agent_id=self.agent_id), proposals=[proposal])
+                self.message_service.produce_message(msg.to_dict())
+                task.change_state(TaskState.PREPARE)
 
-            self.incoming_proposals.add_proposal(proposal=proposal)
-            self.send_message(msg_type=MessageType.Prepare, task_id=task_id, proposal_id=proposal_id)
-            task.change_state(TaskState.PREPARE)
-
-    def __receive_prepare(self, incoming: dict):
-        peer_agent_id = incoming.get("agent_id")
-        task_id = incoming.get("task_id")
-        proposal_id = incoming.get("proposal_id")
-        rcvd_seed = incoming.get("seed", 0)
+    def __receive_prepare(self, incoming: Prepare):
 
         # Prepare for the proposal
-        self.logger.debug(f"Received prepare from Agent: {peer_agent_id} for Task: {task_id}: {proposal_id}")
+        self.logger.debug(f"Received prepare: {incoming}")
 
-        task = self.task_queue.get_task(task_id=task_id)
-        #self.logger.debug(f"Task: {task}")
-        if not task or task.is_ready() or task.is_complete() or task.is_running():
-            self.logger.info(f"Ignoring Prepare: {task}")
-            return
+        for p in incoming.proposals:
+            task = self.task_queue.get_task(task_id=p.task_id)
+            if not task or task.is_ready() or task.is_complete() or task.is_running():
+                self.logger.info(f"Ignoring Prepare: {task}")
+                return
 
-        # Update the prepare votes
-        if self.outgoing_proposals.contains(task_id=task_id, p_id=proposal_id):
-            proposal = self.outgoing_proposals.get_proposal(p_id=proposal_id)
-        elif self.incoming_proposals.contains(task_id=task_id, p_id=proposal_id):
-            proposal = self.incoming_proposals.get_proposal(p_id=proposal_id)
-        else:
-            proposal = Proposal(task_id=task_id, p_id=proposal_id, seed=rcvd_seed,
-                                agent_id=peer_agent_id)
-            self.incoming_proposals.add_proposal(proposal=proposal)
-
-        proposal.prepares += 1
-
-        quorum_count = (len(self.neighbor_map)) / 2
-        task.change_state(TaskState.PREPARE)
-
-        # Check if vote count is more than quorum
-        # if yes, send commit
-        if proposal.prepares >= quorum_count:
-            self.logger.info(f"Agent: {self.agent_id} Task: {task_id} received quorum "
-                             f"prepares: {proposal.prepares}, starting commit!")
-            self.send_message(msg_type=MessageType.Commit, task_id=task_id, proposal_id=proposal_id)
-            task.change_state(TaskState.COMMIT)
-
-    def __receive_commit(self, incoming: dict):
-        peer_agent_id = incoming.get("agent_id")
-        task_id = incoming.get("task_id")
-        proposal_id = incoming.get("proposal_id")
-        rcvd_seed = incoming.get("seed", 0)
-
-        self.logger.debug(f"Received commit from Agent: {peer_agent_id} for Task: {task_id} Proposal: {proposal_id}")
-        task = self.task_queue.get_task(task_id=task_id)
-        #self.logger.debug(f"Task: {task}")
-
-        if not task or task.is_complete() or task.is_ready() or task.is_running() or task.leader_agent_id:
-            self.logger.info(f"Ignoring Commit: {task}")
-            self.incoming_proposals.remove_task(task_id=task_id)
-            self.outgoing_proposals.remove_task(task_id=task_id)
-            return
-
-        # Update the commit votes;
-        if self.outgoing_proposals.contains(task_id=task_id, p_id=proposal_id):
-            proposal = self.outgoing_proposals.get_proposal(p_id=proposal_id)
-        elif self.incoming_proposals.contains(task_id=task_id, p_id=proposal_id):
-            proposal = self.incoming_proposals.get_proposal(p_id=proposal_id)
-        else:
-            proposal = Proposal(task_id=task_id, p_id=proposal_id, seed=rcvd_seed,
-                                agent_id=peer_agent_id)
-            self.incoming_proposals.add_proposal(proposal=proposal)
-
-        proposal.commits += 1
-        quorum_count = (len(self.neighbor_map)) / 2
-
-        if proposal.commits >= quorum_count:
-            self.logger.info(
-                f"Agent: {self.agent_id} received quorum commits for Task: {task_id} Proposal: {proposal}: Task: {task}")
-            task.set_time_to_elect_leader()
-            task.set_leader(leader_agent_id=proposal.agent_id)
-            if self.outgoing_proposals.contains(task_id=task_id, p_id=proposal_id):
-                self.logger.info(f"LEADER CONSENSUS achieved for Task: {task_id} Leader: {self.agent_id}")
-                task.change_state(new_state=TaskState.READY)
-                self.allocate_task(task)
-                self.outgoing_proposals.remove_task(task_id=task_id)
+            # Update the prepare votes
+            if self.outgoing_proposals.contains(task_id=p.task_id, p_id=p.p_id):
+                proposal = self.outgoing_proposals.get_proposal(p_id=p.p_id)
+            elif self.incoming_proposals.contains(task_id=p.task_id, p_id=p.p_id):
+                proposal = self.incoming_proposals.get_proposal(p_id=p.p_id)
             else:
-                self.logger.info(f"PARTICIPANT CONSENSUS achieved for Task: {task_id} Leader: {peer_agent_id}")
-                task.change_state(new_state=TaskState.COMMIT)
-                self.incoming_proposals.remove_task(task_id=task_id)
+                proposal = ProposalInfo(task_id=p.task_id, p_id=p.p_id, seed=p.seed,
+                                        agent_id=p.agent_id)
+                self.incoming_proposals.add_proposal(proposal=proposal)
 
-    def __receive_heartbeat(self, incoming: dict):
-        if 'msg_type' in incoming:
-            incoming.pop('msg_type')
-        peer = Peer.from_dict(incoming)
+            proposal.prepares += 1
 
-        self.neighbor_map[peer.get_agent_id()] = peer
-        self.last_msg_received_timestamp = time.time()
-        temp = ""
-        for p in self.neighbor_map.values():
-            temp += f"[{p}],"
-        self.logger.info(f"Received Heartbeat from Agent: MAP:: {temp}")
+            quorum_count = (len(self.neighbor_map)) / 2
+            task.change_state(TaskState.PREPARE)
 
-    def __receive_task_status(self, incoming: dict):
-        peer_agent_id = incoming.get("agent_id")
-        task_id = incoming.get("task_id")
-        proposal_id = incoming.get("proposal_id")
+            # Check if vote count is more than quorum
+            # if yes, send commit
+            if proposal.prepares >= quorum_count:
+                self.logger.info(f"Agent: {self.agent_id} Task: {p.task_id} received quorum "
+                                 f"prepares: {proposal.prepares}, starting commit!")
 
-        self.logger.debug(f"Received Status from {peer_agent_id} for Task: {task_id} Proposal: {proposal_id}")
+                msg = Commit(agent=AgentInfo(agent_id=self.agent_id), proposals=[proposal])
+                self.message_service.produce_message(msg.to_dict())
 
-        task = self.task_queue.get_task(task_id=task_id)
-        task.set_leader(leader_agent_id=peer_agent_id)
-        task.set_time_to_completion()
-        #self.logger.debug(f"Task: {task}")
-        if not task or task.is_complete() or task.is_ready():
-            self.logger.info(f"Ignoring Task Status: {task}")
-            return
+                task.change_state(TaskState.COMMIT)
 
-        # Update the task status based on broadcast message
-        task.change_state(new_state=TaskState.COMPLETE)
-        self.incoming_proposals.remove_task(task_id=task_id)
-        self.outgoing_proposals.remove_task(task_id=task_id)
+    def __receive_commit(self, incoming: Commit):
+        self.logger.debug(f"Received commit: {incoming}")
+        for p in incoming.proposals:
+            task = self.task_queue.get_task(task_id=p.task_id)
 
-    def __consensus(self, incoming):
-        """
-        Consensus Loop
-        :param message:
-        :return:
-        """
-        try:
-            msg_type = MessageType(incoming.get('msg_type'))
+            if not task or task.is_complete() or task.is_ready() or task.is_running() or task.leader_agent_id:
+                self.logger.info(f"Ignoring Commit: {task}")
+                self.incoming_proposals.remove_task(task_id=p.task_id)
+                self.outgoing_proposals.remove_task(task_id=p.task_id)
+                return
 
-            if msg_type == MessageType.HeartBeat:
-                self.__receive_heartbeat(incoming=incoming)
-
-            elif msg_type == MessageType.Proposal:
-                self.__receive_proposal(incoming=incoming)
-
-            elif msg_type == MessageType.Prepare:
-                self.__receive_prepare(incoming=incoming)
-
-            elif msg_type == MessageType.Commit:
-                self.__receive_commit(incoming=incoming)
-
-            elif msg_type == MessageType.TaskStatus:
-                self.__receive_task_status(incoming=incoming)
+            # Update the commit votes;
+            if self.outgoing_proposals.contains(task_id=p.task_id, p_id=p.p_id):
+                proposal = self.outgoing_proposals.get_proposal(p_id=p.p_id)
+            elif self.incoming_proposals.contains(task_id=p.task_id, p_id=p.p_id):
+                proposal = self.incoming_proposals.get_proposal(p_id=p.p_id)
             else:
-                self.logger.info(f"Ignoring unsupported message: {incoming}")
-        except Exception as e:
-            self.logger.error(f"Error while processing incoming message: {incoming}: {e}")
-            self.logger.error(traceback.format_exc())
+                proposal = ProposalInfo(task_id=p.task_id, p_id=p.p_id, seed=p.seed,
+                                        agent_id=p.agent_id)
+                self.incoming_proposals.add_proposal(proposal=proposal)
+
+            proposal.commits += 1
+            quorum_count = (len(self.neighbor_map)) / 2
+
+            if proposal.commits >= quorum_count:
+                self.logger.info(
+                    f"Agent: {self.agent_id} received quorum commits for Task: {p.task_id} Proposal: {proposal}: Task: {task}")
+                task.set_time_to_elect_leader()
+                task.set_leader(leader_agent_id=proposal.agent_id)
+                if self.outgoing_proposals.contains(task_id=p.task_id, p_id=p.p_id):
+                    self.logger.info(f"LEADER CONSENSUS achieved for Task: {p.task_id} Leader: {self.agent_id}")
+                    task.change_state(new_state=TaskState.READY)
+                    self.allocate_task(task)
+                    self.outgoing_proposals.remove_task(task_id=p.task_id)
+                else:
+                    self.logger.info(f"PARTICIPANT CONSENSUS achieved for Task: {p.task_id} Leader: {p.agent_id}")
+                    task.change_state(new_state=TaskState.COMMIT)
+                    self.incoming_proposals.remove_task(task_id=p.task_id)
+
+    def __receive_task_status(self, incoming: TaskStatus):
+        self.logger.debug(f"Received Status: {incoming}")
+
+        for t in incoming.tasks:
+            task = self.task_queue.get_task(task_id=t.task_id)
+            task.set_leader(leader_agent_id=incoming.agent.agent_id)
+            task.set_time_to_completion()
+            if not task or task.is_complete() or task.is_ready():
+                self.logger.info(f"Ignoring Task Status: {task}")
+                return
+
+            # Update the task status based on broadcast message
+            task.change_state(new_state=TaskState.COMPLETE)
+            self.incoming_proposals.remove_task(task_id=t.task_id)
+            self.outgoing_proposals.remove_task(task_id=t.task_id)
 
     def execute_task(self, task: Task):
         super().execute_task(task=task)
-        self.send_message(msg_type=MessageType.TaskStatus, task_id=task.get_task_id(),
-                          status=task.state)
-
-    def send_message(self, msg_type: MessageType, task_id: str = None, proposal_id: str = None,
-                     status: TaskState = None, seed: float = None, payload: dict = None):
-        message = {
-            "msg_type": msg_type.value,
-            "agent_id": self.agent_id,
-            "load": self.compute_overall_load(proposed_caps=self.__get_proposed_capacities())
-        }
-
-        if task_id:
-            message["task_id"] = task_id
-        if proposal_id:
-            message["proposal_id"] = proposal_id
-        if status:
-            message["status"] = status.value
-        if seed:
-            message["seed"] = seed
-
-        if payload:
-            for key, value in payload.items():
-                message[key] = value
-
-        # Produce the message to the Kafka topic
-        self.message_service.produce_message(message)
-
-    def process_message(self, message):
-        self.__enqueue(incoming=message)
+        msg = TaskStatus(agent=AgentInfo(agent_id=self.agent_id), tasks=[TaskInfo(task_id=task.get_task_id(),
+                                                                                  state=task.state)])
+        self.message_service.produce_message(msg.to_dict())
 
     def start(self):
         self.message_service.register_observers(agent=self)
@@ -616,8 +493,8 @@ class SwarmAgent(Agent):
         disk_load = (task.capacities.disk / total.disk) * 100
 
         cost = (core_load * profile.core_weight +
-                        ram_load * profile.ram_weight +
-                        disk_load * profile.disk_weight) / (profile.core_weight +
-                                                                 profile.ram_weight +
-                                                                 profile.disk_weight)
+                ram_load * profile.ram_weight +
+                disk_load * profile.disk_weight) / (profile.core_weight +
+                                                    profile.ram_weight +
+                                                    profile.disk_weight)
         return cost

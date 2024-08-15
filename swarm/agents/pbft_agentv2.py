@@ -1,32 +1,19 @@
 import csv
-import json
 import os
-import queue
 import random
-import threading
 import time
 import traceback
-from queue import Queue, Empty
+from typing import List
 
 import matplotlib.pyplot as plt
 
 from swarm.agents.agent import Agent
-from swarm.comm.message_service import MessageType
+from swarm.comm.messages.heart_beat import HeartBeat
+from swarm.comm.messages.message import MessageType
 from swarm.models.capacities import Capacities
-from swarm.models.proposal import ProposalContainer, Proposal
+from swarm.models.agent_info import AgentInfo
+from swarm.models.proposal_info import ProposalContainer, ProposalInfo
 from swarm.models.task import Task, TaskState
-
-
-class IterableQueue:
-    def __init__(self, *, source_queue: Queue):
-        self.source_queue = source_queue
-
-    def __iter__(self):
-        while True:
-            try:
-                yield self.source_queue.get_nowait()
-            except Empty:
-                return
 
 
 class PBFTAgent(Agent):
@@ -34,84 +21,27 @@ class PBFTAgent(Agent):
         super().__init__(agent_id, config_file, cycles)
         self.outgoing_proposals = ProposalContainer()
         self.incoming_proposals = ProposalContainer()
-        self.shutdown = False
         self.shutdown_heartbeat = False
-        self.message_queue = queue.Queue()
-        self.thread_lock = threading.Lock()
-        self.condition = threading.Condition()
-        self.heartbeat_thread = threading.Thread(target=self.__heartbeat_main,
-                                                 daemon=True, name="HeartBeatThread")
-        self.msg_processor_thread = threading.Thread(target=self.__message_processor_main,
-                                                     daemon=True, name="MsgProcessorThread")
-        self.main_thread = threading.Thread(target=self.run,
-                                            daemon=True, name="AgentLoop")
-        self.pending_messages = 0
         self.last_msg_received_timestamp = 0
 
-    def __enqueue(self, incoming):
-        try:
-            message = json.loads(incoming)
-            if message.get("agent_id") == self.agent_id:
-                return
-            self.message_queue.put_nowait(message)
-            with self.condition:
-                self.condition.notify_all()
-            self.logger.debug(f"Added incoming message to queue: {incoming}")
-        except Exception as e:
-            self.logger.debug(f"Failed to add incoming message to queue: {incoming}: e: {e}")
+    def _build_heart_beat(self):
+        peer = AgentInfo()
+        peer.agent_id = self.agent_id
+        peer.load = self.compute_overall_load(proposed_caps=self.__get_proposed_capacities())
+        heart_beat = HeartBeat()
+        heart_beat.agent = peer
+        return heart_beat
 
-    def __dequeue(self, queue_obj: queue.Queue):
-        events = []
-        if not queue_obj.empty():
-            try:
-                for event in IterableQueue(source_queue=queue_obj):
-                    events.append(event)
-            except Exception as e:
-                self.logger.error(f"Error while adding message to queue! e: {e}")
-                self.logger.error(traceback.format_exc())
-        return events
-
-    def __process_messages(self, *, messages: list):
+    def _process_messages(self, *, messages: List[dict]):
         for message in messages:
             try:
                 begin = time.time()
                 self.__consensus(incoming=message)
                 diff = int(time.time() - begin)
                 if diff > 0:
-                    self.logger.info(f"Event {message.get('msg_type')} TIME: {diff}")
+                    self.logger.info(f"Event {message.get('message_type')} TIME: {diff}")
             except Exception as e:
                 self.logger.error(f"Error while processing message {type(message)}, {e}")
-                self.logger.error(traceback.format_exc())
-
-    def __message_processor_main(self):
-        self.logger.info("Message Processor Started")
-        while True:
-            try:
-                with self.condition:
-                    while not self.shutdown and self.message_queue.empty():
-                        self.condition.wait()
-
-                if self.shutdown:
-                    break
-
-                messages = self.__dequeue(self.message_queue)
-                self.pending_messages = len(messages)
-                self.__process_messages(messages=messages)
-                self.pending_messages = 0
-            except Exception as e:
-                self.logger.error(f"Error occurred while processing message e: {e}")
-                self.logger.error(traceback.format_exc())
-        self.logger.info("Message Processor Stopped")
-
-    def __heartbeat_main(self):
-        self.send_message(msg_type=MessageType.HeartBeat)
-        while not self.shutdown_heartbeat:
-            try:
-                # Send heartbeats
-                self.send_message(msg_type=MessageType.HeartBeat)
-                time.sleep(10)
-            except Exception as e:
-                self.logger.error(f"Error occurred while sending heartbeat e: {e}")
                 self.logger.error(traceback.format_exc())
 
     def run(self):
@@ -151,21 +81,17 @@ class PBFTAgent(Agent):
                         task.set_time_on_queue()
 
                         # Send proposal to all neighbors
-                        proposal = Proposal(p_id=self.generate_id(), task_id=task.get_task_id(),
-                                            agent_id=self.agent_id)
+                        proposal = ProposalInfo(p_id=self.generate_id(), task_id=task.get_task_id(),
+                                                agent_id=self.agent_id)
 
-                        self.send_message(msg_type=MessageType.Proposal, task_id=task.get_task_id(),
+                        self.send_message(message_type=MessageType.ProposalInfo, task_id=task.get_task_id(),
                                           proposal_id=proposal.p_id, seed=proposal.seed)
 
                         self.outgoing_proposals.add_proposal(proposal=proposal)
                         self.logger.info(f"Added proposal: {proposal}")
-                        #self.logger.info(f"Outgoing Proposals: {self.outgoing_proposals.size()}")
-                        #self.logger.info(f"Incoming Proposals: {self.incoming_proposals.size()}")
 
                         # Begin election for Job leader for this task
                         task.change_state(new_state=TaskState.PRE_PREPARE)
-                        #self.logger.debug(
-                        #    f"Agent: {self.agent_id} sent Proposal: {proposal} for Task: {task.task_id}!")
                     else:
                         self.logger.debug(
                             f"Task: {task.task_id} State: {task.state} cannot be accommodated at this time:")
@@ -180,7 +106,7 @@ class PBFTAgent(Agent):
                 self.logger.error(f"Error occurred while executing e: {e}")
                 self.logger.error(traceback.format_exc())
 
-    def __find_neighbor_with_lowest_load(self):
+    def __find_neighbor_with_lowest_load(self) -> AgentInfo:
         # Initialize variables to track the neighbor with the lowest load
         lowest_load = float('inf')  # Initialize with positive infinity to ensure any load is lower
         lowest_load_neighbor = None
@@ -188,13 +114,10 @@ class PBFTAgent(Agent):
         # Iterate through each neighbor in neighbor_map
         for peer_agent_id, neighbor_info in self.neighbor_map.items():
             # Check if the current load is lower than the lowest load found so far
-            if neighbor_info['load'] < lowest_load:
+            if neighbor_info.load < lowest_load:
                 # Update lowest load and lowest load neighbor
-                lowest_load = neighbor_info['load']
-                lowest_load_neighbor = {
-                    "agent_id": peer_agent_id,
-                    "load": lowest_load
-                }
+                lowest_load = neighbor_info.load
+                lowest_load_neighbor = neighbor_info
 
         return lowest_load_neighbor
 
@@ -213,7 +136,7 @@ class PBFTAgent(Agent):
         #self.logger.info(f"Overall Load: {my_load}")
         least_loaded_neighbor = self.__find_neighbor_with_lowest_load()
 
-        if least_loaded_neighbor and least_loaded_neighbor.get('load') < my_load:
+        if least_loaded_neighbor and least_loaded_neighbor.load < my_load:
             self.logger.debug(f"Can't become leader as my load: {my_load} is more than all of "
                               f"the neighbors: {least_loaded_neighbor}")
             return False
@@ -230,7 +153,6 @@ class PBFTAgent(Agent):
 
     def __receive_proposal(self, incoming: dict):
         peer_agent_id = incoming.get("agent_id")
-        neighbor_load = incoming.get("load")
         task_id = incoming.get("task_id")
         proposal_id = incoming.get("proposal_id")
         rcvd_seed = incoming.get("seed", 0)
@@ -268,8 +190,8 @@ class PBFTAgent(Agent):
                 f"Agent {self.agent_id} accepted Proposal for Task: {task_id} from agent"
                 f" {peer_agent_id} and is now the leader")
 
-            proposal = Proposal(p_id=proposal_id, task_id=task_id, seed=rcvd_seed,
-                                agent_id=peer_agent_id)
+            proposal = ProposalInfo(p_id=proposal_id, task_id=task_id, seed=rcvd_seed,
+                                    agent_id=peer_agent_id)
             if my_proposal:
                 self.outgoing_proposals.remove_proposal(p_id=my_proposal.p_id, task_id=task_id)
             if peer_proposal:
@@ -277,7 +199,7 @@ class PBFTAgent(Agent):
             task.set_time_on_queue()
 
             self.incoming_proposals.add_proposal(proposal=proposal)
-            self.send_message(msg_type=MessageType.Prepare, task_id=task_id, proposal_id=proposal_id)
+            self.send_message(message_type=MessageType.Prepare, task_id=task_id, proposal_id=proposal_id)
             task.change_state(TaskState.PREPARE)
 
     def __receive_prepare(self, incoming: dict):
@@ -290,7 +212,6 @@ class PBFTAgent(Agent):
         self.logger.debug(f"Received prepare from Agent: {peer_agent_id} for Task: {task_id}: {proposal_id}")
 
         task = self.task_queue.get_task(task_id=task_id)
-        #self.logger.debug(f"Task: {task}")
         if not task or task.is_ready() or task.is_complete() or task.is_running():
             self.logger.info(f"Ignoring Prepare: {task}")
             return
@@ -301,8 +222,8 @@ class PBFTAgent(Agent):
         elif self.incoming_proposals.contains(task_id=task_id, p_id=proposal_id):
             proposal = self.incoming_proposals.get_proposal(p_id=proposal_id)
         else:
-            proposal = Proposal(task_id=task_id, p_id=proposal_id, seed=rcvd_seed,
-                                agent_id=peer_agent_id)
+            proposal = ProposalInfo(task_id=task_id, p_id=proposal_id, seed=rcvd_seed,
+                                    agent_id=peer_agent_id)
             self.incoming_proposals.add_proposal(proposal=proposal)
 
         proposal.prepares += 1
@@ -315,7 +236,7 @@ class PBFTAgent(Agent):
         if proposal.prepares >= quorum_count:
             self.logger.info(f"Agent: {self.agent_id} Task: {task_id} received quorum "
                              f"prepares: {proposal.prepares}, starting commit!")
-            self.send_message(msg_type=MessageType.Commit, task_id=task_id, proposal_id=proposal_id)
+            self.send_message(message_type=MessageType.Commit, task_id=task_id, proposal_id=proposal_id)
             task.change_state(TaskState.COMMIT)
 
     def __receive_commit(self, incoming: dict):
@@ -326,7 +247,6 @@ class PBFTAgent(Agent):
 
         self.logger.debug(f"Received commit from Agent: {peer_agent_id} for Task: {task_id} Proposal: {proposal_id}")
         task = self.task_queue.get_task(task_id=task_id)
-        #self.logger.debug(f"Task: {task}")
 
         if not task or task.is_complete() or task.is_ready() or task.is_running() or task.leader_agent_id:
             self.logger.info(f"Ignoring Commit: {task}")
@@ -340,8 +260,8 @@ class PBFTAgent(Agent):
         elif self.incoming_proposals.contains(task_id=task_id, p_id=proposal_id):
             proposal = self.incoming_proposals.get_proposal(p_id=proposal_id)
         else:
-            proposal = Proposal(task_id=task_id, p_id=proposal_id, seed=rcvd_seed,
-                                agent_id=peer_agent_id)
+            proposal = ProposalInfo(task_id=task_id, p_id=proposal_id, seed=rcvd_seed,
+                                    agent_id=peer_agent_id)
             self.incoming_proposals.add_proposal(proposal=proposal)
 
         proposal.commits += 1
@@ -362,21 +282,6 @@ class PBFTAgent(Agent):
                 task.change_state(new_state=TaskState.COMMIT)
                 self.incoming_proposals.remove_task(task_id=task_id)
 
-    def __receive_heartbeat(self, incoming: dict):
-        peer_agent_id = incoming.get("agent_id")
-        neighbor_load = incoming.get("load")
-
-        if neighbor_load is None:
-            return
-        self.last_msg_received_timestamp = time.time()
-
-        # Update neighbor map
-        self.neighbor_map[peer_agent_id] = {
-            "agent_id": peer_agent_id,
-            "load": neighbor_load,
-        }
-        self.logger.info(f"Received Heartbeat from Agent: {peer_agent_id}: MAP: {self.neighbor_map.values()}")
-
     def __receive_task_status(self, incoming: dict):
         peer_agent_id = incoming.get("agent_id")
         task_id = incoming.get("task_id")
@@ -387,7 +292,6 @@ class PBFTAgent(Agent):
         task = self.task_queue.get_task(task_id=task_id)
         task.set_leader(leader_agent_id=peer_agent_id)
         task.set_time_to_completion()
-        #self.logger.debug(f"Task: {task}")
         if not task or task.is_complete() or task.is_ready():
             self.logger.info(f"Ignoring Task Status: {task}")
             return
@@ -397,28 +301,28 @@ class PBFTAgent(Agent):
         self.incoming_proposals.remove_task(task_id=task_id)
         self.outgoing_proposals.remove_task(task_id=task_id)
 
-    def __consensus(self, incoming):
+    def __consensus(self, incoming: dict):
         """
         Consensus Loop
         :param message:
         :return:
         """
         try:
-            msg_type = MessageType(incoming.get('msg_type'))
+            message_type = MessageType(incoming.get('message_type'))
 
-            if msg_type == MessageType.HeartBeat:
-                self.__receive_heartbeat(incoming=incoming)
+            if message_type == MessageType.HeartBeat:
+                self._receive_heartbeat(incoming=incoming)
 
-            elif msg_type == MessageType.Proposal:
+            elif message_type == MessageType.ProposalInfo:
                 self.__receive_proposal(incoming=incoming)
 
-            elif msg_type == MessageType.Prepare:
+            elif message_type == MessageType.Prepare:
                 self.__receive_prepare(incoming=incoming)
 
-            elif msg_type == MessageType.Commit:
+            elif message_type == MessageType.Commit:
                 self.__receive_commit(incoming=incoming)
 
-            elif msg_type == MessageType.TaskStatus:
+            elif message_type == MessageType.TaskStatus:
                 self.__receive_task_status(incoming=incoming)
             else:
                 self.logger.info(f"Ignoring unsupported message: {incoming}")
@@ -428,13 +332,13 @@ class PBFTAgent(Agent):
 
     def execute_task(self, task: Task):
         super().execute_task(task=task)
-        self.send_message(msg_type=MessageType.TaskStatus, task_id=task.get_task_id(),
+        self.send_message(message_type=MessageType.TaskStatus, task_id=task.get_task_id(),
                           status=task.state)
 
-    def send_message(self, msg_type: MessageType, task_id: str = None, proposal_id: str = None,
+    def send_message(self, message_type: MessageType, task_id: str = None, proposal_id: str = None,
                      status: TaskState = None, seed: float = None):
         message = {
-            "msg_type": msg_type.value,
+            "message_type": message_type.value,
             "agent_id": self.agent_id,
             "load": self.compute_overall_load(proposed_caps=self.__get_proposed_capacities())
         }
@@ -450,9 +354,6 @@ class PBFTAgent(Agent):
 
         # Produce the message to the Kafka topic
         self.message_service.produce_message(message)
-
-    def process_message(self, message):
-        self.__enqueue(incoming=message)
 
     def start(self):
         self.message_service.register_observers(agent=self)

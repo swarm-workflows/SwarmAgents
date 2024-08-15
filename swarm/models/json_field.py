@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # import json
+import enum
 import json
 from typing import Dict
 
@@ -41,10 +42,7 @@ class JSONField(ABC):
         If there are no values in the object, returns empty string.
         :return:
         """
-        d = self.__dict__.copy()
-        for k in self.__dict__:
-            if d[k] is None or d[k] == 0:
-                d.pop(k)
+        d = self.to_dict()
         if len(d) == 0:
             return ''
         return json.dumps(d, skipkeys=True, sort_keys=True)
@@ -82,17 +80,40 @@ class JSONField(ABC):
 
     def to_dict(self) -> Dict[str, str] or None:
         """
-        Convert to a dictionary skipping empty fields. Returns None
-        if all fields are empty
-        :return:
+        Convert to a dictionary, skipping empty fields and removing underscores
+        from the beginning of the keys. Returns None if all fields are empty.
         """
-        d = self.__dict__.copy()
-        for k in self.__dict__:
-            if d[k] is None or d[k] == 0:
-                d.pop(k)
-        if len(d) == 0:
+        new_dict = {}
+
+        for k, v in self.__dict__.items():
+            # Remove the underscore from the beginning of the key
+            new_key = k.lstrip('_')
+
+            if v is None or v == 0:
+                continue
+
+            if isinstance(v, JSONField):
+                new_value = v.to_dict()
+                if new_value:
+                    new_dict[new_key] = new_value
+            elif isinstance(v, enum.Enum):
+                new_dict[new_key] = v.value
+            elif isinstance(v, list):
+                new_value = []
+                for x in v:
+                    if isinstance(x, JSONField):
+                        new_x = x.to_dict()
+                        if new_x:
+                            new_value.append(new_x)
+                if len(new_value):
+                    new_dict[new_key] = new_value
+            else:
+                new_dict[new_key] = v
+
+        if len(new_dict) == 0:
             return None
-        return d
+
+        return new_dict
 
     def __repr__(self):
         return self.to_json()

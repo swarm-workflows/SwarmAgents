@@ -1,17 +1,15 @@
-import json
-import queue
 import threading
 import time
 import traceback
-from typing import Dict
+from typing import Dict, List
 
 import redis
 from pyraft.raft import RaftNode
 
 from swarm.agents.agent import Agent
-from swarm.agents.pbft_agent import IterableQueue
-from swarm.comm.message_service import MessageType
+from swarm.comm.messages.message import MessageType
 from swarm.models.capacities import Capacities
+from swarm.models.agent_info import AgentInfo
 from swarm.models.task import TaskState, Task, TaskRepository
 
 
@@ -42,15 +40,6 @@ class RaftAgent(Agent):
         self.redis_client = redis.StrictRedis(host=redis_host, port=redis_port, decode_responses=True)
         self.shutdown_flag = threading.Event()
         self.task_list = 'tasks'
-        self.message_queue = queue.Queue()
-        self.condition = threading.Condition()
-        self.pending_messages = 0
-        self.heartbeat_thread = threading.Thread(target=self.__heartbeat_main,
-                                                 daemon=True, name="HeartBeatThread")
-        self.msg_processor_thread = threading.Thread(target=self.__message_processor_main,
-                                                     daemon=True, name="MsgProcessorThread")
-        self.main_thread = threading.Thread(target=self.run,
-                                            daemon=True, name="AgentLoop")
         self.task_repo = TaskRepository(redis_client=self.redis_client)
 
     def start(self, clean: bool = False):
@@ -66,6 +55,7 @@ class RaftAgent(Agent):
 
     def stop(self):
         super(RaftAgent, self).stop()
+        self.shutdown = True
         self.shutdown_flag.set()
         self.raft.shutdown()
 
@@ -81,11 +71,11 @@ class RaftAgent(Agent):
     def is_leader(self):
         return self.raft.is_leader()
 
-    def can_peer_accommodate_task(self, task: Task, peer_agent: Dict):
-        allocated_caps = peer_agent.get("capacity_allocations")
+    def can_peer_accommodate_task(self, task: Task, peer_agent: AgentInfo):
+        allocated_caps = peer_agent.capacity_allocations
         if not allocated_caps:
             allocated_caps = Capacities()
-        capacities = peer_agent.get("capacities")
+        capacities = peer_agent.capacities
 
         if capacities and allocated_caps:
             available = capacities - allocated_caps
@@ -103,7 +93,7 @@ class RaftAgent(Agent):
 
         return True
 
-    def __find_neighbor_with_lowest_load(self):
+    def __find_neighbor_with_lowest_load(self) -> AgentInfo:
         # Initialize variables to track the neighbor with the lowest load
         lowest_load = float('inf')  # Initialize with positive infinity to ensure any load is lower
         lowest_load_neighbor = None
@@ -111,9 +101,10 @@ class RaftAgent(Agent):
         # Iterate through each neighbor in neighbor_map
         for peer_agent_id, neighbor_info in self.neighbor_map.items():
             # Check if the current load is lower than the lowest load found so far
-            if neighbor_info['load'] < lowest_load:
-                lowest_load = neighbor_info['load']
-                lowest_load_neighbor = neighbor_info.copy()
+            if neighbor_info.load < lowest_load:
+                # Update lowest load and lowest load neighbor
+                lowest_load = neighbor_info.load
+                lowest_load_neighbor = neighbor_info
 
         return lowest_load_neighbor
 
@@ -132,14 +123,14 @@ class RaftAgent(Agent):
                     peer = self.__find_neighbor_with_lowest_load()
                     self.logger.debug(f"Peer found: {peer}")
 
-                    if peer and peer.get('load') < 70.00 and self.can_peer_accommodate_task(peer_agent=peer,
-                                                                                            task=task):
+                    if peer and peer.load < 70.00 and self.can_peer_accommodate_task(peer_agent=peer,
+                                                                                     task=task):
                         task.set_time_on_queue()
-                        task.set_leader(leader_agent_id=peer.get('agent_id'))
+                        task.set_leader(leader_agent_id=peer.agent_id)
                         self.task_repo.delete_task(task_id=task.get_task_id())
                         self.task_repo.save_task(task=task, key_prefix="allocated")
-                        payload = {"dest": peer.get('agent_id')}
-                        self.send_message(msg_type=MessageType.Commit, task_id=task.task_id, payload=payload)
+                        payload = {"dest": peer.agent_id}
+                        self.send_message(message_type=MessageType.Commit, task_id=task.task_id, payload=payload)
 
                     elif my_load < 70.00 and self.can_accommodate_task(task=task):
                         task.set_time_on_queue()
@@ -156,29 +147,6 @@ class RaftAgent(Agent):
             self.logger.info(f"RUN Leader -- error: {e}")
             self.logger.info("Running as leader -- stop")
             traceback.print_exc()
-
-    def __receive_heartbeat(self, incoming: dict):
-        peer_agent_id = incoming.get("agent_id")
-        peer_load = incoming.get("load")
-        capacities = incoming.get("capacities")
-        capacity_allocations = incoming.get("capacity_allocations")
-
-        if peer_load is None:
-            return
-
-        # Update neighbor map
-        self.neighbor_map[peer_agent_id] = {
-            "agent_id": peer_agent_id,
-            "load": peer_load,
-        }
-        if capacities:
-            self.neighbor_map[peer_agent_id]["capacities"] = Capacities.from_dict(capacities)
-
-        if capacity_allocations:
-            self.neighbor_map[peer_agent_id]["capacity_allocations"] = Capacities.from_dict(capacity_allocations)
-
-        self.logger.debug(f"Received Heartbeat from Agent: {peer_agent_id}: Neighbors: {len(self.neighbor_map)}")
-        self.logger.debug(f"MAP: {self.neighbor_map.values()}")
 
     def __receive_commit(self, incoming: dict):
         dest = incoming.get("dest")
@@ -199,9 +167,9 @@ class RaftAgent(Agent):
         else:
             self.logger.error(f"Unable to fetch task from queu: {task_id}")
 
-    def send_message(self, msg_type: MessageType, task_id: str = None, payload: dict = None):
+    def send_message(self, message_type: MessageType, task_id: str = None, payload: dict = None):
         message = {
-            "msg_type": msg_type.value,
+            "message_type": message_type.value,
             "agent_id": self.agent_id,
             "load": self.compute_overall_load()
         }
@@ -215,87 +183,24 @@ class RaftAgent(Agent):
         # Produce the message to the Kafka topic
         self.message_service.produce_message(message)
 
-    def __process_messages(self, *, messages: list):
+    def _process_messages(self, *, messages: List[dict]):
         for message in messages:
             try:
                 begin = time.time()
-                # Parse the message as JSON
-                incoming = json.loads(message)
-                peer_agent_id = incoming.get("agent_id")
-                if peer_agent_id in str(self.agent_id):
-                    return
-                self.logger.debug(f"Consumer received message: {incoming}")
+                self.logger.debug(f"Consumer received message: {message}")
 
-                msg_type = MessageType(incoming.get('msg_type'))
-                if msg_type == MessageType.HeartBeat:
-                    self.__receive_heartbeat(incoming=incoming)
-                elif msg_type == MessageType.Commit:
-                    self.__receive_commit(incoming=incoming)
+                message_type = MessageType(message.get('message_type'))
+                if message_type == MessageType.HeartBeat:
+                    self._receive_heartbeat(incoming=message)
+                elif message_type == MessageType.Commit:
+                    self.__receive_commit(incoming=message)
 
                 diff = int(time.time() - begin)
                 if diff > 0:
-                    self.logger.info(f"Event {message.get('msg_type')} TIME: {diff}")
+                    self.logger.info(f"Event {message.get('message_type')} TIME: {diff}")
             except Exception as e:
                 self.logger.error(f"Error while processing message {type(message)}, {e}")
                 self.logger.error(traceback.format_exc())
-
-    def __heartbeat_main(self):
-        print("Heartbeat thread Started")
-        while not self.shutdown_flag.is_set():
-            try:
-                # Send heartbeats every 30 seconds
-                payload = {"capacities": self.capacities.to_dict()}
-                if self.allocated_tasks.capacities():
-                    payload["capacity_allocations"] = self.allocated_tasks.capacities().to_dict()
-                self.send_message(msg_type=MessageType.HeartBeat, payload=payload)
-                time.sleep(5)
-            except Exception as e:
-                print(f"Error occurred while sending heartbeat e: {e}")
-                self.logger.error(traceback.format_exc())
-        print("Heartbeat thread Stopped")
-
-    def __message_processor_main(self):
-        self.logger.info("Message Processor Started")
-        while not self.shutdown_flag.is_set():
-            try:
-                with self.condition:
-                    while not self.shutdown_flag.is_set() and self.message_queue.empty():
-                        self.condition.wait()
-
-                if self.shutdown_flag.is_set():
-                    break
-
-                messages = self.__dequeue(self.message_queue)
-                self.pending_messages = len(messages)
-                self.__process_messages(messages=messages)
-                self.pending_messages = 0
-            except Exception as e:
-                self.logger.error(f"Error occurred while processing message e: {e}")
-                self.logger.error(traceback.format_exc())
-        self.logger.info("Message Processor Stopped")
-
-    def __enqueue(self, incoming):
-        try:
-            self.message_queue.put_nowait(incoming)
-            with self.condition:
-                self.condition.notify_all()
-            self.logger.debug("Added message to queue {}".format(incoming.__class__.__name__))
-        except Exception as e:
-            self.logger.error(f"Failed to queue message: {incoming.__class__.__name__} e: {e}")
-
-    def __dequeue(self, queue_obj: queue.Queue):
-        events = []
-        if not queue_obj.empty():
-            try:
-                for event in IterableQueue(source_queue=queue_obj):
-                    events.append(event)
-            except Exception as e:
-                self.logger.error(f"Error while adding message to queue! e: {e}")
-                self.logger.error(traceback.format_exc())
-        return events
-
-    def process_message(self, message):
-        self.__enqueue(incoming=message)
 
     def run_as_follower(self):
         self.logger.info("Running as follower")

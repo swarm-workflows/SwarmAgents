@@ -2,6 +2,7 @@ import hashlib
 import json
 import logging
 import os
+import queue
 import random
 import socket
 import string
@@ -9,14 +10,30 @@ import threading
 import time
 import traceback
 from logging.handlers import RotatingFileHandler
+from typing import List
 
 import psutil as psutil
 import yaml
 
-from swarm.comm.message_service import MessageService, Observer, MessageType
+from swarm.comm.messages.heart_beat import HeartBeat
+from swarm.comm.messages.message import MessageType
+from swarm.comm.message_service import MessageService, Observer
 from swarm.models.capacities import Capacities
+from swarm.models.agent_info import AgentInfo
 from swarm.models.profile import ProfileType, PROFILE_MAP
 from swarm.models.task import Task, TaskQueue
+
+
+class IterableQueue:
+    def __init__(self, *, source_queue: queue.Queue):
+        self.source_queue = source_queue
+
+    def __iter__(self):
+        while True:
+            try:
+                yield self.source_queue.get_nowait()
+            except queue.Empty:
+                return
 
 
 class Agent(Observer):
@@ -36,6 +53,103 @@ class Agent(Observer):
         self.capacities = self.get_system_info()
         self.message_service = MessageService(config=self.kafka_config, logger=self.logger)
         self.cycles = cycles
+        self.message_queue = queue.Queue()
+        self.condition = threading.Condition()
+        self.pending_messages = 0
+        self.shutdown = False
+        self.heartbeat_thread = threading.Thread(target=self._heartbeat_main,
+                                                 daemon=True, name="HeartBeatThread")
+        self.msg_processor_thread = threading.Thread(target=self._message_processor_main,
+                                                     daemon=True, name="MsgProcessorThread")
+        self.main_thread = threading.Thread(target=self.run,
+                                            daemon=True, name="AgentLoop")
+
+    def __enqueue(self, incoming: str):
+        try:
+            message = json.loads(incoming)
+            if message.get("agent").get("agent_id") == self.agent_id:
+                return
+            self.message_queue.put_nowait(message)
+            with self.condition:
+                self.condition.notify_all()
+            self.logger.debug(f"Added incoming message to queue: {incoming}")
+        except Exception as e:
+            self.logger.debug(f"Failed to add incoming message to queue: {incoming}: e: {e}")
+
+    def __dequeue(self, queue_obj: queue.Queue) -> List[dict]:
+        events = []
+        if not queue_obj.empty():
+            try:
+                for event in IterableQueue(source_queue=queue_obj):
+                    events.append(event)
+            except Exception as e:
+                self.logger.error(f"Error while adding message to queue! e: {e}")
+                self.logger.error(traceback.format_exc())
+        return events
+
+    def process_message(self, message: str):
+        self.__enqueue(incoming=message)
+
+    def _receive_heartbeat(self, incoming: HeartBeat):
+        self.neighbor_map[incoming.agent.agent_id] = incoming.agent
+        self.last_msg_received_timestamp = time.time()
+        temp = ""
+        for p in self.neighbor_map.values():
+            temp += f"[{p}],"
+        self.logger.info(f"Received Heartbeat from Agent: MAP:: {temp}")
+        self.last_msg_received_timestamp = time.time()
+
+    def _build_heart_beat(self):
+        agent = AgentInfo(agent_id=self.agent_id,
+                          capacities=self.capacities,
+                          capacity_allocations=self.allocated_tasks.capacities(),
+                          load=self.compute_overall_load())
+        return HeartBeat(agent=agent)
+
+    def _heartbeat_main(self):
+        while not self.shutdown:
+            try:
+                self.message_service.produce_message(self._build_heart_beat().to_dict())
+                time.sleep(5)
+            except Exception as e:
+                self.logger.error(f"Error occurred while sending heartbeat e: {e}")
+                self.logger.error(traceback.format_exc())
+
+    def _message_processor_main(self):
+        self.logger.info("Message Processor Started")
+        while True:
+            try:
+                with self.condition:
+                    while not self.shutdown and self.message_queue.empty():
+                        self.condition.wait()
+
+                if self.shutdown:
+                    break
+
+                messages = self.__dequeue(self.message_queue)
+                self.pending_messages = len(messages)
+                self._process_messages(messages=messages)
+                self.pending_messages = 0
+            except Exception as e:
+                self.logger.error(f"Error occurred while processing message e: {e}")
+                self.logger.error(traceback.format_exc())
+        self.logger.info("Message Processor Stopped")
+
+    def _process_messages(self, *, messages: List[dict]):
+        for message in messages:
+            try:
+                begin = time.time()
+                message_type = message.get('message_type')
+                if message_type == str(MessageType.HeartBeat):
+                    self._receive_heartbeat(incoming=message)
+                else:
+                    self.logger.info(f"Ignoring unsupported message: {message}")
+                diff = int(time.time() - begin)
+                if diff > 0:
+                    self.logger.info(f"Event {message.get('message_type')} TIME: {diff}")
+            except Exception as e:
+                self.logger.error(f"Error while processing message {type(message)}, {e}")
+                self.logger.error(traceback.format_exc())
 
     def load_config(self, config_file):
         with open(config_file, 'r') as f:
@@ -59,29 +173,6 @@ class Agent(Observer):
                                            log_retain=log_config.get("log-retain"),
                                            log_size=log_config.get("log-size"),
                                            log_level=log_config.get("log-level"))
-
-    def process_message(self, message):
-        try:
-            # Parse the message as JSON
-            incoming = json.loads(message)
-            agent_id = incoming.get("agent_id")
-            if agent_id == self.agent_id:
-                return
-            self.logger.info(f"Consumer received message: {incoming}")
-
-            msg_type = incoming.get('msg_type')
-            if msg_type == str(MessageType.HeartBeat):
-                # Extract neighbor information
-                neighbor_id = incoming.get("agent_id")
-                neighbor_load = incoming.get("load")
-                # Update neighbor map
-                self.logger.info(f"Message received: {message}")
-                self.neighbor_map[neighbor_id] = neighbor_load
-            else:
-                self.logger.info(f"Ignoring unsupported message: {message}")
-        except Exception as e:
-            self.logger.error(f"Error while processing incoming message: {message}: {e}")
-            self.logger.error(traceback.format_exc())
 
     @staticmethod
     def get_system_info():
@@ -257,9 +348,9 @@ class Agent(Observer):
         console_log.addHandler(console_handler)
         return log
 
-    def send_message(self, msg_type: MessageType, task_id: str = None):
+    def send_message(self, message_type: MessageType, task_id: str = None):
         message = {
-            "msg_type": str(msg_type),
+            "message_type": str(message_type),
             "agent_id": self.agent_id,
             "load": self.compute_overall_load()
         }
