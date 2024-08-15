@@ -212,8 +212,14 @@ class SwarmAgent(Agent):
                 cost_of_job = self.compute_task_cost(task=task, total=peer.capacities, profile=self.profile)
                 feasibility = self.is_task_feasible(total=peer.capacities, task=task)
                 cost_matrix[i, j] = float('inf')
+
+                if self.use_projected_load:
+                    load = peer.projected_load
+                else:
+                    load = peer.load
+
                 if feasibility:
-                    cost_matrix[i, j] = peer.load + feasibility * cost_of_job
+                    cost_matrix[i, j] = load + feasibility * cost_of_job
 
         return cost_matrix
 
