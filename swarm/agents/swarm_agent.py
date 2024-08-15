@@ -57,30 +57,42 @@ class SwarmAgent(Agent):
         for message in messages:
             try:
                 begin = time.time()
-                incoming = MessageBuilder.from_dict(message)
-
-                if isinstance(incoming, HeartBeat):
-                    self._receive_heartbeat(incoming=incoming)
-
-                elif isinstance(incoming, Proposal):
-                    self.__receive_proposal(incoming=incoming)
-
-                elif isinstance(incoming, Prepare):
-                    self.__receive_prepare(incoming=incoming)
-
-                elif isinstance(incoming, Commit):
-                    self.__receive_commit(incoming=incoming)
-
-                elif isinstance(incoming, TaskStatus):
-                    self.__receive_task_status(incoming=incoming)
-                else:
-                    self.logger.info(f"Ignoring unsupported message: {message}")
+                self.__consensus(message=message)
                 diff = int(time.time() - begin)
                 if diff > 0:
                     self.logger.info(f"Event {message.get('message_type')} TIME: {diff}")
             except Exception as e:
                 self.logger.error(f"Error while processing message {type(message)}, {e}")
                 self.logger.error(traceback.format_exc())
+
+    def __consensus(self, message: dict):
+        """
+        Consensus Loop
+        :param message:
+        :return:
+        """
+        try:
+            incoming = MessageBuilder.from_dict(message)
+
+            if isinstance(incoming, HeartBeat):
+                self._receive_heartbeat(incoming=incoming)
+
+            elif isinstance(incoming, Proposal):
+                self.__receive_proposal(incoming=incoming)
+
+            elif isinstance(incoming, Prepare):
+                self.__receive_prepare(incoming=incoming)
+
+            elif isinstance(incoming, Commit):
+                self.__receive_commit(incoming=incoming)
+
+            elif isinstance(incoming, TaskStatus):
+                self.__receive_task_status(incoming=incoming)
+            else:
+                self.logger.info(f"Ignoring unsupported message: {message}")
+        except Exception as e:
+            self.logger.error(f"Error while processing incoming message: {message}: {e}")
+            self.logger.error(traceback.format_exc())
 
     def run(self):
         self.logger.info(f"Starting agent: {self}")
