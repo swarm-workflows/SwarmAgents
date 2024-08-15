@@ -47,10 +47,12 @@ class SwarmAgent(Agent):
         self.number_of_tasks_per_proposal = 3
 
     def _build_heart_beat(self):
+        my_load = self.compute_overall_load(proposed_caps=self.__get_proposed_capacities())
+        self._save_load_metric(self.agent_id, my_load)
         agent = AgentInfo(agent_id=self.agent_id,
                           capacities=self.capacities,
                           capacity_allocations=self.allocated_tasks.capacities(),
-                          load=self.compute_overall_load(proposed_caps=self.__get_proposed_capacities()))
+                          load=my_load)
         return HeartBeat(agent=agent)
 
     def _process_messages(self, *, messages: List[dict]):
@@ -498,6 +500,7 @@ class SwarmAgent(Agent):
             return
         self.plot_tasks_per_agent()
         self.plot_scheduling_latency()
+        self.save_load_to_csv_and_plot()
 
     def __get_proposed_capacities(self):
         proposed_capacities = Capacities()
@@ -535,3 +538,38 @@ class SwarmAgent(Agent):
                                                     profile.ram_weight +
                                                     profile.disk_weight)
         return cost
+
+    def save_load_to_csv_and_plot(self, csv_filename='agent_loads.csv', plot_filename='agent_loads_plot.png'):
+        # Find the maximum length of the load lists
+        max_intervals = max(len(loads) for loads in self.load_per_agent.values())
+
+        # Save the data to a CSV file
+        with open(csv_filename, mode='w', newline='') as file:
+            writer = csv.writer(file)
+
+            # Write the header (agent IDs)
+            header = ['Time Interval'] + [f'Agent {agent_id}' for agent_id in self.load_per_agent.keys()]
+            writer.writerow(header)
+
+            # Write the load data row by row
+            for i in range(max_intervals):
+                row = [i]  # Start with the time interval
+                for agent_id in self.load_per_agent.keys():
+                    # Add load or empty string if not available
+                    row.append(self.load_per_agent[agent_id][i] if i < len(self.load_per_agent[agent_id]) else '')
+                writer.writerow(row)
+
+        # Plot the data
+        plt.figure(figsize=(10, 6))
+
+        for agent_id, loads in self.load_per_agent.items():
+            plt.plot(loads, label=f'Agent {agent_id}')
+
+        plt.xlabel('Time Interval')
+        plt.ylabel('Load')
+        plt.title('Agent Loads Over Time')
+        plt.legend()
+        plt.grid(True)
+
+        # Save the plot to a file
+        plt.savefig(plot_filename)
