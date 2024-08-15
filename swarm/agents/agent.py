@@ -97,7 +97,7 @@ class Agent(Observer):
     def _receive_heartbeat(self, incoming: HeartBeat):
         self.neighbor_map[incoming.agent.agent_id] = incoming.agent
         self.last_msg_received_timestamp = time.time()
-        self._save_load_metric(incoming.agent.agent_id, incoming.agent.load)
+        self._save_load_metric(incoming.agent.agent_id, incoming.agent.load, incoming.agent.projected_load)
         temp = ""
         for p in self.neighbor_map.values():
             temp += f"[{p}],"
