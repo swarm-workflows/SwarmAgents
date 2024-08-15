@@ -36,43 +36,31 @@ class PBFTAgent(Agent):
         for message in messages:
             try:
                 begin = time.time()
-                self.__consensus(message=message)
+                msg_type = MessageType(message.get('msg_type'))
+
+                if msg_type == MessageType.HeartBeat:
+                    incoming = HeartBeat.from_dict(message)
+                    self._receive_heartbeat(incoming=incoming)
+
+                elif msg_type == MessageType.Proposal:
+                    self.__receive_proposal(incoming=message)
+
+                elif msg_type == MessageType.Prepare:
+                    self.__receive_prepare(incoming=message)
+
+                elif msg_type == MessageType.Commit:
+                    self.__receive_commit(incoming=message)
+
+                elif msg_type == MessageType.TaskStatus:
+                    self.__receive_task_status(incoming=message)
+                else:
+                    self.logger.info(f"Ignoring unsupported message: {message}")
                 diff = int(time.time() - begin)
                 if diff > 0:
                     self.logger.info(f"Event {message.get('message_type')} TIME: {diff}")
             except Exception as e:
                 self.logger.error(f"Error while processing message {type(message)}, {e}")
                 self.logger.error(traceback.format_exc())
-
-    def __consensus(self, message: dict):
-        """
-        Consensus Loop
-        :param message:
-        :return:
-        """
-        try:
-            msg_type = MessageType(message.get('msg_type'))
-
-            if msg_type == MessageType.HeartBeat:
-                incoming = HeartBeat.from_dict(message)
-                self._receive_heartbeat(incoming=incoming)
-
-            elif msg_type == MessageType.Proposal:
-                self.__receive_proposal(incoming=message)
-
-            elif msg_type == MessageType.Prepare:
-                self.__receive_prepare(incoming=message)
-
-            elif msg_type == MessageType.Commit:
-                self.__receive_commit(incoming=message)
-
-            elif msg_type == MessageType.TaskStatus:
-                self.__receive_task_status(incoming=message)
-            else:
-                self.logger.info(f"Ignoring unsupported message: {message}")
-        except Exception as e:
-            self.logger.error(f"Error while processing incoming message: {message}: {e}")
-            self.logger.error(traceback.format_exc())
 
     def run(self):
         self.logger.info(f"Starting agent: {self}")

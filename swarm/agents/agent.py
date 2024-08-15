@@ -67,8 +67,10 @@ class Agent(Observer):
     def __enqueue(self, incoming: str):
         try:
             message = json.loads(incoming)
-            if message.get("agent").get("agent_id") == self.agent_id:
+            source_agent_id = message.get("agent").get("agent_id")
+            if source_agent_id == self.agent_id:
                 return
+
             self.message_queue.put_nowait(message)
             with self.condition:
                 self.condition.notify_all()

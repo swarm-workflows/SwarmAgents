@@ -11,7 +11,6 @@ import matplotlib.pyplot as plt
 from swarm.agents.agent import Agent
 from swarm.comm.messages.commit import Commit
 from swarm.comm.messages.heart_beat import HeartBeat
-from swarm.comm.messages.message import MessageType
 from swarm.comm.messages.message_builder import MessageBuilder
 from swarm.comm.messages.prepare import Prepare
 from swarm.comm.messages.proposal import Proposal
@@ -57,42 +56,30 @@ class SwarmAgent(Agent):
         for message in messages:
             try:
                 begin = time.time()
-                self.__consensus(message=message)
+                incoming = MessageBuilder.from_dict(message)
+
+                if isinstance(incoming, HeartBeat):
+                    self._receive_heartbeat(incoming=incoming)
+
+                elif isinstance(incoming, Prepare):
+                    self.__receive_prepare(incoming=incoming)
+
+                elif isinstance(incoming, Commit):
+                    self.__receive_commit(incoming=incoming)
+
+                elif isinstance(incoming, Proposal):
+                    self.__receive_proposal(incoming=incoming)
+
+                elif isinstance(incoming, TaskStatus):
+                    self.__receive_task_status(incoming=incoming)
+                else:
+                    self.logger.info(f"Ignoring unsupported message: {message}")
                 diff = int(time.time() - begin)
                 if diff > 0:
                     self.logger.info(f"Event {message.get('message_type')} TIME: {diff}")
             except Exception as e:
                 self.logger.error(f"Error while processing message {type(message)}, {e}")
                 self.logger.error(traceback.format_exc())
-
-    def __consensus(self, message: dict):
-        """
-        Consensus Loop
-        :param message:
-        :return:
-        """
-        try:
-            incoming = MessageBuilder.from_dict(message)
-
-            if isinstance(incoming, HeartBeat):
-                self._receive_heartbeat(incoming=incoming)
-
-            elif isinstance(incoming, Proposal):
-                self.__receive_proposal(incoming=incoming)
-
-            elif isinstance(incoming, Prepare):
-                self.__receive_prepare(incoming=incoming)
-
-            elif isinstance(incoming, Commit):
-                self.__receive_commit(incoming=incoming)
-
-            elif isinstance(incoming, TaskStatus):
-                self.__receive_task_status(incoming=incoming)
-            else:
-                self.logger.info(f"Ignoring unsupported message: {message}")
-        except Exception as e:
-            self.logger.error(f"Error while processing incoming message: {message}: {e}")
-            self.logger.error(traceback.format_exc())
 
     def run(self):
         self.logger.info(f"Starting agent: {self}")
@@ -216,7 +203,7 @@ class SwarmAgent(Agent):
         return False
 
     def __receive_proposal(self, incoming: Proposal):
-        self.logger.debug(f"Received Proposal: {incoming}")
+        self.logger.debug(f"Received Proposal from: {incoming.agent.agent_id}")
 
         for p in incoming.proposals:
             task = self.task_queue.get_task(task_id=p.task_id)
@@ -262,7 +249,7 @@ class SwarmAgent(Agent):
     def __receive_prepare(self, incoming: Prepare):
 
         # Prepare for the proposal
-        self.logger.debug(f"Received prepare: {incoming}")
+        self.logger.debug(f"Received prepare from: {incoming.agent.agent_id}")
 
         for p in incoming.proposals:
             task = self.task_queue.get_task(task_id=p.task_id)
@@ -297,7 +284,7 @@ class SwarmAgent(Agent):
                 task.change_state(TaskState.COMMIT)
 
     def __receive_commit(self, incoming: Commit):
-        self.logger.debug(f"Received commit: {incoming}")
+        self.logger.debug(f"Received commit from: {incoming.agent.agent_id}")
         for p in incoming.proposals:
             task = self.task_queue.get_task(task_id=p.task_id)
 
@@ -336,7 +323,7 @@ class SwarmAgent(Agent):
                     self.incoming_proposals.remove_task(task_id=p.task_id)
 
     def __receive_task_status(self, incoming: TaskStatus):
-        self.logger.debug(f"Received Status: {incoming}")
+        self.logger.debug(f"Received Status from: {incoming.agent.agent_id}")
 
         for t in incoming.tasks:
             task = self.task_queue.get_task(task_id=t.task_id)
