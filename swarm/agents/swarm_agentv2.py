@@ -139,6 +139,7 @@ class SwarmAgent(Agent):
                         self.message_service.produce_message(msg.to_dict())
                         for p in proposals:
                             self.outgoing_proposals.add_proposal(p)  # Add all proposals
+                        proposals.clear()
 
                         self.logger.info(f"Added proposals: {proposals}")
 
@@ -220,6 +221,7 @@ class SwarmAgent(Agent):
     def __receive_proposal(self, incoming: Proposal):
         self.logger.debug(f"Received Proposal from: {incoming.agent.agent_id}")
 
+        proposals = []
         for p in incoming.proposals:
             task = self.task_queue.get_task(task_id=p.task_id)
             if not task or task.is_ready() or task.is_complete() or task.is_running():
@@ -257,12 +259,16 @@ class SwarmAgent(Agent):
                 task.set_time_on_queue()
 
                 self.incoming_proposals.add_proposal(proposal=proposal)
-                msg = Prepare(agent=AgentInfo(agent_id=self.agent_id), proposals=[proposal])
-                self.message_service.produce_message(msg.to_dict())
+                proposals.append(proposal)
+                #msg = Prepare(agent=AgentInfo(agent_id=self.agent_id), proposals=[proposal])
+                #self.message_service.produce_message(msg.to_dict())
                 task.change_state(TaskState.PREPARE)
+        if len(proposals):
+            msg = Prepare(agent=AgentInfo(agent_id=self.agent_id), proposals=proposals)
+            self.message_service.produce_message(msg.to_dict())
 
     def __receive_prepare(self, incoming: Prepare):
-
+        proposals = []
         # Prepare for the proposal
         self.logger.debug(f"Received prepare from: {incoming.agent.agent_id}")
 
@@ -293,10 +299,15 @@ class SwarmAgent(Agent):
                 self.logger.info(f"Agent: {self.agent_id} Task: {p.task_id} received quorum "
                                  f"prepares: {proposal.prepares}, starting commit!")
 
-                msg = Commit(agent=AgentInfo(agent_id=self.agent_id), proposals=[proposal])
-                self.message_service.produce_message(msg.to_dict())
+                proposals.append(proposal)
+
+                #msg = Commit(agent=AgentInfo(agent_id=self.agent_id), proposals=[proposal])
+                #self.message_service.produce_message(msg.to_dict())
 
                 task.change_state(TaskState.COMMIT)
+        if len(proposals):
+            msg = Commit(agent=AgentInfo(agent_id=self.agent_id), proposals=proposals)
+            self.message_service.produce_message(msg.to_dict())
 
     def __receive_commit(self, incoming: Commit):
         self.logger.debug(f"Received commit from: {incoming.agent.agent_id}")
