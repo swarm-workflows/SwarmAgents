@@ -45,15 +45,17 @@ class SwarmAgent(Agent):
         self.shutdown_heartbeat = False
         self.last_msg_received_timestamp = 0
         self.number_of_tasks_per_proposal = 3
+        self.use_projected_load = True
 
     def _build_heart_beat(self):
-        #my_load = self.compute_overall_load(proposed_caps=self.__get_proposed_capacities())
         my_load = self.compute_overall_load()
+        projected_load = self.compute_projected_load(overall_load_actual=my_load,
+                                                     proposed_caps=self.__get_proposed_capacities())
         self._save_load_metric(self.agent_id, my_load)
         agent = AgentInfo(agent_id=self.agent_id,
                           capacities=self.capacities,
                           capacity_allocations=self.allocated_tasks.capacities(),
-                          load=my_load)
+                          load=my_load, projected_load=projected_load)
         return HeartBeat(agent=agent)
 
     def _process_messages(self, *, messages: List[dict]):
@@ -93,6 +95,7 @@ class SwarmAgent(Agent):
             try:
                 processed = 0
                 proposals = []  # List to accumulate proposals for multiple tasks
+                caps_tasks_selected = Capacities()
 
                 # Make a copy of the dictionary keys
                 task_ids = list(self.task_queue.tasks.keys())
@@ -115,13 +118,14 @@ class SwarmAgent(Agent):
                     election_timeout = random.uniform(150, 300) / 1000
                     time.sleep(election_timeout)
 
-                    if self.__can_become_leader(task=task):
+                    if self.__can_become_leader(task=task, caps_tasks_selected=caps_tasks_selected):
                         task.set_time_on_queue()
 
                         # Send proposal to all neighbors
                         proposal = ProposalInfo(p_id=self.generate_id(), task_id=task.get_task_id(),
                                                 agent_id=self.agent_id)
                         proposals.append(proposal)
+                        caps_tasks_selected += task.get_capacities()
                         #msg = Proposal(agent=AgentInfo(agent_id=self.agent_id), proposals=[proposal])
 
                         #self.message_service.produce_message(msg.to_dict())
@@ -143,6 +147,7 @@ class SwarmAgent(Agent):
                         for p in proposals:
                             self.outgoing_proposals.add_proposal(p)  # Add all proposals
                         proposals.clear()
+                        caps_tasks_selected = Capacities()
 
                         self.logger.info(f"Added proposals: {proposals}")
 
@@ -161,6 +166,7 @@ class SwarmAgent(Agent):
                         self.outgoing_proposals.add_proposal(p)
                     self.logger.info(f"Added remaining proposals: {proposals}")
                     proposals.clear()
+                    caps_tasks_selected = Capacities()
 
                 time.sleep(1)  # Adjust the sleep duration as needed
 
@@ -168,7 +174,7 @@ class SwarmAgent(Agent):
                 self.logger.error(f"Error occurred while executing e: {e}")
                 self.logger.error(traceback.format_exc())
 
-    def __compute_cost_matrix(self, tasks: list) -> np.ndarray:
+    def __compute_cost_matrix(self, tasks: List[Task], caps_tasks_selected: Capacities) -> np.ndarray:
         """
         Compute the cost matrix where rows represent agents and columns represent tasks.
         :param tasks: List of tasks to compute costs for.
@@ -183,15 +189,22 @@ class SwarmAgent(Agent):
 
         # Compute costs for the current agent
         proposed_caps = self.__get_proposed_capacities()
-        #my_load = self.compute_overall_load(proposed_caps=proposed_caps)
+        proposed_caps += caps_tasks_selected
+
+        projected_load = self.compute_overall_load(proposed_caps=proposed_caps)
         my_load = self.compute_overall_load()
+
+        if self.use_projected_load:
+            load = projected_load
+        else:
+            load = my_load
 
         for j, task in enumerate(tasks):
             cost_of_job = self.compute_task_cost(task=task, total=self.capacities, profile=self.profile)
             feasibility = self.is_task_feasible(total=self.capacities, task=task)
             cost_matrix[0, j] = float('inf')
             if feasibility:
-                cost_matrix[0, j] = my_load + feasibility * cost_of_job
+                cost_matrix[0, j] = load + feasibility * cost_of_job
 
         # Compute costs for neighboring agents
         for i, peer in enumerate(self.neighbor_map.values(), start=1):
@@ -219,16 +232,17 @@ class SwarmAgent(Agent):
 
         return min_cost_agents
 
-    def __can_become_leader(self, task: Task) -> bool:
+    def __can_become_leader(self, task: Task, caps_tasks_selected: Capacities) -> bool:
         """
         Check if agent has enough resources to become a leader
             - Agent has resources to executed the task
             - Agent hasn't received a proposal from other agents for this task
             - Agent's load is less than 70%
         :param task:
+        :param caps_tasks_selected: Capacities of the tasks selected in this cycle
         :return: True or False
         """
-        cost_matrix = self.__compute_cost_matrix([task])
+        cost_matrix = self.__compute_cost_matrix([task], caps_tasks_selected)
         min_cost_agents = self.__find_min_cost_agents(cost_matrix)
         if min_cost_agents[0] == self.agent_id:
             return True
@@ -575,3 +589,22 @@ class SwarmAgent(Agent):
 
         # Save the plot to a file
         plt.savefig(plot_filename)
+
+    def compute_projected_load(self, overall_load_actual: float, proposed_caps: Capacities):
+        if not proposed_caps:
+            return overall_load_actual  # No proposed caps, so the load remains the same
+
+        # Calculate the load contribution from the proposed capacities
+        core_load_increase = (proposed_caps.core / self.capacities.core) * 100
+        ram_load_increase = (proposed_caps.ram / self.capacities.ram) * 100
+        disk_load_increase = (proposed_caps.disk / self.capacities.disk) * 100
+
+        # Adjust the overall load based on the increases
+        overall_load_projected = overall_load_actual + (
+                (core_load_increase * self.profile.core_weight +
+                 ram_load_increase * self.profile.ram_weight +
+                 disk_load_increase * self.profile.disk_weight) /
+                (self.profile.core_weight + self.profile.ram_weight + self.profile.disk_weight)
+        )
+
+        return overall_load_projected

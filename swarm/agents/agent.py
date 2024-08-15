@@ -110,6 +110,7 @@ class Agent(Observer):
 
     def _build_heart_beat(self):
         my_load = self.compute_overall_load()
+
         self._save_load_metric(self.agent_id, my_load)
         agent = AgentInfo(agent_id=self.agent_id,
                           capacities=self.capacities,
