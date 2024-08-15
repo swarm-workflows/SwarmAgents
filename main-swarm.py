@@ -5,7 +5,7 @@ import threading
 import time
 from typing import List
 
-from swarm.agents.swarm_agent import SwarmAgent
+from swarm.agents.swarm_agentv2 import SwarmAgent
 from swarm.models.capacities import Capacities
 from swarm.models.data_node import DataNode
 from swarm.models.task import Task
