@@ -47,7 +47,8 @@ class SwarmAgent(Agent):
         self.number_of_tasks_per_proposal = 3
 
     def _build_heart_beat(self):
-        my_load = self.compute_overall_load(proposed_caps=self.__get_proposed_capacities())
+        #my_load = self.compute_overall_load(proposed_caps=self.__get_proposed_capacities())
+        my_load = self.compute_overall_load()
         self._save_load_metric(self.agent_id, my_load)
         agent = AgentInfo(agent_id=self.agent_id,
                           capacities=self.capacities,
@@ -182,7 +183,8 @@ class SwarmAgent(Agent):
 
         # Compute costs for the current agent
         proposed_caps = self.__get_proposed_capacities()
-        my_load = self.compute_overall_load(proposed_caps=proposed_caps)
+        #my_load = self.compute_overall_load(proposed_caps=proposed_caps)
+        my_load = self.compute_overall_load()
 
         for j, task in enumerate(tasks):
             cost_of_job = self.compute_task_cost(task=task, total=self.capacities, profile=self.profile)
