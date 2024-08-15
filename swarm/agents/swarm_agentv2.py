@@ -147,6 +147,18 @@ class SwarmAgent(Agent):
                         time.sleep(1)
                         processed = 0
 
+                # Send remaining proposals if any exist
+                if proposals:
+                    msg = Proposal(
+                        agent=AgentInfo(agent_id=self.agent_id),
+                        proposals=proposals
+                    )
+                    self.message_service.produce_message(msg.to_dict())
+                    for p in proposals:
+                        self.outgoing_proposals.add_proposal(p)
+                    self.logger.info(f"Added remaining proposals: {proposals}")
+                    proposals.clear()
+
                 time.sleep(1)  # Adjust the sleep duration as needed
 
             except Exception as e:
