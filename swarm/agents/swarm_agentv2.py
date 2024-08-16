@@ -188,23 +188,20 @@ class SwarmAgent(Agent):
         cost_matrix = np.zeros((num_agents, num_tasks))
 
         # Compute costs for the current agent
-        proposed_caps = self.__get_proposed_capacities()
+        proposed_caps = Capacities()
+        if self.use_projected_load:
+            proposed_caps = self.__get_proposed_capacities()
+
         proposed_caps += caps_tasks_selected
 
-        projected_load = self.compute_overall_load(proposed_caps=proposed_caps)
-        my_load = self.compute_overall_load()
-
-        if self.use_projected_load:
-            load = projected_load
-        else:
-            load = my_load
+        my_load = self.compute_overall_load(proposed_caps=proposed_caps)
 
         for j, task in enumerate(tasks):
             cost_of_job = self.compute_task_cost(task=task, total=self.capacities, profile=self.profile)
             feasibility = self.is_task_feasible(total=self.capacities, task=task)
             cost_matrix[0, j] = float('inf')
             if feasibility:
-                cost_matrix[0, j] = load + feasibility * cost_of_job
+                cost_matrix[0, j] = my_load + feasibility * cost_of_job
 
         # Compute costs for neighboring agents
         for i, peer in enumerate(self.neighbor_map.values(), start=1):
@@ -217,6 +214,8 @@ class SwarmAgent(Agent):
                     load = peer.projected_load
                 else:
                     load = peer.load
+
+                load = self.compute_projected_load(overall_load_actual=load, proposed_caps=proposed_caps)
 
                 if feasibility:
                     cost_matrix[i, j] = load + feasibility * cost_of_job
