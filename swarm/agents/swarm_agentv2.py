@@ -173,6 +173,7 @@ class SwarmAgent(Agent):
             except Exception as e:
                 self.logger.error(f"Error occurred while executing e: {e}")
                 self.logger.error(traceback.format_exc())
+        self.logger.info(f"Agent: {self} stopped!")
 
     def __compute_cost_matrix(self, tasks: List[Task], caps_tasks_selected: Capacities) -> np.ndarray:
         """
@@ -517,6 +518,7 @@ class SwarmAgent(Agent):
         plt.close()
 
     def plot_results(self):
+        self.logger.info("Plotting Results")
         if self.agent_id != "0":
             return
         self.plot_tasks_per_agent()
@@ -524,6 +526,7 @@ class SwarmAgent(Agent):
         self.save_load_to_csv_and_plot(self.load_per_agent)
         self.save_load_to_csv_and_plot(self.projected_load_per_agent, csv_filename="agent_projected_loads.csv",
                                        plot_filename="agent_projected_loads.png")
+        self.logger.info("Plot completed")
 
     def __get_proposed_capacities(self):
         proposed_capacities = Capacities()

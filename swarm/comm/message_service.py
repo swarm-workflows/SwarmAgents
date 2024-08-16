@@ -69,7 +69,8 @@ class MessageService:
         lag = 1
         offsets = []
         logging.getLogger().info("Consumer thread started")
-        while not self.shutdown or lag:
+        #while not self.shutdown or lag:
+        while not self.shutdown:
             try:
                 msg = self.consumer.poll(1.0)
                 if msg is None:
