@@ -83,11 +83,27 @@ Each agent utilizes a cost matrix to determine whether it should become the lead
 - Greedy approach with random seed used to resolve proposal collisions shows improvement over basic PBFT.
 - Job selection is triggered for only single job at a time
 
-![Scheduling latency - 3 agents](./runs/swarm/3/scheduling-latency.png)
-![Scheduling latency - 5 agents](./runs/swarm/5/scheduling-latency.png)
-![Scheduling latency - 10 agents](./runs/swarm/10/scheduling-latency.png)
+#### Greedy Approach with Random seed and multiple task
+- Greedy approach with random seed used to resolve proposal collisions shows improvement over basic PBFT.
+- Job selection is triggered for upto 3 jobs at a time
 
-![Scheduling latency comparison - Number of agents](./runs/swarm/overall-scheduling-latency.png)
+
+|            | Greedy Approach (Single Task)                                                                    | Greedy Approach (Multiple Task)                                                                                             |
+|------------|--------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------|
+| Scheduling Latency - 3 Agents   | ![Scheduling latency - 3 agents](./runs/swarm/3/scheduling-latency.png)                          | ![Scheduling latency - 3 agents](./runs/swarm/multi-tasks/projected_load/3/scheduling-latency.png)                          |
+| Scheduling Latency - 5 Agents   | ![Scheduling latency - 5 agents](./runs/swarm/5/scheduling-latency.png)                          | ![Scheduling latency - 5 agents](./runs/swarm/multi-tasks/projected_load/5/scheduling-latency.png)                          | 
+| Scheduling Latency - 10 Agents  | ![Scheduling latency - 10 agents](./runs/swarm/10/scheduling-latency.png)                        | ![Scheduling latency - 10 agents](./runs/swarm/multi-tasks/projected_load/10/scheduling-latency.png)                        | 
+| Scheduling Latency - Overall    | ![Scheduling latency comparison - Number of agents](./runs/swarm/overall-scheduling-latency.png) | ![Scheduling latency comparison - Number of agents](./runs/swarm/multi-tasks/projected_load/overall-scheduling-latency.png) | 
+
+
+|            | Greedy Approach (Single Task)                                                                    | Greedy Approach (Multiple Task)                                                                                      |
+|------------|--------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------|
+| Load per agent - 3 Agents   | ![Load per agent - 3 agents](./runs/swarm/3/agent_loads_plot.png)             | ![Load per agent - 3 agents](./runs/swarm/multi-tasks/projected_load/3/agent_loads_plot.png)                          |
+| Load per agent - 5 Agents   | ![Load per agent - 5 agents](./runs/swarm/5/agent_loads_plot.png)             | ![Load per agent - 5 agents](./runs/swarm/multi-tasks/projected_load/5/agent_loads_plot.png)                          | 
+| Load per agent - 10 Agents  | ![Load per agent - 10 agents](./runs/swarm/10/agent_loads_plot.png)           | ![Load per agent - 10 agents](./runs/swarm/multi-tasks/projected_load/10/agent_loads_plot.png)                        | 
+
+
+
 ### Usage
 - Set up the python environment by installing all the dependencies:
 ```
