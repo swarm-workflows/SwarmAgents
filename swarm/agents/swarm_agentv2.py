@@ -216,7 +216,7 @@ class SwarmAgent(Agent):
                 else:
                     load = peer.load
 
-                load = self.compute_projected_load(overall_load_actual=load, proposed_caps=proposed_caps)
+                load = self.compute_projected_load(overall_load_actual=load, proposed_caps=caps_tasks_selected)
 
                 if feasibility:
                     cost_matrix[i, j] = load + feasibility * cost_of_job
