@@ -18,7 +18,7 @@ plt.plot(data1.index, data1['scheduling_latency'], label='Total Agents: 3', mark
 plt.plot(data2.index, data2['scheduling_latency'], label='Total Agents: 5', marker='s')
 plt.plot(data3.index, data3['scheduling_latency'], label='Total Agents: 10', marker='^')
 
-plt.title('RAFT: Scheduling Latency')
+plt.title('SWARM: Scheduling Latency')
 plt.xlabel('Task Index')
 plt.ylabel('Time Units (seconds)')
 plt.grid(True)
