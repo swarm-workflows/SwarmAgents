@@ -25,22 +25,22 @@ class PBFTAgent(Agent):
         for message in messages:
             try:
                 begin = time.time()
-                msg_type = MessageType(message.get('msg_type'))
+                message_type = MessageType(message.get('message_type'))
 
-                if msg_type == MessageType.HeartBeat:
+                if message_type == MessageType.HeartBeat:
                     incoming = HeartBeat.from_dict(message)
                     self._receive_heartbeat(incoming=incoming)
 
-                elif msg_type == MessageType.Proposal:
+                elif message_type == MessageType.Proposal:
                     self.__receive_proposal(incoming=message)
 
-                elif msg_type == MessageType.Prepare:
+                elif message_type == MessageType.Prepare:
                     self.__receive_prepare(incoming=message)
 
-                elif msg_type == MessageType.Commit:
+                elif message_type == MessageType.Commit:
                     self.__receive_commit(incoming=message)
 
-                elif msg_type == MessageType.JobStatus:
+                elif message_type == MessageType.JobStatus:
                     self.__receive_job_status(incoming=message)
                 else:
                     self.logger.info(f"Ignoring unsupported message: {message}")
