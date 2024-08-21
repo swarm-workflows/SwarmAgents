@@ -90,7 +90,7 @@ class PBFTAgent(Agent):
                         proposal = ProposalInfo(p_id=self.generate_id(), job_id=job.get_job_id(),
                                                 agent_id=self.agent_id)
 
-                        self.send_message(message_type=MessageType.ProposalInfo, job_id=job.get_job_id(),
+                        self.send_message(message_type=MessageType.Proposal, job_id=job.get_job_id(),
                                           proposal_id=proposal.p_id, seed=proposal.seed)
 
                         self.outgoing_proposals.add_proposal(proposal=proposal)
