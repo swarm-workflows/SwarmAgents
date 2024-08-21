@@ -75,7 +75,11 @@ class PBFTAgent(Agent):
                     #    job.change_state(new_state=JobState.PENDING)
 
                     if not job.is_pending():
-                        self.logger.debug(f"Job: {job.job_id} State: {job.state}; skipping it!")
+                        if job.get_leader_agent_id() is None:
+                            proposal = self.outgoing_proposals.get_proposal(job_id=job.get_job_id())
+                            if proposal is None:
+                                proposal = self.incoming_proposals.get_proposal(job_id=job.get_job_id())
+                            self.logger.debug(f"Job: {job.job_id} State: {job.state}; proposal: {proposal} skipping it!")
                         continue
 
                     processed += 1
@@ -98,9 +102,6 @@ class PBFTAgent(Agent):
 
                         # Begin election for Job leader for this job
                         job.change_state(new_state=JobState.PRE_PREPARE)
-                    else:
-                        self.logger.debug(
-                            f"Job: {job.job_id} State: {job.state} cannot be accommodated at this time:")
 
                     if processed >= 40:
                         time.sleep(1)
@@ -140,8 +141,8 @@ class PBFTAgent(Agent):
         least_loaded_neighbor = self.__find_neighbor_with_lowest_load()
 
         if least_loaded_neighbor and least_loaded_neighbor.load < my_load:
-            self.logger.debug(f"Can't become leader as my load: {my_load} is more than all of "
-                              f"the neighbors: {least_loaded_neighbor}")
+            self.logger.info(
+                f"__can_select_job: my_load: {my_load} more than neighbor:{least_loaded_neighbor}")
             return False
 
         feasibility = self.is_job_feasible(job=job, total=self.capacities, projected_load=my_load)

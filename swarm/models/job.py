@@ -14,7 +14,6 @@ import redis
 
 from swarm.models.capacities import Capacities
 from swarm.models.data_node import DataNode
-from swarm.models.json_field import JSONField
 
 
 class JobState(enum.Enum):
