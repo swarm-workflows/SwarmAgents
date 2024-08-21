@@ -85,7 +85,6 @@ class PBFTAgent(Agent):
                     time.sleep(election_timeout)
 
                     if self.__can_select_job(job=job):
-                        job.set_wait_time()
 
                         # Send proposal to all neighbors
                         proposal = ProposalInfo(p_id=self.generate_id(), job_id=job.get_job_id(),
@@ -200,7 +199,6 @@ class PBFTAgent(Agent):
                 self.outgoing_proposals.remove_proposal(p_id=my_proposal.p_id, job_id=job_id)
             if peer_proposal:
                 self.incoming_proposals.remove_proposal(p_id=peer_proposal.p_id, job_id=job_id)
-            job.set_wait_time()
 
             self.incoming_proposals.add_proposal(proposal=proposal)
             self.send_message(message_type=MessageType.Prepare, job_id=job_id, proposal_id=proposal_id)
@@ -274,7 +272,6 @@ class PBFTAgent(Agent):
         if proposal.commits >= quorum_count:
             self.logger.info(
                 f"Agent: {self.agent_id} received quorum commits for Job: {job_id} Proposal: {proposal}: Job: {job}")
-            job.set_selection_time()
             job.set_leader(leader_agent_id=proposal.agent_id)
             if self.outgoing_proposals.contains(job_id=job_id, p_id=proposal_id):
                 self.logger.info(f"LEADER CONSENSUS achieved for Job: {job_id} Leader: {self.agent_id}")
@@ -285,6 +282,7 @@ class PBFTAgent(Agent):
                 self.logger.info(f"PARTICIPANT CONSENSUS achieved for Job: {job_id} Leader: {peer_agent_id}")
                 job.change_state(new_state=JobState.COMMIT)
                 self.incoming_proposals.remove_job(job_id=job_id)
+                job.set_scheduled_time()
 
     def __receive_job_status(self, incoming: dict):
         peer_agent_id = incoming.get("agent_id")
@@ -295,7 +293,6 @@ class PBFTAgent(Agent):
 
         job = self.job_queue.get_job(job_id=job_id)
         job.set_leader(leader_agent_id=peer_agent_id)
-        job.set_time_to_completion()
         if not job or job.is_complete() or job.is_ready():
             self.logger.info(f"Ignoring Job Status: {job}")
             return
