@@ -569,7 +569,7 @@ class Agent(Observer):
         plt.close()
 
     @staticmethod
-    def plot_load_per_agent(load_dict: dict, csv_filename='agent_loads.csv',
+    def plot_load_per_agent(load_dict: dict, threshold: float, title_prefix: str = "", csv_filename='agent_loads.csv',
                             plot_filename='agent_loads_plot.png'):
         # Find the maximum length of the load lists
         max_intervals = max(len(loads) for loads in load_dict.values())
@@ -598,7 +598,7 @@ class Agent(Observer):
 
         plt.xlabel('Time Interval')
         plt.ylabel('Load')
-        plt.title('Agent Load Over Time')
+        plt.title(f'{title_prefix} Agent Load Over Time [Max Threshold: {threshold}]')
         plt.legend()
         plt.grid(True)
 
@@ -611,5 +611,5 @@ class Agent(Observer):
             return
         self.plot_jobs_per_agent()
         self.plot_scheduling_latency()
-        self.plot_load_per_agent(self.load_per_agent)
+        self.plot_load_per_agent(self.load_per_agent, self.projected_queue_threshold, title_prefix="Projected")
         self.logger.info("Plot completed")
