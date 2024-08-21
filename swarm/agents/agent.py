@@ -69,8 +69,8 @@ class Agent(Observer):
 
         self.job_scheduling_thread = threading.Thread(target=self.job_scheduling_main,
                                                       daemon=True, name="JobSchedulingThread")
-        self.projected_queue_threshold = 300.0
-        self.ready_queue_threshold = 100.0
+        self.projected_queue_threshold = 300.00
+        self.ready_queue_threshold = 100.00
 
     def __enqueue(self, incoming: str):
         try:
@@ -296,8 +296,9 @@ class Agent(Observer):
 
         return True
 
-    def compute_overall_load(self):
-        allocated_caps = self.ready_queue.capacities()
+    def compute_overall_load(self, proposed_caps: Capacities = Capacities()):
+        allocated_caps = proposed_caps
+        allocated_caps += self.ready_queue.capacities()
         allocated_caps += self.selected_queue.capacities()
 
         core_load = (allocated_caps.core / self.capacities.core) * 100

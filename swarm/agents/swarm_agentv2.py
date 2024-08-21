@@ -40,6 +40,15 @@ class SwarmAgent(Agent):
         self.incoming_proposals = ProposalContainer()
         self.number_of_jobs_per_proposal = 3
 
+    def _build_heart_beat(self):
+        my_load = self.compute_overall_load(proposed_caps=self.__get_proposed_capacities())
+        agent = AgentInfo(agent_id=self.agent_id,
+                          capacities=self.capacities,
+                          capacity_allocations=self.ready_queue.capacities(),
+                          load=my_load)
+        self._save_load_metric(self.agent_id, my_load)
+        return HeartBeat(agent=agent)
+
     def _process_messages(self, *, messages: List[dict]):
         for message in messages:
             try:
@@ -164,29 +173,31 @@ class SwarmAgent(Agent):
         cost_matrix = np.zeros((num_agents, num_jobs))
 
         # Compute costs for the current agent
-        my_load = self.compute_overall_load()
-        load = self.compute_projected_load(overall_load_actual=my_load,
-                                           proposed_caps=caps_jobs_selected)
+        my_load = self.compute_overall_load(proposed_caps=self.__get_proposed_capacities())
+        projected_load = self.compute_projected_load(overall_load_actual=my_load,
+                                                     proposed_caps=caps_jobs_selected)
 
         for j, job in enumerate(jobs):
             cost_of_job = self.compute_job_cost(job=job, total=self.capacities, profile=self.profile)
-            feasibility = self.is_job_feasible(total=self.capacities, job=job, projected_load=load+cost_of_job)
+            feasibility = self.is_job_feasible(total=self.capacities, job=job,
+                                               projected_load=projected_load + cost_of_job)
             cost_matrix[0, j] = float('inf')
             if feasibility:
-                cost_matrix[0, j] = load + feasibility * cost_of_job
+                cost_matrix[0, j] = projected_load + feasibility * cost_of_job
 
         # Compute costs for neighboring agents
         for i, peer in enumerate(self.neighbor_map.values(), start=1):
+            projected_load = self.compute_projected_load(overall_load_actual=peer.load,
+                                                         proposed_caps=caps_jobs_selected)
+
             for j, job in enumerate(jobs):
                 cost_of_job = self.compute_job_cost(job=job, total=peer.capacities, profile=self.profile)
-                load = self.compute_projected_load(overall_load_actual=peer.load,
-                                                   proposed_caps=caps_jobs_selected)
 
-                feasibility = self.is_job_feasible(total=peer.capacities, job=job, projected_load=load+cost_of_job)
+                feasibility = self.is_job_feasible(total=peer.capacities, job=job,
+                                                   projected_load=projected_load + cost_of_job)
                 cost_matrix[i, j] = float('inf')
-
                 if feasibility:
-                    cost_matrix[i, j] = load + feasibility * cost_of_job
+                    cost_matrix[i, j] = projected_load + feasibility * cost_of_job
 
         return cost_matrix
 
