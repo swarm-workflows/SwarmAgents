@@ -509,47 +509,47 @@ class Agent(Observer):
         jobs = self.job_queue.jobs.values()
         completed_jobs = [j for j in jobs if j.leader_agent_id is not None]
 
-        wait_time_to_selection = {}
-        selection_time_data = {}
-        scheduling_latency_data = {}
+        wait_times = {}
+        selection_times = {}
+        scheduling_latency = {}
 
         # Calculate scheduling latency
         for j in completed_jobs:
-            wait_time_to_selection[j.job_id] = j.created_at - j.selection_started_at
-            selection_time_data[j.job_id] = j.selected_by_agent_at - j.selection_started_at
-            scheduling_latency_data[j.job_id] = wait_time_to_selection[j.job_id] + selection_time_data[j.job_id]
+            wait_times[j.job_id] = j.selection_started_at - j.created_at
+            selection_times[j.job_id] = j.selected_by_agent_at - j.selection_started_at
+            scheduling_latency[j.job_id] = wait_times[j.job_id] + selection_times[j.job_id]
 
         with open('wait_time.csv', 'w', newline='') as file:
             writer = csv.writer(file)
-            writer.writerow(['job_id', 'wait_time_dynamic_jq'])
-            for key, value in wait_time_to_selection.items():
+            writer.writerow(['job_id', 'wait_time'])
+            for key, value in wait_times.items():
                 writer.writerow([key, value])
 
         with open('selection_time.csv', 'w', newline='') as file:
             writer = csv.writer(file)
             writer.writerow(['job_id', 'selection_time'])
-            for key, value in selection_time_data.items():
+            for key, value in selection_times.items():
                 writer.writerow([key, value])
 
         with open('scheduling_latency.csv', 'w', newline='') as file:
             writer = csv.writer(file)
             writer.writerow(['job_id', 'scheduling_latency'])
-            for key, value in scheduling_latency_data.items():
+            for key, value in scheduling_latency.items():
                 writer.writerow([key, value])
 
         # Plotting scheduling latency in red
-        plt.plot(list(scheduling_latency_data.values()),
-                 'ro-', label='Scheduling Latency (Wait Time + Selection Time)')
+        plt.plot(list(scheduling_latency.values()),
+                 'ro-', label='Scheduling Latency: Combined Wait Time and Selection Time (Job Ready to be scheduled on Agent)')
 
         # Plotting wait time in blue
-        if wait_time_to_selection:
-            plt.plot(list(wait_time_to_selection.values()),
-                     'bo-', label='Waiting Time')
+        if wait_times:
+            plt.plot(list(wait_times.values()),
+                     'bo-', label='Wait Time: Duration from Job Creation to Start of Selection')
 
         # Plotting leader election time in green
-        if selection_time_data:
-            plt.plot(list(selection_time_data.values()),
-                     'go-', label='Job Selection Time')
+        if selection_times:
+            plt.plot(list(selection_times.values()),
+                     'go-', label='Job Selection Time: Time Taken for Agents to Reach Consensus on Job Selection')
 
         # Title with SWARM and number of agents
         num_agents = len(set([t.leader_agent_id for t in completed_jobs]))

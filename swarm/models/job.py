@@ -88,7 +88,7 @@ class Job:
 
     def set_selection_start_time(self):
         with self.lock:
-            if not self.selected_by_agent_at:
+            if self.selected_by_agent_at is None:
                 self.selection_started_at = time.time()
 
     def set_selection_end_time(self):
