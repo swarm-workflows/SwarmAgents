@@ -60,7 +60,7 @@ job = {
 }
 
 
-class Job(JSONField):
+class Job:
     OP_GET = "GET"
     OP_PUT = "PUT"
 
