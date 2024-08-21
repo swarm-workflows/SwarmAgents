@@ -147,7 +147,7 @@ class PBFTAgent(Agent):
         feasibility = self.is_job_feasible(job=job, total=self.capacities, projected_load=my_load)
         incoming = self.incoming_proposals.contains(job_id=job.get_job_id())
         if not incoming and feasibility:
-            return feasibility
+            return True
         self.logger.info(
             f"__can_select_job: feasibility: {feasibility} incoming:{incoming} my_load: {my_load}")
         return False
