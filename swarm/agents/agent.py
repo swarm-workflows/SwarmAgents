@@ -75,7 +75,12 @@ class Agent(Observer):
     def __enqueue(self, incoming: str):
         try:
             message = json.loads(incoming)
-            source_agent_id = message.get("agent").get("agent_id")
+
+            if "agent" in message:
+                source_agent_id = message.get("agent").get("agent_id")
+            else:
+                source_agent_id = message.get("agent_id")
+                
             if source_agent_id == self.agent_id:
                 return
 
