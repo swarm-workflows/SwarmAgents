@@ -133,7 +133,7 @@ class RaftAgent(Agent):
                         payload = {"dest": peer.agent_id}
                         self.send_message(message_type=MessageType.Commit, job_id=job.job_id, payload=payload)
 
-                    elif my_load < 70.00 and self.can_accommodate_job(job=job):
+                    elif self.is_job_feasible(job=job, total=self.capacities, projected_load=my_load):
                         job.set_wait_time()
                         job.set_leader(leader_agent_id=self.agent_id)
                         job.change_state(new_state=JobState.RUNNING)
@@ -160,13 +160,13 @@ class RaftAgent(Agent):
         self.logger.info(f"Received commit from Agent: {peer_agent_id} for Job: {job_id}")
         job = self.job_repo.get_job(job_id=job_id, key_prefix="allocated")
         if job:
-            if self.can_accommodate_job(job=job):
+            if self.is_job_feasible(job=job, total=self.capacities, projected_load=self.compute_overall_load()):
                 self.select_job(job=job)
             else:
                 self.logger.info(f"Agent: {self.agent_id} cannot execute Job: {job_id}")
                 self.fail_job(job=job)
         else:
-            self.logger.error(f"Unable to fetch job from queu: {job_id}")
+            self.logger.error(f"Unable to fetch job from queue: {job_id}")
 
     def send_message(self, message_type: MessageType, job_id: str = None, payload: dict = None):
         message = {

@@ -144,14 +144,12 @@ class PBFTAgent(Agent):
                               f"the neighbors: {least_loaded_neighbor}")
             return False
 
-        can_accommodate = self.can_accommodate_job(job=job)
+        feasibility = self.is_job_feasible(job=job, total=self.capacities, projected_load=my_load)
         incoming = self.incoming_proposals.contains(job_id=job.get_job_id())
-        if not incoming and \
-                can_accommodate and \
-                my_load < 70.00:
-            return can_accommodate
+        if not incoming and feasibility:
+            return feasibility
         self.logger.info(
-            f"__can_select_job: can_accommodate: {can_accommodate} incoming:{incoming} my_load: {my_load}")
+            f"__can_select_job: feasibility: {feasibility} incoming:{incoming} my_load: {my_load}")
         return False
 
     def __receive_proposal(self, incoming: dict):

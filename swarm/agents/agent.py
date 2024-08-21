@@ -10,6 +10,7 @@ import string
 import threading
 import time
 import traceback
+from abc import abstractmethod
 from logging.handlers import RotatingFileHandler
 from typing import List
 
@@ -217,10 +218,38 @@ class Agent(Observer):
         except (socket.gaierror, socket.timeout, OSError):
             return False
 
-    def can_accommodate_job(self, job: Job):
-        allocated_caps = self.ready_queue.capacities()
-        allocated_caps += self.selected_queue.capacities()
-        available = self.capacities - allocated_caps
+    def is_job_feasible(self, job: Job, total: Capacities, projected_load: float,
+                        proposed_caps: Capacities = Capacities(),
+                        allocated_caps: Capacities = Capacities()):
+        if projected_load >= self.projected_queue_threshold:
+            return 0
+        allocated_caps += proposed_caps
+        available = total - allocated_caps
+
+        # Check if the agent can accommodate the given job based on its capacities
+        # Compare the requested against available
+        available = available - job.get_capacities()
+        negative_fields = available.negative_fields()
+        if len(negative_fields) > 0:
+            return 0
+
+        if self.data_transfer:
+            for data_node in job.get_data_in():
+                if not self.is_reachable(hostname=data_node.get_remote_ip()):
+                    return 0
+
+            for data_node in job.get_data_out():
+                if not self.is_reachable(hostname=data_node.get_remote_ip()):
+                    return 0
+        return 1
+
+    def can_accommodate_job(self, job: Job, only_total: bool = False):
+        if only_total:
+            available = self.capacities
+        else:
+            allocated_caps = self.ready_queue.capacities()
+            allocated_caps += self.selected_queue.capacities()
+            available = self.capacities - allocated_caps
 
         # Check if the agent can accommodate the given job based on its capacities
         # Compare the requested against available
@@ -322,29 +351,11 @@ class Agent(Observer):
     def __str__(self):
         return f"agent_id: {self.agent_id} capacities: {self.capacities} load: {self.compute_overall_load()}"
 
+    @abstractmethod
     def job_selection_main(self):
-        self.logger.info(f"Starting agent: {self}")
-        self.message_service.register_observers(agent=self)
-
-        cycle = 0
-        while cycle <= self.cycles:
-            try:
-                cycle += 1
-                # Filter pending jobs from the job queue
-                for job_id, job in self.job_queue.jobs.items():
-                    self.logger.info(f"Checking job: {job_id} {job}")
-                    if not job.is_pending():
-                        self.logger.info(f"Job {job.job_id} in {job.state}; skipping it!")
-                        continue
-                    if self.can_accommodate_job(job):
-                        self.schedule_job(job=job)
-                        self.logger.info(f"Allocated {job}; new agent load: {self.compute_overall_load()}")
-                    else:
-                        self.logger.info(f"Job {job} cannot be accommodated")
-            except Exception as e:
-                self.logger.error(f"Error occurred while executing cycle: {cycle} e: {e}")
-                self.logger.error(traceback.format_exc())
-            time.sleep(5)  # Adjust the sleep duration as needed
+        """
+        Job selection main loop
+        """
 
     @staticmethod
     def make_logger(*, log_dir: str, log_file: str, log_level, log_retain: int, log_size: int, logger: str,

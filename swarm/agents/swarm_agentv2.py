@@ -384,8 +384,8 @@ class SwarmAgent(Agent):
         return proposed_capacities
 
     def is_job_feasible(self, job: Job, total: Capacities, projected_load: float,
-                         proposed_caps: Capacities = Capacities(),
-                         allocated_caps: Capacities = Capacities()):
+                        proposed_caps: Capacities = Capacities(),
+                        allocated_caps: Capacities = Capacities()):
         if projected_load >= self.projected_queue_threshold:
             return 0
         allocated_caps += proposed_caps
