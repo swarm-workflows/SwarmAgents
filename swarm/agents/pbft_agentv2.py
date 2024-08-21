@@ -76,10 +76,9 @@ class PBFTAgent(Agent):
 
                     if not job.is_pending():
                         if job.get_leader_agent_id() is None:
-                            proposal = self.outgoing_proposals.get_proposal(job_id=job.get_job_id())
-                            if proposal is None:
-                                proposal = self.incoming_proposals.get_proposal(job_id=job.get_job_id())
-                            self.logger.debug(f"Job: {job.job_id} State: {job.state}; proposal: {proposal} skipping it!")
+                            proposal1 = self.outgoing_proposals.get_proposal(job_id=job.get_job_id())
+                            proposal2 = self.incoming_proposals.get_proposal(job_id=job.get_job_id())
+                            self.logger.debug(f"Job: {job.job_id} State: {job.state}; out: {proposal1} in: {proposal2} skipping it!")
                         continue
 
                     processed += 1

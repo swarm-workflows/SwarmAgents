@@ -87,7 +87,11 @@ class SwarmAgent(Agent):
                         continue
 
                     if not job.is_pending():
-                        self.logger.debug(f"Job: {job.job_id} State: {job.state}; skipping it!")
+                        if job.get_leader_agent_id() is None:
+                            proposal1 = self.outgoing_proposals.get_proposal(job_id=job.get_job_id())
+                            proposal2 = self.incoming_proposals.get_proposal(job_id=job.get_job_id())
+                            self.logger.debug(
+                                f"Job: {job.job_id} State: {job.state}; out: {proposal1} in: {proposal2} skipping it!")
                         continue
 
                     processed += 1
@@ -108,9 +112,6 @@ class SwarmAgent(Agent):
 
                         # Begin election for Job leader for this job
                         job.change_state(new_state=JobState.PRE_PREPARE)
-                    else:
-                        self.logger.debug(
-                            f"Job: {job.job_id} State: {job.state} cannot be accommodated at this time:")
 
                     if processed >= 40:
                         time.sleep(1)
@@ -184,6 +185,7 @@ class SwarmAgent(Agent):
         min_cost_agents = self.__find_min_cost_agents(cost_matrix)
         if min_cost_agents[0] == self.agent_id:
             return True
+        self.logger.info(f"Job: {job} not selected for consensus!")
         return False
 
     def __receive_proposal(self, incoming: Proposal):
