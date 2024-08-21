@@ -26,7 +26,7 @@ class TaskDistributor(threading.Thread):
             for agent in self.agents:
                 for task in tasks_to_add:
                     agent.job_queue.add_job(task)
-            time.sleep(random.uniform(0.1, 3.0))
+            time.sleep(0.5)
 
     def stop(self):
         self.shutdown_flag.set()
