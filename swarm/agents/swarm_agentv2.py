@@ -101,8 +101,6 @@ class SwarmAgent(Agent):
                     time.sleep(election_timeout)
 
                     if self.__can_select_job(job=job, caps_jobs_selected=caps_jobs_selected):
-                        job.set_wait_time()
-
                         # Send proposal to all neighbors
                         proposal = ProposalInfo(p_id=self.generate_id(), job_id=job.get_job_id(),
                                                 agent_id=self.agent_id)
@@ -260,7 +258,6 @@ class SwarmAgent(Agent):
                     self.outgoing_proposals.remove_proposal(p_id=my_proposal.p_id, job_id=p.job_id)
                 if peer_proposal:
                     self.incoming_proposals.remove_proposal(p_id=peer_proposal.p_id, job_id=p.job_id)
-                job.set_wait_time()
 
                 self.incoming_proposals.add_proposal(proposal=proposal)
                 proposals.append(proposal)
@@ -340,7 +337,6 @@ class SwarmAgent(Agent):
             if proposal.commits >= quorum_count:
                 self.logger.info(
                     f"Agent: {self.agent_id} received quorum commits for Job: {p.job_id} Proposal: {proposal}: Job: {job}")
-                job.set_selection_time()
                 job.set_leader(leader_agent_id=proposal.agent_id)
                 if self.outgoing_proposals.contains(job_id=p.job_id, p_id=p.p_id):
                     self.logger.info(f"LEADER CONSENSUS achieved for Job: {p.job_id} Leader: {self.agent_id}")
@@ -358,7 +354,6 @@ class SwarmAgent(Agent):
         for t in incoming.jobs:
             job = self.job_queue.get_job(job_id=t.job_id)
             job.set_leader(leader_agent_id=incoming.agent.agent_id)
-            job.set_time_to_completion()
             if not job or job.is_complete() or job.is_ready():
                 self.logger.info(f"Ignoring Job Status: {job}")
                 return
@@ -382,23 +377,6 @@ class SwarmAgent(Agent):
             proposed_capacities += proposed_job.get_capacities()
         self.logger.debug(f"Number of outgoing proposals: {len(jobs)}; Jobs: {jobs}")
         return proposed_capacities
-
-    def is_job_feasible(self, job: Job, total: Capacities, projected_load: float,
-                        proposed_caps: Capacities = Capacities(),
-                        allocated_caps: Capacities = Capacities()):
-        if projected_load >= self.projected_queue_threshold:
-            return 0
-        allocated_caps += proposed_caps
-        available = total - allocated_caps
-
-        # Check if the agent can accommodate the given job based on its capacities
-        # Compare the requested against available
-        available = available - job.get_capacities()
-        negative_fields = available.negative_fields()
-        if len(negative_fields) > 0:
-            return 0
-
-        return 1
 
     @staticmethod
     def compute_job_cost(job: Job, total: Capacities, profile: Profile):

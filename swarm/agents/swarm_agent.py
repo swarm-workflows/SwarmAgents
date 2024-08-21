@@ -97,8 +97,6 @@ class SwarmAgent(Agent):
                     time.sleep(election_timeout)
 
                     if self.__can_select_job(job=job):
-                        job.set_wait_time()
-
                         # Send proposal to all neighbors
                         proposal = ProposalInfo(p_id=self.generate_id(), job_id=job.get_job_id(),
                                                 agent_id=self.agent_id)
@@ -142,7 +140,7 @@ class SwarmAgent(Agent):
 
         for j, job in enumerate(jobs):
             cost_of_job = self.compute_job_cost(job=job, total=self.capacities, profile=self.profile)
-            feasibility = self.is_job_feasible(total=self.capacities, job=job)
+            feasibility = self.is_job_feasible(total=self.capacities, job=job, projected_load=my_load+cost_of_job)
             cost_matrix[0, j] = float('inf')
             if feasibility:
                 cost_matrix[0, j] = my_load + feasibility * cost_of_job
@@ -151,7 +149,7 @@ class SwarmAgent(Agent):
         for i, peer in enumerate(self.neighbor_map.values(), start=1):
             for j, job in enumerate(jobs):
                 cost_of_job = self.compute_job_cost(job=job, total=peer.capacities, profile=self.profile)
-                feasibility = self.is_job_feasible(total=peer.capacities, job=job)
+                feasibility = self.is_job_feasible(total=peer.capacities, job=job, projected_load=my_load+cost_of_job)
                 cost_matrix[i, j] = float('inf')
                 if feasibility:
                     cost_matrix[i, j] = peer.load + feasibility * cost_of_job
@@ -225,7 +223,6 @@ class SwarmAgent(Agent):
                     self.outgoing_proposals.remove_proposal(p_id=my_proposal.p_id, job_id=p.job_id)
                 if peer_proposal:
                     self.incoming_proposals.remove_proposal(p_id=peer_proposal.p_id, job_id=p.job_id)
-                job.set_wait_time()
 
                 self.incoming_proposals.add_proposal(proposal=proposal)
                 msg = Prepare(agent=AgentInfo(agent_id=self.agent_id), proposals=[proposal])
@@ -296,7 +293,6 @@ class SwarmAgent(Agent):
             if proposal.commits >= quorum_count:
                 self.logger.info(
                     f"Agent: {self.agent_id} received quorum commits for Job: {p.job_id} Proposal: {proposal}: Job: {job}")
-                job.set_selection_time()
                 job.set_leader(leader_agent_id=proposal.agent_id)
                 if self.outgoing_proposals.contains(job_id=p.job_id, p_id=p.p_id):
                     self.logger.info(f"LEADER CONSENSUS achieved for Job: {p.job_id} Leader: {self.agent_id}")
@@ -314,7 +310,6 @@ class SwarmAgent(Agent):
         for t in incoming.jobs:
             job = self.job_queue.get_job(job_id=t.job_id)
             job.set_leader(leader_agent_id=incoming.agent.agent_id)
-            job.set_time_to_completion()
             if not job or job.is_complete() or job.is_ready():
                 self.logger.info(f"Ignoring Job Status: {job}")
                 return
@@ -339,16 +334,6 @@ class SwarmAgent(Agent):
         self.logger.debug(f"Number of outgoing proposals: {len(jobs)}; Jobs: {jobs}")
         return proposed_capacities
 
-    @staticmethod
-    def is_job_feasible(job: Job, total: Capacities):
-        # Check if the agent can accommodate the given job based on its capacities
-        # Compare the requested against available
-        available = total - job.get_capacities()
-        negative_fields = available.negative_fields()
-        if len(negative_fields) > 0:
-            return 0
-
-        return 1
 
     @staticmethod
     def compute_job_cost(job: Job, total: Capacities, profile: Profile):
