@@ -10,7 +10,7 @@ from queue import Queue
 from swarm.agents.pbft_agent import PBFTAgent
 from swarm.models.capacities import Capacities
 from swarm.models.data_node import DataNode
-from swarm.models.task import Task
+from swarm.models.job import Job
 
 
 class TaskDistributor(threading.Thread):
@@ -27,7 +27,7 @@ class TaskDistributor(threading.Thread):
             tasks_to_add = [self.task_pool.pop() for _ in range(min(self.tasks_per_interval, len(self.task_pool)))]
             for agent in self.agents:
                 for task in tasks_to_add:
-                    agent.task_queue.add_task(task)
+                    agent.job_queue.add_job(task)
             #time.sleep(self.interval)
             time.sleep(random.uniform(0.1, 1.0))
 
@@ -40,8 +40,8 @@ def build_tasks_from_json(json_file):
     with open(json_file, 'r') as f:
         data = json.load(f)
         for task_data in data:
-            task = Task()
-            task.set_task_id(task_data['id'])
+            task = Job()
+            task.set_job_id(task_data['id'])
             task.set_capacities(Capacities.from_dict(task_data['capacities']))
             task.no_op = task_data['no_op']
             for data_in in task_data['data_in']:
@@ -77,6 +77,6 @@ if __name__ == '__main__':
 
     agent.start()
     distributor.start()
-    agent.run()
+    agent.job_selection_main()
     distributor.stop()
     agent.stop()

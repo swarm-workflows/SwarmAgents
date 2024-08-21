@@ -7,7 +7,7 @@ from swarm.models.agent_info import AgentInfo
 
 class MessageType(enum.Enum):
     HeartBeat = enum.auto()   #1
-    TaskStatus = enum.auto()  #2
+    JobStatus = enum.auto()  #2
     Proposal = enum.auto()    #3
     Prepare = enum.auto()     #4
     Commit = enum.auto()      #5

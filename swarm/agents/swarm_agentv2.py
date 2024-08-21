@@ -1,12 +1,9 @@
-import csv
-import os
 import random
 import time
 import traceback
 from queue import Queue, Empty
 from typing import List
 
-import matplotlib.pyplot as plt
 
 from swarm.agents.agent import Agent
 from swarm.comm.messages.commit import Commit
@@ -14,13 +11,13 @@ from swarm.comm.messages.heart_beat import HeartBeat
 from swarm.comm.messages.message_builder import MessageBuilder
 from swarm.comm.messages.prepare import Prepare
 from swarm.comm.messages.proposal import Proposal
-from swarm.comm.messages.task_info import TaskInfo
-from swarm.comm.messages.task_status import TaskStatus
+from swarm.comm.messages.job_info import JobInfo
+from swarm.comm.messages.job_status import JobStatus
 from swarm.models.capacities import Capacities
 from swarm.models.agent_info import AgentInfo
 from swarm.models.profile import Profile
 from swarm.models.proposal_info import ProposalContainer, ProposalInfo
-from swarm.models.task import Task, TaskState
+from swarm.models.job import Job, JobState
 import numpy as np
 
 
@@ -41,22 +38,7 @@ class SwarmAgent(Agent):
         super().__init__(agent_id, config_file, cycles)
         self.outgoing_proposals = ProposalContainer()
         self.incoming_proposals = ProposalContainer()
-        self.shutdown = False
-        self.shutdown_heartbeat = False
-        self.last_msg_received_timestamp = 0
-        self.number_of_tasks_per_proposal = 3
-        self.use_projected_load = True
-
-    def _build_heart_beat(self):
-        my_load = self.compute_overall_load()
-        projected_load = self.compute_projected_load(overall_load_actual=my_load,
-                                                     proposed_caps=self.__get_proposed_capacities())
-        self._save_load_metric(self.agent_id, my_load, projected_load)
-        agent = AgentInfo(agent_id=self.agent_id,
-                          capacities=self.capacities,
-                          capacity_allocations=self.allocated_tasks.capacities(),
-                          load=my_load, projected_load=projected_load)
-        return HeartBeat(agent=agent)
+        self.number_of_jobs_per_proposal = 3
 
     def _process_messages(self, *, messages: List[dict]):
         for message in messages:
@@ -76,8 +58,8 @@ class SwarmAgent(Agent):
                 elif isinstance(incoming, Proposal):
                     self.__receive_proposal(incoming=incoming)
 
-                elif isinstance(incoming, TaskStatus):
-                    self.__receive_task_status(incoming=incoming)
+                elif isinstance(incoming, JobStatus):
+                    self.__receive_job_status(incoming=incoming)
                 else:
                     self.logger.info(f"Ignoring unsupported message: {message}")
                 diff = int(time.time() - begin)
@@ -87,58 +69,53 @@ class SwarmAgent(Agent):
                 self.logger.error(f"Error while processing message {type(message)}, {e}")
                 self.logger.error(traceback.format_exc())
 
-    def run(self):
+    def job_selection_main(self):
         self.logger.info(f"Starting agent: {self}")
         time.sleep(10)
-        completed_tasks = 0
+        completed_jobs = 0
         while not self.shutdown:
             try:
                 processed = 0
-                proposals = []  # List to accumulate proposals for multiple tasks
-                caps_tasks_selected = Capacities()
+                proposals = []  # List to accumulate proposals for multiple jobs
+                caps_jobs_selected = Capacities()
 
                 # Make a copy of the dictionary keys
-                task_ids = list(self.task_queue.tasks.keys())
-                for task_id in task_ids:
-                    task = self.task_queue.tasks.get(task_id)
-                    if not task:
+                job_ids = list(self.job_queue.jobs.keys())
+                for job_id in job_ids:
+                    job = self.job_queue.jobs.get(job_id)
+                    if not job:
                         continue
 
-                    if task.is_complete():
-                        completed_tasks += 1
+                    if job.is_complete():
+                        completed_jobs += 1
                         continue
 
-                    if not task.is_pending():
-                        self.logger.debug(f"Task: {task.task_id} State: {task.state}; skipping it!")
+                    if not job.is_pending():
+                        self.logger.debug(f"Job: {job.job_id} State: {job.state}; skipping it!")
                         continue
 
                     processed += 1
 
-                    # Trigger leader election for a task after random sleep
+                    # Trigger leader election for a job after random sleep
                     election_timeout = random.uniform(150, 300) / 1000
                     time.sleep(election_timeout)
 
-                    if self.__can_become_leader(task=task, caps_tasks_selected=caps_tasks_selected):
-                        task.set_time_on_queue()
+                    if self.__can_select_job(job=job, caps_jobs_selected=caps_jobs_selected):
+                        job.set_wait_time()
 
                         # Send proposal to all neighbors
-                        proposal = ProposalInfo(p_id=self.generate_id(), task_id=task.get_task_id(),
+                        proposal = ProposalInfo(p_id=self.generate_id(), job_id=job.get_job_id(),
                                                 agent_id=self.agent_id)
                         proposals.append(proposal)
-                        caps_tasks_selected += task.get_capacities()
-                        #msg = Proposal(agent=AgentInfo(agent_id=self.agent_id), proposals=[proposal])
+                        caps_jobs_selected += job.get_capacities()
 
-                        #self.message_service.produce_message(msg.to_dict())
-                        #self.outgoing_proposals.add_proposal(proposal=proposal)
-                        #self.logger.info(f"Added proposal: {proposal}")
-
-                        # Begin election for Job leader for this task
-                        task.change_state(new_state=TaskState.PRE_PREPARE)
+                        # Begin election for Job leader for this job
+                        job.change_state(new_state=JobState.PRE_PREPARE)
                     else:
                         self.logger.debug(
-                            f"Task: {task.task_id} State: {task.state} cannot be accommodated at this time:")
+                            f"Job: {job.job_id} State: {job.state} cannot be accommodated at this time:")
 
-                    if len(proposals) >= self.number_of_tasks_per_proposal:
+                    if len(proposals) >= self.number_of_jobs_per_proposal:
                         msg = Proposal(
                             agent=AgentInfo(agent_id=self.agent_id),
                             proposals=proposals
@@ -147,7 +124,7 @@ class SwarmAgent(Agent):
                         for p in proposals:
                             self.outgoing_proposals.add_proposal(p)  # Add all proposals
                         proposals.clear()
-                        caps_tasks_selected = Capacities()
+                        caps_jobs_selected = Capacities()
 
                         self.logger.info(f"Added proposals: {proposals}")
 
@@ -166,7 +143,6 @@ class SwarmAgent(Agent):
                         self.outgoing_proposals.add_proposal(p)
                     self.logger.info(f"Added remaining proposals: {proposals}")
                     proposals.clear()
-                    caps_tasks_selected = Capacities()
 
                 time.sleep(1)  # Adjust the sleep duration as needed
 
@@ -175,48 +151,40 @@ class SwarmAgent(Agent):
                 self.logger.error(traceback.format_exc())
         self.logger.info(f"Agent: {self} stopped!")
 
-    def __compute_cost_matrix(self, tasks: List[Task], caps_tasks_selected: Capacities) -> np.ndarray:
+    def __compute_cost_matrix(self, jobs: List[Job], caps_jobs_selected: Capacities) -> np.ndarray:
         """
-        Compute the cost matrix where rows represent agents and columns represent tasks.
-        :param tasks: List of tasks to compute costs for.
-        :return: A 2D numpy array where each entry [i, j] is the cost of agent i for task j.
+        Compute the cost matrix where rows represent agents and columns represent jobs.
+        :param jobs: List of jobs to compute costs for.
+        :return: A 2D numpy array where each entry [i, j] is the cost of agent i for job j.
         """
         agent_ids = [self.agent_id] + [peer.agent_id for peer in self.neighbor_map.values()]
         num_agents = len(agent_ids)
-        num_tasks = len(tasks)
+        num_jobs = len(jobs)
 
-        # Initialize a cost matrix of shape (num_agents, num_tasks)
-        cost_matrix = np.zeros((num_agents, num_tasks))
+        # Initialize a cost matrix of shape (num_agents, num_jobs)
+        cost_matrix = np.zeros((num_agents, num_jobs))
 
         # Compute costs for the current agent
-        proposed_caps = Capacities()
-        if self.use_projected_load:
-            proposed_caps = self.__get_proposed_capacities()
+        my_load = self.compute_overall_load()
+        load = self.compute_projected_load(overall_load_actual=my_load,
+                                           proposed_caps=caps_jobs_selected)
 
-        proposed_caps += caps_tasks_selected
-
-        my_load = self.compute_overall_load(proposed_caps=proposed_caps)
-
-        for j, task in enumerate(tasks):
-            cost_of_job = self.compute_task_cost(task=task, total=self.capacities, profile=self.profile)
-            feasibility = self.is_task_feasible(total=self.capacities, task=task)
+        for j, job in enumerate(jobs):
+            cost_of_job = self.compute_job_cost(job=job, total=self.capacities, profile=self.profile)
+            feasibility = self.is_job_feasible(total=self.capacities, job=job, projected_load=load+cost_of_job)
             cost_matrix[0, j] = float('inf')
             if feasibility:
-                cost_matrix[0, j] = my_load + feasibility * cost_of_job
+                cost_matrix[0, j] = load + feasibility * cost_of_job
 
         # Compute costs for neighboring agents
         for i, peer in enumerate(self.neighbor_map.values(), start=1):
-            for j, task in enumerate(tasks):
-                cost_of_job = self.compute_task_cost(task=task, total=peer.capacities, profile=self.profile)
-                feasibility = self.is_task_feasible(total=peer.capacities, task=task)
+            for j, job in enumerate(jobs):
+                cost_of_job = self.compute_job_cost(job=job, total=peer.capacities, profile=self.profile)
+                load = self.compute_projected_load(overall_load_actual=peer.load,
+                                                   proposed_caps=caps_jobs_selected)
+
+                feasibility = self.is_job_feasible(total=peer.capacities, job=job, projected_load=load+cost_of_job)
                 cost_matrix[i, j] = float('inf')
-
-                if self.use_projected_load:
-                    load = peer.projected_load
-                else:
-                    load = peer.load
-
-                load = self.compute_projected_load(overall_load_actual=load, proposed_caps=caps_tasks_selected)
 
                 if feasibility:
                     cost_matrix[i, j] = load + feasibility * cost_of_job
@@ -225,11 +193,11 @@ class SwarmAgent(Agent):
 
     def __find_min_cost_agents(self, cost_matrix: np.ndarray) -> list:
         """
-        Find the agents with the minimum cost for each task.
-        :param cost_matrix: A 2D numpy array where each entry [i, j] is the cost of agent i for task j.
-        :return: A list of agent IDs corresponding to the minimum cost for each task.
+        Find the agents with the minimum cost for each job.
+        :param cost_matrix: A 2D numpy array where each entry [i, j] is the cost of agent i for job j.
+        :return: A list of agent IDs corresponding to the minimum cost for each job.
         """
-        # Find the index of the minimum cost for each task (column)
+        # Find the index of the minimum cost for each job (column)
         min_cost_indices = np.argmin(cost_matrix, axis=0)
 
         # Map the indices back to agent IDs
@@ -238,17 +206,17 @@ class SwarmAgent(Agent):
 
         return min_cost_agents
 
-    def __can_become_leader(self, task: Task, caps_tasks_selected: Capacities) -> bool:
+    def __can_select_job(self, job: Job, caps_jobs_selected: Capacities) -> bool:
         """
         Check if agent has enough resources to become a leader
-            - Agent has resources to executed the task
-            - Agent hasn't received a proposal from other agents for this task
+            - Agent has resources to executed the job
+            - Agent hasn't received a proposal from other agents for this job
             - Agent's load is less than 70%
-        :param task:
-        :param caps_tasks_selected: Capacities of the tasks selected in this cycle
+        :param job:
+        :param caps_jobs_selected: Capacities of the jobs selected in this cycle
         :return: True or False
         """
-        cost_matrix = self.__compute_cost_matrix([task], caps_tasks_selected)
+        cost_matrix = self.__compute_cost_matrix([job], caps_jobs_selected)
         min_cost_agents = self.__find_min_cost_agents(cost_matrix)
         if min_cost_agents[0] == self.agent_id:
             return True
@@ -259,46 +227,46 @@ class SwarmAgent(Agent):
 
         proposals = []
         for p in incoming.proposals:
-            task = self.task_queue.get_task(task_id=p.task_id)
-            if not task or task.is_ready() or task.is_complete() or task.is_running():
-                self.logger.info(f"Ignoring Proposal: {task}")
+            job = self.job_queue.get_job(job_id=p.job_id)
+            if not job or job.is_ready() or job.is_complete() or job.is_running():
+                self.logger.info(f"Ignoring Proposal: {job}")
                 return
 
             # Reject proposal in following cases:
             # - I have initiated a proposal and either received accepts from at least 1 peer or
             #   my proposal's seed is smaller than the incoming proposal
             # - Received and accepted proposal from another agent
-            # - can't accommodate this task
-            # - can accommodate task and neighbor's load is more than mine
-            my_proposal = self.outgoing_proposals.get_proposal(task_id=p.task_id)
-            peer_proposal = self.incoming_proposals.get_proposal(task_id=p.task_id)
+            # - can't accommodate this job
+            # - can accommodate job and neighbor's load is more than mine
+            my_proposal = self.outgoing_proposals.get_proposal(job_id=p.job_id)
+            peer_proposal = self.incoming_proposals.get_proposal(job_id=p.job_id)
 
             # if (my_proposal and (my_proposal.prepares or my_proposal.seed < rcvd_seed)) or \
             #        (peer_proposal and peer_proposal.seed < rcvd_seed) or \
-            #        not can_accept_task or \
-            #        (can_accept_task and my_current_load < neighbor_load):
+            #        not can_accept_job or \
+            #        (can_accept_job and my_current_load < neighbor_load):
             if (my_proposal and (my_proposal.prepares or my_proposal.seed < p.seed)) or \
                     (peer_proposal and peer_proposal.seed < p.seed):
-                self.logger.debug(f"Agent {self.agent_id} rejected Proposal for Task: {p.task_id} from agent"
+                self.logger.debug(f"Agent {self.agent_id} rejected Proposal for Job: {p.job_id} from agent"
                                   f" {p.agent_id} - accepted another proposal")
             else:
                 self.logger.debug(
-                    f"Agent {self.agent_id} accepted Proposal for Task: {p.task_id} from agent"
+                    f"Agent {self.agent_id} accepted Proposal for Job: {p.job_id} from agent"
                     f" {p.agent_id} and is now the leader")
 
-                proposal = ProposalInfo(p_id=p.p_id, task_id=p.task_id, seed=p.seed,
+                proposal = ProposalInfo(p_id=p.p_id, job_id=p.job_id, seed=p.seed,
                                         agent_id=p.agent_id)
                 if my_proposal:
-                    self.outgoing_proposals.remove_proposal(p_id=my_proposal.p_id, task_id=p.task_id)
+                    self.outgoing_proposals.remove_proposal(p_id=my_proposal.p_id, job_id=p.job_id)
                 if peer_proposal:
-                    self.incoming_proposals.remove_proposal(p_id=peer_proposal.p_id, task_id=p.task_id)
-                task.set_time_on_queue()
+                    self.incoming_proposals.remove_proposal(p_id=peer_proposal.p_id, job_id=p.job_id)
+                job.set_wait_time()
 
                 self.incoming_proposals.add_proposal(proposal=proposal)
                 proposals.append(proposal)
                 #msg = Prepare(agent=AgentInfo(agent_id=self.agent_id), proposals=[proposal])
                 #self.message_service.produce_message(msg.to_dict())
-                task.change_state(TaskState.PREPARE)
+                job.change_state(JobState.PREPARE)
         if len(proposals):
             msg = Prepare(agent=AgentInfo(agent_id=self.agent_id), proposals=proposals)
             self.message_service.produce_message(msg.to_dict())
@@ -309,30 +277,30 @@ class SwarmAgent(Agent):
         self.logger.debug(f"Received prepare from: {incoming.agent.agent_id}")
 
         for p in incoming.proposals:
-            task = self.task_queue.get_task(task_id=p.task_id)
-            if not task or task.is_ready() or task.is_complete() or task.is_running():
-                self.logger.info(f"Ignoring Prepare: {task}")
+            job = self.job_queue.get_job(job_id=p.job_id)
+            if not job or job.is_ready() or job.is_complete() or job.is_running():
+                self.logger.info(f"Ignoring Prepare: {job}")
                 return
 
             # Update the prepare votes
-            if self.outgoing_proposals.contains(task_id=p.task_id, p_id=p.p_id):
+            if self.outgoing_proposals.contains(job_id=p.job_id, p_id=p.p_id):
                 proposal = self.outgoing_proposals.get_proposal(p_id=p.p_id)
-            elif self.incoming_proposals.contains(task_id=p.task_id, p_id=p.p_id):
+            elif self.incoming_proposals.contains(job_id=p.job_id, p_id=p.p_id):
                 proposal = self.incoming_proposals.get_proposal(p_id=p.p_id)
             else:
-                proposal = ProposalInfo(task_id=p.task_id, p_id=p.p_id, seed=p.seed,
+                proposal = ProposalInfo(job_id=p.job_id, p_id=p.p_id, seed=p.seed,
                                         agent_id=p.agent_id)
                 self.incoming_proposals.add_proposal(proposal=proposal)
 
             proposal.prepares += 1
 
             quorum_count = (len(self.neighbor_map)) / 2
-            task.change_state(TaskState.PREPARE)
+            job.change_state(JobState.PREPARE)
 
             # Check if vote count is more than quorum
             # if yes, send commit
             if proposal.prepares >= quorum_count:
-                self.logger.info(f"Agent: {self.agent_id} Task: {p.task_id} received quorum "
+                self.logger.info(f"Agent: {self.agent_id} Job: {p.job_id} received quorum "
                                  f"prepares: {proposal.prepares}, starting commit!")
 
                 proposals.append(proposal)
@@ -340,7 +308,7 @@ class SwarmAgent(Agent):
                 #msg = Commit(agent=AgentInfo(agent_id=self.agent_id), proposals=[proposal])
                 #self.message_service.produce_message(msg.to_dict())
 
-                task.change_state(TaskState.COMMIT)
+                job.change_state(JobState.COMMIT)
         if len(proposals):
             msg = Commit(agent=AgentInfo(agent_id=self.agent_id), proposals=proposals)
             self.message_service.produce_message(msg.to_dict())
@@ -348,21 +316,21 @@ class SwarmAgent(Agent):
     def __receive_commit(self, incoming: Commit):
         self.logger.debug(f"Received commit from: {incoming.agent.agent_id}")
         for p in incoming.proposals:
-            task = self.task_queue.get_task(task_id=p.task_id)
+            job = self.job_queue.get_job(job_id=p.job_id)
 
-            if not task or task.is_complete() or task.is_ready() or task.is_running() or task.leader_agent_id:
-                self.logger.info(f"Ignoring Commit: {task}")
-                self.incoming_proposals.remove_task(task_id=p.task_id)
-                self.outgoing_proposals.remove_task(task_id=p.task_id)
+            if not job or job.is_complete() or job.is_ready() or job.is_running() or job.leader_agent_id:
+                self.logger.info(f"Ignoring Commit: {job}")
+                self.incoming_proposals.remove_job(job_id=p.job_id)
+                self.outgoing_proposals.remove_job(job_id=p.job_id)
                 return
 
             # Update the commit votes;
-            if self.outgoing_proposals.contains(task_id=p.task_id, p_id=p.p_id):
+            if self.outgoing_proposals.contains(job_id=p.job_id, p_id=p.p_id):
                 proposal = self.outgoing_proposals.get_proposal(p_id=p.p_id)
-            elif self.incoming_proposals.contains(task_id=p.task_id, p_id=p.p_id):
+            elif self.incoming_proposals.contains(job_id=p.job_id, p_id=p.p_id):
                 proposal = self.incoming_proposals.get_proposal(p_id=p.p_id)
             else:
-                proposal = ProposalInfo(task_id=p.task_id, p_id=p.p_id, seed=p.seed,
+                proposal = ProposalInfo(job_id=p.job_id, p_id=p.p_id, seed=p.seed,
                                         agent_id=p.agent_id)
                 self.incoming_proposals.add_proposal(proposal=proposal)
 
@@ -371,181 +339,61 @@ class SwarmAgent(Agent):
 
             if proposal.commits >= quorum_count:
                 self.logger.info(
-                    f"Agent: {self.agent_id} received quorum commits for Task: {p.task_id} Proposal: {proposal}: Task: {task}")
-                task.set_time_to_elect_leader()
-                task.set_leader(leader_agent_id=proposal.agent_id)
-                if self.outgoing_proposals.contains(task_id=p.task_id, p_id=p.p_id):
-                    self.logger.info(f"LEADER CONSENSUS achieved for Task: {p.task_id} Leader: {self.agent_id}")
-                    task.change_state(new_state=TaskState.READY)
-                    self.allocate_task(task)
-                    self.outgoing_proposals.remove_task(task_id=p.task_id)
+                    f"Agent: {self.agent_id} received quorum commits for Job: {p.job_id} Proposal: {proposal}: Job: {job}")
+                job.set_selection_time()
+                job.set_leader(leader_agent_id=proposal.agent_id)
+                if self.outgoing_proposals.contains(job_id=p.job_id, p_id=p.p_id):
+                    self.logger.info(f"LEADER CONSENSUS achieved for Job: {p.job_id} Leader: {self.agent_id}")
+                    job.change_state(new_state=JobState.READY)
+                    self.select_job(job)
+                    self.outgoing_proposals.remove_job(job_id=p.job_id)
                 else:
-                    self.logger.info(f"PARTICIPANT CONSENSUS achieved for Task: {p.task_id} Leader: {p.agent_id}")
-                    task.change_state(new_state=TaskState.COMMIT)
-                    self.incoming_proposals.remove_task(task_id=p.task_id)
+                    self.logger.info(f"PARTICIPANT CONSENSUS achieved for Job: {p.job_id} Leader: {p.agent_id}")
+                    job.change_state(new_state=JobState.COMMIT)
+                    self.incoming_proposals.remove_job(job_id=p.job_id)
 
-    def __receive_task_status(self, incoming: TaskStatus):
+    def __receive_job_status(self, incoming: JobStatus):
         self.logger.debug(f"Received Status from: {incoming.agent.agent_id}")
 
-        for t in incoming.tasks:
-            task = self.task_queue.get_task(task_id=t.task_id)
-            task.set_leader(leader_agent_id=incoming.agent.agent_id)
-            task.set_time_to_completion()
-            if not task or task.is_complete() or task.is_ready():
-                self.logger.info(f"Ignoring Task Status: {task}")
+        for t in incoming.jobs:
+            job = self.job_queue.get_job(job_id=t.job_id)
+            job.set_leader(leader_agent_id=incoming.agent.agent_id)
+            job.set_time_to_completion()
+            if not job or job.is_complete() or job.is_ready():
+                self.logger.info(f"Ignoring Job Status: {job}")
                 return
 
-            # Update the task status based on broadcast message
-            task.change_state(new_state=TaskState.COMPLETE)
-            self.incoming_proposals.remove_task(task_id=t.task_id)
-            self.outgoing_proposals.remove_task(task_id=t.task_id)
+            # Update the job status based on broadcast message
+            job.change_state(new_state=JobState.COMPLETE)
+            self.incoming_proposals.remove_job(job_id=t.job_id)
+            self.outgoing_proposals.remove_job(job_id=t.job_id)
 
-    def execute_task(self, task: Task):
-        super().execute_task(task=task)
-        msg = TaskStatus(agent=AgentInfo(agent_id=self.agent_id), tasks=[TaskInfo(task_id=task.get_task_id(),
-                                                                                  state=task.state)])
+    def execute_job(self, job: Job):
+        super().execute_job(job=job)
+        msg = JobStatus(agent=AgentInfo(agent_id=self.agent_id), jobs=[JobInfo(job_id=job.get_job_id(),
+                                                                               state=job.state)])
         self.message_service.produce_message(msg.to_dict())
-
-    def start(self):
-        self.message_service.register_observers(agent=self)
-        self.msg_processor_thread.start()
-        self.message_service.start()
-        self.heartbeat_thread.start()
-        self.main_thread.start()
-
-    def stop(self):
-        self.shutdown_heartbeat = True
-        self.shutdown = True
-        self.message_service.stop()
-        with self.condition:
-            self.condition.notify_all()
-        self.heartbeat_thread.join()
-        self.msg_processor_thread.join()
-        self.main_thread.join()
-
-    def plot_tasks_per_agent(self):
-        tasks = self.task_queue.tasks.values()
-        completed_tasks = [t for t in tasks if t.leader_agent_id is not None]
-        tasks_per_agent = {}
-
-        for t in completed_tasks:
-            if t.leader_agent_id:
-                if t.leader_agent_id not in tasks_per_agent:
-                    tasks_per_agent[t.leader_agent_id] = 0
-                tasks_per_agent[t.leader_agent_id] += 1
-
-        # Save tasks_per_agent to CSV
-        with open('tasks_per_agent.csv', 'w', newline='') as file:
-            writer = csv.writer(file)
-            writer.writerow(['Agent ID', 'Number of Tasks Executed'])
-            for agent_id, task_count in tasks_per_agent.items():
-                writer.writerow([agent_id, task_count])
-
-        # Plotting the tasks per agent as a bar chart
-        plt.bar(list(tasks_per_agent.keys()), list(tasks_per_agent.values()), color='blue')
-        plt.xlabel('Agent ID')
-        plt.ylabel('Number of Tasks Executed')
-
-        # Title with SWARM and number of agents
-        num_agents = len(tasks_per_agent)
-        plt.title(f'SWARM: Number of Tasks Executed by Each Agent (Total Agents: {num_agents})')
-
-        plt.grid(axis='y', linestyle='--', linewidth=0.5)
-
-        # Save the plot
-        plot_path = os.path.join("", 'tasks-per-agent.png')
-        plt.savefig(plot_path)
-        plt.close()
-
-    def plot_scheduling_latency(self):
-        tasks = self.task_queue.tasks.values()
-        completed_tasks = [t for t in tasks if t.leader_agent_id is not None]
-
-        # Calculate scheduling latency
-        scheduling_latency = [
-            t.time_on_queue + t.time_to_elect_leader
-            for t in completed_tasks
-            if t.time_on_queue is not None and t.time_to_elect_leader is not None
-        ]
-
-        # Save scheduling latency, time_on_queue, and time_to_elect_leader as CSV
-        wait_time_data = [(t.time_on_queue,) for t in completed_tasks if t.time_on_queue is not None]
-        election_time_data = [(t.time_to_elect_leader,) for t in tasks if t.time_to_elect_leader is not None]
-        latency_data = [(latency,) for latency in scheduling_latency]
-
-        with open('wait_time.csv', 'w', newline='') as file:
-            writer = csv.writer(file)
-            writer.writerow(['time_on_queue'])
-            writer.writerows(wait_time_data)
-
-        with open('election_time.csv', 'w', newline='') as file:
-            writer = csv.writer(file)
-            writer.writerow(['time_to_elect_leader'])
-            writer.writerows(election_time_data)
-
-        with open('scheduling_latency.csv', 'w', newline='') as file:
-            writer = csv.writer(file)
-            writer.writerow(['scheduling_latency'])
-            writer.writerows(latency_data)
-
-        # Plotting scheduling latency in red
-        plt.plot(scheduling_latency, 'ro-', label='Scheduling Latency (Waiting Time + Leader Election Time)')
-
-        # Plotting wait time in blue
-        if wait_time_data:
-            wait_times = [data[0] for data in wait_time_data]
-            plt.plot(wait_times, 'bo-', label='Waiting Time')
-
-        # Plotting leader election time in green
-        if election_time_data:
-            election_times = [data[0] for data in election_time_data]
-            plt.plot(election_times, 'go-', label='Leader Election Time')
-
-        # Title with SWARM and number of agents
-        num_agents = len(set([t.leader_agent_id for t in completed_tasks]))
-        plt.title(f'SWARM: Scheduling Latency (Total Agents: {num_agents})')
-
-        plt.xlabel('Task Index')
-        plt.ylabel('Time Units (seconds)')
-        plt.grid(True)
-
-        # Adjusting legend position to avoid overlapping the graph
-        plt.legend(loc='upper left', bbox_to_anchor=(1, 1))  # This places the legend outside the plot area
-
-        # Save the plot
-        plot_path = os.path.join("", 'scheduling-latency.png')
-        plt.savefig(plot_path, bbox_inches='tight')  # bbox_inches='tight' ensures that the entire plot is saved
-        plt.close()
-
-    def plot_results(self):
-        self.logger.info("Plotting Results")
-        if self.agent_id != "0":
-            return
-        self.plot_tasks_per_agent()
-        self.plot_scheduling_latency()
-        self.save_load_to_csv_and_plot(self.load_per_agent)
-        self.save_load_to_csv_and_plot(self.projected_load_per_agent, csv_filename="agent_projected_loads.csv",
-                                       plot_filename="agent_projected_loads.png")
-        self.logger.info("Plot completed")
 
     def __get_proposed_capacities(self):
         proposed_capacities = Capacities()
-        tasks = self.outgoing_proposals.tasks()
-        for task_id in tasks:
-            proposed_task = self.task_queue.get_task(task_id=task_id)
-            proposed_capacities += proposed_task.get_capacities()
-        self.logger.debug(f"Number of outgoing proposals: {len(tasks)}; Tasks: {tasks}")
+        jobs = self.outgoing_proposals.jobs()
+        for job_id in jobs:
+            proposed_job = self.job_queue.get_job(job_id=job_id)
+            proposed_capacities += proposed_job.get_capacities()
+        self.logger.debug(f"Number of outgoing proposals: {len(jobs)}; Jobs: {jobs}")
         return proposed_capacities
 
-    @staticmethod
-    def is_task_feasible(task: Task, total: Capacities, proposed_caps: Capacities = Capacities(),
+    def is_job_feasible(self, job: Job, total: Capacities, projected_load: float,
+                         proposed_caps: Capacities = Capacities(),
                          allocated_caps: Capacities = Capacities()):
+        if projected_load >= self.projected_queue_threshold:
+            return 0
         allocated_caps += proposed_caps
         available = total - allocated_caps
 
-        # Check if the agent can accommodate the given task based on its capacities
+        # Check if the agent can accommodate the given job based on its capacities
         # Compare the requested against available
-        available = available - task.get_capacities()
+        available = available - job.get_capacities()
         negative_fields = available.negative_fields()
         if len(negative_fields) > 0:
             return 0
@@ -553,10 +401,10 @@ class SwarmAgent(Agent):
         return 1
 
     @staticmethod
-    def compute_task_cost(task: Task, total: Capacities, profile: Profile):
-        core_load = (task.capacities.core / total.core) * 100
-        ram_load = (task.capacities.ram / total.ram) * 100
-        disk_load = (task.capacities.disk / total.disk) * 100
+    def compute_job_cost(job: Job, total: Capacities, profile: Profile):
+        core_load = (job.capacities.core / total.core) * 100
+        ram_load = (job.capacities.ram / total.ram) * 100
+        disk_load = (job.capacities.disk / total.disk) * 100
 
         cost = (core_load * profile.core_weight +
                 ram_load * profile.ram_weight +
@@ -564,43 +412,6 @@ class SwarmAgent(Agent):
                                                     profile.ram_weight +
                                                     profile.disk_weight)
         return cost
-
-    @staticmethod
-    def save_load_to_csv_and_plot(load_dict: dict, csv_filename='agent_loads.csv',
-                                  plot_filename='agent_loads_plot.png'):
-        # Find the maximum length of the load lists
-        max_intervals = max(len(loads) for loads in load_dict.values())
-
-        # Save the data to a CSV file
-        with open(csv_filename, mode='w', newline='') as file:
-            writer = csv.writer(file)
-
-            # Write the header (agent IDs)
-            header = ['Time Interval'] + [f'Agent {agent_id}' for agent_id in load_dict.keys()]
-            writer.writerow(header)
-
-            # Write the load data row by row
-            for i in range(max_intervals):
-                row = [i]  # Start with the time interval
-                for agent_id in load_dict.keys():
-                    # Add load or empty string if not available
-                    row.append(load_dict[agent_id][i] if i < len(load_dict[agent_id]) else '')
-                writer.writerow(row)
-
-        # Plot the data
-        plt.figure(figsize=(10, 6))
-
-        for agent_id, loads in load_dict.items():
-            plt.plot(loads, label=f'Agent {agent_id}')
-
-        plt.xlabel('Time Interval')
-        plt.ylabel('Load')
-        plt.title('Agent Loads Over Time')
-        plt.legend()
-        plt.grid(True)
-
-        # Save the plot to a file
-        plt.savefig(plot_filename)
 
     def compute_projected_load(self, overall_load_actual: float, proposed_caps: Capacities):
         if not proposed_caps:

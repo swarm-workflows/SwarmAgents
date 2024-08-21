@@ -13,7 +13,6 @@ class AgentInfo(JSONField):
     def __init__(self, **kwargs):
         self.agent_id = None
         self.load = 0.0
-        self.projected_load = 0.0
         self._capacities = Capacities()
         self._capacity_allocations = Capacities()
         self._set_fields(**kwargs)

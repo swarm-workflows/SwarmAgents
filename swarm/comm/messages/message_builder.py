@@ -5,12 +5,12 @@ from swarm.comm.messages.heart_beat import HeartBeat
 from swarm.comm.messages.message import MessageType, MessageException
 from swarm.comm.messages.prepare import Prepare
 from swarm.comm.messages.proposal import Proposal
-from swarm.comm.messages.task_status import TaskStatus
+from swarm.comm.messages.job_status import JobStatus
 
 
 class MessageBuilder:
     @staticmethod
-    def from_dict(message: dict) -> Tuple[HeartBeat, Proposal, Prepare, Commit, TaskStatus]:
+    def from_dict(message: dict) -> Tuple[HeartBeat, Proposal, Prepare, Commit, JobStatus]:
         message_type = MessageType(message.get('message_type'))
 
         if message_type == MessageType.HeartBeat:
@@ -25,8 +25,8 @@ class MessageBuilder:
         elif message_type == MessageType.Commit:
             return Commit.from_dict(message)
 
-        elif message_type == MessageType.TaskStatus:
-            return TaskStatus.from_dict(message)
+        elif message_type == MessageType.JobStatus:
+            return JobStatus.from_dict(message)
 
         else:
             raise MessageException(f"Unsupported Message: {message}")
