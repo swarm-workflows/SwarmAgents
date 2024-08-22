@@ -296,10 +296,18 @@ class Agent(Observer):
 
         return True
 
-    def compute_overall_load(self, proposed_caps: Capacities = Capacities()):
-        allocated_caps = proposed_caps
+    def compute_overall_load(self, proposed_jobs: List[str] = None):
+        if proposed_jobs is None:
+            proposed_jobs = []
+
+        allocated_caps = Capacities()
         allocated_caps += self.ready_queue.capacities()
         allocated_caps += self.selected_queue.capacities()
+
+        for j in proposed_jobs:
+            if j not in self.ready_queue and j not in self.selected_queue:
+                job = self.job_queue.get_job(job_id=j)
+                allocated_caps += job.capacities
 
         core_load = (allocated_caps.core / self.capacities.core) * 100
         ram_load = (allocated_caps.ram / self.capacities.ram) * 100

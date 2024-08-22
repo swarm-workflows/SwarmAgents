@@ -452,6 +452,12 @@ class JobQueue:
         finally:
             self.lock.release()
 
+    def __contains__(self, job_id):
+        try:
+            return job_id in self.jobs
+        finally:
+            self.lock.release()
+
 
 class JobRepository:
     def __init__(self, redis_client):

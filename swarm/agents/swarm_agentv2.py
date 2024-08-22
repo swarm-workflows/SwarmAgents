@@ -41,7 +41,7 @@ class SwarmAgent(Agent):
         self.number_of_jobs_per_proposal = 3
 
     def _build_heart_beat(self):
-        my_load = self.compute_overall_load(proposed_caps=self.__get_proposed_capacities())
+        my_load = self.compute_overall_load(proposed_jobs=self.outgoing_proposals.jobs())
         agent = AgentInfo(agent_id=self.agent_id,
                           capacities=self.capacities,
                           capacity_allocations=self.ready_queue.capacities(),
@@ -173,7 +173,7 @@ class SwarmAgent(Agent):
         cost_matrix = np.zeros((num_agents, num_jobs))
 
         # Compute costs for the current agent
-        my_load = self.compute_overall_load(proposed_caps=self.__get_proposed_capacities())
+        my_load = self.compute_overall_load(proposed_jobs=self.outgoing_proposals.jobs())
         projected_load = self.compute_projected_load(overall_load_actual=my_load,
                                                      proposed_caps=caps_jobs_selected)
 
@@ -240,7 +240,7 @@ class SwarmAgent(Agent):
         for p in incoming.proposals:
             job = self.job_queue.get_job(job_id=p.job_id)
             if not job or job.is_ready() or job.is_complete() or job.is_running():
-                self.logger.info(f"Ignoring Proposal: {job}")
+                self.logger.info(f"Ignoring Proposal: {p} for job: {job}")
                 continue  # Continue instead of return to process other proposals
 
             my_proposal = self.outgoing_proposals.get_proposal(job_id=p.job_id)
@@ -279,7 +279,7 @@ class SwarmAgent(Agent):
         for p in incoming.proposals:
             job = self.job_queue.get_job(job_id=p.job_id)
             if not job or job.is_ready() or job.is_complete() or job.is_running():
-                self.logger.info(f"Ignoring Prepare: {job}")
+                self.logger.info(f"Ignoring Prepare: {p} for job: {job}")
                 continue  # Continue instead of return to process other proposals
 
             if self.outgoing_proposals.contains(job_id=p.job_id, p_id=p.p_id):
@@ -300,7 +300,7 @@ class SwarmAgent(Agent):
 
                 # Increment the number of commits to count the commit being sent
                 # Needed to handle 3 agent case
-                proposal.commits += 1
+                #proposal.commits += 1
                 proposals.append(proposal)
                 job.change_state(JobState.COMMIT)  # Update job state to COMMIT
 
@@ -315,7 +315,7 @@ class SwarmAgent(Agent):
             job = self.job_queue.get_job(job_id=p.job_id)
 
             if not job or job.is_complete() or job.is_ready() or job.is_running() or job.leader_agent_id:
-                self.logger.info(f"Ignoring Commit: {job}")
+                self.logger.info(f"Ignoring Commit: {p} for job: {job}")
                 self.incoming_proposals.remove_job(job_id=p.job_id)
                 self.outgoing_proposals.remove_job(job_id=p.job_id)
                 continue  # Continue instead of return to process other proposals
