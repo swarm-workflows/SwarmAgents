@@ -203,6 +203,27 @@ class SwarmAgent(Agent):
 
     def __find_min_cost_agents(self, cost_matrix: np.ndarray) -> list:
         """
+        Find the agents with the minimum cost for each job, excluding those with infinite costs.
+        :param cost_matrix: A 2D numpy array where each entry [i, j] is the cost of agent i for job j.
+        :return: A list of agent IDs corresponding to the minimum cost for each job.
+        """
+        min_cost_agents = []
+        agent_ids = [self.agent_id] + [peer.agent_id for peer in self.neighbor_map.values()]
+
+        for j in range(cost_matrix.shape[1]):  # Iterate over each job (column)
+            valid_costs = cost_matrix[:, j]  # Get the costs for job j
+            finite_costs = valid_costs[valid_costs != float('inf')]  # Filter out infinite costs
+
+            if len(finite_costs) > 0:  # If there are any finite costs
+                min_index = np.argmin(finite_costs)  # Find the index of the minimum cost
+                original_index = np.where(valid_costs == finite_costs[min_index])[0][0]  # Get the original index
+                min_cost_agents.append(agent_ids[original_index])
+
+        return min_cost_agents
+
+    '''
+    def __find_min_cost_agents(self, cost_matrix: np.ndarray) -> list:
+        """
         Find the agents with the minimum cost for each job.
         :param cost_matrix: A 2D numpy array where each entry [i, j] is the cost of agent i for job j.
         :return: A list of agent IDs corresponding to the minimum cost for each job.
@@ -215,6 +236,7 @@ class SwarmAgent(Agent):
         min_cost_agents = [agent_ids[i] for i in min_cost_indices]
 
         return min_cost_agents
+    '''
 
     def __can_select_job(self, job: Job, caps_jobs_selected: Capacities) -> bool:
         """
@@ -228,7 +250,7 @@ class SwarmAgent(Agent):
         """
         cost_matrix = self.__compute_cost_matrix([job], caps_jobs_selected)
         min_cost_agents = self.__find_min_cost_agents(cost_matrix)
-        if min_cost_agents[0] == self.agent_id:
+        if len(min_cost_agents) and min_cost_agents[0] == self.agent_id:
             return True
         self.logger.info(f"Job: {job} not selected for consensus!")
         return False
