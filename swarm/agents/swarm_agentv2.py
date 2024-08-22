@@ -261,6 +261,9 @@ class SwarmAgent(Agent):
                 if peer_proposal:
                     self.incoming_proposals.remove_proposal(p_id=peer_proposal.p_id, job_id=p.job_id)
 
+                # Increment the number of prepares to count the prepare being sent
+                # Needed to handle 3 agent case
+                proposal.prepares += 1
                 self.incoming_proposals.add_proposal(proposal=proposal)
                 proposals.append(proposal)
                 job.change_state(JobState.PREPARE)  # Ensure this is where you want the state to change
@@ -294,6 +297,10 @@ class SwarmAgent(Agent):
             if proposal.prepares >= quorum_count:
                 self.logger.info(f"Agent: {self.agent_id} Job: {p.job_id} received quorum "
                                  f"prepares: {proposal.prepares}, starting commit!")
+
+                # Increment the number of commits to count the commit being sent
+                # Needed to handle 3 agent case
+                proposal.commits += 1
                 proposals.append(proposal)
                 job.change_state(JobState.COMMIT)  # Update job state to COMMIT
 
