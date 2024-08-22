@@ -226,6 +226,7 @@ class Agent(Observer):
     def is_job_feasible(self, job: Job, total: Capacities, projected_load: float,
                         proposed_caps: Capacities = Capacities(),
                         allocated_caps: Capacities = Capacities()):
+        self.logger.info(f"KOMAL -projected_load-- {projected_load}")
         if projected_load >= self.projected_queue_threshold:
             return 0
         allocated_caps += proposed_caps
@@ -312,6 +313,11 @@ class Agent(Observer):
         core_load = (allocated_caps.core / self.capacities.core) * 100
         ram_load = (allocated_caps.ram / self.capacities.ram) * 100
         disk_load = (allocated_caps.disk / self.capacities.disk) * 100
+
+        self.logger.info(f"KOMAL -Ready Queue-- {self.ready_queue.jobs}")
+        self.logger.info(f"KOMAL -Select Queue-- {self.selected_queue.jobs}")
+        self.logger.info(f"KOMAL -Proposed Queue-- {proposed_jobs}")
+        self.logger.info(f"KOMAL -Allocated Caps-- {allocated_caps}")
 
         overall_load = (core_load * self.profile.core_weight +
                         ram_load * self.profile.ram_weight +
