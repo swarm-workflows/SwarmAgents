@@ -221,23 +221,6 @@ class SwarmAgent(Agent):
 
         return min_cost_agents
 
-    '''
-    def __find_min_cost_agents(self, cost_matrix: np.ndarray) -> list:
-        """
-        Find the agents with the minimum cost for each job.
-        :param cost_matrix: A 2D numpy array where each entry [i, j] is the cost of agent i for job j.
-        :return: A list of agent IDs corresponding to the minimum cost for each job.
-        """
-        # Find the index of the minimum cost for each job (column)
-        min_cost_indices = np.argmin(cost_matrix, axis=0)
-
-        # Map the indices back to agent IDs
-        agent_ids = [self.agent_id] + [peer.agent_id for peer in self.neighbor_map.values()]
-        min_cost_agents = [agent_ids[i] for i in min_cost_indices]
-
-        return min_cost_agents
-    '''
-
     def __can_select_job(self, job: Job, caps_jobs_selected: Capacities) -> bool:
         """
         Check if agent has enough resources to become a leader
