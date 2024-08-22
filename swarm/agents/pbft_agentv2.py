@@ -18,8 +18,15 @@ class PBFTAgent(Agent):
         super().__init__(agent_id, config_file, cycles)
         self.outgoing_proposals = ProposalContainer()
         self.incoming_proposals = ProposalContainer()
-        self.shutdown_heartbeat = False
-        self.last_msg_received_timestamp = 0
+
+    def _build_heart_beat(self):
+        my_load = self.compute_overall_load(proposed_jobs=self.outgoing_proposals.jobs())
+        agent = AgentInfo(agent_id=self.agent_id,
+                          capacities=self.capacities,
+                          capacity_allocations=self.ready_queue.capacities(),
+                          load=my_load)
+        self._save_load_metric(self.agent_id, my_load)
+        return HeartBeat(agent=agent)
 
     def _process_messages(self, *, messages: List[dict]):
         for message in messages:
@@ -78,7 +85,8 @@ class PBFTAgent(Agent):
                         if job.get_leader_agent_id() is None:
                             proposal1 = self.outgoing_proposals.get_proposal(job_id=job.get_job_id())
                             proposal2 = self.incoming_proposals.get_proposal(job_id=job.get_job_id())
-                            self.logger.debug(f"Job: {job.job_id} State: {job.state}; out: {proposal1} in: {proposal2} skipping it!")
+                            self.logger.debug(
+                                f"Job: {job.job_id} State: {job.state}; out: {proposal1} in: {proposal2} skipping it!")
                         continue
 
                     processed += 1
@@ -88,7 +96,6 @@ class PBFTAgent(Agent):
                     time.sleep(election_timeout)
 
                     if self.__can_select_job(job=job):
-
                         # Send proposal to all neighbors
                         proposal = ProposalInfo(p_id=self.generate_id(), job_id=job.get_job_id(),
                                                 agent_id=self.agent_id)
@@ -136,7 +143,7 @@ class PBFTAgent(Agent):
         :param job:
         :return: True or False
         """
-        my_load = self.compute_overall_load()
+        my_load = self.compute_overall_load(proposed_jobs=self.outgoing_proposals.jobs())
         least_loaded_neighbor = self.__find_neighbor_with_lowest_load()
 
         if least_loaded_neighbor and least_loaded_neighbor.load < my_load:
@@ -146,11 +153,15 @@ class PBFTAgent(Agent):
 
         feasibility = self.is_job_feasible(job=job, total=self.capacities, projected_load=my_load)
         incoming = self.incoming_proposals.contains(job_id=job.get_job_id())
-        if not incoming and feasibility:
-            return True
+        if incoming or not feasibility:
+            self.logger.info(
+                f"__can_select_job: Either infeasible job or already accepted proposal from another agent "
+                f"feasibility: {feasibility} incoming:{incoming} my_load: {my_load}")
+            return False
+
         self.logger.info(
             f"__can_select_job: feasibility: {feasibility} incoming:{incoming} my_load: {my_load}")
-        return False
+        return True
 
     def __receive_proposal(self, incoming: dict):
         peer_agent_id = incoming.get("agent_id")
@@ -163,7 +174,7 @@ class PBFTAgent(Agent):
 
         job = self.job_queue.get_job(job_id=job_id)
         if not job or job.is_ready() or job.is_complete() or job.is_running():
-            self.logger.info(f"Ignoring Proposal: {job}")
+            self.logger.info(f"Ignoring Prepare: {proposal_id} for job: {job}")
             return
 
         #can_accept_job = self.can_accommodate_job(job=job)
@@ -198,6 +209,9 @@ class PBFTAgent(Agent):
             if peer_proposal:
                 self.incoming_proposals.remove_proposal(p_id=peer_proposal.p_id, job_id=job_id)
 
+            # Increment the number of prepares to count the prepare being sent
+            # Needed to handle 3 agent case
+            proposal.prepares += 1
             self.incoming_proposals.add_proposal(proposal=proposal)
             self.send_message(message_type=MessageType.Prepare, job_id=job_id, proposal_id=proposal_id)
             job.change_state(JobState.PREPARE)
@@ -227,8 +241,7 @@ class PBFTAgent(Agent):
             self.incoming_proposals.add_proposal(proposal=proposal)
 
         proposal.prepares += 1
-
-        quorum_count = (len(self.neighbor_map)) / 2
+        quorum_count = (len(self.neighbor_map) // 2) + 1  # Ensure a true majority
         job.change_state(JobState.PREPARE)
 
         # Check if vote count is more than quorum
@@ -265,7 +278,7 @@ class PBFTAgent(Agent):
             self.incoming_proposals.add_proposal(proposal=proposal)
 
         proposal.commits += 1
-        quorum_count = (len(self.neighbor_map)) / 2
+        quorum_count = (len(self.neighbor_map) // 2) + 1  # Ensure a true majority
 
         if proposal.commits >= quorum_count:
             self.logger.info(
@@ -310,7 +323,7 @@ class PBFTAgent(Agent):
         message = {
             "message_type": message_type.value,
             "agent_id": self.agent_id,
-            "load": self.compute_overall_load()
+            "load": self.compute_overall_load(proposed_jobs=self.outgoing_proposals.jobs())
         }
 
         if job_id:
@@ -324,12 +337,3 @@ class PBFTAgent(Agent):
 
         # Produce the message to the Kafka topic
         self.message_service.produce_message(message)
-
-    def __get_proposed_capacities(self):
-        proposed_capacities = Capacities()
-        jobs = self.outgoing_proposals.jobs()
-        for job_id in jobs:
-            proposed_job = self.job_queue.get_job(job_id=job_id)
-            proposed_capacities += proposed_job.get_capacities()
-        self.logger.debug(f"Number of outgoing proposals: {len(jobs)}; Jobs: {jobs}")
-        return proposed_capacities

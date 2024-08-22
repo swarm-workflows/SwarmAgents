@@ -21,18 +21,6 @@ from swarm.models.job import Job, JobState
 import numpy as np
 
 
-class IterableQueue:
-    def __init__(self, *, source_queue: Queue):
-        self.source_queue = source_queue
-
-    def __iter__(self):
-        while True:
-            try:
-                yield self.source_queue.get_nowait()
-            except Empty:
-                return
-
-
 class SwarmAgent(Agent):
     def __init__(self, agent_id: str, config_file: str, cycles: int):
         super().__init__(agent_id, config_file, cycles)

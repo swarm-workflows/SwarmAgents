@@ -21,18 +21,6 @@ from swarm.models.job import Job, JobState
 import numpy as np
 
 
-class IterableQueue:
-    def __init__(self, *, source_queue: Queue):
-        self.source_queue = source_queue
-
-    def __iter__(self):
-        while True:
-            try:
-                yield self.source_queue.get_nowait()
-            except Empty:
-                return
-
-
 class SwarmAgent(Agent):
     def __init__(self, agent_id: str, config_file: str, cycles: int):
         super().__init__(agent_id, config_file, cycles)
@@ -212,7 +200,7 @@ class SwarmAgent(Agent):
         for p in incoming.proposals:
             job = self.job_queue.get_job(job_id=p.job_id)
             if not job or job.is_ready() or job.is_complete() or job.is_running():
-                self.logger.info(f"Ignoring Proposal: {job}")
+                self.logger.info(f"Ignoring Proposal: {p} for job: {job}")
                 return
 
             my_proposal = self.outgoing_proposals.get_proposal(job_id=p.job_id)
@@ -249,7 +237,7 @@ class SwarmAgent(Agent):
         for p in incoming.proposals:
             job = self.job_queue.get_job(job_id=p.job_id)
             if not job or job.is_ready() or job.is_complete() or job.is_running():
-                self.logger.info(f"Ignoring Prepare: {job}")
+                self.logger.info(f"Ignoring Prepare: {p} for job: {job}")
                 return
 
             # Update the prepare votes
