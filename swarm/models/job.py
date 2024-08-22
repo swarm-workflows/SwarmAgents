@@ -454,6 +454,7 @@ class JobQueue:
 
     def __contains__(self, job_id):
         try:
+            self.lock.acquire()
             return job_id in self.jobs
         finally:
             self.lock.release()
