@@ -37,9 +37,14 @@ Each agent strives to become the leader for executing a task based on the follow
 PBFT consensus works with smaller number of agents but struggles to scale efficiently as the number of agents increases, due to its communication complexity.
 However, it's resilient and fault tolerant.
 
-![Scheduling latency - 3 agents](./runs/pbft/3/scheduling-latency.png)
-![Scheduling latency - 5 agents](./runs/pbft/5/scheduling-latency.png)
-![Scheduling latency - 10 agents](./runs/pbft/10/scheduling-latency.png)
+![Scheduling latency - 3 agents](./runs/pbft/3/job_latency.png)
+![Projected Load per Agent - 3 agents](./runs/pbft/3/agent_loads_plot.png)  
+
+![Scheduling latency - 5 agents](./runs/pbft/5/job_latency.png)
+![Projected Load per Agent - 5 agents](./runs/pbft/5/agent_loads_plot.png)  
+
+![Scheduling latency - 10 agents](./runs/pbft/10/job_latency.png)
+![Projected Load per Agent - 10 agents](./runs/pbft/10/agent_loads_plot.png)  
 
 ![Scheduling latency comparison - Number of agents](./runs/pbft/overall-scheduling-latency.png)
 ### Usage
@@ -83,11 +88,21 @@ Each agent utilizes a cost matrix to determine whether it should become the lead
 - Greedy approach with random seed used to resolve proposal collisions shows improvement over basic PBFT.
 - Job selection is triggered for only single job at a time
 
-![Scheduling latency - 3 agents](./runs/swarm/3/scheduling-latency.png)
-![Scheduling latency - 5 agents](./runs/swarm/5/scheduling-latency.png)
-![Scheduling latency - 10 agents](./runs/swarm/10/scheduling-latency.png)
+#### Greedy Approach with Random seed and multiple task
+- Greedy approach with random seed used to resolve proposal collisions shows improvement over basic PBFT.
+- Job selection is triggered for upto 3 jobs at a time
 
-![Scheduling latency comparison - Number of agents](./runs/swarm/overall-scheduling-latency.png)
+
+|            | Greedy Approach (Single Task)                                                                    | Greedy Approach (Multiple Task)                                                                                             |
+|------------|--------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------|
+| Scheduling Latency - 3 Agents   | ![Scheduling latency - 3 agents](./runs/swarm/single-job/3/job_latency.png)                          | ![Scheduling latency - 3 agents](./runs/swarm/multi-jobs/3/job_latency.png)                          |
+| Projected Load per Agent - 3 Agents   | ![Projected Load per Agent - 3 agents](./runs/swarm/single-job/3/agent_loads_plot.png)         | ![Projected Load per Agent - 3 agents](./runs/swarm/single-job/3/agent_loads_plot.png)|
+| Scheduling Latency - 5 Agents   | ![Scheduling latency - 5 agents](./runs/swarm/single-job/5/job_latency.png)                          | ![Scheduling latency - 5 agents](./runs/swarm/multi-jobs/5/job_latency.png)                          | 
+| Projected Load per Agent - 5 Agents   | ![Projected Load per Agent - 5 agents](./runs/swarm/single-job/5/agent_loads_plot.png)         | ![Projected Load per Agent - 5 agents](./runs/swarm/single-job/5/agent_loads_plot.png) |
+| Scheduling Latency - 10 Agents  | ![Scheduling latency - 10 agents](./runs/swarm/single-job/10/job_latency.png)                        | ![Scheduling latency - 10 agents](./runs/swarm/multi-jobs/10/job_latency.png)                        | 
+| Projected Load per Agent - 10 Agents   | ![Projected Load per Agent - 10 agents](./runs/swarm/single-job/10/agent_loads_plot.png)      | ![Projected Load per Agent - 5 agents](./runs/swarm/single-job/10/agent_loads_plot.png)                          |
+| Scheduling Latency - Overall    | ![Scheduling latency comparison - Number of agents](./runs/swarm/single-job/overall-scheduling-latency.png) | ![Scheduling latency comparison - Number of agents](./runs/swarm/multi-jobs/overall-scheduling-latency.png) |
+
 ### Usage
 - Set up the python environment by installing all the dependencies:
 ```

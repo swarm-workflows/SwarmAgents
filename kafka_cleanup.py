@@ -4,7 +4,7 @@ import redis
 from confluent_kafka.admin import AdminClient, NewTopic
 from confluent_kafka import Consumer, TopicPartition
 
-from swarm.models.task import TaskRepository
+from swarm.models.job import JobRepository
 
 
 def delete_topic(admin_client, topic_name):
@@ -43,5 +43,5 @@ if __name__ == '__main__':
     time.sleep(5)
 
     redis_client = redis.StrictRedis(host="127.0.0.1", port=6379, decode_responses=True)
-    task_repo = TaskRepository(redis_client=redis_client)
+    task_repo = JobRepository(redis_client=redis_client)
     task_repo.delete_all(key_prefix="*")

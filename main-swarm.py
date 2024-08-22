@@ -5,14 +5,14 @@ import threading
 import time
 from typing import List
 
-from swarm.agents.swarm_agent import SwarmAgent
+from swarm.agents.swarm_agentv2 import SwarmAgent
 from swarm.models.capacities import Capacities
 from swarm.models.data_node import DataNode
-from swarm.models.task import Task
+from swarm.models.job import Job
 
 
 class TaskDistributor(threading.Thread):
-    def __init__(self, agents: List[SwarmAgent], task_pool: List[Task], tasks_per_interval: int, interval: int):
+    def __init__(self, agents: List[SwarmAgent], task_pool: List[Job], tasks_per_interval: int, interval: int):
         super().__init__()
         self.agents = agents
         self.task_pool = task_pool
@@ -25,7 +25,7 @@ class TaskDistributor(threading.Thread):
             tasks_to_add = [self.task_pool.pop() for _ in range(min(self.tasks_per_interval, len(self.task_pool)))]
             for agent in self.agents:
                 for task in tasks_to_add:
-                    agent.task_queue.add_task(task)
+                    agent.job_queue.add_job(task)
             #time.sleep(random.uniform(0.1, 3.0))
             time.sleep(0.5)
 
@@ -38,8 +38,8 @@ def build_tasks_from_json(json_file):
     with open(json_file, 'r') as f:
         data = json.load(f)
         for task_data in data:
-            task = Task()
-            task.set_task_id(task_data['id'])
+            task = Job()
+            task.set_job_id(task_data['id'])
             task.set_capacities(Capacities.from_dict(task_data['capacities']))
             task.no_op = task_data['no_op']
             for data_in in task_data['data_in']:

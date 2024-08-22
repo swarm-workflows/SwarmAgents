@@ -6,7 +6,7 @@ import argparse
 
 import redis
 
-from swarm.models.task import TaskRepository, Task
+from swarm.models.job import JobRepository, Job
 
 
 class TaskGenerator:
@@ -18,7 +18,7 @@ class TaskGenerator:
         :param task_count: Max Task Count
         """
         self.redis_client = redis.StrictRedis(host=host, port=port, decode_responses=True)
-        self.task_repository = TaskRepository(self.redis_client)
+        self.task_repository = JobRepository(self.redis_client)
         self.task_count = task_count
         self.shutdown_flag = threading.Event()
         self.thread = threading.Thread(target=self.run, daemon=True, name="TaskGenerator")
@@ -63,9 +63,9 @@ class TaskGenerator:
 
     def generate_and_store_task(self, x):
         task_data = self.generate_task(x)
-        task = Task()
+        task = Job()
         task.from_dict(task_data)
-        self.task_repository.save_task(task)
+        self.task_repository.save_job(task)
 
     def run(self):
         x = 0

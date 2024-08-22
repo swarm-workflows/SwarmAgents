@@ -7,7 +7,7 @@ import sys
 
 from swarm.models.capacities import Capacities
 from swarm.models.data_node import DataNode
-from swarm.models.task import Task, TaskRepository
+from swarm.models.job import Job, JobRepository
 
 
 class TaskDistributor(threading.Thread):
@@ -20,14 +20,14 @@ class TaskDistributor(threading.Thread):
         self.interval = interval
         self.shutdown_flag = threading.Event()
         self.redis_client = redis.StrictRedis(host=self.redis_host, port=self.redis_port, decode_responses=True)
-        self.task_repo = TaskRepository(self.redis_client)
+        self.task_repo = JobRepository(self.redis_client)
 
     def run(self):
         self.task_repo.delete_all()
         while not self.shutdown_flag.is_set() and self.task_pool:
             tasks_to_add = [self.task_pool.pop() for _ in range(min(self.tasks_per_interval, len(self.task_pool)))]
             for task in tasks_to_add:
-                self.task_repo.save_task(task)
+                self.task_repo.save_job(task)
             time.sleep(random.uniform(0.1, 1.0))
 
     def stop(self):
@@ -39,8 +39,8 @@ def load_tasks_from_json(file_path):
     with open(file_path, 'r') as f:
         data = json.load(f)
         for task_data in data:
-            task = Task()
-            task.set_task_id(task_data['id'])
+            task = Job()
+            task.set_job_id(task_data['id'])
             task.set_capacities(Capacities.from_dict(task_data['capacities']))
             task.no_op = task_data['no_op']
             for data_in in task_data['data_in']:

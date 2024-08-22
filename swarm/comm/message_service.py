@@ -9,23 +9,9 @@ from abc import ABC, abstractmethod
 from confluent_kafka import Producer, Consumer, TopicPartition
 
 
-class MessageType(enum.Enum):
-    HeartBeat = enum.auto()   #1
-    TaskStatus = enum.auto()  #2
-    Proposal = enum.auto()    #3
-    Prepare = enum.auto()     #4
-    Commit = enum.auto()      #5
-
-    def __repr__(self):
-        return self.name
-
-    def __str__(self):
-        return self.name
-
-
 class Observer(ABC):
     @abstractmethod
-    def process_message(self, message):
+    def process_message(self, message: str):
         """
         Process incoming message
         :param message:
@@ -83,7 +69,8 @@ class MessageService:
         lag = 1
         offsets = []
         logging.getLogger().info("Consumer thread started")
-        while not self.shutdown or lag:
+        #while not self.shutdown or lag:
+        while not self.shutdown:
             try:
                 msg = self.consumer.poll(1.0)
                 if msg is None:

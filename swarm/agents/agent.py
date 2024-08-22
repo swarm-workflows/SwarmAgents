@@ -1,41 +1,176 @@
+import csv
 import hashlib
 import json
 import logging
 import os
+import queue
 import random
 import socket
 import string
 import threading
 import time
 import traceback
+from abc import abstractmethod
 from logging.handlers import RotatingFileHandler
+from typing import List
 
 import psutil as psutil
 import yaml
+from matplotlib import pyplot as plt
 
-from swarm.comm.message_service import MessageService, Observer, MessageType
+from swarm.comm.messages.heart_beat import HeartBeat
+from swarm.comm.messages.message import MessageType
+from swarm.comm.message_service import MessageService, Observer
 from swarm.models.capacities import Capacities
+from swarm.models.agent_info import AgentInfo
 from swarm.models.profile import ProfileType, PROFILE_MAP
-from swarm.models.task import Task, TaskQueue
+from swarm.models.job import Job, JobQueue
+
+
+class IterableQueue:
+    def __init__(self, *, source_queue: queue.Queue):
+        self.source_queue = source_queue
+
+    def __iter__(self):
+        while True:
+            try:
+                yield self.source_queue.get_nowait()
+            except queue.Empty:
+                return
 
 
 class Agent(Observer):
     def __init__(self, agent_id: str, config_file: str, cycles: int):
         self.agent_id = agent_id
-        self.task_queue = TaskQueue()
-        self.allocated_tasks = TaskQueue()
-        self.completed_tasks = TaskQueue()
+        self.job_queue = JobQueue()
+        self.selected_queue = JobQueue()
+        self.ready_queue = JobQueue()
+        self.done_queue = JobQueue()
         self.last_updated = time.time()
         self.neighbor_map = {}  # Store neighbor information
         self.profile = None
         self.data_transfer = True
         self.kafka_config = {}
-        self.max_pending_elections = 3
         self.logger = None
         self.load_config(config_file)
         self.capacities = self.get_system_info()
         self.message_service = MessageService(config=self.kafka_config, logger=self.logger)
+        self.load_per_agent = {}
         self.cycles = cycles
+        self.message_queue = queue.Queue()
+        self.condition = threading.Condition()
+        self.shutdown = False
+        self.heartbeat_thread = threading.Thread(target=self._heartbeat_main,
+                                                 daemon=True, name="HeartBeatThread")
+        self.msg_processor_thread = threading.Thread(target=self._message_processor_main,
+                                                     daemon=True, name="MsgProcessorThread")
+        self.job_selection_thread = threading.Thread(target=self.job_selection_main,
+                                                     daemon=True, name="JobSelectionThread")
+
+        self.job_scheduling_thread = threading.Thread(target=self.job_scheduling_main,
+                                                      daemon=True, name="JobSchedulingThread")
+        self.projected_queue_threshold = 300.00
+        self.ready_queue_threshold = 100.00
+
+    def __enqueue(self, incoming: str):
+        try:
+            message = json.loads(incoming)
+
+            if "agent" in message:
+                source_agent_id = message.get("agent").get("agent_id")
+            else:
+                source_agent_id = message.get("agent_id")
+
+            if source_agent_id == self.agent_id:
+                return
+
+            self.message_queue.put_nowait(message)
+            with self.condition:
+                self.condition.notify_all()
+            self.logger.debug(f"Added incoming message to queue: {incoming}")
+        except Exception as e:
+            self.logger.debug(f"Failed to add incoming message to queue: {incoming}: e: {e}")
+
+    def __dequeue(self, queue_obj: queue.Queue) -> List[dict]:
+        events = []
+        if not queue_obj.empty():
+            try:
+                for event in IterableQueue(source_queue=queue_obj):
+                    events.append(event)
+            except Exception as e:
+                self.logger.error(f"Error while adding message to queue! e: {e}")
+                self.logger.error(traceback.format_exc())
+        return events
+
+    def process_message(self, message: str):
+        self.__enqueue(incoming=message)
+
+    def _receive_heartbeat(self, incoming: HeartBeat):
+        self.neighbor_map[incoming.agent.agent_id] = incoming.agent
+        self.last_msg_received_timestamp = time.time()
+        self._save_load_metric(incoming.agent.agent_id, incoming.agent.load)
+        temp = ""
+        for p in self.neighbor_map.values():
+            temp += f"[{p}],"
+        self.logger.info(f"Received Heartbeat from Agent: MAP:: {temp}")
+
+    def _save_load_metric(self, agent_id: str, load: float):
+        if agent_id not in self.load_per_agent:
+            self.load_per_agent[agent_id] = []
+        self.load_per_agent[agent_id].append(load)
+
+    def _build_heart_beat(self):
+        my_load = self.compute_overall_load()
+        agent = AgentInfo(agent_id=self.agent_id,
+                          capacities=self.capacities,
+                          capacity_allocations=self.ready_queue.capacities(),
+                          load=my_load)
+        self._save_load_metric(self.agent_id, my_load)
+        return HeartBeat(agent=agent)
+
+    def _heartbeat_main(self):
+        while not self.shutdown:
+            try:
+                self.message_service.produce_message(self._build_heart_beat().to_dict())
+                time.sleep(5)
+            except Exception as e:
+                self.logger.error(f"Error occurred while sending heartbeat e: {e}")
+                self.logger.error(traceback.format_exc())
+
+    def _message_processor_main(self):
+        self.logger.info("Message Processor Started")
+        while True:
+            try:
+                with self.condition:
+                    while not self.shutdown and self.message_queue.empty():
+                        self.condition.wait()
+
+                if self.shutdown:
+                    break
+
+                messages = self.__dequeue(self.message_queue)
+                self._process_messages(messages=messages)
+            except Exception as e:
+                self.logger.error(f"Error occurred while processing message e: {e}")
+                self.logger.error(traceback.format_exc())
+        self.logger.info("Message Processor Stopped")
+
+    def _process_messages(self, *, messages: List[dict]):
+        for message in messages:
+            try:
+                begin = time.time()
+                message_type = message.get('message_type')
+                if message_type == str(MessageType.HeartBeat):
+                    incoming = HeartBeat.from_dict(message)
+                    self._receive_heartbeat(incoming=incoming)
+                else:
+                    self.logger.info(f"Ignoring unsupported message: {message}")
+                diff = int(time.time() - begin)
+                if diff > 0:
+                    self.logger.info(f"Event {message.get('message_type')} TIME: {diff}")
+            except Exception as e:
+                self.logger.error(f"Error while processing message {type(message)}, {e}")
+                self.logger.error(traceback.format_exc())
 
     def load_config(self, config_file):
         with open(config_file, 'r') as f:
@@ -50,7 +185,6 @@ class Agent(Observer):
             profile_name = runtime_config.get("profile", str(ProfileType.BalancedProfile))
             self.profile = PROFILE_MAP.get(profile_name)
             self.data_transfer = runtime_config.get("data_transfer", True)
-            self.max_pending_elections = runtime_config.get("max_pending_elections", True)
 
             log_config = config.get("logging")
             self.logger = self.make_logger(log_dir=log_config.get("log-directory"),
@@ -59,29 +193,6 @@ class Agent(Observer):
                                            log_retain=log_config.get("log-retain"),
                                            log_size=log_config.get("log-size"),
                                            log_level=log_config.get("log-level"))
-
-    def process_message(self, message):
-        try:
-            # Parse the message as JSON
-            incoming = json.loads(message)
-            agent_id = incoming.get("agent_id")
-            if agent_id == self.agent_id:
-                return
-            self.logger.info(f"Consumer received message: {incoming}")
-
-            msg_type = incoming.get('msg_type')
-            if msg_type == str(MessageType.HeartBeat):
-                # Extract neighbor information
-                neighbor_id = incoming.get("agent_id")
-                neighbor_load = incoming.get("load")
-                # Update neighbor map
-                self.logger.info(f"Message received: {message}")
-                self.neighbor_map[neighbor_id] = neighbor_load
-            else:
-                self.logger.info(f"Ignoring unsupported message: {message}")
-        except Exception as e:
-            self.logger.error(f"Error while processing incoming message: {message}: {e}")
-            self.logger.error(traceback.format_exc())
 
     @staticmethod
     def get_system_info():
@@ -112,38 +223,91 @@ class Agent(Observer):
         except (socket.gaierror, socket.timeout, OSError):
             return False
 
-    def can_accommodate_task(self, task: Task, proposed_caps: Capacities = None):
-        allocated_caps = self.allocated_tasks.capacities()
-        if proposed_caps:
-            allocated_caps += proposed_caps
-        available = self.capacities - allocated_caps
-        #self.logger.debug(f"Agent Total Capacities: {self.capacities}")
-        #self.logger.debug(f"Agent Allocated Capacities: {allocated_caps}")
-        #self.logger.debug(f"Agent Available Capacities: {available}")
-        #self.logger.debug(f"Task: {task.get_task_id()} Requested capacities: {task.get_capacities()}")
+    def is_job_feasible(self, job: Job, total: Capacities, projected_load: float,
+                        proposed_caps: Capacities = Capacities(),
+                        allocated_caps: Capacities = Capacities()):
+        if projected_load >= self.projected_queue_threshold:
+            return 0
+        allocated_caps += proposed_caps
+        available = total - allocated_caps
 
-        # Check if the agent can accommodate the given task based on its capacities
+        # Check if the agent can accommodate the given job based on its capacities
         # Compare the requested against available
-        available = available - task.get_capacities()
+        available = available - job.get_capacities()
+        negative_fields = available.negative_fields()
+        if len(negative_fields) > 0:
+            return 0
+
+        if self.data_transfer:
+            for data_node in job.get_data_in():
+                if not self.is_reachable(hostname=data_node.get_remote_ip()):
+                    return 0
+
+            for data_node in job.get_data_out():
+                if not self.is_reachable(hostname=data_node.get_remote_ip()):
+                    return 0
+        return 1
+
+    def can_accommodate_job(self, job: Job, only_total: bool = False):
+        if only_total:
+            available = self.capacities
+        else:
+            allocated_caps = self.ready_queue.capacities()
+            allocated_caps += self.selected_queue.capacities()
+            available = self.capacities - allocated_caps
+
+        # Check if the agent can accommodate the given job based on its capacities
+        # Compare the requested against available
+        available = available - job.get_capacities()
         negative_fields = available.negative_fields()
         if len(negative_fields) > 0:
             return False
 
         if self.data_transfer:
-            for data_node in task.get_data_in():
+            for data_node in job.get_data_in():
                 if not self.is_reachable(hostname=data_node.get_remote_ip()):
                     return False
 
-            for data_node in task.get_data_out():
+            for data_node in job.get_data_out():
                 if not self.is_reachable(hostname=data_node.get_remote_ip()):
                     return False
 
         return True
 
-    def compute_overall_load(self, proposed_caps: Capacities = None):
-        allocated_caps = self.allocated_tasks.capacities()
-        if proposed_caps:
-            allocated_caps += proposed_caps
+    def can_schedule_job(self, job: Job):
+        allocated_caps = self.ready_queue.capacities()
+        available = self.capacities - allocated_caps
+
+        # Check if the agent can accommodate the given job based on its capacities
+        # Compare the requested against available
+        available = available - job.get_capacities()
+        negative_fields = available.negative_fields()
+        if len(negative_fields) > 0:
+            return False
+
+        if self.data_transfer:
+            for data_node in job.get_data_in():
+                if not self.is_reachable(hostname=data_node.get_remote_ip()):
+                    return False
+
+            for data_node in job.get_data_out():
+                if not self.is_reachable(hostname=data_node.get_remote_ip()):
+                    return False
+
+        return True
+
+    def compute_overall_load(self, proposed_jobs: List[str] = None):
+        if proposed_jobs is None:
+            proposed_jobs = []
+
+        allocated_caps = Capacities()
+        allocated_caps += self.ready_queue.capacities()
+        allocated_caps += self.selected_queue.capacities()
+
+        for j in proposed_jobs:
+            if j not in self.ready_queue and j not in self.selected_queue:
+                job = self.job_queue.get_job(job_id=j)
+                allocated_caps += job.capacities
 
         core_load = (allocated_caps.core / self.capacities.core) * 100
         ram_load = (allocated_caps.ram / self.capacities.ram) * 100
@@ -156,24 +320,44 @@ class Agent(Observer):
                                                                  self.profile.disk_weight)
         return overall_load
 
-    def allocate_task(self, task: Task):
-        print(f"Executing: {task.get_task_id()} on agent: {self.agent_id}")
-        self.logger.info(f"Executing: {task.get_task_id()} on agent: {self.agent_id}")
-        # Add the task to the list of allocated tasks
-        self.allocated_tasks.add_task(task=task)
+    def compute_ready_queue_load(self):
+        allocated_caps = self.ready_queue.capacities()
 
-        # Launch a thread to execute the task
-        thread = threading.Thread(target=self.execute_task, args=(task,))
+        core_load = (allocated_caps.core / self.capacities.core) * 100
+        ram_load = (allocated_caps.ram / self.capacities.ram) * 100
+        disk_load = (allocated_caps.disk / self.capacities.disk) * 100
+
+        overall_load = (core_load * self.profile.core_weight +
+                        ram_load * self.profile.ram_weight +
+                        disk_load * self.profile.disk_weight) / (self.profile.core_weight +
+                                                                 self.profile.ram_weight +
+                                                                 self.profile.disk_weight)
+        return overall_load
+
+    def select_job(self, job: Job):
+        print(f"Adding: {job.get_job_id()} on agent: {self.agent_id} to Select Queue")
+        self.logger.info(f"Adding: {job.get_job_id()} on agent: {self.agent_id} to Select Queue")
+        # Add the job to the list of allocated jobs
+        self.selected_queue.add_job(job=job)
+
+    def schedule_job(self, job: Job):
+        print(f"Executing: {job.get_job_id()} on agent: {self.agent_id}")
+        self.logger.info(f"Executing: {job.get_job_id()} on agent: {self.agent_id}")
+        # Add the job to the list of allocated jobs
+        self.ready_queue.add_job(job=job)
+
+        # Launch a thread to execute the job
+        thread = threading.Thread(target=self.execute_job, args=(job,))
         thread.start()
 
-    def execute_task(self, task: Task):
-        # Function to execute the task (similar to the previous implementation)
-        # Once the task is completed, move it to the completed_tasks list and remove it from the allocated_tasks list
-        # Assuming execute_task function performs the actual execution of the task
+    def execute_job(self, job: Job):
+        # Function to execute the job (similar to the previous implementation)
+        # Once the job is completed, move it to the completed_jobs list and remove it from the allocated_jobs list
+        # Assuming execute_job function performs the actual execution of the job
         try:
-            task.execute(data_transfer=self.data_transfer)
-            self.completed_tasks.add_task(task=task)
-            self.allocated_tasks.remove_task(task_id=task.get_task_id())
+            job.execute(data_transfer=self.data_transfer)
+            self.done_queue.add_job(job=job)
+            self.ready_queue.remove_job(job_id=job.get_job_id())
         except Exception as e:
             self.logger.error(f"Execution error: {e}")
             self.logger.error(traceback.format_exc())
@@ -181,29 +365,11 @@ class Agent(Observer):
     def __str__(self):
         return f"agent_id: {self.agent_id} capacities: {self.capacities} load: {self.compute_overall_load()}"
 
-    def run(self):
-        self.logger.info(f"Starting agent: {self}")
-        self.message_service.register_observers(agent=self)
-
-        cycle = 0
-        while cycle <= self.cycles:
-            try:
-                cycle += 1
-                # Filter pending tasks from the task queue
-                for task_id, task in self.task_queue.tasks.items():
-                    self.logger.info(f"Checking task: {task_id} {task}")
-                    if not task.is_pending():
-                        self.logger.info(f"Task {task.task_id} in {task.state}; skipping it!")
-                        continue
-                    if self.can_accommodate_task(task):
-                        self.allocate_task(task=task)
-                        self.logger.info(f"Allocated {task}; new agent load: {self.compute_overall_load()}")
-                    else:
-                        self.logger.info(f"Task {task} cannot be accommodated")
-            except Exception as e:
-                self.logger.error(f"Error occurred while executing cycle: {cycle} e: {e}")
-                self.logger.error(traceback.format_exc())
-            time.sleep(5)  # Adjust the sleep duration as needed
+    @abstractmethod
+    def job_selection_main(self):
+        """
+        Job selection main loop
+        """
 
     @staticmethod
     def make_logger(*, log_dir: str, log_file: str, log_level, log_retain: int, log_size: int, logger: str,
@@ -257,14 +423,14 @@ class Agent(Observer):
         console_log.addHandler(console_handler)
         return log
 
-    def send_message(self, msg_type: MessageType, task_id: str = None):
+    def send_message(self, message_type: MessageType, job_id: str = None):
         message = {
-            "msg_type": str(msg_type),
+            "message_type": str(message_type),
             "agent_id": self.agent_id,
             "load": self.compute_overall_load()
         }
-        if task_id:
-            message["task_id"] = task_id
+        if job_id:
+            message["job_id"] = job_id
 
         # Produce the message to the Kafka topic
         self.message_service.produce_message(message)
@@ -274,7 +440,184 @@ class Agent(Observer):
         return hashlib.sha256(''.join(random.choices(string.ascii_lowercase, k=8)).encode()).hexdigest()[:8]
 
     def start(self):
+        self.message_service.register_observers(agent=self)
+        self.msg_processor_thread.start()
         self.message_service.start()
+        self.heartbeat_thread.start()
+        self.job_selection_thread.start()
+        self.job_scheduling_thread.start()
 
     def stop(self):
+        self.shutdown = True
         self.message_service.stop()
+        with self.condition:
+            self.condition.notify_all()
+        self.heartbeat_thread.join()
+        self.msg_processor_thread.join()
+        self.job_selection_thread.join()
+        self.job_scheduling_thread.join()
+
+    def job_scheduling_main(self):
+        self.logger.info(f"Starting Job Scheduling Thread: {self}")
+        while not self.shutdown:
+            try:
+                job_ids = list(self.selected_queue.jobs.keys())
+                for job_id in job_ids:
+                    job = self.selected_queue.jobs.get(job_id)
+                    if not job:
+                        continue
+
+                    ready_queue_load = self.compute_ready_queue_load()
+                    if ready_queue_load < self.ready_queue_threshold and self.can_schedule_job(job):
+                        self.selected_queue.remove_job(job_id)
+                        self.schedule_job(job)
+                    else:
+                        time.sleep(0.5)
+
+                time.sleep(5)
+            except Exception as e:
+                self.logger.error(f"Error occurred while executing e: {e}")
+                self.logger.error(traceback.format_exc())
+        self.logger.info(f"Stopped Job Scheduling Thread!")
+
+    def plot_jobs_per_agent(self):
+        jobs = self.job_queue.jobs.values()
+        completed_jobs = [j for j in jobs if j.leader_agent_id is not None]
+        jobs_per_agent = {}
+
+        for j in completed_jobs:
+            if j.leader_agent_id:
+                if j.leader_agent_id not in jobs_per_agent:
+                    jobs_per_agent[j.leader_agent_id] = 0
+                jobs_per_agent[j.leader_agent_id] += 1
+
+        # Save jobs_per_agent to CSV
+        with open('jobs_per_agent.csv', 'w', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow(['Agent ID', 'Number of Jobs Selected'])
+            for agent_id, job_count in jobs_per_agent.items():
+                writer.writerow([agent_id, job_count])
+
+        # Plotting the jobs per agent as a bar chart
+        plt.bar(list(jobs_per_agent.keys()), list(jobs_per_agent.values()), color='blue')
+        plt.xlabel('Agent ID')
+        plt.ylabel('Number of Jobs Selected')
+
+        # Title with SWARM and number of agents
+        num_agents = len(jobs_per_agent)
+        plt.title(f'SWARM: Number of Jobs Selected by Each Agent (Total Agents: {num_agents})')
+
+        plt.grid(axis='y', linestyle='--', linewidth=0.5)
+
+        # Save the plot
+        plot_path = os.path.join("", 'jobs_per_agent.png')
+        plt.savefig(plot_path)
+        plt.close()
+
+    def plot_scheduling_latency(self):
+        jobs = self.job_queue.jobs.values()
+        completed_jobs = [j for j in jobs if j.leader_agent_id is not None]
+
+        wait_times = {}
+        selection_times = {}
+        scheduling_latency = {}
+
+        # Calculate scheduling latency
+        for j in completed_jobs:
+            wait_times[j.job_id] = j.selection_started_at - j.created_at
+            selection_times[j.job_id] = j.selected_by_agent_at - j.selection_started_at
+            scheduling_latency[j.job_id] = wait_times[j.job_id] + selection_times[j.job_id]
+
+        with open('wait_time.csv', 'w', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow(['job_id', 'wait_time'])
+            for key, value in wait_times.items():
+                writer.writerow([key, value])
+
+        with open('selection_time.csv', 'w', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow(['job_id', 'selection_time'])
+            for key, value in selection_times.items():
+                writer.writerow([key, value])
+
+        with open('scheduling_latency.csv', 'w', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow(['job_id', 'scheduling_latency'])
+            for key, value in scheduling_latency.items():
+                writer.writerow([key, value])
+
+        # Plotting scheduling latency in red
+        plt.plot(list(scheduling_latency.values()),
+                 'ro-', label='Scheduling Latency: Combined Wait Time and Selection Time (Job Ready to be scheduled on Agent)')
+
+        # Plotting wait time in blue
+        if wait_times:
+            plt.plot(list(wait_times.values()),
+                     'bo-', label='Wait Time: Duration from Job Creation to Start of Selection')
+
+        # Plotting leader election time in green
+        if selection_times:
+            plt.plot(list(selection_times.values()),
+                     'go-', label='Job Selection Time: Time Taken for Agents to Reach Consensus on Job Selection')
+
+        # Title with SWARM and number of agents
+        num_agents = len(set([t.leader_agent_id for t in completed_jobs]))
+        plt.title(f'SWARM: Scheduling Latency (Total Agents: {num_agents})')
+
+        plt.xlabel('Task Index')
+        plt.ylabel('Time Units (seconds)')
+        plt.grid(True)
+
+        # Adjusting legend position to avoid overlapping the graph
+        plt.legend(loc='upper left', bbox_to_anchor=(1, 1))  # This places the legend outside the plot area
+
+        # Save the plot
+        plot_path = os.path.join("", 'job_latency.png')
+        plt.savefig(plot_path, bbox_inches='tight')  # bbox_inches='tight' ensures that the entire plot is saved
+        plt.close()
+
+    @staticmethod
+    def plot_load_per_agent(load_dict: dict, threshold: float, title_prefix: str = "", csv_filename='agent_loads.csv',
+                            plot_filename='agent_loads_plot.png'):
+        # Find the maximum length of the load lists
+        max_intervals = max(len(loads) for loads in load_dict.values())
+
+        # Save the data to a CSV file
+        with open(csv_filename, mode='w', newline='') as file:
+            writer = csv.writer(file)
+
+            # Write the header (agent IDs)
+            header = ['Time Interval'] + [f'Agent {agent_id}' for agent_id in load_dict.keys()]
+            writer.writerow(header)
+
+            # Write the load data row by row
+            for i in range(max_intervals):
+                row = [i]  # Start with the time interval
+                for agent_id in load_dict.keys():
+                    # Add load or empty string if not available
+                    row.append(load_dict[agent_id][i] if i < len(load_dict[agent_id]) else '')
+                writer.writerow(row)
+
+        # Plot the data
+        plt.figure(figsize=(10, 6))
+
+        for agent_id, loads in load_dict.items():
+            plt.plot(loads, label=f'Agent {agent_id}')
+
+        plt.xlabel('Time Interval')
+        plt.ylabel('Load')
+        plt.title(f'{title_prefix} Agent Load Over Time [Max Threshold: {threshold}]')
+        plt.legend()
+        plt.grid(True)
+
+        # Save the plot to a file
+        plt.savefig(plot_filename)
+
+    def plot_results(self):
+        self.logger.info("Plotting Results")
+        if self.agent_id != "0":
+            return
+        self.plot_jobs_per_agent()
+        self.plot_scheduling_latency()
+        self.plot_load_per_agent(self.load_per_agent, self.projected_queue_threshold, title_prefix="Projected")
+        self.logger.info("Plot completed")

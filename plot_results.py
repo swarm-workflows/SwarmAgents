@@ -4,7 +4,7 @@ import os
 import matplotlib.pyplot as plt
 from collections import defaultdict
 import redis
-from swarm.models.task import TaskRepository, Task
+from swarm.models.job import JobRepository, Job
 
 
 class Plotter:
@@ -15,10 +15,10 @@ class Plotter:
         :param port: Redis port
         """
         self.redis_client = redis.StrictRedis(host=host, port=port, decode_responses=True)
-        self.task_repository = TaskRepository(self.redis_client)
+        self.task_repository = JobRepository(self.redis_client)
 
     def plot_tasks_per_agent(self):
-        tasks = self.task_repository.get_all_tasks(key_prefix="*")
+        tasks = self.task_repository.get_all_jobs(key_prefix="*")
         tasks_per_agent = {}
         for t in tasks:
             if t.leader_agent_id:
@@ -50,8 +50,8 @@ class Plotter:
         plt.close()
 
     def plot_wait_time(self):
-        tasks = self.task_repository.get_all_tasks(key_prefix="*")
-        waiting_times = [t.time_on_queue for t in tasks if t.time_on_queue is not None]
+        tasks = self.task_repository.get_all_jobs(key_prefix="*")
+        waiting_times = [t.waited_on_queue for t in tasks if t.waited_on_queue is not None]
 
         # Save scheduling latency to CSV
         with open('scheduling_latency.csv', 'w', newline='') as file:
