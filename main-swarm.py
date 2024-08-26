@@ -41,6 +41,7 @@ class TaskDistributor(threading.Thread):
         self.tasks_per_interval = tasks_per_interval
         self.interval = interval
         self.shutdown = False
+        self.total_tasks = len(self.task_pool)
 
     def run(self):
         total_tasks_added = 0
@@ -50,7 +51,7 @@ class TaskDistributor(threading.Thread):
                 self.agent.job_queue.add_job(task)
                 total_tasks_added += 1
             time.sleep(0.5)
-            if total_tasks_added == len(self.task_pool):
+            if total_tasks_added == self.total_tasks:
                 break
 
     def stop(self):
