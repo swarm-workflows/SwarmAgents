@@ -34,24 +34,28 @@ from swarm.models.job import Job
 
 
 class TaskDistributor(threading.Thread):
-    def __init__(self, agents: List[PBFTAgent], task_pool: List[Job], tasks_per_interval: int, interval: int):
+    def __init__(self, agent: SwarmAgent, task_pool: List[Job], tasks_per_interval: int, interval: int):
         super().__init__()
-        self.agents = agents
+        self.agent = agent
         self.task_pool = task_pool
         self.tasks_per_interval = tasks_per_interval
         self.interval = interval
-        self.shutdown_flag = threading.Event()
+        self.shutdown = False
+        self.total_tasks = len(self.task_pool)
 
     def run(self):
-        while not self.shutdown_flag.is_set() and self.task_pool:
+        total_tasks_added = 0
+        while not self.shutdown and self.task_pool:
             tasks_to_add = [self.task_pool.pop() for _ in range(min(self.tasks_per_interval, len(self.task_pool)))]
-            for agent in self.agents:
-                for task in tasks_to_add:
-                    agent.job_queue.add_job(task)
+            for task in tasks_to_add:
+                self.agent.job_queue.add_job(task)
+                total_tasks_added += 1
             time.sleep(0.5)
+            if total_tasks_added == self.total_tasks:
+                break
 
     def stop(self):
-        self.shutdown_flag.set()
+        self.shutdown = True
 
 
 def build_tasks_from_json(json_file):
@@ -87,12 +91,13 @@ if __name__ == '__main__':
     tasks_per_interval = 1  # Number of tasks to add each interval
     interval = 5  # Interval in seconds
 
-    distributor = TaskDistributor(agents=[agent], task_pool=task_pool, tasks_per_interval=tasks_per_interval,
+    distributor = TaskDistributor(agent=agent, task_pool=task_pool, tasks_per_interval=tasks_per_interval,
                                   interval=interval)
 
     agent.start()
     distributor.start()
 
+    '''
     try:
         while True:
             time.sleep(1)
@@ -101,3 +106,4 @@ if __name__ == '__main__':
         agent.stop()
 
     agent.plot_results()
+    '''
