@@ -25,7 +25,7 @@
 
 # Configurable variables
 RES_DIR="runs/swarm/multi-jobs/3/repeated"  # Directory where results will be copied
-MAX_RETRIES=5                     # Number of times to restart the agents
+MAX_RETRIES=100                     # Number of times to restart the agents
 SLEEP_INTERVAL=10                 # Time in seconds between checks
 START_SCRIPT=swarm-start.sh
 AGENT_SCRIPT=main-swarm.py
