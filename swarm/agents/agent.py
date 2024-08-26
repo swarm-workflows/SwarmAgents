@@ -679,11 +679,10 @@ class Agent(Observer):
 
     def plot_results(self):
         self.logger.info("Plotting Results")
-        if self.agent_id != "0":
-            return
         self.plot_jobs_per_agent()
         self.plot_scheduling_latency()
         self.plot_load_per_agent(self.load_per_agent, self.projected_queue_threshold, title_prefix="Projected")
+        self.plot_idle_time_per_agent()
         self.logger.info("Plot completed")
 
     def _can_shutdown(self, heart_beat: HeartBeat):
