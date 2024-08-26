@@ -49,7 +49,7 @@ class TaskDistributor(threading.Thread):
             for agent in self.agents:
                 for task in tasks_to_add:
                     agent.job_queue.add_job(task)
-                total_tasks_added += tasks_to_add
+                total_tasks_added += len(tasks_to_add)
 
             if total_tasks_added == len(self.task_pool):
                 break
