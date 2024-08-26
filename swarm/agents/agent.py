@@ -132,6 +132,7 @@ class Agent(Observer):
         return HeartBeat(agent=agent)
 
     def _heartbeat_main(self):
+        heart_beat = None
         while not self.shutdown:
             try:
                 heart_beat = self._build_heart_beat()
@@ -458,7 +459,7 @@ class Agent(Observer):
         self.message_service.stop()
         with self.condition:
             self.condition.notify_all()
-        self.heartbeat_thread.join()
+        #self.heartbeat_thread.join()
         self.msg_processor_thread.join()
         self.job_selection_thread.join()
         self.job_scheduling_thread.join()
@@ -631,6 +632,8 @@ class Agent(Observer):
         self.logger.info("Plot completed")
 
     def _can_shutdown(self, heart_beat: HeartBeat):
+        if not heart_beat:
+            return False
         if heart_beat.agent.load != 0.0:
             self.load_check_counter = 0
             return False
