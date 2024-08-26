@@ -78,5 +78,3 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         distributor.stop()
         agent.stop()
-
-    agent.plot_results()

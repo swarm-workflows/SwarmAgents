@@ -71,6 +71,9 @@ class Agent(Observer):
                                                       daemon=True, name="JobSchedulingThread")
         self.projected_queue_threshold = 300.00
         self.ready_queue_threshold = 100.00
+        # Load for self and the peers is 0.0 for upto 5 minutes; trigger shutdown
+        self.load_check_counter = 0
+        self.max_time_load_zero = 60
 
     def __enqueue(self, incoming: str):
         try:
@@ -119,7 +122,7 @@ class Agent(Observer):
             self.load_per_agent[agent_id] = []
         self.load_per_agent[agent_id].append(load)
 
-    def _build_heart_beat(self):
+    def _build_heart_beat(self) -> HeartBeat:
         my_load = self.compute_overall_load()
         agent = AgentInfo(agent_id=self.agent_id,
                           capacities=self.capacities,
@@ -131,11 +134,14 @@ class Agent(Observer):
     def _heartbeat_main(self):
         while not self.shutdown:
             try:
-                self.message_service.produce_message(self._build_heart_beat().to_dict())
+                heart_beat = self._build_heart_beat()
+                self.message_service.produce_message(heart_beat.to_dict())
                 time.sleep(5)
             except Exception as e:
                 self.logger.error(f"Error occurred while sending heartbeat e: {e}")
                 self.logger.error(traceback.format_exc())
+            if self._can_shutdown(heart_beat=heart_beat):
+                self.stop()
 
     def _message_processor_main(self):
         self.logger.info("Message Processor Started")
@@ -456,6 +462,7 @@ class Agent(Observer):
         self.msg_processor_thread.join()
         self.job_selection_thread.join()
         self.job_scheduling_thread.join()
+        self.plot_results()
 
     def job_scheduling_main(self):
         self.logger.info(f"Starting Job Scheduling Thread: {self}")
@@ -492,7 +499,7 @@ class Agent(Observer):
                 jobs_per_agent[j.leader_agent_id] += 1
 
         # Save jobs_per_agent to CSV
-        with open('jobs_per_agent.csv', 'w', newline='') as file:
+        with open(f'jobs_per_agent_{self.agent_id}.csv', 'w', newline='') as file:
             writer = csv.writer(file)
             writer.writerow(['Agent ID', 'Number of Jobs Selected'])
             for agent_id, job_count in jobs_per_agent.items():
@@ -510,7 +517,7 @@ class Agent(Observer):
         plt.grid(axis='y', linestyle='--', linewidth=0.5)
 
         # Save the plot
-        plot_path = os.path.join("", 'jobs_per_agent.png')
+        plot_path = os.path.join("", f'jobs_per_agent_{self.agent_id}.png')
         plt.savefig(plot_path)
         plt.close()
 
@@ -528,19 +535,19 @@ class Agent(Observer):
             selection_times[j.job_id] = j.selected_by_agent_at - j.selection_started_at
             scheduling_latency[j.job_id] = wait_times[j.job_id] + selection_times[j.job_id]
 
-        with open('wait_time.csv', 'w', newline='') as file:
+        with open(f'wait_time_{self.agent_id}.csv', 'w', newline='') as file:
             writer = csv.writer(file)
             writer.writerow(['job_id', 'wait_time'])
             for key, value in wait_times.items():
                 writer.writerow([key, value])
 
-        with open('selection_time.csv', 'w', newline='') as file:
+        with open(f'selection_time.csv_{self.agent_id}', 'w', newline='') as file:
             writer = csv.writer(file)
             writer.writerow(['job_id', 'selection_time'])
             for key, value in selection_times.items():
                 writer.writerow([key, value])
 
-        with open('scheduling_latency.csv', 'w', newline='') as file:
+        with open(f'scheduling_latency.csv_{self.agent_id}', 'w', newline='') as file:
             writer = csv.writer(file)
             writer.writerow(['job_id', 'scheduling_latency'])
             for key, value in scheduling_latency.items():
@@ -548,7 +555,8 @@ class Agent(Observer):
 
         # Plotting scheduling latency in red
         plt.plot(list(scheduling_latency.values()),
-                 'ro-', label='Scheduling Latency: Combined Wait Time and Selection Time (Job Ready to be scheduled on Agent)')
+                 'ro-', label='Scheduling Latency: Combined Wait Time and Selection Time '
+                              '(Job Ready to be scheduled on Agent)')
 
         # Plotting wait time in blue
         if wait_times:
@@ -572,13 +580,13 @@ class Agent(Observer):
         plt.legend(loc='upper left', bbox_to_anchor=(1, 1))  # This places the legend outside the plot area
 
         # Save the plot
-        plot_path = os.path.join("", 'job_latency.png')
+        plot_path = os.path.join("", f'job_latency_{self.agent_id}.png')
         plt.savefig(plot_path, bbox_inches='tight')  # bbox_inches='tight' ensures that the entire plot is saved
         plt.close()
 
-    @staticmethod
-    def plot_load_per_agent(load_dict: dict, threshold: float, title_prefix: str = "", csv_filename='agent_loads.csv',
-                            plot_filename='agent_loads_plot.png'):
+    def plot_load_per_agent(self, load_dict: dict, threshold: float, title_prefix: str = ""):
+        csv_filename = f'agent_loads_{self.agent_id}.csv',
+        plot_filename = f'agent_loads_plot_{self.agent_id}.png'
         # Find the maximum length of the load lists
         max_intervals = max(len(loads) for loads in load_dict.values())
 
@@ -621,3 +629,16 @@ class Agent(Observer):
         self.plot_scheduling_latency()
         self.plot_load_per_agent(self.load_per_agent, self.projected_queue_threshold, title_prefix="Projected")
         self.logger.info("Plot completed")
+
+    def _can_shutdown(self, heart_beat: HeartBeat):
+        if heart_beat.agent.load != 0.0:
+            self.load_check_counter = 0
+            return False
+        for peer in self.neighbor_map.values():
+            if peer.load != 0.0:
+                self.load_check_counter = 0
+                return False
+        self.load_check_counter += 1
+        if self.load_check_counter < self.max_time_load_zero:
+            return False
+        return True
