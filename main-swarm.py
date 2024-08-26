@@ -1,5 +1,27 @@
+# MIT License
+#
+# Copyright (c) 2024 swarm-workflows
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+# Author: Komal Thareja(kthare10@renci.org)
 import json
-import random
 import sys
 import threading
 import time
@@ -18,19 +40,23 @@ class TaskDistributor(threading.Thread):
         self.task_pool = task_pool
         self.tasks_per_interval = tasks_per_interval
         self.interval = interval
-        self.shutdown_flag = threading.Event()
+        self.shutdown = False
 
     def run(self):
-        while not self.shutdown_flag.is_set() and self.task_pool:
+        total_tasks_added = 0
+        while not self.shutdown and self.task_pool:
             tasks_to_add = [self.task_pool.pop() for _ in range(min(self.tasks_per_interval, len(self.task_pool)))]
             for agent in self.agents:
                 for task in tasks_to_add:
                     agent.job_queue.add_job(task)
-            #time.sleep(random.uniform(0.1, 3.0))
+                total_tasks_added += tasks_to_add
+
+            if total_tasks_added == len(self.task_pool):
+                break
             time.sleep(0.5)
 
     def stop(self):
-        self.shutdown_flag.set()
+        self.shutdown = True
 
 
 def build_tasks_from_json(json_file):
@@ -69,12 +95,14 @@ if __name__ == '__main__':
     distributor = TaskDistributor(agents=[agent], task_pool=task_pool, tasks_per_interval=tasks_per_interval,
                                   interval=interval)
 
-    agent.start()
     distributor.start()
+    agent.start()
 
+    '''
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
         distributor.stop()
         agent.stop()
+    '''

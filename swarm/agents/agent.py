@@ -1,3 +1,27 @@
+# MIT License
+#
+# Copyright (c) 2024 swarm-workflows
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+# Author: Komal Thareja(kthare10@renci.org)
+
 import csv
 import hashlib
 import json
@@ -74,6 +98,25 @@ class Agent(Observer):
         # Load for self and the peers is 0.0 for upto 5 minutes; trigger shutdown
         self.load_check_counter = 0
         self.max_time_load_zero = 60
+        self.idle_time = []
+        self.idle_start_time = None
+        self.total_idle_time = 0
+
+    def start_idle(self):
+        if self.idle_start_time is None:
+            self.idle_start_time = time.time()
+
+    def end_idle(self):
+        if self.idle_start_time is not None:
+            current_idle_time = time.time() - self.idle_start_time
+            self.idle_time.append(current_idle_time)
+            self.total_idle_time += current_idle_time
+            self.idle_start_time = None
+
+    def get_total_idle_time(self):
+        # End current idle period before getting the total idle time
+        self.end_idle()
+        return self.total_idle_time
 
     def __enqueue(self, incoming: str):
         try:
@@ -454,15 +497,16 @@ class Agent(Observer):
         self.job_selection_thread.start()
         self.job_scheduling_thread.start()
 
+        self.heartbeat_thread.join()
+        self.msg_processor_thread.join()
+        self.job_selection_thread.join()
+        self.job_scheduling_thread.join()
+
     def stop(self):
         self.shutdown = True
         self.message_service.stop()
         with self.condition:
             self.condition.notify_all()
-        #self.heartbeat_thread.join()
-        self.msg_processor_thread.join()
-        self.job_selection_thread.join()
-        self.job_scheduling_thread.join()
         self.plot_results()
 
     def job_scheduling_main(self):
@@ -470,6 +514,8 @@ class Agent(Observer):
         while not self.shutdown:
             try:
                 job_ids = list(self.selected_queue.jobs.keys())
+                if len(job_ids):
+                    self.end_idle()
                 for job_id in job_ids:
                     job = self.selected_queue.jobs.get(job_id)
                     if not job:
@@ -480,13 +526,22 @@ class Agent(Observer):
                         self.selected_queue.remove_job(job_id)
                         self.schedule_job(job)
                     else:
+                        self.start_idle()
                         time.sleep(0.5)
-
+                self.start_idle()
                 time.sleep(5)
             except Exception as e:
                 self.logger.error(f"Error occurred while executing e: {e}")
                 self.logger.error(traceback.format_exc())
         self.logger.info(f"Stopped Job Scheduling Thread!")
+
+    def plot_idle_time_per_agent(self):
+        # Save jobs_per_agent to CSV
+        with open(f'idle_time_per_agent_{self.agent_id}.csv', 'w', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow(['Idle Time'])
+            for idle_time in self.idle_time:
+                writer.writerow([idle_time])
 
     def plot_jobs_per_agent(self):
         jobs = self.job_queue.jobs.values()
@@ -542,13 +597,13 @@ class Agent(Observer):
             for key, value in wait_times.items():
                 writer.writerow([key, value])
 
-        with open(f'selection_time.csv_{self.agent_id}', 'w', newline='') as file:
+        with open(f'selection_time_{self.agent_id}.csv', 'w', newline='') as file:
             writer = csv.writer(file)
             writer.writerow(['job_id', 'selection_time'])
             for key, value in selection_times.items():
                 writer.writerow([key, value])
 
-        with open(f'scheduling_latency.csv_{self.agent_id}', 'w', newline='') as file:
+        with open(f'scheduling_latency_{self.agent_id}.csv', 'w', newline='') as file:
             writer = csv.writer(file)
             writer.writerow(['job_id', 'scheduling_latency'])
             for key, value in scheduling_latency.items():
@@ -586,7 +641,7 @@ class Agent(Observer):
         plt.close()
 
     def plot_load_per_agent(self, load_dict: dict, threshold: float, title_prefix: str = ""):
-        csv_filename = f'agent_loads_{self.agent_id}.csv',
+        csv_filename = f'agent_loads_{self.agent_id}.csv'
         plot_filename = f'agent_loads_plot_{self.agent_id}.png'
         # Find the maximum length of the load lists
         max_intervals = max(len(loads) for loads in load_dict.values())
