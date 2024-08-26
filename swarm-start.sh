@@ -1,5 +1,6 @@
 #!/bin/bash
 
+python3.11 main-swarm.py 0 100 &
 python3.11 main-swarm.py 1 100 &
 python3.11 main-swarm.py 2 100 &
 #python3.11 main-swarm.py 3 100 &
