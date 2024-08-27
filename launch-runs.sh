@@ -50,6 +50,10 @@ copy_results_and_logs() {
 # Main loop
 for ((i=1; i<=MAX_RETRIES; i++))
 do
+    echo "Cleanup before starting new run"
+    rm -rf *.log* *.csv *.png
+    python3 kafka_cleanup.py
+
     echo "Starting agents... (Attempt $i)"
     sh $START_SCRIPT
 
@@ -63,10 +67,6 @@ do
 
     echo "Agents have stopped. Copying logs and restarting..."
     copy_results_and_logs $i
-
-    echo "Cleanup before starting new run"
-    rm -rf *.log* *.csv *.png
-    python3 kafka_cleanup.py
 
 done
 

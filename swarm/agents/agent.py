@@ -526,7 +526,8 @@ class Agent(Observer):
                         self.selected_queue.remove_job(job_id)
                         self.schedule_job(job)
                     else:
-                        self.start_idle()
+                        if ready_queue_load == 0.0:
+                            self.start_idle()
                         time.sleep(0.5)
                 self.start_idle()
                 time.sleep(5)
