@@ -96,8 +96,8 @@ if __name__ == '__main__':
     distributor = TaskDistributor(agent=agent, task_pool=task_pool, tasks_per_interval=tasks_per_interval,
                                   interval=interval)
 
-    agent.start()
     distributor.start()
+    agent.start()
 
     '''
     try:
