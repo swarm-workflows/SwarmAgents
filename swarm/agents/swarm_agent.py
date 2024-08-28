@@ -108,6 +108,7 @@ class SwarmAgent(Agent):
 
                     diff = int(time.time() - job.time_last_state_change)
                     if diff > self.restart_job_selection and job.get_state() in [JobState.PREPARE, JobState.PRE_PREPARE]:
+                        self.logger.info(f"RESTART: Job: {job} reset to Pending")
                         job.change_state(new_state=JobState.PENDING)
                         self.outgoing_proposals.remove_job(job_id=job.get_job_id())
                         self.incoming_proposals.remove_job(job_id=job.get_job_id())
@@ -248,8 +249,10 @@ class SwarmAgent(Agent):
 
                 p.prepares = 0
                 if my_proposal:
+                    self.logger.info(f"Removed my Proposal: {my_proposal} in favor of incoming proposal")
                     self.outgoing_proposals.remove_proposal(p_id=my_proposal.p_id, job_id=p.job_id)
                 if peer_proposal:
+                    self.logger.info(f"Removed peer Proposal: {peer_proposal} in favor of incoming proposal")
                     self.incoming_proposals.remove_proposal(p_id=peer_proposal.p_id, job_id=p.job_id)
 
                 msg = Prepare(agent=AgentInfo(agent_id=self.agent_id), proposals=[p])
@@ -311,7 +314,7 @@ class SwarmAgent(Agent):
             elif self.incoming_proposals.contains(job_id=p.job_id, p_id=p.p_id):
                 proposal = self.incoming_proposals.get_proposal(p_id=p.p_id)
             else:
-                self.logger.info(f"Job: {p.job_id} Agent: {self.agent_id} received commit without any Prepares")
+                self.logger.info(f"TBD: Job: {p.job_id} Agent: {self.agent_id} received commit without any Prepares")
                 proposal = p
                 p.prepares = 0
                 p.commits = 0

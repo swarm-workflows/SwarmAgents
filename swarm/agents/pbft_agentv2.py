@@ -198,29 +198,18 @@ class PBFTAgent(Agent):
 
         job = self.job_queue.get_job(job_id=job_id)
         if not job or job.is_ready() or job.is_complete() or job.is_running():
-            self.logger.info(f"Ignoring Prepare: {proposal_id} for job: {job}")
+            self.logger.info(f"Job: {job_id} Ignoring Prepare: {proposal_id}")
             return
 
-        #can_accept_job = self.can_accommodate_job(job=job)
-        #my_current_load = self.compute_overall_load()
-
-        # Reject proposal in following cases:
-        # - I have initiated a proposal and either received accepts from at least 1 peer or
-        #   my proposal's seed is smaller than the incoming proposal
-        # - Received and accepted proposal from another agent
-        # - can't accommodate this job
-        # - can accommodate job and neighbor's load is more than mine
         my_proposal = self.outgoing_proposals.get_proposal(job_id=job_id)
         peer_proposal = self.incoming_proposals.get_proposal(job_id=job_id)
 
-        # if (my_proposal and (my_proposal.prepares or my_proposal.seed < rcvd_seed)) or \
-        #        (peer_proposal and peer_proposal.seed < rcvd_seed) or \
-        #        not can_accept_job or \
-        #        (can_accept_job and my_current_load < neighbor_load):
-        if (my_proposal and (my_proposal.prepares or my_proposal.seed < rcvd_seed)) or \
-                (peer_proposal and peer_proposal.seed < rcvd_seed):
-            self.logger.debug(f"Agent {self.agent_id} rejected Proposal for Job: {job_id} from agent"
-                              f" {peer_agent_id} - accepted another proposal")
+        if my_proposal and (my_proposal.prepares or my_proposal.seed < rcvd_seed):
+            self.logger.debug(f"Job:{job_id} Agent:{self.agent_id} rejected Proposal: {proposal_id} from agent"
+                              f" {peer_agent_id} - my proposal {my_proposal} has prepares or smaller seed")
+        elif peer_proposal and peer_proposal.seed < rcvd_seed:
+            self.logger.debug(f"Job:{job_id} Agent:{self.agent_id} rejected Proposal: {proposal_id} from agent"
+                              f" {peer_agent_id} - already accepted proposal {peer_proposal} with a smaller seed")
         else:
             self.logger.debug(
                 f"Agent {self.agent_id} accepted Proposal for Job: {job_id} from agent"
@@ -229,8 +218,10 @@ class PBFTAgent(Agent):
             proposal = ProposalInfo(p_id=proposal_id, job_id=job_id, seed=rcvd_seed,
                                     agent_id=peer_agent_id)
             if my_proposal:
+                self.logger.info(f"Removed my Proposal: {my_proposal} in favor of incoming proposal")
                 self.outgoing_proposals.remove_proposal(p_id=my_proposal.p_id, job_id=job_id)
             if peer_proposal:
+                self.logger.info(f"Removed peer Proposal: {peer_proposal} in favor of incoming proposal")
                 self.incoming_proposals.remove_proposal(p_id=peer_proposal.p_id, job_id=job_id)
 
             # Increment the number of prepares to count the prepare being sent
@@ -251,7 +242,7 @@ class PBFTAgent(Agent):
 
         job = self.job_queue.get_job(job_id=job_id)
         if not job or job.is_ready() or job.is_complete() or job.is_running():
-            self.logger.info(f"Ignoring Prepare: {job}")
+            self.logger.info(f"Job: {job} Ignoring Prepare")
             return
 
         # Update the prepare votes
@@ -286,7 +277,7 @@ class PBFTAgent(Agent):
         job = self.job_queue.get_job(job_id=job_id)
 
         if not job or job.is_complete() or job.is_ready() or job.is_running() or job.leader_agent_id:
-            self.logger.info(f"Ignoring Commit: {job}")
+            self.logger.info(f"Job: {job} Ignoring Commit: {proposal_id}")
             self.incoming_proposals.remove_job(job_id=job_id)
             self.outgoing_proposals.remove_job(job_id=job_id)
             return
@@ -297,6 +288,7 @@ class PBFTAgent(Agent):
         elif self.incoming_proposals.contains(job_id=job_id, p_id=proposal_id):
             proposal = self.incoming_proposals.get_proposal(p_id=proposal_id)
         else:
+            self.logger.info(f"TBD: Job: {job_id} Agent: {self.agent_id} received commit without any Prepares")
             proposal = ProposalInfo(job_id=job_id, p_id=proposal_id, seed=rcvd_seed,
                                     agent_id=peer_agent_id)
             self.incoming_proposals.add_proposal(proposal=proposal)
