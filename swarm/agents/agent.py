@@ -529,7 +529,9 @@ class Agent(Observer):
                         if ready_queue_load == 0.0:
                             self.start_idle()
                         time.sleep(0.5)
-                self.start_idle()
+                ready_queue_load = self.compute_ready_queue_load()
+                if ready_queue_load == 0.0:
+                    self.start_idle()
                 time.sleep(5)
             except Exception as e:
                 self.logger.error(f"Error occurred while executing e: {e}")
