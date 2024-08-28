@@ -21,6 +21,7 @@
 # SOFTWARE.
 #
 # Author: Komal Thareja(kthare10@renci.org)
+import argparse
 import time
 
 import redis
@@ -39,6 +40,7 @@ def delete_topic(admin_client, topic_name):
         except Exception as e:
             print(f"Failed to delete topic {topic}: {e}")
 
+
 def create_topic(admin_client, topic_name, num_partitions=1, replication_factor=1):
     """Create a new Kafka topic."""
     new_topic = NewTopic(topic_name, num_partitions, replication_factor)
@@ -52,8 +54,15 @@ def create_topic(admin_client, topic_name, num_partitions=1, replication_factor=
 
 
 if __name__ == '__main__':
+    # Set up argument parser
+    parser = argparse.ArgumentParser(description="Kafka topic management")
+    parser.add_argument('--topic', type=str, required=True, help='Kafka topic name')
+
+    # Parse command-line arguments
+    args = parser.parse_args()
+    topic_name = args.topic
+
     bootstrap_servers = "localhost:19092"
-    topic_name = "agent_load"
 
     admin_client = AdminClient({'bootstrap.servers': bootstrap_servers})
     # Delete the topic

@@ -29,6 +29,7 @@ MAX_RETRIES=100                     # Number of times to restart the agents
 SLEEP_INTERVAL=10                 # Time in seconds between checks
 START_SCRIPT=swarm-start.sh
 AGENT_SCRIPT=main-swarm.py
+TOPIC=agent_load
 
 # Function to check if agents are running
 are_agents_running() {
@@ -52,7 +53,7 @@ for ((i=1; i<=MAX_RETRIES; i++))
 do
     echo "Cleanup before starting new run"
     rm -rf *.log* *.csv *.png
-    python3 kafka_cleanup.py
+    python3 kafka_cleanup.py --topic $TOPIC
 
     echo "Starting agents... (Attempt $i)"
     sh $START_SCRIPT
