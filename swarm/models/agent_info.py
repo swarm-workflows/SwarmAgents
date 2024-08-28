@@ -36,6 +36,7 @@ class AgentInfo(JSONField):
         self.load = 0.0
         self._capacities = Capacities()
         self._capacity_allocations = Capacities()
+        self.last_updated = 0.0
         self._set_fields(**kwargs)
 
     @property

@@ -76,6 +76,11 @@ class Agent(Observer):
         self.data_transfer = True
         self.kafka_config = {}
         self.logger = None
+        self.projected_queue_threshold = 300.00
+        self.ready_queue_threshold = 100.00
+        self.max_time_load_zero = 60
+        self.restart_job_selection = 300
+        self.peer_heartbeat_timeout = 300
         self.load_config(config_file)
         self.capacities = self.get_system_info()
         self.message_service = MessageService(config=self.kafka_config, logger=self.logger)
@@ -84,6 +89,7 @@ class Agent(Observer):
         self.message_queue = queue.Queue()
         self.condition = threading.Condition()
         self.shutdown = False
+        self.neighbor_map_lock = threading.Lock()
         self.heartbeat_thread = threading.Thread(target=self._heartbeat_main,
                                                  daemon=True, name="HeartBeatThread")
         self.msg_processor_thread = threading.Thread(target=self._message_processor_main,
@@ -93,11 +99,8 @@ class Agent(Observer):
 
         self.job_scheduling_thread = threading.Thread(target=self.job_scheduling_main,
                                                       daemon=True, name="JobSchedulingThread")
-        self.projected_queue_threshold = 300.00
-        self.ready_queue_threshold = 100.00
         # Load for self and the peers is 0.0 for upto 5 minutes; trigger shutdown
         self.load_check_counter = 0
-        self.max_time_load_zero = 60
         self.idle_time = []
         self.idle_start_time = None
         self.total_idle_time = 0
@@ -152,8 +155,8 @@ class Agent(Observer):
         self.__enqueue(incoming=message)
 
     def _receive_heartbeat(self, incoming: HeartBeat):
-        self.neighbor_map[incoming.agent.agent_id] = incoming.agent
-        self.last_msg_received_timestamp = time.time()
+        incoming.agent.last_updated = time.time()
+        self.__add_peer(peer=incoming.agent)
         self._save_load_metric(incoming.agent.agent_id, incoming.agent.load)
         temp = ""
         for p in self.neighbor_map.values():
@@ -243,6 +246,11 @@ class Agent(Observer):
                                            log_retain=log_config.get("log-retain"),
                                            log_size=log_config.get("log-size"),
                                            log_level=log_config.get("log-level"))
+            self.projected_queue_threshold = config.get("projected_queue_threshold", 300.00)
+            self.ready_queue_threshold = config.get("projected_queue_threshold", 100.00)
+            self.max_time_load_zero = config.get("projected_queue_threshold", 60)
+            self.restart_job_selection = config.get("restart_job_selection", 300)
+            self.peer_heartbeat_timeout = config.get("peer_heartbeat_timeout", 300)
 
     @staticmethod
     def get_system_info():
@@ -694,6 +702,14 @@ class Agent(Observer):
         if heart_beat.agent.load != 0.0:
             self.load_check_counter = 0
             return False
+        # Remove stale peers
+        peers_to_remove = []
+        for peer in self.neighbor_map.values():
+            diff = int(time.time() - peer.last_updated)
+            if diff >= self.peer_heartbeat_timeout:
+                peers_to_remove.append(peer.agent_id)
+        for p in peers_to_remove:
+            self.__remove_peer(agent_id=p)
         for peer in self.neighbor_map.values():
             if peer.load != 0.0:
                 self.load_check_counter = 0
@@ -702,3 +718,11 @@ class Agent(Observer):
         if self.load_check_counter < self.max_time_load_zero:
             return False
         return True
+
+    def __add_peer(self, peer: AgentInfo):
+        with self.neighbor_map_lock:
+            self.neighbor_map[peer.agent_id] = peer
+
+    def __remove_peer(self, agent_id: str):
+        with self.neighbor_map_lock:
+            self.neighbor_map.pop(agent_id)

@@ -106,6 +106,12 @@ class SwarmAgent(Agent):
                         completed_jobs += 1
                         continue
 
+                    diff = int(time.time() - job.time_last_state_change)
+                    if diff > self.restart_job_selection and job.get_state() in [JobState.PREPARE, JobState.PRE_PREPARE]:
+                        job.change_state(new_state=JobState.PENDING)
+                        self.outgoing_proposals.remove_job(job_id=job.get_job_id())
+                        self.incoming_proposals.remove_job(job_id=job.get_job_id())
+
                     if not job.is_pending():
                         if job.get_leader_agent_id() is None:
                             proposal1 = self.outgoing_proposals.get_proposal(job_id=job.get_job_id())
@@ -223,33 +229,36 @@ class SwarmAgent(Agent):
         for p in incoming.proposals:
             job = self.job_queue.get_job(job_id=p.job_id)
             if not job or job.is_ready() or job.is_complete() or job.is_running():
-                self.logger.info(f"Ignoring Proposal: {p} for job: {job}")
+                self.logger.info(f"Job: {job} Ignoring Proposal: {p}")
                 return
 
             my_proposal = self.outgoing_proposals.get_proposal(job_id=p.job_id)
             peer_proposal = self.incoming_proposals.get_proposal(job_id=p.job_id)
 
-            if (my_proposal and (my_proposal.prepares or my_proposal.seed < p.seed)) or \
-                    (peer_proposal and peer_proposal.seed < p.seed):
-                self.logger.debug(f"Agent {self.agent_id} rejected Proposal for Job: {p.job_id} from agent"
-                                  f" {p.agent_id} - accepted another proposal")
+            if my_proposal and (my_proposal.prepares or my_proposal.seed < p.seed):
+                self.logger.debug(f"Job:{p.job_id} Agent:{self.agent_id} rejected Proposal: {p} from agent"
+                                  f" {p.agent_id} - my proposal {my_proposal} has prepares or smaller seed")
+            elif peer_proposal and peer_proposal.seed < p.seed:
+                self.logger.debug(f"Job:{p.job_id} Agent:{self.agent_id} rejected Proposal: {p} from agent"
+                                  f" {p.agent_id} - already accepted proposal {peer_proposal} with a smaller seed")
             else:
                 self.logger.debug(
-                    f"Agent {self.agent_id} accepted Proposal for Job: {p.job_id} from agent"
+                    f"Job:{p.job_id} Agent:{self.agent_id} accepted Proposal: {p} from agent"
                     f" {p.agent_id} and is now the leader")
 
-                proposal = ProposalInfo(p_id=p.p_id, job_id=p.job_id, seed=p.seed, agent_id=p.agent_id)
+                p.prepares = 0
                 if my_proposal:
                     self.outgoing_proposals.remove_proposal(p_id=my_proposal.p_id, job_id=p.job_id)
                 if peer_proposal:
                     self.incoming_proposals.remove_proposal(p_id=peer_proposal.p_id, job_id=p.job_id)
 
+                msg = Prepare(agent=AgentInfo(agent_id=self.agent_id), proposals=[p])
+                self.message_service.produce_message(msg.to_dict())
+
                 # Increment the number of prepares to count the prepare being sent
                 # Needed to handle 3 agent case
-                proposal.prepares += 1
-                self.incoming_proposals.add_proposal(proposal=proposal)
-                msg = Prepare(agent=AgentInfo(agent_id=self.agent_id), proposals=[proposal])
-                self.message_service.produce_message(msg.to_dict())
+                p.prepares += 1
+                self.incoming_proposals.add_proposal(proposal=p)
                 job.change_state(JobState.PREPARE)
 
     def __receive_prepare(self, incoming: Prepare):
@@ -260,7 +269,7 @@ class SwarmAgent(Agent):
         for p in incoming.proposals:
             job = self.job_queue.get_job(job_id=p.job_id)
             if not job or job.is_ready() or job.is_complete() or job.is_running():
-                self.logger.info(f"Ignoring Prepare: {p} for job: {job}")
+                self.logger.info(f"Job: {job} Ignoring Prepare: {p}")
                 return
 
             # Update the prepare votes
@@ -269,15 +278,16 @@ class SwarmAgent(Agent):
             elif self.incoming_proposals.contains(job_id=p.job_id, p_id=p.p_id):
                 proposal = self.incoming_proposals.get_proposal(p_id=p.p_id)
             else:
-                proposal = ProposalInfo(job_id=p.job_id, p_id=p.p_id, seed=p.seed, agent_id=p.agent_id)
-                self.incoming_proposals.add_proposal(proposal=proposal)
+                proposal = p
+                p.prepares = 0
+                self.incoming_proposals.add_proposal(proposal=p)
 
             proposal.prepares += 1
             quorum_count = (len(self.neighbor_map) // 2) + 1  # Ensure a true majority
             job.change_state(JobState.PREPARE)  # Consider the necessity of this state change
 
             if proposal.prepares >= quorum_count:
-                self.logger.info(f"Agent: {self.agent_id} Job: {p.job_id} received quorum "
+                self.logger.info(f"Job: {p.job_id} Agent: {self.agent_id} received quorum "
                                  f"prepares: {proposal.prepares}, starting commit!")
 
                 msg = Commit(agent=AgentInfo(agent_id=self.agent_id), proposals=[proposal])
@@ -291,7 +301,7 @@ class SwarmAgent(Agent):
             job = self.job_queue.get_job(job_id=p.job_id)
 
             if not job or job.is_complete() or job.is_ready() or job.is_running() or job.leader_agent_id:
-                self.logger.info(f"Ignoring Commit: {p} for job: {job}")
+                self.logger.info(f"Job: {job} Ignoring Commit: {p}")
                 self.incoming_proposals.remove_job(job_id=p.job_id)
                 self.outgoing_proposals.remove_job(job_id=p.job_id)
                 return
@@ -301,7 +311,10 @@ class SwarmAgent(Agent):
             elif self.incoming_proposals.contains(job_id=p.job_id, p_id=p.p_id):
                 proposal = self.incoming_proposals.get_proposal(p_id=p.p_id)
             else:
-                proposal = ProposalInfo(job_id=p.job_id, p_id=p.p_id, seed=p.seed, agent_id=p.agent_id)
+                self.logger.info(f"Job: {p.job_id} Agent: {self.agent_id} received commit without any Prepares")
+                proposal = p
+                p.prepares = 0
+                p.commits = 0
                 self.incoming_proposals.add_proposal(proposal=proposal)
 
             proposal.commits += 1
@@ -309,7 +322,7 @@ class SwarmAgent(Agent):
 
             if proposal.commits >= quorum_count:
                 self.logger.info(
-                    f"Agent: {self.agent_id} received quorum commits for Job: {p.job_id} Proposal: {proposal}: Job: {job}")
+                    f"Job: {p.job_id} Agent: {self.agent_id} received quorum commits Proposal: {proposal}: Job: {job}")
                 job.set_leader(leader_agent_id=proposal.agent_id)
                 if self.outgoing_proposals.contains(job_id=p.job_id, p_id=p.p_id):
                     self.logger.info(f"LEADER CONSENSUS achieved for Job: {p.job_id} Leader: {self.agent_id}")
@@ -331,7 +344,7 @@ class SwarmAgent(Agent):
                 continue
 
             if job.is_complete() or job.is_ready():
-                self.logger.info(f"Ignoring Job Status: {job} (State: {job.state})")
+                self.logger.info(f"Job: {job} Ignoring Job Status (State: {job.state})")
                 continue
 
             # Update the job status based on broadcast message

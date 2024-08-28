@@ -34,7 +34,14 @@ class ProposalInfo(JSONField):
         self.prepares = 0
         self.commits = 0
         self.agent_id = None
-        self.seed = round(random.random(), 2)
+        # self.seed = round(random.random(), 5)
+        # Decrease chances of collision
+        base_value = round(random.random(), 10)
+        offset = round(random.uniform(0, 1e-10), 10)
+        self.seed = base_value + offset
+        # TODO try this as second option
+        # secure_random = random.SystemRandom()
+        # unique_value = round(secure_random.random(), 10)
         self._set_fields(**kwargs)
 
     def _set_fields(self, forgiving=False, **kwargs):

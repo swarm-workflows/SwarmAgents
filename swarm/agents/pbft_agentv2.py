@@ -99,10 +99,11 @@ class PBFTAgent(Agent):
                         completed_jobs += 1
                         continue
 
-                    # DISABLE THIS
-                    #diff = int(time.time() - job.time_last_state_change)
-                    #if diff > 120 and job.get_state() in [JobState.PREPARE, JobState.PRE_PREPARE]:
-                    #    job.change_state(new_state=JobState.PENDING)
+                    diff = int(time.time() - job.time_last_state_change)
+                    if diff > self.restart_job_selection and job.get_state() in [JobState.PREPARE, JobState.PRE_PREPARE]:
+                        job.change_state(new_state=JobState.PENDING)
+                        self.outgoing_proposals.remove_job(job_id=job.get_job_id())
+                        self.incoming_proposals.remove_job(job_id=job.get_job_id())
 
                     if not job.is_pending():
                         if job.get_leader_agent_id() is None:
