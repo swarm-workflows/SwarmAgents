@@ -104,6 +104,7 @@ class Agent(Observer):
         self.idle_time = []
         self.idle_start_time = None
         self.total_idle_time = 0
+        self.restart_job_selection_cnt = 0
 
     def start_idle(self):
         if self.idle_start_time is None:

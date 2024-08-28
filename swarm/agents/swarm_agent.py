@@ -112,6 +112,7 @@ class SwarmAgent(Agent):
                         job.change_state(new_state=JobState.PENDING)
                         self.outgoing_proposals.remove_job(job_id=job.get_job_id())
                         self.incoming_proposals.remove_job(job_id=job.get_job_id())
+                        self.restart_job_selection_cnt += 1
 
                     if not job.is_pending():
                         if job.get_leader_agent_id() is None:
@@ -149,6 +150,7 @@ class SwarmAgent(Agent):
             except Exception as e:
                 self.logger.error(f"Error occurred while executing e: {e}")
                 self.logger.error(traceback.format_exc())
+        self.logger.info(f"Agent: {self} stopped with restarts: {self.restart_job_selection_cnt}!")
 
     def __compute_cost_matrix(self, jobs: list) -> np.ndarray:
         """
