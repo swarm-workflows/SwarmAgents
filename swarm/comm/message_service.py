@@ -55,7 +55,8 @@ class MessageService:
             "group.id": self.consumer_group_id,
             "auto.offset.reset": "latest",
             "enable.auto.commit": self.enable_auto_commit,
-            "on_commit": self.commit_completed
+            "on_commit": self.commit_completed,
+            "heartbeat.interval.ms": 1000
         })
         self.consumer.commit()
         self.logger = logger
@@ -95,7 +96,7 @@ class MessageService:
         #while not self.shutdown or lag:
         while not self.shutdown:
             try:
-                msg = self.consumer.poll(1.0)
+                msg = self.consumer.poll(0.25)
                 if msg is None:
                     lag = 0
                     continue
