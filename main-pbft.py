@@ -34,7 +34,7 @@ from swarm.models.job import Job
 
 
 class TaskDistributor(threading.Thread):
-    def __init__(self, agent: SwarmAgent, task_pool: List[Job], tasks_per_interval: int, interval: int):
+    def __init__(self, agent: PBFTAgent, task_pool: List[Job], tasks_per_interval: int, interval: int):
         super().__init__()
         self.agent = agent
         self.task_pool = task_pool
@@ -44,6 +44,7 @@ class TaskDistributor(threading.Thread):
         self.total_tasks = len(self.task_pool)
 
     def run(self):
+        print("Started Task Distributor")
         total_tasks_added = 0
         while not self.shutdown and self.task_pool:
             tasks_to_add = [self.task_pool.pop() for _ in range(min(self.tasks_per_interval, len(self.task_pool)))]
@@ -53,6 +54,7 @@ class TaskDistributor(threading.Thread):
             time.sleep(0.5)
             if total_tasks_added == self.total_tasks:
                 break
+        print("Stopped Task Distributor")
 
     def stop(self):
         self.shutdown = True

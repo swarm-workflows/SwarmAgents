@@ -31,7 +31,6 @@ from typing import List
 from swarm.agents.agent import Agent
 from swarm.comm.messages.heart_beat import HeartBeat
 from swarm.comm.messages.message import MessageType
-from swarm.models.capacities import Capacities
 from swarm.models.agent_info import AgentInfo
 from swarm.models.proposal_info import ProposalContainer, ProposalInfo
 from swarm.models.job import Job, JobState
