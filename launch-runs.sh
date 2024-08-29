@@ -33,8 +33,6 @@ fi
 DEST_DIR="$1"       # Directory where results will be copied
 MAX_RETRIES="$2"    # Number of times to restart the agents
 AGENT_TYPE="$3"
-LOG_DIR="logs-$AGENT_TYPE"
-RESULTS_DIR="$AGENT_TYPE"
 SLEEP_INTERVAL=10   # Time in seconds between checks
 
 # Function to check if agents are running
@@ -51,7 +49,7 @@ copy_results_and_logs() {
     local index=$1
     local run_dir="$DEST_DIR/run$index"
     mkdir -p "$run_dir"
-    mv "$LOG_DIR/*.log*" "$RESULTS_DIR/*.png" "$RESULTS_DIR/*.csv" "$run_dir/"
+    cp $AGENT_TYPE/* "$run_dir/"
 }
 
 # Main loop

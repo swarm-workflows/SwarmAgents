@@ -78,7 +78,7 @@ class Agent(Observer):
         self.logger = None
         self.projected_queue_threshold = 300.00
         self.ready_queue_threshold = 100.00
-        self.max_time_load_zero = 60
+        self.max_time_load_zero = 30
         self.restart_job_selection = 300
         self.peer_heartbeat_timeout = 300
         self.results_dir = "."
@@ -241,8 +241,8 @@ class Agent(Observer):
             self.profile = PROFILE_MAP.get(profile_name)
             self.data_transfer = runtime_config.get("data_transfer", True)
             self.projected_queue_threshold = runtime_config.get("projected_queue_threshold", 300.00)
-            self.ready_queue_threshold = runtime_config.get("projected_queue_threshold", 100.00)
-            self.max_time_load_zero = runtime_config.get("projected_queue_threshold", 60)
+            self.ready_queue_threshold = runtime_config.get("ready_queue_threshold", 100.00)
+            self.max_time_load_zero = runtime_config.get("max_time_load_zero", 30)
             self.restart_job_selection = runtime_config.get("restart_job_selection", 300)
             self.peer_heartbeat_timeout = runtime_config.get("peer_heartbeat_timeout", 300)
             self.results_dir = runtime_config.get("results_dir", ".")
