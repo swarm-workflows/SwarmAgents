@@ -27,14 +27,14 @@ import threading
 import time
 from typing import List
 
-from swarm.agents.pbft_agentv2 import PBFTAgent
+from swarm.agents.agent import Agent
 from swarm.models.capacities import Capacities
 from swarm.models.data_node import DataNode
 from swarm.models.job import Job
 
 
 class TaskDistributor(threading.Thread):
-    def __init__(self, agent: PBFTAgent, task_pool: List[Job], tasks_per_interval: int, interval: int):
+    def __init__(self, agent: Agent, task_pool: List[Job], tasks_per_interval: int, interval: int):
         super().__init__()
         self.agent = agent
         self.task_pool = task_pool
@@ -80,14 +80,32 @@ def build_tasks_from_json(json_file):
 
 
 if __name__ == '__main__':
-    if len(sys.argv) != 3:
-        print("Usage: python script.py <agent_id> <task_count>")
+    if len(sys.argv) != 4:
+        print("Usage: python main.py <agent_type> <agent_id> <task_count>")
         sys.exit(1)
 
-    agent_id = int(sys.argv[1])
-    task_count = int(sys.argv[2])
+    agent_type = sys.argv[1].lower()
+    agent_id = int(sys.argv[2])
+    task_count = int(sys.argv[3])
 
-    agent = PBFTAgent(agent_id=str(agent_id), config_file="./config.yml", cycles=1000)
+    # Load configuration based on agent type
+    if agent_type == "pbft":
+        config_file = "./config_pbft.yml"
+        from swarm.agents.pbft_agentv2 import PBFTAgent
+        agent = PBFTAgent(agent_id=str(agent_id), config_file=config_file, cycles=1000)
+    elif agent_type == "swarm-single":
+        config_file = "./config_swarm_single.yml"
+        # Initialize your swarm-single agent here using the config_file
+        from swarm.agents.swarm_agent import SwarmAgent
+        agent = SwarmAgent(agent_id=str(agent_id), config_file=config_file, cycles=1000)
+    elif agent_type == "swarm-multi":
+        config_file = "./config_swarm_multi.yml"
+        # Initialize your swarm-multi agent here using the config_file
+        from swarm.agents.swarm_agentv2 import SwarmAgent
+        agent = SwarmAgent(agent_id=str(agent_id), config_file=config_file, cycles=1000)
+    else:
+        print(f"Unknown agent type: {agent_type}")
+        sys.exit(1)
 
     task_pool = build_tasks_from_json('tasks.json')
     tasks_per_interval = 1  # Number of tasks to add each interval
@@ -106,6 +124,4 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         distributor.stop()
         agent.stop()
-
-    agent.plot_results()
     '''

@@ -3,8 +3,8 @@ redis:
   port: 6379
 kafka:
   bootstrap_servers: localhost:19092
-  topic: agent
-  consumer_group_id: agent
+  topic: agent-pbft
+  consumer_group_id: agent-pbft
 runtime:
   profile: BalancedProfile
   data_transfer: False
@@ -14,11 +14,11 @@ runtime:
   max_time_load_zero: 60
   restart_job_selection: 300
   peer_heartbeat_timeout: 300
-  results_dir: .
+  results_dir: pbft
 logging:
   ## The directory in which actor should create log files.
   ## This directory will be automatically created if it does not exist.
-  log-directory: .
+  log-directory: logs-pbft
 
   ## The filename to be used for actor's log file.
   log-file: agent

@@ -53,19 +53,14 @@ However, it's resilient and fault tolerant.
 pip install -r requirements.txt
 ```
 - Bring up the kafka cluster using `docker-compose up -d`
-- Generates `tasks.json` via `python task_generator.py`
-- Start Agent 0 is started via following command:
+- Generates `tasks.json` via `python task_generator.py 100`
+- Start Agents via following command:
 ```
-   python3.11 main-pbft.py 0 100
+sh pbft-start.sh
 ```
-- Rest of the agents can be started via following command:
+- Launch Log Runs
 ```
-    sh start.sh
-```
-NOTE: Remember to clean up the logs and kafka topic between runs via
-```
-rm -rf *.log*
-python3.11 kafka_cleanup.py
+nohup sh launch-runs.sh runs/pbft/3/repeated 100 pbft & disown
 ```
 
 ## SWARM Consensus (Swarm)
@@ -109,19 +104,24 @@ Each agent utilizes a cost matrix to determine whether it should become the lead
 pip install -r requirements.txt
 ```
 - Bring up the kafka cluster using `docker-compose up -d`
-- Generates `tasks.json` via `python task_generator.py`
-- Start Agent 0 is started via following command:
+- Generates `tasks.json` via `python task_generator.py 100`
+- Start Agents via following command:
+  - Multi Jobs
 ```
-   python3.11 main-swarm.py 0 100
+sh swarm-multi-start.sh
 ```
-- Rest of the agents can be started via following command:
+  - Single Jobs
 ```
-    sh start.sh
+sh swarm-single-start.sh
 ```
-NOTE: Remember to clean up the logs and kafka topic between runs via
+- Launch Log Runs
+  - Multi Jobs
 ```
-rm -rf *.log*
-python3.11 kafka_cleanup.py
+nohup sh launch-runs.sh runs/swarm/multi-jobs/3/repeated 100 swarm-multi & disown
+```
+  - Single Jobs
+```
+nohup sh launch-runs.sh runs/swarm/single-jobs/3/repeated 100 swarm-multi & disown
 ```
 
 ## Raft Consensus Algorithm

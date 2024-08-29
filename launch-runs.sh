@@ -23,17 +23,23 @@
 #
 # Author: Komal Thareja(kthare10@renci.org)
 
-# Configurable variables
-RES_DIR="runs/swarm/multi-jobs/3/repeated"  # Directory where results will be copied
-MAX_RETRIES=100                     # Number of times to restart the agents
-SLEEP_INTERVAL=10                 # Time in seconds between checks
-START_SCRIPT=swarm-start.sh
-AGENT_SCRIPT=main-swarm.py
-TOPIC=agent_load
+# Check if the required parameters are provided
+if [ "$#" -lt 3 ]; then
+    echo "Usage: $0 DEST_DIR MAX_RETRIES AGENT_TYPE"
+    exit 1
+fi
+
+# Assign command line arguments to variables
+DEST_DIR="$1"       # Directory where results will be copied
+MAX_RETRIES="$2"    # Number of times to restart the agents
+AGENT_TYPE="$3"
+LOG_DIR="logs-$AGENT_TYPE"
+RESULTS_DIR="$AGENT_TYPE"
+SLEEP_INTERVAL=10   # Time in seconds between checks
 
 # Function to check if agents are running
 are_agents_running() {
-    if pgrep -f "python3.11 $AGENT_SCRIPT" > /dev/null; then
+    if pgrep -f "python3.11 main.py $AGENT_TYPE" > /dev/null; then
         return 0  # Agents are running
     else
         return 1  # Agents are not running
@@ -43,20 +49,16 @@ are_agents_running() {
 # Function to copy results and logs
 copy_results_and_logs() {
     local index=$1
-    local run_dir="$RES_DIR/run$index"
+    local run_dir="$DEST_DIR/run$index"
     mkdir -p "$run_dir"
-    mv *.log *.png *.csv "$run_dir/"
+    mv "$LOG_DIR/*.log*" "$RESULTS_DIR/*.png" "$RESULTS_DIR/*.csv" "$run_dir/"
 }
 
 # Main loop
 for ((i=1; i<=MAX_RETRIES; i++))
 do
-    echo "Cleanup before starting new run"
-    rm -rf *.log* *.csv *.png
-    python3 kafka_cleanup.py --topic $TOPIC
-
     echo "Starting agents... (Attempt $i)"
-    sh $START_SCRIPT
+    sh "$AGENT_TYPE-start.sh"
 
     # Wait for agents to start and then begin polling
     sleep $SLEEP_INTERVAL

@@ -81,6 +81,7 @@ class Agent(Observer):
         self.max_time_load_zero = 60
         self.restart_job_selection = 300
         self.peer_heartbeat_timeout = 300
+        self.results_dir = "."
         self.load_config(config_file)
         self.capacities = self.get_system_info()
         self.message_service = MessageService(config=self.kafka_config, logger=self.logger)
@@ -400,6 +401,7 @@ class Agent(Observer):
         self.selected_queue.add_job(job=job)
 
     def schedule_job(self, job: Job):
+        self.end_idle()
         print(f"Executing: {job.get_job_id()} on agent: {self.agent_id}")
         self.logger.info(f"Executing: {job.get_job_id()} on agent: {self.agent_id}")
         # Add the job to the list of allocated jobs
@@ -417,6 +419,8 @@ class Agent(Observer):
             job.execute(data_transfer=self.data_transfer)
             self.done_queue.add_job(job=job)
             self.ready_queue.remove_job(job_id=job.get_job_id())
+            if not len(self.ready_queue.jobs):
+                self.start_idle()
         except Exception as e:
             self.logger.error(f"Execution error: {e}")
             self.logger.error(traceback.format_exc())
@@ -523,8 +527,6 @@ class Agent(Observer):
         while not self.shutdown:
             try:
                 job_ids = list(self.selected_queue.jobs.keys())
-                if len(job_ids):
-                    self.end_idle()
                 for job_id in job_ids:
                     job = self.selected_queue.jobs.get(job_id)
                     if not job:
@@ -535,21 +537,17 @@ class Agent(Observer):
                         self.selected_queue.remove_job(job_id)
                         self.schedule_job(job)
                     else:
-                        if ready_queue_load == 0.0:
-                            self.start_idle()
                         time.sleep(0.5)
-                ready_queue_load = self.compute_ready_queue_load()
-                if ready_queue_load == 0.0:
-                    self.start_idle()
+
                 time.sleep(5)
             except Exception as e:
                 self.logger.error(f"Error occurred while executing e: {e}")
                 self.logger.error(traceback.format_exc())
         self.logger.info(f"Stopped Job Scheduling Thread!")
 
-    def plot_idle_time_per_agent(self):
+    def save_idle_time_per_agent(self):
         # Save jobs_per_agent to CSV
-        with open(f'idle_time_per_agent_{self.agent_id}.csv', 'w', newline='') as file:
+        with open(f'{self.results_dir}/idle_time_per_agent_{self.agent_id}.csv', 'w', newline='') as file:
             writer = csv.writer(file)
             writer.writerow(['Idle Time'])
             for idle_time in self.idle_time:
@@ -567,7 +565,7 @@ class Agent(Observer):
                 jobs_per_agent[j.leader_agent_id] += 1
 
         # Save jobs_per_agent to CSV
-        with open(f'jobs_per_agent_{self.agent_id}.csv', 'w', newline='') as file:
+        with open(f'{self.results_dir}/jobs_per_agent_{self.agent_id}.csv', 'w', newline='') as file:
             writer = csv.writer(file)
             writer.writerow(['Agent ID', 'Number of Jobs Selected'])
             for agent_id, job_count in jobs_per_agent.items():
@@ -585,8 +583,7 @@ class Agent(Observer):
         plt.grid(axis='y', linestyle='--', linewidth=0.5)
 
         # Save the plot
-        plot_path = os.path.join("", f'jobs_per_agent_{self.agent_id}.png')
-        plt.savefig(plot_path)
+        plt.savefig(f'{self.results_dir}/jobs_per_agent_{self.agent_id}.png')
         plt.close()
 
     def plot_scheduling_latency(self):
@@ -603,19 +600,19 @@ class Agent(Observer):
             selection_times[j.job_id] = j.selected_by_agent_at - j.selection_started_at
             scheduling_latency[j.job_id] = wait_times[j.job_id] + selection_times[j.job_id]
 
-        with open(f'wait_time_{self.agent_id}.csv', 'w', newline='') as file:
+        with open(f'{self.results_dir}/wait_time_{self.agent_id}.csv', 'w', newline='') as file:
             writer = csv.writer(file)
             writer.writerow(['job_id', 'wait_time'])
             for key, value in wait_times.items():
                 writer.writerow([key, value])
 
-        with open(f'selection_time_{self.agent_id}.csv', 'w', newline='') as file:
+        with open(f'{self.results_dir}/selection_time_{self.agent_id}.csv', 'w', newline='') as file:
             writer = csv.writer(file)
             writer.writerow(['job_id', 'selection_time'])
             for key, value in selection_times.items():
                 writer.writerow([key, value])
 
-        with open(f'scheduling_latency_{self.agent_id}.csv', 'w', newline='') as file:
+        with open(f'{self.results_dir}/scheduling_latency_{self.agent_id}.csv', 'w', newline='') as file:
             writer = csv.writer(file)
             writer.writerow(['job_id', 'scheduling_latency'])
             for key, value in scheduling_latency.items():
@@ -648,13 +645,12 @@ class Agent(Observer):
         plt.legend(loc='upper left', bbox_to_anchor=(1, 1))  # This places the legend outside the plot area
 
         # Save the plot
-        plot_path = os.path.join("", f'job_latency_{self.agent_id}.png')
-        plt.savefig(plot_path, bbox_inches='tight')  # bbox_inches='tight' ensures that the entire plot is saved
+        plt.savefig(f'{self.results_dir}/job_latency_{self.agent_id}.png', bbox_inches='tight')  # bbox_inches='tight' ensures that the entire plot is saved
         plt.close()
 
     def plot_load_per_agent(self, load_dict: dict, threshold: float, title_prefix: str = ""):
-        csv_filename = f'agent_loads_{self.agent_id}.csv'
-        plot_filename = f'agent_loads_plot_{self.agent_id}.png'
+        csv_filename = f'{self.results_dir}/agent_loads_{self.agent_id}.csv'
+        plot_filename = f'{self.results_dir}/agent_loads_plot_{self.agent_id}.png'
         # Find the maximum length of the load lists
         max_intervals = max(len(loads) for loads in load_dict.values())
 
@@ -694,7 +690,7 @@ class Agent(Observer):
         self.plot_jobs_per_agent()
         self.plot_scheduling_latency()
         self.plot_load_per_agent(self.load_per_agent, self.projected_queue_threshold, title_prefix="Projected")
-        self.plot_idle_time_per_agent()
+        self.save_idle_time_per_agent()
         self.logger.info("Plot completed")
 
     def _can_shutdown(self, heart_beat: HeartBeat):
