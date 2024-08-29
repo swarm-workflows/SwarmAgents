@@ -121,7 +121,7 @@ nohup sh launch-runs.sh runs/swarm/multi-jobs/5/repeated 100 swarm-multi & disow
 ```
   - Single Jobs
 ```
-nohup sh launch-runs.sh runs/swarm/single-jobs/5/repeated 100 swarm-single & disown
+nohup sh launch-runs.sh runs/swarm/single-job/5/repeated 100 swarm-single & disown
 ```
 
 ## Raft Consensus Algorithm
