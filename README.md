@@ -60,7 +60,7 @@ sh pbft-start.sh
 ```
 - Launch Log Runs
 ```
-nohup sh launch-runs.sh runs/pbft/3/repeated 100 pbft & disown
+nohup sh launch-runs.sh runs/pbft/5/repeated 100 pbft & disown
 ```
 
 ## SWARM Consensus (Swarm)
@@ -117,11 +117,11 @@ sh swarm-single-start.sh
 - Launch Log Runs
   - Multi Jobs
 ```
-nohup sh launch-runs.sh runs/swarm/multi-jobs/3/repeated 100 swarm-multi & disown
+nohup sh launch-runs.sh runs/swarm/multi-jobs/5/repeated 100 swarm-multi & disown
 ```
   - Single Jobs
 ```
-nohup sh launch-runs.sh runs/swarm/single-jobs/3/repeated 100 swarm-single & disown
+nohup sh launch-runs.sh runs/swarm/single-jobs/5/repeated 100 swarm-single & disown
 ```
 
 ## Raft Consensus Algorithm

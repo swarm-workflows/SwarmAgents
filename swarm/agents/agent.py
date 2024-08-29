@@ -253,6 +253,7 @@ class Agent(Observer):
             self.max_time_load_zero = config.get("projected_queue_threshold", 60)
             self.restart_job_selection = config.get("restart_job_selection", 300)
             self.peer_heartbeat_timeout = config.get("peer_heartbeat_timeout", 300)
+            self.results_dir = config.get("results_dir", ".")
 
     @staticmethod
     def get_system_info():
