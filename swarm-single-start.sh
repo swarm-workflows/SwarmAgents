@@ -1,7 +1,7 @@
 #!/bin/bash
 
 pkill -f "main.py swarm-single"
-python3.11 kafka_cleanup.py agent-swarm-single
+python3.11 kafka_cleanup.py --topic agent-swarm-single
 rm -rf logs-swarm-single
 rm -rf swarm-single
 mkdir -p swarm-single logs-swarm-single

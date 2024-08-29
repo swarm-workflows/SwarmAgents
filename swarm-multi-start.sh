@@ -1,7 +1,7 @@
 #!/bin/bash
 
 pkill -f "main.py swarm-multi"
-python3.11 kafka_cleanup.py agent-swarm-multi
+python3.11 kafka_cleanup.py --topic agent-swarm-multi
 rm -rf logs-swarm-multi
 rm -rf swarm-multi
 mkdir -p swarm-multi logs-swarm-multi

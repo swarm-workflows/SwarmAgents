@@ -1,7 +1,7 @@
 #!/bin/bash
 
 pkill -f "main.py pbft"
-python3.11 kafka_cleanup.py agent-pbft
+python3.11 kafka_cleanup.py --topic agent-pbft
 rm -rf logs-pbft
 rm -rf pbft
 mkdir -p pbft logs-pbft
