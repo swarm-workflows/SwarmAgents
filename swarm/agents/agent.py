@@ -240,6 +240,12 @@ class Agent(Observer):
             profile_name = runtime_config.get("profile", str(ProfileType.BalancedProfile))
             self.profile = PROFILE_MAP.get(profile_name)
             self.data_transfer = runtime_config.get("data_transfer", True)
+            self.projected_queue_threshold = runtime_config.get("projected_queue_threshold", 300.00)
+            self.ready_queue_threshold = runtime_config.get("projected_queue_threshold", 100.00)
+            self.max_time_load_zero = runtime_config.get("projected_queue_threshold", 60)
+            self.restart_job_selection = runtime_config.get("restart_job_selection", 300)
+            self.peer_heartbeat_timeout = runtime_config.get("peer_heartbeat_timeout", 300)
+            self.results_dir = runtime_config.get("results_dir", ".")
 
             log_config = config.get("logging")
             self.logger = self.make_logger(log_dir=log_config.get("log-directory"),
@@ -248,12 +254,6 @@ class Agent(Observer):
                                            log_retain=log_config.get("log-retain"),
                                            log_size=log_config.get("log-size"),
                                            log_level=log_config.get("log-level"))
-            self.projected_queue_threshold = config.get("projected_queue_threshold", 300.00)
-            self.ready_queue_threshold = config.get("projected_queue_threshold", 100.00)
-            self.max_time_load_zero = config.get("projected_queue_threshold", 60)
-            self.restart_job_selection = config.get("restart_job_selection", 300)
-            self.peer_heartbeat_timeout = config.get("peer_heartbeat_timeout", 300)
-            self.results_dir = config.get("results_dir", ".")
 
     @staticmethod
     def get_system_info():
