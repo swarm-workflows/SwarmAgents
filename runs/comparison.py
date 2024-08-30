@@ -99,7 +99,7 @@ def plot_means_median_line_idle(data_list: List[Dict[str, Any]], number_of_agent
     idx = 0
     for mean_median in data_list:
         plt.plot(mean_median['idle_means'], colors[idx][0], label=f'{mean_median["algo"]}: Mean')
-        plt.plot(mean_median['idle_medians'], f'{colors[idx][0]}-', label=f'{mean_median["algo"]}: Median')
+        plt.plot(mean_median['idle_medians'], f'{colors[idx][0]}.', label=f'{mean_median["algo"]}: Median')
         plt.fill_between(range(len(mean_median['idle_means'])), mean_median['idle_ci_lower'], mean_median['idle_ci_upper'],
                          color=colors[idx][1], alpha=0.2,
                          label=f'{mean_median["algo"]}: 95% CI')
@@ -121,7 +121,7 @@ def plot_means_median_line(data_list: List[Dict[str, Any]], number_of_agents: in
     idx = 0
     for mean_median in data_list:
         plt.plot(mean_median['means'], colors[idx][0], label=f'{mean_median["algo"]}: Mean')
-        plt.plot(mean_median['medians'], f'{colors[idx][0]}-', label=f'{mean_median["algo"]}: Median')
+        plt.plot(mean_median['medians'], f'{colors[idx][0]}.', label=f'{mean_median["algo"]}: Median')
         plt.fill_between(range(len(mean_median['means'])), mean_median['ci_lower'], mean_median['ci_upper'],
                          color=colors[idx][1], alpha=0.2,
                          label=f'{mean_median["algo"]}: 95% CI')
