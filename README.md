@@ -37,26 +37,9 @@ Each agent strives to become the leader for executing a job based on the followi
 PBFT consensus works with smaller number of agents but struggles to scale efficiently as the number of agents increases, due to its communication complexity.
 However, it's resilient and fault tolerant.
 
+Performance results for PBFT can be found [here](./runs/pbft).
 
-#### Single Run
-|    3  Agents      |            5   Agents     | 10 Agents|
-|-------------------|---------------------------|----------|
-|![Scheduling latency](./runs/pbft/3/repeated/run2/job_latency_0.png)|![Scheduling latency](./runs/pbft/5/repeated/run2/job_latency_0.png)|![Scheduling latency](./runs/pbft/10/repeated/run2/job_latency_0.png)|
-|![Projected Load per Agent](./runs/pbft/3/repeated/run2/agent_loads_plot_0.png)|![Projected Load per Agent](./runs/pbft/5/repeated/run2/agent_loads_plot_0.png)|![Projected Load per Agent](./runs/pbft/10/repeated/run2/agent_loads_plot_0.png)|
-
-##### Comparison
-![Scheduling latency comparison - Number of agents](./runs/pbft/overall-scheduling-latency.png)
-
-#### Overall across 100 Runs
-|    3  Agents      |            5   Agents     | 10 Agents|
-|-------------------|---------------------------|----------|
-|![Overall Metrics](./runs/pbft/3/repeated/box_plot_overall_metrics.png)|![Overall Metrics](./runs/pbft/5/repeated/box_plot_overall_metrics.png)|![Overall Metrics](./runs/pbft/10/repeated/box_plot_overall_metrics.png)|
-|![Idle Time](./runs/pbft/3/repeated/histogram_idle_times.png)|![Idle Time](./runs/pbft/5/repeated/histogram_idle_times.png)|![Idle Time](./runs/pbft/10/repeated/histogram_idle_times.png)|
-|![Wait Time](./runs/pbft/3/repeated/histogram_wait_times.png)|![Wait Time](./runs/pbft/5/repeated/histogram_wait_times.png)|![Wait Time](./runs/pbft/10/repeated/histogram_wait_times.png)|
-|![Selection Time](./runs/pbft/3/repeated/histogram_selection_times.png)|![Selection Time](./runs/pbft/5/repeated/histogram_selection_times.png)|![Selection Time](./runs/pbft/10/repeated/histogram_selection_times.png)|
-|![Line Plot CI](./runs/pbft/3/repeated/line_plot_with_ci.png)|![Line Plot CI](./runs/pbft/5/repeated/line_plot_with_ci.png)|![Line Plot CI](./runs/pbft/10/repeated/line_plot_with_ci.png)|
-|![Line Plot Selection CI](./runs/pbft/3/repeated/line_plot_with_ci_selection.png)|![Line Plot Selection CI](./runs/pbft/5/repeated/line_plot_with_ci_selection.png)|![Line Plot Selection CI](./runs/pbft/10/repeated/line_plot_with_ci_selection.png)|
-|![Scatter Plot Scheduling Latency Vs Selection Time](./runs/pbft/3/repeated/scatter_plot_with_regression.png)|![Scatter Plot Scheduling Latency Vs Selection Time](./runs/pbft/5/repeated/scatter_plot_with_regression.png)|![Scatter Plot Scheduling Latency Vs Selection Time](./runs/pbft/10/repeated/scatter_plot_with_regression.png)|
+![Overall scheduling latency vs number of agents](./runs/pbft/overall-scheduling-latency.png)
 
 ### Usage
 - Set up the python environment by installing all the dependencies:
@@ -98,45 +81,18 @@ Each agent utilizes a cost matrix to determine whether it should become the lead
 - Greedy approach with random seed used to resolve proposal collisions shows improvement over basic PBFT.
 - Job selection is triggered for only single job at a time
 
+Performance results for SWARM with single job selection can be found [here](./runs/swarm/single-job).
+
+![Overall scheduling latency vs number of agents](./runs/swarm/single-job/overall-scheduling-latency.png)
+
 #### Greedy Approach with Random seed and multiple job
 - Greedy approach with random seed used to resolve proposal collisions shows improvement over basic PBFT.
 - Job selection is triggered for upto 3 jobs at a time
 
-##### Single Run
-|    Number of Agents        | Greedy Approach (Single Job)                                                                    | Greedy Approach (Multiple Job)                                                                                             |
-|------------|--------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------|
-| 3   |![Scheduling latency](./runs/swarm/single-job/3/repeated/run2/job_latency_0.png) |![Scheduling latency](./runs/swarm/multi-jobs/3/repeated/run2/job_latency_0.png) |
-| 3   | ![Projected Load per Agent](./runs/swarm/single-job/3/repeated/run2/agent_loads_plot_0.png) | ![Projected Load per Agent](./runs/swarm/multi-jobs/3/repeated/run2/agent_loads_plot_0.png)|
-| 5   |![Scheduling latency](./runs/swarm/single-job/5/repeated/run2/job_latency_0.png) |![Scheduling latency](./runs/swarm/multi-jobs/5/repeated/run2/job_latency_0.png) |
-| 5   | ![Projected Load per Agent](./runs/swarm/single-job/5/repeated/run2/agent_loads_plot_0.png) | ![Projected Load per Agent](./runs/swarm/multi-jobs/5/repeated/run2/agent_loads_plot_0.png)|
-| 10   |![Scheduling latency](./runs/swarm/single-job/10/repeated/run2/job_latency_0.png) |![Scheduling latency](./runs/swarm/multi-jobs/10/repeated/run2/job_latency_0.png) |
-| 10   | ![Projected Load per Agent](./runs/swarm/single-job/10/repeated/run2/agent_loads_plot_0.png) | ![Projected Load per Agent](./runs/swarm/multi-jobs/10/repeated/run2/agent_loads_plot_0.png)|
-| Overall  |![Scheduling latency comparison - Number of agents](./runs/swarm/single-job/overall-scheduling-latency.png) | ![Scheduling latency comparison - Number of agents](./runs/swarm/multi-jobs/overall-scheduling-latency.png)|
+Performance results for SWARM with mulyiple job selection at a time can be found [here](./runs/swarm/multi-jobs).
 
-##### Multi Run
-|    Number of Agents        | Greedy Approach (Single Job)                                                                    | Greedy Approach (Multiple Job)                                                                                             |
-|------------|--------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------|
-|3|![Overall Metrics](./runs/swarm/single-job/3/repeated/box_plot_overall_metrics.png)|![Overall Metrics](./runs/swarm/multi-jobs/3/repeated/box_plot_overall_metrics.png)|
-|3|![Idle Time](./runs/swarm/single-job/3/repeated/histogram_idle_times.png)|![Idle Time](./runs/swarm/multi-jobs/3/repeated/histogram_idle_times.png)|
-|3|![Wait Time](./runs/swarm/single-job/3/repeated/histogram_wait_times.png)|![Wait Time](./runs/swarm/multi-jobs/3/repeated/histogram_wait_times.png)|
-|3|![Selection Time](./runs/swarm/single-job/3/repeated/histogram_selection_times.png)|![Selection Time](./runs/swarm/multi-jobs/3/repeated/histogram_selection_times.png)|
-|3|![Line Plot CI](./runs/swarm/single-job/3/repeated/line_plot_with_ci.png)|![Line Plot CI](./runs/swarm/multi-jobs/3/repeated/line_plot_with_ci.png)|
-|3|![Line Plot Selection CI](./runs/swarm/single-job/3/repeated/line_plot_with_ci_selection.png)|![Line Plot Selection CI](./runs/swarm/multi-jobs/3/repeated/line_plot_with_ci_selection.png)|
-|3|![Scatter Plot Scheduling Latency Vs Selection Time](./runs/swarm/single-job/3/repeated/scatter_plot_with_regression.png)|![Scatter Plot Scheduling Latency Vs Selection Time](./runs/swarm/multi-jobs/3/repeated/scatter_plot_with_regression.png)|
-|5|![Overall Metrics](./runs/swarm/single-job/5/repeated/box_plot_overall_metrics.png)|![Overall Metrics](./runs/swarm/multi-jobs/5/repeated/box_plot_overall_metrics.png)|
-|5|![Idle Time](./runs/swarm/single-job/5/repeated/histogram_idle_times.png)|![Idle Time](./runs/swarm/multi-jobs/5/repeated/histogram_idle_times.png)|
-|5|![Wait Time](./runs/swarm/single-job/5/repeated/histogram_wait_times.png)|![Wait Time](./runs/swarm/multi-jobs/5/repeated/histogram_wait_times.png)|
-|5|![Selection Time](./runs/swarm/single-job/5/repeated/histogram_selection_times.png)|![Selection Time](./runs/swarm/multi-jobs/5/repeated/histogram_selection_times.png)|
-|5|![Line Plot CI](./runs/swarm/single-job/5/repeated/line_plot_with_ci.png)|![Line Plot CI](./runs/swarm/multi-jobs/5/repeated/line_plot_with_ci.png)|
-|5|![Line Plot Selection CI](./runs/swarm/single-job/5/repeated/line_plot_with_ci_selection.png)|![Line Plot Selection CI](./runs/swarm/multi-jobs/5/repeated/line_plot_with_ci_selection.png)|
-|5|![Scatter Plot Scheduling Latency Vs Selection Time](./runs/swarm/single-job/5/repeated/scatter_plot_with_regression.png)|![Scatter Plot Scheduling Latency Vs Selection Time](./runs/swarm/multi-jobs/5/repeated/scatter_plot_with_regression.png)|
-|10|![Overall Metrics](./runs/swarm/single-job/10/repeated/box_plot_overall_metrics.png)|![Overall Metrics](./runs/swarm/multi-jobs/10/repeated/box_plot_overall_metrics.png)|
-|10|![Idle Time](./runs/swarm/single-job/10/repeated/histogram_idle_times.png)|![Idle Time](./runs/swarm/multi-jobs/10/repeated/histogram_idle_times.png)|
-|10|![Wait Time](./runs/swarm/single-job/10/repeated/histogram_wait_times.png)|![Wait Time](./runs/swarm/multi-jobs/10/repeated/histogram_wait_times.png)|
-|10|![Selection Time](./runs/swarm/single-job/10/repeated/histogram_selection_times.png)|![Selection Time](./runs/swarm/multi-jobs/10/repeated/histogram_selection_times.png)|
-|10|![Line Plot CI](./runs/swarm/single-job/10/repeated/line_plot_with_ci.png)|![Line Plot CI](./runs/swarm/multi-jobs/10/repeated/line_plot_with_ci.png)|
-|10|![Line Plot Selection CI](./runs/swarm/single-job/10/repeated/line_plot_with_ci_selection.png)|![Line Plot Selection CI](./runs/swarm/multi-jobs/10/repeated/line_plot_with_ci_selection.png)|
-|10|![Scatter Plot Scheduling Latency Vs Selection Time](./runs/swarm/single-job/10/repeated/scatter_plot_with_regression.png)|![Scatter Plot Scheduling Latency Vs Selection Time](./runs/swarm/multi-jobs/10/repeated/scatter_plot_with_regression.png)|
+![Overall scheduling latency vs number of agents](./runs/swarm/multi-jobs/overall-scheduling-latency.png)
+
 ### Usage
 - Set up the python environment by installing all the dependencies:
 ```
@@ -173,6 +129,20 @@ python analyze_results.py --number_of_agents 3 --run_directory swarm/multi-jobs/
 python analyze_results.py --number_of_agents 3 --run_directory swarm/single-job/3/repeated/ --algo SWARM-SINGLE
 ```
 
+## Comparison PBFT vs SWARM Single vs SWARM Multi
+### Results with 3 Agents
+![Scheduling Latency](./runs/comparison_histogram_flat_scheduling_latencies_3.png)
+![Idle Time](./runs/comparison_histogram_flat_idle_times_3.png)
+![CI Plot](./runs/comparison_line_plot_with_ci_3.png)
+### Results with 5 Agents
+![Scheduling Latency](./runs/comparison_histogram_flat_scheduling_latencies_5.png)
+![Idle Time](./runs/comparison_histogram_flat_idle_times_5.png)
+![CI Plot](./runs/comparison_line_plot_with_ci_5.png)
+
+### Results with 10 Agents
+![Scheduling Latency](./runs/comparison_histogram_flat_scheduling_latencies_10.png)
+![Idle Time](./runs/comparison_histogram_flat_idle_times_10.png)
+![CI Plot](./runs/comparison_line_plot_with_ci_10.png)
 
 ## Raft Consensus Algorithm
 RAFT algorithm is explored and implemented in `raft_agent.py`. This agent works as follows:

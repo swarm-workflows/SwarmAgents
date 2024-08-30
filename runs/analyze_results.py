@@ -13,6 +13,7 @@ def main(run_directory: str, number_of_agents: int, algo: str):
     scheduling_latencies = []
     wait_times = []
     all_idle_times = []
+    agent_loads_dict = {}
 
     # Loop through the directories for each run
     for i in range(100):
@@ -21,10 +22,19 @@ def main(run_directory: str, number_of_agents: int, algo: str):
         selection_time_file = os.path.join(run_dir, f'selection_time_0.csv')
         scheduling_latency_file = os.path.join(run_dir, f'scheduling_latency_0.csv')
         wait_time_file = os.path.join(run_dir, f'wait_time_0.csv')
+        agent_load_file = os.path.join(run_dir, 'agent_loads_0.csv')
 
         if not os.path.exists(selection_time_file) or not os.path.exists(scheduling_latency_file) or \
                 not os.path.exists(wait_time_file):
             continue
+
+        if os.path.exists(agent_load_file):
+            df = pd.read_csv(agent_load_file, index_col=0)
+            for agent_id in range(number_of_agents):
+                agent_load = df[f'Agent {agent_id}'].dropna().tolist()
+                if agent_id not in agent_loads_dict:
+                    agent_loads_dict[agent_id] = []
+                agent_loads_dict[agent_id].append(np.mean(agent_load))  # Mean load per agent per run
 
         # Load Selection Time
         if os.path.exists(selection_time_file):
@@ -182,7 +192,22 @@ def main(run_directory: str, number_of_agents: int, algo: str):
     plt.savefig(os.path.join(run_directory, 'histogram_idle_times.png'), bbox_inches='tight')
     plt.close()
 
-    print('All plots including idle time analysis have been saved successfully.')
+    print(agent_loads_dict)
+
+
+    # Convert the dictionary to a DataFrame
+    df_all_runs = pd.DataFrame(agent_loads_dict)
+
+
+    # Plotting the box plot
+    plt.figure(figsize=(14, 10))
+    df_all_runs.boxplot()
+    plt.title(f'{algo}: Agents: {number_of_agents} - Box Plot of Agent Loads Across 100 Runs')
+    plt.xlabel('Agent ID')
+    plt.ylabel('Agent Load')
+    plt.grid(True)
+    plt.savefig(os.path.join(run_directory, 'box_plot_agent_loads.png'), bbox_inches='tight')
+    plt.close()
 
 
 if __name__ == '__main__':

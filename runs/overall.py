@@ -37,7 +37,7 @@ def plot_scheduling_latency(algo: str, base_dir: str):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Overll scheduling latency comparison')
+    parser = argparse.ArgumentParser(description='Overall scheduling latency comparison')
     parser.add_argument('--run_directory', type=str, required=True, help='Directory where run folders exist')
     parser.add_argument('--algo', type=str, required=True, help='Algorithm: pbft, swarm-single, swarm-multi')
 
