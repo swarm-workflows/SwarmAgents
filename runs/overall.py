@@ -1,13 +1,15 @@
+import argparse
 import os
 import pandas as pd
 import matplotlib.pyplot as plt
 
-def plot_scheduling_latency(algo, base_dir):
+
+def plot_scheduling_latency(algo: str, base_dir: str):
     # Define file paths dynamically based on the algorithm and base directory
     file_paths = [
-        os.path.join(base_dir, f'3/repeated/run1/scheduling_latency_0.csv'),
-        os.path.join(base_dir, f'5/repeated/run1/scheduling_latency_0.csv'),
-        os.path.join(base_dir, f'10/repeated/run1/scheduling_latency_0.csv')
+        os.path.join(base_dir, f'3/repeated/run2/scheduling_latency_0.csv'),
+        os.path.join(base_dir, f'5/repeated/run2/scheduling_latency_0.csv'),
+        os.path.join(base_dir, f'10/repeated/run2/scheduling_latency_0.csv')
     ]
 
     # Load data from each file
@@ -29,14 +31,16 @@ def plot_scheduling_latency(algo, base_dir):
     plt.legend()
 
     # Save the plot
-    plot_path = os.path.join(base_dir, f'{base_dir}/overall-scheduling-latency.png')
+    plot_path = os.path.join(base_dir, f'overall-scheduling-latency.png')
     plt.savefig(plot_path, bbox_inches='tight')  # bbox_inches='tight' ensures that the entire plot is saved
     plt.close()
 
 
 if __name__ == '__main__':
-    # Example usage: provide the algorithm name and base directory
-    algo = 'pbft'  # Replace with the algorithm name you want to analyze
-    base_dir = '/path/to/directory'  # Replace with the path to your base directory
+    parser = argparse.ArgumentParser(description='Overll scheduling latency comparison')
+    parser.add_argument('--run_directory', type=str, required=True, help='Directory where run folders exist')
+    parser.add_argument('--algo', type=str, required=True, help='Algorithm: pbft, swarm-single, swarm-multi')
 
-    plot_scheduling_latency(algo, base_dir)
+    args = parser.parse_args()
+
+    plot_scheduling_latency(args.algo, args.run_directory)

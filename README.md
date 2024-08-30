@@ -41,8 +41,8 @@ However, it's resilient and fault tolerant.
 #### Single Run
 |    3  Agents      |            5   Agents     | 10 Agents|
 |-------------------|---------------------------|----------|
-|![Scheduling latency](./runs/pbft/3/repeated/run1/job_latency_0.png)|![Scheduling latency](./runs/pbft/5/repeated/run2/job_latency_0.png)|![Scheduling latency](./runs/pbft/10/repeated/run1/job_latency_0.png)|
-|![Projected Load per Agent](./runs/pbft/3/repeated/run1/agent_loads_plot_0.png)|![Projected Load per Agent](./runs/pbft/5/repeated/run2/agent_loads_plot_0.png)|![Projected Load per Agent](./runs/pbft/10/repeated/run1/agent_loads_plot_0.png)|
+|![Scheduling latency](./runs/pbft/3/repeated/run2/job_latency_0.png)|![Scheduling latency](./runs/pbft/5/repeated/run2/job_latency_0.png)|![Scheduling latency](./runs/pbft/10/repeated/run2/job_latency_0.png)|
+|![Projected Load per Agent](./runs/pbft/3/repeated/run2/agent_loads_plot_0.png)|![Projected Load per Agent](./runs/pbft/5/repeated/run2/agent_loads_plot_0.png)|![Projected Load per Agent](./runs/pbft/10/repeated/run2/agent_loads_plot_0.png)|
 
 ##### Comparison
 ![Scheduling latency comparison - Number of agents](./runs/pbft/overall-scheduling-latency.png)
@@ -105,12 +105,12 @@ Each agent utilizes a cost matrix to determine whether it should become the lead
 ##### Single Run
 |    Number of Agents        | Greedy Approach (Single Job)                                                                    | Greedy Approach (Multiple Job)                                                                                             |
 |------------|--------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------|
-| 3   |![Scheduling latency](./runs/swarm/single-job/3/repeated/run1/job_latency_0.png) |![Scheduling latency](./runs/swarm/multi-jobs/3/repeated/run1/job_latency_0.png) |
-| 3   | ![Projected Load per Agent](./runs/swarm/single-job/3/repeated/run1/agent_loads_plot_0.png) | ![Projected Load per Agent](./runs/swarm/multi-jobs/3/repeated/run1/agent_loads_plot_0.png)|
-| 5   |![Scheduling latency](./runs/swarm/single-job/5/repeated/run2/job_latency_0.png) |![Scheduling latency](./runs/swarm/multi-jobs/5/repeated/run1/job_latency_0.png) |
-| 5   | ![Projected Load per Agent](./runs/swarm/single-job/5/repeated/run2/agent_loads_plot_0.png) | ![Projected Load per Agent](./runs/swarm/multi-jobs/5/repeated/run1/agent_loads_plot_0.png)|
-| 10   |![Scheduling latency](./runs/swarm/single-job/10/repeated/run1/job_latency_0.png) |![Scheduling latency](./runs/swarm/multi-jobs/10/repeated/run1/job_latency_0.png) |
-| 10   | ![Projected Load per Agent](./runs/swarm/single-job/10/repeated/run1/agent_loads_plot_0.png) | ![Projected Load per Agent](./runs/swarm/multi-jobs/10/repeated/run1/agent_loads_plot_0.png)|
+| 3   |![Scheduling latency](./runs/swarm/single-job/3/repeated/run2/job_latency_0.png) |![Scheduling latency](./runs/swarm/multi-jobs/3/repeated/run2/job_latency_0.png) |
+| 3   | ![Projected Load per Agent](./runs/swarm/single-job/3/repeated/run2/agent_loads_plot_0.png) | ![Projected Load per Agent](./runs/swarm/multi-jobs/3/repeated/run2/agent_loads_plot_0.png)|
+| 5   |![Scheduling latency](./runs/swarm/single-job/5/repeated/run2/job_latency_0.png) |![Scheduling latency](./runs/swarm/multi-jobs/5/repeated/run2/job_latency_0.png) |
+| 5   | ![Projected Load per Agent](./runs/swarm/single-job/5/repeated/run2/agent_loads_plot_0.png) | ![Projected Load per Agent](./runs/swarm/multi-jobs/5/repeated/run2/agent_loads_plot_0.png)|
+| 10   |![Scheduling latency](./runs/swarm/single-job/10/repeated/run2/job_latency_0.png) |![Scheduling latency](./runs/swarm/multi-jobs/10/repeated/run2/job_latency_0.png) |
+| 10   | ![Projected Load per Agent](./runs/swarm/single-job/10/repeated/run2/agent_loads_plot_0.png) | ![Projected Load per Agent](./runs/swarm/multi-jobs/10/repeated/run2/agent_loads_plot_0.png)|
 | Overall  |![Scheduling latency comparison - Number of agents](./runs/swarm/single-job/overall-scheduling-latency.png) | ![Scheduling latency comparison - Number of agents](./runs/swarm/multi-jobs/overall-scheduling-latency.png)|
 
 ##### Multi Run
