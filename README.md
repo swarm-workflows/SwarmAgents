@@ -133,15 +133,17 @@ python analyze_results.py --number_of_agents 3 --run_directory swarm/single-job/
 ### Results with 3 Agents
 ![Scheduling Latency](./runs/comparison_histogram_flat_scheduling_latencies_3.png)
 ![Idle Time](./runs/comparison_histogram_flat_idle_times_3.png)
+![CI Plot Idle Time](./runs/comparison_line_plot_idle_time_with_ci_3.png)
 ![CI Plot](./runs/comparison_line_plot_with_ci_3.png)
 ### Results with 5 Agents
 ![Scheduling Latency](./runs/comparison_histogram_flat_scheduling_latencies_5.png)
 ![Idle Time](./runs/comparison_histogram_flat_idle_times_5.png)
+![CI Plot Idle Time](./runs/comparison_line_plot_idle_time_with_ci_5.png)
 ![CI Plot](./runs/comparison_line_plot_with_ci_5.png)
-
 ### Results with 10 Agents
 ![Scheduling Latency](./runs/comparison_histogram_flat_scheduling_latencies_10.png)
 ![Idle Time](./runs/comparison_histogram_flat_idle_times_10.png)
+![CI Plot Idle Time](./runs/comparison_line_plot_idle_time_with_ci_10.png)
 ![CI Plot](./runs/comparison_line_plot_with_ci_10.png)
 
 ## Raft Consensus Algorithm

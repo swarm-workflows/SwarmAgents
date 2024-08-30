@@ -15,6 +15,7 @@ def compute_metrics(run_directory: str, number_of_agents: int, algo: str):
     scheduling_latencies = []
     wait_times = []
     all_idle_times = []
+    all_idle_times_list = []
 
     # Loop through the directories for each run
     for i in range(100):
@@ -54,6 +55,7 @@ def compute_metrics(run_directory: str, number_of_agents: int, algo: str):
                 idle_times_list.extend(idle_times[agent_id])
 
         all_idle_times.append(idle_times)
+        all_idle_times_list.append(idle_times_list)
 
     # Flatten the lists for overall metrics analysis
     flat_selection_times = [item for sublist in selection_times for item in sublist]
@@ -67,6 +69,12 @@ def compute_metrics(run_directory: str, number_of_agents: int, algo: str):
     ci_lower = [ci[0] for ci in conf_intervals]
     ci_upper = [ci[1] for ci in conf_intervals]
 
+    idle_means = [np.mean(run) for run in all_idle_times_list]
+    idle_medians = [np.median(run) for run in all_idle_times_list]
+    idle_conf_intervals = [stats.t.interval(0.95, len(run) - 1, loc=np.mean(run), scale=stats.sem(run)) for run in all_idle_times_list]
+    idle_ci_lower = [ci[0] for ci in idle_conf_intervals]
+    idle_ci_upper = [ci[1] for ci in idle_conf_intervals]
+
     return {
         'flat_selection_times': flat_selection_times,
         'flat_scheduling_latencies': flat_scheduling_latencies,
@@ -76,8 +84,34 @@ def compute_metrics(run_directory: str, number_of_agents: int, algo: str):
         'medians': medians,
         'ci_lower': ci_lower,
         'ci_upper': ci_upper,
+        'idle_means': idle_means,
+        'idle_medians': idle_medians,
+        'idle_ci_lower': idle_ci_lower,
+        'idle_ci_upper': idle_ci_upper,
         'algo': algo
     }
+
+
+def plot_means_median_line_idle(data_list: List[Dict[str, Any]], number_of_agents: int):
+    plt.figure(figsize=(14, 10))
+    colors = [["b-", "blue"], ["r-", "red"], ["g-", "green"]]
+
+    idx = 0
+    for mean_median in data_list:
+        plt.plot(mean_median['idle_means'], colors[idx][0], label=f'{mean_median["algo"]}: Mean')
+        plt.plot(mean_median['idle_medians'], f'{colors[idx][0]}-', label=f'{mean_median["algo"]}: Median')
+        plt.fill_between(range(len(mean_median['idle_means'])), mean_median['idle_ci_lower'], mean_median['idle_ci_upper'],
+                         color=colors[idx][1], alpha=0.2,
+                         label=f'{mean_median["algo"]}: 95% CI')
+        idx += 1
+
+    plt.title(f'Comparison of Idle Time Across Algorithms - {number_of_agents} agents')
+    plt.xlabel('Run Index')
+    plt.ylabel('Idle Time (seconds)')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(f'comparison_line_plot_idle_time_with_ci_{number_of_agents}.png', bbox_inches='tight')
+    plt.close()
 
 
 def plot_means_median_line(data_list: List[Dict[str, Any]], number_of_agents: int):
@@ -87,7 +121,7 @@ def plot_means_median_line(data_list: List[Dict[str, Any]], number_of_agents: in
     idx = 0
     for mean_median in data_list:
         plt.plot(mean_median['means'], colors[idx][0], label=f'{mean_median["algo"]}: Mean')
-        plt.plot(mean_median['medians'], colors[idx][0], label=f'{mean_median["algo"]}: Median')
+        plt.plot(mean_median['medians'], f'{colors[idx][0]}-', label=f'{mean_median["algo"]}: Median')
         plt.fill_between(range(len(mean_median['means'])), mean_median['ci_lower'], mean_median['ci_upper'],
                          color=colors[idx][1], alpha=0.2,
                          label=f'{mean_median["algo"]}: 95% CI')
@@ -149,6 +183,7 @@ def plots(number_of_agents: int):
                                         number_of_agents=number_of_agents, algo="SWARM-SINGLE")
     data_list = [data_pbft, data_swarm_single, data_swarm_multi]
     plot_means_median_line(number_of_agents=number_of_agents, data_list=data_list)
+    plot_means_median_line_idle(number_of_agents=number_of_agents, data_list=data_list)
     plot_histograms(number_of_agents=number_of_agents, data_list=data_list, param_name='flat_wait_times',
                     param_pretty_name="Wait Time")
     plot_histograms(number_of_agents=number_of_agents, data_list=data_list, param_name='flat_idle_times',
