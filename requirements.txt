@@ -6,3 +6,5 @@ confluent-kafka
 numpy
 matplotlib
 pyraft
+seaborn
+scipy

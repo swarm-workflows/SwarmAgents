@@ -37,14 +37,14 @@ Each agent strives to become the leader for executing a task based on the follow
 PBFT consensus works with smaller number of agents but struggles to scale efficiently as the number of agents increases, due to its communication complexity.
 However, it's resilient and fault tolerant.
 
-![Scheduling latency - 3 agents](./runs/pbft/3/job_latency.png)
-![Projected Load per Agent - 3 agents](./runs/pbft/3/agent_loads_plot.png)  
+![Scheduling latency - 3 agents](./runs/pbft/3/repeated/run1/job_latency_0.png)
+![Projected Load per Agent - 3 agents](./runs/pbft/3/repeated/run1/agent_loads_plot_0.png)  
 
-![Scheduling latency - 5 agents](./runs/pbft/5/job_latency.png)
-![Projected Load per Agent - 5 agents](./runs/pbft/5/agent_loads_plot.png)  
+![Scheduling latency - 5 agents](./runs/pbft/5/repeated/run1/job_latency_0.png)
+![Projected Load per Agent - 5 agents](./runs/pbft/5/repeated/run1/agent_loads_plot_0.png)  
 
-![Scheduling latency - 10 agents](./runs/pbft/10/job_latency.png)
-![Projected Load per Agent - 10 agents](./runs/pbft/10/agent_loads_plot.png)  
+![Scheduling latency - 10 agents](./runs/pbft/10/repeated/run1/job_latency_0.png)
+![Projected Load per Agent - 10 agents](./runs/pbft/10/repeated/run1/agent_loads_plot_0.png)  
 
 ![Scheduling latency comparison - Number of agents](./runs/pbft/overall-scheduling-latency.png)
 ### Usage
@@ -61,6 +61,10 @@ sh pbft-start.sh
 - Launch Log Runs
 ```
 nohup sh launch-runs.sh runs/pbft/3/repeated 100 pbft & disown
+```
+- Analyze results and generate plots
+```
+python analyze_results.py --number_of_agents 3 --run_directory pbft/3/repeated/ --algo PBFT
 ```
 
 ## SWARM Consensus (Swarm)
@@ -90,12 +94,12 @@ Each agent utilizes a cost matrix to determine whether it should become the lead
 
 |            | Greedy Approach (Single Task)                                                                    | Greedy Approach (Multiple Task)                                                                                             |
 |------------|--------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------|
-| Scheduling Latency - 3 Agents   | ![Scheduling latency - 3 agents](./runs/swarm/single-job/3/job_latency.png)                          | ![Scheduling latency - 3 agents](./runs/swarm/multi-jobs/3/job_latency.png)                          |
-| Projected Load per Agent - 3 Agents   | ![Projected Load per Agent - 3 agents](./runs/swarm/single-job/3/agent_loads_plot.png)         | ![Projected Load per Agent - 3 agents](./runs/swarm/single-job/3/agent_loads_plot.png)|
-| Scheduling Latency - 5 Agents   | ![Scheduling latency - 5 agents](./runs/swarm/single-job/5/job_latency.png)                          | ![Scheduling latency - 5 agents](./runs/swarm/multi-jobs/5/job_latency.png)                          | 
-| Projected Load per Agent - 5 Agents   | ![Projected Load per Agent - 5 agents](./runs/swarm/single-job/5/agent_loads_plot.png)         | ![Projected Load per Agent - 5 agents](./runs/swarm/single-job/5/agent_loads_plot.png) |
-| Scheduling Latency - 10 Agents  | ![Scheduling latency - 10 agents](./runs/swarm/single-job/10/job_latency.png)                        | ![Scheduling latency - 10 agents](./runs/swarm/multi-jobs/10/job_latency.png)                        | 
-| Projected Load per Agent - 10 Agents   | ![Projected Load per Agent - 10 agents](./runs/swarm/single-job/10/agent_loads_plot.png)      | ![Projected Load per Agent - 5 agents](./runs/swarm/single-job/10/agent_loads_plot.png)                          |
+| Scheduling Latency - 3 Agents   | ![Scheduling latency - 3 agents](./runs/swarm/single-job/3/repeated/run1/job_latency_0.png)                          | ![Scheduling latency - 3 agents](./runs/swarm/multi-jobs/3/repeated/run1/job_latency_0.png)                          |
+| Projected Load per Agent - 3 Agents   | ![Projected Load per Agent - 3 agents](./runs/swarm/single-job/3/repeated/run1/agent_loads_plot_0.png)         | ![Projected Load per Agent - 3 agents](./runs/swarm/single-job/3/repeated/run1/agent_loads_plot_0.png)|
+| Scheduling Latency - 5 Agents   | ![Scheduling latency - 5 agents](./runs/swarm/single-job/5/repeated/run1/job_latency_0.png)                          | ![Scheduling latency - 5 agents](./runs/swarm/multi-jobs/5/repeated/run1/job_latency_0.png)                          | 
+| Projected Load per Agent - 5 Agents   | ![Projected Load per Agent - 5 agents](./runs/swarm/single-job/5/repeated/run1/agent_loads_plot_0.png)         | ![Projected Load per Agent - 5 agents](./runs/swarm/single-job/5/repeated/run1/agent_loads_plot_0.png) |
+| Scheduling Latency - 10 Agents  | ![Scheduling latency - 10 agents](./runs/swarm/single-job/10/repeated/run1/job_latency_0.png)                        | ![Scheduling latency - 10 agents](./runs/swarm/multi-jobs/10/repeated/run1/job_latency_0.png)                        | 
+| Projected Load per Agent - 10 Agents   | ![Projected Load per Agent - 10 agents](./runs/swarm/single-job/10/repeated/run1/agent_loads_plot_0.png)      | ![Projected Load per Agent - 5 agents](./runs/swarm/single-job/10/repeated/run1/agent_loads_plot_0.png)                          |
 | Scheduling Latency - Overall    | ![Scheduling latency comparison - Number of agents](./runs/swarm/single-job/overall-scheduling-latency.png) | ![Scheduling latency comparison - Number of agents](./runs/swarm/multi-jobs/overall-scheduling-latency.png) |
 
 ### Usage
@@ -123,6 +127,17 @@ sh swarm-single-start.sh
 ```
 nohup sh launch-runs.sh runs/swarm/single-job/3/repeated 100 swarm-single & disown
 ```
+
+- Analyze results and generate plots
+  - Multi Jobs
+```
+python analyze_results.py --number_of_agents 3 --run_directory swarm/multi-jobs/3/repeated/ --algo SWARM-MULTI
+```
+  - Single Jobs
+```
+python analyze_results.py --number_of_agents 3 --run_directory swarm/single-job/3/repeated/ --algo SWARM-SINGLE
+```
+
 
 ## Raft Consensus Algorithm
 RAFT algorithm is explored and implemented in `raft_agent.py`. This agent works as follows:
