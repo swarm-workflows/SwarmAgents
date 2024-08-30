@@ -39,51 +39,24 @@ However, it's resilient and fault tolerant.
 
 
 #### Single Run
-##### 3 Agents
-![Scheduling latency](./runs/pbft/3/repeated/run1/job_latency_0.png)
-![Projected Load per Agent](./runs/pbft/3/repeated/run1/agent_loads_plot_0.png)
-
-##### 5 Agents
-![Scheduling latency](./runs/pbft/5/repeated/run1/job_latency_0.png)
-![Projected Load per Agent](./runs/pbft/5/repeated/run1/agent_loads_plot_0.png)
-
-##### 10 Agents
-![Scheduling latency](./runs/pbft/10/repeated/run1/job_latency_0.png)
-![Projected Load per Agent](./runs/pbft/10/repeated/run1/agent_loads_plot_0.png)
+|    3  Agents      |            5   Agents     | 10 Agents|
+|-------------------|---------------------------|----------|
+|![Scheduling latency](./runs/pbft/3/repeated/run1/job_latency_0.png)|![Scheduling latency](./runs/pbft/5/repeated/run2/job_latency_0.png)|![Scheduling latency](./runs/pbft/10/repeated/run1/job_latency_0.png)|
+|![Projected Load per Agent](./runs/pbft/3/repeated/run1/agent_loads_plot_0.png)|![Projected Load per Agent](./runs/pbft/5/repeated/run2/agent_loads_plot_0.png)|![Projected Load per Agent](./runs/pbft/10/repeated/run1/agent_loads_plot_0.png)|
 
 ##### Comparison
 ![Scheduling latency comparison - Number of agents](./runs/pbft/overall-scheduling-latency.png)
 
 #### Overall across 100 Runs
-##### 3 Agents
-![Overall Metrics](./runs/pbft/3/repeated/box_plot_overall_metrics.png)
-![Idle Time](./runs/pbft/3/repeated/histogram_idle_times.png)
-![Wait Time](./runs/pbft/3/repeated/histogram_wait_times.png)
-![Selection Time](./runs/pbft/3/repeated/histogram_selection_times.png)
-
-![Line Plot CI](./runs/pbft/3/repeated/line_plot_with_ci.png)
-![Line Plot Selection CI](./runs/pbft/3/repeated/line_plot_with_ci_selection.png)
-![Scatter Plot Scheduling Latency Vs Selection Time](./runs/pbft/3/repeated/scatter_plot_with_regression.png)
-
-##### 5 Agents
-![Overall Metrics](./runs/pbft/5/repeated/box_plot_overall_metrics.png)
-![Idle Time](./runs/pbft/5/repeated/histogram_idle_times.png)
-![Wait Time](./runs/pbft/5/repeated/histogram_wait_times.png)
-![Selection Time](./runs/pbft/5/repeated/histogram_selection_times.png)
-
-![Line Plot CI](./runs/pbft/5/repeated/line_plot_with_ci.png)
-![Line Plot Selection CI](./runs/pbft/5/repeated/line_plot_with_ci_selection.png)
-![Scatter Plot Scheduling Latency Vs Selection Time](./runs/pbft/5/repeated/scatter_plot_with_regression.png)
-
-##### 10 Agents
-![Overall Metrics](./runs/pbft/10/repeated/box_plot_overall_metrics.png)
-![Idle Time](./runs/pbft/10/repeated/histogram_idle_times.png)
-![Wait Time](./runs/pbft/10/repeated/histogram_wait_times.png)
-![Selection Time](./runs/pbft/10/repeated/histogram_selection_times.png)
-
-![Line Plot CI](./runs/pbft/10/repeated/line_plot_with_ci.png)
-![Line Plot Selection CI](./runs/pbft/10/repeated/line_plot_with_ci_selection.png)
-![Scatter Plot Scheduling Latency Vs Selection Time](./runs/pbft/10/repeated/scatter_plot_with_regression.png)
+|    3  Agents      |            5   Agents     | 10 Agents|
+|-------------------|---------------------------|----------|
+|![Overall Metrics](./runs/pbft/3/repeated/box_plot_overall_metrics.png)|![Overall Metrics](./runs/pbft/5/repeated/box_plot_overall_metrics.png)|![Overall Metrics](./runs/pbft/10/repeated/box_plot_overall_metrics.png)|
+|![Idle Time](./runs/pbft/3/repeated/histogram_idle_times.png)|![Idle Time](./runs/pbft/5/repeated/histogram_idle_times.png)|![Idle Time](./runs/pbft/10/repeated/histogram_idle_times.png)|
+|![Wait Time](./runs/pbft/3/repeated/histogram_wait_times.png)|![Wait Time](./runs/pbft/5/repeated/histogram_wait_times.png)|![Wait Time](./runs/pbft/10/repeated/histogram_wait_times.png)|
+|![Selection Time](./runs/pbft/3/repeated/histogram_selection_times.png)|![Selection Time](./runs/pbft/5/repeated/histogram_selection_times.png)|![Selection Time](./runs/pbft/10/repeated/histogram_selection_times.png)|
+|![Line Plot CI](./runs/pbft/3/repeated/line_plot_with_ci.png)|![Line Plot CI](./runs/pbft/5/repeated/line_plot_with_ci.png)|![Line Plot CI](./runs/pbft/10/repeated/line_plot_with_ci.png)|
+|![Line Plot Selection CI](./runs/pbft/3/repeated/line_plot_with_ci_selection.png)|![Line Plot Selection CI](./runs/pbft/5/repeated/line_plot_with_ci_selection.png)|![Line Plot Selection CI](./runs/pbft/10/repeated/line_plot_with_ci_selection.png)|
+|![Scatter Plot Scheduling Latency Vs Selection Time](./runs/pbft/3/repeated/scatter_plot_with_regression.png)|![Scatter Plot Scheduling Latency Vs Selection Time](./runs/pbft/5/repeated/scatter_plot_with_regression.png)|![Scatter Plot Scheduling Latency Vs Selection Time](./runs/pbft/10/repeated/scatter_plot_with_regression.png)|
 
 ### Usage
 - Set up the python environment by installing all the dependencies:
