@@ -22,6 +22,10 @@ def main(run_directory: str, number_of_agents: int, algo: str):
         scheduling_latency_file = os.path.join(run_dir, f'scheduling_latency_0.csv')
         wait_time_file = os.path.join(run_dir, f'wait_time_0.csv')
 
+        if not os.path.exists(selection_time_file) or not os.path.exists(scheduling_latency_file) or \
+                not os.path.exists(wait_time_file):
+            continue
+
         # Load Selection Time
         if os.path.exists(selection_time_file):
             df_selection_time = pd.read_csv(selection_time_file)

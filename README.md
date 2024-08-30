@@ -134,8 +134,8 @@ Each agent utilizes a cost matrix to determine whether it should become the lead
 |------------|--------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------|
 | 3   |![Scheduling latency](./runs/swarm/single-job/3/repeated/run1/job_latency_0.png) |![Scheduling latency](./runs/swarm/multi-jobs/3/repeated/run1/job_latency_0.png) |
 | 3   | ![Projected Load per Agent](./runs/swarm/single-job/3/repeated/run1/agent_loads_plot_0.png) | ![Projected Load per Agent](./runs/swarm/multi-jobs/3/repeated/run1/agent_loads_plot_0.png)|
-| 5   |![Scheduling latency](./runs/swarm/single-job/5/repeated/run1/job_latency_0.png) |![Scheduling latency](./runs/swarm/multi-jobs/5/repeated/run1/job_latency_0.png) |
-| 5   | ![Projected Load per Agent](./runs/swarm/single-job/5/repeated/run1/agent_loads_plot_0.png) | ![Projected Load per Agent](./runs/swarm/multi-jobs/5/repeated/run1/agent_loads_plot_0.png)|
+| 5   |![Scheduling latency](./runs/swarm/single-job/5/repeated/run2/job_latency_0.png) |![Scheduling latency](./runs/swarm/multi-jobs/5/repeated/run1/job_latency_0.png) |
+| 5   | ![Projected Load per Agent](./runs/swarm/single-job/5/repeated/run2/agent_loads_plot_0.png) | ![Projected Load per Agent](./runs/swarm/multi-jobs/5/repeated/run1/agent_loads_plot_0.png)|
 | 10   |![Scheduling latency](./runs/swarm/single-job/10/repeated/run1/job_latency_0.png) |![Scheduling latency](./runs/swarm/multi-jobs/10/repeated/run1/job_latency_0.png) |
 | 10   | ![Projected Load per Agent](./runs/swarm/single-job/10/repeated/run1/agent_loads_plot_0.png) | ![Projected Load per Agent](./runs/swarm/multi-jobs/10/repeated/run1/agent_loads_plot_0.png)|
 | Overall  |![Scheduling latency comparison - Number of agents](./runs/swarm/single-job/overall-scheduling-latency.png) | ![Scheduling latency comparison - Number of agents](./runs/swarm/multi-jobs/overall-scheduling-latency.png)|
@@ -157,13 +157,13 @@ Each agent utilizes a cost matrix to determine whether it should become the lead
 |5|![Line Plot CI](./runs/swarm/single-job/5/repeated/line_plot_with_ci.png)|![Line Plot CI](./runs/swarm/multi-jobs/5/repeated/line_plot_with_ci.png)|
 |5|![Line Plot Selection CI](./runs/swarm/single-job/5/repeated/line_plot_with_ci_selection.png)|![Line Plot Selection CI](./runs/swarm/multi-jobs/5/repeated/line_plot_with_ci_selection.png)|
 |5|![Scatter Plot Scheduling Latency Vs Selection Time](./runs/swarm/single-job/5/repeated/scatter_plot_with_regression.png)|![Scatter Plot Scheduling Latency Vs Selection Time](./runs/swarm/multi-jobs/5/repeated/scatter_plot_with_regression.png)|
-|10|![Overall Metrics](./runs/swarm/single-job/5/repeated/box_plot_overall_metrics.png)|![Overall Metrics](./runs/swarm/multi-jobs/5/repeated/box_plot_overall_metrics.png)|
-|10|![Idle Time](./runs/swarm/single-job/5/repeated/histogram_idle_times.png)|![Idle Time](./runs/swarm/multi-jobs/5/repeated/histogram_idle_times.png)|
-|10|![Wait Time](./runs/swarm/single-job/5/repeated/histogram_wait_times.png)|![Wait Time](./runs/swarm/multi-jobs/5/repeated/histogram_wait_times.png)|
-|10|![Selection Time](./runs/swarm/single-job/5/repeated/histogram_selection_times.png)|![Selection Time](./runs/swarm/multi-jobs/5/repeated/histogram_selection_times.png)|
-|10|![Line Plot CI](./runs/swarm/single-job/5/repeated/line_plot_with_ci.png)|![Line Plot CI](./runs/swarm/multi-jobs/5/repeated/line_plot_with_ci.png)|
-|10|![Line Plot Selection CI](./runs/swarm/single-job/5/repeated/line_plot_with_ci_selection.png)|![Line Plot Selection CI](./runs/swarm/multi-jobs/5/repeated/line_plot_with_ci_selection.png)|
-|10|![Scatter Plot Scheduling Latency Vs Selection Time](./runs/swarm/single-job/5/repeated/scatter_plot_with_regression.png)|![Scatter Plot Scheduling Latency Vs Selection Time](./runs/swarm/multi-jobs/5/repeated/scatter_plot_with_regression.png)|
+|10|![Overall Metrics](./runs/swarm/single-job/10/repeated/box_plot_overall_metrics.png)|![Overall Metrics](./runs/swarm/multi-jobs/10/repeated/box_plot_overall_metrics.png)|
+|10|![Idle Time](./runs/swarm/single-job/10/repeated/histogram_idle_times.png)|![Idle Time](./runs/swarm/multi-jobs/10/repeated/histogram_idle_times.png)|
+|10|![Wait Time](./runs/swarm/single-job/10/repeated/histogram_wait_times.png)|![Wait Time](./runs/swarm/multi-jobs/10/repeated/histogram_wait_times.png)|
+|10|![Selection Time](./runs/swarm/single-job/10/repeated/histogram_selection_times.png)|![Selection Time](./runs/swarm/multi-jobs/10/repeated/histogram_selection_times.png)|
+|10|![Line Plot CI](./runs/swarm/single-job/10/repeated/line_plot_with_ci.png)|![Line Plot CI](./runs/swarm/multi-jobs/10/repeated/line_plot_with_ci.png)|
+|10|![Line Plot Selection CI](./runs/swarm/single-job/10/repeated/line_plot_with_ci_selection.png)|![Line Plot Selection CI](./runs/swarm/multi-jobs/10/repeated/line_plot_with_ci_selection.png)|
+|10|![Scatter Plot Scheduling Latency Vs Selection Time](./runs/swarm/single-job/10/repeated/scatter_plot_with_regression.png)|![Scatter Plot Scheduling Latency Vs Selection Time](./runs/swarm/multi-jobs/10/repeated/scatter_plot_with_regression.png)|
 ### Usage
 - Set up the python environment by installing all the dependencies:
 ```
