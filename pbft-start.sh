@@ -1,12 +1,18 @@
 #!/bin/bash
 
-python3.11 main-pbft.py 1 100 &
-python3.11 main-pbft.py 2 100 &
-#python3.11 main-pbft.py 3 100 &
-#python3.11 main-pbft.py 4 100 &
-#python3.11 main-pbft.py 5 100 &
-#python3.11 main-pbft.py 6 100 &
-#python3.11 main-pbft.py 7 100 &
-#python3.11 main-pbft.py 8 100 &
-#python3.11 main-pbft.py 9 100 &
+pkill -f "main.py pbft"
+python3.11 kafka_cleanup.py --topic agent-pbft
+rm -rf pbft
+rm -rf pbft
+mkdir -p pbft pbft
+python3.11 main.py pbft 0 100 &
+python3.11 main.py pbft 1 100 &
+python3.11 main.py pbft 2 100 &
+#python3.11 main.py pbft 3 100 &
+#python3.11 main.py pbft 4 100 &
+#python3.11 main.py pbft 5 100 &
+#python3.11 main.py pbft 6 100 &
+#python3.11 main.py pbft 7 100 &
+#python3.11 main.py pbft 8 100 &
+#python3.11 main.py pbft 9 100 &
 

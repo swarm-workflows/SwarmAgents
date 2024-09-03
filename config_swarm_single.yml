@@ -1,0 +1,36 @@
+redis:
+  host: 127.0.0.1
+  port: 6379
+kafka:
+  bootstrap_servers: localhost:19092
+  topic: agent-swarm-single
+  consumer_group_id: agent-swarm-single
+runtime:
+  profile: BalancedProfile
+  data_transfer: False
+  max_pending_elections: 10
+  projected_queue_threshold: 300.00
+  ready_queue_threshold: 100.00
+  max_time_load_zero: 30
+  restart_job_selection: 300
+  peer_heartbeat_timeout: 300
+  results_dir: swarm-single
+logging:
+  ## The directory in which actor should create log files.
+  ## This directory will be automatically created if it does not exist.
+  log-directory: swarm-single
+
+  ## The filename to be used for actor's log file.
+  log-file: agent
+
+  ## The default log level for actor.
+  log-level: DEBUG 
+
+  ## actor rotates log files. You may specify how many archived log files to keep here.
+  log-retain: 5
+
+  ## actor rotates log files after they exceed a certain size.
+  ## You may specify the file size that results in a log file being rotated here.
+  log-size: 5000000
+
+  logger: agent

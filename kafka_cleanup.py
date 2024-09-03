@@ -1,8 +1,31 @@
+# MIT License
+#
+# Copyright (c) 2024 swarm-workflows
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+# Author: Komal Thareja(kthare10@renci.org)
+import argparse
 import time
 
 import redis
 from confluent_kafka.admin import AdminClient, NewTopic
-from confluent_kafka import Consumer, TopicPartition
 
 from swarm.models.job import JobRepository
 
@@ -17,6 +40,7 @@ def delete_topic(admin_client, topic_name):
         except Exception as e:
             print(f"Failed to delete topic {topic}: {e}")
 
+
 def create_topic(admin_client, topic_name, num_partitions=1, replication_factor=1):
     """Create a new Kafka topic."""
     new_topic = NewTopic(topic_name, num_partitions, replication_factor)
@@ -30,8 +54,15 @@ def create_topic(admin_client, topic_name, num_partitions=1, replication_factor=
 
 
 if __name__ == '__main__':
+    # Set up argument parser
+    parser = argparse.ArgumentParser(description="Kafka topic management")
+    parser.add_argument('--topic', type=str, required=True, help='Kafka topic name')
+
+    # Parse command-line arguments
+    args = parser.parse_args()
+    topic_name = args.topic
+
     bootstrap_servers = "localhost:19092"
-    topic_name = "agent_load"
 
     admin_client = AdminClient({'bootstrap.servers': bootstrap_servers})
     # Delete the topic

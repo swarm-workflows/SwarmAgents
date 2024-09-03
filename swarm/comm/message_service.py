@@ -1,3 +1,26 @@
+# MIT License
+#
+# Copyright (c) 2024 swarm-workflows
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+# Author: Komal Thareja(kthare10@renci.org)
 import enum
 import json
 import logging
@@ -32,7 +55,8 @@ class MessageService:
             "group.id": self.consumer_group_id,
             "auto.offset.reset": "latest",
             "enable.auto.commit": self.enable_auto_commit,
-            "on_commit": self.commit_completed
+            "on_commit": self.commit_completed,
+            "heartbeat.interval.ms": 1000
         })
         self.consumer.commit()
         self.logger = logger
@@ -72,7 +96,7 @@ class MessageService:
         #while not self.shutdown or lag:
         while not self.shutdown:
             try:
-                msg = self.consumer.poll(1.0)
+                msg = self.consumer.poll(0.25)
                 if msg is None:
                     lag = 0
                     continue

@@ -1,3 +1,3 @@
 #!/bin/bash
-pkill -f "main-pbft.py"
+pkill -f "main.py pbft"
 
