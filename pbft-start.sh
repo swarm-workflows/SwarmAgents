@@ -5,14 +5,10 @@ python3.11 kafka_cleanup.py --topic agent-pbft
 rm -rf pbft
 rm -rf pbft
 mkdir -p pbft pbft
-python3.11 main.py pbft 0 100 &
-python3.11 main.py pbft 1 100 &
-python3.11 main.py pbft 2 100 &
-#python3.11 main.py pbft 3 100 &
-#python3.11 main.py pbft 4 100 &
-#python3.11 main.py pbft 5 100 &
-#python3.11 main.py pbft 6 100 &
-#python3.11 main.py pbft 7 100 &
-#python3.11 main.py pbft 8 100 &
-#python3.11 main.py pbft 9 100 &
+# Define the number of agents
+num_agents=5
 
+# Launch the Python commands for each agent
+for i in $(seq 0 $(($num_agents - 1))); do
+    python3.11 main.py pbft $i 100 &
+done
