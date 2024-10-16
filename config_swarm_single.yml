@@ -4,6 +4,7 @@ redis:
 kafka:
   bootstrap_servers: localhost:19092
   topic: agent-swarm-single
+  hb_topic: agent-swarm-single-hb
   consumer_group_id: agent-swarm-single
 runtime:
   profile: BalancedProfile

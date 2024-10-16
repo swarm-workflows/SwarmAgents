@@ -75,6 +75,7 @@ class Agent(Observer):
         self.profile = None
         self.data_transfer = True
         self.kafka_config = {}
+        self.kafka_config_hb = {}
         self.logger = None
         self.projected_queue_threshold = 300.00
         self.ready_queue_threshold = 100.00
@@ -84,15 +85,19 @@ class Agent(Observer):
         self.results_dir = "."
         self.load_config(config_file)
         self.capacities = self.get_system_info()
-        self.message_service = MessageService(config=self.kafka_config, logger=self.logger)
+        self.ctrl_msg_srv = MessageService(config=self.kafka_config, logger=self.logger)
+        self.hrt_msg_srv = MessageService(config=self.kafka_config_hb, logger=self.logger)
         self.load_per_agent = {}
         self.cycles = cycles
         self.message_queue = queue.Queue()
+        self.hb_message_queue = queue.Queue()
         self.condition = threading.Condition()
         self.shutdown = False
         self.neighbor_map_lock = threading.Lock()
         self.heartbeat_thread = threading.Thread(target=self._heartbeat_main,
                                                  daemon=True, name="HeartBeatThread")
+        self.heartbeat_processor_thread = threading.Thread(target=self._heartbeat_processor_main,
+                                                           daemon=True, name="HeartBeatProcessorThread")
         self.msg_processor_thread = threading.Thread(target=self._message_processor_main,
                                                      daemon=True, name="MsgProcessorThread")
         self.job_selection_thread = threading.Thread(target=self.job_selection_main,
@@ -135,7 +140,11 @@ class Agent(Observer):
             if source_agent_id == self.agent_id:
                 return
 
-            self.message_queue.put_nowait(message)
+            message_type = message.get('message_type')
+            if message_type == str(MessageType.HeartBeat):
+                self.hb_message_queue.put_nowait(message)
+            else:
+                self.message_queue.put_nowait(message)
             with self.condition:
                 self.condition.notify_all()
             self.logger.debug(f"Added incoming message to queue: {incoming}")
@@ -184,7 +193,7 @@ class Agent(Observer):
         while not self.shutdown:
             try:
                 heart_beat = self._build_heart_beat()
-                self.message_service.produce_message(heart_beat.to_dict())
+                self.hrt_msg_srv.produce_message(heart_beat.to_dict())
                 time.sleep(5)
             except Exception as e:
                 self.logger.error(f"Error occurred while sending heartbeat e: {e}")
@@ -210,6 +219,24 @@ class Agent(Observer):
                 self.logger.error(traceback.format_exc())
         self.logger.info("Message Processor Stopped")
 
+    def _heartbeat_processor_main(self):
+        self.logger.info("Heartbeat Processor Started")
+        while True:
+            try:
+                with self.condition:
+                    while not self.shutdown and self.hb_message_queue.empty():
+                        self.condition.wait()
+
+                if self.shutdown:
+                    break
+
+                messages = self.__dequeue(self.hb_message_queue)
+                self._process_messages(messages=messages)
+            except Exception as e:
+                self.logger.error(f"Error occurred while processing message e: {e}")
+                self.logger.error(traceback.format_exc())
+        self.logger.info("Heartbeat Processor Stopped")
+
     def _process_messages(self, *, messages: List[dict]):
         for message in messages:
             try:
@@ -234,6 +261,11 @@ class Agent(Observer):
             self.kafka_config = {
                 'kafka_bootstrap_servers': kafka_config.get("bootstrap_servers", "localhost:19092"),
                 'kafka_topic': kafka_config.get("topic", "agent_load"),
+                'consumer_group_id': f'{kafka_config.get("consumer_group_id", "swarm_agent")}-{self.agent_id}'
+            }
+            self.kafka_config_hb = {
+                'kafka_bootstrap_servers': kafka_config.get("bootstrap_servers", "localhost:19092"),
+                'kafka_topic': kafka_config.get("hb_topic", "agent_load_hb"),
                 'consumer_group_id': f'{kafka_config.get("consumer_group_id", "swarm_agent")}-{self.agent_id}'
             }
             runtime_config = config.get("runtime", {})
@@ -487,38 +519,31 @@ class Agent(Observer):
         console_log.addHandler(console_handler)
         return log
 
-    def send_message(self, message_type: MessageType, job_id: str = None):
-        message = {
-            "message_type": str(message_type),
-            "agent_id": self.agent_id,
-            "load": self.compute_overall_load()
-        }
-        if job_id:
-            message["job_id"] = job_id
-
-        # Produce the message to the Kafka topic
-        self.message_service.produce_message(message)
-
     @staticmethod
     def generate_id() -> str:
         return hashlib.sha256(''.join(random.choices(string.ascii_lowercase, k=8)).encode()).hexdigest()[:8]
 
     def start(self):
-        self.message_service.register_observers(agent=self)
+        self.ctrl_msg_srv.register_observers(agent=self)
+        self.hrt_msg_srv.register_observers(agent=self)
+        self.heartbeat_processor_thread.start()
         self.msg_processor_thread.start()
-        self.message_service.start()
+        self.ctrl_msg_srv.start()
+        self.hrt_msg_srv.start()
         self.heartbeat_thread.start()
         self.job_selection_thread.start()
         self.job_scheduling_thread.start()
 
         self.heartbeat_thread.join()
+        self.heartbeat_processor_thread.join()
         self.msg_processor_thread.join()
         self.job_selection_thread.join()
         self.job_scheduling_thread.join()
 
     def stop(self):
         self.shutdown = True
-        self.message_service.stop()
+        self.ctrl_msg_srv.stop()
+        self.hrt_msg_srv.stop()
         with self.condition:
             self.condition.notify_all()
         self.plot_results()

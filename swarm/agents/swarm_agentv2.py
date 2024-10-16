@@ -147,7 +147,7 @@ class SwarmAgent(Agent):
                             agent=AgentInfo(agent_id=self.agent_id),
                             proposals=proposals
                         )
-                        self.message_service.produce_message(msg.to_dict())
+                        self.ctrl_msg_srv.produce_message(msg.to_dict())
                         for p in proposals:
                             self.outgoing_proposals.add_proposal(p)  # Add all proposals
                         proposals.clear()
@@ -165,7 +165,7 @@ class SwarmAgent(Agent):
                         agent=AgentInfo(agent_id=self.agent_id),
                         proposals=proposals
                     )
-                    self.message_service.produce_message(msg.to_dict())
+                    self.ctrl_msg_srv.produce_message(msg.to_dict())
                     for p in proposals:
                         self.outgoing_proposals.add_proposal(p)
                     self.logger.info(f"Added remaining proposals: {proposals}")
@@ -298,7 +298,7 @@ class SwarmAgent(Agent):
 
         if proposals:
             msg = Prepare(agent=AgentInfo(agent_id=self.agent_id), proposals=proposals)
-            self.message_service.produce_message(msg.to_dict())
+            self.ctrl_msg_srv.produce_message(msg.to_dict())
 
     def __receive_prepare(self, incoming: Prepare):
         proposals = []
@@ -335,7 +335,7 @@ class SwarmAgent(Agent):
 
         if proposals:
             msg = Commit(agent=AgentInfo(agent_id=self.agent_id), proposals=proposals)
-            self.message_service.produce_message(msg.to_dict())
+            self.ctrl_msg_srv.produce_message(msg.to_dict())
 
     def __receive_commit(self, incoming: Commit):
         self.logger.debug(f"Received commit from: {incoming.agent.agent_id}")
@@ -401,7 +401,7 @@ class SwarmAgent(Agent):
         super().execute_job(job=job)
         msg = JobStatus(agent=AgentInfo(agent_id=self.agent_id), jobs=[JobInfo(job_id=job.get_job_id(),
                                                                                state=job.state)])
-        self.message_service.produce_message(msg.to_dict())
+        self.ctrl_msg_srv.produce_message(msg.to_dict())
 
     def __get_proposed_capacities(self):
         proposed_capacities = Capacities()

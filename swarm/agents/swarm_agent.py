@@ -134,7 +134,7 @@ class SwarmAgent(Agent):
                                                 agent_id=self.agent_id)
                         msg = Proposal(agent=AgentInfo(agent_id=self.agent_id), proposals=[proposal])
 
-                        self.message_service.produce_message(msg.to_dict())
+                        self.ctrl_msg_srv.produce_message(msg.to_dict())
                         self.outgoing_proposals.add_proposal(proposal=proposal)
                         self.logger.info(f"Added proposal: {proposal}")
 
@@ -258,7 +258,7 @@ class SwarmAgent(Agent):
                     self.incoming_proposals.remove_proposal(p_id=peer_proposal.p_id, job_id=p.job_id)
 
                 msg = Prepare(agent=AgentInfo(agent_id=self.agent_id), proposals=[p])
-                self.message_service.produce_message(msg.to_dict())
+                self.ctrl_msg_srv.produce_message(msg.to_dict())
 
                 # Increment the number of prepares to count the prepare being sent
                 # Needed to handle 3 agent case
@@ -296,7 +296,7 @@ class SwarmAgent(Agent):
                                  f"prepares: {proposal.prepares}, starting commit!")
 
                 msg = Commit(agent=AgentInfo(agent_id=self.agent_id), proposals=[proposal])
-                self.message_service.produce_message(msg.to_dict())
+                self.ctrl_msg_srv.produce_message(msg.to_dict())
 
                 job.change_state(JobState.COMMIT)
 
@@ -363,7 +363,7 @@ class SwarmAgent(Agent):
         super().execute_job(job=job)
         msg = JobStatus(agent=AgentInfo(agent_id=self.agent_id), jobs=[JobInfo(job_id=job.get_job_id(),
                                                                                state=job.state)])
-        self.message_service.produce_message(msg.to_dict())
+        self.ctrl_msg_srv.produce_message(msg.to_dict())
 
     def __get_proposed_capacities(self):
         proposed_capacities = Capacities()

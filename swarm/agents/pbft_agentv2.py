@@ -354,4 +354,4 @@ class PBFTAgent(Agent):
             message["seed"] = seed
 
         # Produce the message to the Kafka topic
-        self.message_service.produce_message(message)
+        self.ctrl_msg_srv.produce_message(message)

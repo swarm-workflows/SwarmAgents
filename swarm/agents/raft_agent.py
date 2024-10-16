@@ -72,9 +72,12 @@ class RaftAgent(Agent):
 
         if not self.agent_id and clean:
             self.job_repo.delete_all()
-        self.message_service.register_observers(agent=self)
+        self.ctrl_msg_srv.register_observers(agent=self)
+        self.hrt_msg_srv.register_observers(agent=self)
+        self.heartbeat_processor_thread.start()
         self.msg_processor_thread.start()
-        self.message_service.start()
+        self.ctrl_msg_srv.start()
+        self.hrt_msg_srv.start()
         self.heartbeat_thread.start()
         self.job_selection_thread.start()
 
@@ -88,6 +91,10 @@ class RaftAgent(Agent):
             with self.condition:
                 self.condition.notify_all()
             self.msg_processor_thread.join()
+        if self.heartbeat_processor_thread.is_alive():
+            with self.condition:
+                self.condition.notify_all()
+            self.heartbeat_processor_thread.join()
         if self.heartbeat_thread.is_alive():
             self.heartbeat_thread.join()
         if self.job_selection_thread.is_alive():
@@ -206,7 +213,7 @@ class RaftAgent(Agent):
                 message[key] = value
 
         # Produce the message to the Kafka topic
-        self.message_service.produce_message(message)
+        self.ctrl_msg_srv.produce_message(message)
 
     def _process_messages(self, *, messages: List[dict]):
         for message in messages:
@@ -233,7 +240,7 @@ class RaftAgent(Agent):
 
     def job_selection_main(self):
         self.logger.info(f"Starting agent: {self}")
-        self.message_service.register_observers(agent=self)
+        self.ctrl_msg_srv.register_observers(agent=self)
 
         while not self.shutdown_flag.is_set():
             try:

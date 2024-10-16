@@ -4,6 +4,7 @@ redis:
 kafka:
   bootstrap_servers: localhost:19092
   topic: agent-pbft
+  hb_topic: agent-pbft-hb
   consumer_group_id: agent-pbft
 runtime:
   profile: BalancedProfile
