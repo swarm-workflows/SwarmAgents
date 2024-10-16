@@ -79,7 +79,7 @@ class MessageService:
 
     def produce_message(self, json_message: dict):
         message = json.dumps(json_message)
-        self.logger.debug(f"Message sent: {message}")
+        self.logger.debug(f"Message sent: {message} to topic: {self.kafka_topic}")
         self.producer.produce(self.kafka_topic, message.encode('utf-8'))
         #self.producer.flush()
 

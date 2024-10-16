@@ -141,7 +141,7 @@ class Agent(Observer):
                 return
 
             message_type = message.get('message_type')
-            if message_type == str(MessageType.HeartBeat):
+            if message_type == MessageType.HeartBeat.name or message_type == MessageType.HeartBeat.value:
                 self.hb_message_queue.put_nowait(message)
             else:
                 self.message_queue.put_nowait(message)
