@@ -8,3 +8,4 @@ matplotlib
 pyraft
 seaborn
 scipy
+nats-py

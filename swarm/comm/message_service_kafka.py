@@ -21,7 +21,6 @@
 # SOFTWARE.
 #
 # Author: Komal Thareja(kthare10@renci.org)
-import enum
 import json
 import logging
 import threading
@@ -31,25 +30,17 @@ from abc import ABC, abstractmethod
 
 from confluent_kafka import Producer, Consumer, TopicPartition
 
-
-class Observer(ABC):
-    @abstractmethod
-    def process_message(self, message: str):
-        """
-        Process incoming message
-        :param message:
-        :return:
-        """
+from swarm.comm.observer import Observer
 
 
-class MessageService:
+class MessageServiceKafka:
     def __init__(self, config: dict, logger: logging.Logger):
         self.kafka_bootstrap_servers = config.get('kafka_bootstrap_servers')
         self.kafka_topic = config.get('kafka_topic')
         self.consumer_group_id = config.get('consumer_group_id')
         self.enable_auto_commit = config.get("enable_auto_commit", False)
         self.batch_size = config.get("batch_size", 10)
-        self.producer = Producer({"bootstrap.servers": self.kafka_bootstrap_servers})
+        self.producer = Producer({"bootstrap.servers": self.kafka_bootstrap_servers, "acks": "all",})
         self.consumer = Consumer({
             "bootstrap.servers": self.kafka_bootstrap_servers,
             "group.id": self.consumer_group_id,
@@ -73,7 +64,7 @@ class MessageService:
         if self.thread.is_alive():
             self.thread.join()
 
-    def register_observers(self, agent):
+    def register_observers(self, agent: Observer):
         if agent not in self.observers:
             self.observers.append(agent)
 

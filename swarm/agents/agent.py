@@ -42,9 +42,10 @@ import psutil as psutil
 import yaml
 from matplotlib import pyplot as plt
 
+from swarm.comm.message_service_nats import MessageServiceNats
 from swarm.comm.messages.heart_beat import HeartBeat
 from swarm.comm.messages.message import MessageType
-from swarm.comm.message_service import MessageService, Observer
+from swarm.comm.message_service_kafka import MessageServiceKafka, Observer
 from swarm.models.capacities import Capacities
 from swarm.models.agent_info import AgentInfo
 from swarm.models.profile import ProfileType, PROFILE_MAP
@@ -76,6 +77,9 @@ class Agent(Observer):
         self.data_transfer = True
         self.kafka_config = {}
         self.kafka_config_hb = {}
+        self.nat_config = {}
+        self.nat_config_hb = {}
+        self.message_service_type = "kafka"
         self.logger = None
         self.projected_queue_threshold = 300.00
         self.ready_queue_threshold = 100.00
@@ -85,8 +89,12 @@ class Agent(Observer):
         self.results_dir = "."
         self.load_config(config_file)
         self.capacities = self.get_system_info()
-        self.ctrl_msg_srv = MessageService(config=self.kafka_config, logger=self.logger)
-        self.hrt_msg_srv = MessageService(config=self.kafka_config_hb, logger=self.logger)
+        if self.message_service_type == "nats":
+            self.ctrl_msg_srv = MessageServiceNats(config=self.nat_config, logger=self.logger)
+            self.hrt_msg_srv = MessageServiceNats(config=self.nat_config_hb, logger=self.logger)
+        else:
+            self.ctrl_msg_srv = MessageServiceKafka(config=self.kafka_config, logger=self.logger)
+            self.hrt_msg_srv = MessageServiceKafka(config=self.kafka_config_hb, logger=self.logger)
         self.load_per_agent = {}
         self.cycles = cycles
         self.message_queue = queue.Queue()
@@ -258,17 +266,30 @@ class Agent(Observer):
         with open(config_file, 'r') as f:
             config = yaml.safe_load(f)
             kafka_config = config.get("kafka", {})
+            nat_config = config.get("nats", {})
             self.kafka_config = {
                 'kafka_bootstrap_servers': kafka_config.get("bootstrap_servers", "localhost:19092"),
                 'kafka_topic': kafka_config.get("topic", "agent_load"),
                 'consumer_group_id': f'{kafka_config.get("consumer_group_id", "swarm_agent")}-{self.agent_id}'
             }
+
             self.kafka_config_hb = {
                 'kafka_bootstrap_servers': kafka_config.get("bootstrap_servers", "localhost:19092"),
                 'kafka_topic': kafka_config.get("hb_topic", "agent_load_hb"),
                 'consumer_group_id': f'{kafka_config.get("consumer_group_id", "swarm_agent")}-{self.agent_id}'
             }
+
+            self.nat_config = {
+                'nats_servers': nat_config.get('nats_servers', 'nats://127.0.0.1:4222'),
+                'nats_topic': nat_config.get('nats_topic', 'job.consensus'),
+            }
+
+            self.nat_config_hb = {
+                'nats_servers': nat_config.get('nats_servers', 'nats://127.0.0.1:4222'),
+                'nats_topic': nat_config.get('hb_nats_topic', 'job.consensus'),
+            }
             runtime_config = config.get("runtime", {})
+            self.message_service_type = runtime_config.get("message_service", "nats")
             profile_name = runtime_config.get("profile", str(ProfileType.BalancedProfile))
             self.profile = PROFILE_MAP.get(profile_name)
             self.data_transfer = runtime_config.get("data_transfer", True)
