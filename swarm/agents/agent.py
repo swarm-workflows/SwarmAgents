@@ -201,7 +201,7 @@ class Agent(Observer):
         while not self.shutdown:
             try:
                 heart_beat = self._build_heart_beat()
-                await self.hrt_msg_srv.produce_message(heart_beat.to_dict())
+                self.hrt_msg_srv.produce_message(heart_beat.to_dict())
                 time.sleep(5)
             except Exception as e:
                 self.logger.error(f"Error occurred while sending heartbeat e: {e}")

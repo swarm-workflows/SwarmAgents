@@ -4,7 +4,6 @@ import logging
 import threading
 import traceback
 from nats.aio.client import Client as NATS
-from nats.aio.errors import ErrConnectionClosed, ErrTimeout
 
 from swarm.comm.observer import Observer
 
@@ -41,15 +40,22 @@ class MessageServiceNats:
         if agent not in self.observers:
             self.observers.append(agent)
 
-    async def produce_message(self, json_message: dict):
+    def produce_message(self, json_message: dict):
         message = json.dumps(json_message)
         try:
-            await self.nc.publish(self.nats_topic, message.encode('utf-8'))
-            await self.nc.flush()
+            # Run async methods in a synchronous context
+            asyncio.run(self._publish_message(message))
             self.logger.debug(f"Message sent: {message} to topic: {self.nats_topic}")
         except Exception as e:
             self.logger.error(f"NATS: Failed to publish message: {e}")
             self.logger.error(traceback.format_exc())
+
+    async def _publish_message(self, message):
+        """
+        Helper method to publish a message asynchronously
+        """
+        await self.nc.publish(self.nats_topic, message.encode('utf-8'))
+        await self.nc.flush()
 
     def notify_observers(self, message):
         decoded_message = message.decode('utf-8')
