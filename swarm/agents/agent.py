@@ -49,7 +49,8 @@ from swarm.comm.message_service_kafka import MessageServiceKafka, Observer
 from swarm.models.capacities import Capacities
 from swarm.models.agent_info import AgentInfo
 from swarm.models.profile import ProfileType, PROFILE_MAP
-from swarm.models.job import Job, JobQueue
+from swarm.models.job import Job
+from swarm.queue.simple_job_queue import SimpleJobQueue
 
 
 class IterableQueue:
@@ -67,10 +68,10 @@ class IterableQueue:
 class Agent(Observer):
     def __init__(self, agent_id: str, config_file: str, cycles: int):
         self.agent_id = agent_id
-        self.job_queue = JobQueue()
-        self.selected_queue = JobQueue()
-        self.ready_queue = JobQueue()
-        self.done_queue = JobQueue()
+        self.job_queue = SimpleJobQueue()
+        self.selected_queue = SimpleJobQueue()
+        self.ready_queue = SimpleJobQueue()
+        self.done_queue = SimpleJobQueue()
         self.last_updated = time.time()
         self.neighbor_map = {}  # Store neighbor information
         self.profile = None
@@ -191,7 +192,7 @@ class Agent(Observer):
         my_load = self.compute_overall_load()
         agent = AgentInfo(agent_id=self.agent_id,
                           capacities=self.capacities,
-                          capacity_allocations=self.ready_queue.capacities(),
+                          capacity_allocations=self.ready_queue.capacities(jobs=self.ready_queue.get_jobs()),
                           load=my_load)
         self._save_load_metric(self.agent_id, my_load)
         return HeartBeat(agent=agent)
@@ -289,7 +290,7 @@ class Agent(Observer):
                 'nats_topic': nat_config.get('hb_nats_topic', 'job.consensus'),
             }
             runtime_config = config.get("runtime", {})
-            self.message_service_type = runtime_config.get("message_service", "nats")
+            self.message_service_type = runtime_config.get("message_service", "kafka")
             profile_name = runtime_config.get("profile", str(ProfileType.BalancedProfile))
             self.profile = PROFILE_MAP.get(profile_name)
             self.data_transfer = runtime_config.get("data_transfer", True)
@@ -366,8 +367,8 @@ class Agent(Observer):
         if only_total:
             available = self.capacities
         else:
-            allocated_caps = self.ready_queue.capacities()
-            allocated_caps += self.selected_queue.capacities()
+            allocated_caps = self.ready_queue.capacities(jobs=self.ready_queue.get_jobs())
+            allocated_caps += self.selected_queue.capacities(jobs=self.selected_queue.get_jobs())
             available = self.capacities - allocated_caps
 
         # Check if the agent can accommodate the given job based on its capacities
@@ -389,7 +390,7 @@ class Agent(Observer):
         return True
 
     def can_schedule_job(self, job: Job):
-        allocated_caps = self.ready_queue.capacities()
+        allocated_caps = self.ready_queue.capacities(jobs=self.ready_queue.get_jobs())
         available = self.capacities - allocated_caps
 
         # Check if the agent can accommodate the given job based on its capacities
@@ -415,8 +416,8 @@ class Agent(Observer):
             proposed_jobs = []
 
         allocated_caps = Capacities()
-        allocated_caps += self.ready_queue.capacities()
-        allocated_caps += self.selected_queue.capacities()
+        allocated_caps += self.ready_queue.capacities(jobs=self.ready_queue.get_jobs())
+        allocated_caps += self.selected_queue.capacities(jobs=self.selected_queue.get_jobs())
 
         for j in proposed_jobs:
             if j not in self.ready_queue and j not in self.selected_queue:
@@ -435,7 +436,7 @@ class Agent(Observer):
         return overall_load
 
     def compute_ready_queue_load(self):
-        allocated_caps = self.ready_queue.capacities()
+        allocated_caps = self.ready_queue.capacities(jobs=self.ready_queue.get_jobs())
 
         core_load = (allocated_caps.core / self.capacities.core) * 100
         ram_load = (allocated_caps.ram / self.capacities.ram) * 100
@@ -473,7 +474,7 @@ class Agent(Observer):
             job.execute(data_transfer=self.data_transfer)
             self.done_queue.add_job(job=job)
             self.ready_queue.remove_job(job_id=job.get_job_id())
-            if not len(self.ready_queue.jobs):
+            if not len(self.ready_queue.get_jobs()):
                 self.start_idle()
         except Exception as e:
             self.logger.error(f"Execution error: {e}")
@@ -573,15 +574,10 @@ class Agent(Observer):
         self.logger.info(f"Starting Job Scheduling Thread: {self}")
         while not self.shutdown:
             try:
-                job_ids = list(self.selected_queue.jobs.keys())
-                for job_id in job_ids:
-                    job = self.selected_queue.jobs.get(job_id)
-                    if not job:
-                        continue
-
+                for job in self.selected_queue.get_jobs():
                     ready_queue_load = self.compute_ready_queue_load()
                     if ready_queue_load < self.ready_queue_threshold and self.can_schedule_job(job):
-                        self.selected_queue.remove_job(job_id)
+                        self.selected_queue.remove_job(job.get_job_id())
                         self.schedule_job(job)
                     else:
                         time.sleep(0.5)
@@ -601,7 +597,7 @@ class Agent(Observer):
                 writer.writerow([idle_time])
 
     def plot_jobs_per_agent(self):
-        jobs = self.job_queue.jobs.values()
+        jobs = self.job_queue.get_jobs()
         completed_jobs = [j for j in jobs if j.leader_agent_id is not None]
         jobs_per_agent = {}
 
@@ -634,7 +630,7 @@ class Agent(Observer):
         plt.close()
 
     def plot_scheduling_latency(self):
-        jobs = self.job_queue.jobs.values()
+        jobs = self.job_queue.get_jobs()
         completed_jobs = [j for j in jobs if j.leader_agent_id is not None]
 
         wait_times = {}

@@ -16,6 +16,7 @@ runtime:
   restart_job_selection: 300
   peer_heartbeat_timeout: 300
   results_dir: swarm-single
+  message_service: kafka
 logging:
   ## The directory in which actor should create log files.
   ## This directory will be automatically created if it does not exist.
