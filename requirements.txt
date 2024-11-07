@@ -9,3 +9,4 @@ pyraft
 seaborn
 scipy
 nats-py
+zmq

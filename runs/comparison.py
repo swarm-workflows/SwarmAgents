@@ -18,7 +18,7 @@ def compute_metrics(run_directory: str, number_of_agents: int, algo: str):
     all_idle_times_list = []
 
     # Loop through the directories for each run
-    for i in range(100):
+    for i in range(3, 100):
         run_dir = os.path.join(run_directory, f'run{i + 1}')
 
         selection_time_file = os.path.join(run_dir, f'selection_time_0.csv')

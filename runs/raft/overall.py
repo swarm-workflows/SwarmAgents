@@ -14,9 +14,9 @@ data3 = pd.read_csv(file_paths[2])
 # Plotting the data
 plt.figure(figsize=(10, 6))
 
-plt.plot(data1.index, data1['Scheduling Latency'], label='Total Agents: 3', marker='o')
-plt.plot(data2.index, data2['Scheduling Latency'], label='Total Agents: 5', marker='s')
-plt.plot(data3.index, data3['Scheduling Latency'], label='Total Agents: 10', marker='^')
+plt.plot(data1.index, data1['scheduling_latency'], label='Total Agents: 3', marker='o')
+plt.plot(data2.index, data2['scheduling_latency'], label='Total Agents: 5', marker='s')
+plt.plot(data3.index, data3['scheduling_latency'], label='Total Agents: 10', marker='^')
 
 plt.title('RAFT: Scheduling Latency')
 plt.xlabel('Task Index')
