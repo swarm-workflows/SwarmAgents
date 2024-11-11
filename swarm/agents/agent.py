@@ -120,6 +120,7 @@ class Agent(Observer):
         self.idle_start_time = None
         self.total_idle_time = 0
         self.restart_job_selection_cnt = 0
+        self.conflicts = 0
 
     def start_idle(self):
         if self.idle_start_time is None:
@@ -596,6 +597,15 @@ class Agent(Observer):
             for idle_time in self.idle_time:
                 writer.writerow([idle_time])
 
+    def save_miscellaneous(self):
+        # Save misc to JSON
+        with open(f'{self.results_dir}/misc_{self.agent_id}.json', 'w') as file:
+            data = {
+                "restarts": self.restart_job_selection_cnt,
+                "conflicts": self.conflicts
+            }
+            json.dump(data, file, indent=4)
+
     def plot_jobs_per_agent(self):
         jobs = self.job_queue.get_jobs()
         completed_jobs = [j for j in jobs if j.leader_agent_id is not None]
@@ -730,6 +740,7 @@ class Agent(Observer):
 
     def plot_results(self):
         self.logger.info("Plotting Results")
+        self.save_miscellaneous()
         self.plot_jobs_per_agent()
         self.plot_scheduling_latency()
         self.plot_load_per_agent(self.load_per_agent, self.projected_queue_threshold, title_prefix="Projected")

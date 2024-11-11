@@ -204,9 +204,11 @@ class PBFTAgent(Agent):
         if my_proposal and (my_proposal.prepares or my_proposal.seed < rcvd_seed):
             self.logger.debug(f"Job:{job_id} Agent:{self.agent_id} rejected Proposal: {proposal_id} from agent"
                               f" {peer_agent_id} - my proposal {my_proposal} has prepares or smaller seed")
+            self.conflicts += 1
         elif peer_proposal and peer_proposal.seed < rcvd_seed:
             self.logger.debug(f"Job:{job_id} Agent:{self.agent_id} rejected Proposal: {proposal_id} from agent"
                               f" {peer_agent_id} - already accepted proposal {peer_proposal} with a smaller seed")
+            self.conflicts += 1
         else:
             self.logger.debug(
                 f"Agent {self.agent_id} accepted Proposal for Job: {job_id} from agent"
