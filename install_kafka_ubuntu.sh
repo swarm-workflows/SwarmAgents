@@ -31,6 +31,7 @@ EOL
 echo "$((i + 1))" | sudo tee /var/lib/zookeeper/myid > /dev/null
 sudo sed -i "s/^broker.id=0/broker.id=$1/" /etc/kafka/server.properties
 sudo sed -i "s/^zookeeper.connect=localhost:2181/zookeeper.connect=cmbus-0:2181,cmbus-1:2181,cmbus-2:2181/" /etc/kafka/server.properties
+sed -i 's/^#listeners=PLAINTEXT:\/\/:9092/listeners=PLAINTEXT:\/\/:9092/' /etc/kafka/server.properties
 
 # Check if the first argument is 0
 if [ "$1" -eq 0 ]; then
@@ -43,5 +44,6 @@ sudo systemctl start confluent-zookeeper
 sudo systemctl start confluent-kafka
 
 if [ "$1" -eq 0 ]; then
+  sudo systemctl enable confluent-schema-registry
   sudo systemctl start confluent-schema-registry
 fi

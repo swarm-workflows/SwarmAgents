@@ -2,7 +2,7 @@ redis:
   host: 127.0.0.1
   port: 6379
 kafka:
-  bootstrap_servers: localhost:19092
+  bootstrap_servers: mbus-0:9092,mbus-1:9092,mbus-2:9092
   topic: agent
   hb_topic: agent-hb
   consumer_group_id: agent
