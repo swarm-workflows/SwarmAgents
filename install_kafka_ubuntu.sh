@@ -20,9 +20,9 @@ dataDir=/var/lib/zookeeper/
 clientPort=2181
 initLimit=5
 syncLimit=2
-server.1=mbus-0:2888:3888
-server.2=mbus-1:2888:3888
-server.3=mbus-2:2888:3888
+server.1=cmbus-0:2888:3888
+server.2=cmbus-1:2888:3888
+server.3=cmbus-2:2888:3888
 autopurge.snapRetainCount=3
 autopurge.purgeInterval=24
 EOL
@@ -30,11 +30,11 @@ EOL
 # Write the first argument to /var/lib/zookeeper/myid
 echo "$((i + 1))" | sudo tee /var/lib/zookeeper/myid > /dev/null
 sudo sed -i "s/^broker.id=0/broker.id=$1/" /etc/kafka/server.properties
-sudo sed -i "s/^zookeeper.connect=localhost:2181/zookeeper.connect=mbus-0:2181,mbus-1:2181,mbus-2:2181/" /etc/kafka/server.properties
+sudo sed -i "s/^zookeeper.connect=localhost:2181/zookeeper.connect=cmbus-0:2181,cmbus-1:2181,cmbus-2:2181/" /etc/kafka/server.properties
 
 # Check if the first argument is 0
 if [ "$1" -eq 0 ]; then
-  sudo sed -i "s|^kafkastore.bootstrap.servers=PLAINTEXT://localhost:9092|kafkastore.bootstrap.servers=PLAINTEXT://mbus-0:9092,PLAINTEXT://mbus-1:9092,PLAINTEXT://mbus-2:9092|" /etc/schema-registry/schema-registry.properties
+  sudo sed -i "s|^kafkastore.bootstrap.servers=PLAINTEXT://localhost:9092|kafkastore.bootstrap.servers=PLAINTEXT://cmbus-0:9092,PLAINTEXT://cmbus-1:9092,PLAINTEXT://cmbus-2:9092|" /etc/schema-registry/schema-registry.properties
 fi
 
 sudo systemctl enable confluent-zookeeper
