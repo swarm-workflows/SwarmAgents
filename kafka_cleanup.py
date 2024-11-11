@@ -62,7 +62,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
     topic_name = args.topic
 
-    bootstrap_servers = "localhost:19092"
+    bootstrap_servers = "mbus-0:9092,mbus-1:9092,mbus-2:9092"
 
     admin_client = AdminClient({'bootstrap.servers': bootstrap_servers})
     # Delete the topic
