@@ -37,6 +37,8 @@ if [ "$1" -eq 0 ]; then
   sudo sed -i "s|^kafkastore.bootstrap.servers=PLAINTEXT://localhost:9092|kafkastore.bootstrap.servers=PLAINTEXT://mbus-0:9092,PLAINTEXT://mbus-1:9092,PLAINTEXT://mbus-2:9092|" /etc/schema-registry/schema-registry.properties
 fi
 
+sudo systemctl enable confluent-zookeeper
+sudo systemctl enable confluent-kafka
 sudo systemctl start confluent-zookeeper
 sudo systemctl start confluent-kafka
 
