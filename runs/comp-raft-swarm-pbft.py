@@ -38,24 +38,53 @@ data_10_agents = {
     "SWARM-MULTI (10 Agents)": pd.read_csv(swarm_multiple_file_paths[2])
 }
 
-# Set up the figure with three subplots and further reduced figsize
+# Color mapping for each algorithm
+color_map = {
+    "PBFT": "#1f77b4",
+    "SWARM-SINGLE": "#ff7f0e",
+    "SWARM-MULTI": "#2ca02c",
+    "Raft": "#d62728"
+}
+
+# Set up the figure with two subplots
 fig, axs = plt.subplots(2, 1, figsize=(6, 8))  # Smaller figure size
+fig = plt.figure(figsize=(8, 4))
+
 
 # Function to plot all algorithms for a given agent count on a specified subplot axis
 def plot_all_algorithms(data, ax):
     for algo, df in data.items():
-        ax.plot(df.index, df['scheduling_latency'], label=algo, marker='o', markersize=2)
+        # Extract the base algorithm name from the label to match color map
+        base_algo = algo.split()[0]
+        color = color_map.get(base_algo, 'black')  # Default to black if algo not found
+        ax.plot(df.index, df['scheduling_latency'], label=algo, color=color, marker='o', markersize=2)
 
     ax.set_xlabel('Task Index', fontsize=8)
     ax.set_ylabel('Scheduling Latency (seconds)', fontsize=8)
     ax.grid(True)
-    ax.legend(fontsize=7)
+    plt.legend(fontsize=7)
+
+
+# Function to plot all algorithms for a given agent count on a specified subplot axis
+def plot_all_algorithms_fig(data):
+    for algo, df in data.items():
+        # Extract the base algorithm name from the label to match color map
+        base_algo = algo.split()[0]
+        color = color_map.get(base_algo, 'black')  # Default to black if algo not found
+        plt.plot(df.index, df['scheduling_latency'], label=algo, color=color, marker='o', markersize=2)
+
+    plt.xlabel('Task Index', fontsize=8)
+    plt.ylabel('Scheduling Latency (seconds)', fontsize=8)
+    plt.grid(True)
+    plt.legend(fontsize='medium')
+
+
 
 if __name__ == '__main__':
-    # Plot for 3 agents, 5 agents, and 10 agents
-    #plot_all_algorithms(data_3_agents, axs[0])
-    plot_all_algorithms(data_5_agents, axs[0])
-    plot_all_algorithms(data_10_agents, axs[1])
+    # Plot for 5 agents and 10 agents
+    #plot_all_algorithms(data_5_agents, axs[0])
+    #plot_all_algorithms(data_10_agents, axs[1])
+    plot_all_algorithms_fig(data_10_agents)
 
     # Adjust layout and save the figure as a single PNG
     plt.tight_layout()  # Adjust layout to fit in a smaller space

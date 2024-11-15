@@ -10,3 +10,4 @@ seaborn
 scipy
 nats-py
 zmq
+riak

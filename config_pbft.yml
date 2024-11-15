@@ -1,6 +1,10 @@
 redis:
   host: 127.0.0.1
   port: 6379
+queue:
+  type: simple
+  host: 127.0.0.1
+  port: 8098
 kafka:
   bootstrap_servers: zoo-0:9092,zoo-1:9092,zoo-2:9092
   topic: agent-pbft

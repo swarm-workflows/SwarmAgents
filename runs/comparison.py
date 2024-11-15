@@ -4,9 +4,11 @@ from typing import List, Dict, Any
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import seaborn as sns
 from scipy import stats
 import argparse
+
+colors = [["#1f77b4", "#aec7e8"], ["#ff7f0e", "#ffbb78"], ["#2ca02c", "#98df8a"]]
+figsize=(8, 4)
 
 
 def compute_metrics(run_directory: str, number_of_agents: int, algo: str):
@@ -93,59 +95,61 @@ def compute_metrics(run_directory: str, number_of_agents: int, algo: str):
 
 
 def plot_means_median_line_idle(data_list: List[Dict[str, Any]], number_of_agents: int):
-    plt.figure(figsize=(14, 10))
-    colors = [["b-", "blue"], ["r-", "red"], ["g-", "green"]]
+    plt.figure(figsize=figsize)
 
-    idx = 0
-    for mean_median in data_list:
-        plt.plot(mean_median['idle_means'], colors[idx][0], label=f'{mean_median["algo"]}: Mean')
-        plt.plot(mean_median['idle_medians'], f'{colors[idx][0]}.', label=f'{mean_median["algo"]}: Median')
+    for idx, mean_median in enumerate(data_list):
+        # Plot mean line
+        plt.plot(mean_median['idle_means'], color=colors[idx][0], label=f'{mean_median["algo"]}: Mean')
+        # Plot median points
+        plt.plot(mean_median['idle_medians'], linestyle=':', color=colors[idx][0], label=f'{mean_median["algo"]}: Median')
+        # CI shading
         plt.fill_between(range(len(mean_median['idle_means'])), mean_median['idle_ci_lower'], mean_median['idle_ci_upper'],
-                         color=colors[idx][1], alpha=0.2,
-                         label=f'{mean_median["algo"]}: 95% CI')
-        idx += 1
+                         color=colors[idx][1], alpha=0.3, label=f'{mean_median["algo"]}: 95% CI')
 
-    plt.title(f'Comparison of Idle Time Across Algorithms - {number_of_agents} agents')
+    #plt.title(f'Comparison of Idle Time Across Algorithms - {number_of_agents} agents')
     plt.xlabel('Run Index')
     plt.ylabel('Idle Time (seconds)')
-    plt.legend()
+    #, fontsize='medium'
+    plt.legend(loc='upper left', bbox_to_anchor=(1, 1))
+    plt.rcParams.update({'font.size': 14})
     plt.grid(True)
+    plt.tight_layout()
     plt.savefig(f'comparison_line_plot_idle_time_with_ci_{number_of_agents}.png', bbox_inches='tight')
     plt.close()
 
 
 def plot_means_median_line(data_list: List[Dict[str, Any]], number_of_agents: int):
-    plt.figure(figsize=(14, 10))
-    colors = [["b-", "blue"], ["r-", "red"], ["g-", "green"]]
+    plt.figure(figsize=figsize)
 
-    idx = 0
-    for mean_median in data_list:
-        plt.plot(mean_median['means'], colors[idx][0], label=f'{mean_median["algo"]}: Mean')
-        plt.plot(mean_median['medians'], f'{colors[idx][0]}.', label=f'{mean_median["algo"]}: Median')
+    for idx, mean_median in enumerate(data_list):
+        # Plot mean line
+        plt.plot(mean_median['means'], color=colors[idx][0], label=f'{mean_median["algo"]}: Mean')
+        # Plot median points
+        plt.plot(mean_median['medians'], linestyle=':', color=colors[idx][0], label=f'{mean_median["algo"]}: Median')
+        # CI shading
         plt.fill_between(range(len(mean_median['means'])), mean_median['ci_lower'], mean_median['ci_upper'],
-                         color=colors[idx][1], alpha=0.2,
-                         label=f'{mean_median["algo"]}: 95% CI')
-        idx += 1
+                         color=colors[idx][1], alpha=0.3, label=f'{mean_median["algo"]}: 95% CI')
 
-    plt.title(f'Comparison of Scheduling Latency Across Algorithms - {number_of_agents} agents')
+    #plt.title(f'Comparison of Scheduling Latency Across Algorithms - {number_of_agents} agents')
     plt.xlabel('Run Index')
     plt.ylabel('Scheduling Latency (seconds)')
-    plt.legend()
+    plt.legend(loc='upper left', bbox_to_anchor=(1, 1))
+    plt.rcParams.update({'font.size': 14})
     plt.grid(True)
+    plt.tight_layout()
     plt.savefig(f'comparison_line_plot_with_ci_{number_of_agents}.png', bbox_inches='tight')
     plt.close()
 
 
 def plot_histograms(data_list: list, number_of_agents: int, param_name: str, param_pretty_name: str):
     plt.figure(figsize=(20, 14))
-    colors = ["blue", "red", "green"]
 
     idx = 1
     for data in data_list:
         # Histogram for Algorithm 1
         plt.subplot(3, 1, idx)
-        plt.hist(data[param_name], bins=20, color=colors[idx-1], alpha=0.7)
-        plt.title(f'{data["algo"]}: Frequency Distribution of {param_pretty_name} - {number_of_agents} agents')
+        plt.hist(data[param_name], bins=20, color=colors[idx-1][0], alpha=0.7)
+        #plt.title(f'{data["algo"]}: Frequency Distribution of {param_pretty_name} - {number_of_agents} agents')
         plt.xlabel(f'{param_pretty_name} (seconds)')
         plt.ylabel('Frequency')
         plt.grid(True)
@@ -158,19 +162,54 @@ def plot_histograms(data_list: list, number_of_agents: int, param_name: str, par
 
 def plot_overlaying_histograms(flat_selection_times_pbft: list, flat_selection_times_swarm_single: list,
                                flat_selection_times_swarm_multi: list, number_of_agents: int):
-    plt.figure(figsize=(14, 10))
+    plt.figure(figsize=figsize)
 
     # Overlay Histogram
-    plt.hist(flat_selection_times_pbft, bins=20, color='blue', alpha=0.5, label='PBFT')
-    plt.hist(flat_selection_times_swarm_single, bins=20, color='red', alpha=0.5, label='SWARM-SINGLE')
-    plt.hist(flat_selection_times_swarm_multi, bins=20, color='green', alpha=0.5, label='SWARM-MULTI')
+    plt.hist(flat_selection_times_pbft, bins=20, color=colors[0], alpha=0.5, label='PBFT')
+    plt.hist(flat_selection_times_swarm_single, bins=20, color=colors[1], alpha=0.5, label='SWARM-SINGLE')
+    plt.hist(flat_selection_times_swarm_multi, bins=20, color=colors[2], alpha=0.5, label='SWARM-MULTI')
 
-    plt.title(f'Comparison of Selection Times Across Algorithms - {number_of_agents} agents')
+    #plt.title(f'Comparison of Selection Times Across Algorithms - {number_of_agents} agents')
     plt.xlabel('Selection Time (seconds)')
     plt.ylabel('Frequency')
     plt.legend()
     plt.grid(True)
     plt.savefig(f'comparison_histogram_selection_times_{number_of_agents}.png', bbox_inches='tight')
+    plt.close()
+
+
+def plot_combined_ci(data_list: List[Dict[str, Any]], number_of_agents: int):
+    # Set up a single figure with two subplots for Scheduling Latency and Idle Time
+    fig, axs = plt.subplots(1, 2, figsize=(12, 6), constrained_layout=True)
+
+    # Plot Scheduling Latency (first subplot)
+    for idx, mean_median in enumerate(data_list):
+        axs[0].plot(mean_median['means'], color=colors[idx][0], label=f'{mean_median["algo"]}: Mean')
+        axs[0].plot(mean_median['medians'], linestyle=':', color=colors[idx][0], label=f'{mean_median["algo"]}: Median')
+        axs[0].fill_between(range(len(mean_median['means'])), mean_median['ci_lower'], mean_median['ci_upper'],
+                            color=colors[idx][1], alpha=0.3, label=f'{mean_median["algo"]}: 95% CI')
+    axs[0].set_title('Scheduling Latency')
+    axs[0].set_xlabel('Run Index')
+    axs[0].set_ylabel('Latency (seconds)')
+    #axs[0].legend(loc='upper left', bbox_to_anchor=(1, 1))
+    axs[0].grid(True)
+
+    # Plot Idle Time (second subplot)
+    for idx, mean_median in enumerate(data_list):
+        axs[1].plot(mean_median['idle_means'], color=colors[idx][0], label=f'{mean_median["algo"]}: Mean')
+        axs[1].plot(mean_median['idle_medians'], linestyle=':', color=colors[idx][0],
+                    label=f'{mean_median["algo"]}: Median')
+        axs[1].fill_between(range(len(mean_median['idle_means'])), mean_median['idle_ci_lower'],
+                            mean_median['idle_ci_upper'],
+                            color=colors[idx][1], alpha=0.3, label=f'{mean_median["algo"]}: 95% CI')
+    axs[1].set_title('Idle Time')
+    axs[1].set_xlabel('Run Index')
+    axs[1].set_ylabel('Idle Time (seconds)')
+    axs[1].legend(loc='upper left', bbox_to_anchor=(1, 1))
+    axs[1].grid(True)
+
+    # Save the combined figure
+    plt.savefig(f'comparison_combined_ci_{number_of_agents}.png', dpi=150, bbox_inches='tight')
     plt.close()
 
 
@@ -192,6 +231,7 @@ def plots(number_of_agents: int):
                     param_pretty_name="Selection Time")
     plot_histograms(number_of_agents=number_of_agents, data_list=data_list, param_name='flat_scheduling_latencies',
                     param_pretty_name="Scheduling Latency")
+    plot_combined_ci(data_list=data_list, number_of_agents=number_of_agents)
 
 
 if __name__ == '__main__':

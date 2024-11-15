@@ -33,17 +33,13 @@ sudo sed -i "s/^broker.id=0/broker.id=$1/" /etc/kafka/server.properties
 sudo sed -i "s/^zookeeper.connect=localhost:2181/zookeeper.connect=zoo-0:2181,zoo-1:2181,zoo-2:2181/" /etc/kafka/server.properties
 sed -i 's/^#listeners=PLAINTEXT:\/\/:9092/listeners=PLAINTEXT:\/\/:9092/' /etc/kafka/server.properties
 
-# Check if the first argument is 0
-if [ "$1" -eq 0 ]; then
-  sudo sed -i "s|^kafkastore.bootstrap.servers=PLAINTEXT://localhost:9092|kafkastore.bootstrap.servers=PLAINTEXT://zoo-0:9092,PLAINTEXT://zoo-1:9092,PLAINTEXT://zoo-2:9092|" /etc/schema-registry/schema-registry.properties
-fi
-
 sudo systemctl enable confluent-zookeeper
 sudo systemctl enable confluent-kafka
 sudo systemctl start confluent-zookeeper
 sudo systemctl start confluent-kafka
 
-if [ "$1" -eq 0 ]; then
-  sudo systemctl enable confluent-schema-registry
-  sudo systemctl start confluent-schema-registry
-fi
+#if [ "$1" -eq 0 ]; then
+#  sudo sed -i "s|^kafkastore.bootstrap.servers=PLAINTEXT://localhost:9092|kafkastore.bootstrap.servers=PLAINTEXT://zoo-0:9092,PLAINTEXT://zoo-1:9092,PLAINTEXT://zoo-2:9092|" /etc/schema-registry/schema-registry.properties
+#  sudo systemctl enable confluent-schema-registry
+#  sudo systemctl start confluent-schema-registry
+#fi
