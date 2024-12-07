@@ -6,6 +6,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy import stats
 import argparse
+import seaborn as sns
 
 colors = [["#1f77b4", "#aec7e8"], ["#ff7f0e", "#ffbb78"], ["#2ca02c", "#98df8a"]]
 figsize=(8, 4)
@@ -94,6 +95,127 @@ def compute_metrics(run_directory: str, number_of_agents: int, algo: str):
     }
 
 
+def plot_means_median_idle_box_plots_with_points(data_list: List[Dict[str, Any]], number_of_agents: int):
+    data_frames = []
+    for d in data_list:
+        df = pd.DataFrame({'Idle Time': d['idle_means'], 'Algorithm': d['algo']})
+        data_frames.append(df)
+    combined_df = pd.concat(data_frames)
+    plt.figure(figsize=(10, 6))
+    sns.boxplot(x='Algorithm', y='Idle Time', data=combined_df, showmeans=True)
+    sns.stripplot(x='Algorithm', y='Idle Time', data=combined_df, color='black', alpha=0.5, jitter=True)
+    plt.title(f'Box Plot of Idle Time with Individual Runs - {number_of_agents} agents')
+    plt.ylabel('Idle Time (seconds)')
+    plt.grid(axis='y', linestyle='--', alpha=0.6)
+    plt.tight_layout()
+    plt.savefig(f'box_plot_idle_time_{number_of_agents}.png')
+    plt.close()
+
+
+def plot_means_median_idle_ci_bars(data_list: List[Dict[str, Any]], number_of_agents: int):
+    plt.figure(figsize=(10, 6))
+    for idx, d in enumerate(data_list):
+        mean_idle = np.mean(d['idle_means'])
+        ci_low = np.mean(d['idle_ci_lower'])
+        ci_high = np.mean(d['idle_ci_upper'])
+        plt.errorbar(idx, mean_idle, yerr=[[mean_idle - ci_low], [ci_high - mean_idle]], fmt='o', capsize=5,
+                     label=d['algo'])
+
+    plt.xticks(range(len(data_list)), [d['algo'] for d in data_list])
+    plt.ylabel('Mean Idle Time (seconds)')
+    plt.title(f'Dot Plot with Confidence Intervals - {number_of_agents} agents')
+    plt.grid(axis='y', linestyle='--', alpha=0.6)
+    plt.tight_layout()
+    plt.savefig(f'dot_plot_idle_time_{number_of_agents}.png')
+    plt.close()
+
+
+def plot_means_median_violin(data_list: List[Dict[str, Any]], number_of_agents: int):
+    data_frames = []
+    for d in data_list:
+        df = pd.DataFrame({'Idle Time': d['idle_means'], 'Algorithm': d['algo']})
+        data_frames.append(df)
+    combined_df = pd.concat(data_frames)
+
+    plt.figure(figsize=(10, 6))
+    sns.violinplot(x='Algorithm', y='Idle Time', data=combined_df, scale='width', inner='quartile')
+    plt.title(f'Violin Plot of Idle Time Distribution - {number_of_agents} agents')
+    plt.ylabel('Idle Time (seconds)')
+    plt.grid(axis='y', linestyle='--', alpha=0.6)
+    plt.tight_layout()
+    plt.savefig(f'violin_plot_idle_time_{number_of_agents}.png')
+    plt.close()
+
+
+def print_percentage_improvements(data_list: List[Dict[str, Any]]):
+    # Assuming data_list contains 'algo' and 'idle_means'
+    algorithms = [d['algo'] for d in data_list]
+    means = [np.mean(d['idle_means']) for d in data_list]
+
+    # Use the first algorithm as the baseline
+    baseline_mean = means[0]
+
+    print(f"Baseline Algorithm: {algorithms[0]} (Mean Idle Time: {baseline_mean:.2f})")
+
+    # Compute and print percentage improvements
+    for algo, mean in zip(algorithms, means):
+        improvement = ((baseline_mean - mean) / baseline_mean) * 100
+        print(f"{algo}: {improvement:.2f}% improvement over {algorithms[0]} (Mean Idle Time: {mean:.2f})")
+
+
+def plot_means_median_histogram_error_bars_percent(data_list: List[Dict[str, Any]], number_of_agents: int):
+    # Assuming data_list contains 'algo', 'idle_means', 'idle_ci_lower', 'idle_ci_upper'
+    algorithms = [d['algo'] for d in data_list]
+    means = [np.mean(d['idle_means']) for d in data_list]
+    ci_errors = [((np.mean(d['idle_means']) - np.mean(d['idle_ci_lower'])),
+                  (np.mean(d['idle_ci_upper']) - np.mean(d['idle_means']))) for d in data_list]
+
+    # Compute percentage improvements relative to the first algorithm (e.g., PBFT as baseline)
+    baseline_mean = means[0]
+    percentage_improvements = [
+        ((baseline_mean - mean) / baseline_mean) * 100 for mean in means
+    ]
+
+    # x positions for bars
+    x = np.arange(len(algorithms))
+
+    # Create the bar plot
+    plt.figure(figsize=(10, 6))
+    plt.bar(x, means, yerr=np.array(ci_errors).T, capsize=5, alpha=0.7, tick_label=algorithms)
+
+    # Annotate percentage improvements on top of bars
+    for i, (mean, improvement) in enumerate(zip(means, percentage_improvements)):
+        plt.text(x[i], mean + max(ci_errors[i]) * 0.1, f'{improvement:.1f}%', ha='center', fontsize=10)
+
+    plt.xlabel('Algorithms')
+    plt.ylabel('Mean Idle Time (seconds)')
+    plt.title(f'Comparison of Mean Idle Time with Error Bars - {number_of_agents} agents')
+    plt.grid(axis='y', linestyle='--', alpha=0.6)
+    plt.tight_layout()
+    plt.savefig(f'histogram_idle_time_with_error_bars_{number_of_agents}_percent.png')
+    plt.close()
+
+
+def plot_means_median_histogram_error_bars(data_list: List[Dict[str, Any]], number_of_agents: int):
+    # Assuming data_list contains 'algo', 'idle_means', 'idle_ci_lower', 'idle_ci_upper'
+    algorithms = [d['algo'] for d in data_list]
+    means = [np.mean(d['idle_means']) for d in data_list]
+    ci_errors = [((np.mean(d['idle_means']) - np.mean(d['idle_ci_lower'])),
+                  (np.mean(d['idle_ci_upper']) - np.mean(d['idle_means']))) for d in data_list]
+
+    x = np.arange(len(algorithms))  # x positions for bars
+
+    plt.figure(figsize=(10, 6))
+    plt.bar(x, means, yerr=np.array(ci_errors).T, capsize=5, alpha=0.7, tick_label=algorithms)
+    plt.xlabel('Algorithms')
+    plt.ylabel('Mean Idle Time (seconds)')
+    plt.title(f'Comparison of Mean Idle Time with Error Bars - {number_of_agents} agents')
+    plt.grid(axis='y', linestyle='--', alpha=0.6)
+    plt.tight_layout()
+    plt.savefig(f'histogram_idle_time_with_error_bars_{number_of_agents}.png')
+    plt.close()
+
+
 def plot_means_median_line_idle(data_list: List[Dict[str, Any]], number_of_agents: int):
     plt.figure(figsize=figsize)
 
@@ -115,6 +237,36 @@ def plot_means_median_line_idle(data_list: List[Dict[str, Any]], number_of_agent
     plt.grid(True)
     plt.tight_layout()
     plt.savefig(f'comparison_line_plot_idle_time_with_ci_{number_of_agents}.png', bbox_inches='tight')
+    plt.close()
+
+
+def plot_means_median_line_percent(data_list: List[Dict[str, Any]], number_of_agents: int):
+    plt.figure(figsize=figsize)
+
+    # Calculate mean improvements relative to the first algorithm
+    baseline_mean = np.mean(data_list[0]['means'])  # First algorithm as baseline
+    improvements = [
+        ((baseline_mean - np.mean(d['means'])) / baseline_mean) * 100 if idx > 0 else 0
+        for idx, d in enumerate(data_list)
+    ]
+
+    for idx, mean_median in enumerate(data_list):
+        # Plot mean line
+        plt.plot(mean_median['means'], color=colors[idx][0], label=f'{mean_median["algo"]}: Mean ({np.mean(mean_median["means"]):.2f}s, {improvements[idx]:.1f}% improvement)')
+        # Plot median points
+        plt.plot(mean_median['medians'], linestyle=':', color=colors[idx][0], label=f'{mean_median["algo"]}: Median')
+        # CI shading
+        plt.fill_between(range(len(mean_median['means'])), mean_median['ci_lower'], mean_median['ci_upper'],
+                         color=colors[idx][1], alpha=0.3, label=f'{mean_median["algo"]}: 95% CI')
+
+    # Set labels and legend
+    plt.xlabel('Run Index')
+    plt.ylabel('Scheduling Latency (seconds)')
+    plt.legend(loc='upper left', bbox_to_anchor=(1, 1))
+    plt.rcParams.update({'font.size': 14})
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(f'comparison_line_plot_with_ci_{number_of_agents}_percent.png', bbox_inches='tight')
     plt.close()
 
 
@@ -222,7 +374,9 @@ def plots(number_of_agents: int):
                                         number_of_agents=number_of_agents, algo="SWARM-SINGLE")
     data_list = [data_pbft, data_swarm_single, data_swarm_multi]
     plot_means_median_line(number_of_agents=number_of_agents, data_list=data_list)
-    plot_means_median_line_idle(number_of_agents=number_of_agents, data_list=data_list)
+    plot_means_median_line_percent(number_of_agents=number_of_agents, data_list=data_list)
+    plot_means_median_histogram_error_bars(number_of_agents=number_of_agents, data_list=data_list)
+    print_percentage_improvements(data_list=data_list)
     plot_histograms(number_of_agents=number_of_agents, data_list=data_list, param_name='flat_wait_times',
                     param_pretty_name="Wait Time")
     plot_histograms(number_of_agents=number_of_agents, data_list=data_list, param_name='flat_idle_times',
@@ -231,7 +385,7 @@ def plots(number_of_agents: int):
                     param_pretty_name="Selection Time")
     plot_histograms(number_of_agents=number_of_agents, data_list=data_list, param_name='flat_scheduling_latencies',
                     param_pretty_name="Scheduling Latency")
-    plot_combined_ci(data_list=data_list, number_of_agents=number_of_agents)
+    #plot_combined_ci(data_list=data_list, number_of_agents=number_of_agents)
 
 
 if __name__ == '__main__':
