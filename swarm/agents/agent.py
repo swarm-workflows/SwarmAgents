@@ -50,7 +50,6 @@ from swarm.models.capacities import Capacities
 from swarm.models.agent_info import AgentInfo
 from swarm.models.profile import ProfileType, PROFILE_MAP
 from swarm.models.job import Job
-from swarm.queue.riak_job_queue import RiakJobQueue
 from swarm.queue.simple_job_queue import SimpleJobQueue
 
 
@@ -272,6 +271,7 @@ class Agent(Observer):
             queue_config = config.get("queue", {})
             queue_type = queue_config.get("type", "simple")
             if queue_type == "riak":
+                from swarm.queue.riak_job_queue import RiakJobQueue
                 self.job_queue = RiakJobQueue()
                 self.selected_queue = self.job_queue
                 self.ready_queue = self.job_queue

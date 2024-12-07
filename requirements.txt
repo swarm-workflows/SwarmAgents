@@ -1,4 +1,3 @@
-redis
 psutil
 paramiko
 PyYAML
@@ -11,3 +10,4 @@ scipy
 nats-py
 zmq
 riak
+redis
