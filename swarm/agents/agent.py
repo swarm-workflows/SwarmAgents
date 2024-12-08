@@ -622,8 +622,9 @@ class Agent(Observer):
             }
             json.dump(data, file, indent=4)
 
-    def plot_jobs_per_agent(self):
-        jobs = self.job_queue.get_jobs()
+    def plot_jobs_per_agent(self, jobs: list[Job] = None):
+        if not jobs:
+            jobs = self.job_queue.get_jobs()
         completed_jobs = [j for j in jobs if j.leader_agent_id is not None]
         jobs_per_agent = {}
 
@@ -656,8 +657,9 @@ class Agent(Observer):
             plt.savefig(f'{self.results_dir}/jobs_per_agent_{self.agent_id}.png')
             plt.close()
 
-    def plot_scheduling_latency(self):
-        jobs = self.job_queue.get_jobs()
+    def plot_scheduling_latency(self, jobs: list[Job] = None):
+        if not jobs:
+            jobs = self.job_queue.get_jobs()
         completed_jobs = [j for j in jobs if j.leader_agent_id is not None]
 
         wait_times = {}
@@ -757,12 +759,13 @@ class Agent(Observer):
             # Save the plot to a file
             plt.savefig(plot_filename)
 
-    def plot_results(self):
+    def plot_results(self, jobs: list[Job] = None):
         self.logger.info("Plotting Results")
         self.save_miscellaneous()
-        self.plot_jobs_per_agent()
-        self.plot_scheduling_latency()
-        self.plot_load_per_agent(self.load_per_agent, self.projected_queue_threshold, title_prefix="Projected")
+        self.plot_jobs_per_agent(jobs=jobs)
+        self.plot_scheduling_latency(jobs=jobs)
+        self.plot_load_per_agent(self.load_per_agent, self.projected_queue_threshold,
+                                 title_prefix="Projected")
         self.save_idle_time_per_agent()
         self.logger.info("Plot completed")
 

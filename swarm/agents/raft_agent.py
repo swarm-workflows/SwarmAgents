@@ -75,8 +75,14 @@ class RaftAgent(Agent):
         super().start()
 
     def stop(self):
-        super(RaftAgent, self).stop()
+        #super(RaftAgent, self).stop()
         self.shutdown = True
+        self.ctrl_msg_srv.stop()
+        self.hrt_msg_srv.stop()
+        with self.condition:
+            self.condition.notify_all()
+        jobs = self.job_repo.get_all_jobs()
+        self.plot_results(jobs=jobs)
         self.shutdown_flag.set()
         self.raft.shutdown()
 
@@ -135,6 +141,7 @@ class RaftAgent(Agent):
                     my_load = self.compute_overall_load()
                     peer = self.__find_neighbor_with_lowest_load()
                     #self.logger.debug(f"Peer found: {peer}")
+                    job.change_state(new_state=JobState.PREPARE)
 
                     if peer and peer.load < 70.00 and self.can_peer_accommodate_job(peer_agent=peer,
                                                                                     job=job):
@@ -146,7 +153,8 @@ class RaftAgent(Agent):
 
                     elif self.is_job_feasible(job=job, total=self.capacities, projected_load=my_load):
                         job.set_leader(leader_agent_id=self.agent_id)
-                        job.change_state(new_state=JobState.RUNNING)
+                        #job.change_state(new_state=JobState.RUNNING)
+                        job.change_state(new_state=JobState.READY)
                         self.job_repo.delete_job(job_id=job.get_job_id())
                         self.job_repo.save_job(job=job, key_prefix="allocated")
                         self.select_job(job=job)
@@ -172,6 +180,7 @@ class RaftAgent(Agent):
         self.logger.info(f"Received commit from Agent: {peer_agent_id} for Job: {job_id}")
         job = self.job_repo.get_job(job_id=job_id, key_prefix="allocated")
         if job:
+            job.change_state(new_state=JobState.READY)
             self.select_job(job=job)
             '''
             if self.is_job_feasible(job=job, total=self.capacities, projected_load=self.compute_overall_load()):
