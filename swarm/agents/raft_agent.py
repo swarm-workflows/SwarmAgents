@@ -138,7 +138,8 @@ class RaftAgent(Agent):
         try:
             processed = 0
             jobs = self.job_repo.get_all_jobs()
-            self.logger.debug(f"Fetched jobs: {len(jobs)} {processed} {self.neighbor_map.values()}")
+            if len(jobs):
+                self.logger.debug(f"Fetched jobs: {len(jobs)} {processed} {self.neighbor_map.values()}")
             for job in jobs:
                 if self.shutdown_flag.is_set():
                     break

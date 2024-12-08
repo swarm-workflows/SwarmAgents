@@ -768,6 +768,7 @@ class Agent(Observer):
         if heart_beat.agent.load != 0.0:
             self.load_check_counter = 0
             return False
+        self.logger.info(f"Can Shutdown; Neighbor Map: {self.neighbor_map}")
         # Remove stale peers
         peers_to_remove = []
         for peer in self.neighbor_map.values():
