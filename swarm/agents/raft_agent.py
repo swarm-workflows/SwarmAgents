@@ -157,7 +157,6 @@ class RaftAgent(Agent):
 
                     if peer and peer.load < 70.00 and self.can_peer_accommodate_job(peer_agent=peer,
                                                                                      job=job):
-                        job.set_wait_time()
                         job.set_leader(leader_agent_id=peer.agent_id)
                         self.job_repo.delete_job(job_id=job.get_job_id())
                         self.job_repo.save_job(job=job, key_prefix="allocated")
@@ -165,7 +164,6 @@ class RaftAgent(Agent):
                         self.send_message(message_type=MessageType.Commit, job_id=job.job_id, payload=payload)
 
                     elif self.is_job_feasible(job=job, total=self.capacities, projected_load=my_load):
-                        job.set_wait_time()
                         job.set_leader(leader_agent_id=self.agent_id)
                         job.change_state(new_state=JobState.RUNNING)
                         self.job_repo.delete_job(job_id=job.get_job_id())

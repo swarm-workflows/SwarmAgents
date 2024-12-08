@@ -66,11 +66,5 @@ if __name__ == "__main__":
     task_generator = TaskGenerator(task_count=task_count)
     if agent_id == 0:
         task_generator.start()
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        agent.stop()
-        if agent_id == 0:
-            task_generator.stop()
+
 
