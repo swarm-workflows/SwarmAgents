@@ -72,14 +72,7 @@ class RaftAgent(Agent):
 
         if not self.agent_id and clean:
             self.job_repo.delete_all()
-        self.ctrl_msg_srv.register_observers(agent=self)
-        self.hrt_msg_srv.register_observers(agent=self)
-        self.heartbeat_processor_thread.start()
-        self.msg_processor_thread.start()
-        self.ctrl_msg_srv.start()
-        self.hrt_msg_srv.start()
-        self.heartbeat_thread.start()
-        self.job_selection_thread.start()
+        super().start()
 
     def stop(self):
         super(RaftAgent, self).stop()
