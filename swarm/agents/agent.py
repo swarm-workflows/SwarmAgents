@@ -121,6 +121,7 @@ class Agent(Observer):
         self.total_idle_time = 0
         self.restart_job_selection_cnt = 0
         self.conflicts = 0
+        self.plot_figures = False
 
     def start_idle(self):
         if self.idle_start_time is None:
@@ -639,20 +640,21 @@ class Agent(Observer):
             for agent_id, job_count in jobs_per_agent.items():
                 writer.writerow([agent_id, job_count])
 
-        # Plotting the jobs per agent as a bar chart
-        plt.bar(list(jobs_per_agent.keys()), list(jobs_per_agent.values()), color='blue')
-        plt.xlabel('Agent ID')
-        plt.ylabel('Number of Jobs Selected')
+        if self.plot_figures:
+            # Plotting the jobs per agent as a bar chart
+            plt.bar(list(jobs_per_agent.keys()), list(jobs_per_agent.values()), color='blue')
+            plt.xlabel('Agent ID')
+            plt.ylabel('Number of Jobs Selected')
 
-        # Title with SWARM and number of agents
-        num_agents = len(jobs_per_agent)
-        plt.title(f'SWARM: Number of Jobs Selected by Each Agent (Total Agents: {num_agents})')
+            # Title with SWARM and number of agents
+            num_agents = len(jobs_per_agent)
+            plt.title(f'SWARM: Number of Jobs Selected by Each Agent (Total Agents: {num_agents})')
 
-        plt.grid(axis='y', linestyle='--', linewidth=0.5)
+            plt.grid(axis='y', linestyle='--', linewidth=0.5)
 
-        # Save the plot
-        plt.savefig(f'{self.results_dir}/jobs_per_agent_{self.agent_id}.png')
-        plt.close()
+            # Save the plot
+            plt.savefig(f'{self.results_dir}/jobs_per_agent_{self.agent_id}.png')
+            plt.close()
 
     def plot_scheduling_latency(self):
         jobs = self.job_queue.get_jobs()
@@ -686,35 +688,36 @@ class Agent(Observer):
             for key, value in scheduling_latency.items():
                 writer.writerow([key, value])
 
-        # Plotting scheduling latency in red
-        plt.plot(list(scheduling_latency.values()),
-                 'ro-', label='Scheduling Latency: Combined Wait Time and Selection Time '
-                              '(Job Ready to be scheduled on Agent)')
+        if self.plot_figures:
+            # Plotting scheduling latency in red
+            plt.plot(list(scheduling_latency.values()),
+                     'ro-', label='Scheduling Latency: Combined Wait Time and Selection Time '
+                                  '(Job Ready to be scheduled on Agent)')
 
-        # Plotting wait time in blue
-        if wait_times:
-            plt.plot(list(wait_times.values()),
-                     'bo-', label='Wait Time: Duration from Job Creation to Start of Selection')
+            # Plotting wait time in blue
+            if wait_times:
+                plt.plot(list(wait_times.values()),
+                         'bo-', label='Wait Time: Duration from Job Creation to Start of Selection')
 
-        # Plotting leader election time in green
-        if selection_times:
-            plt.plot(list(selection_times.values()),
-                     'go-', label='Job Selection Time: Time Taken for Agents to Reach Consensus on Job Selection')
+            # Plotting leader election time in green
+            if selection_times:
+                plt.plot(list(selection_times.values()),
+                         'go-', label='Job Selection Time: Time Taken for Agents to Reach Consensus on Job Selection')
 
-        # Title with SWARM and number of agents
-        num_agents = len(set([t.leader_agent_id for t in completed_jobs]))
-        plt.title(f'SWARM: Scheduling Latency (Total Agents: {num_agents})')
+            # Title with SWARM and number of agents
+            num_agents = len(set([t.leader_agent_id for t in completed_jobs]))
+            plt.title(f'SWARM: Scheduling Latency (Total Agents: {num_agents})')
 
-        plt.xlabel('Task Index')
-        plt.ylabel('Time Units (seconds)')
-        plt.grid(True)
+            plt.xlabel('Task Index')
+            plt.ylabel('Time Units (seconds)')
+            plt.grid(True)
 
-        # Adjusting legend position to avoid overlapping the graph
-        plt.legend(loc='upper left', bbox_to_anchor=(1, 1))  # This places the legend outside the plot area
+            # Adjusting legend position to avoid overlapping the graph
+            plt.legend(loc='upper left', bbox_to_anchor=(1, 1))  # This places the legend outside the plot area
 
-        # Save the plot
-        plt.savefig(f'{self.results_dir}/job_latency_{self.agent_id}.png', bbox_inches='tight')  # bbox_inches='tight' ensures that the entire plot is saved
-        plt.close()
+            # Save the plot
+            plt.savefig(f'{self.results_dir}/job_latency_{self.agent_id}.png', bbox_inches='tight')  # bbox_inches='tight' ensures that the entire plot is saved
+            plt.close()
 
     def plot_load_per_agent(self, load_dict: dict, threshold: float, title_prefix: str = ""):
         csv_filename = f'{self.results_dir}/agent_loads_{self.agent_id}.csv'
@@ -738,20 +741,21 @@ class Agent(Observer):
                     row.append(load_dict[agent_id][i] if i < len(load_dict[agent_id]) else '')
                 writer.writerow(row)
 
-        # Plot the data
-        plt.figure(figsize=(10, 6))
+        if self.plot_figures:
+            # Plot the data
+            plt.figure(figsize=(10, 6))
 
-        for agent_id, loads in load_dict.items():
-            plt.plot(loads, label=f'Agent {agent_id}')
+            for agent_id, loads in load_dict.items():
+                plt.plot(loads, label=f'Agent {agent_id}')
 
-        plt.xlabel('Time Interval')
-        plt.ylabel('Load')
-        plt.title(f'{title_prefix} Agent Load Over Time [Max Threshold: {threshold}]')
-        plt.legend()
-        plt.grid(True)
+            plt.xlabel('Time Interval')
+            plt.ylabel('Load')
+            plt.title(f'{title_prefix} Agent Load Over Time [Max Threshold: {threshold}]')
+            plt.legend()
+            plt.grid(True)
 
-        # Save the plot to a file
-        plt.savefig(plot_filename)
+            # Save the plot to a file
+            plt.savefig(plot_filename)
 
     def plot_results(self):
         self.logger.info("Plotting Results")
