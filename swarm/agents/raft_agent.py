@@ -121,7 +121,7 @@ class RaftAgent(Agent):
         return lowest_load_neighbor
 
     def run_as_leader(self):
-        self.logger.info("Running as leader")
+        #self.logger.debug("Running as leader")
         try:
             processed = 0
             jobs = self.job_repo.get_all_jobs()
@@ -154,6 +154,8 @@ class RaftAgent(Agent):
                 if processed >= 40:
                     time.sleep(1)
                     processed = 0
+            if not len(jobs):
+                time.sleep(5)
         except Exception as e:
             self.logger.info(f"RUN Leader -- error: {e}")
             self.logger.info("Running as leader -- stop")
@@ -223,6 +225,8 @@ class RaftAgent(Agent):
     def job_selection_main(self):
         self.logger.info(f"Starting agent: {self}")
         self.ctrl_msg_srv.register_observers(agent=self)
+        if self.is_leader():
+            self.logger.info("Running as leader!")
 
         while not self.shutdown_flag.is_set():
             try:
