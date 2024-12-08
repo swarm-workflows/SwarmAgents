@@ -111,10 +111,10 @@ class RaftAgent(Agent):
 
         if capacities and allocated_caps:
             available = capacities - allocated_caps
-            self.logger.debug(f"Agent Total Capacities: {self.capacities}")
-            self.logger.debug(f"Agent Allocated Capacities: {allocated_caps}")
-            self.logger.debug(f"Agent Available Capacities: {available}")
-            self.logger.debug(f"Job: {job.get_job_id()} Requested capacities: {job.get_capacities()}")
+            #self.logger.debug(f"Agent Total Capacities: {self.capacities}")
+            #self.logger.debug(f"Agent Allocated Capacities: {allocated_caps}")
+            #self.logger.debug(f"Agent Available Capacities: {available}")
+            #self.logger.debug(f"Job: {job.get_job_id()} Requested capacities: {job.get_capacities()}")
 
             # Check if the agent can accommodate the given job based on its capacities
             # Compare the requested against available
@@ -153,10 +153,10 @@ class RaftAgent(Agent):
                     processed += 1
                     my_load = self.compute_overall_load()
                     peer = self.__find_neighbor_with_lowest_load()
-                    self.logger.debug(f"Peer found: {peer}")
+                    #self.logger.debug(f"Peer found: {peer}")
 
                     if peer and peer.load < 70.00 and self.can_peer_accommodate_job(peer_agent=peer,
-                                                                                     job=job):
+                                                                                    job=job):
                         job.set_leader(leader_agent_id=peer.agent_id)
                         self.job_repo.delete_job(job_id=job.get_job_id())
                         self.job_repo.save_job(job=job, key_prefix="allocated")
@@ -189,11 +189,14 @@ class RaftAgent(Agent):
         self.logger.info(f"Received commit from Agent: {peer_agent_id} for Job: {job_id}")
         job = self.job_repo.get_job(job_id=job_id, key_prefix="allocated")
         if job:
+            self.select_job(job=job)
+            '''
             if self.is_job_feasible(job=job, total=self.capacities, projected_load=self.compute_overall_load()):
                 self.select_job(job=job)
             else:
                 self.logger.info(f"Agent: {self.agent_id} cannot execute Job: {job_id}")
                 self.fail_job(job=job)
+            '''
         else:
             self.logger.error(f"Unable to fetch job from queue: {job_id}")
 

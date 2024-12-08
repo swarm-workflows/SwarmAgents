@@ -6,7 +6,7 @@ queue:
   host: 127.0.0.1
   port: 8098
 kafka:
-  bootstrap_servers: zoo-0:9092,zoo-1:9092,zoo-2:9092
+  bootstrap_servers: localhost:19092
   topic: agent
   hb_topic: agent-hb
   consumer_group_id: agent
@@ -24,7 +24,7 @@ runtime:
 logging:
   ## The directory in which actor should create log files.
   ## This directory will be automatically created if it does not exist.
-  log-directory: .
+  log-directory: raft
 
   ## The filename to be used for actor's log file.
   log-file: agent
