@@ -567,11 +567,16 @@ class Agent(Observer):
         self.job_selection_thread.start()
         self.job_scheduling_thread.start()
 
-        self.heartbeat_thread.join()
-        self.heartbeat_processor_thread.join()
-        self.msg_processor_thread.join()
-        self.job_selection_thread.join()
-        self.job_scheduling_thread.join()
+        if self.heartbeat_thread.is_alive():
+            self.heartbeat_thread.join()
+        if self.heartbeat_processor_thread.is_alive():
+            self.heartbeat_processor_thread.join()
+        if self.msg_processor_thread.is_alive():
+            self.msg_processor_thread.join()
+        if self.job_selection_thread.is_alive():
+            self.job_selection_thread.join()
+        if self.job_scheduling_thread.is_alive():
+            self.job_scheduling_thread.join()
 
     def stop(self):
         self.shutdown = True
