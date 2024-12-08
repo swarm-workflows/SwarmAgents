@@ -181,6 +181,7 @@ class RaftAgent(Agent):
         job = self.job_repo.get_job(job_id=job_id, key_prefix="allocated")
         if job:
             job.change_state(new_state=JobState.READY)
+            self.job_repo.save_job(job=job, key_prefix="allocated")
             self.select_job(job=job)
             '''
             if self.is_job_feasible(job=job, total=self.capacities, projected_load=self.compute_overall_load()):
