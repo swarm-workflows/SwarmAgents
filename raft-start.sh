@@ -9,5 +9,5 @@ num_agents=5
 
 # Launch the Python commands for each agent
 for i in $(seq 0 $(($num_agents - 1))); do
-    python3.11 main-raft.py pbft $i $num_agents 100 &
+    python3.11 main-raft.py $i $num_agents 100 &
 done
