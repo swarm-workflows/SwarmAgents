@@ -80,19 +80,6 @@ class RaftAgent(Agent):
         self.shutdown_flag.set()
         self.raft.shutdown()
 
-        if self.msg_processor_thread.is_alive():
-            with self.condition:
-                self.condition.notify_all()
-            self.msg_processor_thread.join()
-        if self.heartbeat_processor_thread.is_alive():
-            with self.condition:
-                self.condition.notify_all()
-            self.heartbeat_processor_thread.join()
-        if self.heartbeat_thread.is_alive():
-            self.heartbeat_thread.join()
-        if self.job_selection_thread.is_alive():
-            self.job_selection_thread.join()
-
     def is_leader(self):
         return self.raft.is_leader()
 
