@@ -81,7 +81,7 @@ class RaftAgent(Agent):
         self.hrt_msg_srv.stop()
         with self.condition:
             self.condition.notify_all()
-        jobs = self.job_repo.get_all_jobs()
+        jobs = self.job_repo.get_all_jobs(key_prefix="allocated")
         self.plot_results(jobs=jobs)
         self.shutdown_flag.set()
         self.raft.shutdown()
