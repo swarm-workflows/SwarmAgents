@@ -19,7 +19,7 @@ runtime:
   max_time_load_zero: 60
   restart_job_selection: 300
   peer_heartbeat_timeout: 300
-  results_dir: .
+  results_dir: raft
   message_service: kafka
 logging:
   ## The directory in which actor should create log files.
