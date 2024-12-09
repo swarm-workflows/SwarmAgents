@@ -9,6 +9,14 @@ import argparse
 import seaborn as sns
 
 colors = [["#1f77b4", "#aec7e8"], ["#ff7f0e", "#ffbb78"], ["#2ca02c", "#98df8a"]]
+
+colors_dict = {
+    "PBFT": ["#1f77b4", "#aec7e8"],
+    "SWARM-SINGLE":["#ff7f0e", "#ffbb78"],
+    "SWARM-MULTI": ["#2ca02c", "#98df8a"],
+    "Raft": ["#9467bd", "#c5b0d5"]  # Soothing purple tones
+}
+
 figsize=(8, 4)
 
 
@@ -72,11 +80,16 @@ def compute_metrics(run_directory: str, number_of_agents: int, algo: str):
     ci_lower = [ci[0] for ci in conf_intervals]
     ci_upper = [ci[1] for ci in conf_intervals]
 
-    idle_means = [np.mean(run) for run in all_idle_times_list]
-    idle_medians = [np.median(run) for run in all_idle_times_list]
-    idle_conf_intervals = [stats.t.interval(0.95, len(run) - 1, loc=np.mean(run), scale=stats.sem(run)) for run in all_idle_times_list]
-    idle_ci_lower = [ci[0] for ci in idle_conf_intervals]
-    idle_ci_upper = [ci[1] for ci in idle_conf_intervals]
+    idle_means = []
+    idle_medians = []
+    idle_ci_lower = []
+    idle_ci_upper = []
+    if algo != "Raft":
+        idle_means = [np.mean(run) for run in all_idle_times_list]
+        idle_medians = [np.median(run) for run in all_idle_times_list]
+        idle_conf_intervals = [stats.t.interval(0.95, len(run) - 1, loc=np.mean(run), scale=stats.sem(run)) for run in all_idle_times_list]
+        idle_ci_lower = [ci[0] for ci in idle_conf_intervals]
+        idle_ci_upper = [ci[1] for ci in idle_conf_intervals]
 
     return {
         'flat_selection_times': flat_selection_times,
@@ -240,7 +253,8 @@ def plot_means_median_line_idle(data_list: List[Dict[str, Any]], number_of_agent
     plt.close()
 
 
-def plot_means_median_line_percent(data_list: List[Dict[str, Any]], number_of_agents: int):
+def plot_means_median_line_percent(data_list: List[Dict[str, Any]], number_of_agents: int,
+                                   file_name_suffix: str = ""):
     plt.figure(figsize=figsize)
 
     # Calculate mean improvements relative to the first algorithm
@@ -266,21 +280,26 @@ def plot_means_median_line_percent(data_list: List[Dict[str, Any]], number_of_ag
     plt.rcParams.update({'font.size': 14})
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig(f'comparison_line_plot_with_ci_{number_of_agents}_percent.png', bbox_inches='tight')
+    plt.savefig(f'comparison_line_plot_with_ci_{number_of_agents}_percent{file_name_suffix}.png', bbox_inches='tight')
     plt.close()
 
 
-def plot_means_median_line(data_list: List[Dict[str, Any]], number_of_agents: int):
+def plot_means_median_line(data_list: List[Dict[str, Any]], number_of_agents: int,
+                           file_name_suffix: str = ""):
     plt.figure(figsize=figsize)
 
     for idx, mean_median in enumerate(data_list):
         # Plot mean line
-        plt.plot(mean_median['means'], color=colors[idx][0], label=f'{mean_median["algo"]}: Mean')
+        plt.plot(mean_median['means'], color=colors_dict[mean_median["algo"]][0],
+                 label=f'{mean_median["algo"]}: Mean')
         # Plot median points
-        plt.plot(mean_median['medians'], linestyle=':', color=colors[idx][0], label=f'{mean_median["algo"]}: Median')
+        plt.plot(mean_median['medians'], linestyle=':', color=colors_dict[mean_median["algo"]][0],
+                 label=f'{mean_median["algo"]}: Median')
         # CI shading
-        plt.fill_between(range(len(mean_median['means'])), mean_median['ci_lower'], mean_median['ci_upper'],
-                         color=colors[idx][1], alpha=0.3, label=f'{mean_median["algo"]}: 95% CI')
+        plt.fill_between(range(len(mean_median['means'])), mean_median['ci_lower'],
+                         mean_median['ci_upper'],
+                         color=colors_dict[mean_median["algo"]][1], alpha=0.3,
+                         label=f'{mean_median["algo"]}: 95% CI')
 
     #plt.title(f'Comparison of Scheduling Latency Across Algorithms - {number_of_agents} agents')
     plt.xlabel('Run Index')
@@ -289,7 +308,7 @@ def plot_means_median_line(data_list: List[Dict[str, Any]], number_of_agents: in
     plt.rcParams.update({'font.size': 14})
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig(f'comparison_line_plot_with_ci_{number_of_agents}.png', bbox_inches='tight')
+    plt.savefig(f'comparison_line_plot_with_ci_{number_of_agents}{file_name_suffix}.png', bbox_inches='tight')
     plt.close()
 
 
@@ -386,6 +405,12 @@ def plots(number_of_agents: int):
     plot_histograms(number_of_agents=number_of_agents, data_list=data_list, param_name='flat_scheduling_latencies',
                     param_pretty_name="Scheduling Latency")
     #plot_combined_ci(data_list=data_list, number_of_agents=number_of_agents)
+
+    if number_of_agents == 10:
+        data_raft = compute_metrics(run_directory=f"./raft/10/repeated",
+                                    number_of_agents=10, algo="Raft")
+        data_list = [data_raft, data_swarm_multi]
+        plot_means_median_line(number_of_agents=10, data_list=data_list, file_name_suffix="raft")
 
 
 if __name__ == '__main__':
