@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 # Define file paths for each algorithm and agent count
 raft_file_paths = ['./raft/3/scheduling_latency.csv',
                    './raft/5/scheduling_latency.csv',
-                   './raft/10/scheduling_latency.csv']
+                   './raft/10/repeated/run50/scheduling_latency_0.csv']
 pbft_file_paths = ['./pbft/3/repeated/run50/scheduling_latency_0.csv',
                    './pbft/5/repeated/run50/scheduling_latency_0.csv',
                    './pbft/10/repeated/run50/scheduling_latency_0.csv']
@@ -43,7 +43,7 @@ color_map = {
     "PBFT": "#1f77b4",
     "SWARM-SINGLE": "#ff7f0e",
     "SWARM-MULTI": "#2ca02c",
-    "Raft": "#d62728"
+    "Raft": "#9467bd"
 }
 
 # Set up the figure with two subplots
@@ -77,7 +77,6 @@ def plot_all_algorithms_fig(data):
     plt.ylabel('Scheduling Latency (seconds)', fontsize=8)
     plt.grid(True)
     plt.legend(fontsize='medium')
-
 
 
 if __name__ == '__main__':

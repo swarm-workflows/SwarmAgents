@@ -221,8 +221,10 @@ def plot_means_median_histogram_error_bars(data_list: List[Dict[str, Any]], numb
     plt.figure(figsize=(10, 6))
     plt.bar(x, means, yerr=np.array(ci_errors).T, capsize=5, alpha=0.7, tick_label=algorithms)
     plt.xlabel('Algorithms')
-    plt.ylabel('Mean Idle Time (seconds)')
-    plt.title(f'Comparison of Mean Idle Time with Error Bars - {number_of_agents} agents')
+    plt.ylabel('Mean Resource Idle Time (seconds)')
+    plt.title(f'Mean Resource Idle Time with Error Bars\n'
+              f'({number_of_agents} Agents, Each Managing 4 Cores, 16GB RAM, 100GB Disk)')
+    #plt.title(f'Comparison of Mean Idle Time with Error Bars - {number_of_agents} agents')
     plt.grid(axis='y', linestyle='--', alpha=0.6)
     plt.tight_layout()
     plt.savefig(f'histogram_idle_time_with_error_bars_{number_of_agents}.png')
@@ -409,7 +411,7 @@ def plots(number_of_agents: int):
     if number_of_agents == 10:
         data_raft = compute_metrics(run_directory=f"./raft/10/repeated",
                                     number_of_agents=10, algo="Raft")
-        data_list = [data_raft, data_swarm_multi]
+        data_list = [data_pbft, data_swarm_single, data_raft, data_swarm_multi]
         plot_means_median_line(number_of_agents=10, data_list=data_list, file_name_suffix="raft")
 
 
