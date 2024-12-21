@@ -131,19 +131,13 @@ python analyze_results.py --number_of_agents 3 --run_directory swarm/single-job/
 
 ## Comparison PBFT vs SWARM Single vs SWARM Multi
 ### Results with 3 Agents
-![Scheduling Latency](./runs/comparison_histogram_flat_scheduling_latencies_3.png)
-![Idle Time](./runs/comparison_histogram_flat_idle_times_3.png)
-![CI Plot Idle Time](./runs/comparison_line_plot_idle_time_with_ci_3.png)
+![Idle Time](./runs/histogram_idle_time_with_error_bars_3.png)
 ![CI Plot](./runs/comparison_line_plot_with_ci_3.png)
 ### Results with 5 Agents
-![Scheduling Latency](./runs/comparison_histogram_flat_scheduling_latencies_5.png)
-![Idle Time](./runs/comparison_histogram_flat_idle_times_5.png)
-![CI Plot Idle Time](./runs/comparison_line_plot_idle_time_with_ci_5.png)
+![Idle Time](./runs/histogram_idle_time_with_error_bars_5.png)
 ![CI Plot](./runs/comparison_line_plot_with_ci_5.png)
 ### Results with 10 Agents
-![Scheduling Latency](./runs/comparison_histogram_flat_scheduling_latencies_10.png)
-![Idle Time](./runs/comparison_histogram_flat_idle_times_10.png)
-![CI Plot Idle Time](./runs/comparison_line_plot_idle_time_with_ci_10.png)
+![Idle Time](./runs/histogram_idle_time_with_error_bars_10.png)
 ![CI Plot](./runs/comparison_line_plot_with_ci_10.png)
 
 ## Raft Consensus Algorithm
@@ -187,9 +181,4 @@ Scales well, handling large numbers of agents effectively.
 
 Number of Agents: 10
 
-![Scheduling latency](./runs/raft/raft-by-time.png)
-![Scheduling latency - 3 agents](./runs/raft/3/raft-by-time.png)
-![Scheduling latency - 5 agents](./runs/raft/5/raft-by-time.png)
-![Scheduling latency - 10 agents](./runs/raft/10/raft-by-time.png)
-
-![Scheduling latency comparison - Number of agents](./runs/raft/overall-scheduling-latency.png)
+![Scheduling latency comparison - Number of agents](./runs/comparison_line_plot_with_ci_10raft.png)
