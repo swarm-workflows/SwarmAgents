@@ -42,13 +42,15 @@ import psutil as psutil
 import yaml
 from matplotlib import pyplot as plt
 
+from swarm.comm.message_service_nats import MessageServiceNats
 from swarm.comm.messages.heart_beat import HeartBeat
 from swarm.comm.messages.message import MessageType
-from swarm.comm.message_service import MessageService, Observer
+from swarm.comm.message_service_kafka import MessageServiceKafka, Observer
 from swarm.models.capacities import Capacities
 from swarm.models.agent_info import AgentInfo
 from swarm.models.profile import ProfileType, PROFILE_MAP
-from swarm.models.job import Job, JobQueue
+from swarm.models.job import Job
+from swarm.queue.simple_job_queue import SimpleJobQueue
 
 
 class IterableQueue:
@@ -66,15 +68,19 @@ class IterableQueue:
 class Agent(Observer):
     def __init__(self, agent_id: str, config_file: str, cycles: int):
         self.agent_id = agent_id
-        self.job_queue = JobQueue()
-        self.selected_queue = JobQueue()
-        self.ready_queue = JobQueue()
-        self.done_queue = JobQueue()
+        self.job_queue = SimpleJobQueue()
+        self.selected_queue = SimpleJobQueue()
+        self.ready_queue = SimpleJobQueue()
+        self.done_queue = SimpleJobQueue()
         self.last_updated = time.time()
         self.neighbor_map = {}  # Store neighbor information
         self.profile = None
         self.data_transfer = True
         self.kafka_config = {}
+        self.kafka_config_hb = {}
+        self.nat_config = {}
+        self.nat_config_hb = {}
+        self.message_service_type = "kafka"
         self.logger = None
         self.projected_queue_threshold = 300.00
         self.ready_queue_threshold = 100.00
@@ -84,15 +90,23 @@ class Agent(Observer):
         self.results_dir = "."
         self.load_config(config_file)
         self.capacities = self.get_system_info()
-        self.message_service = MessageService(config=self.kafka_config, logger=self.logger)
+        if self.message_service_type == "nats":
+            self.ctrl_msg_srv = MessageServiceNats(config=self.nat_config, logger=self.logger)
+            self.hrt_msg_srv = MessageServiceNats(config=self.nat_config_hb, logger=self.logger)
+        else:
+            self.ctrl_msg_srv = MessageServiceKafka(config=self.kafka_config, logger=self.logger)
+            self.hrt_msg_srv = MessageServiceKafka(config=self.kafka_config_hb, logger=self.logger)
         self.load_per_agent = {}
         self.cycles = cycles
         self.message_queue = queue.Queue()
+        self.hb_message_queue = queue.Queue()
         self.condition = threading.Condition()
         self.shutdown = False
         self.neighbor_map_lock = threading.Lock()
         self.heartbeat_thread = threading.Thread(target=self._heartbeat_main,
                                                  daemon=True, name="HeartBeatThread")
+        self.heartbeat_processor_thread = threading.Thread(target=self._heartbeat_processor_main,
+                                                           daemon=True, name="HeartBeatProcessorThread")
         self.msg_processor_thread = threading.Thread(target=self._message_processor_main,
                                                      daemon=True, name="MsgProcessorThread")
         self.job_selection_thread = threading.Thread(target=self.job_selection_main,
@@ -106,6 +120,8 @@ class Agent(Observer):
         self.idle_start_time = None
         self.total_idle_time = 0
         self.restart_job_selection_cnt = 0
+        self.conflicts = 0
+        self.plot_figures = False
 
     def start_idle(self):
         if self.idle_start_time is None:
@@ -135,7 +151,11 @@ class Agent(Observer):
             if source_agent_id == self.agent_id:
                 return
 
-            self.message_queue.put_nowait(message)
+            message_type = message.get('message_type')
+            if message_type == MessageType.HeartBeat.name or message_type == MessageType.HeartBeat.value:
+                self.hb_message_queue.put_nowait(message)
+            else:
+                self.message_queue.put_nowait(message)
             with self.condition:
                 self.condition.notify_all()
             self.logger.debug(f"Added incoming message to queue: {incoming}")
@@ -174,7 +194,7 @@ class Agent(Observer):
         my_load = self.compute_overall_load()
         agent = AgentInfo(agent_id=self.agent_id,
                           capacities=self.capacities,
-                          capacity_allocations=self.ready_queue.capacities(),
+                          capacity_allocations=self.ready_queue.capacities(jobs=self.ready_queue.get_jobs()),
                           load=my_load)
         self._save_load_metric(self.agent_id, my_load)
         return HeartBeat(agent=agent)
@@ -184,7 +204,7 @@ class Agent(Observer):
         while not self.shutdown:
             try:
                 heart_beat = self._build_heart_beat()
-                self.message_service.produce_message(heart_beat.to_dict())
+                self.hrt_msg_srv.produce_message(heart_beat.to_dict())
                 time.sleep(5)
             except Exception as e:
                 self.logger.error(f"Error occurred while sending heartbeat e: {e}")
@@ -210,6 +230,24 @@ class Agent(Observer):
                 self.logger.error(traceback.format_exc())
         self.logger.info("Message Processor Stopped")
 
+    def _heartbeat_processor_main(self):
+        self.logger.info("Heartbeat Processor Started")
+        while True:
+            try:
+                with self.condition:
+                    while not self.shutdown and self.hb_message_queue.empty():
+                        self.condition.wait()
+
+                if self.shutdown:
+                    break
+
+                messages = self.__dequeue(self.hb_message_queue)
+                self._process_messages(messages=messages)
+            except Exception as e:
+                self.logger.error(f"Error occurred while processing message e: {e}")
+                self.logger.error(traceback.format_exc())
+        self.logger.info("Heartbeat Processor Stopped")
+
     def _process_messages(self, *, messages: List[dict]):
         for message in messages:
             try:
@@ -230,13 +268,41 @@ class Agent(Observer):
     def load_config(self, config_file):
         with open(config_file, 'r') as f:
             config = yaml.safe_load(f)
+
+            queue_config = config.get("queue", {})
+            queue_type = queue_config.get("type", "simple")
+            if queue_type == "riak":
+                from swarm.queue.riak_job_queue import RiakJobQueue
+                self.job_queue = RiakJobQueue()
+                self.selected_queue = self.job_queue
+                self.ready_queue = self.job_queue
+                self.done_queue = self.job_queue
+
             kafka_config = config.get("kafka", {})
+            nat_config = config.get("nats", {})
             self.kafka_config = {
                 'kafka_bootstrap_servers': kafka_config.get("bootstrap_servers", "localhost:19092"),
                 'kafka_topic': kafka_config.get("topic", "agent_load"),
                 'consumer_group_id': f'{kafka_config.get("consumer_group_id", "swarm_agent")}-{self.agent_id}'
             }
+
+            self.kafka_config_hb = {
+                'kafka_bootstrap_servers': kafka_config.get("bootstrap_servers", "localhost:19092"),
+                'kafka_topic': kafka_config.get("hb_topic", "agent_load_hb"),
+                'consumer_group_id': f'{kafka_config.get("consumer_group_id", "swarm_agent")}-{self.agent_id}'
+            }
+
+            self.nat_config = {
+                'nats_servers': nat_config.get('nats_servers', 'nats://127.0.0.1:4222'),
+                'nats_topic': nat_config.get('nats_topic', 'job.consensus'),
+            }
+
+            self.nat_config_hb = {
+                'nats_servers': nat_config.get('nats_servers', 'nats://127.0.0.1:4222'),
+                'nats_topic': nat_config.get('hb_nats_topic', 'job.consensus'),
+            }
             runtime_config = config.get("runtime", {})
+            self.message_service_type = runtime_config.get("message_service", "kafka")
             profile_name = runtime_config.get("profile", str(ProfileType.BalancedProfile))
             self.profile = PROFILE_MAP.get(profile_name)
             self.data_transfer = runtime_config.get("data_transfer", True)
@@ -313,8 +379,8 @@ class Agent(Observer):
         if only_total:
             available = self.capacities
         else:
-            allocated_caps = self.ready_queue.capacities()
-            allocated_caps += self.selected_queue.capacities()
+            allocated_caps = self.ready_queue.capacities(jobs=self.ready_queue.get_jobs())
+            allocated_caps += self.selected_queue.capacities(jobs=self.selected_queue.get_jobs())
             available = self.capacities - allocated_caps
 
         # Check if the agent can accommodate the given job based on its capacities
@@ -336,7 +402,7 @@ class Agent(Observer):
         return True
 
     def can_schedule_job(self, job: Job):
-        allocated_caps = self.ready_queue.capacities()
+        allocated_caps = self.ready_queue.capacities(jobs=self.ready_queue.get_jobs())
         available = self.capacities - allocated_caps
 
         # Check if the agent can accommodate the given job based on its capacities
@@ -362,8 +428,8 @@ class Agent(Observer):
             proposed_jobs = []
 
         allocated_caps = Capacities()
-        allocated_caps += self.ready_queue.capacities()
-        allocated_caps += self.selected_queue.capacities()
+        allocated_caps += self.ready_queue.capacities(jobs=self.ready_queue.get_jobs())
+        allocated_caps += self.selected_queue.capacities(jobs=self.selected_queue.get_jobs())
 
         for j in proposed_jobs:
             if j not in self.ready_queue and j not in self.selected_queue:
@@ -382,7 +448,7 @@ class Agent(Observer):
         return overall_load
 
     def compute_ready_queue_load(self):
-        allocated_caps = self.ready_queue.capacities()
+        allocated_caps = self.ready_queue.capacities(jobs=self.ready_queue.get_jobs())
 
         core_load = (allocated_caps.core / self.capacities.core) * 100
         ram_load = (allocated_caps.ram / self.capacities.ram) * 100
@@ -420,7 +486,7 @@ class Agent(Observer):
             job.execute(data_transfer=self.data_transfer)
             self.done_queue.add_job(job=job)
             self.ready_queue.remove_job(job_id=job.get_job_id())
-            if not len(self.ready_queue.jobs):
+            if not len(self.ready_queue.get_jobs()):
                 self.start_idle()
         except Exception as e:
             self.logger.error(f"Execution error: {e}")
@@ -487,38 +553,36 @@ class Agent(Observer):
         console_log.addHandler(console_handler)
         return log
 
-    def send_message(self, message_type: MessageType, job_id: str = None):
-        message = {
-            "message_type": str(message_type),
-            "agent_id": self.agent_id,
-            "load": self.compute_overall_load()
-        }
-        if job_id:
-            message["job_id"] = job_id
-
-        # Produce the message to the Kafka topic
-        self.message_service.produce_message(message)
-
     @staticmethod
     def generate_id() -> str:
         return hashlib.sha256(''.join(random.choices(string.ascii_lowercase, k=8)).encode()).hexdigest()[:8]
 
     def start(self):
-        self.message_service.register_observers(agent=self)
+        self.ctrl_msg_srv.register_observers(agent=self)
+        self.hrt_msg_srv.register_observers(agent=self)
+        self.heartbeat_processor_thread.start()
         self.msg_processor_thread.start()
-        self.message_service.start()
+        self.ctrl_msg_srv.start()
+        self.hrt_msg_srv.start()
         self.heartbeat_thread.start()
         self.job_selection_thread.start()
         self.job_scheduling_thread.start()
 
-        self.heartbeat_thread.join()
-        self.msg_processor_thread.join()
-        self.job_selection_thread.join()
-        self.job_scheduling_thread.join()
+        if self.heartbeat_thread.is_alive():
+            self.heartbeat_thread.join()
+        if self.heartbeat_processor_thread.is_alive():
+            self.heartbeat_processor_thread.join()
+        if self.msg_processor_thread.is_alive():
+            self.msg_processor_thread.join()
+        if self.job_selection_thread.is_alive():
+            self.job_selection_thread.join()
+        if self.job_scheduling_thread.is_alive():
+            self.job_scheduling_thread.join()
 
     def stop(self):
         self.shutdown = True
-        self.message_service.stop()
+        self.ctrl_msg_srv.stop()
+        self.hrt_msg_srv.stop()
         with self.condition:
             self.condition.notify_all()
         self.plot_results()
@@ -527,15 +591,10 @@ class Agent(Observer):
         self.logger.info(f"Starting Job Scheduling Thread: {self}")
         while not self.shutdown:
             try:
-                job_ids = list(self.selected_queue.jobs.keys())
-                for job_id in job_ids:
-                    job = self.selected_queue.jobs.get(job_id)
-                    if not job:
-                        continue
-
+                for job in self.selected_queue.get_jobs():
                     ready_queue_load = self.compute_ready_queue_load()
                     if ready_queue_load < self.ready_queue_threshold and self.can_schedule_job(job):
-                        self.selected_queue.remove_job(job_id)
+                        self.selected_queue.remove_job(job.get_job_id())
                         self.schedule_job(job)
                     else:
                         time.sleep(0.5)
@@ -554,8 +613,18 @@ class Agent(Observer):
             for idle_time in self.idle_time:
                 writer.writerow([idle_time])
 
-    def plot_jobs_per_agent(self):
-        jobs = self.job_queue.jobs.values()
+    def save_miscellaneous(self):
+        # Save misc to JSON
+        with open(f'{self.results_dir}/misc_{self.agent_id}.json', 'w') as file:
+            data = {
+                "restarts": self.restart_job_selection_cnt,
+                "conflicts": self.conflicts
+            }
+            json.dump(data, file, indent=4)
+
+    def plot_jobs_per_agent(self, jobs: list[Job] = None):
+        if not jobs:
+            jobs = self.job_queue.get_jobs()
         completed_jobs = [j for j in jobs if j.leader_agent_id is not None]
         jobs_per_agent = {}
 
@@ -572,23 +641,25 @@ class Agent(Observer):
             for agent_id, job_count in jobs_per_agent.items():
                 writer.writerow([agent_id, job_count])
 
-        # Plotting the jobs per agent as a bar chart
-        plt.bar(list(jobs_per_agent.keys()), list(jobs_per_agent.values()), color='blue')
-        plt.xlabel('Agent ID')
-        plt.ylabel('Number of Jobs Selected')
+        if self.plot_figures:
+            # Plotting the jobs per agent as a bar chart
+            plt.bar(list(jobs_per_agent.keys()), list(jobs_per_agent.values()), color='blue')
+            plt.xlabel('Agent ID')
+            plt.ylabel('Number of Jobs Selected')
 
-        # Title with SWARM and number of agents
-        num_agents = len(jobs_per_agent)
-        plt.title(f'SWARM: Number of Jobs Selected by Each Agent (Total Agents: {num_agents})')
+            # Title with SWARM and number of agents
+            num_agents = len(jobs_per_agent)
+            plt.title(f'SWARM: Number of Jobs Selected by Each Agent (Total Agents: {num_agents})')
 
-        plt.grid(axis='y', linestyle='--', linewidth=0.5)
+            plt.grid(axis='y', linestyle='--', linewidth=0.5)
 
-        # Save the plot
-        plt.savefig(f'{self.results_dir}/jobs_per_agent_{self.agent_id}.png')
-        plt.close()
+            # Save the plot
+            plt.savefig(f'{self.results_dir}/jobs_per_agent_{self.agent_id}.png')
+            plt.close()
 
-    def plot_scheduling_latency(self):
-        jobs = self.job_queue.jobs.values()
+    def plot_scheduling_latency(self, jobs: list[Job] = None):
+        if not jobs:
+            jobs = self.job_queue.get_jobs()
         completed_jobs = [j for j in jobs if j.leader_agent_id is not None]
 
         wait_times = {}
@@ -619,35 +690,36 @@ class Agent(Observer):
             for key, value in scheduling_latency.items():
                 writer.writerow([key, value])
 
-        # Plotting scheduling latency in red
-        plt.plot(list(scheduling_latency.values()),
-                 'ro-', label='Scheduling Latency: Combined Wait Time and Selection Time '
-                              '(Job Ready to be scheduled on Agent)')
+        if self.plot_figures:
+            # Plotting scheduling latency in red
+            plt.plot(list(scheduling_latency.values()),
+                     'ro-', label='Scheduling Latency: Combined Wait Time and Selection Time '
+                                  '(Job Ready to be scheduled on Agent)')
 
-        # Plotting wait time in blue
-        if wait_times:
-            plt.plot(list(wait_times.values()),
-                     'bo-', label='Wait Time: Duration from Job Creation to Start of Selection')
+            # Plotting wait time in blue
+            if wait_times:
+                plt.plot(list(wait_times.values()),
+                         'bo-', label='Wait Time: Duration from Job Creation to Start of Selection')
 
-        # Plotting leader election time in green
-        if selection_times:
-            plt.plot(list(selection_times.values()),
-                     'go-', label='Job Selection Time: Time Taken for Agents to Reach Consensus on Job Selection')
+            # Plotting leader election time in green
+            if selection_times:
+                plt.plot(list(selection_times.values()),
+                         'go-', label='Job Selection Time: Time Taken for Agents to Reach Consensus on Job Selection')
 
-        # Title with SWARM and number of agents
-        num_agents = len(set([t.leader_agent_id for t in completed_jobs]))
-        plt.title(f'SWARM: Scheduling Latency (Total Agents: {num_agents})')
+            # Title with SWARM and number of agents
+            num_agents = len(set([t.leader_agent_id for t in completed_jobs]))
+            plt.title(f'SWARM: Scheduling Latency (Total Agents: {num_agents})')
 
-        plt.xlabel('Task Index')
-        plt.ylabel('Time Units (seconds)')
-        plt.grid(True)
+            plt.xlabel('Task Index')
+            plt.ylabel('Time Units (seconds)')
+            plt.grid(True)
 
-        # Adjusting legend position to avoid overlapping the graph
-        plt.legend(loc='upper left', bbox_to_anchor=(1, 1))  # This places the legend outside the plot area
+            # Adjusting legend position to avoid overlapping the graph
+            plt.legend(loc='upper left', bbox_to_anchor=(1, 1))  # This places the legend outside the plot area
 
-        # Save the plot
-        plt.savefig(f'{self.results_dir}/job_latency_{self.agent_id}.png', bbox_inches='tight')  # bbox_inches='tight' ensures that the entire plot is saved
-        plt.close()
+            # Save the plot
+            plt.savefig(f'{self.results_dir}/job_latency_{self.agent_id}.png', bbox_inches='tight')  # bbox_inches='tight' ensures that the entire plot is saved
+            plt.close()
 
     def plot_load_per_agent(self, load_dict: dict, threshold: float, title_prefix: str = ""):
         csv_filename = f'{self.results_dir}/agent_loads_{self.agent_id}.csv'
@@ -671,26 +743,29 @@ class Agent(Observer):
                     row.append(load_dict[agent_id][i] if i < len(load_dict[agent_id]) else '')
                 writer.writerow(row)
 
-        # Plot the data
-        plt.figure(figsize=(10, 6))
+        if self.plot_figures:
+            # Plot the data
+            plt.figure(figsize=(10, 6))
 
-        for agent_id, loads in load_dict.items():
-            plt.plot(loads, label=f'Agent {agent_id}')
+            for agent_id, loads in load_dict.items():
+                plt.plot(loads, label=f'Agent {agent_id}')
 
-        plt.xlabel('Time Interval')
-        plt.ylabel('Load')
-        plt.title(f'{title_prefix} Agent Load Over Time [Max Threshold: {threshold}]')
-        plt.legend()
-        plt.grid(True)
+            plt.xlabel('Time Interval')
+            plt.ylabel('Load')
+            plt.title(f'{title_prefix} Agent Load Over Time [Max Threshold: {threshold}]')
+            plt.legend()
+            plt.grid(True)
 
-        # Save the plot to a file
-        plt.savefig(plot_filename)
+            # Save the plot to a file
+            plt.savefig(plot_filename)
 
-    def plot_results(self):
+    def plot_results(self, jobs: list[Job] = None):
         self.logger.info("Plotting Results")
-        self.plot_jobs_per_agent()
-        self.plot_scheduling_latency()
-        self.plot_load_per_agent(self.load_per_agent, self.projected_queue_threshold, title_prefix="Projected")
+        self.save_miscellaneous()
+        self.plot_jobs_per_agent(jobs=jobs)
+        self.plot_scheduling_latency(jobs=jobs)
+        self.plot_load_per_agent(self.load_per_agent, self.projected_queue_threshold,
+                                 title_prefix="Projected")
         self.save_idle_time_per_agent()
         self.logger.info("Plot completed")
 
@@ -700,6 +775,7 @@ class Agent(Observer):
         if heart_beat.agent.load != 0.0:
             self.load_check_counter = 0
             return False
+        self.logger.info(f"Can Shutdown; Neighbor Map: {self.neighbor_map}")
         # Remove stale peers
         peers_to_remove = []
         for peer in self.neighbor_map.values():

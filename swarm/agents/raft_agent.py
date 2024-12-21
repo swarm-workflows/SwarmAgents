@@ -72,26 +72,19 @@ class RaftAgent(Agent):
 
         if not self.agent_id and clean:
             self.job_repo.delete_all()
-        self.message_service.register_observers(agent=self)
-        self.msg_processor_thread.start()
-        self.message_service.start()
-        self.heartbeat_thread.start()
-        self.job_selection_thread.start()
+        super().start()
 
     def stop(self):
-        super(RaftAgent, self).stop()
+        #super(RaftAgent, self).stop()
         self.shutdown = True
+        self.ctrl_msg_srv.stop()
+        self.hrt_msg_srv.stop()
+        with self.condition:
+            self.condition.notify_all()
+        jobs = self.job_repo.get_all_jobs(key_prefix="allocated")
+        self.plot_results(jobs=jobs)
         self.shutdown_flag.set()
         self.raft.shutdown()
-
-        if self.msg_processor_thread.is_alive():
-            with self.condition:
-                self.condition.notify_all()
-            self.msg_processor_thread.join()
-        if self.heartbeat_thread.is_alive():
-            self.heartbeat_thread.join()
-        if self.job_selection_thread.is_alive():
-            self.job_selection_thread.join()
 
     def is_leader(self):
         return self.raft.is_leader()
@@ -104,10 +97,10 @@ class RaftAgent(Agent):
 
         if capacities and allocated_caps:
             available = capacities - allocated_caps
-            self.logger.debug(f"Agent Total Capacities: {self.capacities}")
-            self.logger.debug(f"Agent Allocated Capacities: {allocated_caps}")
-            self.logger.debug(f"Agent Available Capacities: {available}")
-            self.logger.debug(f"Job: {job.get_job_id()} Requested capacities: {job.get_capacities()}")
+            #self.logger.debug(f"Agent Total Capacities: {self.capacities}")
+            #self.logger.debug(f"Agent Allocated Capacities: {allocated_caps}")
+            #self.logger.debug(f"Agent Available Capacities: {available}")
+            #self.logger.debug(f"Job: {job.get_job_id()} Requested capacities: {job.get_capacities()}")
 
             # Check if the agent can accommodate the given job based on its capacities
             # Compare the requested against available
@@ -134,11 +127,12 @@ class RaftAgent(Agent):
         return lowest_load_neighbor
 
     def run_as_leader(self):
-        self.logger.info("Running as leader")
+        #self.logger.debug("Running as leader")
         try:
             processed = 0
             jobs = self.job_repo.get_all_jobs()
-            self.logger.debug(f"Fetched jobs: {len(jobs)} {processed} {self.neighbor_map.values()}")
+            if len(jobs):
+                self.logger.debug(f"Fetched jobs: {len(jobs)} {processed} {self.neighbor_map.values()}")
             for job in jobs:
                 if self.shutdown_flag.is_set():
                     break
@@ -146,11 +140,11 @@ class RaftAgent(Agent):
                     processed += 1
                     my_load = self.compute_overall_load()
                     peer = self.__find_neighbor_with_lowest_load()
-                    self.logger.debug(f"Peer found: {peer}")
+                    #self.logger.debug(f"Peer found: {peer}")
+                    job.change_state(new_state=JobState.PREPARE)
 
                     if peer and peer.load < 70.00 and self.can_peer_accommodate_job(peer_agent=peer,
-                                                                                     job=job):
-                        job.set_wait_time()
+                                                                                    job=job):
                         job.set_leader(leader_agent_id=peer.agent_id)
                         self.job_repo.delete_job(job_id=job.get_job_id())
                         self.job_repo.save_job(job=job, key_prefix="allocated")
@@ -158,9 +152,9 @@ class RaftAgent(Agent):
                         self.send_message(message_type=MessageType.Commit, job_id=job.job_id, payload=payload)
 
                     elif self.is_job_feasible(job=job, total=self.capacities, projected_load=my_load):
-                        job.set_wait_time()
                         job.set_leader(leader_agent_id=self.agent_id)
-                        job.change_state(new_state=JobState.RUNNING)
+                        #job.change_state(new_state=JobState.RUNNING)
+                        job.change_state(new_state=JobState.READY)
                         self.job_repo.delete_job(job_id=job.get_job_id())
                         self.job_repo.save_job(job=job, key_prefix="allocated")
                         self.select_job(job=job)
@@ -168,6 +162,8 @@ class RaftAgent(Agent):
                 if processed >= 40:
                     time.sleep(1)
                     processed = 0
+            if not len(jobs):
+                time.sleep(5)
         except Exception as e:
             self.logger.info(f"RUN Leader -- error: {e}")
             self.logger.info("Running as leader -- stop")
@@ -184,11 +180,16 @@ class RaftAgent(Agent):
         self.logger.info(f"Received commit from Agent: {peer_agent_id} for Job: {job_id}")
         job = self.job_repo.get_job(job_id=job_id, key_prefix="allocated")
         if job:
+            job.change_state(new_state=JobState.READY)
+            self.job_repo.save_job(job=job, key_prefix="allocated")
+            self.select_job(job=job)
+            '''
             if self.is_job_feasible(job=job, total=self.capacities, projected_load=self.compute_overall_load()):
                 self.select_job(job=job)
             else:
                 self.logger.info(f"Agent: {self.agent_id} cannot execute Job: {job_id}")
                 self.fail_job(job=job)
+            '''
         else:
             self.logger.error(f"Unable to fetch job from queue: {job_id}")
 
@@ -206,7 +207,7 @@ class RaftAgent(Agent):
                 message[key] = value
 
         # Produce the message to the Kafka topic
-        self.message_service.produce_message(message)
+        self.ctrl_msg_srv.produce_message(message)
 
     def _process_messages(self, *, messages: List[dict]):
         for message in messages:
@@ -233,7 +234,9 @@ class RaftAgent(Agent):
 
     def job_selection_main(self):
         self.logger.info(f"Starting agent: {self}")
-        self.message_service.register_observers(agent=self)
+        self.ctrl_msg_srv.register_observers(agent=self)
+        if self.is_leader():
+            self.logger.info("Running as leader!")
 
         while not self.shutdown_flag.is_set():
             try:

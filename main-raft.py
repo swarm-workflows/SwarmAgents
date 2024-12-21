@@ -62,15 +62,10 @@ if __name__ == "__main__":
     print(f"Starting at: {start_port + agent_id} with peers: {peers}")
     agent = RaftAgent(str(agent_id), port=start_port + agent_id, peers=peers,
                       config_file="./config.yml", cycles=1000)
-    agent.start(clean=True)
     task_generator = TaskGenerator(task_count=task_count)
     if agent_id == 0:
         task_generator.start()
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        agent.stop()
-        if agent_id == 0:
-            task_generator.stop()
+
+    agent.start(clean=True)
+
 

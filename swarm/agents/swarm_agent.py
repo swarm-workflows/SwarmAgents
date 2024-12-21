@@ -54,7 +54,7 @@ class SwarmAgent(Agent):
         my_load = self.compute_overall_load(proposed_jobs=self.outgoing_proposals.jobs())
         agent = AgentInfo(agent_id=self.agent_id,
                           capacities=self.capacities,
-                          capacity_allocations=self.ready_queue.capacities(),
+                          capacity_allocations=self.ready_queue.capacities(jobs=self.ready_queue.get_jobs()),
                           load=my_load)
         self._save_load_metric(self.agent_id, my_load)
         return HeartBeat(agent=agent)
@@ -95,13 +95,7 @@ class SwarmAgent(Agent):
         while not self.shutdown:
             try:
                 processed = 0
-                # Make a copy of the dictionary keys
-                job_ids = list(self.job_queue.jobs.keys())
-                for job_id in job_ids:
-                    job = self.job_queue.jobs.get(job_id)
-                    if not job:
-                        continue
-
+                for job in self.job_queue.get_jobs():
                     if job.is_complete():
                         completed_jobs += 1
                         continue
@@ -134,7 +128,7 @@ class SwarmAgent(Agent):
                                                 agent_id=self.agent_id)
                         msg = Proposal(agent=AgentInfo(agent_id=self.agent_id), proposals=[proposal])
 
-                        self.message_service.produce_message(msg.to_dict())
+                        self.ctrl_msg_srv.produce_message(msg.to_dict())
                         self.outgoing_proposals.add_proposal(proposal=proposal)
                         self.logger.info(f"Added proposal: {proposal}")
 
@@ -241,9 +235,11 @@ class SwarmAgent(Agent):
             if my_proposal and (my_proposal.prepares or my_proposal.seed < p.seed):
                 self.logger.debug(f"Job:{p.job_id} Agent:{self.agent_id} rejected Proposal: {p} from agent"
                                   f" {p.agent_id} - my proposal {my_proposal} has prepares or smaller seed")
+                self.conflicts += 1
             elif peer_proposal and peer_proposal.seed < p.seed:
                 self.logger.debug(f"Job:{p.job_id} Agent:{self.agent_id} rejected Proposal: {p} from agent"
                                   f" {p.agent_id} - already accepted proposal {peer_proposal} with a smaller seed")
+                self.conflicts += 1
             else:
                 self.logger.debug(
                     f"Job:{p.job_id} Agent:{self.agent_id} accepted Proposal: {p} from agent"
@@ -258,7 +254,7 @@ class SwarmAgent(Agent):
                     self.incoming_proposals.remove_proposal(p_id=peer_proposal.p_id, job_id=p.job_id)
 
                 msg = Prepare(agent=AgentInfo(agent_id=self.agent_id), proposals=[p])
-                self.message_service.produce_message(msg.to_dict())
+                self.ctrl_msg_srv.produce_message(msg.to_dict())
 
                 # Increment the number of prepares to count the prepare being sent
                 # Needed to handle 3 agent case
@@ -296,7 +292,7 @@ class SwarmAgent(Agent):
                                  f"prepares: {proposal.prepares}, starting commit!")
 
                 msg = Commit(agent=AgentInfo(agent_id=self.agent_id), proposals=[proposal])
-                self.message_service.produce_message(msg.to_dict())
+                self.ctrl_msg_srv.produce_message(msg.to_dict())
 
                 job.change_state(JobState.COMMIT)
 
@@ -363,7 +359,7 @@ class SwarmAgent(Agent):
         super().execute_job(job=job)
         msg = JobStatus(agent=AgentInfo(agent_id=self.agent_id), jobs=[JobInfo(job_id=job.get_job_id(),
                                                                                state=job.state)])
-        self.message_service.produce_message(msg.to_dict())
+        self.ctrl_msg_srv.produce_message(msg.to_dict())
 
     def __get_proposed_capacities(self):
         proposed_capacities = Capacities()

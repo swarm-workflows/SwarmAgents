@@ -46,7 +46,7 @@ class PBFTAgent(Agent):
         my_load = self.compute_overall_load(proposed_jobs=self.outgoing_proposals.jobs())
         agent = AgentInfo(agent_id=self.agent_id,
                           capacities=self.capacities,
-                          capacity_allocations=self.ready_queue.capacities(),
+                          capacity_allocations=self.ready_queue.capacities(jobs=self.ready_queue.get_jobs()),
                           load=my_load)
         self._save_load_metric(self.agent_id, my_load)
         return HeartBeat(agent=agent)
@@ -89,12 +89,7 @@ class PBFTAgent(Agent):
             try:
                 processed = 0
                 # Make a copy of the dictionary keys
-                job_ids = list(self.job_queue.jobs.keys())
-                for job_id in job_ids:
-                    job = self.job_queue.jobs.get(job_id)
-                    if not job:
-                        continue
-
+                for job in self.job_queue.get_jobs():
                     if job.is_complete():
                         completed_jobs += 1
                         continue
@@ -209,9 +204,11 @@ class PBFTAgent(Agent):
         if my_proposal and (my_proposal.prepares or my_proposal.seed < rcvd_seed):
             self.logger.debug(f"Job:{job_id} Agent:{self.agent_id} rejected Proposal: {proposal_id} from agent"
                               f" {peer_agent_id} - my proposal {my_proposal} has prepares or smaller seed")
+            self.conflicts += 1
         elif peer_proposal and peer_proposal.seed < rcvd_seed:
             self.logger.debug(f"Job:{job_id} Agent:{self.agent_id} rejected Proposal: {proposal_id} from agent"
                               f" {peer_agent_id} - already accepted proposal {peer_proposal} with a smaller seed")
+            self.conflicts += 1
         else:
             self.logger.debug(
                 f"Agent {self.agent_id} accepted Proposal for Job: {job_id} from agent"
@@ -354,4 +351,4 @@ class PBFTAgent(Agent):
             message["seed"] = seed
 
         # Produce the message to the Kafka topic
-        self.message_service.produce_message(message)
+        self.ctrl_msg_srv.produce_message(message)

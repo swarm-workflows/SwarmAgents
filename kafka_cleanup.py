@@ -67,10 +67,14 @@ if __name__ == '__main__':
     admin_client = AdminClient({'bootstrap.servers': bootstrap_servers})
     # Delete the topic
     delete_topic(admin_client, topic_name)
+    delete_topic(admin_client, f"{topic_name}-hb")
     time.sleep(10)
 
     # Create the topic
     create_topic(admin_client, topic_name)
+    time.sleep(5)
+
+    create_topic(admin_client, f"{topic_name}-hb")
     time.sleep(5)
 
     redis_client = redis.StrictRedis(host="127.0.0.1", port=6379, decode_responses=True)

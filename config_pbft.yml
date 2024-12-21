@@ -1,9 +1,14 @@
 redis:
   host: 127.0.0.1
   port: 6379
+queue:
+  type: simple
+  host: 127.0.0.1
+  port: 8098
 kafka:
-  bootstrap_servers: localhost:19092
+  bootstrap_servers: zoo-0:9092,zoo-1:9092,zoo-2:9092
   topic: agent-pbft
+  hb_topic: agent-pbft-hb
   consumer_group_id: agent-pbft
 runtime:
   profile: BalancedProfile
@@ -15,6 +20,7 @@ runtime:
   restart_job_selection: 300
   peer_heartbeat_timeout: 300
   results_dir: pbft
+  message_service: kafka
 logging:
   ## The directory in which actor should create log files.
   ## This directory will be automatically created if it does not exist.

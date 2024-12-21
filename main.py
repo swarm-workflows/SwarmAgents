@@ -31,6 +31,7 @@ from swarm.agents.agent import Agent
 from swarm.models.capacities import Capacities
 from swarm.models.data_node import DataNode
 from swarm.models.job import Job
+from swarm.queue.simple_job_queue import SimpleJobQueue
 
 
 class TaskDistributor(threading.Thread):
@@ -111,17 +112,10 @@ if __name__ == '__main__':
     tasks_per_interval = 1  # Number of tasks to add each interval
     interval = 5  # Interval in seconds
 
-    distributor = TaskDistributor(agent=agent, task_pool=task_pool, tasks_per_interval=tasks_per_interval,
-                                  interval=interval)
+    if isinstance(agent.job_queue, SimpleJobQueue):
+        distributor = TaskDistributor(agent=agent, task_pool=task_pool, tasks_per_interval=tasks_per_interval,
+                                      interval=interval)
 
-    distributor.start()
+        distributor.start()
+
     agent.start()
-
-    '''
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        distributor.stop()
-        agent.stop()
-    '''
