@@ -300,7 +300,8 @@ class Agent(Observer):
                 peer_agents = topology_config.get("peer_agents")
                 if "," in peer_agents:
                     peer_agents = peer_agents.split(",")
-                self.topology_peer_agent_list = peer_agents
+                    self.topology_peer_agent_list = peer_agents
+                    self.logger.info(f"topology_peer_agent_list: {self.topology_peer_agent_list}")
 
             if isinstance(peer_agents, list):
                 topic_suffix = self.agent_id

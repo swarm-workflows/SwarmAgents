@@ -22,7 +22,7 @@
 #
 # Author: Komal Thareja(kthare10@renci.org)
 import enum
-from typing import Tuple, List, Union
+from typing import List, Union
 
 from swarm.models.json_field import JSONField
 from swarm.models.agent_info import AgentInfo
