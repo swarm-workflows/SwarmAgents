@@ -71,7 +71,7 @@ class MessageServiceKafka:
     def produce_message(self, json_message: dict, topic: str = None):
         message = json.dumps(json_message)
         outgoing_topic = self.kafka_topic
-        if not topic:
+        if topic:
             outgoing_topic = topic
         self.logger.debug(f"Message sent: {message} to topic: {outgoing_topic}")
         self.producer.produce(outgoing_topic, message.encode('utf-8'))
