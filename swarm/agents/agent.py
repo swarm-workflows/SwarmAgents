@@ -92,6 +92,7 @@ class Agent(Observer):
         self.peer_heartbeat_timeout = 300
         self.results_dir = "."
         self.load_config(config_file)
+        print(f"topology_peer_agent_list: {self.topology_peer_agent_list} {type(self.topology_peer_agent_list)}")
         self.capacities = self.get_system_info()
         if self.message_service_type == "nats":
             self.ctrl_msg_srv = MessageServiceNats(config=self.nat_config, logger=self.logger)
@@ -301,7 +302,6 @@ class Agent(Observer):
                 if "," in peer_agents:
                     peer_agents = peer_agents.split(",")
                     self.topology_peer_agent_list = peer_agents
-                    self.logger.info(f"topology_peer_agent_list: {self.topology_peer_agent_list}")
 
             if isinstance(peer_agents, list):
                 topic_suffix = self.agent_id
