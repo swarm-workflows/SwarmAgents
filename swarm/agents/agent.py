@@ -70,7 +70,7 @@ class Agent(Observer):
         self.agent_id = agent_id
         self.peer_topic_prefix = ""
         self.peer_hb_topic_prefix = ""
-        self.peer_agents = "all"
+        self.topology_peer_agent_list = "all"
         self.job_queue = SimpleJobQueue()
         self.selected_queue = SimpleJobQueue()
         self.ready_queue = SimpleJobQueue()
@@ -180,35 +180,44 @@ class Agent(Observer):
         self.__enqueue(incoming=message)
 
     def _receive_heartbeat(self, incoming: HeartBeat):
-        incoming.agent.last_updated = time.time()
-        self.__add_peer(peer=incoming.agent)
-        self._save_load_metric(incoming.agent.agent_id, incoming.agent.load)
-        temp = ""
-        for p in self.neighbor_map.values():
-            temp += f"[{p}],"
-        self.logger.info(f"Received Heartbeat from Agent: MAP:: {temp}")
+        for peer in incoming.agents:
+            peer.last_updated = time.time()
+            self.__add_peer(peer=peer)
+            self._save_load_metric(peer.agent_id, peer.load)
+            temp = ""
+            for p in self.neighbor_map.values():
+                temp += f"[{p}],"
+            self.logger.info(f"Received Heartbeat from Agent: MAP:: {temp}")
 
     def _save_load_metric(self, agent_id: str, load: float):
         if agent_id not in self.load_per_agent:
             self.load_per_agent[agent_id] = []
         self.load_per_agent[agent_id].append(load)
 
-    def _build_heart_beat(self) -> HeartBeat:
+    def _build_heart_beat(self, dest_agent_id: str = None) -> HeartBeat:
+        agents = []
         my_load = self.compute_overall_load()
         agent = AgentInfo(agent_id=self.agent_id,
                           capacities=self.capacities,
                           capacity_allocations=self.ready_queue.capacities(jobs=self.ready_queue.get_jobs()),
                           load=my_load)
+        agents.append(agent)
         self._save_load_metric(self.agent_id, my_load)
-        return HeartBeat(agent=agent)
+        if isinstance(self.topology_peer_agent_list, list) and len(self.neighbor_map.values()):
+            for peer_agent_id, peer in self.neighbor_map.items():
+                if peer_agent_id and peer_agent_id == dest_agent_id:
+                    continue
+                agents.append(peer)
+
+        return HeartBeat(agents=agents)
 
     def _heartbeat_main(self):
         heart_beat = None
         while not self.shutdown:
             try:
-                heart_beat = self._build_heart_beat()
-                if isinstance(self.peer_agents, list):
-                    for peer_agent_id in self.peer_agents:
+                if isinstance(self.topology_peer_agent_list, list):
+                    for peer_agent_id in self.topology_peer_agent_list:
+                        heart_beat = self._build_heart_beat(dest_agent_id=peer_agent_id)
                         self.hrt_msg_srv.produce_message(json_message=heart_beat.to_dict(),
                                                          topic=f"{self.peer_hb_topic_prefix}-{peer_agent_id}")
                 else:
@@ -221,8 +230,8 @@ class Agent(Observer):
                 self.stop()
 
     def _send_message(self, json_message: dict):
-        if isinstance(self.peer_agents, list):
-            for peer_agent_id in self.peer_agents:
+        if isinstance(self.topology_peer_agent_list, list):
+            for peer_agent_id in self.topology_peer_agent_list:
                 self.ctrl_msg_srv.produce_message(json_message=json_message,
                                                   topic=f"{self.peer_topic_prefix}-{peer_agent_id}")
         else:
@@ -291,7 +300,7 @@ class Agent(Observer):
                 peer_agents = topology_config.get("peer_agents")
                 if "," in peer_agents:
                     peer_agents = peer_agents.split(",")
-                self.peer_agents = peer_agents
+                self.topology_peer_agent_list = peer_agents
 
             if isinstance(peer_agents, list):
                 topic_suffix = self.agent_id

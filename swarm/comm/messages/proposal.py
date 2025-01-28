@@ -51,7 +51,7 @@ class Proposal(Message):
             raise ValueError("Unsupported value type for proposals")
 
     def __str__(self):
-        return f"[agent: {self.agent}, proposals: {self.proposals}]"
+        return f"[agent: {self.agents}, proposals: {self.proposals}]"
 
 
 if __name__ == '__main__':
