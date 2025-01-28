@@ -146,7 +146,7 @@ class SwarmAgent(Agent):
 
                     if len(proposals) >= self.number_of_jobs_per_proposal:
                         msg = Proposal(
-                            agent=AgentInfo(agent_id=self.agent_id),
+                            agents=[AgentInfo(agent_id=self.agent_id)],
                             proposals=proposals
                         )
                         self._send_message(json_message=msg.to_dict())
@@ -164,7 +164,7 @@ class SwarmAgent(Agent):
                 # Send remaining proposals if any exist
                 if proposals:
                     msg = Proposal(
-                        agent=AgentInfo(agent_id=self.agent_id),
+                        agents=[AgentInfo(agent_id=self.agent_id)],
                         proposals=proposals
                     )
                     self._send_message(json_message=msg.to_dict())
@@ -260,7 +260,7 @@ class SwarmAgent(Agent):
         return False
 
     def __receive_proposal(self, incoming: Proposal):
-        self.logger.debug(f"Received Proposal from: {incoming.agent.agent_id}")
+        self.logger.debug(f"Received Proposal from: {incoming.agents[0].agent_id}")
 
         proposals = []
         for p in incoming.proposals:
@@ -301,12 +301,12 @@ class SwarmAgent(Agent):
                 job.change_state(JobState.PREPARE)  # Ensure this is where you want the state to change
 
         if proposals:
-            msg = Prepare(agent=AgentInfo(agent_id=self.agent_id), proposals=proposals)
+            msg = Prepare(agents=[AgentInfo(agent_id=self.agent_id)], proposals=proposals)
             self._send_message(json_message=msg.to_dict())
 
     def __receive_prepare(self, incoming: Prepare):
         proposals = []
-        self.logger.debug(f"Received prepare from: {incoming.agent.agent_id}")
+        self.logger.debug(f"Received prepare from: {incoming.agents[0].agent_id}")
 
         for p in incoming.proposals:
             job = self.job_queue.get_job(job_id=p.job_id)
@@ -338,11 +338,11 @@ class SwarmAgent(Agent):
                 job.change_state(JobState.COMMIT)  # Update job state to COMMIT
 
         if proposals:
-            msg = Commit(agent=AgentInfo(agent_id=self.agent_id), proposals=proposals)
+            msg = Commit(agenst=[AgentInfo(agent_id=self.agent_id)], proposals=proposals)
             self._send_message(json_message=msg.to_dict())
 
     def __receive_commit(self, incoming: Commit):
-        self.logger.debug(f"Received commit from: {incoming.agent.agent_id}")
+        self.logger.debug(f"Received commit from: {incoming.agents[0].agent_id}")
 
         for p in incoming.proposals:
             job = self.job_queue.get_job(job_id=p.job_id)
@@ -382,7 +382,7 @@ class SwarmAgent(Agent):
                     self.incoming_proposals.remove_job(job_id=p.job_id)
 
     def __receive_job_status(self, incoming: JobStatus):
-        self.logger.debug(f"Received Status from: {incoming.agent.agent_id}")
+        self.logger.debug(f"Received Status from: {incoming.agents[0].agent_id}")
 
         for t in incoming.jobs:
             job = self.job_queue.get_job(job_id=t.job_id)
@@ -396,14 +396,14 @@ class SwarmAgent(Agent):
 
             # Update the job status based on broadcast message
             self.logger.debug(f"Updating Job: {job.job_id} state to COMPLETE")
-            job.set_leader(leader_agent_id=incoming.agent.agent_id)
+            job.set_leader(leader_agent_id=incoming.agents[0].agent_id)
             job.change_state(new_state=JobState.COMPLETE)
             self.incoming_proposals.remove_job(job_id=t.job_id)
             self.outgoing_proposals.remove_job(job_id=t.job_id)
 
     def execute_job(self, job: Job):
         super().execute_job(job=job)
-        msg = JobStatus(agent=AgentInfo(agent_id=self.agent_id), jobs=[JobInfo(job_id=job.get_job_id(),
+        msg = JobStatus(agents=[AgentInfo(agent_id=self.agent_id)], jobs=[JobInfo(job_id=job.get_job_id(),
                                                                                state=job.state)])
         self._send_message(json_message=msg.to_dict())
 
