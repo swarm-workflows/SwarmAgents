@@ -57,7 +57,7 @@ if __name__ == '__main__':
     # Set up argument parser
     parser = argparse.ArgumentParser(description="Kafka topic management")
     parser.add_argument('--topic', type=str, required=True, help='Kafka topic name')
-    parser.add_argument('--agents', type=str, required=False, help='Kafka topic name')
+    parser.add_argument('--agents', type=int, required=False, help='Kafka topic name')
     parser.add_argument('--broker', type=str, required=False, help='Kafka Broker')
 
     # Parse command-line arguments
