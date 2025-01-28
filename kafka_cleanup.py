@@ -57,25 +57,45 @@ if __name__ == '__main__':
     # Set up argument parser
     parser = argparse.ArgumentParser(description="Kafka topic management")
     parser.add_argument('--topic', type=str, required=True, help='Kafka topic name')
+    parser.add_argument('--agents', type=str, required=False, help='Kafka topic name')
+    parser.add_argument('--broker', type=str, required=False, help='Kafka Broker')
 
     # Parse command-line arguments
     args = parser.parse_args()
     topic_name = args.topic
 
     bootstrap_servers = "localhost:19092"
+    if args.broker:
+        bootstrap_servers =  args.broker
 
     admin_client = AdminClient({'bootstrap.servers': bootstrap_servers})
-    # Delete the topic
-    delete_topic(admin_client, topic_name)
-    delete_topic(admin_client, f"{topic_name}-hb")
+
+    if args.agents:
+        for x in range(args.agents):
+            delete_topic(admin_client, f"{topic_name}-{x}")
+            delete_topic(admin_client, f"{topic_name}-hb-{x}")
+    else:
+        # Delete the topic
+        delete_topic(admin_client, topic_name)
+        delete_topic(admin_client, f"{topic_name}-hb")
+
     time.sleep(10)
 
-    # Create the topic
-    create_topic(admin_client, topic_name)
-    time.sleep(5)
+    if args.agents:
+        for x in range(args.agents):
+            # Create the topic
+            create_topic(admin_client, f"{topic_name}-{x}")
+            time.sleep(5)
 
-    create_topic(admin_client, f"{topic_name}-hb")
-    time.sleep(5)
+            create_topic(admin_client, f"{topic_name}-hb-{x}")
+            time.sleep(5)
+    else:
+        # Create the topic
+        create_topic(admin_client, topic_name)
+        time.sleep(5)
+
+        create_topic(admin_client, f"{topic_name}-hb")
+        time.sleep(5)
 
     redis_client = redis.StrictRedis(host="127.0.0.1", port=6379, decode_responses=True)
     task_repo = JobRepository(redis_client=redis_client)
