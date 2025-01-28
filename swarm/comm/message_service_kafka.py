@@ -68,10 +68,13 @@ class MessageServiceKafka:
         if agent not in self.observers:
             self.observers.append(agent)
 
-    def produce_message(self, json_message: dict):
+    def produce_message(self, json_message: dict, topic: str = None):
         message = json.dumps(json_message)
-        self.logger.debug(f"Message sent: {message} to topic: {self.kafka_topic}")
-        self.producer.produce(self.kafka_topic, message.encode('utf-8'))
+        outgoing_topic = self.kafka_topic
+        if not topic:
+            outgoing_topic = topic
+        self.logger.debug(f"Message sent: {message} to topic: {outgoing_topic}")
+        self.producer.produce(outgoing_topic, message.encode('utf-8'))
         #self.producer.flush()
 
     def notify_observers(self, msg):

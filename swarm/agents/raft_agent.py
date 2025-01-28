@@ -207,7 +207,7 @@ class RaftAgent(Agent):
                 message[key] = value
 
         # Produce the message to the Kafka topic
-        self.ctrl_msg_srv.produce_message(message)
+        self._send_message(json_message=message)
 
     def _process_messages(self, *, messages: List[dict]):
         for message in messages:

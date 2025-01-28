@@ -68,6 +68,9 @@ class IterableQueue:
 class Agent(Observer):
     def __init__(self, agent_id: str, config_file: str, cycles: int):
         self.agent_id = agent_id
+        self.peer_topic_prefix = ""
+        self.peer_hb_topic_prefix = ""
+        self.peer_agents = "all"
         self.job_queue = SimpleJobQueue()
         self.selected_queue = SimpleJobQueue()
         self.ready_queue = SimpleJobQueue()
@@ -105,10 +108,10 @@ class Agent(Observer):
         self.neighbor_map_lock = threading.Lock()
         self.heartbeat_thread = threading.Thread(target=self._heartbeat_main,
                                                  daemon=True, name="HeartBeatThread")
-        self.heartbeat_processor_thread = threading.Thread(target=self._heartbeat_processor_main,
-                                                           daemon=True, name="HeartBeatProcessorThread")
-        self.msg_processor_thread = threading.Thread(target=self._message_processor_main,
-                                                     daemon=True, name="MsgProcessorThread")
+        self.heartbeat_receiver_thread = threading.Thread(target=self._heartbeat_processor_main,
+                                                          daemon=True, name="HeartBeatReceiverThread")
+        self.msg_receiver_thread = threading.Thread(target=self._message_processor_main,
+                                                    daemon=True, name="MsgReceiverThread")
         self.job_selection_thread = threading.Thread(target=self.job_selection_main,
                                                      daemon=True, name="JobSelectionThread")
 
@@ -204,13 +207,26 @@ class Agent(Observer):
         while not self.shutdown:
             try:
                 heart_beat = self._build_heart_beat()
-                self.hrt_msg_srv.produce_message(heart_beat.to_dict())
+                if isinstance(self.peer_agents, list):
+                    for peer_agent_id in self.peer_agents:
+                        self.hrt_msg_srv.produce_message(json_message=heart_beat.to_dict(),
+                                                         topic=f"{self.peer_hb_topic_prefix}-{peer_agent_id}")
+                else:
+                    self.hrt_msg_srv.produce_message(heart_beat.to_dict())
                 time.sleep(5)
             except Exception as e:
                 self.logger.error(f"Error occurred while sending heartbeat e: {e}")
                 self.logger.error(traceback.format_exc())
             if self._can_shutdown(heart_beat=heart_beat):
                 self.stop()
+
+    def _send_message(self, json_message: dict):
+        if isinstance(self.peer_agents, list):
+            for peer_agent_id in self.peer_agents:
+                self.ctrl_msg_srv.produce_message(json_message=json_message,
+                                                  topic=f"{self.peer_topic_prefix}-{peer_agent_id}")
+        else:
+            self.ctrl_msg_srv.produce_message(json_message=json_message)
 
     def _message_processor_main(self):
         self.logger.info("Message Processor Started")
@@ -268,6 +284,17 @@ class Agent(Observer):
     def load_config(self, config_file):
         with open(config_file, 'r') as f:
             config = yaml.safe_load(f)
+            topic_suffix = ""
+
+            topology_config = config.get("topology", {})
+            if topology_config.get("peer_agents"):
+                peer_agents = topology_config.get("peer_agents")
+                if "," in peer_agents:
+                    peer_agents = peer_agents.split(",")
+                self.peer_agents = peer_agents
+
+            if isinstance(peer_agents, list):
+                topic_suffix = self.agent_id
 
             queue_config = config.get("queue", {})
             queue_type = queue_config.get("type", "simple")
@@ -282,15 +309,18 @@ class Agent(Observer):
             nat_config = config.get("nats", {})
             self.kafka_config = {
                 'kafka_bootstrap_servers': kafka_config.get("bootstrap_servers", "localhost:19092"),
-                'kafka_topic': kafka_config.get("topic", "agent_load"),
+                'kafka_topic': f'{kafka_config.get("topic", "agent_load")}-{topic_suffix}',
                 'consumer_group_id': f'{kafka_config.get("consumer_group_id", "swarm_agent")}-{self.agent_id}'
             }
+            self.peer_topic_prefix = kafka_config.get("topic", "agent_load")
 
             self.kafka_config_hb = {
                 'kafka_bootstrap_servers': kafka_config.get("bootstrap_servers", "localhost:19092"),
-                'kafka_topic': kafka_config.get("hb_topic", "agent_load_hb"),
+                'kafka_topic': f'{kafka_config.get("hb_topic", "agent_load_hb")}-{topic_suffix}',
                 'consumer_group_id': f'{kafka_config.get("consumer_group_id", "swarm_agent")}-{self.agent_id}'
             }
+
+            self.peer_hb_topic_prefix = kafka_config.get("hb_topic", "agent_load_hb")
 
             self.nat_config = {
                 'nats_servers': nat_config.get('nats_servers', 'nats://127.0.0.1:4222'),
@@ -560,8 +590,8 @@ class Agent(Observer):
     def start(self):
         self.ctrl_msg_srv.register_observers(agent=self)
         self.hrt_msg_srv.register_observers(agent=self)
-        self.heartbeat_processor_thread.start()
-        self.msg_processor_thread.start()
+        self.heartbeat_receiver_thread.start()
+        self.msg_receiver_thread.start()
         self.ctrl_msg_srv.start()
         self.hrt_msg_srv.start()
         self.heartbeat_thread.start()
@@ -570,10 +600,10 @@ class Agent(Observer):
 
         if self.heartbeat_thread.is_alive():
             self.heartbeat_thread.join()
-        if self.heartbeat_processor_thread.is_alive():
-            self.heartbeat_processor_thread.join()
-        if self.msg_processor_thread.is_alive():
-            self.msg_processor_thread.join()
+        if self.heartbeat_receiver_thread.is_alive():
+            self.heartbeat_receiver_thread.join()
+        if self.msg_receiver_thread.is_alive():
+            self.msg_receiver_thread.join()
         if self.job_selection_thread.is_alive():
             self.job_selection_thread.join()
         if self.job_scheduling_thread.is_alive():
