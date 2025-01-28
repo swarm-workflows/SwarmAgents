@@ -811,9 +811,10 @@ class Agent(Observer):
     def _can_shutdown(self, heart_beat: HeartBeat):
         if not heart_beat:
             return False
-        if heart_beat.agent.load != 0.0:
-            self.load_check_counter = 0
-            return False
+        for peer in heart_beat.agents:
+            if peer.load != 0.0:
+                self.load_check_counter = 0
+                return False
         self.logger.info(f"Can Shutdown; Neighbor Map: {self.neighbor_map}")
         # Remove stale peers
         peers_to_remove = []
