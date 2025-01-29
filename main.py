@@ -89,7 +89,7 @@ if __name__ == '__main__':
     agent_id = int(sys.argv[2])
     task_count = int(sys.argv[3])
 
-    local_topo = True if len(sys.argv) == 5 else False
+    local_topo = True if len(sys.argv) > 4 else False
 
     # Load configuration based on agent type
     if agent_type == "pbft":
