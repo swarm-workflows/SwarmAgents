@@ -358,7 +358,7 @@ class SwarmAgent(Agent):
             self._send_message(json_message=msg.to_dict())
 
         if len(proposals_to_forward):
-            msg = Prepare(agenst=[AgentInfo(agent_id=self.agent_id)], proposals=proposals_to_forward)
+            msg = Prepare(agents=[AgentInfo(agent_id=self.agent_id)], proposals=proposals_to_forward)
             self._send_message(json_message=msg.to_dict(), excluded_peers=[incoming.agents[0].agent_id])
 
     def __receive_commit(self, incoming: Commit):
@@ -415,7 +415,7 @@ class SwarmAgent(Agent):
                         proposals_to_forward.append(p)
 
         if len(proposals_to_forward):
-            msg = Commit(agenst=[AgentInfo(agent_id=self.agent_id)], proposals=proposals_to_forward)
+            msg = Commit(agents=[AgentInfo(agent_id=self.agent_id)], proposals=proposals_to_forward)
             self._send_message(json_message=msg.to_dict(), excluded_peers=[incoming.agents[0].agent_id])
 
     def __receive_job_status(self, incoming: JobStatus):
