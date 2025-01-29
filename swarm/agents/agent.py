@@ -230,9 +230,11 @@ class Agent(Observer):
             if self._can_shutdown(heart_beat=heart_beat):
                 self.stop()
 
-    def _send_message(self, json_message: dict):
+    def _send_message(self, json_message: dict, excluded_peers: list[str] = []):
         if isinstance(self.topology_peer_agent_list, list):
             for peer_agent_id in self.topology_peer_agent_list:
+                if peer_agent_id in excluded_peers:
+                    continue
                 self.ctrl_msg_srv.produce_message(json_message=json_message,
                                                   topic=f"{self.peer_topic_prefix}-{peer_agent_id}")
         else:

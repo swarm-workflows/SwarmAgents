@@ -118,6 +118,9 @@ class ProposalContainer:
             if proposals and len(proposals):
                 return next(iter(proposals))
 
+    def get_proposals_by_job_id(self, job_id: str) -> List[ProposalInfo]:
+        return self.proposals_by_job_id.get(job_id)
+
     def size(self):
         return len(self.proposals_by_pid)
 

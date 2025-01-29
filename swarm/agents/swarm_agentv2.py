@@ -300,12 +300,13 @@ class SwarmAgent(Agent):
                 self.incoming_proposals.add_proposal(proposal=p)
                 job.change_state(JobState.PREPARE)  # Ensure this is where you want the state to change
 
-        if proposals:
+        if len(proposals):
             msg = Prepare(agents=[AgentInfo(agent_id=self.agent_id)], proposals=proposals)
             self._send_message(json_message=msg.to_dict())
 
     def __receive_prepare(self, incoming: Prepare):
         proposals = []
+        proposals_to_forward = []
         self.logger.debug(f"Received prepare from: {incoming.agents[0].agent_id}")
 
         for p in incoming.proposals:
@@ -314,10 +315,16 @@ class SwarmAgent(Agent):
                 self.logger.debug(f"Job: {job} Ignoring Prepare: {p}")
                 continue
 
+            existing_outgoing_proposals = self.outgoing_proposals.get_proposals_by_job_id(job_id=job.get_job_id())
+            existing_incoming_proposals = self.incoming_proposals.get_proposals_by_job_id(job_id=job.get_job_id())
+
+            # I have sent this proposal
             if self.outgoing_proposals.contains(job_id=p.job_id, p_id=p.p_id):
                 proposal = self.outgoing_proposals.get_proposal(p_id=p.p_id)
+            # Received this proposal
             elif self.incoming_proposals.contains(job_id=p.job_id, p_id=p.p_id):
                 proposal = self.incoming_proposals.get_proposal(p_id=p.p_id)
+            # New proposal
             else:
                 proposal = p
                 p.prepares = 0
@@ -329,7 +336,7 @@ class SwarmAgent(Agent):
 
             if proposal.prepares >= quorum_count:
                 self.logger.debug(f"Job: {p.job_id} Agent: {self.agent_id} received quorum "
-                                 f"prepares: {proposal.prepares}, starting commit!")
+                                  f"prepares: {proposal.prepares}, starting commit!")
 
                 # Increment the number of commits to count the commit being sent
                 # Needed to handle 3 agent case
@@ -337,15 +344,32 @@ class SwarmAgent(Agent):
                 proposals.append(proposal)
                 job.change_state(JobState.COMMIT)  # Update job state to COMMIT
 
-        if proposals:
+            if isinstance(self.topology_peer_agent_list, list):
+                for e in existing_outgoing_proposals:
+                    if p.seed <= e.seed:
+                        proposals_to_forward.append(p)
+
+                for e in existing_incoming_proposals:
+                    if p.seed <= e.seed:
+                        proposals_to_forward.append(p)
+
+        if len(proposals):
             msg = Commit(agenst=[AgentInfo(agent_id=self.agent_id)], proposals=proposals)
             self._send_message(json_message=msg.to_dict())
 
+        if len(proposals_to_forward):
+            msg = Prepare(agenst=[AgentInfo(agent_id=self.agent_id)], proposals=proposals_to_forward)
+            self._send_message(json_message=msg.to_dict(), excluded_peers=[incoming.agents[0].agent_id])
+
     def __receive_commit(self, incoming: Commit):
         self.logger.debug(f"Received commit from: {incoming.agents[0].agent_id}")
+        proposals_to_forward = []
 
         for p in incoming.proposals:
             job = self.job_queue.get_job(job_id=p.job_id)
+
+            existing_outgoing_proposals = self.outgoing_proposals.get_proposals_by_job_id(job_id=job.get_job_id())
+            existing_incoming_proposals = self.incoming_proposals.get_proposals_by_job_id(job_id=job.get_job_id())
 
             if not job or job.is_complete() or job.is_ready() or job.is_running() or job.leader_agent_id:
                 self.logger.debug(f"Job: {job} Ignoring Commit: {p}")
@@ -380,6 +404,19 @@ class SwarmAgent(Agent):
                     self.logger.info(f"PARTICIPANT CONSENSUS achieved for Job: {p.job_id} Leader: {p.agent_id}")
                     job.change_state(new_state=JobState.COMMIT)
                     self.incoming_proposals.remove_job(job_id=p.job_id)
+
+            if isinstance(self.topology_peer_agent_list, list):
+                for e in existing_outgoing_proposals:
+                    if p.seed <= e.seed:
+                        proposals_to_forward.append(p)
+
+                for e in existing_incoming_proposals:
+                    if p.seed <= e.seed:
+                        proposals_to_forward.append(p)
+
+        if len(proposals_to_forward):
+            msg = Commit(agenst=[AgentInfo(agent_id=self.agent_id)], proposals=proposals_to_forward)
+            self._send_message(json_message=msg.to_dict(), excluded_peers=[incoming.agents[0].agent_id])
 
     def __receive_job_status(self, incoming: JobStatus):
         self.logger.debug(f"Received Status from: {incoming.agents[0].agent_id}")
