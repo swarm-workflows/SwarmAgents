@@ -354,7 +354,7 @@ class SwarmAgent(Agent):
                         proposals_to_forward.append(p)
 
         if len(proposals):
-            msg = Commit(agenst=[AgentInfo(agent_id=self.agent_id)], proposals=proposals)
+            msg = Commit(agents=[AgentInfo(agent_id=self.agent_id)], proposals=proposals)
             self._send_message(json_message=msg.to_dict())
 
         if len(proposals_to_forward):
