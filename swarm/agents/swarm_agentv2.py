@@ -256,7 +256,7 @@ class SwarmAgent(Agent):
         min_cost_agents = self.__find_min_cost_agents(cost_matrix)
         if len(min_cost_agents) and min_cost_agents[0] == self.agent_id:
             return True
-        self.logger.debug(f"Job: {job} not selected for consensus!")
+        self.logger.debug(f"[CONSENSUS]: Not picked Job: {job.get_job_id()} - {job}")
         return False
 
     def __receive_proposal(self, incoming: Proposal):
@@ -396,12 +396,12 @@ class SwarmAgent(Agent):
                     f"Job: {p.job_id} Agent: {self.agent_id} received quorum commits Proposal: {proposal}: Job: {job}")
                 job.set_leader(leader_agent_id=proposal.agent_id)
                 if self.outgoing_proposals.contains(job_id=p.job_id, p_id=p.p_id):
-                    self.logger.info(f"LEADER CONSENSUS achieved for Job: {p.job_id} Leader: {self.agent_id}")
+                    self.logger.info(f"[LEADER CONSENSUS] achieved for Job: {p.job_id} Leader: {self.agent_id}")
                     job.change_state(new_state=JobState.READY)
                     self.select_job(job)
                     self.outgoing_proposals.remove_job(job_id=p.job_id)
                 else:
-                    self.logger.info(f"PARTICIPANT CONSENSUS achieved for Job: {p.job_id} Leader: {p.agent_id}")
+                    self.logger.info(f"[PARTICIPANT CONSENSUS] achieved for Job: {p.job_id} Leader: {p.agent_id}")
                     job.change_state(new_state=JobState.COMMIT)
                     self.incoming_proposals.remove_job(job_id=p.job_id)
 

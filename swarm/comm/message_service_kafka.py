@@ -78,7 +78,7 @@ class MessageServiceKafka:
         if msg_type:
             from swarm.comm.messages.message import MessageType
             msg_name = MessageType(msg_type)
-        self.logger.debug(f"Outbound [{str(msg_name)}] sent to topic: {outgoing_topic}, Payload:  {message}")
+        self.logger.debug(f"[OUTBOUND] [{str(msg_name)}] sent to topic: {outgoing_topic}, Payload:  {message}")
         self.producer.produce(outgoing_topic, message.encode('utf-8'))
         #self.producer.flush()
 

@@ -158,7 +158,7 @@ class Agent(Observer):
             message_type = message.get('message_type')
             msg_name = MessageType(message_type)
 
-            self.logger.debug(f"Inbound [{str(msg_name)}] received from: {source_agent_id}, Payload:  {message}")
+            self.logger.debug(f"[INBOUND] [{str(msg_name)}] received from: {source_agent_id}, Payload:  {message}")
 
             if message_type == MessageType.HeartBeat.name or message_type == MessageType.HeartBeat.value:
                 self.hb_message_queue.put_nowait(message)
@@ -509,14 +509,14 @@ class Agent(Observer):
 
     def select_job(self, job: Job):
         print(f"Adding: {job.get_job_id()} on agent: {self.agent_id} to Select Queue")
-        self.logger.info(f"Adding: {job.get_job_id()} on agent: {self.agent_id} to Select Queue")
+        self.logger.info(f"[SELECTED]: {job.get_job_id()} on agent: {self.agent_id} to Select Queue")
         # Add the job to the list of allocated jobs
         self.selected_queue.add_job(job=job)
 
     def schedule_job(self, job: Job):
         self.end_idle()
         print(f"Executing: {job.get_job_id()} on agent: {self.agent_id}")
-        self.logger.info(f"Executing: {job.get_job_id()} on agent: {self.agent_id}")
+        self.logger.info(f"[SCHEDULED]: {job.get_job_id()} on agent: {self.agent_id}")
         # Add the job to the list of allocated jobs
         self.ready_queue.add_job(job=job)
 
