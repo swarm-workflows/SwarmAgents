@@ -166,7 +166,7 @@ class Agent(Observer):
                 self.message_queue.put_nowait(message)
             with self.condition:
                 self.condition.notify_all()
-            self.logger.debug(f"Added incoming message to queue: {incoming}")
+            #self.logger.debug(f"Added incoming message to queue: {incoming}")
         except Exception as e:
             self.logger.debug(f"Failed to add incoming message to queue: {incoming}: e: {e}")
 
