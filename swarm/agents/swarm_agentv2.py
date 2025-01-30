@@ -260,7 +260,7 @@ class SwarmAgent(Agent):
         return False
 
     def __receive_proposal(self, incoming: Proposal):
-        self.logger.debug(f"Received Proposal from: {incoming.agents[0].agent_id}")
+        #self.logger.debug(f"Received Proposal from: {incoming.agents[0].agent_id}")
 
         proposals = []
         for p in incoming.proposals:
@@ -307,7 +307,7 @@ class SwarmAgent(Agent):
     def __receive_prepare(self, incoming: Prepare):
         proposals = []
         proposals_to_forward = []
-        self.logger.debug(f"Received prepare from: {incoming.agents[0].agent_id}")
+        #self.logger.debug(f"Received prepare from: {incoming.agents[0].agent_id}")
 
         for p in incoming.proposals:
             job = self.job_queue.get_job(job_id=p.job_id)
@@ -362,7 +362,7 @@ class SwarmAgent(Agent):
             self._send_message(json_message=msg.to_dict(), excluded_peers=[incoming.agents[0].agent_id])
 
     def __receive_commit(self, incoming: Commit):
-        self.logger.debug(f"Received commit from: {incoming.agents[0].agent_id}")
+        #self.logger.debug(f"Received commit from: {incoming.agents[0].agent_id}")
         proposals_to_forward = []
 
         for p in incoming.proposals:
@@ -419,7 +419,7 @@ class SwarmAgent(Agent):
             self._send_message(json_message=msg.to_dict(), excluded_peers=[incoming.agents[0].agent_id])
 
     def __receive_job_status(self, incoming: JobStatus):
-        self.logger.debug(f"Received Status from: {incoming.agents[0].agent_id}")
+        #self.logger.debug(f"Received Status from: {incoming.agents[0].agent_id}")
 
         for t in incoming.jobs:
             job = self.job_queue.get_job(job_id=t.job_id)
