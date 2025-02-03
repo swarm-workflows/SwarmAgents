@@ -1,5 +1,13 @@
 #!/bin/bash
 
+# Ensure an ID argument is provided
+if [ -z "$1" ]; then
+    echo "Usage: $0 <ID>"
+    exit 1
+fi
+
+ID=$1  # Assign input argument to ID
+
 # Add Confluent repository key
 wget -qO - https://packages.confluent.io/deb/7.7/archive.key | sudo apt-key add - > /dev/null
 
@@ -27,18 +35,21 @@ autopurge.snapRetainCount=3
 autopurge.purgeInterval=24
 EOL
 
-# Write the first argument to /var/lib/zookeeper/myid
-echo "$((i + 1))" | sudo tee /var/lib/zookeeper/myid > /dev/null
-sudo sed -i "s/^broker.id=0/broker.id=$1/" /etc/kafka/server.properties
+# Write the ID to /var/lib/zookeeper/myid
+echo "$ID" | sudo tee /var/lib/zookeeper/myid > /dev/null
+
+# Set broker ID based on the provided ID
+sudo sed -i "s/^broker.id=0/broker.id=$ID/" /etc/kafka/server.properties
 sudo sed -i "s/^zookeeper.connect=localhost:2181/zookeeper.connect=zoo-0:2181,zoo-1:2181,zoo-2:2181/" /etc/kafka/server.properties
 sed -i 's/^#listeners=PLAINTEXT:\/\/:9092/listeners=PLAINTEXT:\/\/:9092/' /etc/kafka/server.properties
 
+# Enable and start Zookeeper and Kafka
 sudo systemctl enable confluent-zookeeper
 sudo systemctl enable confluent-kafka
 sudo systemctl start confluent-zookeeper
 sudo systemctl start confluent-kafka
 
-#if [ "$1" -eq 0 ]; then
+#if [ "$ID" -eq 0 ]; then
 #  sudo sed -i "s|^kafkastore.bootstrap.servers=PLAINTEXT://localhost:9092|kafkastore.bootstrap.servers=PLAINTEXT://zoo-0:9092,PLAINTEXT://zoo-1:9092,PLAINTEXT://zoo-2:9092|" /etc/schema-registry/schema-registry.properties
 #  sudo systemctl enable confluent-schema-registry
 #  sudo systemctl start confluent-schema-registry

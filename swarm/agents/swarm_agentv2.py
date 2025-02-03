@@ -437,7 +437,7 @@ class SwarmAgent(Agent):
             self.outgoing_proposals.remove_job(job_id=t.job_id)
 
             # TODO forward Job Status
-            
+
 
     def execute_job(self, job: Job):
         super().execute_job(job=job)
