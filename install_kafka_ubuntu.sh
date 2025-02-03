@@ -36,7 +36,7 @@ autopurge.purgeInterval=24
 EOL
 
 # Write the ID to /var/lib/zookeeper/myid
-echo "$ID" | sudo tee /var/lib/zookeeper/myid > /dev/null
+echo "$(($ID + 1))" | sudo tee /var/lib/zookeeper/myid > /dev/null
 
 # Set broker ID based on the provided ID
 sudo sed -i "s/^broker.id=0/broker.id=$ID/" /etc/kafka/server.properties
