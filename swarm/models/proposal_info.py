@@ -142,3 +142,11 @@ class ProposalContainer:
 
     def jobs(self) -> List[str]:
         return list(self.proposals_by_job_id.keys())
+
+    def has_better_proposal(self, proposal: ProposalInfo) -> ProposalInfo:
+        better = None
+        for p in self.get_proposals_by_job_id(proposal.job_id):
+            if p.seed <= proposal.seed:
+                better = p
+                break
+        return better

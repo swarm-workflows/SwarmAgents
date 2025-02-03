@@ -263,20 +263,21 @@ class SwarmAgent(Agent):
         #self.logger.debug(f"Received Proposal from: {incoming.agents[0].agent_id}")
 
         proposals = []
+        proposals_to_forward = []
         for p in incoming.proposals:
             job = self.job_queue.get_job(job_id=p.job_id)
             if not job or job.is_ready() or job.is_complete() or job.is_running():
                 self.logger.debug(f"Ignoring Proposal: {p} for job: {job}")
                 continue  # Continue instead of return to process other proposals
 
-            my_proposal = self.outgoing_proposals.get_proposal(job_id=p.job_id)
-            peer_proposal = self.incoming_proposals.get_proposal(job_id=p.job_id)
+            my_proposal = self.outgoing_proposals.has_better_proposal(proposal=p)
+            peer_proposal = self.incoming_proposals.has_better_proposal(proposal=p)
 
-            if my_proposal and (my_proposal.prepares or my_proposal.seed < p.seed):
+            if my_proposal:
                 self.logger.debug(f"Job:{p.job_id} Agent:{self.agent_id} rejected Proposal: {p} from agent"
                                   f" {p.agent_id} - my proposal {my_proposal} has prepares or smaller seed")
                 self.conflicts += 1
-            elif peer_proposal and peer_proposal.seed < p.seed:
+            elif peer_proposal:
                 self.logger.debug(f"Job:{p.job_id} Agent:{self.agent_id} rejected Proposal: {p} from agent"
                                   f" {p.agent_id} - already accepted proposal {peer_proposal} with a smaller seed")
                 self.conflicts += 1
@@ -299,6 +300,14 @@ class SwarmAgent(Agent):
                 p.prepares += 1
                 self.incoming_proposals.add_proposal(proposal=p)
                 job.change_state(JobState.PREPARE)  # Ensure this is where you want the state to change
+
+                # New proposal, forward to my peers
+                proposals_to_forward.append(p)
+
+        if len(proposals_to_forward):
+            # TODO verify if originator should be me or proposal issuer
+            msg = Proposal(agents=[AgentInfo(agent_id=self.agent_id)], proposals=proposals_to_forward)
+            self._send_message(json_message=msg.to_dict(), excluded_peers=[incoming.agents[0].agent_id])
 
         if len(proposals):
             msg = Prepare(agents=[AgentInfo(agent_id=self.agent_id)], proposals=proposals)
@@ -345,13 +354,9 @@ class SwarmAgent(Agent):
                 job.change_state(JobState.COMMIT)  # Update job state to COMMIT
 
             if isinstance(self.topology_peer_agent_list, list):
-                for e in existing_outgoing_proposals:
-                    if p.seed <= e.seed:
-                        proposals_to_forward.append(p)
-
-                for e in existing_incoming_proposals:
-                    if p.seed <= e.seed:
-                        proposals_to_forward.append(p)
+                if not self.outgoing_proposals.has_better_proposal(proposal=proposal) and \
+                        not self.incoming_proposals.has_better_proposal(proposal=proposal):
+                    proposals_to_forward.append(proposal)
 
         if len(proposals):
             msg = Commit(agents=[AgentInfo(agent_id=self.agent_id)], proposals=proposals)
@@ -367,9 +372,6 @@ class SwarmAgent(Agent):
 
         for p in incoming.proposals:
             job = self.job_queue.get_job(job_id=p.job_id)
-
-            existing_outgoing_proposals = self.outgoing_proposals.get_proposals_by_job_id(job_id=job.get_job_id())
-            existing_incoming_proposals = self.incoming_proposals.get_proposals_by_job_id(job_id=job.get_job_id())
 
             if not job or job.is_complete() or job.is_ready() or job.is_running() or job.leader_agent_id:
                 self.logger.debug(f"Job: {job} Ignoring Commit: {p}")
@@ -406,13 +408,9 @@ class SwarmAgent(Agent):
                     self.incoming_proposals.remove_job(job_id=p.job_id)
 
             if isinstance(self.topology_peer_agent_list, list):
-                for e in existing_outgoing_proposals:
-                    if p.seed <= e.seed:
-                        proposals_to_forward.append(p)
-
-                for e in existing_incoming_proposals:
-                    if p.seed <= e.seed:
-                        proposals_to_forward.append(p)
+                if not self.outgoing_proposals.has_better_proposal(proposal=proposal) and \
+                        not self.incoming_proposals.has_better_proposal(proposal=proposal):
+                    proposals_to_forward.append(proposal)
 
         if len(proposals_to_forward):
             msg = Commit(agents=[AgentInfo(agent_id=self.agent_id)], proposals=proposals_to_forward)
@@ -437,6 +435,9 @@ class SwarmAgent(Agent):
             job.change_state(new_state=JobState.COMPLETE)
             self.incoming_proposals.remove_job(job_id=t.job_id)
             self.outgoing_proposals.remove_job(job_id=t.job_id)
+
+            # TODO forward Job Status
+            
 
     def execute_job(self, job: Job):
         super().execute_job(job=job)
