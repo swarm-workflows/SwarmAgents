@@ -66,7 +66,7 @@ if __name__ == '__main__':
 
     bootstrap_servers = "localhost:19092"
     if args.broker:
-        bootstrap_servers =  args.broker
+        bootstrap_servers = args.broker
 
     admin_client = AdminClient({'bootstrap.servers': bootstrap_servers})
 
