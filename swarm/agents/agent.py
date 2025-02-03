@@ -677,19 +677,25 @@ class Agent(Observer):
         for j in completed_jobs:
             if j.leader_agent_id:
                 if j.leader_agent_id not in jobs_per_agent:
-                    jobs_per_agent[j.leader_agent_id] = 0
-                jobs_per_agent[j.leader_agent_id] += 1
+                    jobs_per_agent[j.leader_agent_id] = {"jobs": [], "job_count": 0}
+                jobs_per_agent[j.leader_agent_id]["job_count"] += 1
+                jobs_per_agent[j.leader_agent_id]["jobs"].append(j.job_id)
 
         # Save jobs_per_agent to CSV
         with open(f'{self.results_dir}/jobs_per_agent_{self.agent_id}.csv', 'w', newline='') as file:
             writer = csv.writer(file)
-            writer.writerow(['Agent ID', 'Number of Jobs Selected'])
-            for agent_id, job_count in jobs_per_agent.items():
-                writer.writerow([agent_id, job_count])
+            writer.writerow(['Agent ID', 'Number of Jobs Selected', "Jobs"])
+            for agent_id, info in jobs_per_agent.items():
+                writer.writerow([agent_id, info["job_count"], info["jobs"]])
 
         if self.plot_figures:
+            # Extracting agent IDs and job counts for plotting
+            agent_ids = list(jobs_per_agent.keys())
+            job_counts = [info["job_count"] for info in jobs_per_agent.values()]
+
             # Plotting the jobs per agent as a bar chart
-            plt.bar(list(jobs_per_agent.keys()), list(jobs_per_agent.values()), color='blue')
+            plt.figure(figsize=(10, 6))
+            plt.bar(agent_ids, job_counts, color='blue')
             plt.xlabel('Agent ID')
             plt.ylabel('Number of Jobs Selected')
 

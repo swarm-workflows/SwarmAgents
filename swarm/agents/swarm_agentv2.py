@@ -438,7 +438,6 @@ class SwarmAgent(Agent):
 
             # TODO forward Job Status
 
-
     def execute_job(self, job: Job):
         super().execute_job(job=job)
         msg = JobStatus(agents=[AgentInfo(agent_id=self.agent_id)], jobs=[JobInfo(job_id=job.get_job_id(),
