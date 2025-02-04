@@ -286,7 +286,7 @@ class SwarmAgent(Agent):
                     f"Job:{p.job_id} Agent:{self.agent_id} accepted Proposal: {p} from agent"
                     f" {p.agent_id} and is now the leader")
 
-                p.prepares = 0
+                p.prepares = []
                 if my_proposal:
                     self.logger.debug(f"Removed my Proposal: {my_proposal} in favor of incoming proposal")
                     self.outgoing_proposals.remove_proposal(p_id=my_proposal.p_id, job_id=p.job_id)
@@ -297,7 +297,8 @@ class SwarmAgent(Agent):
                 # Increment the number of prepares to count the prepare being sent
                 # Needed to handle 3 agent case
                 proposals.append(p)
-                p.prepares += 1
+                if incoming.agents[0].agent_id not in p.prepares:
+                    p.prepares.append(incoming.agents[0].agent_id)
                 self.incoming_proposals.add_proposal(proposal=p)
                 job.change_state(JobState.PREPARE)  # Ensure this is where you want the state to change
 
@@ -305,8 +306,8 @@ class SwarmAgent(Agent):
                 proposals_to_forward.append(p)
 
         if len(proposals_to_forward):
-            # TODO verify if originator should be me or proposal issuer
-            msg = Proposal(agents=[AgentInfo(agent_id=self.agent_id)], proposals=proposals_to_forward)
+            msg = Proposal(agents=[AgentInfo(agent_id=incoming.agents[0].agent_id)], proposals=proposals_to_forward,
+                           forwarded_by=self.agent_id)
             self._send_message(json_message=msg.to_dict(), excluded_peers=[incoming.agents[0].agent_id])
 
         if len(proposals):
@@ -324,9 +325,6 @@ class SwarmAgent(Agent):
                 self.logger.debug(f"Job: {job} Ignoring Prepare: {p}")
                 continue
 
-            existing_outgoing_proposals = self.outgoing_proposals.get_proposals_by_job_id(job_id=job.get_job_id())
-            existing_incoming_proposals = self.incoming_proposals.get_proposals_by_job_id(job_id=job.get_job_id())
-
             # I have sent this proposal
             if self.outgoing_proposals.contains(job_id=p.job_id, p_id=p.p_id):
                 proposal = self.outgoing_proposals.get_proposal(p_id=p.p_id)
@@ -336,14 +334,16 @@ class SwarmAgent(Agent):
             # New proposal
             else:
                 proposal = p
-                p.prepares = 0
+                p.prepares = []
                 self.incoming_proposals.add_proposal(proposal=p)
 
-            proposal.prepares += 1
+            if incoming.agents[0].agent_id not in proposal.prepares:
+                p.prepares.append(incoming.agents[0].agent_id)
+                proposals_to_forward.append(p)
             quorum_count = (len(self.neighbor_map) // 2) + 1  # Ensure a true majority
             job.change_state(JobState.PREPARE)  # Consider the necessity of this state change
 
-            if proposal.prepares >= quorum_count:
+            if len(proposal.prepares) >= quorum_count:
                 self.logger.debug(f"Job: {p.job_id} Agent: {self.agent_id} received quorum "
                                   f"prepares: {proposal.prepares}, starting commit!")
 
@@ -353,17 +353,14 @@ class SwarmAgent(Agent):
                 proposals.append(proposal)
                 job.change_state(JobState.COMMIT)  # Update job state to COMMIT
 
-            if isinstance(self.topology_peer_agent_list, list):
-                if not self.outgoing_proposals.has_better_proposal(proposal=proposal) and \
-                        not self.incoming_proposals.has_better_proposal(proposal=proposal):
-                    proposals_to_forward.append(proposal)
-
         if len(proposals):
             msg = Commit(agents=[AgentInfo(agent_id=self.agent_id)], proposals=proposals)
             self._send_message(json_message=msg.to_dict())
 
         if len(proposals_to_forward):
-            msg = Prepare(agents=[AgentInfo(agent_id=self.agent_id)], proposals=proposals_to_forward)
+            # Use the originators agent id when forwarding the Prepare
+            msg = Prepare(agents=[AgentInfo(agent_id=incoming.agents[0].agent_id)], proposals=proposals_to_forward,
+                          forwarded_by=self.agent_id)
             self._send_message(json_message=msg.to_dict(), excluded_peers=[incoming.agents[0].agent_id])
 
     def __receive_commit(self, incoming: Commit):
@@ -386,14 +383,17 @@ class SwarmAgent(Agent):
             else:
                 self.logger.info(f"TBD: Job: {p.job_id} Agent: {self.agent_id} received commit without any Prepares")
                 proposal = p
-                p.prepares = 0
-                p.commits = 0
+                p.prepares = []
+                p.commits = []
                 self.incoming_proposals.add_proposal(proposal=proposal)
 
-            proposal.commits += 1
+            if incoming.agents[0].agent_id not in proposal.commits:
+                proposal.commits.append(incoming.agents[0].agent_id)
+                proposals_to_forward.append(proposal)
+
             quorum_count = (len(self.neighbor_map) // 2) + 1  # Ensure a true majority
 
-            if proposal.commits >= quorum_count:
+            if len(proposal.commits) >= quorum_count:
                 self.logger.info(
                     f"Job: {p.job_id} Agent: {self.agent_id} received quorum commits Proposal: {proposal}: Job: {job}")
                 job.set_leader(leader_agent_id=proposal.agent_id)
@@ -407,13 +407,9 @@ class SwarmAgent(Agent):
                     job.change_state(new_state=JobState.COMMIT)
                     self.incoming_proposals.remove_job(job_id=p.job_id)
 
-            if isinstance(self.topology_peer_agent_list, list):
-                if not self.outgoing_proposals.has_better_proposal(proposal=proposal) and \
-                        not self.incoming_proposals.has_better_proposal(proposal=proposal):
-                    proposals_to_forward.append(proposal)
-
         if len(proposals_to_forward):
-            msg = Commit(agents=[AgentInfo(agent_id=self.agent_id)], proposals=proposals_to_forward)
+            msg = Commit(agents=[AgentInfo(agent_id=incoming.agents[0])], proposals=proposals_to_forward,
+                         forwarded_by=self.agent_id)
             self._send_message(json_message=msg.to_dict(), excluded_peers=[incoming.agents[0].agent_id])
 
     def __receive_job_status(self, incoming: JobStatus):

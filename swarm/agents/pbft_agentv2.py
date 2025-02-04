@@ -212,7 +212,7 @@ class PBFTAgent(Agent):
         my_proposal = self.outgoing_proposals.get_proposal(job_id=job_id)
         peer_proposal = self.incoming_proposals.get_proposal(job_id=job_id)
 
-        if my_proposal and (my_proposal.prepares or my_proposal.seed < rcvd_seed):
+        if my_proposal and (len(my_proposal.prepares) or my_proposal.seed < rcvd_seed):
             self.logger.debug(f"Job:{job_id} Agent:{self.agent_id} rejected Proposal: {proposal_id} from agent"
                               f" {peer_agent_id} - my proposal {my_proposal} has prepares or smaller seed")
             self.conflicts += 1
@@ -236,7 +236,8 @@ class PBFTAgent(Agent):
 
             # Increment the number of prepares to count the prepare being sent
             # Needed to handle 3 agent case
-            proposal.prepares += 1
+            if peer_agent_id not in proposal.prepares:
+                proposal.prepares.append(peer_agent_id)
             self.incoming_proposals.add_proposal(proposal=proposal)
             self.send_message(message_type=MessageType.Prepare, job_id=job_id, proposal_id=proposal_id)
             job.change_state(JobState.PREPARE)
@@ -265,13 +266,14 @@ class PBFTAgent(Agent):
                                     agent_id=peer_agent_id)
             self.incoming_proposals.add_proposal(proposal=proposal)
 
-        proposal.prepares += 1
+        if peer_agent_id not in proposal.prepares:
+            proposal.prepares.append(peer_agent_id)
         quorum_count = (len(self.neighbor_map) // 2) + 1  # Ensure a true majority
         job.change_state(JobState.PREPARE)
 
         # Check if vote count is more than quorum
         # if yes, send commit
-        if proposal.prepares >= quorum_count:
+        if len(proposal.prepares) >= quorum_count:
             self.logger.info(f"Agent: {self.agent_id} Job: {job_id} received quorum "
                              f"prepares: {proposal.prepares}, starting commit!")
             self.send_message(message_type=MessageType.Commit, job_id=job_id, proposal_id=proposal_id)
@@ -303,10 +305,11 @@ class PBFTAgent(Agent):
                                     agent_id=peer_agent_id)
             self.incoming_proposals.add_proposal(proposal=proposal)
 
-        proposal.commits += 1
+        if peer_agent_id not in proposal.commits:
+            proposal.commits.append(peer_agent_id)
         quorum_count = (len(self.neighbor_map) // 2) + 1  # Ensure a true majority
 
-        if proposal.commits >= quorum_count:
+        if len(proposal.commits) >= quorum_count:
             self.logger.info(
                 f"Agent: {self.agent_id} received quorum commits for Job: {job_id} Proposal: {proposal}: Job: {job}")
             job.set_leader(leader_agent_id=proposal.agent_id)

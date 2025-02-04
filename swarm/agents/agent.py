@@ -158,7 +158,8 @@ class Agent(Observer):
             message_type = message.get('message_type')
             msg_name = MessageType(message_type)
 
-            self.logger.debug(f"[INBOUND] [{str(msg_name)}] received from: {source_agent_id}, Payload:  {message}")
+            self.logger.debug(f"[INBOUND] [{str(msg_name)}] received from: {source_agent_id}, "
+                              f"Payload:  {json.dumps(message)}")
 
             if message_type == MessageType.HeartBeat.name or message_type == MessageType.HeartBeat.value:
                 self.hb_message_queue.put_nowait(message)

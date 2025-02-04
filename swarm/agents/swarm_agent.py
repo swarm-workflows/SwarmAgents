@@ -240,7 +240,7 @@ class SwarmAgent(Agent):
             my_proposal = self.outgoing_proposals.get_proposal(job_id=p.job_id)
             peer_proposal = self.incoming_proposals.get_proposal(job_id=p.job_id)
 
-            if my_proposal and (my_proposal.prepares or my_proposal.seed < p.seed):
+            if my_proposal and (len(my_proposal.prepares) or my_proposal.seed < p.seed):
                 self.logger.debug(f"Job:{p.job_id} Agent:{self.agent_id} rejected Proposal: {p} from agent"
                                   f" {p.agent_id} - my proposal {my_proposal} has prepares or smaller seed")
                 self.conflicts += 1
@@ -253,7 +253,7 @@ class SwarmAgent(Agent):
                     f"Job:{p.job_id} Agent:{self.agent_id} accepted Proposal: {p} from agent"
                     f" {p.agent_id} and is now the leader")
 
-                p.prepares = 0
+                p.prepares = []
                 if my_proposal:
                     self.logger.info(f"Removed my Proposal: {my_proposal} in favor of incoming proposal")
                     self.outgoing_proposals.remove_proposal(p_id=my_proposal.p_id, job_id=p.job_id)
@@ -266,7 +266,8 @@ class SwarmAgent(Agent):
 
                 # Increment the number of prepares to count the prepare being sent
                 # Needed to handle 3 agent case
-                p.prepares += 1
+                if incoming.agents[0].agent_id not in p.prepares:
+                    p.prepares.append(incoming.agents[0].agent_id)
                 self.incoming_proposals.add_proposal(proposal=p)
                 job.change_state(JobState.PREPARE)
 
@@ -288,14 +289,15 @@ class SwarmAgent(Agent):
                 proposal = self.incoming_proposals.get_proposal(p_id=p.p_id)
             else:
                 proposal = p
-                p.prepares = 0
+                p.prepares = []
                 self.incoming_proposals.add_proposal(proposal=p)
 
-            proposal.prepares += 1
+            if incoming.agents[0].agent_id not in proposal.prepares:
+                p.prepares.append(incoming.agents[0].agent_id)
             quorum_count = (len(self.neighbor_map) // 2) + 1  # Ensure a true majority
             job.change_state(JobState.PREPARE)  # Consider the necessity of this state change
 
-            if proposal.prepares >= quorum_count:
+            if len(proposal.prepares) >= quorum_count:
                 self.logger.info(f"Job: {p.job_id} Agent: {self.agent_id} received quorum "
                                  f"prepares: {proposal.prepares}, starting commit!")
 
@@ -322,14 +324,15 @@ class SwarmAgent(Agent):
             else:
                 self.logger.info(f"TBD: Job: {p.job_id} Agent: {self.agent_id} received commit without any Prepares")
                 proposal = p
-                p.prepares = 0
-                p.commits = 0
+                p.prepares = []
+                p.commits = []
                 self.incoming_proposals.add_proposal(proposal=proposal)
 
-            proposal.commits += 1
+            if incoming.agents[0].agent_id not in proposal.commits:
+                proposal.commits.append(incoming.agents[0].agent_id)
             quorum_count = (len(self.neighbor_map) // 2) + 1  # Ensure a true majority
 
-            if proposal.commits >= quorum_count:
+            if len(proposal.commits) >= quorum_count:
                 self.logger.info(
                     f"Job: {p.job_id} Agent: {self.agent_id} received quorum commits Proposal: {proposal}: Job: {job}")
                 job.set_leader(leader_agent_id=proposal.agent_id)

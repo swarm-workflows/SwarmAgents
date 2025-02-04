@@ -31,8 +31,8 @@ class ProposalInfo(JSONField):
     def __init__(self, **kwargs):
         self.p_id = None
         self.job_id = None
-        self.prepares = 0
-        self.commits = 0
+        self.prepares = []
+        self.commits = []
         self.agent_id = None
         # self.seed = round(random.random(), 5)
         # Decrease chances of collision

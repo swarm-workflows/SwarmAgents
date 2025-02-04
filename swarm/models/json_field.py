@@ -126,6 +126,8 @@ class JSONField(ABC):
                         new_x = x.to_dict()
                         if new_x:
                             new_value.append(new_x)
+                    else:
+                        new_value.append(x)
                 if len(new_value):
                     new_dict[new_key] = new_value
             else:
