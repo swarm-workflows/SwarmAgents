@@ -344,8 +344,8 @@ class SwarmAgent(Agent):
                 if proposal.agent_id != self.agent_id:
                     proposals_to_forward.append(p)
 
-            # My proposal and commit has already been triggered
-            if job.is_commit() and p.agent_id == self.agent_id:
+            # Commit has already been triggered
+            if job.is_commit():
                 continue
 
             quorum_count = (len(self.neighbor_map) // 2) + 1  # Ensure a true majority
