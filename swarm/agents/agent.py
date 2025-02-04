@@ -160,7 +160,7 @@ class Agent(Observer):
             message_type = message.get('message_type')
             msg_name = MessageType(message_type)
 
-            if fwd:
+            if not fwd:
                 self.logger.debug(f"[INBOUND] [{str(msg_name)}] [SRC: {source_agent_id}], "
                                   f"Payload:  {json.dumps(message)}")
             else:
