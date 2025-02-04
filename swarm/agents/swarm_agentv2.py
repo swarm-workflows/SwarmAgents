@@ -339,8 +339,10 @@ class SwarmAgent(Agent):
                 self.incoming_proposals.add_proposal(proposal=p)
 
             if incoming.agents[0].agent_id not in proposal.prepares:
-                p.prepares.append(incoming.agents[0].agent_id)
-                proposals_to_forward.append(p)
+                proposal.prepares.append(incoming.agents[0].agent_id)
+                # Forward Prepare for peer proposals
+                if proposal.agent_id != self.agent_id:
+                    proposals_to_forward.append(p)
             quorum_count = (len(self.neighbor_map) // 2) + 1  # Ensure a true majority
             job.change_state(JobState.PREPARE)  # Consider the necessity of this state change
 
@@ -392,7 +394,8 @@ class SwarmAgent(Agent):
 
             if incoming.agents[0].agent_id not in proposal.commits:
                 proposal.commits.append(incoming.agents[0].agent_id)
-                proposals_to_forward.append(proposal)
+                if proposal.agent_id != self.agent_id:
+                    proposals_to_forward.append(proposal)
 
             quorum_count = (len(self.neighbor_map) // 2) + 1  # Ensure a true majority
 
