@@ -308,7 +308,8 @@ class SwarmAgent(Agent):
         if len(proposals_to_forward):
             msg = Proposal(agents=[AgentInfo(agent_id=incoming.agents[0].agent_id)], proposals=proposals_to_forward,
                            forwarded_by=self.agent_id)
-            self._send_message(json_message=msg.to_dict(), excluded_peers=[incoming.forwarded_by])
+            self._send_message(json_message=msg.to_dict(),
+                               excluded_peers=[incoming.forwarded_by, incoming.agents[0].agent_id])
 
         if len(proposals):
             msg = Prepare(agents=[AgentInfo(agent_id=self.agent_id)], proposals=proposals)
@@ -361,7 +362,8 @@ class SwarmAgent(Agent):
             # Use the originators agent id when forwarding the Prepare
             msg = Prepare(agents=[AgentInfo(agent_id=incoming.agents[0].agent_id)], proposals=proposals_to_forward,
                           forwarded_by=self.agent_id)
-            self._send_message(json_message=msg.to_dict(), excluded_peers=[incoming.forwarded_by])
+            self._send_message(json_message=msg.to_dict(),
+                               excluded_peers=[incoming.forwarded_by, incoming.agents[0].agent_id])
 
     def __receive_commit(self, incoming: Commit):
         #self.logger.debug(f"Received commit from: {incoming.agents[0].agent_id}")
@@ -411,7 +413,8 @@ class SwarmAgent(Agent):
         if len(proposals_to_forward):
             msg = Commit(agents=[AgentInfo(agent_id=incoming.agents[0])], proposals=proposals_to_forward,
                          forwarded_by=self.agent_id)
-            self._send_message(json_message=msg.to_dict(), excluded_peers=[incoming.forwarded_by])
+            self._send_message(json_message=msg.to_dict(),
+                               excluded_peers=[incoming.forwarded_by, incoming.agents[0].agent_id])
 
     def __receive_job_status(self, incoming: JobStatus):
         #self.logger.debug(f"Received Status from: {incoming.agents[0].agent_id}")
@@ -438,7 +441,7 @@ class SwarmAgent(Agent):
     def execute_job(self, job: Job):
         super().execute_job(job=job)
         msg = JobStatus(agents=[AgentInfo(agent_id=self.agent_id)], jobs=[JobInfo(job_id=job.get_job_id(),
-                                                                               state=job.state)])
+                                                                                  state=job.state)])
         self._send_message(json_message=msg.to_dict())
 
     def __get_proposed_capacities(self):
