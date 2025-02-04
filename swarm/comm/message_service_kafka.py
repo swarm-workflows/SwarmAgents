@@ -68,7 +68,8 @@ class MessageServiceKafka:
         if agent not in self.observers:
             self.observers.append(agent)
 
-    def produce_message(self, json_message: dict, topic: str = None):
+    def produce_message(self, json_message: dict, topic: str = None, src: str = None,
+                        dest: str = None, fwd: str = None):
         message = json.dumps(json_message)
         outgoing_topic = self.kafka_topic
         if topic:
@@ -78,7 +79,19 @@ class MessageServiceKafka:
         if msg_type:
             from swarm.comm.messages.message import MessageType
             msg_name = MessageType(msg_type)
-        self.logger.debug(f"[OUTBOUND] [{str(msg_name)}] sent to topic: {outgoing_topic}, Payload:  {message}")
+        if fwd and src and dest:
+            self.logger.debug(
+                f"[OUTBOUND] [{str(msg_name)}] [SRC: {src}] [DEST: {dest}] [FWD: {fwd}] sent to "
+                f"topic: {outgoing_topic}, Payload:  {message}")
+        elif src and dest:
+            self.logger.debug(
+                f"[OUTBOUND] [{str(msg_name)}] [SRC: {src}] [DEST: {dest}] sent to topic: {outgoing_topic}, "
+                f"Payload:  {message}")
+        else:
+            self.logger.debug(
+                f"[OUTBOUND] [{str(msg_name)}] sent to topic: {outgoing_topic}, "
+                f"Payload:  {message}")
+
         self.producer.produce(outgoing_topic, message.encode('utf-8'))
         #self.producer.flush()
 

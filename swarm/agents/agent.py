@@ -146,9 +146,11 @@ class Agent(Observer):
     def __enqueue(self, incoming: str):
         try:
             message = json.loads(incoming)
+            fwd = None
 
             if "agents" in message:
                 source_agent_id = message.get("agents")[0].get("agent_id")
+                fwd = message.get("forwarded_by")
             else:
                 source_agent_id = message.get("agent_id")
 
@@ -158,8 +160,13 @@ class Agent(Observer):
             message_type = message.get('message_type')
             msg_name = MessageType(message_type)
 
-            self.logger.debug(f"[INBOUND] [{str(msg_name)}] received from: {source_agent_id}, "
-                              f"Payload:  {json.dumps(message)}")
+            if fwd:
+                self.logger.debug(f"[INBOUND] [{str(msg_name)}] [SRC: {source_agent_id}], "
+                                  f"Payload:  {json.dumps(message)}")
+            else:
+                self.logger.debug(f"[INBOUND] [{str(msg_name)}] [SRC: {source_agent_id}] [FWD: {fwd}], "
+                                  f"Payload:  {json.dumps(message)}")
+
 
             if message_type == MessageType.HeartBeat.name or message_type == MessageType.HeartBeat.value:
                 self.hb_message_queue.put_nowait(message)
@@ -225,7 +232,9 @@ class Agent(Observer):
                     for peer_agent_id in self.topology_peer_agent_list:
                         heart_beat = self._build_heart_beat(dest_agent_id=peer_agent_id)
                         self.hrt_msg_srv.produce_message(json_message=heart_beat.to_dict(),
-                                                         topic=f"{self.peer_hb_topic_prefix}-{peer_agent_id}")
+                                                         topic=f"{self.peer_hb_topic_prefix}-{peer_agent_id}",
+                                                         dest=peer_agent_id,
+                                                         src=self.agent_id)
                 else:
                     self.hrt_msg_srv.produce_message(heart_beat.to_dict())
                 time.sleep(5)
@@ -235,13 +244,17 @@ class Agent(Observer):
             if self._can_shutdown(heart_beat=heart_beat):
                 self.stop()
 
-    def _send_message(self, json_message: dict, excluded_peers: list[str] = []):
+    def _send_message(self, json_message: dict, excluded_peers: list[str] = [], src: str = None, fwd: str = None):
+        if src is None:
+            src = self.agent_id
         if isinstance(self.topology_peer_agent_list, list):
             for peer_agent_id in self.topology_peer_agent_list:
                 if peer_agent_id in excluded_peers:
                     continue
                 self.ctrl_msg_srv.produce_message(json_message=json_message,
-                                                  topic=f"{self.peer_topic_prefix}-{peer_agent_id}")
+                                                  topic=f"{self.peer_topic_prefix}-{peer_agent_id}",
+                                                  dest=peer_agent_id,
+                                                  src=src, fwd=fwd)
         else:
             self.ctrl_msg_srv.produce_message(json_message=json_message)
 

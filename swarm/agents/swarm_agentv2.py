@@ -309,7 +309,8 @@ class SwarmAgent(Agent):
             msg = Proposal(agents=[AgentInfo(agent_id=incoming.agents[0].agent_id)], proposals=proposals_to_forward,
                            forwarded_by=self.agent_id)
             self._send_message(json_message=msg.to_dict(),
-                               excluded_peers=[incoming.forwarded_by, incoming.agents[0].agent_id])
+                               excluded_peers=[incoming.forwarded_by, incoming.agents[0].agent_id],
+                               src=incoming.agents[0].agent_id, fwd=self.agent_id)
 
         if len(proposals):
             msg = Prepare(agents=[AgentInfo(agent_id=self.agent_id)], proposals=proposals)
@@ -370,7 +371,8 @@ class SwarmAgent(Agent):
             msg = Prepare(agents=[AgentInfo(agent_id=incoming.agents[0].agent_id)], proposals=proposals_to_forward,
                           forwarded_by=self.agent_id)
             self._send_message(json_message=msg.to_dict(),
-                               excluded_peers=[incoming.forwarded_by, incoming.agents[0].agent_id])
+                               excluded_peers=[incoming.forwarded_by, incoming.agents[0].agent_id],
+                               src=incoming.agents[0].agent_id, fwd=self.agent_id)
 
     def __receive_commit(self, incoming: Commit):
         #self.logger.debug(f"Received commit from: {incoming.agents[0].agent_id}")
@@ -419,10 +421,11 @@ class SwarmAgent(Agent):
                     self.incoming_proposals.remove_job(job_id=p.job_id)
 
         if len(proposals_to_forward):
-            msg = Commit(agents=[AgentInfo(agent_id=incoming.agents[0])], proposals=proposals_to_forward,
+            msg = Commit(agents=[AgentInfo(agent_id=incoming.agents[0].agent_id)], proposals=proposals_to_forward,
                          forwarded_by=self.agent_id)
             self._send_message(json_message=msg.to_dict(),
-                               excluded_peers=[incoming.forwarded_by, incoming.agents[0].agent_id])
+                               excluded_peers=[incoming.forwarded_by, incoming.agents[0].agent_id],
+                               src=incoming.agents[0].agent_id, fwd=self.agent_id)
 
     def __receive_job_status(self, incoming: JobStatus):
         #self.logger.debug(f"Received Status from: {incoming.agents[0].agent_id}")
