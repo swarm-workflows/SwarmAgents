@@ -32,7 +32,7 @@ class Proposal(Message):
         self._proposals = []
         super().__init__(**kwargs)
         self._message_type = MessageType.Proposal
-        self.forwarded_by = None
+        self._forwarded_by = None
 
     @property
     def proposals(self) -> List[ProposalInfo]:
