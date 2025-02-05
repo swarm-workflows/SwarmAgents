@@ -841,6 +841,19 @@ class Agent(Observer):
     def _can_shutdown(self, heart_beat: HeartBeat):
         if not heart_beat:
             return False
+
+        if self.shutdown != "auto":
+            # Remove stale peers
+            peers_to_remove = []
+            for peer in self.neighbor_map.values():
+                diff = int(time.time() - peer.last_updated)
+                if diff >= self.peer_heartbeat_timeout:
+                    peers_to_remove.append(peer.agent_id)
+            for p in peers_to_remove:
+                self.__remove_peer(agent_id=p)
+            if not os.path.exists(self.shutdown_path):
+                return False
+
         for peer in heart_beat.agents:
             if peer.load != 0.0:
                 self.load_check_counter = 0
@@ -859,12 +872,8 @@ class Agent(Observer):
                 self.load_check_counter = 0
                 return False
         self.load_check_counter += 1
-        if self.shutdown == "auto" and self.load_check_counter < self.max_time_load_zero:
+        if self.load_check_counter < self.max_time_load_zero:
             return False
-
-        if self.shutdown != "auto":
-            if not os.path.exists(self.shutdown_path):
-                return False
 
         return True
 
