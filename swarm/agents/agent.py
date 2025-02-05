@@ -91,6 +91,7 @@ class Agent(Observer):
         self.restart_job_selection = 300
         self.peer_heartbeat_timeout = 300
         self.results_dir = "."
+        self.shutdown = "auto"
         self.load_config(config_file)
         print(f"topology_peer_agent_list: {self.topology_peer_agent_list} {type(self.topology_peer_agent_list)}")
         self.capacities = self.get_system_info()
@@ -106,6 +107,7 @@ class Agent(Observer):
         self.hb_message_queue = queue.Queue()
         self.condition = threading.Condition()
         self.shutdown = False
+        self.shutdown_path = "./shutdown"
         self.neighbor_map_lock = threading.Lock()
         self.heartbeat_thread = threading.Thread(target=self._heartbeat_main,
                                                  daemon=True, name="HeartBeatThread")
@@ -362,6 +364,7 @@ class Agent(Observer):
                 'nats_topic': nat_config.get('hb_nats_topic', 'job.consensus'),
             }
             runtime_config = config.get("runtime", {})
+            self.shutdown = runtime_config.get("shutdown")
             self.message_service_type = runtime_config.get("message_service", "kafka")
             profile_name = runtime_config.get("profile", str(ProfileType.BalancedProfile))
             self.profile = PROFILE_MAP.get(profile_name)
@@ -856,8 +859,13 @@ class Agent(Observer):
                 self.load_check_counter = 0
                 return False
         self.load_check_counter += 1
-        if self.load_check_counter < self.max_time_load_zero:
+        if self.shutdown == "auto" and self.load_check_counter < self.max_time_load_zero:
             return False
+
+        if self.shutdown != "auto":
+            if not os.path.exists(self.shutdown_path):
+                return False
+
         return True
 
     def __add_peer(self, peer: AgentInfo):

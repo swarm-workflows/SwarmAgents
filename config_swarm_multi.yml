@@ -28,6 +28,7 @@ runtime:
   peer_heartbeat_timeout: 300
   results_dir: swarm-multi
   message_service: kafka
+  shutdown: auto
 logging:
   ## The directory in which actor should create log files.
   ## This directory will be automatically created if it does not exist.
