@@ -853,6 +853,7 @@ class Agent(Observer):
                 self.__remove_peer(agent_id=p)
             if not os.path.exists(self.shutdown_path):
                 return False
+            return True
 
         for peer in heart_beat.agents:
             if peer.load != 0.0:
