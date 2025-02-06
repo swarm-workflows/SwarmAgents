@@ -5,11 +5,32 @@ import matplotlib.pyplot as plt
 import argparse
 
 
+def compare_dicts_list(dict_list):
+    reference_dict = dict_list[0]  # Using the first dictionary as a reference
+    differences = {}
+
+    for i, current_dict in enumerate(dict_list):
+        diff = {}
+        all_keys = set(reference_dict.keys()).union(set(current_dict.keys()))
+
+        for key in all_keys:
+            val_ref = reference_dict.get(key, None)
+            val_cur = current_dict.get(key, None)
+
+            if val_ref != val_cur:
+                diff[key] = (val_ref, val_cur)
+
+        if diff:  # If there are differences, store them
+            differences[i] = diff
+
+    return differences
+
+
 def main(run_directory: str, number_of_agents: int, algo: str):
     # Initialize dictionaries for data storage
     agent_diff_latencies = {agent_id: [] for agent_id in range(number_of_agents)}
     agent_idle_times = {agent_id: [] for agent_id in range(number_of_agents)}
-    agent_job_counts = {agent_id: 0 for agent_id in range(number_of_agents)}
+    agent_job_counts = []
 
     run_dir = run_directory
 
@@ -30,9 +51,6 @@ def main(run_directory: str, number_of_agents: int, algo: str):
             print(f"Skipping Agent {agent_id}: Missing required columns.")
             continue
 
-        # Track Job Count for Each Agent
-        agent_job_counts[agent_id] = len(df_selection_time)
-
         # Compute Scheduling Latency Difference Per Agent
         if len(df_selection_time) > 0 and len(df_scheduling_latency) > 0:
             diff_latency = df_scheduling_latency['scheduling_latency'].values - df_selection_time['selection_time'].values
@@ -50,6 +68,21 @@ def main(run_directory: str, number_of_agents: int, algo: str):
     if all_scheduling_latencies:
         mean_scheduling_latency = np.mean(all_scheduling_latencies)
         print(f"Mean Scheduling Latency over All Jobs: {mean_scheduling_latency:.4f} seconds")
+
+    # Track Job Count for Each Agent
+    for agent_id in range(number_of_agents):
+        jobs_per_agent_file = os.path.join(run_dir, f'jobs_per_agent_{agent_id}.csv')
+        df_jobs_per_agent = pd.read_csv(jobs_per_agent_file)
+        job_cnts = {}
+        for index, row in df_jobs_per_agent.iterrows():
+            job_cnts[index] = row.get("Number of Jobs Selected", 0)
+        agent_job_counts.append(job_cnts)
+
+    # Find differences
+    differences = compare_dicts_list(agent_job_counts)
+    # Print results
+    for idx, diff in differences.items():
+        print(f"Differences at Agent {idx}: {diff}")
 
     # Read and Store Idle Time Per Agent
     for agent_id in range(number_of_agents):
@@ -92,11 +125,11 @@ def main(run_directory: str, number_of_agents: int, algo: str):
 
     # Plot Jobs per Agent (Bar Chart)
     plt.figure(figsize=(10, 6))
-    plt.bar(agent_job_counts.keys(), agent_job_counts.values())
+    plt.bar(agent_job_counts[0].keys(), agent_job_counts[0].values())
     plt.xlabel('Agent ID')
     plt.ylabel('Number of Jobs Selected')
     plt.title(f'{algo}: Jobs per Agent')
-    plt.xticks(list(agent_job_counts.keys()))
+    plt.xticks(list(agent_job_counts[0].keys()))
     plt.grid(axis='y')
     plt.savefig(os.path.join(run_dir, 'jobs_per_agent.png'), bbox_inches='tight')
     plt.close()
@@ -107,7 +140,7 @@ def main(run_directory: str, number_of_agents: int, algo: str):
             print(f"Agent {agent_id}: Mean Idle Time = {np.mean(idle_times):.4f} seconds")
 
     # Print Total Jobs Per Agent
-    for agent_id, job_count in agent_job_counts.items():
+    for agent_id, job_count in agent_job_counts[0].items():
         print(f"Agent {agent_id}: Jobs Handled = {job_count}")
 
 

@@ -256,7 +256,7 @@ class SwarmAgent(Agent):
         min_cost_agents = self.__find_min_cost_agents(cost_matrix)
         if len(min_cost_agents) and min_cost_agents[0] == self.agent_id:
             return True
-        self.logger.debug(f"[CONSENSUS]: Not picked Job: {job.get_job_id()} - {job}")
+        self.logger.debug(f"[CONSENSUS]: Not picked Job: {job.get_job_id()} - {job}  Cost Matrix: {cost_matrix}  MIN Cost Agents: {min_cost_agents}")
         return False
 
     def __receive_proposal(self, incoming: Proposal):

@@ -52,7 +52,7 @@ class TaskDistributor(threading.Thread):
             for task in tasks_to_add:
                 self.agent.job_queue.add_job(task)
                 total_tasks_added += 1
-            time.sleep(0.5)
+            time.sleep(1)
             if total_tasks_added == self.total_tasks:
                 break
         print("Stopped Task Distributor")
