@@ -224,7 +224,9 @@ class SwarmAgent(Agent):
 
     def __find_min_cost_agents(self, cost_matrix: np.ndarray) -> list:
         """
-        Find the agents with the minimum cost for each job, excluding those with infinite costs.
+        Find the agents with the minimum cost for each job, ensuring random selection
+        if multiple agents have the same minimum cost.
+
         :param cost_matrix: A 2D numpy array where each entry [i, j] is the cost of agent i for job j.
         :return: A list of agent IDs corresponding to the minimum cost for each job.
         """
@@ -235,10 +237,19 @@ class SwarmAgent(Agent):
             valid_costs = cost_matrix[:, j]  # Get the costs for job j
             finite_costs = valid_costs[valid_costs != float('inf')]  # Filter out infinite costs
 
+            '''
             if len(finite_costs) > 0:  # If there are any finite costs
                 min_index = np.argmin(finite_costs)  # Find the index of the minimum cost
                 original_index = np.where(valid_costs == finite_costs[min_index])[0][0]  # Get the original index
                 min_cost_agents.append(agent_ids[original_index])
+            '''
+            if len(finite_costs) > 0:  # If there are any finite costs
+                min_cost = np.min(finite_costs)  # Get the minimum cost
+                min_indices = np.where(valid_costs == min_cost)[0]  # Find all indices with min cost
+
+                # Randomly shuffle and pick one agent ID
+                selected_index = random.choice(min_indices)
+                min_cost_agents.append(agent_ids[selected_index])
 
         return min_cost_agents
 
