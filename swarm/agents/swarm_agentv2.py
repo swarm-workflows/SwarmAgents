@@ -476,11 +476,11 @@ class SwarmAgent(Agent):
                 disk_load * profile.disk_weight) / (profile.core_weight +
                                                     profile.ram_weight +
                                                     profile.disk_weight)
-        return "{:.2f}".format(cost)
+        return round(cost, 2)
 
     def compute_projected_load(self, overall_load_actual: float, proposed_caps: Capacities):
         if not proposed_caps:
-            return "{:.2f}".format(overall_load_actual)  # No proposed caps, so the load remains the same
+            return round(overall_load_actual, 2)  # No proposed caps, so the load remains the same
 
         # Calculate the load contribution from the proposed capacities
         core_load_increase = (proposed_caps.core / self.capacities.core) * 100
@@ -495,4 +495,4 @@ class SwarmAgent(Agent):
                 (self.profile.core_weight + self.profile.ram_weight + self.profile.disk_weight)
         )
 
-        return "{:.2f}".format(overall_load_projected)
+        return round(overall_load_projected, 2)
