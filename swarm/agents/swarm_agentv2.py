@@ -256,7 +256,8 @@ class SwarmAgent(Agent):
         min_cost_agents = self.__find_min_cost_agents(cost_matrix)
         if len(min_cost_agents) and min_cost_agents[0] == self.agent_id:
             return True
-        self.logger.debug(f"[CONSENSUS]: Not picked Job: {job.get_job_id()} - {job}  Cost Matrix: {cost_matrix}  MIN Cost Agents: {min_cost_agents}")
+        self.logger.debug(f"[CONSENSUS]: Not picked Job: {job.get_job_id()} - {job}  Cost Matrix: {cost_matrix}  "
+                          f"MIN Cost Agents: {min_cost_agents}")
         return False
 
     def __receive_proposal(self, incoming: Proposal):
@@ -475,11 +476,11 @@ class SwarmAgent(Agent):
                 disk_load * profile.disk_weight) / (profile.core_weight +
                                                     profile.ram_weight +
                                                     profile.disk_weight)
-        return cost
+        return "{:.2f}".format(cost)
 
     def compute_projected_load(self, overall_load_actual: float, proposed_caps: Capacities):
         if not proposed_caps:
-            return overall_load_actual  # No proposed caps, so the load remains the same
+            return "{:.2f}".format(overall_load_actual)  # No proposed caps, so the load remains the same
 
         # Calculate the load contribution from the proposed capacities
         core_load_increase = (proposed_caps.core / self.capacities.core) * 100
@@ -494,4 +495,4 @@ class SwarmAgent(Agent):
                 (self.profile.core_weight + self.profile.ram_weight + self.profile.disk_weight)
         )
 
-        return overall_load_projected
+        return "{:.2f}".format(overall_load_projected)

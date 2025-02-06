@@ -508,7 +508,7 @@ class Agent(Observer):
                         disk_load * self.profile.disk_weight) / (self.profile.core_weight +
                                                                  self.profile.ram_weight +
                                                                  self.profile.disk_weight)
-        return overall_load
+        return "{:.2f}".format(overall_load)
 
     def compute_ready_queue_load(self):
         allocated_caps = self.ready_queue.capacities(jobs=self.ready_queue.get_jobs())
@@ -522,7 +522,7 @@ class Agent(Observer):
                         disk_load * self.profile.disk_weight) / (self.profile.core_weight +
                                                                  self.profile.ram_weight +
                                                                  self.profile.disk_weight)
-        return overall_load
+        return "{:.2f}".format(overall_load)
 
     def select_job(self, job: Job):
         print(f"Adding: {job.get_job_id()} on agent: {self.agent_id} to Select Queue")
