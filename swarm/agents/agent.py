@@ -737,9 +737,12 @@ class Agent(Observer):
 
         # Calculate scheduling latency
         for j in completed_jobs:
-            wait_times[j.job_id] = j.selection_started_at - j.created_at
-            selection_times[j.job_id] = j.selected_by_agent_at - j.selection_started_at
-            scheduling_latency[j.job_id] = wait_times[j.job_id] + selection_times[j.job_id]
+            if j.selection_started_at and j.created_at:
+                wait_times[j.job_id] = j.selection_started_at - j.created_at
+            if j.selected_by_agent_at and j.selection_started_at:
+                selection_times[j.job_id] = j.selected_by_agent_at - j.selection_started_at
+            if j.job_id in wait_times and j.job_id in selection_times:
+                scheduling_latency[j.job_id] = wait_times[j.job_id] + selection_times[j.job_id]
 
         with open(f'{self.results_dir}/wait_time_{self.agent_id}.csv', 'w', newline='') as file:
             writer = csv.writer(file)
