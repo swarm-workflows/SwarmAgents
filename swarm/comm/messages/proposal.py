@@ -29,18 +29,9 @@ from swarm.models.proposal_info import ProposalInfo
 
 class Proposal(Message):
     def __init__(self, **kwargs):
-        self._forwarded_by = None
         self._proposals = []
         super().__init__(**kwargs)
         self._message_type = MessageType.Proposal
-
-    @property
-    def forwarded_by(self) -> str:
-        return self._forwarded_by
-
-    @forwarded_by.setter
-    def forwarded_by(self, value: str):
-        self._forwarded_by = value
 
     @property
     def proposals(self) -> List[ProposalInfo]:

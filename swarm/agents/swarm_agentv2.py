@@ -248,12 +248,15 @@ class SwarmAgent(Agent):
                 min_cost = np.min(finite_costs)  # Get the minimum cost
                 min_indices = np.where(valid_costs == min_cost)[0]  # Find all indices with min cost
 
+                '''
                 # Check if self is in min_indices
                 self_index = 0  # Self agent is always at index 0
                 if self_index in min_indices:
                     selected_index = self_index  # Prioritize selecting itself
                 else:
                     selected_index = random.choice(min_indices)  # Randomly select from others
+                '''
+                selected_index = random.choice(min_indices)  # Randomly select from others
 
                 min_cost_agents.append(agent_ids[selected_index])
 
@@ -448,6 +451,7 @@ class SwarmAgent(Agent):
     def __receive_job_status(self, incoming: JobStatus):
         #self.logger.debug(f"Received Status from: {incoming.agents[0].agent_id}")
 
+        jobs_to_fwd = []
         for t in incoming.jobs:
             job = self.job_queue.get_job(job_id=t.job_id)
             if not job:
@@ -458,6 +462,9 @@ class SwarmAgent(Agent):
                 self.logger.debug(f"Job: {job} Ignoring Job Status (State: {job.state})")
                 continue
 
+            if incoming.agents[0].agent_id == self.agent_id:
+                continue
+
             # Update the job status based on broadcast message
             self.logger.debug(f"Updating Job: {job.job_id} state to COMPLETE")
             job.set_leader(leader_agent_id=incoming.agents[0].agent_id)
@@ -465,7 +472,16 @@ class SwarmAgent(Agent):
             self.incoming_proposals.remove_job(job_id=t.job_id)
             self.outgoing_proposals.remove_job(job_id=t.job_id)
 
-            # TODO forward Job Status
+            jobs_to_fwd.append(job)
+
+        # Forward Job Status
+        if len(jobs_to_fwd):
+            # Use the originators agent id when forwarding the Prepare
+            msg = JobStatus(agents=[AgentInfo(agent_id=incoming.agents[0].agent_id)], jobs=jobs_to_fwd,
+                                    forwarded_by=self.agent_id)
+            self._send_message(json_message=msg.to_dict(),
+                               excluded_peers=[incoming.forwarded_by, incoming.agents[0].agent_id],
+                               src=incoming.agents[0].agent_id, fwd=self.agent_id)
 
     def execute_job(self, job: Job):
         super().execute_job(job=job)
