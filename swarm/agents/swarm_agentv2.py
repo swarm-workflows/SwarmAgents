@@ -256,7 +256,8 @@ class SwarmAgent(Agent):
                 else:
                     selected_index = random.choice(min_indices)  # Randomly select from others
                 '''
-                selected_index = random.choice(min_indices)  # Randomly select from others
+                #selected_index = random.choice(min_indices)  # Randomly select from others
+                selected_index = min_indices[0]  # Randomly select from others
 
                 min_cost_agents.append(agent_ids[selected_index])
 

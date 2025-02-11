@@ -1,3 +1,4 @@
+import ast
 import os
 import pandas as pd
 import numpy as np
@@ -69,20 +70,53 @@ def main(run_directory: str, number_of_agents: int, algo: str):
         mean_scheduling_latency = np.mean(all_scheduling_latencies)
         print(f"Mean Scheduling Latency over All Jobs: {mean_scheduling_latency:.4f} seconds")
 
+    job_agent_id_mapping = {}
+
     # Track Job Count for Each Agent
+    # Jobs and corresponding agents which think they may have executed it
     for agent_id in range(number_of_agents):
         jobs_per_agent_file = os.path.join(run_dir, f'jobs_per_agent_{agent_id}.csv')
         df_jobs_per_agent = pd.read_csv(jobs_per_agent_file)
         job_cnts = {}
         for index, row in df_jobs_per_agent.iterrows():
             job_cnts[index] = row.get("Number of Jobs Selected", 0)
+            jobs = ast.literal_eval(row.get("Jobs", []))
+            for j in jobs:
+                if j not in job_agent_id_mapping:
+                    job_agent_id_mapping[j] = set()
+                job_agent_id_mapping[j].add(index)
+
         agent_job_counts.append(job_cnts)
 
-    # Find differences
-    differences = compare_dicts_list(agent_job_counts)
-    # Print results
-    for idx, diff in differences.items():
-        print(f"Differences at Agent {idx}: {diff}")
+    # Filter job_agent_id_mapping to include only jobs with more than one agent
+    filtered_job_agent_id_mapping = {job: agents for job, agents in job_agent_id_mapping.items() if len(agents) > 1}
+
+    # Prepare data for stacked bar plot with filtered jobs
+    filtered_job_ids = list(filtered_job_agent_id_mapping.keys())
+    unique_agents = sorted(set(agent for agents in filtered_job_agent_id_mapping.values() for agent in agents))
+    filtered_agent_presence = {
+        agent: [1 if agent in filtered_job_agent_id_mapping[job] else 0 for job in filtered_job_ids] for agent in
+        unique_agents}
+
+    # Plot stacked bars for filtered jobs
+    plt.figure(figsize=(12, 6))
+    bottom = np.zeros(len(filtered_job_ids))  # Initialize bottom for stacking
+
+    for agent in unique_agents:
+        plt.bar(filtered_job_ids, filtered_agent_presence[agent], bottom=bottom, label=f"Agent {agent}")
+        bottom += np.array(filtered_agent_presence[agent])  # Update bottom for stacking
+
+    # Formatting
+    plt.xlabel("Job ID")
+    plt.ylabel("Number of Agents")
+    plt.title("Stacked Representation of Agents Executing Jobs (Filtered: More than 1 Agent)")
+    plt.xticks(filtered_job_ids)  # Set x-ticks to job IDs
+    plt.legend(title="Agent ID", bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+
+    # Show plot
+    plt.savefig(os.path.join(run_dir, 'jobs_agent_mapping.png'))
+    plt.close()
 
     # Read and Store Idle Time Per Agent
     for agent_id in range(number_of_agents):
