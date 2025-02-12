@@ -66,6 +66,7 @@ def main(run_directory: str, number_of_agents: int, algo: str):
             if 'scheduling_latency' in df_scheduling_latency.columns:
                 all_scheduling_latencies.extend(df_scheduling_latency["scheduling_latency"].tolist())
 
+    mean_scheduling_latency = 0
     if all_scheduling_latencies:
         mean_scheduling_latency = np.mean(all_scheduling_latencies)
         print(f"Mean Scheduling Latency over All Jobs: {mean_scheduling_latency:.4f} seconds")
@@ -76,6 +77,8 @@ def main(run_directory: str, number_of_agents: int, algo: str):
     # Jobs and corresponding agents which think they may have executed it
     for agent_id in range(number_of_agents):
         jobs_per_agent_file = os.path.join(run_dir, f'jobs_per_agent_{agent_id}.csv')
+        if not os.path.exists(jobs_per_agent_file):
+            continue
         df_jobs_per_agent = pd.read_csv(jobs_per_agent_file)
         job_cnts = {}
         for index, row in df_jobs_per_agent.iterrows():
@@ -99,7 +102,7 @@ def main(run_directory: str, number_of_agents: int, algo: str):
         unique_agents}
 
     # Plot stacked bars for filtered jobs
-    plt.figure(figsize=(12, 6))
+    plt.figure(figsize=(15, 6))
     bottom = np.zeros(len(filtered_job_ids))  # Initialize bottom for stacking
 
     for agent in unique_agents:
@@ -109,9 +112,11 @@ def main(run_directory: str, number_of_agents: int, algo: str):
     # Formatting
     plt.xlabel("Job ID")
     plt.ylabel("Number of Agents")
-    plt.title("Stacked Representation of Agents Executing Jobs (Filtered: More than 1 Agent)")
+    plt.title(f"Stacked Representation of Agents Executing Jobs (Agents: {number_of_agents})")
     plt.xticks(filtered_job_ids)  # Set x-ticks to job IDs
-    plt.legend(title="Agent ID", bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.legend(title="Agent ID", bbox_to_anchor=(1.05, 1), loc='upper left', fontsize='small', ncol=2, frameon=True)
+
+
     plt.grid(axis='y', linestyle='--', alpha=0.7)
 
     # Show plot
@@ -137,7 +142,7 @@ def main(run_directory: str, number_of_agents: int, algo: str):
 
     plt.xlabel('Job ID')
     plt.ylabel('Scheduling Latency (seconds)')
-    plt.title(f'{algo}: Scheduling Latency per Job')
+    plt.title(f'{algo}: Scheduling Latency per Job (Mean {mean_scheduling_latency:.4f}/ Agents: {number_of_agents})')
     plt.legend()
     plt.grid(True)
     plt.savefig(os.path.join(run_dir, 'scheduling_latency_per_job.png'), bbox_inches='tight')
@@ -151,7 +156,7 @@ def main(run_directory: str, number_of_agents: int, algo: str):
 
     plt.xlabel('Time Index')
     plt.ylabel('Idle Time (seconds)')
-    plt.title(f'{algo}: Idle Time per Agent')
+    plt.title(f'{algo}: Idle Time per Agent (Agents: {number_of_agents})')
     plt.legend()
     plt.grid(True)
     plt.savefig(os.path.join(run_dir, 'idle_time_per_agent.png'), bbox_inches='tight')
@@ -162,7 +167,7 @@ def main(run_directory: str, number_of_agents: int, algo: str):
     plt.bar(agent_job_counts[0].keys(), agent_job_counts[0].values())
     plt.xlabel('Agent ID')
     plt.ylabel('Number of Jobs Selected')
-    plt.title(f'{algo}: Jobs per Agent')
+    plt.title(f'{algo}: Jobs per Agent (Agents: {number_of_agents})')
     plt.xticks(list(agent_job_counts[0].keys()))
     plt.grid(axis='y')
     plt.savefig(os.path.join(run_dir, 'jobs_per_agent.png'), bbox_inches='tight')

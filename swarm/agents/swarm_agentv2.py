@@ -256,8 +256,8 @@ class SwarmAgent(Agent):
                 else:
                     selected_index = random.choice(min_indices)  # Randomly select from others
                 '''
-                #selected_index = random.choice(min_indices)  # Randomly select from others
-                selected_index = min_indices[0]  # Randomly select from others
+                selected_index = random.choice(min_indices)  # Randomly select from others
+                #selected_index = min_indices[0]  # Randomly select from others
 
                 min_cost_agents.append(agent_ids[selected_index])
 
@@ -431,7 +431,8 @@ class SwarmAgent(Agent):
             if len(proposal.commits) >= quorum_count:
                 self.logger.info(
                     f"Job: {p.job_id} Agent: {self.agent_id} received quorum commits Proposal: {proposal}: Job: {job}")
-                job.set_leader(leader_agent_id=proposal.agent_id)
+                if proposal.agent_id == self.agent_id:
+                    job.set_leader(leader_agent_id=proposal.agent_id)
                 if self.outgoing_proposals.contains(job_id=p.job_id, p_id=p.p_id):
                     self.logger.info(f"[LEADER CONSENSUS] achieved for Job: {p.job_id} Leader: {self.agent_id}")
                     job.change_state(new_state=JobState.READY)
@@ -468,7 +469,7 @@ class SwarmAgent(Agent):
 
             # Update the job status based on broadcast message
             self.logger.debug(f"Updating Job: {job.job_id} state to COMPLETE")
-            job.set_leader(leader_agent_id=incoming.agents[0].agent_id)
+            #job.set_leader(leader_agent_id=incoming.agents[0].agent_id)
             job.change_state(new_state=JobState.COMPLETE)
             self.incoming_proposals.remove_job(job_id=t.job_id)
             self.outgoing_proposals.remove_job(job_id=t.job_id)
