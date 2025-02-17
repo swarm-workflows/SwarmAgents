@@ -102,8 +102,11 @@ class SwarmConfigGenerator:
                 first_next_ring = self.rings[i + 1][0]
                 agent_peers[first_agent].append(first_next_ring)
             else:
-                agent_peers[first_agent].append(self.rings[0][0])  # Last ring connects to first
-            agent_peers[first_agent].append(first_prev_ring)
+                if first_agent != self.rings[0][0]:
+                    agent_peers[first_agent].append(self.rings[0][0])  # Last ring connects to first
+
+            if first_agent != first_prev_ring:
+                agent_peers[first_agent].append(first_prev_ring)
 
         # Remove duplicate entries
         for agent_id in agent_peers:
