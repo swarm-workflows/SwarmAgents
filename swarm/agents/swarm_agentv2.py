@@ -277,7 +277,7 @@ class SwarmAgent(Agent):
         min_cost_agents = self.__find_min_cost_agents(cost_matrix)
         if len(min_cost_agents) and min_cost_agents[0] == self.agent_id:
             return True
-        self.logger.debug(f"[CONSENSUS]: Not picked Job: {job.get_job_id()} - {job}  Cost Matrix: {cost_matrix}  "
+        self.logger.debug(f"[CONSENSUS]: Not picked Job: {job.get_job_id()} - {job} "
                           f"MIN Cost Agents: {min_cost_agents}")
         return False
 
@@ -477,6 +477,7 @@ class SwarmAgent(Agent):
             jobs_to_fwd.append(job)
 
         # Forward Job Status
+        '''
         if len(jobs_to_fwd):
             # Use the originators agent id when forwarding the Prepare
             msg = JobStatus(agents=[AgentInfo(agent_id=incoming.agents[0].agent_id)], jobs=jobs_to_fwd,
@@ -484,6 +485,7 @@ class SwarmAgent(Agent):
             self._send_message(json_message=msg.to_dict(),
                                excluded_peers=[incoming.forwarded_by, incoming.agents[0].agent_id],
                                src=incoming.agents[0].agent_id, fwd=self.agent_id)
+        '''
 
     def execute_job(self, job: Job):
         super().execute_job(job=job)

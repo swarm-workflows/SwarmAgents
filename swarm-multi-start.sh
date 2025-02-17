@@ -2,6 +2,7 @@
 
 pkill -f "main.py swarm-multi"
 #python3 kafka_cleanup.py --topic agent-swarm-multi
+python3 generate_configs.py 5 ./config_swarm_multi.yml .
 python3 kafka_cleanup.py --topic agent-swarm-multi --agents 5 --broker zoo-0:9092
 rm -rf swarm-multi
 mkdir -p swarm-multi swarm-multi

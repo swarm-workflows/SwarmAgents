@@ -31,7 +31,7 @@ def main(run_directory: str, number_of_agents: int, algo: str):
     # Initialize dictionaries for data storage
     agent_diff_latencies = {agent_id: [] for agent_id in range(number_of_agents)}
     agent_idle_times = {agent_id: [] for agent_id in range(number_of_agents)}
-    agent_job_counts = []
+    agent_job_counts = {}
 
     run_dir = run_directory
 
@@ -80,16 +80,14 @@ def main(run_directory: str, number_of_agents: int, algo: str):
         if not os.path.exists(jobs_per_agent_file):
             continue
         df_jobs_per_agent = pd.read_csv(jobs_per_agent_file)
-        job_cnts = {}
         for index, row in df_jobs_per_agent.iterrows():
-            job_cnts[index] = row.get("Number of Jobs Selected", 0)
+            _id = row.get("Agent ID")
+            agent_job_counts[_id] = row.get("Number of Jobs Selected", 0)
             jobs = ast.literal_eval(row.get("Jobs", []))
             for j in jobs:
                 if j not in job_agent_id_mapping:
                     job_agent_id_mapping[j] = set()
                 job_agent_id_mapping[j].add(index)
-
-        agent_job_counts.append(job_cnts)
 
     # Filter job_agent_id_mapping to include only jobs with more than one agent
     filtered_job_agent_id_mapping = {job: agents for job, agents in job_agent_id_mapping.items() if len(agents) > 1}
@@ -115,7 +113,6 @@ def main(run_directory: str, number_of_agents: int, algo: str):
     plt.title(f"Stacked Representation of Agents Executing Jobs (Agents: {number_of_agents})")
     plt.xticks(filtered_job_ids)  # Set x-ticks to job IDs
     plt.legend(title="Agent ID", bbox_to_anchor=(1.05, 1), loc='upper left', fontsize='small', ncol=2, frameon=True)
-
 
     plt.grid(axis='y', linestyle='--', alpha=0.7)
 
@@ -164,11 +161,11 @@ def main(run_directory: str, number_of_agents: int, algo: str):
 
     # Plot Jobs per Agent (Bar Chart)
     plt.figure(figsize=(10, 6))
-    plt.bar(agent_job_counts[0].keys(), agent_job_counts[0].values())
+    plt.bar(agent_job_counts.keys(), agent_job_counts.values())
     plt.xlabel('Agent ID')
     plt.ylabel('Number of Jobs Selected')
     plt.title(f'{algo}: Jobs per Agent (Agents: {number_of_agents})')
-    plt.xticks(list(agent_job_counts[0].keys()))
+    plt.xticks(list(agent_job_counts.keys()))
     plt.grid(axis='y')
     plt.savefig(os.path.join(run_dir, 'jobs_per_agent.png'), bbox_inches='tight')
     plt.close()
@@ -179,7 +176,7 @@ def main(run_directory: str, number_of_agents: int, algo: str):
             print(f"Agent {agent_id}: Mean Idle Time = {np.mean(idle_times):.4f} seconds")
 
     # Print Total Jobs Per Agent
-    for agent_id, job_count in agent_job_counts[0].items():
+    for agent_id, job_count in agent_job_counts.items():
         print(f"Agent {agent_id}: Jobs Handled = {job_count}")
 
 
