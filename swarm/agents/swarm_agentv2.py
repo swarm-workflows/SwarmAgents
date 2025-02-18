@@ -97,7 +97,7 @@ class SwarmAgent(Agent):
 
     def job_selection_main(self):
         self.logger.info(f"Starting agent: {self}")
-        while len(self.neighbor_map) + 1 == self.total_agents:
+        while len(self.neighbor_map) + 1 != self.total_agents:
             time.sleep(5)
             self.logger.info("PEER MAP ---- Waiting for Peer map to be populated!")
         completed_jobs = 0

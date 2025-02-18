@@ -204,7 +204,7 @@ class Agent(Observer):
             temp = ""
             for p in self.neighbor_map.values():
                 temp += f"[{p}],"
-            #self.logger.info(f"Received Heartbeat from Agent: MAP:: {temp}")
+            self.logger.info(f"Received Heartbeat from Agent: MAP:: {temp}")
 
     def _save_load_metric(self, agent_id: str, load: float):
         if agent_id not in self.load_per_agent:
