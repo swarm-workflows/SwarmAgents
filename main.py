@@ -81,35 +81,39 @@ def build_tasks_from_json(json_file):
 
 
 if __name__ == '__main__':
-    if len(sys.argv) < 4:
-        print("Usage: python main.py <agent_type> <agent_id> <task_count> [<topo>]")
+    if len(sys.argv) < 5:
+        print("Usage: python main.py <agent_type> <agent_id> <task_count> <agent_count> [<topo>]")
         sys.exit(1)
 
     agent_type = sys.argv[1].lower()
-    agent_id = int(sys.argv[2])
+    agent_id = str(sys.argv[2])
     task_count = int(sys.argv[3])
+    total_agents = int(sys.argv[4])
 
-    local_topo = True if len(sys.argv) > 4 else False
+    local_topo = True if len(sys.argv) > 5 else False
 
     # Load configuration based on agent type
     if agent_type == "pbft":
         config_file = "./config_pbft.yml"
         from swarm.agents.pbft_agentv2 import PBFTAgent
-        agent = PBFTAgent(agent_id=str(agent_id), config_file=config_file, cycles=1000)
+        agent = PBFTAgent(agent_id=str(agent_id), config_file=config_file, cycles=1000,
+                          total_agents=total_agents)
     elif agent_type == "swarm-single":
         config_file = "./config_swarm_single.yml"
         if local_topo:
             config_file = f"./config_swarm_single_{agent_id}.yml"
         # Initialize your swarm-single agent here using the config_file
         from swarm.agents.swarm_agent import SwarmAgent
-        agent = SwarmAgent(agent_id=str(agent_id), config_file=config_file, cycles=1000)
+        agent = SwarmAgent(agent_id=str(agent_id), config_file=config_file, cycles=1000,
+                           total_agents=total_agents)
     elif agent_type == "swarm-multi":
         config_file = "./config_swarm_multi.yml"
         if local_topo:
             config_file = f"./config_swarm_multi_{agent_id}.yml"
         # Initialize your swarm-multi agent here using the config_file
         from swarm.agents.swarm_agentv2 import SwarmAgent
-        agent = SwarmAgent(agent_id=str(agent_id), config_file=config_file, cycles=1000)
+        agent = SwarmAgent(agent_id=str(agent_id), config_file=config_file, cycles=1000,
+                           total_agents=total_agents)
     else:
         print(f"Unknown agent type: {agent_type}")
         sys.exit(1)

@@ -66,7 +66,7 @@ class IterableQueue:
 
 
 class Agent(Observer):
-    def __init__(self, agent_id: str, config_file: str, cycles: int):
+    def __init__(self, agent_id: str, config_file: str, cycles: int, total_agents: int):
         self.agent_id = agent_id
         self.peer_topic_prefix = ""
         self.peer_hb_topic_prefix = ""
@@ -103,6 +103,7 @@ class Agent(Observer):
             self.hrt_msg_srv = MessageServiceKafka(config=self.kafka_config_hb, logger=self.logger)
         self.load_per_agent = {}
         self.cycles = cycles
+        self.total_agents = total_agents
         self.message_queue = queue.Queue()
         self.hb_message_queue = queue.Queue()
         self.condition = threading.Condition()
@@ -169,7 +170,6 @@ class Agent(Observer):
                 self.logger.debug(f"[INBOUND] [{str(msg_name)}] [SRC: {source_agent_id}] [FWD: {fwd}], "
                                   f"Payload:  {json.dumps(message)}")
 
-
             if message_type == MessageType.HeartBeat.name or message_type == MessageType.HeartBeat.value:
                 self.hb_message_queue.put_nowait(message)
             else:
@@ -197,6 +197,8 @@ class Agent(Observer):
     def _receive_heartbeat(self, incoming: HeartBeat):
         for peer in incoming.agents:
             peer.last_updated = time.time()
+            if peer.agent_id == self.agent_id:
+                continue
             self.__add_peer(peer=peer)
             self._save_load_metric(peer.agent_id, peer.load)
             temp = ""
@@ -210,21 +212,23 @@ class Agent(Observer):
         self.load_per_agent[agent_id].append(load)
 
     def _build_heart_beat(self, dest_agent_id: str = None) -> HeartBeat:
-        agents = []
+        agents = {}
         my_load = self.compute_overall_load()
         agent = AgentInfo(agent_id=self.agent_id,
                           capacities=self.capacities,
                           capacity_allocations=self.ready_queue.capacities(jobs=self.ready_queue.get_jobs()),
                           load=my_load)
-        agents.append(agent)
         self._save_load_metric(self.agent_id, my_load)
         if isinstance(self.topology_peer_agent_list, list) and len(self.neighbor_map.values()):
             for peer_agent_id, peer in self.neighbor_map.items():
-                if peer_agent_id and peer_agent_id == dest_agent_id:
-                    continue
-                agents.append(peer)
+                agents[peer_agent_id] = peer
 
-        return HeartBeat(agents=agents)
+        if self.agent_id in agents:
+            agents.pop(self.agent_id)
+
+        agents[self.agent_id] = agent
+
+        return HeartBeat(agents=list(agents.values()))
 
     def _heartbeat_main(self):
         heart_beat = None

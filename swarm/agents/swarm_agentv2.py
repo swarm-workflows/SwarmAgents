@@ -45,8 +45,8 @@ import numpy as np
 
 
 class SwarmAgent(Agent):
-    def __init__(self, agent_id: str, config_file: str, cycles: int):
-        super().__init__(agent_id, config_file, cycles)
+    def __init__(self, agent_id: str, config_file: str, cycles: int, total_agents: int):
+        super().__init__(agent_id, config_file, cycles, total_agents)
         self.outgoing_proposals = ProposalContainer()
         self.incoming_proposals = ProposalContainer()
         self.number_of_jobs_per_proposal = 3
@@ -99,7 +99,9 @@ class SwarmAgent(Agent):
 
     def job_selection_main(self):
         self.logger.info(f"Starting agent: {self}")
-        time.sleep(10)
+        while len(self.neighbor_map) + 1 == self.total_agents:
+            time.sleep(5)
+            self.logger.info("PEER MAP ---- Waiting for Peer map to be populated!")
         completed_jobs = 0
         while not self.shutdown:
             try:
@@ -238,7 +240,6 @@ class SwarmAgent(Agent):
             valid_costs = cost_matrix[:, j]  # Get the costs for job j
             finite_costs = valid_costs[valid_costs != float('inf')]  # Filter out infinite costs
 
-            '''
             if len(finite_costs) > 0:  # If there are any finite costs
                 min_index = np.argmin(finite_costs)  # Find the index of the minimum cost
                 original_index = np.where(valid_costs == finite_costs[min_index])[0][0]  # Get the original index
@@ -248,18 +249,16 @@ class SwarmAgent(Agent):
                 min_cost = np.min(finite_costs)  # Get the minimum cost
                 min_indices = np.where(valid_costs == min_cost)[0]  # Find all indices with min cost
 
-                '''
                 # Check if self is in min_indices
-                self_index = 0  # Self agent is always at index 0
-                if self_index in min_indices:
-                    selected_index = self_index  # Prioritize selecting itself
-                else:
-                    selected_index = random.choice(min_indices)  # Randomly select from others
-                '''
+                #self_index = 0  # Self agent is always at index 0
+                #if self_index in min_indices:
+                #    selected_index = self_index  # Prioritize selecting itself
+                #else:
+                #    selected_index = random.choice(min_indices)  # Randomly select from others
                 selected_index = random.choice(min_indices)  # Randomly select from others
                 #selected_index = min_indices[0]  # Randomly select from others
-
                 min_cost_agents.append(agent_ids[selected_index])
+            '''
 
         return min_cost_agents
 
