@@ -66,7 +66,7 @@ class IterableQueue:
 
 
 class Agent(Observer):
-    def __init__(self, agent_id: str, config_file: str, cycles: int, total_agents: int):
+    def __init__(self, agent_id: int, config_file: str, cycles: int, total_agents: int):
         self.agent_id = agent_id
         self.peer_topic_prefix = ""
         self.peer_hb_topic_prefix = ""
@@ -201,14 +201,8 @@ class Agent(Observer):
                 continue
             self.__add_peer(peer=peer)
             self._save_load_metric(peer.agent_id, peer.load)
-            '''
-            temp = ""
-            for p in self.neighbor_map.values():
-                temp += f"[{p}],"
-            self.logger.info(f"Received Heartbeat from Agent: MAP:: {temp}")
-            '''
 
-    def _save_load_metric(self, agent_id: str, load: float):
+    def _save_load_metric(self, agent_id: int, load: float):
         if agent_id not in self.load_per_agent:
             self.load_per_agent[agent_id] = []
         self.load_per_agent[agent_id].append(load)
@@ -253,7 +247,7 @@ class Agent(Observer):
             if self._can_shutdown(heart_beat=heart_beat):
                 self.stop()
 
-    def _send_message(self, json_message: dict, excluded_peers: list[str] = [], src: str = None, fwd: str = None):
+    def _send_message(self, json_message: dict, excluded_peers: list[int] = [], src: int = None, fwd: int = None):
         if src is None:
             src = self.agent_id
         if isinstance(self.topology_peer_agent_list, list):

@@ -45,7 +45,7 @@ import numpy as np
 
 
 class SwarmAgent(Agent):
-    def __init__(self, agent_id: str, config_file: str, cycles: int, total_agents: int):
+    def __init__(self, agent_id: int, config_file: str, cycles: int, total_agents: int):
         super().__init__(agent_id, config_file, cycles, total_agents)
         self.outgoing_proposals = ProposalContainer()
         self.incoming_proposals = ProposalContainer()
@@ -100,7 +100,6 @@ class SwarmAgent(Agent):
         while len(self.neighbor_map) + 1 != self.total_agents:
             time.sleep(5)
             self.logger.info("PEER MAP ---- Waiting for Peer map to be populated!")
-            self.logger.info(f"KOMAL --- {self.neighbor_map}")
         completed_jobs = 0
         while not self.shutdown:
             try:

@@ -45,7 +45,7 @@ import numpy as np
 
 
 class SwarmAgent(Agent):
-    def __init__(self, agent_id: str, config_file: str, cycles: int, total_agents: int):
+    def __init__(self, agent_id: int, config_file: str, cycles: int, total_agents: int):
         super().__init__(agent_id, config_file, cycles, total_agents)
         self.outgoing_proposals = ProposalContainer()
         self.incoming_proposals = ProposalContainer()
