@@ -42,9 +42,9 @@ class PBFTAgent(Agent):
         self.outgoing_proposals = ProposalContainer()
         self.incoming_proposals = ProposalContainer()
 
-    def _build_heart_beat(self, dest_agent_id: str = None) -> HeartBeat:
+    def _build_heart_beat(self, dest_agent_id: str = None) -> dict:
         my_load = self.compute_overall_load(proposed_jobs=self.outgoing_proposals.jobs())
-        agents = []
+        agents = {}
 
         agent = AgentInfo(agent_id=self.agent_id,
                           capacities=self.capacities,
@@ -52,15 +52,13 @@ class PBFTAgent(Agent):
                           load=my_load)
         self._save_load_metric(self.agent_id, my_load)
 
-        agents.append(agent)
         self._save_load_metric(self.agent_id, my_load)
         if isinstance(self.topology_peer_agent_list, list) and len(self.neighbor_map.values()):
             for peer_agent_id, peer in self.neighbor_map.items():
-                if peer_agent_id and peer_agent_id == dest_agent_id:
-                    continue
-                agents.append(peer)
+                agents[peer_agent_id] = peer
 
-        return HeartBeat(agents=agents)
+        agents[self.agent_id] = agent
+        return agents
 
     def _process_messages(self, *, messages: List[dict]):
         for message in messages:
