@@ -211,7 +211,7 @@ class Agent(Observer):
             self.load_per_agent[agent_id] = []
         self.load_per_agent[agent_id].append(load)
 
-    def _build_heart_beat(self, dest_agent_id: str = None) -> HeartBeat:
+    def _build_heart_beat(self) -> dict:
         agents = {}
         my_load = self.compute_overall_load()
         agent = AgentInfo(agent_id=self.agent_id,
@@ -222,26 +222,27 @@ class Agent(Observer):
         if isinstance(self.topology_peer_agent_list, list) and len(self.neighbor_map.values()):
             for peer_agent_id, peer in self.neighbor_map.items():
                 agents[peer_agent_id] = peer
-
-        if self.agent_id in agents:
-            agents.pop(self.agent_id)
-
         agents[self.agent_id] = agent
 
-        return HeartBeat(agents=list(agents.values()))
+        return agents
 
     def _heartbeat_main(self):
         heart_beat = None
         while not self.shutdown:
             try:
+                agents = self._build_heart_beat()
                 if isinstance(self.topology_peer_agent_list, list):
                     for peer_agent_id in self.topology_peer_agent_list:
-                        heart_beat = self._build_heart_beat(dest_agent_id=peer_agent_id)
-                        self.hrt_msg_srv.produce_message(json_message=heart_beat.to_dict(),
+                        hb_agents = agents.copy()
+                        if peer_agent_id in hb_agents:
+                            hb_agents.pop(peer_agent_id)
+                        hb = HeartBeat(agents=list(hb_agents.values()))
+                        self.hrt_msg_srv.produce_message(json_message=hb.to_dict(),
                                                          topic=f"{self.peer_hb_topic_prefix}-{peer_agent_id}",
                                                          dest=peer_agent_id,
                                                          src=self.agent_id)
                 else:
+                    heart_beat = HeartBeat(agents=list(agents.values()))
                     self.hrt_msg_srv.produce_message(heart_beat.to_dict())
                 time.sleep(5)
             except Exception as e:
