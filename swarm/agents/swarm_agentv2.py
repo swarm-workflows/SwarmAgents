@@ -100,6 +100,7 @@ class SwarmAgent(Agent):
         while len(self.neighbor_map) + 1 != self.total_agents:
             time.sleep(5)
             self.logger.info("PEER MAP ---- Waiting for Peer map to be populated!")
+            self.logger.info(f"KOMAL --- {self.neighbor_map}")
         completed_jobs = 0
         while not self.shutdown:
             try:
