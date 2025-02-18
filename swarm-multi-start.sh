@@ -16,6 +16,6 @@ base_index=0
 # Launch the Python commands for each agent
 for i in $(seq 0 $(($num_agents - 1))); do
     #python3 main.py swarm-multi $(($base_index + $i)) 100 &
-    python3 main.py swarm-multi $(($base_index + $i)) 100 topo &
+    python3 main.py swarm-multi $(($base_index + $i)) 100  $num_agents topo &
 done
 

@@ -10,5 +10,5 @@ num_agents=5
 
 # Launch the Python commands for each agent
 for i in $(seq 0 $(($num_agents - 1))); do
-    python3 main.py pbft $i 100 &
+    python3 main.py pbft $i 100 $num_agents &
 done
