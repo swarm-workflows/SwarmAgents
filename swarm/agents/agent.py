@@ -590,14 +590,14 @@ class Agent(Observer):
         return round(overall_load, 2)
 
     def select_job(self, job: Job):
-        print(f"Adding: {job.get_job_id()} on agent: {self.agent_id} to Select Queue")
+        #print(f"Adding: {job.get_job_id()} on agent: {self.agent_id} to Select Queue")
         self.logger.info(f"[SELECTED]: {job.get_job_id()} on agent: {self.agent_id} to Select Queue")
         # Add the job to the list of allocated jobs
         self.selected_queue.add_job(job=job)
 
     def schedule_job(self, job: Job):
         self.end_idle()
-        print(f"Executing: {job.get_job_id()} on agent: {self.agent_id}")
+        print(f"SCHEDULED: {job.get_job_id()} on agent: {self.agent_id}")
         self.logger.info(f"[SCHEDULED]: {job.get_job_id()} on agent: {self.agent_id}")
         # Add the job to the list of allocated jobs
         self.ready_queue.add_job(job=job)
