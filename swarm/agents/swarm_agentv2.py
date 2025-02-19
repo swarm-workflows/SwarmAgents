@@ -498,6 +498,7 @@ class SwarmAgent(Agent):
         '''
 
     def execute_job(self, job: Job):
+        self.completed_jobs_set.add(job.get_job_id())
         self.job_repo.save_job(job=job)
         super().execute_job(job=job)
         '''
