@@ -229,36 +229,9 @@ class Agent(Observer):
 
         return agents
 
-    '''
-    def _heartbeat_main(self):
-        agents = {}
-        while not self.shutdown:
-            try:
-                agents = self._build_heart_beat()
-                if isinstance(self.topology_peer_agent_list, list):
-                    for peer_agent_id in self.topology_peer_agent_list:
-                        hb_agents = agents.copy()
-                        if peer_agent_id in hb_agents:
-                            hb_agents.pop(peer_agent_id)
-                        hb = HeartBeat(agents=list(hb_agents.values()))
-                        self.hrt_msg_srv.produce_message(json_message=hb.to_dict(),
-                                                         topic=f"{self.peer_hb_topic_prefix}-{peer_agent_id}",
-                                                         dest=peer_agent_id,
-                                                         src=self.agent_id)
-                else:
-                    hb = HeartBeat(agents=list(agents.values()))
-                    self.hrt_msg_srv.produce_message(hb.to_dict())
-                time.sleep(5)
-            except Exception as e:
-                self.logger.error(f"Error occurred while sending heartbeat e: {e}")
-                self.logger.error(traceback.format_exc())
-            if self._can_shutdown(agents=agents):
-                self.stop()
-    '''
-
     def _heartbeat_main(self):
         while not self.shutdown:
-            agents = None
+            agents = {}
             try:
                 agents = self._build_heart_beat()
 
@@ -285,7 +258,8 @@ class Agent(Observer):
             if self._can_shutdown(agents=agents):
                 self.stop()
 
-    def _send_message(self, json_message: dict, excluded_peers: list[int] = [], src: int = None, fwd: int = None):
+    def _send_message(self, json_message: dict, excluded_peers: list[int] = [],
+                      src: int = None, fwd: int = None):
         if src is None:
             src = self.agent_id
 
@@ -342,7 +316,6 @@ class Agent(Observer):
 
         self.logger.info("Message Processor Stopped")
 
-    '''
     def _heartbeat_processor_main(self):
         self.logger.info("Heartbeat Processor Started")
         while True:
@@ -380,6 +353,7 @@ class Agent(Observer):
                 self.logger.error(traceback.format_exc())
 
         self.logger.info("Heartbeat Processor Stopped")
+    '''
 
     def _process_messages(self, *, messages: List[dict]):
         for message in messages:

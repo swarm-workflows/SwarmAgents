@@ -53,7 +53,8 @@ class MessageServiceKafka:
         self.logger = logger
         self.observers = []
         self.shutdown = False
-        self.thread = threading.Thread(target=self.consume_messages, daemon=True, name="KafkaConsumer")
+        self.thread = threading.Thread(target=self.consume_messages, daemon=True,
+                                       name=f"KafkaConsumer-{self.kafka_topic}")
 
     def start(self):
         self.consumer.subscribe([self.kafka_topic])
