@@ -61,7 +61,8 @@ class SwarmAgent(Agent):
         self._save_load_metric(self.agent_id, my_load)
         if isinstance(self.topology_peer_agent_list, list) and len(self.neighbor_map.values()):
             for peer_agent_id, peer in self.neighbor_map.items():
-                agents[peer_agent_id] = peer
+                if peer_agent_id:
+                    agents[peer_agent_id] = peer
 
         agents[self.agent_id] = agent
         return agents

@@ -238,8 +238,8 @@ class Agent(Observer):
                                                          dest=peer_agent_id,
                                                          src=self.agent_id)
                 else:
-                    heart_beat = HeartBeat(agents=list(agents.values()))
-                    self.hrt_msg_srv.produce_message(heart_beat.to_dict())
+                    hb = HeartBeat(agents=list(hb_agents.values()))
+                    self.hrt_msg_srv.produce_message(hb.to_dict())
                 time.sleep(5)
             except Exception as e:
                 self.logger.error(f"Error occurred while sending heartbeat e: {e}")
@@ -882,7 +882,8 @@ class Agent(Observer):
 
     def __add_peer(self, peer: AgentInfo):
         with self.neighbor_map_lock:
-            self.neighbor_map[peer.agent_id] = peer
+            if peer.agent_id:
+                self.neighbor_map[peer.agent_id] = peer
 
     def __remove_peer(self, agent_id: str):
         with self.neighbor_map_lock:
