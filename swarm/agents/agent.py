@@ -92,7 +92,7 @@ class Agent(Observer):
         self.restart_job_selection = 300
         self.peer_heartbeat_timeout = 300
         self.results_dir = "."
-        self.shutdown = "auto"
+        self.shutdown_mode = "auto"
         self.redis_host = "127.0.0.1"
         self.redis_port = 6379
         self.load_config(config_file)
@@ -203,7 +203,8 @@ class Agent(Observer):
 
     def _receive_heartbeat(self, incoming: HeartBeat):
         for peer in incoming.agents:
-            peer.last_updated = time.time()
+            if self.shutdown_mode == "auto":
+                peer.last_updated = time.time()
             if peer.agent_id == self.agent_id:
                 continue
             self.__add_peer(peer=peer)
@@ -220,7 +221,8 @@ class Agent(Observer):
         agent = AgentInfo(agent_id=self.agent_id,
                           capacities=self.capacities,
                           capacity_allocations=self.ready_queue.capacities(jobs=self.ready_queue.get_jobs()),
-                          load=my_load)
+                          load=my_load,
+                          last_updated=time.time())
         self._save_load_metric(self.agent_id, my_load)
         if isinstance(self.topology_peer_agent_list, list) and len(self.neighbor_map.values()):
             for peer_agent_id, peer in self.neighbor_map.items():
@@ -910,7 +912,7 @@ class Agent(Observer):
         if not agents or len(agents) == 0:
             return False
 
-        if self.shutdown != "auto":
+        if self.shutdown_mode != "auto":
             # Remove stale peers
             peers_to_remove = []
             for peer in self.neighbor_map.values():
@@ -947,8 +949,17 @@ class Agent(Observer):
         return True
 
     def __add_peer(self, peer: AgentInfo):
+        """
+        Adds or updates a peer in the neighbor map, ensuring only the latest update is stored.
+        """
+        if peer.agent_id is None:
+            return  # Ignore invalid agent_id
+
         with self.neighbor_map_lock:
-            if peer.agent_id is not None:
+            current_peer_info = self.neighbor_map.get(peer.agent_id)
+
+            # Only update if the new peer info is newer
+            if current_peer_info is None or peer.last_updated > current_peer_info.last_updated:
                 self.neighbor_map[peer.agent_id] = peer
 
     def __remove_peer(self, agent_id: str):
