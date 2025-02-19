@@ -60,6 +60,8 @@ class SwarmAgent(Agent):
         self._save_load_metric(self.agent_id, my_load)
         if isinstance(self.topology_peer_agent_list, list) and len(self.neighbor_map.values()):
             for peer_agent_id, peer in self.neighbor_map.items():
+                if peer_agent_id is None:
+                    continue
                 agents[peer_agent_id] = peer
 
         agents[self.agent_id] = agent
@@ -108,7 +110,8 @@ class SwarmAgent(Agent):
                         continue
 
                     diff = int(time.time() - job.time_last_state_change)
-                    if diff > self.restart_job_selection and job.get_state() in [JobState.PREPARE, JobState.PRE_PREPARE]:
+                    if diff > self.restart_job_selection and job.get_state() in [JobState.PREPARE,
+                                                                                 JobState.PRE_PREPARE]:
                         self.logger.info(f"RESTART: Job: {job} reset to Pending")
                         job.change_state(new_state=JobState.PENDING)
                         self.outgoing_proposals.remove_job(job_id=job.get_job_id())
@@ -310,7 +313,8 @@ class SwarmAgent(Agent):
         for p in incoming.proposals:
             job = self.job_queue.get_job(job_id=p.job_id)
 
-            if not job or job.is_complete() or job.is_ready() or job.is_running() or job.leader_agent_id:
+            if not job or job.is_complete() or job.is_ready() or job.is_running() or \
+                    job.leader_agent_id is not None:
                 self.logger.info(f"Job: {job} Ignoring Commit: {p}")
                 self.incoming_proposals.remove_job(job_id=p.job_id)
                 self.outgoing_proposals.remove_job(job_id=p.job_id)

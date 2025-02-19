@@ -61,9 +61,11 @@ class SwarmAgent(Agent):
         self._save_load_metric(self.agent_id, my_load)
         if isinstance(self.topology_peer_agent_list, list) and len(self.neighbor_map.values()):
             for peer_agent_id, peer in self.neighbor_map.items():
-                if peer_agent_id:
+                if peer_agent_id is not None:
                     agents[peer_agent_id] = peer
 
+        if self.agent_id is None:
+            self.logger.info("AGENT ID IS NONE")
         agents[self.agent_id] = agent
         return agents
 
@@ -114,7 +116,8 @@ class SwarmAgent(Agent):
                         continue
 
                     diff = int(time.time() - job.time_last_state_change)
-                    if diff > self.restart_job_selection and job.get_state() in [JobState.PREPARE, JobState.PRE_PREPARE]:
+                    if diff > self.restart_job_selection and job.get_state() in [JobState.PREPARE,
+                                                                                 JobState.PRE_PREPARE]:
                         self.logger.info(f"RESTART: Job: {job} reset to Pending")
                         job.change_state(new_state=JobState.PENDING)
                         self.outgoing_proposals.remove_job(job_id=job.get_job_id())
@@ -388,7 +391,8 @@ class SwarmAgent(Agent):
 
         if len(proposals_to_forward):
             # Use the originators agent id when forwarding the Prepare
-            msg = Prepare(agents=[AgentInfo(agent_id=incoming.agents[0].agent_id)], proposals=proposals_to_forward,
+            msg = Prepare(agents=[AgentInfo(agent_id=incoming.agents[0].agent_id)],
+                          proposals=proposals_to_forward,
                           forwarded_by=self.agent_id)
             self._send_message(json_message=msg.to_dict(),
                                excluded_peers=[incoming.forwarded_by, incoming.agents[0].agent_id],
@@ -401,7 +405,8 @@ class SwarmAgent(Agent):
         for p in incoming.proposals:
             job = self.job_queue.get_job(job_id=p.job_id)
 
-            if not job or job.is_complete() or job.is_ready() or job.is_running() or job.leader_agent_id:
+            if not job or job.is_complete() or job.is_ready() or job.is_running() or \
+                    job.leader_agent_id is not None:
                 self.logger.debug(f"Job: {job} Ignoring Commit: {p}")
                 self.incoming_proposals.remove_job(job_id=p.job_id)
                 self.outgoing_proposals.remove_job(job_id=p.job_id)
@@ -442,7 +447,8 @@ class SwarmAgent(Agent):
                     self.incoming_proposals.remove_job(job_id=p.job_id)
 
         if len(proposals_to_forward):
-            msg = Commit(agents=[AgentInfo(agent_id=incoming.agents[0].agent_id)], proposals=proposals_to_forward,
+            msg = Commit(agents=[AgentInfo(agent_id=incoming.agents[0].agent_id)],
+                         proposals=proposals_to_forward,
                          forwarded_by=self.agent_id)
             self._send_message(json_message=msg.to_dict(),
                                excluded_peers=[incoming.forwarded_by, incoming.agents[0].agent_id],

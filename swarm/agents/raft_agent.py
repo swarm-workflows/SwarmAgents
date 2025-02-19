@@ -71,7 +71,7 @@ class RaftAgent(Agent):
     def start(self, clean: bool = False):
         self.raft.start()
 
-        if not self.agent_id and clean:
+        if self.agent_id is None and clean:
             self.job_repo.delete_all()
         super().start()
 
@@ -172,7 +172,7 @@ class RaftAgent(Agent):
 
     def __receive_commit(self, incoming: dict):
         dest = incoming.get("dest")
-        if not dest or dest != self.agent_id:
+        if dest is not None or dest != self.agent_id:
             self.logger.debug(f"Discarding incoming message: {incoming}")
             return
         peer_agent_id = incoming.get("agent_id")

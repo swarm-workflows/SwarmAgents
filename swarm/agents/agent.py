@@ -163,7 +163,7 @@ class Agent(Observer):
             message_type = message.get('message_type')
             msg_name = MessageType(message_type)
 
-            if not fwd:
+            if fwd is not None:
                 self.logger.debug(f"[INBOUND] [{str(msg_name)}] [SRC: {source_agent_id}], "
                                   f"Payload:  {json.dumps(message)}")
             else:
@@ -223,7 +223,7 @@ class Agent(Observer):
         return agents
 
     def _heartbeat_main(self):
-        heart_beat = None
+        agents = {}
         while not self.shutdown:
             try:
                 agents = self._build_heart_beat()
@@ -691,7 +691,7 @@ class Agent(Observer):
         jobs_per_agent = {}
 
         for j in completed_jobs:
-            if j.leader_agent_id:
+            if j.leader_agent_id is not None:
                 if j.leader_agent_id not in jobs_per_agent:
                     jobs_per_agent[j.leader_agent_id] = {"jobs": [], "job_count": 0}
                 jobs_per_agent[j.leader_agent_id]["job_count"] += 1
@@ -882,7 +882,7 @@ class Agent(Observer):
 
     def __add_peer(self, peer: AgentInfo):
         with self.neighbor_map_lock:
-            if peer.agent_id:
+            if peer.agent_id is not None:
                 self.neighbor_map[peer.agent_id] = peer
 
     def __remove_peer(self, agent_id: str):
