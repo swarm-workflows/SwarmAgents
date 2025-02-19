@@ -156,7 +156,7 @@ class SwarmAgent(Agent):
                         job.change_state(new_state=JobState.PRE_PREPARE)
 
                     if len(proposals) >= self.number_of_jobs_per_proposal:
-                        msg = Proposal(
+                        msg = Proposal(source=self.agent_id,
                             agents=[AgentInfo(agent_id=self.agent_id)],
                             proposals=proposals
                         )
@@ -174,7 +174,7 @@ class SwarmAgent(Agent):
 
                 # Send remaining proposals if any exist
                 if proposals:
-                    msg = Proposal(
+                    msg = Proposal(source=self.agent_id,
                         agents=[AgentInfo(agent_id=self.agent_id)],
                         proposals=proposals
                     )
@@ -336,14 +336,15 @@ class SwarmAgent(Agent):
                 proposals_to_forward.append(p)
 
         if len(proposals_to_forward):
-            msg = Proposal(agents=[AgentInfo(agent_id=incoming.agents[0].agent_id)], proposals=proposals_to_forward,
+            msg = Proposal(source=incoming.agents[0].agent_id,
+                           agents=[AgentInfo(agent_id=incoming.agents[0].agent_id)], proposals=proposals_to_forward,
                            forwarded_by=self.agent_id)
             self._send_message(json_message=msg.to_dict(),
                                excluded_peers=[incoming.forwarded_by, incoming.agents[0].agent_id],
                                src=incoming.agents[0].agent_id, fwd=self.agent_id)
 
         if len(proposals):
-            msg = Prepare(agents=[AgentInfo(agent_id=self.agent_id)], proposals=proposals)
+            msg = Prepare(source=self.agent_id, agents=[AgentInfo(agent_id=self.agent_id)], proposals=proposals)
             self._send_message(json_message=msg.to_dict())
 
     def __receive_prepare(self, incoming: Prepare):
@@ -393,12 +394,12 @@ class SwarmAgent(Agent):
                 job.change_state(JobState.COMMIT)  # Update job state to COMMIT
 
         if len(proposals):
-            msg = Commit(agents=[AgentInfo(agent_id=self.agent_id)], proposals=proposals)
+            msg = Commit(source=self.agent_id, agents=[AgentInfo(agent_id=self.agent_id)], proposals=proposals)
             self._send_message(json_message=msg.to_dict())
 
         if len(proposals_to_forward):
             # Use the originators agent id when forwarding the Prepare
-            msg = Prepare(agents=[AgentInfo(agent_id=incoming.agents[0].agent_id)],
+            msg = Prepare(source=incoming.agents[0].agent_id, agents=[AgentInfo(agent_id=incoming.agents[0].agent_id)],
                           proposals=proposals_to_forward,
                           forwarded_by=self.agent_id)
             self._send_message(json_message=msg.to_dict(),
@@ -454,7 +455,7 @@ class SwarmAgent(Agent):
                     self.incoming_proposals.remove_job(job_id=p.job_id)
 
         if len(proposals_to_forward):
-            msg = Commit(agents=[AgentInfo(agent_id=incoming.agents[0].agent_id)],
+            msg = Commit(source=incoming.agents[0].agent_id, agents=[AgentInfo(agent_id=incoming.agents[0].agent_id)],
                          proposals=proposals_to_forward,
                          forwarded_by=self.agent_id)
             self._send_message(json_message=msg.to_dict(),

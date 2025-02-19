@@ -53,10 +53,19 @@ class MessageException(Exception):
 
 class Message(JSONField):
     def __init__(self, **kwargs):
+        self._source = None
         self._forwarded_by = None
         self._message_type = None
         self._agents = []  # List of agents
         self._set_fields(**kwargs)
+
+    @property
+    def source(self) -> str:
+        return self._source
+
+    @source.setter
+    def source(self, value: str):
+        self._source = value
 
     @property
     def forwarded_by(self) -> str:

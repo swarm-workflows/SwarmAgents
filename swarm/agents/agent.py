@@ -159,7 +159,7 @@ class Agent(Observer):
             fwd = None
 
             if "agents" in message:
-                source_agent_id = message.get("agents")[0].get("agent_id")
+                source_agent_id = message.get("source")
                 fwd = message.get("forwarded_by")
             else:
                 source_agent_id = message.get("agent_id")
@@ -237,14 +237,14 @@ class Agent(Observer):
 
                 # If broadcasting is enabled, send one message for all
                 if self.topology_peer_agent_list == "all":
-                    hb = HeartBeat(agents=list(agents.values()))
+                    hb = HeartBeat(source=self.agent_id, agents=list(agents.values()))
                     self.hrt_msg_srv.produce_message(json_message=hb.to_dict())
 
                 else:
                     # Send individually only if required
                     for peer_agent_id in self.topology_peer_agent_list:
                         hb_agents = {k: v for k, v in agents.items() if k != peer_agent_id}
-                        hb = HeartBeat(agents=list(hb_agents.values()))
+                        hb = HeartBeat(source=self.agent_id, agents=list(hb_agents.values()))
                         self.hrt_msg_srv.produce_message(json_message=hb.to_dict(),
                                                          topic=f"{self.peer_hb_topic_prefix}-{peer_agent_id}",
                                                          dest=peer_agent_id,
