@@ -71,7 +71,7 @@ if __name__ == '__main__':
     admin_client = AdminClient({'bootstrap.servers': bootstrap_servers})
 
     if args.agents:
-        for x in range(args.agents):
+        for x in range(1, args.agents + 1):
             delete_topic(admin_client, f"{topic_name}-{x}")
             delete_topic(admin_client, f"{topic_name}-hb-{x}")
     else:
@@ -82,7 +82,7 @@ if __name__ == '__main__':
     time.sleep(10)
 
     if args.agents:
-        for x in range(args.agents):
+        for x in range(1, args.agents + 1):
             # Create the topic
             create_topic(admin_client, f"{topic_name}-{x}")
             time.sleep(5)

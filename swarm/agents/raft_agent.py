@@ -56,7 +56,7 @@ class ExtendedRaftNode(RaftNode):
 
 
 class RaftAgent(Agent):
-    def __init__(self, agent_id: str, config_file: str, cycles: int, total_agents: int, address: str = "127.0.0.1", port: int = 5010,
+    def __init__(self, agent_id: int, config_file: str, cycles: int, total_agents: int, address: str = "127.0.0.1", port: int = 5010,
                  peers: Dict[str, str] = {}, redis_host: str = "127.0.0.1", redis_port: int = 6379):
         super(RaftAgent, self).__init__(agent_id=agent_id, config_file=config_file, cycles=cycles,
                                         total_agents=total_agents)
