@@ -114,7 +114,7 @@ class SwarmAgent(Agent):
                     if job.is_complete():
                         completed_jobs += 1
                         continue
-
+                    '''
                     diff = int(time.time() - job.time_last_state_change)
                     if diff > self.restart_job_selection and job.get_state() in [JobState.PREPARE,
                                                                                  JobState.PRE_PREPARE]:
@@ -123,6 +123,7 @@ class SwarmAgent(Agent):
                         self.outgoing_proposals.remove_job(job_id=job.get_job_id())
                         self.incoming_proposals.remove_job(job_id=job.get_job_id())
                         self.restart_job_selection_cnt += 1
+                    '''
 
                     if not job.is_pending():
                         if job.get_leader_agent_id() is None:
