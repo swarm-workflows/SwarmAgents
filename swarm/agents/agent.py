@@ -39,6 +39,7 @@ from logging.handlers import RotatingFileHandler
 from typing import List
 
 import psutil as psutil
+import redis
 import yaml
 from matplotlib import pyplot as plt
 
@@ -49,7 +50,7 @@ from swarm.comm.message_service_kafka import MessageServiceKafka, Observer
 from swarm.models.capacities import Capacities
 from swarm.models.agent_info import AgentInfo
 from swarm.models.profile import ProfileType, PROFILE_MAP
-from swarm.models.job import Job
+from swarm.models.job import Job, JobRepository
 from swarm.queue.simple_job_queue import SimpleJobQueue
 
 
@@ -92,6 +93,8 @@ class Agent(Observer):
         self.peer_heartbeat_timeout = 300
         self.results_dir = "."
         self.shutdown = "auto"
+        self.redis_host = "127.0.0.1"
+        self.redis_port = 6379
         self.load_config(config_file)
         print(f"topology_peer_agent_list: {self.topology_peer_agent_list} {type(self.topology_peer_agent_list)}")
         self.capacities = self.get_system_info()
@@ -129,7 +132,10 @@ class Agent(Observer):
         self.restart_job_selection_cnt = 0
         self.conflicts = 0
         self.plot_figures = False
-        self.job_priority_queue = queue.PriorityQueue()  # Priority queue for jobs
+        self.redis_client = redis.StrictRedis(host=self.redis_host, port=self.redis_port,
+                                              decode_responses=True)
+        self.job_repo = JobRepository(redis_client=self.redis_client)
+        self.completed_jobs_set = set()
 
     def start_idle(self):
         if self.idle_start_time is None:
@@ -396,6 +402,10 @@ class Agent(Observer):
         with open(config_file, 'r') as f:
             config = yaml.safe_load(f)
             topic_suffix = ""
+
+            redis_cfg = config.get("redis")
+            self.redis_host = redis_cfg.get("host")
+            self.redis_port = redis_cfg.get("port")
 
             topology_config = config.get("topology", {})
             if topology_config.get("peer_agents"):

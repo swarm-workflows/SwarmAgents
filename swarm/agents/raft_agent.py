@@ -35,7 +35,7 @@ from swarm.comm.messages.heart_beat import HeartBeat
 from swarm.comm.messages.message import MessageType
 from swarm.models.capacities import Capacities
 from swarm.models.agent_info import AgentInfo
-from swarm.models.job import JobState, Job, JobRepository
+from swarm.models.job import JobState, Job
 
 
 class ExtendedRaftNode(RaftNode):
@@ -56,17 +56,15 @@ class ExtendedRaftNode(RaftNode):
 
 
 class RaftAgent(Agent):
-    def __init__(self, agent_id: int, config_file: str, cycles: int, total_agents: int, address: str = "127.0.0.1", port: int = 5010,
-                 peers: Dict[str, str] = {}, redis_host: str = "127.0.0.1", redis_port: int = 6379):
+    def __init__(self, agent_id: int, config_file: str, cycles: int, total_agents: int,
+                 address: str = "127.0.0.1", port: int = 5010, peers: Dict[str, str] = {}):
         super(RaftAgent, self).__init__(agent_id=agent_id, config_file=config_file, cycles=cycles,
                                         total_agents=total_agents)
         self.agent_id = agent_id
         self.peers = peers
         self.raft = ExtendedRaftNode(self.agent_id, f"{address}:{port}", peers)
-        self.redis_client = redis.StrictRedis(host=redis_host, port=redis_port, decode_responses=True)
         self.shutdown_flag = threading.Event()
         self.job_list = 'jobs'
-        self.job_repo = JobRepository(redis_client=self.redis_client)
 
     def start(self, clean: bool = False):
         self.raft.start()

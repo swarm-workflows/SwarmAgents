@@ -59,6 +59,7 @@ if __name__ == '__main__':
     parser.add_argument('--topic', type=str, required=True, help='Kafka topic name')
     parser.add_argument('--agents', type=int, required=False, help='Kafka topic name')
     parser.add_argument('--broker', type=str, required=False, help='Kafka Broker')
+    parser.add_argument('--redis', type=str, required=False, help='Redis Service')
 
     # Parse command-line arguments
     args = parser.parse_args()
@@ -97,6 +98,6 @@ if __name__ == '__main__':
         create_topic(admin_client, f"{topic_name}-hb")
         time.sleep(5)
 
-    redis_client = redis.StrictRedis(host="127.0.0.1", port=6379, decode_responses=True)
+    redis_client = redis.StrictRedis(host=args.redis, port=6379, decode_responses=True)
     task_repo = JobRepository(redis_client=redis_client)
     task_repo.delete_all(key_prefix="*")

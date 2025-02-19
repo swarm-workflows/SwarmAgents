@@ -102,7 +102,7 @@ class SwarmAgent(Agent):
         self.logger.info(f"Starting agent: {self}")
         while len(self.neighbor_map) + 1 != self.total_agents:
             time.sleep(5)
-            self.logger.info("PEER MAP ---- Waiting for Peer map to be populated!")
+            self.logger.info("[SELECTION_WAIT] Waiting for Peer map to be populated!")
         completed_jobs = 0
         while not self.shutdown:
             try:
@@ -111,9 +111,14 @@ class SwarmAgent(Agent):
                 caps_jobs_selected = Capacities()
 
                 for job in self.job_queue.get_jobs():
-                    if job.is_complete():
+                    if job.get_job_id() in self.completed_jobs_set:
+                        continue
+
+                    if self.job_repo.get_job(job_id=job.get_job_id()):
+                        self.completed_jobs_set.add(job.get_job_id())
                         completed_jobs += 1
                         continue
+
                     '''
                     diff = int(time.time() - job.time_last_state_change)
                     if diff > self.restart_job_selection and job.get_state() in [JobState.PREPARE,
@@ -130,7 +135,7 @@ class SwarmAgent(Agent):
                             proposal1 = self.outgoing_proposals.get_proposal(job_id=job.get_job_id())
                             proposal2 = self.incoming_proposals.get_proposal(job_id=job.get_job_id())
                             self.logger.debug(
-                                f"Job: {job.job_id} State: {job.state}; out: {proposal1} in: {proposal2} skipping it!")
+                                f"[SELECTION_SKIP] Job: {job.job_id} State: {job.state}; out: {proposal1} in: {proposal2} skipping it!")
                         continue
 
                     processed += 1
@@ -160,7 +165,7 @@ class SwarmAgent(Agent):
                         proposals.clear()
                         caps_jobs_selected = Capacities()
 
-                        self.logger.debug(f"Added proposals: {proposals}")
+                        #self.logger.debug(f"Added proposals: {proposals}")
 
                     if processed >= 40:
                         time.sleep(1)
@@ -175,7 +180,7 @@ class SwarmAgent(Agent):
                     self._send_message(json_message=msg.to_dict())
                     for p in proposals:
                         self.outgoing_proposals.add_proposal(p)
-                    self.logger.debug(f"Added remaining proposals: {proposals}")
+                    #self.logger.debug(f"Added remaining proposals: {proposals}")
                     proposals.clear()
 
                 time.sleep(1)  # Adjust the sleep duration as needed
@@ -279,7 +284,7 @@ class SwarmAgent(Agent):
         min_cost_agents = self.__find_min_cost_agents(cost_matrix)
         if len(min_cost_agents) and min_cost_agents[0] == self.agent_id:
             return True
-        self.logger.debug(f"[CONSENSUS]: Not picked Job: {job.get_job_id()} - {job} "
+        self.logger.debug(f"[SELECTION]: Not picked Job: {job.get_job_id()} - TIME: {job.no_op} "
                           f"MIN Cost Agents: {min_cost_agents}")
         return False
 
@@ -438,12 +443,12 @@ class SwarmAgent(Agent):
                 if proposal.agent_id == self.agent_id:
                     job.set_leader(leader_agent_id=proposal.agent_id)
                 if self.outgoing_proposals.contains(job_id=p.job_id, p_id=p.p_id):
-                    self.logger.info(f"[LEADER CONSENSUS] achieved for Job: {p.job_id} Leader: {self.agent_id}")
+                    self.logger.info(f"[CONSENSUS_LEADER] achieved for Job: {p.job_id} Leader: {self.agent_id}")
                     job.change_state(new_state=JobState.READY)
                     self.select_job(job)
                     self.outgoing_proposals.remove_job(job_id=p.job_id)
                 else:
-                    self.logger.info(f"[PARTICIPANT CONSENSUS] achieved for Job: {p.job_id} Leader: {p.agent_id}")
+                    self.logger.info(f"[CONSENSUS_PARTICIPANT] achieved for Job: {p.job_id} Leader: {p.agent_id}")
                     job.change_state(new_state=JobState.COMMIT)
                     self.incoming_proposals.remove_job(job_id=p.job_id)
 
@@ -493,10 +498,13 @@ class SwarmAgent(Agent):
         '''
 
     def execute_job(self, job: Job):
+        self.job_repo.save_job(job=job)
         super().execute_job(job=job)
+        '''
         msg = JobStatus(agents=[AgentInfo(agent_id=self.agent_id)], jobs=[JobInfo(job_id=job.get_job_id(),
                                                                                   state=job.state)])
         self._send_message(json_message=msg.to_dict())
+        '''
 
     def __get_proposed_capacities(self):
         proposed_capacities = Capacities()
