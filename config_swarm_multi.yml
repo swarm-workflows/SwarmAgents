@@ -10,9 +10,9 @@ topology:
   peer_agents: all
 kafka:
   bootstrap_servers: zoo-0:9092,zoo-1:9092,zoo-2:9092
-  topic: agent-swarm-multi
-  hb_topic: agent-swarm-multi-hb
-  consumer_group_id: agent-swarm-multi
+  topic: multi
+  hb_topic: multi-hb
+  consumer_group_id: cg
 nats:
   nats_servers: nats://127.0.0.1:4222
   nats_topic: agent-swarm-multi

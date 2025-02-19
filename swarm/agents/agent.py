@@ -400,20 +400,24 @@ class Agent(Observer):
 
             kafka_config = config.get("kafka", {})
             nat_config = config.get("nats", {})
+
+            topic = kafka_config.get("consumer_group_id", "agent")
+            topic_hb = kafka_config.get("hb_topic", "agent-hb")
+            cg = kafka_config.get("consumer_group_id", "cg")
             self.kafka_config = {
                 'kafka_bootstrap_servers': kafka_config.get("bootstrap_servers", "localhost:19092"),
-                'kafka_topic': f'{kafka_config.get("topic", "agent_load")}-{topic_suffix}',
-                'consumer_group_id': f'{kafka_config.get("consumer_group_id", "swarm_agent")}-{self.agent_id}'
+                'kafka_topic': f'{topic}-{topic_suffix}',
+                'consumer_group_id': f'{cg}-{topic}-{self.agent_id}'
             }
-            self.peer_topic_prefix = kafka_config.get("topic", "agent_load")
+            self.peer_topic_prefix = topic
 
             self.kafka_config_hb = {
                 'kafka_bootstrap_servers': kafka_config.get("bootstrap_servers", "localhost:19092"),
-                'kafka_topic': f'{kafka_config.get("hb_topic", "agent_load_hb")}-{topic_suffix}',
-                'consumer_group_id': f'{kafka_config.get("consumer_group_id", "swarm_agent")}-{self.agent_id}'
+                'kafka_topic': f'{topic_hb}-{topic_suffix}',
+                'consumer_group_id': f'{cg}-{topic_hb}-{self.agent_id}'
             }
 
-            self.peer_hb_topic_prefix = kafka_config.get("hb_topic", "agent_load_hb")
+            self.peer_hb_topic_prefix = topic_hb
 
             self.nat_config = {
                 'nats_servers': nat_config.get('nats_servers', 'nats://127.0.0.1:4222'),
