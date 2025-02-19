@@ -238,13 +238,13 @@ class Agent(Observer):
                                                          dest=peer_agent_id,
                                                          src=self.agent_id)
                 else:
-                    hb = HeartBeat(agents=list(hb_agents.values()))
+                    hb = HeartBeat(agents=list(agents.values()))
                     self.hrt_msg_srv.produce_message(hb.to_dict())
                 time.sleep(5)
             except Exception as e:
                 self.logger.error(f"Error occurred while sending heartbeat e: {e}")
                 self.logger.error(traceback.format_exc())
-            if self._can_shutdown(heart_beat=heart_beat):
+            if self._can_shutdown(agents=agents):
                 self.stop()
 
     def _send_message(self, json_message: dict, excluded_peers: list[int] = [], src: int = None, fwd: int = None):
@@ -840,8 +840,8 @@ class Agent(Observer):
         self.save_idle_time_per_agent()
         self.logger.info("Plot completed")
 
-    def _can_shutdown(self, heart_beat: HeartBeat):
-        if not heart_beat:
+    def _can_shutdown(self, agents: dict):
+        if not agents or len(agents) == 0:
             return False
 
         if self.shutdown != "auto":
@@ -857,7 +857,7 @@ class Agent(Observer):
                 return False
             return True
 
-        for peer in heart_beat.agents:
+        for peer in agents:
             if peer.load != 0.0:
                 self.load_check_counter = 0
                 return False
