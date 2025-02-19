@@ -37,9 +37,9 @@ class SwarmConfigGenerator:
         :return: A list of lists, where each sublist represents a ring of agents.
         """
         rings = []
-        agents = list(range(self.num_agents))
+        agents = list(range(1, self.num_agents + 1))  # Start IDs from 1
 
-        # Always include agent 0 in the first ring
+        # Always include agent 1 in the first ring
         first_ring = agents[:5]
         rings.append(first_ring)
 
@@ -82,7 +82,7 @@ class SwarmConfigGenerator:
 
         self.print_ring_topology()  # Print rings before generating configs
 
-        agent_peers = {i: [] for i in range(self.num_agents)}
+        agent_peers = {i: [] for i in range(1, self.num_agents + 1)}  # IDs start from 1
 
         # Assign peer connections based on ring topology
         for ring in self.rings:
@@ -115,7 +115,7 @@ class SwarmConfigGenerator:
         config_prefix = self.get_config_prefix()
 
         # Generate YAML files for each agent
-        for agent_id in range(self.num_agents):
+        for agent_id in range(1, self.num_agents + 1):
             config = self.base_config.copy()
             config["topology"] = {"peer_agents": agent_peers[agent_id]}
 

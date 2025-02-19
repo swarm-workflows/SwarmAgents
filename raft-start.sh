@@ -6,9 +6,10 @@ rm -rf raft
 mkdir -p raft
 # Define the number of agents
 num_agents=10
+base_index=0
 
 # Launch the Python commands for each agent
 for i in $(seq 0 $(($num_agents - 1))); do
-    python3 main-raft.py $i $num_agents 100 &
+    python3 main-raft.py $(($base_index + $i)) $num_agents 100 &
     sleep 1
 done
