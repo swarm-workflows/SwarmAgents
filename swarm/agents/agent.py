@@ -129,6 +129,7 @@ class Agent(Observer):
         self.restart_job_selection_cnt = 0
         self.conflicts = 0
         self.plot_figures = False
+        self.job_priority_queue = queue.PriorityQueue()  # Priority queue for jobs
 
     def start_idle(self):
         if self.idle_start_time is None:
@@ -222,6 +223,7 @@ class Agent(Observer):
 
         return agents
 
+    '''
     def _heartbeat_main(self):
         agents = {}
         while not self.shutdown:
@@ -246,10 +248,44 @@ class Agent(Observer):
                 self.logger.error(traceback.format_exc())
             if self._can_shutdown(agents=agents):
                 self.stop()
+    '''
+
+    def _heartbeat_main(self):
+        while not self.shutdown:
+            agents = None
+            try:
+                agents = self._build_heart_beat()
+
+                # If broadcasting is enabled, send one message for all
+                if self.topology_peer_agent_list == "all":
+                    hb = HeartBeat(agents=list(agents.values()))
+                    self.hrt_msg_srv.produce_message(json_message=hb.to_dict())
+
+                else:
+                    # Send individually only if required
+                    for peer_agent_id in self.topology_peer_agent_list:
+                        hb_agents = {k: v for k, v in agents.items() if k != peer_agent_id}
+                        hb = HeartBeat(agents=list(hb_agents.values()))
+                        self.hrt_msg_srv.produce_message(json_message=hb.to_dict(),
+                                                         topic=f"{self.peer_hb_topic_prefix}-{peer_agent_id}",
+                                                         dest=peer_agent_id,
+                                                         src=self.agent_id)
+
+                time.sleep(5)
+            except Exception as e:
+                self.logger.error(f"Error occurred while sending heartbeat e: {e}")
+                self.logger.error(traceback.format_exc())
+
+            if self._can_shutdown(agents=agents):
+                self.stop()
 
     def _send_message(self, json_message: dict, excluded_peers: list[int] = [], src: int = None, fwd: int = None):
         if src is None:
             src = self.agent_id
+
+        if excluded_peers is None:
+            excluded_peers = set()
+
         if isinstance(self.topology_peer_agent_list, list):
             for peer_agent_id in self.topology_peer_agent_list:
                 if peer_agent_id in excluded_peers:
@@ -261,6 +297,7 @@ class Agent(Observer):
         else:
             self.ctrl_msg_srv.produce_message(json_message=json_message)
 
+    '''
     def _message_processor_main(self):
         self.logger.info("Message Processor Started")
         while True:
@@ -278,7 +315,28 @@ class Agent(Observer):
                 self.logger.error(f"Error occurred while processing message e: {e}")
                 self.logger.error(traceback.format_exc())
         self.logger.info("Message Processor Stopped")
+    '''
 
+    def _message_processor_main(self):
+        self.logger.info("Message Processor Started")
+
+        while not self.shutdown:
+            try:
+                messages = []
+                while not self.message_queue.empty():
+                    messages.extend(self.__dequeue(self.message_queue))
+
+                if messages:
+                    self._process_messages(messages=messages)
+
+                time.sleep(0.01)  # Short sleep to prevent CPU overuse
+            except Exception as e:
+                self.logger.error(f"Error occurred while processing message e: {e}")
+                self.logger.error(traceback.format_exc())
+
+        self.logger.info("Message Processor Stopped")
+
+    '''
     def _heartbeat_processor_main(self):
         self.logger.info("Heartbeat Processor Started")
         while True:
@@ -296,6 +354,26 @@ class Agent(Observer):
                 self.logger.error(f"Error occurred while processing message e: {e}")
                 self.logger.error(traceback.format_exc())
         self.logger.info("Heartbeat Processor Stopped")
+    '''
+
+    def _heartbeat_processor_main(self):
+        self.logger.info("Heartbeat Processor Started")
+
+        while not self.shutdown:
+            try:
+                messages = []
+                while not self.hb_message_queue.empty():
+                    messages.extend(self.__dequeue(self.hb_message_queue))
+
+                if messages:
+                    self._process_messages(messages=messages)
+
+                time.sleep(0.01)  # Short sleep to avoid tight loop consuming CPU
+            except Exception as e:
+                self.logger.error(f"Error occurred while processing heartbeat messages e: {e}")
+                self.logger.error(traceback.format_exc())
+
+        self.logger.info("Heartbeat Processor Stopped")
 
     def _process_messages(self, *, messages: List[dict]):
         for message in messages:
@@ -308,7 +386,7 @@ class Agent(Observer):
                 else:
                     self.logger.info(f"Ignoring unsupported message: {message}")
                 diff = int(time.time() - begin)
-                if diff > 0:
+                if diff > 1:
                     self.logger.info(f"Event {message.get('message_type')} TIME: {diff}")
             except Exception as e:
                 self.logger.error(f"Error while processing message {type(message)}, {e}")

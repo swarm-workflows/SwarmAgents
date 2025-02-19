@@ -107,6 +107,13 @@ class Job:
         self.leader_agent_id = None
         self.time_last_state_change = 0
 
+    def get_age(self) -> float:
+        """
+        Returns the age of the job in seconds since it was created.
+        :return: Age of the job in seconds
+        """
+        return time.time() - self.created_at
+
     def set_selection_start_time(self):
         with self.lock:
             if self.selected_by_agent_at is None:

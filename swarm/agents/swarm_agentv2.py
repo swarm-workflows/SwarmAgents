@@ -21,7 +21,7 @@
 # SOFTWARE.
 #
 # Author: Komal Thareja(kthare10@renci.org)
-
+import queue
 import random
 import time
 import traceback
@@ -359,7 +359,7 @@ class SwarmAgent(Agent):
             # New proposal
             else:
                 proposal = p
-                p.prepares = []
+                #p.prepares = []
                 self.incoming_proposals.add_proposal(proposal=p)
 
             if incoming.agents[0].agent_id not in proposal.prepares:
@@ -421,7 +421,7 @@ class SwarmAgent(Agent):
                 proposal = p
                 #p.prepares = []
                 #p.commits = []
-                proposal.commits = []
+                #proposal.commits = []
                 self.incoming_proposals.add_proposal(proposal=proposal)
 
             if incoming.agents[0].agent_id not in proposal.commits:
