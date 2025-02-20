@@ -67,7 +67,7 @@ def build_tasks_from_json(json_file):
         data = json.load(f)
         for task_data in data:
             task = Job()
-            task.set_job_id(task_data['agent_id'])
+            task.set_job_id(task_data['id'])
             task.set_capacities(Capacities.from_dict(task_data['capacities']))
             task.no_op = task_data['no_op']
             for data_in in task_data['data_in']:
