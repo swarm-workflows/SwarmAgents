@@ -246,7 +246,8 @@ class Agent(Observer):
             try:
                 agents = self._build_heart_beat()
                 if self.heartbeat_mode != "kafka":
-                    self.agent_repo.save(agents[0].to_dict(), key_prefix="agent")
+                    agent_info = next(agents.values()[0])
+                    self.agent_repo.save(agent_info.to_dict(), key_prefix="agent")
 
                     # Update Peer info
                     peers = self.agent_repo.get_all_objects(key_prefix="agent")
