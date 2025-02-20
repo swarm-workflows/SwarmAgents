@@ -56,7 +56,8 @@ class SwarmAgent(Agent):
         agent = AgentInfo(agent_id=self.agent_id,
                           capacities=self.capacities,
                           capacity_allocations=self.ready_queue.capacities(jobs=self.ready_queue.get_jobs()),
-                          load=my_load)
+                          load=my_load,
+                          last_updated=time.time())
         self._save_load_metric(self.agent_id, my_load)
         if isinstance(self.topology_peer_agent_list, list) and len(self.neighbor_map.values()):
             for peer_agent_id, peer in self.neighbor_map.items():
