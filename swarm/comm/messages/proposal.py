@@ -65,3 +65,4 @@ if __name__ == '__main__':
 
     new_p = Proposal.from_dict(proposal.to_dict())
     print(new_p)
+    print(new_p.proposals[0].job_id)

@@ -51,7 +51,7 @@ from swarm.database.repository import Repository
 from swarm.models.capacities import Capacities
 from swarm.models.agent_info import AgentInfo
 from swarm.models.profile import ProfileType, PROFILE_MAP
-from swarm.models.job import Job, JobRepository
+from swarm.models.job import Job
 from swarm.queue.simple_job_queue import SimpleJobQueue
 
 
@@ -247,7 +247,7 @@ class Agent(Observer):
                 agents = self._build_heart_beat()
                 if self.heartbeat_mode != "kafka":
                     agent_info = agents[self.agent_id]
-                    self.agent_repo.save(agent_info.to_dict(), key_prefix="agent")
+                    self.agent_repo.save(obj=agent_info.to_dict(), key_prefix="agent")
 
                     # Update Peer info
                     peers = self.agent_repo.get_all_objects(key_prefix="agent")
