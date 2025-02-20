@@ -24,7 +24,7 @@
 import redis
 
 
-def display_tasks(redis_host='localhost', redis_port=6379, task_list='tasks'):
+def display_tasks(redis_host='zoo-0', redis_port=6379, task_list='tasks'):
     # Connect to the Redis database
     redis_client = redis.StrictRedis(host=redis_host, port=redis_port, decode_responses=True)
 

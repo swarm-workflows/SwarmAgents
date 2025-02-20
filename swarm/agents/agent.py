@@ -250,6 +250,7 @@ class Agent(Observer):
 
                     # Update Peer info
                     peers = self.agent_repo.get_all_objects(key_prefix="agent")
+                    self.logger.debug(f"Fetched peers: {peers}")
                     for p in peers:
                         agent_info = AgentInfo.from_dict(p)
                         self.__add_peer(peer=agent_info)
@@ -935,7 +936,7 @@ class Agent(Observer):
         """
         Adds or updates a peer in the neighbor map, ensuring only the latest update is stored.
         """
-        if peer.id is None:
+        if peer.id is None or peer.id == self.agent_id:
             return  # Ignore invalid agent_id
 
         with self.neighbor_map_lock:
