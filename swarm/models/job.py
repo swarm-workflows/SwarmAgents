@@ -51,7 +51,7 @@ class JobState(enum.Enum):
 
 
 job = {
-    "id": "job_id",
+    "agent_id": "job_id",
     "no_op": 10,
     "capacities": {
         "core": 1,
@@ -377,7 +377,7 @@ class Job:
 
     def to_dict(self):
         return {
-            'id': self.job_id,
+            'agent_id': self.job_id,
             'capacities': self.capacities.to_dict() if self.capacities else None,
             'capacity_allocations': self.capacity_allocations,
             'no_op': self.no_op,
@@ -398,7 +398,7 @@ class Job:
         }
 
     def from_dict(self, job_data: dict):
-        self.job_id = job_data['id']
+        self.job_id = job_data['agent_id']
         self.capacities = Capacities.from_dict(job_data['capacities']) if job_data.get('capacities') else None
         self.capacity_allocations = Capacities.from_dict(job_data['capacity_allocations']) if job_data.get('capacity_allocations') else None
         self.no_op = job_data['no_op']

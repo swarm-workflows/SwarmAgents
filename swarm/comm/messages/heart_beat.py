@@ -34,7 +34,7 @@ class HeartBeat(Message):
 if __name__ == '__main__':
     from swarm.models.capacities import Capacities
 
-    agent = AgentInfo(id="agent-1", load=0.1, capacities=Capacities(core=1.0, disk=1.0, ram=1.0),)
+    agent = AgentInfo(agent_id="agent-1", load=0.1, capacities=Capacities(core=1.0, disk=1.0, ram=1.0),)
     print(agent)
     print(agent.to_dict())
 

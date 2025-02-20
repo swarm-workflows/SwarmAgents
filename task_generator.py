@@ -75,7 +75,7 @@ class TaskGenerator:
             data_out.append({'remote_ip': remote_ip, 'remote_file': remote_file, 'remote_user': 'root'})
 
         task = {
-            'id': task_id,
+            'agent_id': task_id,
             'no_op': no_op,
             'capacities': {'core': core, 'ram': ram, 'disk': disk},
             'data_in': data_in,

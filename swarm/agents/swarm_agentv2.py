@@ -54,7 +54,7 @@ class SwarmAgent(Agent):
     def _build_heart_beat(self, only_self: bool = False) -> dict:
         agents = {}
         my_load = self.compute_overall_load(proposed_jobs=self.outgoing_proposals.jobs())
-        agent = AgentInfo(id=self.agent_id,
+        agent = AgentInfo(agent_id=self.agent_id,
                           capacities=self.capacities,
                           capacity_allocations=self.ready_queue.capacities(jobs=self.ready_queue.get_jobs()),
                           load=my_load,
@@ -152,7 +152,7 @@ class SwarmAgent(Agent):
 
                     if len(proposals) >= self.number_of_jobs_per_proposal:
                         msg = Proposal(source=self.agent_id,
-                                       agents=[AgentInfo(id=self.agent_id)],
+                                       agents=[AgentInfo(agent_id=self.agent_id)],
                                        proposals=proposals)
                         self._send_message(json_message=msg.to_dict())
                         for p in proposals:
@@ -168,7 +168,7 @@ class SwarmAgent(Agent):
 
                 # Send remaining proposals if any exist
                 if proposals:
-                    msg = Proposal(source=self.agent_id, agents=[AgentInfo(id=self.agent_id)],
+                    msg = Proposal(source=self.agent_id, agents=[AgentInfo(agent_id=self.agent_id)],
                                    proposals=proposals)
                     self._send_message(json_message=msg.to_dict())
                     for p in proposals:
@@ -189,7 +189,7 @@ class SwarmAgent(Agent):
         :param jobs: List of jobs to compute costs for.
         :return: A 2D numpy array where each entry [i, j] is the cost of agent i for job j.
         """
-        agent_ids = [self.agent_id] + [peer.id for peer in self.neighbor_map.values()]
+        agent_ids = [self.agent_id] + [peer.agent_id for peer in self.neighbor_map.values()]
         num_agents = len(agent_ids)
         num_jobs = len(jobs)
 
@@ -235,7 +235,7 @@ class SwarmAgent(Agent):
         :return: A list of agent IDs corresponding to the minimum cost for each job.
         """
         min_cost_agents = []
-        agent_ids = [self.agent_id] + [peer.id for peer in self.neighbor_map.values()]
+        agent_ids = [self.agent_id] + [peer.agent_id for peer in self.neighbor_map.values()]
 
         for j in range(cost_matrix.shape[1]):  # Iterate over each job (column)
             valid_costs = cost_matrix[:, j]  # Get the costs for job j
@@ -319,8 +319,8 @@ class SwarmAgent(Agent):
                 # Increment the number of prepares to count the prepare being sent
                 # Needed to handle 3 agent case
                 proposals.append(p)
-                if incoming.agents[0].id not in p.prepares:
-                    p.prepares.append(incoming.agents[0].id)
+                if incoming.agents[0].agent_id not in p.prepares:
+                    p.prepares.append(incoming.agents[0].agent_id)
                 self.incoming_proposals.add_proposal(proposal=p)
                 job.change_state(JobState.PREPARE)  # Ensure this is where you want the state to change
 
@@ -328,15 +328,15 @@ class SwarmAgent(Agent):
                 proposals_to_forward.append(p)
 
         if len(proposals_to_forward):
-            msg = Proposal(source=incoming.agents[0].id,
-                           agents=[AgentInfo(agent_id=incoming.agents[0].id)], proposals=proposals_to_forward,
+            msg = Proposal(source=incoming.agents[0].agent_id,
+                           agents=[AgentInfo(agent_id=incoming.agents[0].agent_id)], proposals=proposals_to_forward,
                            forwarded_by=self.agent_id)
             self._send_message(json_message=msg.to_dict(),
-                               excluded_peers=[incoming.forwarded_by, incoming.agents[0].id],
-                               src=incoming.agents[0].id, fwd=self.agent_id)
+                               excluded_peers=[incoming.forwarded_by, incoming.agents[0].agent_id],
+                               src=incoming.agents[0].agent_id, fwd=self.agent_id)
 
         if len(proposals):
-            msg = Prepare(source=self.agent_id, agents=[AgentInfo(id=self.agent_id)], proposals=proposals)
+            msg = Prepare(source=self.agent_id, agents=[AgentInfo(agent_id=self.agent_id)], proposals=proposals)
             self._send_message(json_message=msg.to_dict())
 
     def __receive_prepare(self, incoming: Prepare):
@@ -361,8 +361,8 @@ class SwarmAgent(Agent):
                 proposal = p
                 self.incoming_proposals.add_proposal(proposal=p)
 
-            if incoming.agents[0].id not in proposal.prepares:
-                proposal.prepares.append(incoming.agents[0].id)
+            if incoming.agents[0].agent_id not in proposal.prepares:
+                proposal.prepares.append(incoming.agents[0].agent_id)
                 # Forward Prepare for peer proposals
                 if proposal.agent_id != self.agent_id:
                     proposals_to_forward.append(p)
@@ -385,17 +385,17 @@ class SwarmAgent(Agent):
                 job.change_state(JobState.COMMIT)  # Update job state to COMMIT
 
         if len(proposals):
-            msg = Commit(source=self.agent_id, agents=[AgentInfo(id=self.agent_id)], proposals=proposals)
+            msg = Commit(source=self.agent_id, agents=[AgentInfo(agent_id=self.agent_id)], proposals=proposals)
             self._send_message(json_message=msg.to_dict())
 
         if len(proposals_to_forward):
-            # Use the originators agent id when forwarding the Prepare
-            msg = Prepare(source=incoming.agents[0].id, agents=[AgentInfo(id=incoming.agents[0].id)],
+            # Use the originators agent agent_id when forwarding the Prepare
+            msg = Prepare(source=incoming.agents[0].agent_id, agents=[AgentInfo(agent_id=incoming.agents[0].agent_id)],
                           proposals=proposals_to_forward,
                           forwarded_by=self.agent_id)
             self._send_message(json_message=msg.to_dict(),
-                               excluded_peers=[incoming.forwarded_by, incoming.agents[0].id],
-                               src=incoming.agents[0].id, fwd=self.agent_id)
+                               excluded_peers=[incoming.forwarded_by, incoming.agents[0].agent_id],
+                               src=incoming.agents[0].agent_id, fwd=self.agent_id)
 
     def __receive_commit(self, incoming: Commit):
         #self.logger.debug(f"Received commit from: {incoming.agents[0].agent_id}")
@@ -419,8 +419,8 @@ class SwarmAgent(Agent):
                 proposal = p
                 self.incoming_proposals.add_proposal(proposal=proposal)
 
-            if incoming.agents[0].id not in proposal.commits:
-                proposal.commits.append(incoming.agents[0].id)
+            if incoming.agents[0].agent_id not in proposal.commits:
+                proposal.commits.append(incoming.agents[0].agent_id)
                 if proposal.agent_id != self.agent_id:
                     proposals_to_forward.append(proposal)
 
@@ -443,12 +443,12 @@ class SwarmAgent(Agent):
                     self.incoming_proposals.remove_job(job_id=p.job_id)
 
         if len(proposals_to_forward):
-            msg = Commit(source=incoming.agents[0].id, agents=[AgentInfo(id=incoming.agents[0].id)],
+            msg = Commit(source=incoming.agents[0].agent_id, agents=[AgentInfo(agent_id=incoming.agents[0].agent_id)],
                          proposals=proposals_to_forward,
                          forwarded_by=self.agent_id)
             self._send_message(json_message=msg.to_dict(),
-                               excluded_peers=[incoming.forwarded_by, incoming.agents[0].id],
-                               src=incoming.agents[0].id, fwd=self.agent_id)
+                               excluded_peers=[incoming.forwarded_by, incoming.agents[0].agent_id],
+                               src=incoming.agents[0].agent_id, fwd=self.agent_id)
 
     def __receive_job_status(self, incoming: JobStatus):
         #self.logger.debug(f"Received Status from: {incoming.agents[0].agent_id}")
@@ -464,7 +464,7 @@ class SwarmAgent(Agent):
                 self.logger.debug(f"Job: {job.get_job_id()} Ignoring Job Status (State: {job.state})")
                 continue
 
-            if incoming.agents[0].id == self.agent_id:
+            if incoming.agents[0].agent_id == self.agent_id:
                 continue
 
             # Update the job status based on broadcast message
@@ -479,7 +479,7 @@ class SwarmAgent(Agent):
         # Forward Job Status
         '''
         if len(jobs_to_fwd):
-            # Use the originators agent id when forwarding the Prepare
+            # Use the originators agent agent_id when forwarding the Prepare
             msg = JobStatus(agents=[AgentInfo(agent_id=incoming.agents[0].agent_id)], jobs=jobs_to_fwd,
                                     forwarded_by=self.agent_id)
             self._send_message(json_message=msg.to_dict(),

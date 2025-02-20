@@ -43,7 +43,7 @@ class MessageServiceKafka:
         self.producer = Producer({"bootstrap.servers": self.kafka_bootstrap_servers, "acks": "all",})
         self.consumer = Consumer({
             "bootstrap.servers": self.kafka_bootstrap_servers,
-            "group.id": self.consumer_group_id,
+            "group.agent_id": self.consumer_group_id,
             "auto.offset.reset": "latest",
             "enable.auto.commit": self.enable_auto_commit,
             "on_commit": self.commit_completed,

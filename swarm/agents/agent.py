@@ -214,10 +214,10 @@ class Agent(Observer):
         for peer in incoming.agents:
             if self.shutdown_mode == "auto":
                 peer.last_updated = time.time()
-            if peer.id == self.agent_id:
+            if peer.agent_id == self.agent_id:
                 continue
             self.__add_peer(peer=peer)
-            self._save_load_metric(peer.id, peer.load)
+            self._save_load_metric(peer.agent_id, peer.load)
 
     def _save_load_metric(self, agent_id: int, load: float):
         if agent_id not in self.load_per_agent:
@@ -227,7 +227,7 @@ class Agent(Observer):
     def _build_heart_beat(self, only_self: bool = False) -> dict:
         agents = {}
         my_load = self.compute_overall_load()
-        agent = AgentInfo(id=self.agent_id,
+        agent = AgentInfo(agent_id=self.agent_id,
                           capacities=self.capacities,
                           capacity_allocations=self.ready_queue.capacities(jobs=self.ready_queue.get_jobs()),
                           load=my_load,
@@ -902,7 +902,7 @@ class Agent(Observer):
             for peer in self.neighbor_map.values():
                 diff = int(time.time() - peer.last_updated)
                 if diff >= self.peer_heartbeat_timeout:
-                    peers_to_remove.append(peer.id)
+                    peers_to_remove.append(peer.agent_id)
             for p in peers_to_remove:
                 self.__remove_peer(agent_id=p)
             if not os.path.exists(self.shutdown_path):
@@ -919,7 +919,7 @@ class Agent(Observer):
         for peer in self.neighbor_map.values():
             diff = int(time.time() - peer.last_updated)
             if diff >= self.peer_heartbeat_timeout:
-                peers_to_remove.append(peer.id)
+                peers_to_remove.append(peer.agent_id)
         for p in peers_to_remove:
             self.__remove_peer(agent_id=p)
         for peer in self.neighbor_map.values():
@@ -936,15 +936,15 @@ class Agent(Observer):
         """
         Adds or updates a peer in the neighbor map, ensuring only the latest update is stored.
         """
-        if peer.id is None or peer.id == self.agent_id:
+        if peer.agent_id is None or peer.agent_id == self.agent_id:
             return  # Ignore invalid agent_id
 
         with self.neighbor_map_lock:
-            current_peer_info = self.neighbor_map.get(peer.id)
+            current_peer_info = self.neighbor_map.get(peer.agent_id)
 
             # Only update if the new peer info is newer
             if current_peer_info is None or peer.last_updated > current_peer_info.last_updated:
-                self.neighbor_map[peer.id] = peer
+                self.neighbor_map[peer.agent_id] = peer
 
     def __remove_peer(self, agent_id: str):
         with self.neighbor_map_lock:
