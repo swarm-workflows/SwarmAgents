@@ -667,18 +667,22 @@ class Agent(Observer):
 
     def start(self):
         self.ctrl_msg_srv.register_observers(agent=self)
-        self.hrt_msg_srv.register_observers(agent=self)
-        self.heartbeat_receiver_thread.start()
+        if self.hrt_msg_srv:
+            self.hrt_msg_srv.register_observers(agent=self)
+        if self.heartbeat_receiver_thread:
+            self.heartbeat_receiver_thread.start()
         self.msg_receiver_thread.start()
         self.ctrl_msg_srv.start()
-        self.hrt_msg_srv.start()
-        self.heartbeat_thread.start()
+        if self.hrt_msg_srv:
+            self.hrt_msg_srv.start()
+        if self.heartbeat_receiver_thread:
+            self.heartbeat_thread.start()
         self.job_selection_thread.start()
         self.job_scheduling_thread.start()
 
         if self.heartbeat_thread.is_alive():
             self.heartbeat_thread.join()
-        if self.heartbeat_receiver_thread.is_alive():
+        if self.heartbeat_receiver_thread and self.heartbeat_receiver_thread.is_alive():
             self.heartbeat_receiver_thread.join()
         if self.msg_receiver_thread.is_alive():
             self.msg_receiver_thread.join()
@@ -690,7 +694,8 @@ class Agent(Observer):
     def stop(self):
         self.shutdown = True
         self.ctrl_msg_srv.stop()
-        self.hrt_msg_srv.stop()
+        if self.hrt_msg_srv:
+            self.hrt_msg_srv.stop()
         with self.condition:
             self.condition.notify_all()
         self.plot_results()
