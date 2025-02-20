@@ -104,7 +104,7 @@ class SwarmAgent(Agent):
         while len(self.neighbor_map) + 1 != self.total_agents:
             time.sleep(5)
             self.logger.info("[SELECTION_WAIT] Waiting for Peer map to be populated!")
-        completed_jobs = 0
+
         while not self.shutdown:
             try:
                 processed = 0
@@ -112,12 +112,7 @@ class SwarmAgent(Agent):
                 caps_jobs_selected = Capacities()
 
                 for job in self.job_queue.get_jobs():
-                    if job.get_job_id() in self.completed_jobs_set:
-                        continue
-
-                    if self.job_repo.get_job(job_id=job.get_job_id()):
-                        self.completed_jobs_set.add(job.get_job_id())
-                        completed_jobs += 1
+                    if self.is_job_completed(job_id=job.get_job_id()):
                         continue
 
                     '''
@@ -157,9 +152,8 @@ class SwarmAgent(Agent):
 
                     if len(proposals) >= self.number_of_jobs_per_proposal:
                         msg = Proposal(source=self.agent_id,
-                            agents=[AgentInfo(agent_id=self.agent_id)],
-                            proposals=proposals
-                        )
+                                       agents=[AgentInfo(agent_id=self.agent_id)],
+                                       proposals=proposals)
                         self._send_message(json_message=msg.to_dict())
                         for p in proposals:
                             self.outgoing_proposals.add_proposal(p)  # Add all proposals
@@ -174,10 +168,8 @@ class SwarmAgent(Agent):
 
                 # Send remaining proposals if any exist
                 if proposals:
-                    msg = Proposal(source=self.agent_id,
-                        agents=[AgentInfo(agent_id=self.agent_id)],
-                        proposals=proposals
-                    )
+                    msg = Proposal(source=self.agent_id, agents=[AgentInfo(agent_id=self.agent_id)],
+                                   proposals=proposals)
                     self._send_message(json_message=msg.to_dict())
                     for p in proposals:
                         self.outgoing_proposals.add_proposal(p)
@@ -296,9 +288,9 @@ class SwarmAgent(Agent):
         proposals_to_forward = []
         for p in incoming.proposals:
             job = self.job_queue.get_job(job_id=p.job_id)
-            if not job or job.is_ready() or job.is_complete() or job.is_running():
+            if self.is_job_completed(job_id=job.get_job_id()):
                 self.logger.debug(f"Ignoring Proposal: {p} for job: {job}")
-                continue  # Continue instead of return to process other proposals
+                continue
 
             my_proposal = self.outgoing_proposals.has_better_proposal(proposal=p)
             peer_proposal = self.incoming_proposals.has_better_proposal(proposal=p)
@@ -354,8 +346,8 @@ class SwarmAgent(Agent):
 
         for p in incoming.proposals:
             job = self.job_queue.get_job(job_id=p.job_id)
-            if not job or job.is_ready() or job.is_complete() or job.is_running():
-                self.logger.debug(f"Job: {job} Ignoring Prepare: {p}")
+            if self.is_job_completed(job_id=job.get_job_id()):
+                self.logger.debug(f"Job: {job.get_job_id()} Ignoring Prepare: {p}")
                 continue
 
             # I have sent this proposal
@@ -367,7 +359,6 @@ class SwarmAgent(Agent):
             # New proposal
             else:
                 proposal = p
-                #p.prepares = []
                 self.incoming_proposals.add_proposal(proposal=p)
 
             if incoming.agents[0].agent_id not in proposal.prepares:
@@ -413,9 +404,8 @@ class SwarmAgent(Agent):
         for p in incoming.proposals:
             job = self.job_queue.get_job(job_id=p.job_id)
 
-            if not job or job.is_complete() or job.is_ready() or job.is_running() or \
-                    job.leader_agent_id is not None:
-                self.logger.debug(f"Job: {job} Ignoring Commit: {p}")
+            if self.is_job_completed(job_id=job.get_job_id()):
+                self.logger.debug(f"Job: {job.get_job_id()} Ignoring Commit: {p}")
                 self.incoming_proposals.remove_job(job_id=p.job_id)
                 self.outgoing_proposals.remove_job(job_id=p.job_id)
                 continue  # Continue instead of return to process other proposals
@@ -427,9 +417,6 @@ class SwarmAgent(Agent):
             else:
                 self.logger.info(f"TBD: Job: {p.job_id} Agent: {self.agent_id} received commit without any Prepares")
                 proposal = p
-                #p.prepares = []
-                #p.commits = []
-                #proposal.commits = []
                 self.incoming_proposals.add_proposal(proposal=proposal)
 
             if incoming.agents[0].agent_id not in proposal.commits:
@@ -472,8 +459,8 @@ class SwarmAgent(Agent):
                 self.logger.info(f"Received Job Status for non-existent job: {t.job_id}")
                 continue
 
-            if job.is_complete() or job.is_ready():
-                self.logger.debug(f"Job: {job} Ignoring Job Status (State: {job.state})")
+            if self.is_job_completed(job_id=job.get_job_id()):
+                self.logger.debug(f"Job: {job.get_job_id()} Ignoring Job Status (State: {job.state})")
                 continue
 
             if incoming.agents[0].agent_id == self.agent_id:
@@ -515,7 +502,7 @@ class SwarmAgent(Agent):
         for job_id in jobs:
             proposed_job = self.job_queue.get_job(job_id=job_id)
             proposed_capacities += proposed_job.get_capacities()
-        self.logger.debug(f"Number of outgoing proposals: {len(jobs)}; Jobs: {jobs}")
+        #self.logger.debug(f"Number of outgoing proposals: {len(jobs)}; Jobs: {jobs}")
         return proposed_capacities
 
     @staticmethod

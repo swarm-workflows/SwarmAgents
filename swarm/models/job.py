@@ -453,6 +453,15 @@ class JobRepository:
         with self.lock:
             self.redis.delete(key)
 
+    def get_all_job_ids(self, key_prefix: str = "job") -> list:
+        """
+        Retrieves all job IDs from Redis, stripping the key prefix.
+        """
+        with self.lock:
+            job_keys = self.redis.keys(f'{key_prefix}:*')  # Fetch all keys with prefix
+            job_ids = [key.decode().split(f"{key_prefix}:")[1] for key in job_keys]  # Extract job_id
+        return job_ids
+
     def get_all_jobs(self, key_prefix: str = "job") -> list:
         with self.lock:
             job_keys = self.redis.keys(f'{key_prefix}:*')  # Assuming job keys are prefixed with 'job:'
@@ -461,7 +470,7 @@ class JobRepository:
                 data = self.redis.get(key)
                 if data:
                     job = Job()
-                    job.from_dict(json.loads(data) )  # Redis stores data as bytes, so using eval to convert back to dict
+                    job.from_dict(json.loads(data))  # Redis stores data as bytes, so using eval to convert back to dict
                     jobs.append(job)
             return jobs
 

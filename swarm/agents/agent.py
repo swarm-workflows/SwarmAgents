@@ -135,6 +135,7 @@ class Agent(Observer):
         self.redis_client = redis.StrictRedis(host=self.redis_host, port=self.redis_port,
                                               decode_responses=True)
         self.job_repo = JobRepository(redis_client=self.redis_client)
+        self.completed_lock = threading.Lock()
         self.completed_jobs_set = set()
 
     def start_idle(self):
@@ -965,3 +966,17 @@ class Agent(Observer):
     def __remove_peer(self, agent_id: str):
         with self.neighbor_map_lock:
             self.neighbor_map.pop(agent_id)
+
+    def is_job_completed(self, job_id: str) -> bool:
+        """
+        Checks if a job is completed by looking it up in the completed_jobs_set.
+        If not found, updates the set from the job repository and checks again.
+        """
+        if job_id in self.completed_jobs_set:
+            return True
+
+        # Update completed_jobs_set from job repository
+        with self.completed_lock:
+            self.completed_jobs_set.update(self.job_repo.get_all_job_ids())
+
+        return job_id in self.completed_jobs_set
