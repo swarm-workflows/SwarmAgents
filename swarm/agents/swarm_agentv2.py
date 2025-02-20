@@ -103,7 +103,7 @@ class SwarmAgent(Agent):
         self.logger.info(f"Starting agent: {self}")
         while len(self.neighbor_map) + 1 != self.total_agents:
             time.sleep(5)
-            self.logger.info("[SELECTION_WAIT] Waiting for Peer map to be populated!")
+            self.logger.info("[SEL_WAIT] Waiting for Peer map to be populated!")
 
         while not self.shutdown:
             try:
@@ -131,7 +131,7 @@ class SwarmAgent(Agent):
                             proposal1 = self.outgoing_proposals.get_proposal(job_id=job.get_job_id())
                             proposal2 = self.incoming_proposals.get_proposal(job_id=job.get_job_id())
                             self.logger.debug(
-                                f"[SELECTION_SKIP] Job: {job.job_id} State: {job.state}; out: {proposal1} in: {proposal2} skipping it!")
+                                f"[SEL_SKIP] Job: {job.job_id} State: {job.state}; out: {proposal1} in: {proposal2} skipping it!")
                         continue
 
                     processed += 1
@@ -277,7 +277,7 @@ class SwarmAgent(Agent):
         min_cost_agents = self.__find_min_cost_agents(cost_matrix)
         if len(min_cost_agents) and min_cost_agents[0] == self.agent_id:
             return True
-        self.logger.debug(f"[SELECTION]: Not picked Job: {job.get_job_id()} - TIME: {job.no_op} "
+        self.logger.debug(f"[SEL]: Not picked Job: {job.get_job_id()} - TIME: {job.no_op} "
                           f"MIN Cost Agents: {min_cost_agents}")
         return False
 
@@ -289,7 +289,7 @@ class SwarmAgent(Agent):
         for p in incoming.proposals:
             job = self.job_queue.get_job(job_id=p.job_id)
             if self.is_job_completed(job_id=job.get_job_id()):
-                self.logger.debug(f"Ignoring Proposal: {p} for job: {job}")
+                self.logger.debug(f"Ignoring Proposal: {p} for job: {job.get_job_id()}")
                 continue
 
             my_proposal = self.outgoing_proposals.has_better_proposal(proposal=p)
@@ -428,16 +428,17 @@ class SwarmAgent(Agent):
 
             if len(proposal.commits) >= quorum_count:
                 self.logger.info(
-                    f"Job: {p.job_id} Agent: {self.agent_id} received quorum commits Proposal: {proposal}: Job: {job}")
+                    f"Job: {p.job_id} Agent: {self.agent_id} received quorum commits Proposal: {proposal}: "
+                    f"Job: {job.get_job_id()}")
                 if proposal.agent_id == self.agent_id:
                     job.set_leader(leader_agent_id=proposal.agent_id)
                 if self.outgoing_proposals.contains(job_id=p.job_id, p_id=p.p_id):
-                    self.logger.info(f"[CONSENSUS_LEADER] achieved for Job: {p.job_id} Leader: {self.agent_id}")
+                    self.logger.info(f"[CON_LEADER] achieved for Job: {p.job_id} Leader: {self.agent_id}")
                     job.change_state(new_state=JobState.READY)
                     self.select_job(job)
                     self.outgoing_proposals.remove_job(job_id=p.job_id)
                 else:
-                    self.logger.info(f"[CONSENSUS_PARTICIPANT] achieved for Job: {p.job_id} Leader: {p.agent_id}")
+                    self.logger.info(f"[CON_PART] achieved for Job: {p.job_id} Leader: {p.agent_id}")
                     job.change_state(new_state=JobState.COMMIT)
                     self.incoming_proposals.remove_job(job_id=p.job_id)
 

@@ -157,12 +157,10 @@ class Agent(Observer):
     def __enqueue(self, incoming: str):
         try:
             message = json.loads(incoming)
-            fwd = None
+            source_agent_id = message.get("source")
+            fwd = message.get("forwarded_by")
 
-            if "agents" in message:
-                source_agent_id = message.get("source")
-                fwd = message.get("forwarded_by")
-            else:
+            if source_agent_id is None:
                 source_agent_id = message.get("agent_id")
 
             if source_agent_id == self.agent_id:
@@ -172,10 +170,10 @@ class Agent(Observer):
             msg_name = MessageType(message_type)
 
             if fwd is not None:
-                self.logger.debug(f"[INBOUND] [{str(msg_name)}] [SRC: {source_agent_id}], "
+                self.logger.debug(f"[IN] [{str(msg_name)}] [SRC: {source_agent_id}], "
                                   f"Payload:  {json.dumps(message)}")
             else:
-                self.logger.debug(f"[INBOUND] [{str(msg_name)}] [SRC: {source_agent_id}] [FWD: {fwd}], "
+                self.logger.debug(f"[IN] [{str(msg_name)}] [SRC: {source_agent_id}] [FWD: {fwd}], "
                                   f"Payload:  {json.dumps(message)}")
 
             if message_type == MessageType.HeartBeat.name or message_type == MessageType.HeartBeat.value:

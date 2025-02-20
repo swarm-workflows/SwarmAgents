@@ -82,15 +82,15 @@ class MessageServiceKafka:
             msg_name = MessageType(msg_type)
         if fwd and src and dest:
             self.logger.debug(
-                f"[OUTBOUND] [{str(msg_name)}] [SRC: {src}] [DEST: {dest}] [FWD: {fwd}] sent to "
+                f"[OUT] [{str(msg_name)}] [SRC: {src}] [DEST: {dest}] [FWD: {fwd}] sent to "
                 f"topic: {outgoing_topic}, Payload:  {message}")
         elif src and dest:
             self.logger.debug(
-                f"[OUTBOUND] [{str(msg_name)}] [SRC: {src}] [DEST: {dest}] sent to topic: {outgoing_topic}, "
+                f"[OUT] [{str(msg_name)}] [SRC: {src}] [DEST: {dest}] sent to topic: {outgoing_topic}, "
                 f"Payload:  {message}")
         else:
             self.logger.debug(
-                f"[OUTBOUND] [{str(msg_name)}] sent to topic: {outgoing_topic}, "
+                f"[OUT] [{str(msg_name)}] sent to topic: {outgoing_topic}, "
                 f"Payload:  {message}")
 
         self.producer.produce(outgoing_topic, message.encode('utf-8'))
