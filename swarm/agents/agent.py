@@ -92,7 +92,7 @@ class Agent(Observer):
         self.restart_job_selection = 300
         self.peer_heartbeat_timeout = 300
         self.results_dir = "."
-        self.shutdown_mode = "auto"
+        self.shutdown_mode = "manual"
         self.redis_host = "127.0.0.1"
         self.redis_port = 6379
         self.load_config(config_file)
@@ -925,7 +925,7 @@ class Agent(Observer):
                 return False
             return True
 
-        for peer in agents:
+        for peer in agents.values():
             if peer.load != 0.0:
                 self.load_check_counter = 0
                 return False
