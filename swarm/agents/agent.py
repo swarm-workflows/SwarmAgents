@@ -47,6 +47,7 @@ from swarm.comm.message_service_nats import MessageServiceNats
 from swarm.comm.messages.heart_beat import HeartBeat
 from swarm.comm.messages.message import MessageType
 from swarm.comm.message_service_kafka import MessageServiceKafka, Observer
+from swarm.database.repository import Repository
 from swarm.models.capacities import Capacities
 from swarm.models.agent_info import AgentInfo
 from swarm.models.profile import ProfileType, PROFILE_MAP
@@ -95,6 +96,7 @@ class Agent(Observer):
         self.shutdown_mode = "manual"
         self.redis_host = "127.0.0.1"
         self.redis_port = 6379
+        self.heartbeat_mode = "kafka"
         self.load_config(config_file)
         print(f"topology_peer_agent_list: {self.topology_peer_agent_list} {type(self.topology_peer_agent_list)}")
         self.capacities = self.get_system_info()
@@ -103,7 +105,13 @@ class Agent(Observer):
             self.hrt_msg_srv = MessageServiceNats(config=self.nat_config_hb, logger=self.logger)
         else:
             self.ctrl_msg_srv = MessageServiceKafka(config=self.kafka_config, logger=self.logger)
-            self.hrt_msg_srv = MessageServiceKafka(config=self.kafka_config_hb, logger=self.logger)
+            if self.heartbeat_mode == "kafka":
+                self.hrt_msg_srv = MessageServiceKafka(config=self.kafka_config_hb, logger=self.logger)
+                self.heartbeat_receiver_thread = threading.Thread(target=self._heartbeat_processor_main,
+                                                                  daemon=True, name="HeartBeatReceiverThread")
+            else:
+                self.hrt_msg_srv = None
+                self.heartbeat_receiver_thread = None
         self.load_per_agent = {}
         self.cycles = cycles
         self.total_agents = total_agents
@@ -115,8 +123,6 @@ class Agent(Observer):
         self.neighbor_map_lock = threading.Lock()
         self.heartbeat_thread = threading.Thread(target=self._heartbeat_main,
                                                  daemon=True, name="HeartBeatThread")
-        self.heartbeat_receiver_thread = threading.Thread(target=self._heartbeat_processor_main,
-                                                          daemon=True, name="HeartBeatReceiverThread")
         self.msg_receiver_thread = threading.Thread(target=self._message_processor_main,
                                                     daemon=True, name="MsgReceiverThread")
         self.job_selection_thread = threading.Thread(target=self.job_selection_main,
@@ -134,7 +140,7 @@ class Agent(Observer):
         self.plot_figures = False
         self.redis_client = redis.StrictRedis(host=self.redis_host, port=self.redis_port,
                                               decode_responses=True)
-        self.job_repo = JobRepository(redis_client=self.redis_client)
+        self.job_repo = Repository(redis_client=self.redis_client)
         self.completed_lock = threading.Lock()
         self.completed_jobs_set = set()
 
@@ -278,26 +284,6 @@ class Agent(Observer):
         else:
             self.ctrl_msg_srv.produce_message(json_message=json_message)
 
-    '''
-    def _message_processor_main(self):
-        self.logger.info("Message Processor Started")
-        while True:
-            try:
-                with self.condition:
-                    while not self.shutdown and self.message_queue.empty():
-                        self.condition.wait()
-
-                if self.shutdown:
-                    break
-
-                messages = self.__dequeue(self.message_queue)
-                self._process_messages(messages=messages)
-            except Exception as e:
-                self.logger.error(f"Error occurred while processing message e: {e}")
-                self.logger.error(traceback.format_exc())
-        self.logger.info("Message Processor Stopped")
-    '''
-
     def _message_processor_main(self):
         self.logger.info("Message Processor Started")
 
@@ -317,6 +303,7 @@ class Agent(Observer):
 
         self.logger.info("Message Processor Stopped")
 
+    '''
     def _heartbeat_processor_main(self):
         self.logger.info("Heartbeat Processor Started")
         while True:
@@ -354,7 +341,6 @@ class Agent(Observer):
                 self.logger.error(traceback.format_exc())
 
         self.logger.info("Heartbeat Processor Stopped")
-    '''
 
     def _process_messages(self, *, messages: List[dict]):
         for message in messages:
@@ -430,7 +416,8 @@ class Agent(Observer):
                 'nats_topic': nat_config.get('hb_nats_topic', 'job.consensus'),
             }
             runtime_config = config.get("runtime", {})
-            self.shutdown = runtime_config.get("shutdown")
+            self.heartbeat_mode = runtime_config.get("heartbeat", "kafka")
+            self.shutdown_mode = runtime_config.get("shutdown")
             self.message_service_type = runtime_config.get("message_service", "kafka")
             profile_name = runtime_config.get("profile", str(ProfileType.BalancedProfile))
             self.profile = PROFILE_MAP.get(profile_name)
@@ -975,6 +962,6 @@ class Agent(Observer):
 
         # Update completed_jobs_set from job repository
         with self.completed_lock:
-            self.completed_jobs_set.update(self.job_repo.get_all_job_ids())
+            self.completed_jobs_set.update(self.job_repo.get_all_ids())
 
         return job_id in self.completed_jobs_set

@@ -489,7 +489,7 @@ class SwarmAgent(Agent):
 
     def execute_job(self, job: Job):
         self.completed_jobs_set.add(job.get_job_id())
-        self.job_repo.save_job(job=job)
+        self.job_repo.save(obj=job.to_dict())
         super().execute_job(job=job)
         '''
         msg = JobStatus(agents=[AgentInfo(agent_id=self.agent_id)], jobs=[JobInfo(job_id=job.get_job_id(),
