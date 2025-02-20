@@ -676,8 +676,7 @@ class Agent(Observer):
         self.ctrl_msg_srv.start()
         if self.hrt_msg_srv:
             self.hrt_msg_srv.start()
-        if self.heartbeat_receiver_thread:
-            self.heartbeat_thread.start()
+        self.heartbeat_thread.start()
         self.job_selection_thread.start()
         self.job_scheduling_thread.start()
 
