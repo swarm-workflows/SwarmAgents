@@ -101,12 +101,16 @@ class Agent(Observer):
         print(f"topology_peer_agent_list: {self.topology_peer_agent_list} {type(self.topology_peer_agent_list)}")
         self.capacities = self.get_system_info()
         if self.message_service_type == "nats":
-            self.ctrl_msg_srv = MessageServiceNats(config=self.nat_config, logger=self.logger)
-            self.hrt_msg_srv = MessageServiceNats(config=self.nat_config_hb, logger=self.logger)
+            self.ctrl_msg_srv = MessageServiceNats(config=self.nat_config,
+                                                   logger=self.logger)
+            self.hrt_msg_srv = MessageServiceNats(config=self.nat_config_hb,
+                                                  logger=self.logger)
         else:
-            self.ctrl_msg_srv = MessageServiceKafka(config=self.kafka_config, logger=self.logger)
+            self.ctrl_msg_srv = MessageServiceKafka(config=self.kafka_config,
+                                                    logger=self.logger)
             if self.heartbeat_mode == "kafka":
-                self.hrt_msg_srv = MessageServiceKafka(config=self.kafka_config_hb, logger=self.logger)
+                self.hrt_msg_srv = MessageServiceKafka(config=self.kafka_config_hb,
+                                                       logger=self.logger)
                 self.heartbeat_receiver_thread = threading.Thread(target=self._heartbeat_processor_main,
                                                                   daemon=True, name="HeartBeatReceiverThread")
             else:
@@ -127,7 +131,6 @@ class Agent(Observer):
                                                     daemon=True, name="MsgReceiverThread")
         self.job_selection_thread = threading.Thread(target=self.job_selection_main,
                                                      daemon=True, name="JobSelectionThread")
-
         self.job_scheduling_thread = threading.Thread(target=self.job_scheduling_main,
                                                       daemon=True, name="JobSchedulingThread")
         # Load for self and the peers is 0.0 for upto 5 minutes; trigger shutdown
@@ -141,6 +144,7 @@ class Agent(Observer):
         self.redis_client = redis.StrictRedis(host=self.redis_host, port=self.redis_port,
                                               decode_responses=True)
         self.job_repo = Repository(redis_client=self.redis_client)
+        self.agent_repo = Repository(redis_client=self.redis_client)
         self.completed_lock = threading.Lock()
         self.completed_jobs_set = set()
 
@@ -210,26 +214,26 @@ class Agent(Observer):
         for peer in incoming.agents:
             if self.shutdown_mode == "auto":
                 peer.last_updated = time.time()
-            if peer.agent_id == self.agent_id:
+            if peer.id == self.agent_id:
                 continue
             self.__add_peer(peer=peer)
-            self._save_load_metric(peer.agent_id, peer.load)
+            self._save_load_metric(peer.id, peer.load)
 
     def _save_load_metric(self, agent_id: int, load: float):
         if agent_id not in self.load_per_agent:
             self.load_per_agent[agent_id] = []
         self.load_per_agent[agent_id].append(load)
 
-    def _build_heart_beat(self) -> dict:
+    def _build_heart_beat(self, only_self: bool = False) -> dict:
         agents = {}
         my_load = self.compute_overall_load()
-        agent = AgentInfo(agent_id=self.agent_id,
+        agent = AgentInfo(id=self.agent_id,
                           capacities=self.capacities,
                           capacity_allocations=self.ready_queue.capacities(jobs=self.ready_queue.get_jobs()),
                           load=my_load,
                           last_updated=time.time())
         self._save_load_metric(self.agent_id, my_load)
-        if isinstance(self.topology_peer_agent_list, list) and len(self.neighbor_map.values()):
+        if not only_self and isinstance(self.topology_peer_agent_list, list) and len(self.neighbor_map.values()):
             for peer_agent_id, peer in self.neighbor_map.items():
                 agents[peer_agent_id] = peer
         agents[self.agent_id] = agent
@@ -241,21 +245,29 @@ class Agent(Observer):
             agents = {}
             try:
                 agents = self._build_heart_beat()
+                if self.heartbeat_mode != "kafka":
+                    self.agent_repo.save(agents[0].to_dict(), key_prefix="agent")
 
-                # If broadcasting is enabled, send one message for all
-                if self.topology_peer_agent_list == "all":
-                    hb = HeartBeat(source=self.agent_id, agents=list(agents.values()))
-                    self.hrt_msg_srv.produce_message(json_message=hb.to_dict())
-
+                    # Update Peer info
+                    peers = self.agent_repo.get_all_objects(key_prefix="agent")
+                    for p in peers:
+                        agent_info = AgentInfo.from_dict(p)
+                        self.__add_peer(peer=agent_info)
                 else:
-                    # Send individually only if required
-                    for peer_agent_id in self.topology_peer_agent_list:
-                        hb_agents = {k: v for k, v in agents.items() if k != peer_agent_id}
-                        hb = HeartBeat(source=self.agent_id, agents=list(hb_agents.values()))
-                        self.hrt_msg_srv.produce_message(json_message=hb.to_dict(),
-                                                         topic=f"{self.peer_hb_topic_prefix}-{peer_agent_id}",
-                                                         dest=peer_agent_id,
-                                                         src=self.agent_id)
+                    # If broadcasting is enabled, send one message for all
+                    if self.topology_peer_agent_list == "all":
+                        hb = HeartBeat(source=self.agent_id, agents=list(agents.values()))
+                        self.hrt_msg_srv.produce_message(json_message=hb.to_dict())
+
+                    else:
+                        # Send individually only if required
+                        for peer_agent_id in self.topology_peer_agent_list:
+                            hb_agents = {k: v for k, v in agents.items() if k != peer_agent_id}
+                            hb = HeartBeat(source=self.agent_id, agents=list(hb_agents.values()))
+                            self.hrt_msg_srv.produce_message(json_message=hb.to_dict(),
+                                                             topic=f"{self.peer_hb_topic_prefix}-{peer_agent_id}",
+                                                             dest=peer_agent_id,
+                                                             src=self.agent_id)
 
                 time.sleep(5)
             except Exception as e:
@@ -302,26 +314,6 @@ class Agent(Observer):
                 self.logger.error(traceback.format_exc())
 
         self.logger.info("Message Processor Stopped")
-
-    '''
-    def _heartbeat_processor_main(self):
-        self.logger.info("Heartbeat Processor Started")
-        while True:
-            try:
-                with self.condition:
-                    while not self.shutdown and self.hb_message_queue.empty():
-                        self.condition.wait()
-
-                if self.shutdown:
-                    break
-
-                messages = self.__dequeue(self.hb_message_queue)
-                self._process_messages(messages=messages)
-            except Exception as e:
-                self.logger.error(f"Error occurred while processing message e: {e}")
-                self.logger.error(traceback.format_exc())
-        self.logger.info("Heartbeat Processor Stopped")
-    '''
 
     def _heartbeat_processor_main(self):
         self.logger.info("Heartbeat Processor Started")
@@ -904,7 +896,7 @@ class Agent(Observer):
             for peer in self.neighbor_map.values():
                 diff = int(time.time() - peer.last_updated)
                 if diff >= self.peer_heartbeat_timeout:
-                    peers_to_remove.append(peer.agent_id)
+                    peers_to_remove.append(peer.id)
             for p in peers_to_remove:
                 self.__remove_peer(agent_id=p)
             if not os.path.exists(self.shutdown_path):
@@ -921,7 +913,7 @@ class Agent(Observer):
         for peer in self.neighbor_map.values():
             diff = int(time.time() - peer.last_updated)
             if diff >= self.peer_heartbeat_timeout:
-                peers_to_remove.append(peer.agent_id)
+                peers_to_remove.append(peer.id)
         for p in peers_to_remove:
             self.__remove_peer(agent_id=p)
         for peer in self.neighbor_map.values():
@@ -938,15 +930,15 @@ class Agent(Observer):
         """
         Adds or updates a peer in the neighbor map, ensuring only the latest update is stored.
         """
-        if peer.agent_id is None:
+        if peer.id is None:
             return  # Ignore invalid agent_id
 
         with self.neighbor_map_lock:
-            current_peer_info = self.neighbor_map.get(peer.agent_id)
+            current_peer_info = self.neighbor_map.get(peer.id)
 
             # Only update if the new peer info is newer
             if current_peer_info is None or peer.last_updated > current_peer_info.last_updated:
-                self.neighbor_map[peer.agent_id] = peer
+                self.neighbor_map[peer.id] = peer
 
     def __remove_peer(self, agent_id: str):
         with self.neighbor_map_lock:

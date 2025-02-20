@@ -32,7 +32,7 @@ class AgentInfo(JSONField):
     from JSON dictionaries of properties.
     """
     def __init__(self, **kwargs):
-        self.agent_id = 0
+        self.id = 0
         self.load = 0.0
         self._capacities = Capacities()
         self._capacity_allocations = Capacities()
@@ -86,7 +86,7 @@ class AgentInfo(JSONField):
         return self
 
     def __str__(self):
-        result = f"agent_id: {self.agent_id}, load: {self.load}, capacities: {self.capacities}"
+        result = f"agent_id: {self.id}, load: {self.load}, capacities: {self.capacities}"
         if self.capacity_allocations:
             result += f" capacity_allocations: {self.capacity_allocations}"
         return result

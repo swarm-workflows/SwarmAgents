@@ -42,17 +42,17 @@ class PBFTAgent(Agent):
         self.outgoing_proposals = ProposalContainer()
         self.incoming_proposals = ProposalContainer()
 
-    def _build_heart_beat(self, dest_agent_id: str = None) -> dict:
+    def _build_heart_beat(self, only_self: bool = False) -> dict:
         my_load = self.compute_overall_load(proposed_jobs=self.outgoing_proposals.jobs())
         agents = {}
 
-        agent = AgentInfo(agent_id=self.agent_id,
+        agent = AgentInfo(id=self.agent_id,
                           capacities=self.capacities,
                           capacity_allocations=self.ready_queue.capacities(jobs=self.ready_queue.get_jobs()),
                           load=my_load,
                           last_updated=time.time())
         self._save_load_metric(self.agent_id, my_load)
-        if isinstance(self.topology_peer_agent_list, list) and len(self.neighbor_map.values()):
+        if not only_self and isinstance(self.topology_peer_agent_list, list) and len(self.neighbor_map.values()):
             for peer_agent_id, peer in self.neighbor_map.items():
                 if peer_agent_id is None:
                     continue
