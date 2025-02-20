@@ -7,9 +7,9 @@ queue:
   port: 8098
 kafka:
   bootstrap_servers: zoo-0:9092,zoo-1:9092,zoo-2:9092
-  topic: agent-pbft
-  hb_topic: agent-pbft-hb
-  consumer_group_id: agent-pbft
+  topic: pbft
+  hb_topic: pbft-hb
+  consumer_group_id: cg
 runtime:
   profile: BalancedProfile
   data_transfer: False

@@ -1,12 +1,12 @@
 #!/bin/bash
+num_agents=$1
+base_index=0
 
 pkill -f "main-raft.py"
 python3 kafka_cleanup.py --topic agent
 rm -rf raft
 mkdir -p raft
-# Define the number of agents
-num_agents=10
-base_index=0
+
 
 # Launch the Python commands for each agent
 for i in $(seq 0 $(($num_agents - 1))); do

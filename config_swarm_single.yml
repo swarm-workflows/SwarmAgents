@@ -7,9 +7,9 @@ queue:
   port: 8098
 kafka:
   bootstrap_servers: zoo-0:9092,zoo-1:9092,zoo-2:9092
-  topic: agent-swarm-single
-  hb_topic: agent-swarm-single-hb
-  consumer_group_id: agent-swarm-single
+  topic: single
+  hb_topic: single-hb
+  consumer_group_id: cg
 runtime:
   profile: BalancedProfile
   data_transfer: False
