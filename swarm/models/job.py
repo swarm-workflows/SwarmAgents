@@ -459,7 +459,7 @@ class JobRepository:
         """
         with self.lock:
             job_keys = self.redis.keys(f'{key_prefix}:*')  # Fetch all keys with prefix
-            job_ids = [key.decode().split(f"{key_prefix}:")[1] for key in job_keys]  # Extract job_id
+            job_ids = [key.split(f"{key_prefix}:")[1] for key in job_keys]  # Extract job_id
         return job_ids
 
     def get_all_jobs(self, key_prefix: str = "job") -> list:
