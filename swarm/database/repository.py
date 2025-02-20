@@ -33,7 +33,7 @@ class Repository:
         self.lock = threading.Lock()
 
     def save(self, obj: dict, key_prefix: str = "job"):
-        obj_id = obj.get("obj_id")
+        obj_id = obj.get("id")
         if obj_id is None:
             obj_id = obj.get(f"{key_prefix}_id")
         if obj_id is None:
