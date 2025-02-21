@@ -28,7 +28,7 @@ runtime:
   peer_heartbeat_timeout: 300
   results_dir: swarm-multi
   message_service: kafka
-  shutdown: auto
+  shutdown: manual
   heartbeat: redis
 logging:
   ## The directory in which actor should create log files.
@@ -39,7 +39,7 @@ logging:
   log-file: agent
 
   ## The default log level for actor.
-  log-level: DEBUG 
+  log-level: INFO
 
   ## actor rotates log files. You may specify how many archived log files to keep here.
   log-retain: 5
