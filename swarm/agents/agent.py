@@ -389,14 +389,16 @@ class Agent(Observer):
             self.kafka_config = {
                 'kafka_bootstrap_servers': kafka_config.get("bootstrap_servers", "localhost:19092"),
                 'kafka_topic': f'{topic}-{topic_suffix}',
-                'consumer_group_id': f'{cg}-{topic}-{self.agent_id}'
+                'consumer_group_id': f'{cg}-{topic}-{self.agent_id}',
+                'batch_size': kafka_config.get('batch_size')
             }
             self.peer_topic_prefix = topic
 
             self.kafka_config_hb = {
                 'kafka_bootstrap_servers': kafka_config.get("bootstrap_servers", "localhost:19092"),
                 'kafka_topic': f'{topic_hb}-{topic_suffix}',
-                'consumer_group_id': f'{cg}-{topic_hb}-{self.agent_id}'
+                'consumer_group_id': f'{cg}-{topic_hb}-{self.agent_id}',
+                'batch_size': kafka_config.get('batch_size')
             }
 
             self.peer_hb_topic_prefix = topic_hb
