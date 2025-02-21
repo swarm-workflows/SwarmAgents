@@ -80,23 +80,23 @@ if __name__ == '__main__':
         delete_topic(admin_client, topic_name)
         delete_topic(admin_client, f"{topic_name}-hb")
 
-    time.sleep(10)
+    time.sleep(1)
 
     if args.agents:
         for x in range(1, args.agents + 1):
             # Create the topic
             create_topic(admin_client, f"{topic_name}-{x}")
-            time.sleep(5)
+            time.sleep(1)
 
             create_topic(admin_client, f"{topic_name}-hb-{x}")
-            time.sleep(5)
+            time.sleep(1)
     else:
         # Create the topic
         create_topic(admin_client, topic_name)
-        time.sleep(5)
+        time.sleep(1)
 
         create_topic(admin_client, f"{topic_name}-hb")
-        time.sleep(5)
+        time.sleep(1)
 
     redis_client = redis.StrictRedis(host=args.redis, port=6379, decode_responses=True)
     task_repo = JobRepository(redis_client=redis_client)
