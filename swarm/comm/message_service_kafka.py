@@ -26,7 +26,6 @@ import logging
 import threading
 import time
 import traceback
-from abc import ABC, abstractmethod
 
 from confluent_kafka import Producer, Consumer, TopicPartition
 
@@ -40,14 +39,16 @@ class MessageServiceKafka:
         self.consumer_group_id = config.get('consumer_group_id')
         self.enable_auto_commit = config.get("enable_auto_commit", False)
         self.batch_size = config.get("batch_size", 10)
-        self.producer = Producer({"bootstrap.servers": self.kafka_bootstrap_servers, "acks": "all",})
+        self.producer = Producer({"bootstrap.servers": self.kafka_bootstrap_servers,
+                                  "acks": "all",
+                                  "linger.ms": 1,})
         self.consumer = Consumer({
             "bootstrap.servers": self.kafka_bootstrap_servers,
             "group.id": self.consumer_group_id,
             "auto.offset.reset": "latest",
             "enable.auto.commit": self.enable_auto_commit,
             "on_commit": self.commit_completed,
-            "heartbeat.interval.ms": 1000
+            #"heartbeat.interval.ms": 1000
         })
         self.consumer.commit()
         self.logger = logger
@@ -107,9 +108,10 @@ class MessageServiceKafka:
         offsets = []
         logging.getLogger().info("Consumer thread started")
         #while not self.shutdown or lag:
+        last_commit_time = time.time()
         while not self.shutdown:
             try:
-                msg = self.consumer.poll(0.25)
+                msg = self.consumer.poll(0.05)
                 if msg is None:
                     lag = 0
                     continue
@@ -136,8 +138,9 @@ class MessageServiceKafka:
 
                 if not self.enable_auto_commit:
                     msg_count += 1
-                    if msg_count % self.batch_size == 0:
+                    if msg_count % self.batch_size == 0 or time.time() - last_commit_time > 1:
                         self.consumer.commit(offsets=offsets)
+                        last_commit_time = time.time()
                         offsets.clear()
             except KeyboardInterrupt:
                 break
@@ -157,3 +160,8 @@ class MessageServiceKafka:
             self.logger.error(f"KAFKA: commit failure: {err}")
         #else:
         #    self.logger.debug(f"KAFKA: Committed partition offsets: {partitions}")
+
+    def flush_producer(self):
+        while not self.shutdown:
+            time.sleep(0.5)
+            self.producer.flush()

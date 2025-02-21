@@ -271,6 +271,7 @@ class Agent(Observer):
                                                              dest=peer_agent_id,
                                                              src=self.agent_id)
 
+                self.ctrl_msg_srv.flush_producer()
                 time.sleep(5)
             except Exception as e:
                 self.logger.error(f"Error occurred while sending heartbeat e: {e}")
@@ -713,7 +714,7 @@ class Agent(Observer):
                     else:
                         time.sleep(0.5)
 
-                time.sleep(5)
+                time.sleep(1)
             except Exception as e:
                 self.logger.error(f"Error occurred while executing e: {e}")
                 self.logger.error(traceback.format_exc())

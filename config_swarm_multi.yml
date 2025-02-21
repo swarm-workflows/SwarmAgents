@@ -13,6 +13,7 @@ kafka:
   topic: multi
   hb_topic: multi-hb
   consumer_group_id: cg
+  batch_size: 10
 nats:
   nats_servers: nats://127.0.0.1:4222
   nats_topic: agent-swarm-multi

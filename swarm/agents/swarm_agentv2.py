@@ -21,7 +21,6 @@
 # SOFTWARE.
 #
 # Author: Komal Thareja(kthare10@renci.org)
-import queue
 import random
 import time
 import traceback
