@@ -382,7 +382,7 @@ class Agent(Observer):
             kafka_config = config.get("kafka", {})
             nat_config = config.get("nats", {})
 
-            topic = kafka_config.get("consumer_group_id", "agent")
+            topic = kafka_config.get("topic", "agent")
             topic_hb = kafka_config.get("hb_topic", "agent-hb")
             cg = kafka_config.get("consumer_group_id", "cg")
             self.kafka_config = {
