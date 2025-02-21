@@ -950,6 +950,11 @@ class Agent(Observer):
         with self.neighbor_map_lock:
             self.neighbor_map.pop(agent_id)
 
+    def update_completed_jobs(self, jobs: list[str]):
+        # Update completed_jobs_set from job repository
+        with self.completed_lock:
+            self.completed_jobs_set.update(jobs)
+
     def is_job_completed(self, job_id: str) -> bool:
         """
         Checks if a job is completed by looking it up in the completed_jobs_set.
@@ -959,7 +964,6 @@ class Agent(Observer):
             return True
 
         # Update completed_jobs_set from job repository
-        with self.completed_lock:
-            self.completed_jobs_set.update(self.job_repo.get_all_ids())
+        self.update_completed_jobs(self.job_repo.get_all_ids())
 
         return job_id in self.completed_jobs_set

@@ -488,7 +488,7 @@ class SwarmAgent(Agent):
         '''
 
     def execute_job(self, job: Job):
-        self.completed_jobs_set.add(job.get_job_id())
+        self.update_completed_jobs(jobs=[job.get_job_id()])
         self.job_repo.save(obj=job.to_dict())
         super().execute_job(job=job)
         '''
@@ -537,3 +537,8 @@ class SwarmAgent(Agent):
         )
 
         return round(overall_load_projected, 2)
+
+    def update_completed_jobs(self, jobs: list[str]):
+        super().update_completed_jobs(jobs=jobs)
+        for j in jobs:
+            self.outgoing_proposals.remove_job(job_id=j)
