@@ -212,8 +212,6 @@ class Agent(Observer):
 
     def _receive_heartbeat(self, incoming: HeartBeat):
         for peer in incoming.agents:
-            if self.shutdown_mode == "auto":
-                peer.last_updated = time.time()
             if peer.agent_id == self.agent_id:
                 continue
             self.__add_peer(peer=peer)
@@ -270,8 +268,6 @@ class Agent(Observer):
                                                              topic=f"{self.peer_hb_topic_prefix}-{peer_agent_id}",
                                                              dest=peer_agent_id,
                                                              src=self.agent_id)
-
-                self.ctrl_msg_srv.flush_producer()
                 time.sleep(5)
             except Exception as e:
                 self.logger.error(f"Error occurred while sending heartbeat e: {e}")
