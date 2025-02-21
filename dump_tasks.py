@@ -22,17 +22,25 @@
 #
 # Author: Komal Thareja(kthare10@renci.org)
 import redis
+import sys
 
 
-def display_tasks(redis_host='zoo-0', redis_port=6379, task_list='tasks'):
-    # Connect to the Redis database
+def display_tasks(redis_host='zoo-0', redis_port=6379, task_list='*'):
+    """Connects to Redis and displays tasks stored in the specified task list."""
     redis_client = redis.StrictRedis(host=redis_host, port=redis_port, decode_responses=True)
 
-    task_keys = redis_client.keys('*:*')  # Assuming task keys are prefixed with 'task:'
+    task_keys = redis_client.keys(f"{task_list}:*")  # Filter keys based on task list prefix
+    if not task_keys:
+        print(f"No tasks found in queue '{task_list}'.")
+        return
+
     for key in task_keys:
         data = redis_client.get(key)
         print(f"{key}: {data}")
 
 
 if __name__ == "__main__":
-    display_tasks()
+    # Get queue name from command-line arguments (default to '*')
+    queue_name = sys.argv[1] if len(sys.argv) > 1 else '*'
+
+    display_tasks(task_list=queue_name)
