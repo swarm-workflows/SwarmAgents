@@ -131,14 +131,14 @@ python analyze_results.py --number_of_agents 3 --run_directory swarm/single-job/
 
 ## Comparison PBFT vs SWARM Single vs SWARM Multi
 ### Results with 3 Agents
-![Idle Time](./runs/histogram_idle_time_with_error_bars_3.png)
-![CI Plot](./runs/comparison_line_plot_with_ci_3.png)
+![Idle Time](./runs/histogram_idle_time_with_error_bars_3.pdf)
+![CI Plot](./runs/comparison_line_plot_with_ci_3.pdf)
 ### Results with 5 Agents
-![Idle Time](./runs/histogram_idle_time_with_error_bars_5.png)
-![CI Plot](./runs/comparison_line_plot_with_ci_5.png)
+![Idle Time](./runs/histogram_idle_time_with_error_bars_5.pdf)
+![CI Plot](./runs/comparison_line_plot_with_ci_5.pdf)
 ### Results with 10 Agents
-![Idle Time](./runs/histogram_idle_time_with_error_bars_10.png)
-![CI Plot](./runs/comparison_line_plot_with_ci_10.png)
+![Idle Time](./runs/histogram_idle_time_with_error_bars_10.pdf)
+![CI Plot](./runs/comparison_line_plot_with_ci_10.pdf)
 
 ## Raft Consensus Algorithm
 RAFT algorithm is explored and implemented in `raft_agent.py`. This agent works as follows:
