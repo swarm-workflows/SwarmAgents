@@ -130,15 +130,20 @@ python analyze_results.py --number_of_agents 3 --run_directory swarm/single-job/
 ```
 
 ## Comparison PBFT vs SWARM Single vs SWARM Multi
+Plots generated using the script:
+```
+python comparison.py --number_of_agents <number of agents>
+```
+
 ### Results with 3 Agents
-![Idle Time](./runs/histogram_idle_time_with_error_bars_3.pdf)
-![CI Plot](./runs/comparison_line_plot_with_ci_3.pdf)
+![Idle Time](./runs/histogram_idle_time_with_bootstrap_ci_3.png)
+![CI Plot](./runs/comparison_line_plot_with_ci_3.png)
 ### Results with 5 Agents
-![Idle Time](./runs/histogram_idle_time_with_error_bars_5.pdf)
-![CI Plot](./runs/comparison_line_plot_with_ci_5.pdf)
+![Idle Time](./runs/histogram_idle_time_with_bootstrap_ci_5.png)
+![CI Plot](./runs/comparison_line_plot_with_ci_5.png)
 ### Results with 10 Agents
-![Idle Time](./runs/histogram_idle_time_with_error_bars_10.pdf)
-![CI Plot](./runs/comparison_line_plot_with_ci_10.pdf)
+![Idle Time](./runs/histogram_idle_time_with_bootstrap_ci_10.png)
+![CI Plot](./runs/comparison_line_plot_with_ci_10.png)
 
 ## Raft Consensus Algorithm
 RAFT algorithm is explored and implemented in `raft_agent.py`. This agent works as follows:
@@ -180,5 +185,11 @@ python3.11 kafka_cleanup.py
 Scales well, handling large numbers of agents effectively.
 
 Number of Agents: 10
+
+Plots generated using:
+```
+python comparison.py --number_of_agents 10
+```
+
 
 ![Scheduling latency comparison - Number of agents](./runs/comparison_line_plot_with_ci_10raft.png)

@@ -131,7 +131,8 @@ def plot_means_median_idle_box_plots_with_points(data_list: List[Dict[str, Any]]
     plt.ylabel('Idle Time (seconds)')
     plt.grid(axis='y', linestyle='--', alpha=0.6)
     plt.tight_layout()
-    plt.savefig(f'box_plot_idle_time_{number_of_agents}.pdf')
+    plt.savefig(f'box_plot_idle_time_{number_of_agents}.pdf', format="pdf")
+    plt.savefig(f'box_plot_idle_time_{number_of_agents}.png')
     plt.close()
 
 
@@ -149,7 +150,8 @@ def plot_means_median_idle_ci_bars(data_list: List[Dict[str, Any]], number_of_ag
     plt.title(f'Dot Plot with Confidence Intervals - {number_of_agents} agents')
     plt.grid(axis='y', linestyle='--', alpha=0.6)
     plt.tight_layout()
-    plt.savefig(f'dot_plot_idle_time_{number_of_agents}.pdf')
+    plt.savefig(f'dot_plot_idle_time_{number_of_agents}.pdf', format="pdf")
+    plt.savefig(f'dot_plot_idle_time_{number_of_agents}.png')
     plt.close()
 
 
@@ -166,7 +168,8 @@ def plot_means_median_violin(data_list: List[Dict[str, Any]], number_of_agents: 
     plt.ylabel('Idle Time (seconds)')
     plt.grid(axis='y', linestyle='--', alpha=0.6)
     plt.tight_layout()
-    plt.savefig(f'violin_plot_idle_time_{number_of_agents}.pdf')
+    plt.savefig(f'violin_plot_idle_time_{number_of_agents}.pdf', format="pdf")
+    plt.savefig(f'violin_plot_idle_time_{number_of_agents}.png')
     plt.close()
 
 
@@ -215,7 +218,8 @@ def plot_means_median_histogram_error_bars_percent(data_list: List[Dict[str, Any
     plt.title(f'Comparison of Mean Idle Time with Error Bars - {number_of_agents} agents')
     plt.grid(axis='y', linestyle='--', alpha=0.6)
     plt.tight_layout()
-    plt.savefig(f'histogram_idle_time_with_error_bars_{number_of_agents}_percent.pdf')
+    plt.savefig(f'histogram_idle_time_with_error_bars_{number_of_agents}_percent.pdf', format="pdf")
+    plt.savefig(f'histogram_idle_time_with_error_bars_{number_of_agents}_percent.png')
     plt.close()
 
 '''
@@ -258,6 +262,7 @@ def plot_means_median_histogram_error_bars(data_list, number_of_agents):
     plt.grid(axis='y', linestyle='--', alpha=0.6)
     plt.tight_layout()
     plt.savefig(f'histogram_idle_time_with_bootstrap_ci_{number_of_agents}.pdf', format="pdf")
+    plt.savefig(f'histogram_idle_time_with_bootstrap_ci_{number_of_agents}.png')
     plt.close()
 
 
@@ -281,7 +286,11 @@ def plot_means_median_line_idle(data_list: List[Dict[str, Any]], number_of_agent
     plt.rcParams.update({'font.size': 14})
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig(f'comparison_line_plot_idle_time_with_ci_{number_of_agents}.pdf', format="pdf", bbox_inches='tight')
+    plt.savefig(f'comparison_line_plot_idle_time_with_ci_{number_of_agents}.pdf',
+                format="pdf", bbox_inches='tight')
+
+    plt.savefig(f'comparison_line_plot_idle_time_with_ci_{number_of_agents}.png',
+                bbox_inches='tight')
     plt.close()
 
 
@@ -312,7 +321,10 @@ def plot_means_median_line_percent(data_list: List[Dict[str, Any]], number_of_ag
     plt.rcParams.update({'font.size': 14})
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig(f'comparison_line_plot_with_ci_{number_of_agents}_percent{file_name_suffix}.pdf', format="pdf", bbox_inches='tight')
+    plt.savefig(f'comparison_line_plot_with_ci_{number_of_agents}_percent{file_name_suffix}.pdf',
+                format="pdf", bbox_inches='tight')
+    plt.savefig(f'comparison_line_plot_with_ci_{number_of_agents}_percent{file_name_suffix}.png',
+                bbox_inches='tight')
     plt.close()
 
 
@@ -340,7 +352,10 @@ def plot_means_median_line(data_list: List[Dict[str, Any]], number_of_agents: in
     plt.rcParams.update({'font.size': 14})
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig(f'comparison_line_plot_with_ci_{number_of_agents}{file_name_suffix}.pdf', format="pdf", bbox_inches='tight')
+    plt.savefig(f'comparison_line_plot_with_ci_{number_of_agents}{file_name_suffix}.pdf',
+                format="pdf", bbox_inches='tight')
+    plt.savefig(f'comparison_line_plot_with_ci_{number_of_agents}{file_name_suffix}.png',
+                bbox_inches='tight')
     plt.close()
 
 
@@ -360,6 +375,7 @@ def plot_histograms(data_list: list, number_of_agents: int, param_name: str, par
 
     plt.suptitle(f'Comparison of {param_pretty_name} Across Algorithms - {number_of_agents} agents')
     plt.savefig(f'comparison_histogram_{param_name}_{number_of_agents}.pdf', format="pdf", bbox_inches='tight')
+    plt.savefig(f'comparison_histogram_{param_name}_{number_of_agents}.png', bbox_inches='tight')
     plt.close()
 
 
@@ -378,6 +394,7 @@ def plot_overlaying_histograms(flat_selection_times_pbft: list, flat_selection_t
     plt.legend()
     plt.grid(True)
     plt.savefig(f'comparison_histogram_selection_times_{number_of_agents}.pdf', format="pdf", bbox_inches='tight')
+    plt.savefig(f'comparison_histogram_selection_times_{number_of_agents}.png', bbox_inches='tight')
     plt.close()
 
 
@@ -413,6 +430,7 @@ def plot_combined_ci(data_list: List[Dict[str, Any]], number_of_agents: int):
 
     # Save the combined figure
     plt.savefig(f'comparison_combined_ci_{number_of_agents}.pdf', format="pdf", dpi=150, bbox_inches='tight')
+    plt.savefig(f'comparison_combined_ci_{number_of_agents}.png', dpi=150, bbox_inches='tight')
     plt.close()
 
 
