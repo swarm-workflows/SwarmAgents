@@ -16,5 +16,7 @@ sudo python get-pip.py
 # Install Development Tools (build-essential on Ubuntu)
 sudo DEBIAN_FRONTEND=noninteractive apt install -y build-essential
 
+sudo DEBIAN_FRONTEND=noninteractive apt install python3-pip -y
+
 # Install dependencies from requirements.txt
-pip3.11 install -r requirements.txt
+pip3 install -r requirements.txt
