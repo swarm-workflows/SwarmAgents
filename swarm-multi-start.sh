@@ -6,7 +6,7 @@ num_agents=$1
 shift
 
 if [[ -z "$num_agents" ]]; then
-    echo "Usage: $0 <num_agents> [broker] [redis] [topic]"
+    echo "Usage: $0 <num_agents> [redis] [broker] [topic]"
     exit 1
 fi
 
@@ -15,7 +15,7 @@ redis="$1"
 broker="$2"
 topic="$3"
 tasks=100
-jobs_per_proposal=5
+jobs_per_proposal=3
 
 base_index=0
 
