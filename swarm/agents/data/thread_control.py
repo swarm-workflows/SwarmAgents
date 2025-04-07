@@ -21,15 +21,18 @@
 # SOFTWARE.
 #
 # Author: Komal Thareja(kthare10@renci.org)
-from abc import ABC, abstractmethod
-from typing import Any
+from dataclasses import dataclass, field
+import threading
+from typing import Optional
 
-
-class Observer(ABC):
-    @abstractmethod
-    def process_message(self, message: Any):
-        """
-        Process incoming message
-        :param message:
-        :return:
-        """
+@dataclass
+class ThreadControl:
+    shutdown: bool = False
+    condition: threading.Condition = field(default_factory=threading.Condition)
+    neighbor_map_lock: threading.Lock = field(default_factory=threading.Lock)
+    completed_lock: threading.Lock = field(default_factory=threading.Lock)
+    heartbeat_thread: Optional[threading.Thread] = None
+    heartbeat_receiver_thread: Optional[threading.Thread] = None
+    msg_receiver_thread: Optional[threading.Thread] = None
+    job_selection_thread: Optional[threading.Thread] = None
+    job_scheduling_thread: Optional[threading.Thread] = None

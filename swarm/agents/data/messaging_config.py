@@ -21,15 +21,14 @@
 # SOFTWARE.
 #
 # Author: Komal Thareja(kthare10@renci.org)
-from abc import ABC, abstractmethod
-from typing import Any
+from dataclasses import dataclass, field
+from typing import List, Dict
 
-
-class Observer(ABC):
-    @abstractmethod
-    def process_message(self, message: Any):
-        """
-        Process incoming message
-        :param message:
-        :return:
-        """
+@dataclass
+class MessagingConfig:
+    kafka_config: dict = field(default_factory=dict)
+    kafka_config_hb: dict = field(default_factory=dict)
+    nat_config: dict = field(default_factory=dict)
+    nat_config_hb: dict = field(default_factory=dict)
+    grpc_config: dict = field(default_factory=dict)
+    topology_peer_agent_list: List[int] = field(default_factory=list)

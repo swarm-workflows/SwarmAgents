@@ -20,7 +20,10 @@ runtime:
   restart_job_selection: 300
   peer_heartbeat_timeout: 300
   results_dir: raft
-  message_service: kafka
+  message_service_type: kafka
+  shutdown_mode: manual
+  heartbeat_mode: redis
+  total_agents: 5
 logging:
   ## The directory in which actor should create log files.
   ## This directory will be automatically created if it does not exist.

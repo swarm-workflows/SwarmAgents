@@ -7,15 +7,17 @@ class SwarmConfigGenerator:
     A class to generate configuration files for agents in a structured ring topology.
     """
 
-    def __init__(self, num_agents, base_config_path, output_dir):
+    def __init__(self, num_agents, jobs_per_proposal, base_config_path, output_dir):
         """
         Initializes the generator with the number of agents, base config path, and output directory.
 
         :param num_agents: Number of agents to generate configurations for.
+        :param jobs_per_proposal: Jobs per proposal
         :param base_config_path: Path to the base configuration YAML file.
         :param output_dir: Directory where generated configs should be saved.
         """
         self.num_agents = num_agents
+        self.jobs_per_proposal = jobs_per_proposal
         self.base_config_path = base_config_path
         self.output_dir = output_dir
         self.base_config = self.load_base_config()
@@ -118,6 +120,8 @@ class SwarmConfigGenerator:
         for agent_id in range(1, self.num_agents + 1):
             config = self.base_config.copy()
             config["topology"] = {"peer_agents": agent_peers[agent_id]}
+            config["runtime"]["total_agents"] = self.num_agents
+            config["runtime"]["jobs_per_proposal"] = self.jobs_per_proposal
 
             config_file_path = os.path.join(self.output_dir, f"{config_prefix}_{agent_id}.yml")
             with open(config_file_path, "w") as file:
@@ -129,10 +133,11 @@ class SwarmConfigGenerator:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate agent configuration files with a structured ring topology.")
     parser.add_argument("num_agents", type=int, help="Number of agents to generate configurations for.")
+    parser.add_argument("jobs_per_proposal", type=int, help="Number of Jobs per proposal.")
     parser.add_argument("base_config_file", type=str, help="Path to the base configuration YAML file.")
     parser.add_argument("output_dir", type=str, help="Directory where generated configs should be saved.")
 
     args = parser.parse_args()
 
-    generator = SwarmConfigGenerator(args.num_agents, args.base_config_file, args.output_dir)
+    generator = SwarmConfigGenerator(args.num_agents, args.jobs_per_proposal, args.base_config_file, args.output_dir)
     generator.generate_configs()

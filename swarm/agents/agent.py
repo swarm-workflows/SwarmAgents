@@ -36,13 +36,16 @@ import time
 import traceback
 from abc import abstractmethod
 from logging.handlers import RotatingFileHandler
-from typing import List
+from typing import Union
 
 import psutil as psutil
 import redis
 import yaml
 from matplotlib import pyplot as plt
 
+from swarm.agents.data.messaging_config import MessagingConfig
+from swarm.agents.data.queues import AgentQueues
+from swarm.comm.message_service_grpc import MessageServiceGrpc
 from swarm.comm.message_service_nats import MessageServiceNats
 from swarm.comm.messages.heart_beat import HeartBeat
 from swarm.comm.messages.message import MessageType
@@ -52,7 +55,6 @@ from swarm.models.capacities import Capacities
 from swarm.models.agent_info import AgentInfo
 from swarm.models.profile import ProfileType, PROFILE_MAP
 from swarm.models.job import Job
-from swarm.queue.simple_job_queue import SimpleJobQueue
 
 
 class IterableQueue:
@@ -68,63 +70,42 @@ class IterableQueue:
 
 
 class Agent(Observer):
-    def __init__(self, agent_id: int, config_file: str, cycles: int, total_agents: int):
+    def __init__(self, agent_id: int, config_file: str):
         self.agent_id = agent_id
-        self.peer_topic_prefix = ""
-        self.peer_hb_topic_prefix = ""
-        self.topology_peer_agent_list = "all"
-        self.job_queue = SimpleJobQueue()
-        self.selected_queue = SimpleJobQueue()
-        self.ready_queue = SimpleJobQueue()
-        self.done_queue = SimpleJobQueue()
-        self.last_updated = time.time()
         self.neighbor_map = {}  # Store neighbor information
-        self.profile = None
-        self.data_transfer = True
-        self.kafka_config = {}
-        self.kafka_config_hb = {}
-        self.nat_config = {}
-        self.nat_config_hb = {}
-        self.message_service_type = "kafka"
-        self.logger = None
-        self.projected_queue_threshold = 300.00
-        self.ready_queue_threshold = 100.00
-        self.max_time_load_zero = 30
-        self.restart_job_selection = 300
-        self.peer_heartbeat_timeout = 300
-        self.results_dir = "."
-        self.shutdown_mode = "manual"
-        self.redis_host = "127.0.0.1"
-        self.redis_port = 6379
-        self.heartbeat_mode = "kafka"
-        self.load_config(config_file)
-        print(f"topology_peer_agent_list: {self.topology_peer_agent_list} {type(self.topology_peer_agent_list)}")
-        self.capacities = self.get_system_info()
-        if self.message_service_type == "nats":
-            self.ctrl_msg_srv = MessageServiceNats(config=self.nat_config,
-                                                   logger=self.logger)
-            self.hrt_msg_srv = MessageServiceNats(config=self.nat_config_hb,
-                                                  logger=self.logger)
-        else:
-            self.ctrl_msg_srv = MessageServiceKafka(config=self.kafka_config,
-                                                    logger=self.logger)
-            if self.heartbeat_mode == "kafka":
-                self.hrt_msg_srv = MessageServiceKafka(config=self.kafka_config_hb,
-                                                       logger=self.logger)
-                self.heartbeat_receiver_thread = threading.Thread(target=self._heartbeat_processor_main,
-                                                                  daemon=True, name="HeartBeatReceiverThread")
-            else:
-                self.hrt_msg_srv = None
-                self.heartbeat_receiver_thread = None
+        self.neighbor_map_lock = threading.Lock()
+
+        self.config = {}
+        with open(config_file, 'r') as f:
+            self.config = yaml.safe_load(f)
+        self.queues = AgentQueues(self.config.get("queue", {}))
+        self.messaging = self._build_messaging_config(config=self.config)
+        self.log_config = self.config.get("logging", {})
+        self.runtime_config = self.config.get("runtime", {})
+        self.redis_config = self.config.get(redis, {"host": "127.0.0.1", "port": 6379})
+        self.last_updated = time.time()
+        self.logger = self.make_logger(log_dir=self.log_config.get("log-directory"),
+                                       log_file=f'{self.log_config.get("log-file")}-{self.agent_id}.log',
+                                       logger=f'{self.log_config.get("logger")}-{self.agent_id}',
+                                       log_retain=self.log_config.get("log-retain"),
+                                       log_size=self.log_config.get("log-size"),
+                                       log_level=self.log_config.get("log-level"))
+
+        self.redis_client = redis.StrictRedis(host=self.redis_config.get("host"),
+                                              port=self.redis_config.get("port"),
+                                              decode_responses=True)
+
+        self.job_repo = Repository(redis_client=self.redis_client)
+        self.agent_repo = Repository(redis_client=self.redis_client)
+
+        # Message Processors
+        self.ctrl_msg_srv = self._create_control_message_service()
+        self.hrt_msg_srv, self.heartbeat_receiver_thread = self._create_heartbeat_message_service()
+
         self.load_per_agent = {}
-        self.cycles = cycles
-        self.total_agents = total_agents
-        self.message_queue = queue.Queue()
-        self.hb_message_queue = queue.Queue()
         self.condition = threading.Condition()
         self.shutdown = False
         self.shutdown_path = "./shutdown"
-        self.neighbor_map_lock = threading.Lock()
         self.heartbeat_thread = threading.Thread(target=self._heartbeat_main,
                                                  daemon=True, name="HeartBeatThread")
         self.msg_receiver_thread = threading.Thread(target=self._message_processor_main,
@@ -141,12 +122,166 @@ class Agent(Observer):
         self.restart_job_selection_cnt = 0
         self.conflicts = 0
         self.plot_figures = False
-        self.redis_client = redis.StrictRedis(host=self.redis_host, port=self.redis_port,
-                                              decode_responses=True)
-        self.job_repo = Repository(redis_client=self.redis_client)
-        self.agent_repo = Repository(redis_client=self.redis_client)
         self.completed_lock = threading.Lock()
         self.completed_jobs_set = set()
+
+    @property
+    def grpc_port(self):
+        return self.messaging.grpc_config.get("port", 50051)
+
+    @property
+    def total_agents(self):
+        return self.runtime_config.get("total_agents", 5)
+
+    @property
+    def agent_count(self):
+        return len(self.neighbor_map) + 1
+
+    @property
+    def topic(self):
+        return self.messaging.kafka_config.get("topic")
+
+    @property
+    def hb_topic(self):
+        return self.messaging.kafka_config.get("hb_topic")
+
+    @property
+    def capacities(self):
+        return self.get_system_info()
+
+    @property
+    def profile(self):
+        return PROFILE_MAP.get(self.runtime_config.get("profile", str(ProfileType.BalancedProfile)))
+
+    @property
+    def data_transfer(self):
+        return self.runtime_config.get("data_transfer", False)
+
+    @property
+    def message_service_type(self):
+        return self.runtime_config.get("message_service_type", "kafka")
+
+    @property
+    def projected_queue_threshold(self):
+        return self.runtime_config.get("projected_queue_threshold", 300.0)
+
+    @property
+    def ready_queue_threshold(self):
+        return self.runtime_config.get("ready_queue_threshold", 100.0)
+
+    @property
+    def max_time_load_zero(self):
+        return self.runtime_config.get("max_time_load_zero", 30)
+
+    @property
+    def restart_job_selection(self):
+        return self.runtime_config.get("restart_job_selection", 300)
+
+    @property
+    def peer_heartbeat_timeout(self):
+        return self.runtime_config.get("peer_heartbeat_timeout", 300)
+
+    @property
+    def results_dir(self):
+        return self.runtime_config.get("results_dir", ".")
+
+    @property
+    def shutdown_mode(self):
+        return self.runtime_config.get("shutdown_mode", "manual")
+
+    @property
+    def heartbeat_mode(self):
+        return self.runtime_config.get("heartbeat_mode", "kafka")
+
+    @property
+    def jobs_per_proposal(self):
+        return self.runtime_config.get("jobs_per_proposal", 3)
+
+    def _build_messaging_config(self, config: dict) -> MessagingConfig:
+        topic_suffix = ""
+        peer_agents = []
+
+        # Handle topology config
+        topology_config = config.get("topology", {})
+        if "peer_agents" in topology_config:
+            peer_agents = topology_config["peer_agents"]
+            if isinstance(peer_agents, list):
+                topic_suffix = self.agent_id
+
+        # Load individual configs
+        kafka_config_raw = config.get("kafka", {})
+        nat_config_raw = config.get("nats", {})
+        grpc_config = config.get("grpc", {})
+
+        topic = kafka_config_raw.get("topic", "agent")
+        topic_hb = kafka_config_raw.get("hb_topic", "agent-hb")
+        cg = kafka_config_raw.get("consumer_group_id", "cg")
+        bootstrap_servers = kafka_config_raw.get("bootstrap_servers", "localhost:19092")
+        batch_size = kafka_config_raw.get("batch_size")
+
+        # Construct Kafka configs
+        kafka_config = {
+            'kafka_bootstrap_servers': bootstrap_servers,
+            'kafka_topic': f'{topic}-{topic_suffix}',
+            'consumer_group_id': f'{cg}-{topic}-{self.agent_id}',
+            'batch_size': batch_size
+        }
+
+        kafka_config_hb = {
+            'kafka_bootstrap_servers': bootstrap_servers,
+            'kafka_topic': f'{topic_hb}-{topic_suffix}',
+            'consumer_group_id': f'{cg}-{topic_hb}-{self.agent_id}',
+            'batch_size': batch_size
+        }
+
+        # Construct NATS configs
+        nat_config = {
+            'nats_servers': nat_config_raw.get('nats_servers', 'nats://127.0.0.1:4222'),
+            'nats_topic': nat_config_raw.get('nats_topic', 'job.consensus')
+        }
+
+        nat_config_hb = {
+            'nats_servers': nat_config_raw.get('nats_servers', 'nats://127.0.0.1:4222'),
+            'nats_topic': nat_config_raw.get('hb_nats_topic', 'job.consensus')
+        }
+
+        return MessagingConfig(
+            kafka_config=kafka_config,
+            kafka_config_hb=kafka_config_hb,
+            nat_config=nat_config,
+            nat_config_hb=nat_config_hb,
+            grpc_config=grpc_config,
+            topology_peer_agent_list=peer_agents
+        )
+
+    def _create_control_message_service(self):
+        if self.message_service_type == "nats":
+            return MessageServiceNats(config=self.messaging.nat_config, logger=self.logger)
+        elif self.message_service_type == "grpc":
+            port = self.grpc_port + self.agent_id
+            return MessageServiceGrpc(port=port, logger=self.logger)
+        else:  # Default to Kafka
+            return MessageServiceKafka(config=self.messaging.kafka_config, logger=self.logger)
+
+    def _create_heartbeat_message_service(self) -> tuple[Union[MessageServiceNats, MessageServiceKafka, None],
+                                                         Union[threading.Thread, None]]:
+        if self.message_service_type == "nats":
+            return (
+                MessageServiceNats(config=self.messaging.nat_config_hb, logger=self.logger),
+                None
+            )
+        elif self.message_service_type == "grpc":
+            return (None, None)  # No heartbeat service for gRPC
+        else:  # Kafka
+            if self.heartbeat_mode == "kafka":
+                thread = threading.Thread(target=self._heartbeat_processor_main,
+                                          daemon=True, name="HeartBeatReceiverThread")
+                return (
+                    MessageServiceKafka(config=self.messaging.kafka_config_hb, logger=self.logger),
+                    thread
+                )
+            else:
+                return (None, None)
 
     def start_idle(self):
         if self.idle_start_time is None:
@@ -166,7 +301,10 @@ class Agent(Observer):
 
     def __enqueue(self, incoming: str):
         try:
-            message = json.loads(incoming)
+            if isinstance(incoming, str):
+                message = json.loads(incoming)
+            else:
+                message = incoming
             source_agent_id = message.get("source")
             fwd = message.get("forwarded_by")
 
@@ -187,16 +325,15 @@ class Agent(Observer):
                                   f"Payload:  {json.dumps(message)}")
 
             if message_type == MessageType.HeartBeat.name or message_type == MessageType.HeartBeat.value:
-                self.hb_message_queue.put_nowait(message)
+                self.queues.hb_message_queue.put_nowait(message)
             else:
-                self.message_queue.put_nowait(message)
+                self.queues.message_queue.put_nowait(message)
             with self.condition:
                 self.condition.notify_all()
-            #self.logger.debug(f"Added incoming message to queue: {incoming}")
         except Exception as e:
             self.logger.debug(f"Failed to add incoming message to queue: {incoming}: e: {e}")
 
-    def __dequeue(self, queue_obj: queue.Queue) -> List[dict]:
+    def __dequeue(self, queue_obj: queue.Queue) -> list[dict]:
         events = []
         if not queue_obj.empty():
             try:
@@ -227,11 +364,11 @@ class Agent(Observer):
         my_load = self.compute_overall_load()
         agent = AgentInfo(agent_id=self.agent_id,
                           capacities=self.capacities,
-                          capacity_allocations=self.ready_queue.capacities(jobs=self.ready_queue.get_jobs()),
+                          capacity_allocations=self.queues.ready_queue.capacities(jobs=self.queues.ready_queue.get_jobs()),
                           load=my_load,
                           last_updated=time.time())
         self._save_load_metric(self.agent_id, my_load)
-        if not only_self and isinstance(self.topology_peer_agent_list, list) and len(self.neighbor_map.values()):
+        if not only_self and isinstance(self.messaging.topology_peer_agent_list, list) and len(self.neighbor_map.values()):
             for peer_agent_id, peer in self.neighbor_map.items():
                 agents[peer_agent_id] = peer
         agents[self.agent_id] = agent
@@ -255,17 +392,17 @@ class Agent(Observer):
                         self.__add_peer(peer=agent_info)
                 else:
                     # If broadcasting is enabled, send one message for all
-                    if self.topology_peer_agent_list == "all":
+                    if self.messaging.topology_peer_agent_list == "all":
                         hb = HeartBeat(source=self.agent_id, agents=list(agents.values()))
                         self.hrt_msg_srv.produce_message(json_message=hb.to_dict())
 
                     else:
                         # Send individually only if required
-                        for peer_agent_id in self.topology_peer_agent_list:
+                        for peer_agent_id in self.messaging.topology_peer_agent_list:
                             hb_agents = {k: v for k, v in agents.items() if k != peer_agent_id}
                             hb = HeartBeat(source=self.agent_id, agents=list(hb_agents.values()))
                             self.hrt_msg_srv.produce_message(json_message=hb.to_dict(),
-                                                             topic=f"{self.peer_hb_topic_prefix}-{peer_agent_id}",
+                                                             topic=f"{self.hb_topic}-{peer_agent_id}",
                                                              dest=peer_agent_id,
                                                              src=self.agent_id)
                 time.sleep(5)
@@ -276,24 +413,28 @@ class Agent(Observer):
             if self._can_shutdown(agents=agents):
                 self.stop()
 
-    def _send_message(self, json_message: dict, excluded_peers: list[int] = [],
-                      src: int = None, fwd: int = None):
+    def _send_message(self, json_message: dict, excluded_peers: list[int] = [], src: int = None, fwd: int = None):
         if src is None:
             src = self.agent_id
 
         if excluded_peers is None:
             excluded_peers = set()
 
-        if isinstance(self.topology_peer_agent_list, list):
-            for peer_agent_id in self.topology_peer_agent_list:
+        if isinstance(self.messaging.topology_peer_agent_list, list):
+            for peer_agent_id in self.messaging.topology_peer_agent_list:
                 if peer_agent_id in excluded_peers:
                     continue
+                if self.message_service_type == "grpc":
+                    topic = f"localhost:{self.grpc_port + peer_agent_id}"
+                else:
+                    topic = f"{self.topic}-{peer_agent_id}"
                 self.ctrl_msg_srv.produce_message(json_message=json_message,
-                                                  topic=f"{self.peer_topic_prefix}-{peer_agent_id}",
+                                                  topic=topic,
                                                   dest=peer_agent_id,
                                                   src=src, fwd=fwd)
         else:
-            self.ctrl_msg_srv.produce_message(json_message=json_message)
+            self.ctrl_msg_srv.produce_message(json_message=json_message,
+                                              src=src)
 
     def _message_processor_main(self):
         self.logger.info("Message Processor Started")
@@ -301,8 +442,8 @@ class Agent(Observer):
         while not self.shutdown:
             try:
                 messages = []
-                while not self.message_queue.empty():
-                    messages.extend(self.__dequeue(self.message_queue))
+                while not self.queues.message_queue.empty():
+                    messages.extend(self.__dequeue(self.queues.message_queue))
 
                 if messages:
                     self._process_messages(messages=messages)
@@ -320,8 +461,8 @@ class Agent(Observer):
         while not self.shutdown:
             try:
                 messages = []
-                while not self.hb_message_queue.empty():
-                    messages.extend(self.__dequeue(self.hb_message_queue))
+                while not self.queues.hb_message_queue.empty():
+                    messages.extend(self.__dequeue(self.queues.hb_message_queue))
 
                 if messages:
                     self._process_messages(messages=messages)
@@ -333,7 +474,7 @@ class Agent(Observer):
 
         self.logger.info("Heartbeat Processor Stopped")
 
-    def _process_messages(self, *, messages: List[dict]):
+    def _process_messages(self, *, messages: list[dict]):
         for message in messages:
             try:
                 begin = time.time()
@@ -349,86 +490,6 @@ class Agent(Observer):
             except Exception as e:
                 self.logger.error(f"Error while processing message {type(message)}, {e}")
                 self.logger.error(traceback.format_exc())
-
-    def load_config(self, config_file):
-        with open(config_file, 'r') as f:
-            config = yaml.safe_load(f)
-            topic_suffix = ""
-
-            redis_cfg = config.get("redis")
-            self.redis_host = redis_cfg.get("host")
-            self.redis_port = redis_cfg.get("port")
-
-            topology_config = config.get("topology", {})
-            if topology_config.get("peer_agents"):
-                peer_agents = topology_config.get("peer_agents")
-                self.topology_peer_agent_list = peer_agents
-
-            if isinstance(peer_agents, list):
-                topic_suffix = self.agent_id
-
-            queue_config = config.get("queue", {})
-            queue_type = queue_config.get("type", "simple")
-            if queue_type == "riak":
-                from swarm.queue.riak_job_queue import RiakJobQueue
-                self.job_queue = RiakJobQueue()
-                self.selected_queue = self.job_queue
-                self.ready_queue = self.job_queue
-                self.done_queue = self.job_queue
-
-            kafka_config = config.get("kafka", {})
-            nat_config = config.get("nats", {})
-
-            topic = kafka_config.get("topic", "agent")
-            topic_hb = kafka_config.get("hb_topic", "agent-hb")
-            cg = kafka_config.get("consumer_group_id", "cg")
-            self.kafka_config = {
-                'kafka_bootstrap_servers': kafka_config.get("bootstrap_servers", "localhost:19092"),
-                'kafka_topic': f'{topic}-{topic_suffix}',
-                'consumer_group_id': f'{cg}-{topic}-{self.agent_id}',
-                'batch_size': kafka_config.get('batch_size')
-            }
-            self.peer_topic_prefix = topic
-
-            self.kafka_config_hb = {
-                'kafka_bootstrap_servers': kafka_config.get("bootstrap_servers", "localhost:19092"),
-                'kafka_topic': f'{topic_hb}-{topic_suffix}',
-                'consumer_group_id': f'{cg}-{topic_hb}-{self.agent_id}',
-                'batch_size': kafka_config.get('batch_size')
-            }
-
-            self.peer_hb_topic_prefix = topic_hb
-
-            self.nat_config = {
-                'nats_servers': nat_config.get('nats_servers', 'nats://127.0.0.1:4222'),
-                'nats_topic': nat_config.get('nats_topic', 'job.consensus'),
-            }
-
-            self.nat_config_hb = {
-                'nats_servers': nat_config.get('nats_servers', 'nats://127.0.0.1:4222'),
-                'nats_topic': nat_config.get('hb_nats_topic', 'job.consensus'),
-            }
-            runtime_config = config.get("runtime", {})
-            self.heartbeat_mode = runtime_config.get("heartbeat", "kafka")
-            self.shutdown_mode = runtime_config.get("shutdown")
-            self.message_service_type = runtime_config.get("message_service", "kafka")
-            profile_name = runtime_config.get("profile", str(ProfileType.BalancedProfile))
-            self.profile = PROFILE_MAP.get(profile_name)
-            self.data_transfer = runtime_config.get("data_transfer", True)
-            self.projected_queue_threshold = runtime_config.get("projected_queue_threshold", 300.00)
-            self.ready_queue_threshold = runtime_config.get("ready_queue_threshold", 100.00)
-            self.max_time_load_zero = runtime_config.get("max_time_load_zero", 30)
-            self.restart_job_selection = runtime_config.get("restart_job_selection", 300)
-            self.peer_heartbeat_timeout = runtime_config.get("peer_heartbeat_timeout", 300)
-            self.results_dir = runtime_config.get("results_dir", ".")
-
-            log_config = config.get("logging")
-            self.logger = self.make_logger(log_dir=log_config.get("log-directory"),
-                                           log_file=f'{log_config.get("log-file")}-{self.agent_id}.log',
-                                           logger=f'{log_config.get("logger")}-{self.agent_id}',
-                                           log_retain=log_config.get("log-retain"),
-                                           log_size=log_config.get("log-size"),
-                                           log_level=log_config.get("log-level"))
 
     @staticmethod
     def get_system_info():
@@ -488,8 +549,8 @@ class Agent(Observer):
         if only_total:
             available = self.capacities
         else:
-            allocated_caps = self.ready_queue.capacities(jobs=self.ready_queue.get_jobs())
-            allocated_caps += self.selected_queue.capacities(jobs=self.selected_queue.get_jobs())
+            allocated_caps = self.queues.ready_queue.capacities(jobs=self.queues.ready_queue.get_jobs())
+            allocated_caps += self.queues.selected_queue.capacities(jobs=self.queues.selected_queue.get_jobs())
             available = self.capacities - allocated_caps
 
         # Check if the agent can accommodate the given job based on its capacities
@@ -511,7 +572,7 @@ class Agent(Observer):
         return True
 
     def can_schedule_job(self, job: Job):
-        allocated_caps = self.ready_queue.capacities(jobs=self.ready_queue.get_jobs())
+        allocated_caps = self.queues.ready_queue.capacities(jobs=self.queues.ready_queue.get_jobs())
         available = self.capacities - allocated_caps
 
         # Check if the agent can accommodate the given job based on its capacities
@@ -532,17 +593,17 @@ class Agent(Observer):
 
         return True
 
-    def compute_overall_load(self, proposed_jobs: List[str] = None):
+    def compute_overall_load(self, proposed_jobs: list[str] = None):
         if proposed_jobs is None:
             proposed_jobs = []
 
         allocated_caps = Capacities()
-        allocated_caps += self.ready_queue.capacities(jobs=self.ready_queue.get_jobs())
-        allocated_caps += self.selected_queue.capacities(jobs=self.selected_queue.get_jobs())
+        allocated_caps += self.queues.ready_queue.capacities(jobs=self.queues.ready_queue.get_jobs())
+        allocated_caps += self.queues.selected_queue.capacities(jobs=self.queues.selected_queue.get_jobs())
 
         for j in proposed_jobs:
-            if j not in self.ready_queue and j not in self.selected_queue:
-                job = self.job_queue.get_job(job_id=j)
+            if j not in self.queues.ready_queue and j not in self.queues.selected_queue:
+                job = self.queues.job_queue.get_job(job_id=j)
                 allocated_caps += job.capacities
 
         core_load = (allocated_caps.core / self.capacities.core) * 100
@@ -557,7 +618,7 @@ class Agent(Observer):
         return round(overall_load, 2)
 
     def compute_ready_queue_load(self):
-        allocated_caps = self.ready_queue.capacities(jobs=self.ready_queue.get_jobs())
+        allocated_caps = self.queues.ready_queue.capacities(jobs=self.queues.ready_queue.get_jobs())
 
         core_load = (allocated_caps.core / self.capacities.core) * 100
         ram_load = (allocated_caps.ram / self.capacities.ram) * 100
@@ -574,14 +635,14 @@ class Agent(Observer):
         #print(f"Adding: {job.get_job_id()} on agent: {self.agent_id} to Select Queue")
         self.logger.info(f"[SELECTED]: {job.get_job_id()} on agent: {self.agent_id} to Select Queue")
         # Add the job to the list of allocated jobs
-        self.selected_queue.add_job(job=job)
+        self.queues.selected_queue.add_job(job=job)
 
     def schedule_job(self, job: Job):
         self.end_idle()
         print(f"SCHEDULED: {job.get_job_id()} on agent: {self.agent_id}")
         self.logger.info(f"[SCHEDULED]: {job.get_job_id()} on agent: {self.agent_id}")
         # Add the job to the list of allocated jobs
-        self.ready_queue.add_job(job=job)
+        self.queues.ready_queue.add_job(job=job)
 
         # Launch a thread to execute the job
         thread = threading.Thread(target=self.execute_job, args=(job,))
@@ -593,9 +654,9 @@ class Agent(Observer):
         # Assuming execute_job function performs the actual execution of the job
         try:
             job.execute(data_transfer=self.data_transfer)
-            self.done_queue.add_job(job=job)
-            self.ready_queue.remove_job(job_id=job.get_job_id())
-            if not len(self.ready_queue.get_jobs()):
+            self.queues.done_queue.add_job(job=job)
+            self.queues.ready_queue.remove_job(job_id=job.get_job_id())
+            if not len(self.queues.ready_queue.get_jobs()):
                 self.start_idle()
         except Exception as e:
             self.logger.error(f"Execution error: {e}")
@@ -704,10 +765,10 @@ class Agent(Observer):
         self.logger.info(f"Starting Job Scheduling Thread: {self}")
         while not self.shutdown:
             try:
-                for job in self.selected_queue.get_jobs():
+                for job in self.queues.selected_queue.get_jobs():
                     ready_queue_load = self.compute_ready_queue_load()
                     if ready_queue_load < self.ready_queue_threshold and self.can_schedule_job(job):
-                        self.selected_queue.remove_job(job.get_job_id())
+                        self.queues.selected_queue.remove_job(job.get_job_id())
                         self.schedule_job(job)
                     else:
                         time.sleep(0.5)
@@ -737,7 +798,7 @@ class Agent(Observer):
 
     def plot_jobs_per_agent(self, jobs: list[Job] = None):
         if not jobs:
-            jobs = self.job_queue.get_jobs()
+            jobs = self.queues.job_queue.get_jobs()
         completed_jobs = [j for j in jobs if j.leader_agent_id is not None]
         jobs_per_agent = {}
 
@@ -778,7 +839,7 @@ class Agent(Observer):
 
     def plot_scheduling_latency(self, jobs: list[Job] = None):
         if not jobs:
-            jobs = self.job_queue.get_jobs()
+            jobs = self.queues.job_queue.get_jobs()
         completed_jobs = [j for j in jobs if j.leader_agent_id is not None]
 
         wait_times = {}

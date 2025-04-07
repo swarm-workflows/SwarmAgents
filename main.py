@@ -50,7 +50,7 @@ class TaskDistributor(threading.Thread):
         while not self.shutdown and self.task_pool:
             tasks_to_add = [self.task_pool.pop() for _ in range(min(self.tasks_per_interval, len(self.task_pool)))]
             for task in tasks_to_add:
-                self.agent.job_queue.add_job(task)
+                self.agent.queues.job_queue.add_job(task)
                 total_tasks_added += 1
             time.sleep(1)
             if total_tasks_added == self.total_tasks:
@@ -96,24 +96,21 @@ if __name__ == '__main__':
     if agent_type == "pbft":
         config_file = "./config_pbft.yml"
         from swarm.agents.pbft_agentv2 import PBFTAgent
-        agent = PBFTAgent(agent_id=agent_id, config_file=config_file, cycles=1000,
-                          total_agents=total_agents)
+        agent = PBFTAgent(agent_id=agent_id, config_file=config_file)
     elif agent_type == "swarm-single":
         config_file = "./config_swarm_single.yml"
         if local_topo:
             config_file = f"./config_swarm_single_{agent_id}.yml"
         # Initialize your swarm-single agent here using the config_file
         from swarm.agents.swarm_agent import SwarmAgent
-        agent = SwarmAgent(agent_id=agent_id, config_file=config_file, cycles=1000,
-                           total_agents=total_agents)
+        agent = SwarmAgent(agent_id=agent_id, config_file=config_file)
     elif agent_type == "swarm-multi":
         config_file = "./config_swarm_multi.yml"
         if local_topo:
             config_file = f"./config_swarm_multi_{agent_id}.yml"
         # Initialize your swarm-multi agent here using the config_file
         from swarm.agents.swarm_agentv2 import SwarmAgent
-        agent = SwarmAgent(agent_id=agent_id, config_file=config_file, cycles=1000,
-                           total_agents=total_agents)
+        agent = SwarmAgent(agent_id=agent_id, config_file=config_file)
     else:
         print(f"Unknown agent type: {agent_type}")
         sys.exit(1)
@@ -122,7 +119,7 @@ if __name__ == '__main__':
     tasks_per_interval = 1  # Number of tasks to add each interval
     interval = 5  # Interval in seconds
 
-    if isinstance(agent.job_queue, SimpleJobQueue):
+    if isinstance(agent.queues.job_queue, SimpleJobQueue):
         distributor = TaskDistributor(agent=agent, task_pool=task_pool, tasks_per_interval=tasks_per_interval,
                                       interval=interval)
 

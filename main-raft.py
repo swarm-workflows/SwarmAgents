@@ -61,7 +61,7 @@ if __name__ == "__main__":
     # Create and start the Raft agent
     print(f"Starting at: {start_port + agent_id} with peers: {peers}")
     agent = RaftAgent(agent_id, port=start_port + agent_id, peers=peers,
-                      config_file="./config.yml", cycles=1000, total_agents=total_agents)
+                      config_file="./config.yml")
     task_generator = TaskGenerator(task_count=task_count)
     if agent_id == 0:
         task_generator.start()

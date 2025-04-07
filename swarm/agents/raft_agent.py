@@ -25,9 +25,7 @@
 import threading
 import time
 import traceback
-from typing import Dict, List
 
-import redis
 from pyraft.raft import RaftNode
 
 from swarm.agents.agent import Agent
@@ -56,10 +54,9 @@ class ExtendedRaftNode(RaftNode):
 
 
 class RaftAgent(Agent):
-    def __init__(self, agent_id: int, config_file: str, cycles: int, total_agents: int,
-                 address: str = "127.0.0.1", port: int = 5010, peers: Dict[str, str] = {}):
-        super(RaftAgent, self).__init__(agent_id=agent_id, config_file=config_file, cycles=cycles,
-                                        total_agents=total_agents)
+    def __init__(self, agent_id: int, config_file: str,  address: str = "127.0.0.1", port: int = 5010,
+                 peers: dict[str, str] = {}):
+        super(RaftAgent, self).__init__(agent_id=agent_id, config_file=config_file)
         self.agent_id = agent_id
         self.peers = peers
         self.raft = ExtendedRaftNode(self.agent_id, f"{address}:{port}", peers)
@@ -208,7 +205,7 @@ class RaftAgent(Agent):
         # Produce the message to the Kafka topic
         self._send_message(json_message=message)
 
-    def _process_messages(self, *, messages: List[dict]):
+    def _process_messages(self, *, messages: list[dict]):
         for message in messages:
             try:
                 begin = time.time()

@@ -29,14 +29,14 @@ def compare_dicts_list(dict_list):
 
 def main(run_directory: str, number_of_agents: int, algo: str):
     # Initialize dictionaries for data storage
-    agent_diff_latencies = {agent_id: [] for agent_id in range(number_of_agents)}
-    agent_idle_times = {agent_id: [] for agent_id in range(number_of_agents)}
+    agent_diff_latencies = {agent_id: [] for agent_id in range(1, number_of_agents+1)}
+    agent_idle_times = {agent_id: [] for agent_id in range(1, number_of_agents+1)}
     agent_job_counts = {}
 
     run_dir = run_directory
 
     # Read and Process Per-Agent Selection Time and Scheduling Latency
-    for agent_id in range(number_of_agents):
+    for agent_id in range(1, number_of_agents+1):
         selection_time_file = os.path.join(run_dir, f'selection_time_{agent_id}.csv')
         scheduling_latency_file = os.path.join(run_dir, f'scheduling_latency_{agent_id}.csv')
 
@@ -59,7 +59,7 @@ def main(run_directory: str, number_of_agents: int, algo: str):
 
     # Compute Mean Scheduling Latency Over All Jobs
     all_scheduling_latencies = []
-    for agent_id in range(number_of_agents):
+    for agent_id in range(1, number_of_agents+1):
         scheduling_latency_file = os.path.join(run_dir, f'scheduling_latency_{agent_id}.csv')
         if os.path.exists(scheduling_latency_file):
             df_scheduling_latency = pd.read_csv(scheduling_latency_file)
@@ -71,11 +71,25 @@ def main(run_directory: str, number_of_agents: int, algo: str):
         mean_scheduling_latency = np.mean(all_scheduling_latencies)
         print(f"Mean Scheduling Latency over All Jobs: {mean_scheduling_latency:.4f} seconds")
 
+    # Compute Mean Selection Time Latency Over All Jobs
+    all_selection_time = []
+    for agent_id in range(1, number_of_agents+1):
+        selection_time_file = os.path.join(run_dir, f'selection_time_{agent_id}.csv')
+        if os.path.exists(selection_time_file):
+            df_selection_time = pd.read_csv(selection_time_file)
+            if 'selection_time' in df_selection_time.columns:
+                all_selection_time.extend(df_selection_time["selection_time"].tolist())
+
+    mean_selection_time = 0
+    if all_selection_time:
+        mean_selection_time = np.mean(all_selection_time)
+        print(f"Mean Selection Time over All Jobs: {mean_selection_time:.4f} seconds")
+
     job_agent_id_mapping = {}
 
     # Track Job Count for Each Agent
     # Jobs and corresponding agents which think they may have executed it
-    for agent_id in range(number_of_agents):
+    for agent_id in range(1, number_of_agents+1):
         jobs_per_agent_file = os.path.join(run_dir, f'jobs_per_agent_{agent_id}.csv')
         if not os.path.exists(jobs_per_agent_file):
             continue
@@ -121,7 +135,7 @@ def main(run_directory: str, number_of_agents: int, algo: str):
     plt.close()
 
     # Read and Store Idle Time Per Agent
-    for agent_id in range(number_of_agents):
+    for agent_id in range(1, number_of_agents+1):
         idle_time_file = os.path.join(run_dir, f'idle_time_per_agent_{agent_id}.csv')
         if os.path.exists(idle_time_file):
             df_idle_time = pd.read_csv(idle_time_file)
@@ -130,12 +144,14 @@ def main(run_directory: str, number_of_agents: int, algo: str):
 
     # Plot Scheduling Latency per Job
     plt.figure(figsize=(12, 6))
-    for agent_id in range(number_of_agents):
+    for agent_id in range(1, number_of_agents+1):
         scheduling_latency_file = os.path.join(run_dir, f'scheduling_latency_{agent_id}.csv')
         if os.path.exists(scheduling_latency_file):
             df_scheduling_latency = pd.read_csv(scheduling_latency_file)
             if 'job_id' in df_scheduling_latency.columns and 'scheduling_latency' in df_scheduling_latency.columns:
-                plt.plot(df_scheduling_latency["job_id"], df_scheduling_latency["scheduling_latency"], marker='o', linestyle='-', label=f'Agent {agent_id}')
+                #plt.plot(df_scheduling_latency["job_id"], df_scheduling_latency["scheduling_latency"], marker='o', linestyle='-', label=f'Agent {agent_id}')
+                plt.scatter(df_scheduling_latency["job_id"], df_scheduling_latency["scheduling_latency"],
+                            label=f'Agent {agent_id}')
 
     plt.xlabel('Job ID')
     plt.ylabel('Scheduling Latency (seconds)')
@@ -149,7 +165,7 @@ def main(run_directory: str, number_of_agents: int, algo: str):
     plt.figure(figsize=(10, 6))
     for agent_id, idle_times in agent_idle_times.items():
         if idle_times:
-            plt.plot(range(len(idle_times)), idle_times, marker='o', linestyle='-', label=f'Agent {agent_id}')
+            plt.scatter(range(len(idle_times)), idle_times, label=f'Agent {agent_id}')
 
     plt.xlabel('Time Index')
     plt.ylabel('Idle Time (seconds)')
@@ -178,6 +194,25 @@ def main(run_directory: str, number_of_agents: int, algo: str):
     # Print Total Jobs Per Agent
     for agent_id, job_count in agent_job_counts.items():
         print(f"Agent {agent_id}: Jobs Handled = {job_count}")
+
+    # Plot Selection Latency per Job
+    plt.figure(figsize=(12, 6))
+    for agent_id in range(1, number_of_agents+1):
+        selection_time_file = os.path.join(run_dir, f'selection_time_{agent_id}.csv')
+        if os.path.exists(selection_time_file):
+            df_selection_time = pd.read_csv(selection_time_file)
+            if 'job_id' in df_selection_time.columns and 'selection_time' in df_selection_time.columns:
+                #plt.plot(df_selection_time["job_id"], df_selection_time["selection_time"], marker='o', linestyle='-',
+                #         label=f'Agent {agent_id}')
+                plt.scatter(df_selection_time["job_id"], df_selection_time["selection_time"], label=f'Agent {agent_id}')
+
+    plt.xlabel('Job ID')
+    plt.ylabel('Selection Time (seconds)')
+    plt.title(f'{algo}: Selection Time per Job (Mean {mean_selection_time:.4f}/ Agents: {number_of_agents})')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(os.path.join(run_dir, 'selection_time_per_job.png'), bbox_inches='tight')
+    plt.close()
 
 
 if __name__ == '__main__':

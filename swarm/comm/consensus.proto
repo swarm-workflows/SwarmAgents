@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package swarm;
+
+service ConsensusService {
+  rpc SendMessage(ConsensusMessage) returns (Ack);
+}
+
+message ConsensusMessage {
+  string sender_id = 1;
+  string receiver_id = 2;
+  string message_type = 3;
+  string payload = 4;
+  int64 timestamp = 5;
+}
+
+message Ack {
+  bool success = 1;
+  string info = 2;
+}

@@ -33,7 +33,6 @@ from swarm.comm.messages.heart_beat import HeartBeat
 from swarm.comm.messages.message_builder import MessageBuilder
 from swarm.comm.messages.prepare import Prepare
 from swarm.comm.messages.proposal import Proposal
-from swarm.comm.messages.job_info import JobInfo
 from swarm.comm.messages.job_status import JobStatus
 from swarm.models.capacities import Capacities
 from swarm.models.agent_info import AgentInfo
@@ -44,22 +43,21 @@ import numpy as np
 
 
 class SwarmAgent(Agent):
-    def __init__(self, agent_id: int, config_file: str, cycles: int, total_agents: int):
-        super().__init__(agent_id, config_file, cycles, total_agents)
+    def __init__(self, agent_id: int, config_file: str):
+        super().__init__(agent_id, config_file)
         self.outgoing_proposals = ProposalContainer()
         self.incoming_proposals = ProposalContainer()
-        self.number_of_jobs_per_proposal = 3
 
     def _build_heart_beat(self, only_self: bool = False) -> dict:
         agents = {}
         my_load = self.compute_overall_load(proposed_jobs=self.outgoing_proposals.jobs())
         agent = AgentInfo(agent_id=self.agent_id,
                           capacities=self.capacities,
-                          capacity_allocations=self.ready_queue.capacities(jobs=self.ready_queue.get_jobs()),
+                          capacity_allocations=self.queues.ready_queue.capacities(jobs=self.queues.ready_queue.get_jobs()),
                           load=my_load,
                           last_updated=time.time())
         self._save_load_metric(self.agent_id, my_load)
-        if not only_self and isinstance(self.topology_peer_agent_list, list) and len(self.neighbor_map.values()):
+        if not only_self and isinstance(self.messaging.topology_peer_agent_list, list) and len(self.neighbor_map.values()):
             for peer_agent_id, peer in self.neighbor_map.items():
                 if peer_agent_id is not None:
                     agents[peer_agent_id] = peer
@@ -100,7 +98,7 @@ class SwarmAgent(Agent):
 
     def job_selection_main(self):
         self.logger.info(f"Starting agent: {self}")
-        while len(self.neighbor_map) + 1 != self.total_agents:
+        while self.agent_count != self.total_agents:
             time.sleep(5)
             self.logger.info("[SEL_WAIT] Waiting for Peer map to be populated!")
 
@@ -110,7 +108,7 @@ class SwarmAgent(Agent):
                 proposals = []  # List to accumulate proposals for multiple jobs
                 caps_jobs_selected = Capacities()
 
-                for job in self.job_queue.get_jobs():
+                for job in self.queues.job_queue.get_jobs():
                     if self.is_job_completed(job_id=job.get_job_id()):
                         continue
 
@@ -149,7 +147,7 @@ class SwarmAgent(Agent):
                         # Begin election for Job leader for this job
                         job.change_state(new_state=JobState.PRE_PREPARE)
 
-                    if len(proposals) >= self.number_of_jobs_per_proposal:
+                    if len(proposals) >= self.jobs_per_proposal:
                         msg = Proposal(source=self.agent_id,
                                        agents=[AgentInfo(agent_id=self.agent_id)],
                                        proposals=proposals)
@@ -286,7 +284,7 @@ class SwarmAgent(Agent):
         proposals = []
         proposals_to_forward = []
         for p in incoming.proposals:
-            job = self.job_queue.get_job(job_id=p.job_id)
+            job = self.queues.job_queue.get_job(job_id=p.job_id)
             if self.is_job_completed(job_id=job.get_job_id()):
                 self.logger.debug(f"Ignoring Proposal: {p} for job: {job.get_job_id()}")
                 continue
@@ -344,7 +342,7 @@ class SwarmAgent(Agent):
         #self.logger.debug(f"Received prepare from: {incoming.agents[0].agent_id}")
 
         for p in incoming.proposals:
-            job = self.job_queue.get_job(job_id=p.job_id)
+            job = self.queues.job_queue.get_job(job_id=p.job_id)
             if self.is_job_completed(job_id=job.get_job_id()):
                 self.logger.debug(f"Job: {job.get_job_id()} Ignoring Prepare: {p}")
                 continue
@@ -401,7 +399,7 @@ class SwarmAgent(Agent):
         proposals_to_forward = []
 
         for p in incoming.proposals:
-            job = self.job_queue.get_job(job_id=p.job_id)
+            job = self.queues.job_queue.get_job(job_id=p.job_id)
 
             if self.is_job_completed(job_id=job.get_job_id()):
                 self.logger.debug(f"Job: {job.get_job_id()} Ignoring Commit: {p}")
@@ -454,7 +452,7 @@ class SwarmAgent(Agent):
 
         jobs_to_fwd = []
         for t in incoming.jobs:
-            job = self.job_queue.get_job(job_id=t.job_id)
+            job = self.queues.job_queue.get_job(job_id=t.job_id)
             if not job:
                 self.logger.info(f"Received Job Status for non-existent job: {t.job_id}")
                 continue
@@ -500,7 +498,7 @@ class SwarmAgent(Agent):
         proposed_capacities = Capacities()
         jobs = self.outgoing_proposals.jobs()
         for job_id in jobs:
-            proposed_job = self.job_queue.get_job(job_id=job_id)
+            proposed_job = self.queues.job_queue.get_job(job_id=job_id)
             proposed_capacities += proposed_job.get_capacities()
         #self.logger.debug(f"Number of outgoing proposals: {len(jobs)}; Jobs: {jobs}")
         return proposed_capacities

@@ -1,17 +1,50 @@
 #!/bin/bash
+set -e
+
+# Required argument
 num_agents=$1
+shift
+
+if [[ -z "$num_agents" ]]; then
+    echo "Usage: $0 <num_agents> [broker] [redis] [topic]"
+    exit 1
+fi
+
+# Optional arguments (only assigned if passed)
+redis="$1"
+broker="$2"
+topic="$3"
+tasks=100
+jobs_per_proposal=5
+
 base_index=0
-pkill -f "main.py swarm-multi"
-#python3 kafka_cleanup.py --topic multi
+
+echo "Starting $num_agents agents with:"
+[[ -n "$redis" ]] && echo "  Redis: $redis"
+[[ -n "$broker" ]] && echo "  Broker: $broker"
+[[ -n "$topic" ]] && echo "  Topic: $topic"
+
+pkill -f "main.py swarm-multi" || true
 rm -f shutdown
-python3 generate_configs.py $num_agents ./config_swarm_multi.yml .
-python3 kafka_cleanup.py --topic multi --agents $num_agents --broker zoo-0:9092 --redis zoo-0
+
+# Call generate_configs as-is
+python3 generate_configs.py "$num_agents" "$jobs_per_proposal" ./config_swarm_multi.yml .
+
+# Build cleanup command with optional args only if set
+cleanup_cmd="python3 cleanup.py --agents $num_agents"
+[[ -n "$topic" ]] && cleanup_cmd+=" --topic $topic"
+[[ -n "$broker" ]] && cleanup_cmd+=" --broker $broker"
+[[ -n "$redis" ]] && cleanup_cmd+=" --redis $redis"
+
+# Run cleanup
+eval "$cleanup_cmd"
+
+# Prepare agent run directory
 rm -rf swarm-multi
-mkdir -p swarm-multi swarm-multi
+mkdir -p swarm-multi
 
-# Launch the Python commands for each agent
+# Launch agents
 for i in $(seq 0 $(($num_agents - 1))); do
-    #python3 main.py swarm-multi $(($base_index + $i)) 100 &
-    python3 main.py swarm-multi $(($base_index + $i + 1)) 100  $num_agents topo &
+    agent_index=$(($base_index + $i + 1))
+    python3 main.py swarm-multi "$agent_index" "$tasks" "$num_agents" topo &
 done
-

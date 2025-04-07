@@ -45,8 +45,8 @@ import numpy as np
 
 
 class SwarmAgent(Agent):
-    def __init__(self, agent_id: int, config_file: str, cycles: int, total_agents: int):
-        super().__init__(agent_id, config_file, cycles, total_agents)
+    def __init__(self, agent_id: int, config_file: str):
+        super().__init__(agent_id, config_file)
         self.outgoing_proposals = ProposalContainer()
         self.incoming_proposals = ProposalContainer()
 
@@ -55,11 +55,11 @@ class SwarmAgent(Agent):
         my_load = self.compute_overall_load(proposed_jobs=self.outgoing_proposals.jobs())
         agent = AgentInfo(agent_id=self.agent_id,
                           capacities=self.capacities,
-                          capacity_allocations=self.ready_queue.capacities(jobs=self.ready_queue.get_jobs()),
+                          capacity_allocations=self.queues.ready_queue.capacities(jobs=self.queues.ready_queue.get_jobs()),
                           load=my_load,
                           last_updated=time.time())
         self._save_load_metric(self.agent_id, my_load)
-        if not only_self and isinstance(self.topology_peer_agent_list, list) and len(self.neighbor_map.values()):
+        if not only_self and isinstance(self.messaging.topology_peer_agent_list, list) and len(self.neighbor_map.values()):
             for peer_agent_id, peer in self.neighbor_map.items():
                 if peer_agent_id is None:
                     continue
@@ -105,7 +105,7 @@ class SwarmAgent(Agent):
         while not self.shutdown:
             try:
                 processed = 0
-                for job in self.job_queue.get_jobs():
+                for job in self.queues.job_queue.get_jobs():
                     if job.is_complete():
                         completed_jobs += 1
                         continue
@@ -235,7 +235,7 @@ class SwarmAgent(Agent):
         self.logger.debug(f"Received Proposal from: {incoming.agents[0].agent_id}")
 
         for p in incoming.proposals:
-            job = self.job_queue.get_job(job_id=p.job_id)
+            job = self.queues.job_queue.get_job(job_id=p.job_id)
             if not job or job.is_ready() or job.is_complete() or job.is_running():
                 self.logger.info(f"Job: {job} Ignoring Proposal: {p}")
                 return
@@ -280,7 +280,7 @@ class SwarmAgent(Agent):
         self.logger.debug(f"Received prepare from: {incoming.agents[0].agent_id}")
 
         for p in incoming.proposals:
-            job = self.job_queue.get_job(job_id=p.job_id)
+            job = self.queues.job_queue.get_job(job_id=p.job_id)
             if not job or job.is_ready() or job.is_complete() or job.is_running():
                 self.logger.info(f"Job: {job} Ignoring Prepare: {p}")
                 return
@@ -312,7 +312,7 @@ class SwarmAgent(Agent):
     def __receive_commit(self, incoming: Commit):
         self.logger.debug(f"Received commit from: {incoming.agents[0].agent_id}")
         for p in incoming.proposals:
-            job = self.job_queue.get_job(job_id=p.job_id)
+            job = self.queues.job_queue.get_job(job_id=p.job_id)
 
             if not job or job.is_complete() or job.is_ready() or job.is_running() or \
                     job.leader_agent_id is not None:
@@ -354,7 +354,7 @@ class SwarmAgent(Agent):
         self.logger.debug(f"Received Status from: {incoming.agents[0].agent_id}")
 
         for t in incoming.jobs:
-            job = self.job_queue.get_job(job_id=t.job_id)
+            job = self.queues.job_queue.get_job(job_id=t.job_id)
             if not job:
                 self.logger.info(f"Received Job Status for non-existent job: {t.job_id}")
                 continue
@@ -373,14 +373,14 @@ class SwarmAgent(Agent):
     def execute_job(self, job: Job):
         super().execute_job(job=job)
         msg = JobStatus(agents=[AgentInfo(agent_id=self.agent_id)], jobs=[JobInfo(job_id=job.get_job_id(),
-                                                                               state=job.state)])
+                                                                                  state=job.state)])
         self._send_message(json_message=msg.to_dict())
 
     def __get_proposed_capacities(self):
         proposed_capacities = Capacities()
         jobs = self.outgoing_proposals.jobs()
         for job_id in jobs:
-            proposed_job = self.job_queue.get_job(job_id=job_id)
+            proposed_job = self.queues.job_queue.get_job(job_id=job_id)
             proposed_capacities += proposed_job.get_capacities()
         self.logger.debug(f"Number of outgoing proposals: {len(jobs)}; Jobs: {jobs}")
         return proposed_capacities

@@ -21,15 +21,19 @@
 # SOFTWARE.
 #
 # Author: Komal Thareja(kthare10@renci.org)
-from abc import ABC, abstractmethod
-from typing import Any
+from dataclasses import dataclass, field
+import queue
+
+from swarm.queue.job_queue import JobQueue
+from swarm.queue.simple_job_queue import SimpleJobQueue
 
 
-class Observer(ABC):
-    @abstractmethod
-    def process_message(self, message: Any):
-        """
-        Process incoming message
-        :param message:
-        :return:
-        """
+@dataclass
+class AgentQueues:
+    def __init__(self, queue_config: dict):
+        self.job_queue = SimpleJobQueue()
+        self.selected_queue = SimpleJobQueue()
+        self.ready_queue = SimpleJobQueue()
+        self.done_queue = SimpleJobQueue()
+        self.message_queue = queue.Queue()
+        self.hb_message_queue = queue.Queue()

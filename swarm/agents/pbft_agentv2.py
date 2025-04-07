@@ -37,8 +37,8 @@ from swarm.models.job import Job, JobState
 
 
 class PBFTAgent(Agent):
-    def __init__(self, agent_id: int, config_file: str, cycles: int, total_agents: int):
-        super().__init__(agent_id, config_file, cycles, total_agents=total_agents)
+    def __init__(self, agent_id: int, config_file: str):
+        super().__init__(agent_id, config_file)
         self.outgoing_proposals = ProposalContainer()
         self.incoming_proposals = ProposalContainer()
 
@@ -48,11 +48,11 @@ class PBFTAgent(Agent):
 
         agent = AgentInfo(agent_id=self.agent_id,
                           capacities=self.capacities,
-                          capacity_allocations=self.ready_queue.capacities(jobs=self.ready_queue.get_jobs()),
+                          capacity_allocations=self.queues.ready_queue.capacities(jobs=self.queues.ready_queue.get_jobs()),
                           load=my_load,
                           last_updated=time.time())
         self._save_load_metric(self.agent_id, my_load)
-        if not only_self and isinstance(self.topology_peer_agent_list, list) and len(self.neighbor_map.values()):
+        if not only_self and isinstance(self.messaging.topology_peer_agent_list, list) and len(self.neighbor_map.values()):
             for peer_agent_id, peer in self.neighbor_map.items():
                 if peer_agent_id is None:
                     continue
@@ -99,7 +99,7 @@ class PBFTAgent(Agent):
             try:
                 processed = 0
                 # Make a copy of the dictionary keys
-                for job in self.job_queue.get_jobs():
+                for job in self.queues.job_queue.get_jobs():
                     if job.is_complete():
                         completed_jobs += 1
                         continue
@@ -204,7 +204,7 @@ class PBFTAgent(Agent):
         self.logger.debug(f"Received Proposal from Agent: {peer_agent_id} for Job: {job_id} "
                           f"Proposal: {proposal_id} Seed: {rcvd_seed}")
 
-        job = self.job_queue.get_job(job_id=job_id)
+        job = self.queues.job_queue.get_job(job_id=job_id)
         if not job or job.is_ready() or job.is_complete() or job.is_running():
             self.logger.info(f"Job: {job_id} Ignoring Prepare: {proposal_id}")
             return
@@ -251,7 +251,7 @@ class PBFTAgent(Agent):
         # Prepare for the proposal
         self.logger.debug(f"Received prepare from Agent: {peer_agent_id} for Job: {job_id}: {proposal_id}")
 
-        job = self.job_queue.get_job(job_id=job_id)
+        job = self.queues.job_queue.get_job(job_id=job_id)
         if not job or job.is_ready() or job.is_complete() or job.is_running():
             self.logger.info(f"Job: {job} Ignoring Prepare")
             return
@@ -286,7 +286,7 @@ class PBFTAgent(Agent):
         rcvd_seed = incoming.get("seed", 0)
 
         self.logger.debug(f"Received commit from Agent: {peer_agent_id} for Job: {job_id} Proposal: {proposal_id}")
-        job = self.job_queue.get_job(job_id=job_id)
+        job = self.queues.job_queue.get_job(job_id=job_id)
 
         if not job or job.is_complete() or job.is_ready() or job.is_running() or \
                 job.leader_agent_id is not None:
@@ -332,7 +332,7 @@ class PBFTAgent(Agent):
 
         self.logger.debug(f"Received Status from {peer_agent_id} for Job: {job_id} Proposal: {proposal_id}")
 
-        job = self.job_queue.get_job(job_id=job_id)
+        job = self.queues.job_queue.get_job(job_id=job_id)
         job.set_leader(leader_agent_id=peer_agent_id)
         if not job or job.is_complete() or job.is_ready():
             self.logger.info(f"Ignoring Job Status: {job}")
