@@ -11,5 +11,6 @@ nats-py
 zmq
 riak
 redis
+protobuf
 grpcio>=1.50.0
 grpcio-tools>=1.50.0

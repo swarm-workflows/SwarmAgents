@@ -13,10 +13,10 @@ sudo DEBIAN_FRONTEND=noninteractive apt install -y python3.11 python3.11-venv py
 
 # Download and install pip for Python 3.11
 curl -O https://bootstrap.pypa.io/get-pip.py
-sudo python get-pip.py
+sudo python3.11 get-pip.py
 
 # Install Development Tools (build-essential on Ubuntu)
 sudo DEBIAN_FRONTEND=noninteractive apt install -y build-essential
 
 # Install dependencies from requirements.txt
-pip3 install -r requirements.txt
+pip3.11 install -r requirements.txt

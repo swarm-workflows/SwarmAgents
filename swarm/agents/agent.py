@@ -82,7 +82,7 @@ class Agent(Observer):
         self.messaging = self._build_messaging_config(config=self.config)
         self.log_config = self.config.get("logging", {})
         self.runtime_config = self.config.get("runtime", {})
-        self.redis_config = self.config.get(redis, {"host": "127.0.0.1", "port": 6379})
+        self.redis_config = self.config.get("redis", {"host": "127.0.0.1", "port": 6379})
         self.last_updated = time.time()
         self.logger = self.make_logger(log_dir=self.log_config.get("log-directory"),
                                        log_file=f'{self.log_config.get("log-file")}-{self.agent_id}.log',
