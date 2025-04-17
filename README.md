@@ -14,8 +14,19 @@ PBFT algorithm is explored and implemented in `pbft_agentv2.py`. This agent work
   - The agent's available resources
   - Load status of neighboring agents
 
-- Communication between agents occurs via Kafka using broadcast messaging.
-- Agents share load and resource information through heartbeat messages.
+- Communication between agents occurs via gRPC.
+  - Topology Support (Configurable)
+    - Mesh: Every agent connects to every other agent 
+    - Ring:
+      - Agents grouped into rings of 5 
+      - Multiple rings interconnected, forming hierarchical rings
+- Agents share load and resource information by periodically updating this information in the Neighbor Map in Redis Database. 
+- Any agent whose information is stale by a configured timeout is considered to be lost or out of topology.
+
+![Agent](./images/agent-overview.png)
+
+#### Deploy
+[Notebook](./notebooks/SWARM-topo-simple.ipynb) can be used to deploy this on FABRIC. 
 
 #### Leader Election
 Each agent strives to become the leader for executing a job based on the following conditions:
