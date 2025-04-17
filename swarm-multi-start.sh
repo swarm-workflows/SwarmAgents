@@ -4,9 +4,11 @@ set -e
 # Required argument
 num_agents=$1
 shift
+topology=$1
+shift
 
 if [[ -z "$num_agents" ]]; then
-    echo "Usage: $0 <num_agents> [redis] [broker] [topic]"
+    echo "Usage: $0 <num_agents> <topology> [redis] [broker] [topic]"
     exit 1
 fi
 
@@ -28,6 +30,8 @@ pkill -f "main.py swarm-multi" || true
 rm -f shutdown
 
 # Call generate_configs as-is
+python3 generate_configs.py "$num_agents" "$jobs_per_proposal" ./config_swarm_multi.yml . $topology
+
 python3 generate_configs.py "$num_agents" "$jobs_per_proposal" ./config_swarm_multi.yml .
 
 # Build cleanup command with optional args only if set

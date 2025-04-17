@@ -2,12 +2,13 @@ import yaml
 import os
 import argparse
 
+
 class SwarmConfigGenerator:
     """
     A class to generate configuration files for agents in a structured ring topology.
     """
 
-    def __init__(self, num_agents, jobs_per_proposal, base_config_path, output_dir):
+    def __init__(self, num_agents, jobs_per_proposal, base_config_path, output_dir, topology):
         """
         Initializes the generator with the number of agents, base config path, and output directory.
 
@@ -22,6 +23,7 @@ class SwarmConfigGenerator:
         self.output_dir = output_dir
         self.base_config = self.load_base_config()
         self.rings = self.create_ring_topology()
+        self.topology = topology
 
     def load_base_config(self):
         """
@@ -82,44 +84,46 @@ class SwarmConfigGenerator:
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
 
-        self.print_ring_topology()  # Print rings before generating configs
+        agent_peers = None
+        if self.topology == "ring":
+            self.print_ring_topology()  # Print rings before generating configs
 
-        agent_peers = {i: [] for i in range(1, self.num_agents + 1)}  # IDs start from 1
+            agent_peers = {i: [] for i in range(1, self.num_agents + 1)}  # IDs start from 1
 
-        # Assign peer connections based on ring topology
-        for ring in self.rings:
-            for i in range(len(ring)):
-                next_agent = ring[(i + 1) % len(ring)]  # Circular connection
-                prev_agent = ring[(i - 1) % len(ring)]
-                agent_peers[ring[i]].extend([next_agent, prev_agent])
+            # Assign peer connections based on ring topology
+            for ring in self.rings:
+                for i in range(len(ring)):
+                    next_agent = ring[(i + 1) % len(ring)]  # Circular connection
+                    prev_agent = ring[(i - 1) % len(ring)]
+                    agent_peers[ring[i]].extend([next_agent, prev_agent])
 
-        # Connect last agent of each ring to the first agent of the previous ring
-        for i in range(len(self.rings)):  # Start from first ring
-            first_agent = self.rings[i][0]
-            if i == 0:
-                first_prev_ring = self.rings[-1][0]  # Last ring connects to first ring
-            else:
-                first_prev_ring = self.rings[i - 1][0]
-            if i != len(self.rings) - 1:
-                first_next_ring = self.rings[i + 1][0]
-                agent_peers[first_agent].append(first_next_ring)
-            else:
-                if first_agent != self.rings[0][0]:
-                    agent_peers[first_agent].append(self.rings[0][0])  # Last ring connects to first
+            # Connect last agent of each ring to the first agent of the previous ring
+            for i in range(len(self.rings)):  # Start from first ring
+                first_agent = self.rings[i][0]
+                if i == 0:
+                    first_prev_ring = self.rings[-1][0]  # Last ring connects to first ring
+                else:
+                    first_prev_ring = self.rings[i - 1][0]
+                if i != len(self.rings) - 1:
+                    first_next_ring = self.rings[i + 1][0]
+                    agent_peers[first_agent].append(first_next_ring)
+                else:
+                    if first_agent != self.rings[0][0]:
+                        agent_peers[first_agent].append(self.rings[0][0])  # Last ring connects to first
 
-            if first_agent != first_prev_ring:
-                agent_peers[first_agent].append(first_prev_ring)
+                if first_agent != first_prev_ring:
+                    agent_peers[first_agent].append(first_prev_ring)
 
-        # Remove duplicate entries
-        for agent_id in agent_peers:
-            agent_peers[agent_id] = sorted(set(agent_peers[agent_id]))
+            # Remove duplicate entries
+            for agent_id in agent_peers:
+                agent_peers[agent_id] = sorted(set(agent_peers[agent_id]))
 
         config_prefix = self.get_config_prefix()
 
         # Generate YAML files for each agent
         for agent_id in range(1, self.num_agents + 1):
             config = self.base_config.copy()
-            config["topology"] = {"peer_agents": agent_peers[agent_id]}
+            config["topology"] = {"peer_agents": agent_peers[agent_id] if agent_peers else "all"}
             config["runtime"]["total_agents"] = self.num_agents
             config["runtime"]["jobs_per_proposal"] = self.jobs_per_proposal
 
@@ -136,8 +140,10 @@ if __name__ == "__main__":
     parser.add_argument("jobs_per_proposal", type=int, help="Number of Jobs per proposal.")
     parser.add_argument("base_config_file", type=str, help="Path to the base configuration YAML file.")
     parser.add_argument("output_dir", type=str, help="Directory where generated configs should be saved.")
+    parser.add_argument("topology", type=str, default="all", help="Agent Topology: Possible values - all, ring")
 
     args = parser.parse_args()
 
-    generator = SwarmConfigGenerator(args.num_agents, args.jobs_per_proposal, args.base_config_file, args.output_dir)
+    generator = SwarmConfigGenerator(args.num_agents, args.jobs_per_proposal, args.base_config_file,
+                                     args.output_dir, args.topology)
     generator.generate_configs()
