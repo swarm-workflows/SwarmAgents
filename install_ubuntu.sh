@@ -4,7 +4,9 @@
 sudo DEBIAN_FRONTEND=noninteractive apt update
 
 # Install Git
-sudo DEBIAN_FRONTEND=noninteractive apt install -y git
+sudo DEBIAN_FRONTEND=noninteractive apt install -y git software-properties-common -y
+sudo DEBIAN_FRONTEND=noninteractive add-apt-repository ppa:deadsnakes/ppa -y
+sudo DEBIAN_FRONTEND=noninteractive apt update
 
 # Install Python 3.11 and dependencies
 sudo DEBIAN_FRONTEND=noninteractive apt install -y python3.11 python3.11-venv python3.11-dev

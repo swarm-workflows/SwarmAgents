@@ -22,17 +22,32 @@
 #
 # Author: Komal Thareja(kthare10@renci.org)
 import redis
+import argparse
 
 
-def display_tasks(redis_host='localhost', redis_port=6379, task_list='tasks'):
-    # Connect to the Redis database
+def display_tasks(redis_host='localhost', redis_port=6379, task_list='*', count=False):
+    """Connects to Redis and displays tasks or task count from the specified task list."""
     redis_client = redis.StrictRedis(host=redis_host, port=redis_port, decode_responses=True)
 
-    task_keys = redis_client.keys('*:*')  # Assuming task keys are prefixed with 'task:'
-    for key in task_keys:
-        data = redis_client.get(key)
-        print(f"{key}: {data}")
+    task_keys = redis_client.keys(f"{task_list}:*")  # Filter keys based on task list prefix
+
+    if not task_keys:
+        print(f"No tasks found in queue '{task_list}'.")
+        return
+
+    if count:
+        print(f"Total tasks in '{task_list}': {len(task_keys)}")
+    else:
+        for key in task_keys:
+            data = redis_client.get(key)
+            print(f"{key}: {data}")
 
 
 if __name__ == "__main__":
-    display_tasks()
+    parser = argparse.ArgumentParser(description="Display Redis task queue or count.")
+    parser.add_argument("--host", default="localhost", help="Redis host (default: localhost)")
+    parser.add_argument("--key", default="*", help="Task key prefix to match (default: *)")
+    parser.add_argument("--count", action="store_true", help="Only display the count of entries")
+
+    args = parser.parse_args()
+    display_tasks(redis_host=args.host, task_list=args.key, count=args.count)

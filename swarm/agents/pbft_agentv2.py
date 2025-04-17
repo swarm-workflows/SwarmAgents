@@ -37,19 +37,29 @@ from swarm.models.job import Job, JobState
 
 
 class PBFTAgent(Agent):
-    def __init__(self, agent_id: str, config_file: str, cycles: int):
-        super().__init__(agent_id, config_file, cycles)
+    def __init__(self, agent_id: int, config_file: str):
+        super().__init__(agent_id, config_file)
         self.outgoing_proposals = ProposalContainer()
         self.incoming_proposals = ProposalContainer()
 
-    def _build_heart_beat(self):
+    def _build_heart_beat(self, only_self: bool = False) -> dict:
         my_load = self.compute_overall_load(proposed_jobs=self.outgoing_proposals.jobs())
+        agents = {}
+
         agent = AgentInfo(agent_id=self.agent_id,
                           capacities=self.capacities,
-                          capacity_allocations=self.ready_queue.capacities(jobs=self.ready_queue.get_jobs()),
-                          load=my_load)
+                          capacity_allocations=self.queues.ready_queue.capacities(jobs=self.queues.ready_queue.get_jobs()),
+                          load=my_load,
+                          last_updated=time.time())
         self._save_load_metric(self.agent_id, my_load)
-        return HeartBeat(agent=agent)
+        if not only_self and isinstance(self.messaging.topology_peer_agent_list, list) and len(self.neighbor_map.values()):
+            for peer_agent_id, peer in self.neighbor_map.items():
+                if peer_agent_id is None:
+                    continue
+                agents[peer_agent_id] = peer
+
+        agents[self.agent_id] = agent
+        return agents
 
     def _process_messages(self, *, messages: List[dict]):
         for message in messages:
@@ -89,13 +99,14 @@ class PBFTAgent(Agent):
             try:
                 processed = 0
                 # Make a copy of the dictionary keys
-                for job in self.job_queue.get_jobs():
+                for job in self.queues.job_queue.get_jobs():
                     if job.is_complete():
                         completed_jobs += 1
                         continue
 
                     diff = int(time.time() - job.time_last_state_change)
-                    if diff > self.restart_job_selection and job.get_state() in [JobState.PREPARE, JobState.PRE_PREPARE]:
+                    if diff > self.restart_job_selection and job.get_state() in [JobState.PREPARE,
+                                                                                 JobState.PRE_PREPARE]:
                         job.change_state(new_state=JobState.PENDING)
                         self.outgoing_proposals.remove_job(job_id=job.get_job_id())
                         self.incoming_proposals.remove_job(job_id=job.get_job_id())
@@ -193,7 +204,7 @@ class PBFTAgent(Agent):
         self.logger.debug(f"Received Proposal from Agent: {peer_agent_id} for Job: {job_id} "
                           f"Proposal: {proposal_id} Seed: {rcvd_seed}")
 
-        job = self.job_queue.get_job(job_id=job_id)
+        job = self.queues.job_queue.get_job(job_id=job_id)
         if not job or job.is_ready() or job.is_complete() or job.is_running():
             self.logger.info(f"Job: {job_id} Ignoring Prepare: {proposal_id}")
             return
@@ -201,7 +212,7 @@ class PBFTAgent(Agent):
         my_proposal = self.outgoing_proposals.get_proposal(job_id=job_id)
         peer_proposal = self.incoming_proposals.get_proposal(job_id=job_id)
 
-        if my_proposal and (my_proposal.prepares or my_proposal.seed < rcvd_seed):
+        if my_proposal and (len(my_proposal.prepares) or my_proposal.seed < rcvd_seed):
             self.logger.debug(f"Job:{job_id} Agent:{self.agent_id} rejected Proposal: {proposal_id} from agent"
                               f" {peer_agent_id} - my proposal {my_proposal} has prepares or smaller seed")
             self.conflicts += 1
@@ -225,7 +236,8 @@ class PBFTAgent(Agent):
 
             # Increment the number of prepares to count the prepare being sent
             # Needed to handle 3 agent case
-            proposal.prepares += 1
+            if peer_agent_id not in proposal.prepares:
+                proposal.prepares.append(peer_agent_id)
             self.incoming_proposals.add_proposal(proposal=proposal)
             self.send_message(message_type=MessageType.Prepare, job_id=job_id, proposal_id=proposal_id)
             job.change_state(JobState.PREPARE)
@@ -239,7 +251,7 @@ class PBFTAgent(Agent):
         # Prepare for the proposal
         self.logger.debug(f"Received prepare from Agent: {peer_agent_id} for Job: {job_id}: {proposal_id}")
 
-        job = self.job_queue.get_job(job_id=job_id)
+        job = self.queues.job_queue.get_job(job_id=job_id)
         if not job or job.is_ready() or job.is_complete() or job.is_running():
             self.logger.info(f"Job: {job} Ignoring Prepare")
             return
@@ -254,13 +266,14 @@ class PBFTAgent(Agent):
                                     agent_id=peer_agent_id)
             self.incoming_proposals.add_proposal(proposal=proposal)
 
-        proposal.prepares += 1
+        if peer_agent_id not in proposal.prepares:
+            proposal.prepares.append(peer_agent_id)
         quorum_count = (len(self.neighbor_map) // 2) + 1  # Ensure a true majority
         job.change_state(JobState.PREPARE)
 
         # Check if vote count is more than quorum
         # if yes, send commit
-        if proposal.prepares >= quorum_count:
+        if len(proposal.prepares) >= quorum_count:
             self.logger.info(f"Agent: {self.agent_id} Job: {job_id} received quorum "
                              f"prepares: {proposal.prepares}, starting commit!")
             self.send_message(message_type=MessageType.Commit, job_id=job_id, proposal_id=proposal_id)
@@ -273,9 +286,10 @@ class PBFTAgent(Agent):
         rcvd_seed = incoming.get("seed", 0)
 
         self.logger.debug(f"Received commit from Agent: {peer_agent_id} for Job: {job_id} Proposal: {proposal_id}")
-        job = self.job_queue.get_job(job_id=job_id)
+        job = self.queues.job_queue.get_job(job_id=job_id)
 
-        if not job or job.is_complete() or job.is_ready() or job.is_running() or job.leader_agent_id:
+        if not job or job.is_complete() or job.is_ready() or job.is_running() or \
+                job.leader_agent_id is not None:
             self.logger.info(f"Job: {job} Ignoring Commit: {proposal_id}")
             self.incoming_proposals.remove_job(job_id=job_id)
             self.outgoing_proposals.remove_job(job_id=job_id)
@@ -292,10 +306,11 @@ class PBFTAgent(Agent):
                                     agent_id=peer_agent_id)
             self.incoming_proposals.add_proposal(proposal=proposal)
 
-        proposal.commits += 1
+        if peer_agent_id not in proposal.commits:
+            proposal.commits.append(peer_agent_id)
         quorum_count = (len(self.neighbor_map) // 2) + 1  # Ensure a true majority
 
-        if proposal.commits >= quorum_count:
+        if len(proposal.commits) >= quorum_count:
             self.logger.info(
                 f"Agent: {self.agent_id} received quorum commits for Job: {job_id} Proposal: {proposal}: Job: {job}")
             job.set_leader(leader_agent_id=proposal.agent_id)
@@ -317,7 +332,7 @@ class PBFTAgent(Agent):
 
         self.logger.debug(f"Received Status from {peer_agent_id} for Job: {job_id} Proposal: {proposal_id}")
 
-        job = self.job_queue.get_job(job_id=job_id)
+        job = self.queues.job_queue.get_job(job_id=job_id)
         job.set_leader(leader_agent_id=peer_agent_id)
         if not job or job.is_complete() or job.is_ready():
             self.logger.info(f"Ignoring Job Status: {job}")
@@ -351,4 +366,4 @@ class PBFTAgent(Agent):
             message["seed"] = seed
 
         # Produce the message to the Kafka topic
-        self.ctrl_msg_srv.produce_message(message)
+        self._send_message(json_message=message)

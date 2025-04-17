@@ -38,7 +38,7 @@ if __name__ == '__main__':
     print(agent)
     print(agent.to_dict())
 
-    heartbeat = HeartBeat(agent=agent)
+    heartbeat = HeartBeat(agents=[agent])
     print(heartbeat)
     print(heartbeat.to_dict())
     print(heartbeat.to_json())

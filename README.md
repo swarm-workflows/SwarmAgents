@@ -14,7 +14,7 @@ PBFT algorithm is explored and implemented in `pbft_agentv2.py`. This agent work
   - The agent's available resources
   - Load status of neighboring agents
 
-- Communication between agents occurs via Kafka using broadcast messaging.
+- Communication between agents occurs via Kafka using broadcast messaging. 
 - Agents share load and resource information through heartbeat messages.
 
 #### Leader Election
@@ -63,6 +63,33 @@ python analyze_results.py --number_of_agents 3 --run_directory pbft/3/repeated/ 
 
 ## SWARM Consensus (Swarm)
 SWARM algorithm extends PBFT consensus to the swarm topology and implemented in `swarm_agent.py`. In the first version, we have changed the leader election process as described below:
+
+### Swarm Agent Upgrade (Swarm Multi) (Scalability)
+
+- Neighbor Map via Redis (Source of Truth)
+  - Centralized state of peer agents maintained in Redis 
+  - Each agent periodically updates its metadata (load, availability, etc.)
+  - Any agent whose information is stale by a configured timeout is considered to be lost or out of topology.
+
+- Topology Support (Configurable)
+  - Mesh: Every agent connects to every other agent 
+  - Ring:
+    - Agents grouped into rings of 5 
+    - Multiple rings interconnected, forming hierarchical rings
+    - Each agent shares information about its connected peers with others in its ring. 
+    - Despite the segmented structure, consensus is reached by aggregating the state across all agents.
+- Communication Upgrade 
+  - Replaced Kafka with gRPC 
+  - Reduced overhead 
+    - Improved real-time responsiveness 
+    - Simplified protocol semantics
+
+New results based on these changes can be found [here](./runs/swarm/topology/)
+
+![Agent](./images/agent-overview.png)
+
+#### Deploy
+[Notebook](./notebooks/SWARM-topo-simple.ipynb) can be used to deploy this on FABRIC. 
 
 ### Leader Election Process
 

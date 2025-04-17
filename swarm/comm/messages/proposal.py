@@ -51,7 +51,7 @@ class Proposal(Message):
             raise ValueError("Unsupported value type for proposals")
 
     def __str__(self):
-        return f"[agent: {self.agent}, proposals: {self.proposals}]"
+        return f"[agent: {self.agents}, proposals: {self.proposals}]"
 
 
 if __name__ == '__main__':
@@ -65,3 +65,4 @@ if __name__ == '__main__':
 
     new_p = Proposal.from_dict(proposal.to_dict())
     print(new_p)
+    print(new_p.proposals[0].job_id)

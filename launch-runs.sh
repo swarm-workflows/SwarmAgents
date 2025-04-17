@@ -37,7 +37,7 @@ SLEEP_INTERVAL=10   # Time in seconds between checks
 
 # Function to check if agents are running
 are_agents_running() {
-    if pgrep -f "python3.11 main.py $AGENT_TYPE" > /dev/null; then
+    if pgrep -f "python3 main.py $AGENT_TYPE" > /dev/null; then
         return 0  # Agents are running
     else
         return 1  # Agents are not running

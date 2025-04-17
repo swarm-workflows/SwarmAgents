@@ -32,7 +32,7 @@ class AgentInfo(JSONField):
     from JSON dictionaries of properties.
     """
     def __init__(self, **kwargs):
-        self.agent_id = None
+        self.agent_id = 0
         self.load = 0.0
         self._capacities = Capacities()
         self._capacity_allocations = Capacities()

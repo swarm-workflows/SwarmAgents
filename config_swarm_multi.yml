@@ -1,19 +1,26 @@
 redis:
-  host: 127.0.0.1
+  host: database
   port: 6379
 queue:
   type: simple
   host: 127.0.0.1
   port: 8098
+topology:
+  # Possible values, all, or comma separated list neighbor agent ids
+  peer_agents: all
 kafka:
   bootstrap_servers: zoo-0:9092,zoo-1:9092,zoo-2:9092
-  topic: agent-swarm-multi
-  hb_topic: agent-swarm-multi-hb
-  consumer_group_id: agent-swarm-multi
+  topic: multi
+  hb_topic: multi-hb
+  consumer_group_id: cg
+  batch_size: 10
 nats:
   nats_servers: nats://127.0.0.1:4222
   nats_topic: agent-swarm-multi
   hb_nats_topic: agent-swarm-multi-hb
+grpc:
+  port: 50051
+  host: localhost
 runtime:
   profile: BalancedProfile
   data_transfer: False
@@ -24,7 +31,11 @@ runtime:
   restart_job_selection: 300
   peer_heartbeat_timeout: 300
   results_dir: swarm-multi
-  message_service: kafka
+  message_service_type: grpc
+  shutdown_mode: manual
+  heartbeat_mode: redis
+  total_agents: 5
+  jobs_per_proposal: 3
 logging:
   ## The directory in which actor should create log files.
   ## This directory will be automatically created if it does not exist.
@@ -34,7 +45,7 @@ logging:
   log-file: agent
 
   ## The default log level for actor.
-  log-level: DEBUG 
+  log-level: INFO
 
   ## actor rotates log files. You may specify how many archived log files to keep here.
   log-retain: 5

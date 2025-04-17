@@ -31,8 +31,8 @@ class ProposalInfo(JSONField):
     def __init__(self, **kwargs):
         self.p_id = None
         self.job_id = None
-        self.prepares = 0
-        self.commits = 0
+        self.prepares = []
+        self.commits = []
         self.agent_id = None
         # self.seed = round(random.random(), 5)
         # Decrease chances of collision
@@ -118,6 +118,9 @@ class ProposalContainer:
             if proposals and len(proposals):
                 return next(iter(proposals))
 
+    def get_proposals_by_job_id(self, job_id: str) -> List[ProposalInfo]:
+        return self.proposals_by_job_id.get(job_id, [])
+
     def size(self):
         return len(self.proposals_by_pid)
 
@@ -134,8 +137,16 @@ class ProposalContainer:
     def remove_job(self, job_id: str):
         if job_id in self.proposals_by_job_id:
             for p in self.proposals_by_job_id[job_id]:
-                self.proposals_by_pid.get(p.p_id)
+                self.proposals_by_pid.pop(p.p_id)
             self.proposals_by_job_id.pop(job_id)
 
     def jobs(self) -> List[str]:
         return list(self.proposals_by_job_id.keys())
+
+    def has_better_proposal(self, proposal: ProposalInfo) -> ProposalInfo:
+        better = None
+        for p in self.get_proposals_by_job_id(proposal.job_id):
+            if p.seed <= proposal.seed:
+                better = p
+                break
+        return better

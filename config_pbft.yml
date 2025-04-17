@@ -7,9 +7,9 @@ queue:
   port: 8098
 kafka:
   bootstrap_servers: zoo-0:9092,zoo-1:9092,zoo-2:9092
-  topic: agent-pbft
-  hb_topic: agent-pbft-hb
-  consumer_group_id: agent-pbft
+  topic: pbft
+  hb_topic: pbft-hb
+  consumer_group_id: cg
 runtime:
   profile: BalancedProfile
   data_transfer: False
@@ -20,7 +20,10 @@ runtime:
   restart_job_selection: 300
   peer_heartbeat_timeout: 300
   results_dir: pbft
-  message_service: kafka
+  message_service_type: kafka
+  shutdown_mode: manual
+  heartbeat_mode: redis
+  total_agents: 5
 logging:
   ## The directory in which actor should create log files.
   ## This directory will be automatically created if it does not exist.

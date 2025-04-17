@@ -22,11 +22,12 @@
 #
 # Author: Komal Thareja(kthare10@renci.org)
 from abc import ABC, abstractmethod
+from typing import Any
 
 
 class Observer(ABC):
     @abstractmethod
-    def process_message(self, message: str):
+    def process_message(self, message: Any):
         """
         Process incoming message
         :param message:

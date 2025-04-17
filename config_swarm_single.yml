@@ -1,5 +1,5 @@
 redis:
-  host: 127.0.0.1
+  host: zoo-0
   port: 6379
 queue:
   type: simple
@@ -7,9 +7,9 @@ queue:
   port: 8098
 kafka:
   bootstrap_servers: zoo-0:9092,zoo-1:9092,zoo-2:9092
-  topic: agent-swarm-single
-  hb_topic: agent-swarm-single-hb
-  consumer_group_id: agent-swarm-single
+  topic: single
+  hb_topic: single-hb
+  consumer_group_id: cg
 runtime:
   profile: BalancedProfile
   data_transfer: False
@@ -20,7 +20,10 @@ runtime:
   restart_job_selection: 300
   peer_heartbeat_timeout: 300
   results_dir: swarm-single
-  message_service: kafka
+  message_service_type: kafka
+  shutdown_mode: manual
+  heartbeat_mode: redis
+  total_agents: 5
 logging:
   ## The directory in which actor should create log files.
   ## This directory will be automatically created if it does not exist.

@@ -50,9 +50,9 @@ class TaskDistributor(threading.Thread):
         while not self.shutdown and self.task_pool:
             tasks_to_add = [self.task_pool.pop() for _ in range(min(self.tasks_per_interval, len(self.task_pool)))]
             for task in tasks_to_add:
-                self.agent.job_queue.add_job(task)
+                self.agent.queues.job_queue.add_job(task)
                 total_tasks_added += 1
-            time.sleep(0.5)
+            time.sleep(1)
             if total_tasks_added == self.total_tasks:
                 break
         print("Stopped Task Distributor")
@@ -81,29 +81,36 @@ def build_tasks_from_json(json_file):
 
 
 if __name__ == '__main__':
-    if len(sys.argv) != 4:
-        print("Usage: python main.py <agent_type> <agent_id> <task_count>")
+    if len(sys.argv) < 5:
+        print("Usage: python main.py <agent_type> <agent_id> <task_count> <agent_count> [<topo>]")
         sys.exit(1)
 
     agent_type = sys.argv[1].lower()
     agent_id = int(sys.argv[2])
     task_count = int(sys.argv[3])
+    total_agents = int(sys.argv[4])
+
+    local_topo = True if len(sys.argv) > 5 else False
 
     # Load configuration based on agent type
     if agent_type == "pbft":
         config_file = "./config_pbft.yml"
         from swarm.agents.pbft_agentv2 import PBFTAgent
-        agent = PBFTAgent(agent_id=str(agent_id), config_file=config_file, cycles=1000)
+        agent = PBFTAgent(agent_id=agent_id, config_file=config_file)
     elif agent_type == "swarm-single":
         config_file = "./config_swarm_single.yml"
+        if local_topo:
+            config_file = f"./config_swarm_single_{agent_id}.yml"
         # Initialize your swarm-single agent here using the config_file
         from swarm.agents.swarm_agent import SwarmAgent
-        agent = SwarmAgent(agent_id=str(agent_id), config_file=config_file, cycles=1000)
+        agent = SwarmAgent(agent_id=agent_id, config_file=config_file)
     elif agent_type == "swarm-multi":
         config_file = "./config_swarm_multi.yml"
+        if local_topo:
+            config_file = f"./config_swarm_multi_{agent_id}.yml"
         # Initialize your swarm-multi agent here using the config_file
         from swarm.agents.swarm_agentv2 import SwarmAgent
-        agent = SwarmAgent(agent_id=str(agent_id), config_file=config_file, cycles=1000)
+        agent = SwarmAgent(agent_id=agent_id, config_file=config_file)
     else:
         print(f"Unknown agent type: {agent_type}")
         sys.exit(1)
@@ -112,7 +119,7 @@ if __name__ == '__main__':
     tasks_per_interval = 1  # Number of tasks to add each interval
     interval = 5  # Interval in seconds
 
-    if isinstance(agent.job_queue, SimpleJobQueue):
+    if isinstance(agent.queues.job_queue, SimpleJobQueue):
         distributor = TaskDistributor(agent=agent, task_pool=task_pool, tasks_per_interval=tasks_per_interval,
                                       interval=interval)
 

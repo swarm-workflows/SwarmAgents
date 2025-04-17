@@ -22,7 +22,7 @@
 #
 # Author: Komal Thareja(kthare10@renci.org)
 import enum
-from typing import Tuple
+from typing import List, Union
 
 from swarm.models.json_field import JSONField
 from swarm.models.agent_info import AgentInfo
@@ -53,16 +53,34 @@ class MessageException(Exception):
 
 class Message(JSONField):
     def __init__(self, **kwargs):
+        self._source = None
+        self._forwarded_by = None
         self._message_type = None
-        self._agent = None
+        self._agents = []  # List of agents
         self._set_fields(**kwargs)
+
+    @property
+    def source(self) -> str:
+        return self._source
+
+    @source.setter
+    def source(self, value: str):
+        self._source = value
+
+    @property
+    def forwarded_by(self) -> str:
+        return self._forwarded_by
+
+    @forwarded_by.setter
+    def forwarded_by(self, value: str):
+        self._forwarded_by = value
 
     @property
     def message_type(self) -> MessageType:
         return self._message_type
 
     @message_type.setter
-    def message_type(self, value: Tuple[MessageType, int]):
+    def message_type(self, value: Union[MessageType, int]):
         if isinstance(value, MessageType):
             self._message_type = value
         elif isinstance(value, int):
@@ -71,17 +89,15 @@ class Message(JSONField):
             raise ValueError("Unsupported value type for message type")
 
     @property
-    def agent(self) -> AgentInfo:
-        return self._agent
+    def agents(self) -> List[AgentInfo]:
+        return self._agents
 
-    @agent.setter
-    def agent(self, value: dict):
-        if isinstance(value, AgentInfo):
-            self._agent = value
-        elif isinstance(value, dict):
-            self._agent = AgentInfo.from_dict(value)
+    @agents.setter
+    def agents(self, value: Union[List[dict], List[AgentInfo]]):
+        if isinstance(value, list):
+            self._agents = [AgentInfo.from_dict(v) if isinstance(v, dict) else v for v in value]
         else:
-            raise ValueError("Unsupported value type for agent")
+            raise ValueError("Agents must be a list of AgentInfo objects or dictionaries")
 
     def _set_fields(self, forgiving=False, **kwargs):
         """
@@ -104,4 +120,4 @@ class Message(JSONField):
         return self
 
     def __str__(self):
-        return f"message_type: {self.message_type}, agent: {self.agent}"
+        return f"message_type: {self.message_type}, agents: {self.agents}, forwarded_by: {self.forwarded_by}"

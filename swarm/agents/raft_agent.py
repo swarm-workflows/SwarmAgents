@@ -25,9 +25,7 @@
 import threading
 import time
 import traceback
-from typing import Dict, List
 
-import redis
 from pyraft.raft import RaftNode
 
 from swarm.agents.agent import Agent
@@ -35,7 +33,7 @@ from swarm.comm.messages.heart_beat import HeartBeat
 from swarm.comm.messages.message import MessageType
 from swarm.models.capacities import Capacities
 from swarm.models.agent_info import AgentInfo
-from swarm.models.job import JobState, Job, JobRepository
+from swarm.models.job import JobState, Job
 
 
 class ExtendedRaftNode(RaftNode):
@@ -56,21 +54,19 @@ class ExtendedRaftNode(RaftNode):
 
 
 class RaftAgent(Agent):
-    def __init__(self, agent_id: str, config_file: str, cycles: int, address: str = "127.0.0.1", port: int = 5010,
-                 peers: Dict[str, str] = {}, redis_host: str = "127.0.0.1", redis_port: int = 6379):
-        super(RaftAgent, self).__init__(agent_id=agent_id, config_file=config_file, cycles=cycles)
+    def __init__(self, agent_id: int, config_file: str,  address: str = "127.0.0.1", port: int = 5010,
+                 peers: dict[str, str] = {}):
+        super(RaftAgent, self).__init__(agent_id=agent_id, config_file=config_file)
         self.agent_id = agent_id
         self.peers = peers
         self.raft = ExtendedRaftNode(self.agent_id, f"{address}:{port}", peers)
-        self.redis_client = redis.StrictRedis(host=redis_host, port=redis_port, decode_responses=True)
         self.shutdown_flag = threading.Event()
         self.job_list = 'jobs'
-        self.job_repo = JobRepository(redis_client=self.redis_client)
 
     def start(self, clean: bool = False):
         self.raft.start()
 
-        if not self.agent_id and clean:
+        if self.agent_id is None and clean:
             self.job_repo.delete_all()
         super().start()
 
@@ -171,7 +167,7 @@ class RaftAgent(Agent):
 
     def __receive_commit(self, incoming: dict):
         dest = incoming.get("dest")
-        if not dest or dest != self.agent_id:
+        if dest is not None or dest != self.agent_id:
             self.logger.debug(f"Discarding incoming message: {incoming}")
             return
         peer_agent_id = incoming.get("agent_id")
@@ -207,9 +203,9 @@ class RaftAgent(Agent):
                 message[key] = value
 
         # Produce the message to the Kafka topic
-        self.ctrl_msg_srv.produce_message(message)
+        self._send_message(json_message=message)
 
-    def _process_messages(self, *, messages: List[dict]):
+    def _process_messages(self, *, messages: list[dict]):
         for message in messages:
             try:
                 begin = time.time()

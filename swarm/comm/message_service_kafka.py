@@ -26,7 +26,6 @@ import logging
 import threading
 import time
 import traceback
-from abc import ABC, abstractmethod
 
 from confluent_kafka import Producer, Consumer, TopicPartition
 
@@ -40,20 +39,23 @@ class MessageServiceKafka:
         self.consumer_group_id = config.get('consumer_group_id')
         self.enable_auto_commit = config.get("enable_auto_commit", False)
         self.batch_size = config.get("batch_size", 10)
-        self.producer = Producer({"bootstrap.servers": self.kafka_bootstrap_servers, "acks": "all",})
+        self.producer = Producer({"bootstrap.servers": self.kafka_bootstrap_servers,
+                                  "acks": "all",
+                                  "linger.ms": 1,})
         self.consumer = Consumer({
             "bootstrap.servers": self.kafka_bootstrap_servers,
             "group.id": self.consumer_group_id,
             "auto.offset.reset": "latest",
             "enable.auto.commit": self.enable_auto_commit,
             "on_commit": self.commit_completed,
-            "heartbeat.interval.ms": 1000
+            #"heartbeat.interval.ms": 1000
         })
         self.consumer.commit()
         self.logger = logger
         self.observers = []
         self.shutdown = False
-        self.thread = threading.Thread(target=self.consume_messages, daemon=True, name="KafkaConsumer")
+        self.thread = threading.Thread(target=self.consume_messages, daemon=True,
+                                       name=f"KafkaConsumer-{self.kafka_topic}")
 
     def start(self):
         self.consumer.subscribe([self.kafka_topic])
@@ -68,10 +70,31 @@ class MessageServiceKafka:
         if agent not in self.observers:
             self.observers.append(agent)
 
-    def produce_message(self, json_message: dict):
+    def produce_message(self, json_message: dict, topic: str = None, src: int = None,
+                        dest: int = None, fwd: int = None):
         message = json.dumps(json_message)
-        self.logger.debug(f"Message sent: {message} to topic: {self.kafka_topic}")
-        self.producer.produce(self.kafka_topic, message.encode('utf-8'))
+        outgoing_topic = self.kafka_topic
+        if topic:
+            outgoing_topic = topic
+        msg_type = json_message.get("message_type")
+        msg_name = None
+        if msg_type:
+            from swarm.comm.messages.message import MessageType
+            msg_name = MessageType(msg_type)
+        if fwd and src and dest:
+            self.logger.debug(
+                f"[OUT] [{str(msg_name)}] [SRC: {src}] [DEST: {dest}] [FWD: {fwd}] sent to "
+                f"topic: {outgoing_topic}, Payload:  {message}")
+        elif src and dest:
+            self.logger.debug(
+                f"[OUT] [{str(msg_name)}] [SRC: {src}] [DEST: {dest}] sent to topic: {outgoing_topic}, "
+                f"Payload:  {message}")
+        else:
+            self.logger.debug(
+                f"[OUT] [{str(msg_name)}] sent to topic: {outgoing_topic}, "
+                f"Payload:  {message}")
+
+        self.producer.produce(outgoing_topic, message.encode('utf-8'))
         #self.producer.flush()
 
     def notify_observers(self, msg):
@@ -85,9 +108,10 @@ class MessageServiceKafka:
         offsets = []
         logging.getLogger().info("Consumer thread started")
         #while not self.shutdown or lag:
+        last_commit_time = time.time()
         while not self.shutdown:
             try:
-                msg = self.consumer.poll(0.25)
+                msg = self.consumer.poll(0.05)
                 if msg is None:
                     lag = 0
                     continue
@@ -114,8 +138,9 @@ class MessageServiceKafka:
 
                 if not self.enable_auto_commit:
                     msg_count += 1
-                    if msg_count % self.batch_size == 0:
+                    if msg_count % self.batch_size == 0 or time.time() - last_commit_time > 1:
                         self.consumer.commit(offsets=offsets)
+                        last_commit_time = time.time()
                         offsets.clear()
             except KeyboardInterrupt:
                 break
@@ -135,3 +160,8 @@ class MessageServiceKafka:
             self.logger.error(f"KAFKA: commit failure: {err}")
         #else:
         #    self.logger.debug(f"KAFKA: Committed partition offsets: {partitions}")
+
+    def flush_producer(self):
+        while not self.shutdown:
+            time.sleep(0.5)
+            self.producer.flush()
