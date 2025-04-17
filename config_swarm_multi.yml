@@ -1,5 +1,5 @@
 redis:
-  host: zoo-0
+  host: database
   port: 6379
 queue:
   type: simple
@@ -20,6 +20,7 @@ nats:
   hb_nats_topic: agent-swarm-multi-hb
 grpc:
   port: 50051
+  host: localhost
 runtime:
   profile: BalancedProfile
   data_transfer: False

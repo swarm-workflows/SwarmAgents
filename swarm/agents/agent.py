@@ -130,6 +130,10 @@ class Agent(Observer):
         return self.messaging.grpc_config.get("port", 50051)
 
     @property
+    def grpc_host(self):
+        return self.messaging.grpc_config.get("host", "localhost")
+
+    @property
     def total_agents(self):
         return self.runtime_config.get("total_agents", 5)
 
@@ -425,7 +429,11 @@ class Agent(Observer):
                 if peer_agent_id in excluded_peers:
                     continue
                 if self.message_service_type == "grpc":
-                    topic = f"localhost:{self.grpc_port + peer_agent_id}"
+                    peer_host = "localhost"
+                    if self.grpc_host != peer_host:
+                        peer_host = f"agent-{peer_agent_id}"
+
+                    topic = f"{peer_host}:{self.grpc_port + peer_agent_id}"
                 else:
                     topic = f"{self.topic}-{peer_agent_id}"
                 self.ctrl_msg_srv.produce_message(json_message=json_message,
