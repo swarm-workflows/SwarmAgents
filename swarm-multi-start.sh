@@ -33,7 +33,7 @@ rm -f shutdown
 python3.11 generate_configs.py "$num_agents" "$jobs_per_proposal" ./config_swarm_multi.yml . $topology
 
 # Build cleanup command with optional args only if set
-cleanup_cmd="python3 cleanup.py --agents $num_agents"
+cleanup_cmd="python3.11 cleanup.py --agents $num_agents"
 [[ -n "$topic" ]] && cleanup_cmd+=" --topic $topic"
 [[ -n "$broker" ]] && cleanup_cmd+=" --broker $broker"
 [[ -n "$redis" ]] && cleanup_cmd+=" --redis $redis"
