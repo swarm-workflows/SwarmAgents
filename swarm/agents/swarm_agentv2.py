@@ -102,6 +102,78 @@ class SwarmAgent(Agent):
             time.sleep(5)
             self.logger.info("[SEL_WAIT] Waiting for Peer map to be populated!")
 
+        jobs_per_batch = 10  # configurable batch size
+        while not self.shutdown:
+            try:
+                all_jobs = [job for job in self.queues.job_queue.get_jobs()
+                            if job.is_pending() and not self.is_job_completed(job_id=job.get_job_id())]
+
+                job_batches = [all_jobs[i:i + jobs_per_batch] for i in range(0, len(all_jobs), jobs_per_batch)]
+                for batch in job_batches:
+                    if self.shutdown:
+                        break
+
+                    processed = 0
+                    proposals = []
+                    caps_jobs_selected = Capacities()
+
+                    for job in batch:
+                        #election_timeout = random.uniform(150, 300) / 1000
+                        #time.sleep(election_timeout)
+
+                        status, cost = self.__can_select_job(job=job, caps_jobs_selected=caps_jobs_selected)
+                        if status:
+                            proposal = ProposalInfo(
+                                p_id=self.generate_id(),
+                                job_id=job.get_job_id(),
+                                agent_id=self.agent_id,
+                                seed=cost
+                            )
+                            proposals.append(proposal)
+                            caps_jobs_selected += job.get_capacities()
+                            job.change_state(new_state=JobState.PRE_PREPARE)
+
+                        if len(proposals) >= self.jobs_per_proposal:
+                            msg = Proposal(source=self.agent_id,
+                                           agents=[AgentInfo(agent_id=self.agent_id)],
+                                           proposals=proposals)
+                            self._send_message(json_message=msg.to_dict())
+                            for p in proposals:
+                                self.outgoing_proposals.add_proposal(p)
+                            proposals.clear()
+                            caps_jobs_selected = Capacities()
+
+                        processed += 1
+
+                    # Send remaining proposals for this batch
+                    if proposals:
+                        msg = Proposal(source=self.agent_id,
+                                       agents=[AgentInfo(agent_id=self.agent_id)],
+                                       proposals=proposals)
+                        self._send_message(json_message=msg.to_dict())
+                        for p in proposals:
+                            self.outgoing_proposals.add_proposal(p)
+
+                    # Wait until all jobs in the batch are no longer in PENDING before moving on
+                    while not self.shutdown and any(job.is_pending() for job in batch):
+                        self.logger.debug("[SEL_WAIT] Waiting for batch consensus to complete...")
+                        time.sleep(2)
+
+                time.sleep(2)  # Sleep briefly before checking for new batches
+
+            except Exception as e:
+                self.logger.error(f"Error occurred while executing e: {e}")
+                self.logger.error(traceback.format_exc())
+
+        self.logger.info(f"Agent: {self} stopped with restarts: {self.restart_job_selection_cnt}!")
+
+    '''
+    def job_selection_main(self):
+        self.logger.info(f"Starting agent: {self}")
+        while self.agent_count != self.total_agents:
+            time.sleep(5)
+            self.logger.info("[SEL_WAIT] Waiting for Peer map to be populated!")
+
         while not self.shutdown:
             try:
                 processed = 0
@@ -112,16 +184,14 @@ class SwarmAgent(Agent):
                     if self.is_job_completed(job_id=job.get_job_id()):
                         continue
 
-                    '''
-                    diff = int(time.time() - job.time_last_state_change)
-                    if diff > self.restart_job_selection and job.get_state() in [JobState.PREPARE,
-                                                                                 JobState.PRE_PREPARE]:
-                        self.logger.info(f"RESTART: Job: {job} reset to Pending")
-                        job.change_state(new_state=JobState.PENDING)
-                        self.outgoing_proposals.remove_job(job_id=job.get_job_id())
-                        self.incoming_proposals.remove_job(job_id=job.get_job_id())
-                        self.restart_job_selection_cnt += 1
-                    '''
+                    #diff = int(time.time() - job.time_last_state_change)
+                    #if diff > self.restart_job_selection and job.get_state() in [JobState.PREPARE,
+                    #                                                             JobState.PRE_PREPARE]:
+                    #    self.logger.info(f"RESTART: Job: {job} reset to Pending")
+                    #    job.change_state(new_state=JobState.PENDING)
+                    #    self.outgoing_proposals.remove_job(job_id=job.get_job_id())
+                    #    self.incoming_proposals.remove_job(job_id=job.get_job_id())
+                    #    self.restart_job_selection_cnt += 1
 
                     if not job.is_pending():
                         if job.get_leader_agent_id() is None:
@@ -137,10 +207,11 @@ class SwarmAgent(Agent):
                     election_timeout = random.uniform(150, 300) / 1000
                     time.sleep(election_timeout)
 
-                    if self.__can_select_job(job=job, caps_jobs_selected=caps_jobs_selected):
+                    status, cost = self.__can_select_job(job=job, caps_jobs_selected=caps_jobs_selected)
+                    if status:
                         # Send proposal to all neighbors
                         proposal = ProposalInfo(p_id=self.generate_id(), job_id=job.get_job_id(),
-                                                agent_id=self.agent_id)
+                                                agent_id=self.agent_id, seed=cost)
                         proposals.append(proposal)
                         caps_jobs_selected += job.get_capacities()
 
@@ -157,8 +228,6 @@ class SwarmAgent(Agent):
                         proposals.clear()
                         caps_jobs_selected = Capacities()
 
-                        #self.logger.debug(f"Added proposals: {proposals}")
-
                     if processed >= 40:
                         time.sleep(1)
                         processed = 0
@@ -170,7 +239,6 @@ class SwarmAgent(Agent):
                     self._send_message(json_message=msg.to_dict())
                     for p in proposals:
                         self.outgoing_proposals.add_proposal(p)
-                    #self.logger.debug(f"Added remaining proposals: {proposals}")
                     proposals.clear()
 
                 time.sleep(1)  # Adjust the sleep duration as needed
@@ -179,7 +247,7 @@ class SwarmAgent(Agent):
                 self.logger.error(f"Error occurred while executing e: {e}")
                 self.logger.error(traceback.format_exc())
         self.logger.info(f"Agent: {self} stopped with restarts: {self.restart_job_selection_cnt}!")
-
+    '''
     def __compute_cost_matrix(self, jobs: List[Job], caps_jobs_selected: Capacities) -> np.ndarray:
         """
         Compute the cost matrix where rows represent agents and columns represent jobs.
@@ -236,12 +304,18 @@ class SwarmAgent(Agent):
 
         for j in range(cost_matrix.shape[1]):  # Iterate over each job (column)
             valid_costs = cost_matrix[:, j]  # Get the costs for job j
-            finite_costs = valid_costs[valid_costs != float('inf')]  # Filter out infinite costs
+            finite_indices = np.where(valid_costs != float('inf'))[0]  # Indices with finite costs
 
-            if len(finite_costs) > 0:  # If there are any finite costs
-                min_index = np.argmin(finite_costs)  # Find the index of the minimum cost
-                original_index = np.where(valid_costs == finite_costs[min_index])[0][0]  # Get the original index
-                min_cost_agents.append(agent_ids[original_index])
+            if len(finite_indices) > 0:
+                costs = valid_costs[finite_indices]
+                min_idx_in_finite = np.argmin(costs)
+                original_index = finite_indices[min_idx_in_finite]
+
+                agent_id = agent_ids[original_index]
+                min_cost = valid_costs[original_index]
+
+                min_cost_agents.append((agent_id, min_cost))  # Or use {"agent_id": agent_id, "cost": min_cost}
+
             '''
             if len(finite_costs) > 0:  # If there are any finite costs
                 min_cost = np.min(finite_costs)  # Get the minimum cost
@@ -260,7 +334,7 @@ class SwarmAgent(Agent):
 
         return min_cost_agents
 
-    def __can_select_job(self, job: Job, caps_jobs_selected: Capacities) -> bool:
+    def __can_select_job(self, job: Job, caps_jobs_selected: Capacities) -> tuple[bool, float]:
         """
         Check if agent has enough resources to become a leader
             - Agent has resources to executed the job
@@ -272,14 +346,15 @@ class SwarmAgent(Agent):
         """
         cost_matrix = self.__compute_cost_matrix([job], caps_jobs_selected)
         min_cost_agents = self.__find_min_cost_agents(cost_matrix)
-        if len(min_cost_agents) and min_cost_agents[0] == self.agent_id:
-            return True
+
+        if len(min_cost_agents) and min_cost_agents[0][0] == self.agent_id:
+            return True, min_cost_agents[0][1]
+
         self.logger.debug(f"[SEL]: Not picked Job: {job.get_job_id()} - TIME: {job.no_op} "
                           f"MIN Cost Agents: {min_cost_agents}")
-        return False
+        return False, min_cost_agents[0][1] if min_cost_agents else float('inf')
 
     def __receive_proposal(self, incoming: Proposal):
-        #self.logger.debug(f"Received Proposal from: {incoming.agents[0].agent_id}")
 
         proposals = []
         proposals_to_forward = []
@@ -296,10 +371,13 @@ class SwarmAgent(Agent):
                 self.logger.debug(f"Job:{p.job_id} Agent:{self.agent_id} rejected Proposal: {p} from agent"
                                   f" {p.agent_id} - my proposal {my_proposal} has prepares or smaller seed")
                 self.conflicts += 1
+                print(f"Collision -- mine -- {my_proposal}")
+
             elif peer_proposal:
                 self.logger.debug(f"Job:{p.job_id} Agent:{self.agent_id} rejected Proposal: {p} from agent"
                                   f" {p.agent_id} - already accepted proposal {peer_proposal} with a smaller seed")
                 self.conflicts += 1
+                print(f"Collision -- peer -- {peer_proposal}")
             else:
                 self.logger.debug(
                     f"Job:{p.job_id} Agent:{self.agent_id} accepted Proposal: {p} from agent"
@@ -339,7 +417,6 @@ class SwarmAgent(Agent):
     def __receive_prepare(self, incoming: Prepare):
         proposals = []
         proposals_to_forward = []
-        #self.logger.debug(f"Received prepare from: {incoming.agents[0].agent_id}")
 
         for p in incoming.proposals:
             job = self.queues.job_queue.get_job(job_id=p.job_id)
@@ -395,7 +472,6 @@ class SwarmAgent(Agent):
                                src=incoming.agents[0].agent_id, fwd=self.agent_id)
 
     def __receive_commit(self, incoming: Commit):
-        #self.logger.debug(f"Received commit from: {incoming.agents[0].agent_id}")
         proposals_to_forward = []
 
         for p in incoming.proposals:
@@ -448,7 +524,6 @@ class SwarmAgent(Agent):
                                src=incoming.agents[0].agent_id, fwd=self.agent_id)
 
     def __receive_job_status(self, incoming: JobStatus):
-        #self.logger.debug(f"Received Status from: {incoming.agents[0].agent_id}")
 
         jobs_to_fwd = []
         for t in incoming.jobs:
