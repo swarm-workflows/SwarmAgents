@@ -8,7 +8,8 @@ class SwarmConfigGenerator:
     A class to generate configuration files for agents in a structured ring topology.
     """
 
-    def __init__(self, num_agents, jobs_per_proposal, base_config_path, output_dir, topology):
+    def __init__(self, num_agents, jobs_per_proposal, base_config_path, output_dir, topology,
+                 db_host):
         """
         Initializes the generator with the number of agents, base config path, and output directory.
 
@@ -24,6 +25,7 @@ class SwarmConfigGenerator:
         self.base_config = self.load_base_config()
         self.rings = self.create_ring_topology()
         self.topology = topology
+        self.db_host = db_host
 
     def load_base_config(self):
         """
@@ -123,6 +125,7 @@ class SwarmConfigGenerator:
         # Generate YAML files for each agent
         for agent_id in range(1, self.num_agents + 1):
             config = self.base_config.copy()
+            config["redis"]["host"] = self.db_host
             config["topology"] = {"peer_agents": agent_peers[agent_id] if agent_peers else "all"}
             config["runtime"]["total_agents"] = self.num_agents
             config["runtime"]["jobs_per_proposal"] = self.jobs_per_proposal
@@ -141,9 +144,11 @@ if __name__ == "__main__":
     parser.add_argument("base_config_file", type=str, help="Path to the base configuration YAML file.")
     parser.add_argument("output_dir", type=str, help="Directory where generated configs should be saved.")
     parser.add_argument("topology", type=str, default="all", help="Agent Topology: Possible values - all, ring")
+    parser.add_argument("database", type=str, default="all", help="Database Host")
+
 
     args = parser.parse_args()
 
     generator = SwarmConfigGenerator(args.num_agents, args.jobs_per_proposal, args.base_config_file,
-                                     args.output_dir, args.topology)
+                                     args.output_dir, args.topology, args.database)
     generator.generate_configs()
