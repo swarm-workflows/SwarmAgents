@@ -97,11 +97,13 @@ def main(run_directory: str, number_of_agents: int, algo: str):
         for index, row in df_jobs_per_agent.iterrows():
             _id = row.get("Agent ID")
             agent_job_counts[_id] = row.get("Number of Jobs Selected", 0)
+            '''
             jobs = ast.literal_eval(row.get("Jobs", []))
             for j in jobs:
                 if j not in job_agent_id_mapping:
                     job_agent_id_mapping[j] = set()
                 job_agent_id_mapping[j].add(index)
+            '''
 
     # Filter job_agent_id_mapping to include only jobs with more than one agent
     filtered_job_agent_id_mapping = {job: agents for job, agents in job_agent_id_mapping.items() if len(agents) > 1}
@@ -163,9 +165,13 @@ def main(run_directory: str, number_of_agents: int, algo: str):
 
     # Plot Idle Time per Agent (Multiple Lines)
     plt.figure(figsize=(10, 6))
+    all_idle_times = []
     for agent_id, idle_times in agent_idle_times.items():
         if idle_times:
             plt.scatter(range(len(idle_times)), idle_times, label=f'Agent {agent_id}')
+            all_idle_times.extend(idle_times)
+    if all_idle_times:
+        print(f"Mean Idle Time = {np.mean(all_idle_times):.4f} seconds")
 
     plt.xlabel('Time Index')
     plt.ylabel('Idle Time (seconds)')
