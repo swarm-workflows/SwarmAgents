@@ -96,6 +96,7 @@ class SwarmAgent(Agent):
                 self.logger.error(f"Error while processing message {type(message)}, {e}")
                 self.logger.error(traceback.format_exc())
 
+    '''
     def job_selection_main(self):
         self.logger.info(f"Starting agent: {self}")
         while self.agent_count != self.total_agents:
@@ -166,8 +167,8 @@ class SwarmAgent(Agent):
                 self.logger.error(traceback.format_exc())
 
         self.logger.info(f"Agent: {self} stopped with restarts: {self.restart_job_selection_cnt}!")
-
     '''
+
     def job_selection_main(self):
         self.logger.info(f"Starting agent: {self}")
         while self.agent_count != self.total_agents:
@@ -247,7 +248,7 @@ class SwarmAgent(Agent):
                 self.logger.error(f"Error occurred while executing e: {e}")
                 self.logger.error(traceback.format_exc())
         self.logger.info(f"Agent: {self} stopped with restarts: {self.restart_job_selection_cnt}!")
-    '''
+
     def __compute_cost_matrix(self, jobs: List[Job], caps_jobs_selected: Capacities) -> np.ndarray:
         """
         Compute the cost matrix where rows represent agents and columns represent jobs.
