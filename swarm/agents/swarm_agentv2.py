@@ -137,10 +137,11 @@ class SwarmAgent(Agent):
                     election_timeout = random.uniform(150, 300) / 1000
                     time.sleep(election_timeout)
 
-                    if self.__can_select_job(job=job, caps_jobs_selected=caps_jobs_selected):
+                    status, cost = self.__can_select_job(job=job, caps_jobs_selected=caps_jobs_selected)
+                    if status:
                         # Send proposal to all neighbors
                         proposal = ProposalInfo(p_id=self.generate_id(), job_id=job.get_job_id(),
-                                                agent_id=self.agent_id)
+                                                agent_id=self.agent_id, seed=cost + self.agent_id)
                         proposals.append(proposal)
                         caps_jobs_selected += job.get_capacities()
 
@@ -225,8 +226,6 @@ class SwarmAgent(Agent):
     def __find_min_cost_agents(self, cost_matrix: np.ndarray) -> list:
         """
         Find the agents with the minimum cost for each job, ensuring:
-        1. The agent itself is chosen if it has the minimum cost.
-        2. Otherwise, a random agent is selected from those with the minimum cost.
 
         :param cost_matrix: A 2D numpy array where each entry [i, j] is the cost of agent i for job j.
         :return: A list of agent IDs corresponding to the minimum cost for each job.
@@ -236,31 +235,27 @@ class SwarmAgent(Agent):
 
         for j in range(cost_matrix.shape[1]):  # Iterate over each job (column)
             valid_costs = cost_matrix[:, j]  # Get the costs for job j
+            finite_indices = np.where(valid_costs != float('inf'))[0]  # Indices with finite costs
+
+            if len(finite_indices) > 0:
+                min_cost = np.min(valid_costs[finite_indices])
+                candidate_indices = [i for i in finite_indices if valid_costs[i] == min_cost]
+                selected_index = candidate_indices[0]
+                min_cost_agents.append((agent_ids[selected_index], min_cost))
+        '''
+        for j in range(cost_matrix.shape[1]):  # Iterate over each job (column)
+            valid_costs = cost_matrix[:, j]  # Get the costs for job j
             finite_costs = valid_costs[valid_costs != float('inf')]  # Filter out infinite costs
 
             if len(finite_costs) > 0:  # If there are any finite costs
                 min_index = np.argmin(finite_costs)  # Find the index of the minimum cost
                 original_index = np.where(valid_costs == finite_costs[min_index])[0][0]  # Get the original index
                 min_cost_agents.append(agent_ids[original_index])
-            '''
-            if len(finite_costs) > 0:  # If there are any finite costs
-                min_cost = np.min(finite_costs)  # Get the minimum cost
-                min_indices = np.where(valid_costs == min_cost)[0]  # Find all indices with min cost
-
-                # Check if self is in min_indices
-                #self_index = 0  # Self agent is always at index 0
-                #if self_index in min_indices:
-                #    selected_index = self_index  # Prioritize selecting itself
-                #else:
-                #    selected_index = random.choice(min_indices)  # Randomly select from others
-                selected_index = random.choice(min_indices)  # Randomly select from others
-                #selected_index = min_indices[0]  # Randomly select from others
-                min_cost_agents.append(agent_ids[selected_index])
-            '''
+        '''
 
         return min_cost_agents
 
-    def __can_select_job(self, job: Job, caps_jobs_selected: Capacities) -> bool:
+    def __can_select_job(self, job: Job, caps_jobs_selected: Capacities) -> tuple[bool, float]:
         """
         Check if agent has enough resources to become a leader
             - Agent has resources to executed the job
@@ -272,11 +267,13 @@ class SwarmAgent(Agent):
         """
         cost_matrix = self.__compute_cost_matrix([job], caps_jobs_selected)
         min_cost_agents = self.__find_min_cost_agents(cost_matrix)
-        if len(min_cost_agents) and min_cost_agents[0] == self.agent_id:
-            return True
+        if len(min_cost_agents):
+            agent_id, cost = min_cost_agents[0]
+            if agent_id == self.agent_id:
+                return True, cost
         self.logger.debug(f"[SEL]: Not picked Job: {job.get_job_id()} - TIME: {job.no_op} "
                           f"MIN Cost Agents: {min_cost_agents}")
-        return False
+        return False, 0.0
 
     def __receive_proposal(self, incoming: Proposal):
         #self.logger.debug(f"Received Proposal from: {incoming.agents[0].agent_id}")

@@ -36,9 +36,9 @@ class ProposalInfo(JSONField):
         self.agent_id = None
         # self.seed = round(random.random(), 5)
         # Decrease chances of collision
-        base_value = round(random.random(), 10)
-        offset = round(random.uniform(0, 1e-10), 10)
-        self.seed = base_value + offset
+        #base_value = round(random.random(), 10)
+        #offset = round(random.uniform(0, 1e-10), 10)
+        #self.seed = base_value + offset
         # TODO try this as second option
         # secure_random = random.SystemRandom()
         # unique_value = round(secure_random.random(), 10)
