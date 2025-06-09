@@ -1035,23 +1035,3 @@ class Agent(Observer):
         self.update_completed_jobs(self.job_repo.get_all_ids())
 
         return job_id in self.completed_jobs_set
-
-    def record_prepare_vote_redis(self, job_id: str, agent_id: str):
-        key = f"prepare:{job_id}"
-        self.redis_client.sadd(key, agent_id)
-        self.redis_client.expire(key, 120)  # Optional TTL cleanup
-
-    def has_prepare_quorum_redis(self, job_id: str, total_agents: int) -> bool:
-        quorum = (2 * ((total_agents - 1) // 3)) + 1
-        key = f"prepare:{job_id}"
-        return self.redis_client.scard(key) >= quorum
-
-    def record_commit_vote_redis(self, job_id: str, agent_id: str):
-        key = f"commit:{job_id}"
-        self.redis_client.sadd(key, agent_id)
-        self.redis_client.expire(key, 120)  # Optional TTL cleanup
-
-    def has_commit_quorum_redis(self, job_id: str, total_agents: int) -> bool:
-        quorum = (2 * ((total_agents - 1) // 3)) + 1
-        key = f"commit:{job_id}"
-        return self.redis_client.scard(key) >= quorum
