@@ -34,6 +34,7 @@ class ProposalInfo(JSONField):
         self.prepares = []
         self.commits = []
         self.agent_id = None
+        self.seed = 0
         # self.seed = round(random.random(), 5)
         # Decrease chances of collision
         #base_value = round(random.random(), 10)
@@ -57,7 +58,7 @@ class ProposalInfo(JSONField):
                 self.__getattribute__(k)
                 self.__setattr__(k, v)
             except AttributeError:
-                report = f"Unable to set field {k} of capacity, no such field available "\
+                report = f"Unable to set field {k} of ProposalInfo, no such field available "\
                        f"{[k for k in self.__dict__.keys()]}"
                 if forgiving:
                     print(report)
