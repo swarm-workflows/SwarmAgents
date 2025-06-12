@@ -348,7 +348,7 @@ class Agent(Observer):
                 self.logger.error(traceback.format_exc())
         return events
 
-    def process_message(self, message: str):
+    def dispatch_message(self, message: str):
         self.__enqueue(incoming=message)
 
     def _receive_heartbeat(self, incoming: HeartBeat):

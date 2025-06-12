@@ -71,7 +71,7 @@ class MessageServiceZeroMQ:
         :param message: The message received from the topic
         """
         for observer in self.observers:
-            observer.process_message(message)
+            observer.dispatch_message(message)
 
     def consume_messages(self):
         """

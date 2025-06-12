@@ -1,3 +1,5 @@
+import random
+
 import yaml
 import os
 import argparse
@@ -125,6 +127,13 @@ class SwarmConfigGenerator:
         # Generate YAML files for each agent
         for agent_id in range(1, self.num_agents + 1):
             config = self.base_config.copy()
+
+            # Randomize capacities
+            config['capacities']['cpu'] = self.random_capacity(1, 8)
+            config['capacities']['gpu'] = self.random_capacity(1, 8)
+            config['capacities']['ram'] = self.random_capacity(16, 64)
+            config['capacities']['disk'] = self.random_capacity(100, 500)
+
             config["redis"]["host"] = self.db_host
             config["topology"] = {"peer_agents": agent_peers[agent_id] if agent_peers else "all"}
             config["runtime"]["total_agents"] = self.num_agents
@@ -136,6 +145,9 @@ class SwarmConfigGenerator:
 
         print(f"\nGenerated {self.num_agents} config files in {self.output_dir}")
 
+    @staticmethod
+    def random_capacity(min_val, max_val):
+        return random.randint(min_val, max_val)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate agent configuration files with a structured ring topology.")

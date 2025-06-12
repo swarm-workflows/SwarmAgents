@@ -42,9 +42,9 @@ class MessageServiceGrpc(Observer):
 
     def notify_observers(self, msg: dict):
         for o in self.observers:
-            o.process_message(msg)
+            o.dispatch_message(msg)
 
-    def process_message(self, message: Any):
+    def dispatch_message(self, message: Any):
         self.logger.info(f"Received consensus message: {message}")
         self.notify_observers(msg=message.get("payload"))
 

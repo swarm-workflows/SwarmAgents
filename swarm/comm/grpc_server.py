@@ -44,7 +44,7 @@ class ConsensusServiceServicer(consensus_pb2_grpc.ConsensusServiceServicer):
             "payload": json.loads(request.payload),
             "timestamp": request.timestamp
         }
-        self.observer.process_message(msg)
+        self.observer.dispatch_message(msg)
         return consensus_pb2.Ack(success=True, info="Processed")
 
 

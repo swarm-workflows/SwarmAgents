@@ -21,24 +21,55 @@
 # SOFTWARE.
 #
 # Author: Komal Thareja(kthare10@renci.org)
+# MIT License
+# Copyright (c) 2024 swarm-workflows
+
 import json
 import threading
-
 import redis
+from typing import Optional, Dict, Tuple, List
 
 
 class Repository:
-    def __init__(self, redis_client):
+    """
+    Repository class to handle Redis-based storage for jobs, agents, and multi-phase consensus state
+    (Pre-Prepare, Prepare, Commit) for decentralized job scheduling.
+    """
+
+    KEY_JOB = "job"
+    KEY_AGENT = "agent"
+    KEY_PRE_PREPARE = "pre_prepare"
+    KEY_PREPARE = "prepare"
+    KEY_COMMIT = "commit"
+
+    def __init__(self, redis_client: redis.Redis):
+        """
+        Initialize Repository instance.
+
+        Args:
+            redis_client (redis.Redis): Redis client connection object.
+        """
         self.redis = redis_client
         self.lock = threading.Lock()
 
-    def save(self, obj: dict, key_prefix: str = "job"):
-        obj_id = obj.get("id")
-        if obj_id is None:
-            obj_id = obj.get(f"{key_prefix}_id")
-        if obj_id is None:
-            raise ValueError("obj_id must be set to save an object")
-        key = f"{key_prefix}:{obj_id}"
+    ##########################
+    # GENERIC JOB OPERATIONS #
+    ##########################
+
+    def save(self, obj: dict, key_prefix: str = KEY_JOB, key: Optional[str] = None):
+        """
+        Save a generic object into Redis under the given key.
+
+        Args:
+            obj (dict): Object to save.
+            key_prefix (str): Prefix to use (job, agent, etc.).
+            key (Optional[str]): Specific Redis key. If None, will derive key from object ID.
+        """
+        if not key:
+            obj_id = obj.get("id") or obj.get(f"{key_prefix}_id")
+            if obj_id is None:
+                raise ValueError("obj_id must be set to save an object")
+            key = f"{key_prefix}:{obj_id}"
         with self.lock:
             pipeline = self.redis.pipeline()
             while True:
@@ -51,39 +82,210 @@ class Repository:
                 except redis.WatchError:
                     continue
 
-    def get(self, obj_id: str, key_prefix: str = "job") -> dict:
+    def get(self, obj_id: str, key_prefix: str = KEY_JOB) -> dict:
+        """
+        Retrieve a generic object from Redis.
+
+        Args:
+            obj_id (str): Object ID.
+            key_prefix (str): Prefix of key to search under.
+
+        Returns:
+            dict: Retrieved object, or empty dict if not found.
+        """
         key = f"{key_prefix}:{obj_id}"
         with self.lock:
             data = self.redis.get(key)
-            if data:
-                return json.loads(data)
+            return json.loads(data) if data else {}
 
-    def delete(self, obj_id: str, key_prefix: str = "job"):
+    def delete(self, obj_id: str, key_prefix: str = KEY_JOB):
+        """
+        Delete object from Redis.
+
+        Args:
+            obj_id (str): Object ID.
+            key_prefix (str): Prefix of key to delete under.
+        """
         key = f"{key_prefix}:{obj_id}"
         with self.lock:
             self.redis.delete(key)
 
-    def get_all_ids(self, key_prefix: str = "job") -> list:
+    def get_all_ids(self, key_prefix: str = KEY_JOB) -> List[str]:
         """
-        Retrieves all IDs from Redis, stripping the key prefix.
+        Get list of all IDs under given key prefix.
+
+        Args:
+            key_prefix (str): Prefix to search.
+
+        Returns:
+            List[str]: List of object IDs.
         """
         with self.lock:
-            all_keys = self.redis.keys(f'{key_prefix}:*')  # Fetch all keys with prefix
-            ids = [key.split(f"{key_prefix}:")[1] for key in all_keys]  # Extract agent_id
-        return ids
+            all_keys = self.redis.keys(f'{key_prefix}:*')
+            return list(set(key.split(":")[1] for key in all_keys))
 
-    def get_all_objects(self, key_prefix: str = "job") -> list[dict]:
-        with self.lock:
-            keys = self.redis.keys(f'{key_prefix}:*')  # Assuming job keys are prefixed with 'job:'
-            result = []
-            for key in keys:
-                data = self.redis.get(key)
-                if data:
-                    result.append(json.loads(data))
-            return result
+    def get_all_objects(self, key_prefix: str = KEY_JOB) -> List[dict]:
+        """
+        Retrieve all objects under given key prefix.
 
-    def delete_all(self, key_prefix: str = "job"):
+        Args:
+            key_prefix (str): Prefix to search.
+
+        Returns:
+            List[dict]: List of retrieved objects.
+        """
         with self.lock:
-            keys = self.redis.keys(f'{key_prefix}:*')  # Assuming job keys are prefixed with 'job:'
+            keys = self.redis.keys(f'{key_prefix}:*')
+            return [json.loads(self.redis.get(key)) for key in keys if self.redis.get(key)]
+
+    def delete_all(self, key_prefix: str = KEY_JOB):
+        """
+        Delete all objects under given key prefix.
+
+        Args:
+            key_prefix (str): Prefix to delete.
+        """
+        with self.lock:
+            keys = self.redis.keys(f'{key_prefix}:*')
             for key in keys:
                 self.redis.delete(key)
+
+    ################################
+    # PRE-PREPARE PHASE OPERATIONS #
+    ################################
+
+    def push_pre_prepare(self, job_id: str, cost: float, agent_id: int):
+        """
+        Save pre-prepare cost for given job and agent.
+
+        Args:
+            job_id (str): Job ID.
+            cost (float): Proposed cost.
+            agent_id (int): Agent ID.
+        """
+        redis_key = f"{self.KEY_PRE_PREPARE}:{job_id}:{agent_id}"
+        clean_cost = float(cost)  # convert np.float64 to native float
+        with self.lock:
+            self.redis.set(redis_key, round(clean_cost, 2))
+
+    def get_pre_prepare(self, job_id: str) -> Dict[str, float]:
+        """
+        Retrieve pre-prepare costs for a given job.
+
+        Args:
+            job_id (str): Job ID.
+
+        Returns:
+            Dict[str, float]: Mapping of agent IDs to their proposed costs.
+        """
+        return self._get_votes(self.KEY_PRE_PREPARE, job_id)
+
+    def get_min_cost_agent_for_job(self, job_id: str) -> Tuple[Optional[int], float]:
+        """
+        Retrieve agent with minimum cost for a job.
+
+        Args:
+            job_id (str): Job ID.
+
+        Returns:
+            Tuple[Optional[int], float]: (Agent ID with min cost, min cost value).
+        """
+        job_costs = self.get_pre_prepare(job_id)
+        if not job_costs:
+            return None, float('inf')
+        min_agent = min(job_costs, key=lambda k: job_costs[k])
+        return int(min_agent), job_costs[min_agent]
+
+    ###########################
+    # PREPARE PHASE OPERATIONS #
+    ###########################
+
+    def push_prepare_vote(self, job_id: str, leader_agent_id: int, agent_id: int):
+        """
+        Save prepare vote for a given job and agent.
+
+        Args:
+            job_id (str): Job ID.
+            leader_agent_id (int): Proposed leader by this agent.
+            agent_id (int): Agent ID.
+        """
+        redis_key = f"{self.KEY_PREPARE}:{job_id}:{agent_id}"
+        with self.lock:
+            self.redis.set(redis_key, leader_agent_id)
+
+    def get_prepare(self, job_id: str) -> Dict[str, int]:
+        """
+        Retrieve prepare votes for a job.
+
+        Args:
+            job_id (str): Job ID.
+
+        Returns:
+            Dict[str, int]: Mapping of agent IDs to voted leaders.
+        """
+        return self._get_votes(self.KEY_PREPARE, job_id)
+
+    #########################
+    # COMMIT PHASE OPERATIONS #
+    #########################
+
+    def push_commit_vote(self, job_id: str, leader_agent_id: int, agent_id: int):
+        """
+        Save commit vote for a given job and agent.
+
+        Args:
+            job_id (str): Job ID.
+            leader_agent_id (int): Proposed leader by this agent.
+            agent_id (int): Agent ID.
+        """
+        redis_key = f"{self.KEY_COMMIT}:{job_id}:{agent_id}"
+        with self.lock:
+            self.redis.set(redis_key, leader_agent_id)
+
+    def get_commit(self, job_id: str) -> Dict[str, int]:
+        """
+        Retrieve commit votes for a job.
+
+        Args:
+            job_id (str): Job ID.
+
+        Returns:
+            Dict[str, int]: Mapping of agent IDs to voted leaders.
+        """
+        return self._get_votes(self.KEY_COMMIT, job_id)
+
+    #####################
+    # INTERNAL UTILITIES #
+    #####################
+
+    def _get_votes(self, phase_prefix: str, job_id: str) -> Dict[str, float or int]:
+        """
+        Internal helper to retrieve votes for any phase.
+
+        Args:
+            phase_prefix (str): Phase (pre_prepare, prepare, commit).
+            job_id (str): Job ID.
+
+        Returns:
+            Dict[str, float or int]: Agent ID -> vote value map.
+        """
+        pattern = f"{phase_prefix}:{job_id}:*"
+        with self.lock:
+            keys = self.redis.keys(pattern)
+            result = {}
+            for key in keys:
+                parts = key.split(":")
+                agent_id = parts[2]
+                raw_value = self.redis.get(key)
+                if raw_value is None:
+                    continue
+                try:
+                    if phase_prefix == self.KEY_PRE_PREPARE:
+                        value = float(raw_value)
+                    else:
+                        value = int(raw_value)
+                except ValueError:
+                    print(f"Invalid value found for key {key}: {raw_value}")
+                    continue
+                result[agent_id] = value
+            return result
