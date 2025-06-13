@@ -1,4 +1,18 @@
 services:
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.10
+    container_name: etcd-server
+    ports:
+      - "2379:2379"
+      - "2380:2380"
+    environment:
+      - ETCD_NAME=etcd-server
+      - ETCD_INITIAL_ADVERTISE_PEER_URLS=http://etcd-server:2380
+      - ETCD_ADVERTISE_CLIENT_URLS=http://0.0.0.0:2379
+      - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
+      - ETCD_LISTEN_PEER_URLS=http://0.0.0.0:2380
+      - ETCD_INITIAL_CLUSTER=etcd-server=http://etcd-server:2380
+      - ETCD_INITIAL_CLUSTER_STATE=new
   redis:
     image: redis:latest
     container_name: redis

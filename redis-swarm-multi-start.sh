@@ -38,7 +38,7 @@ python3.11 generate_configs.py "$num_agents" "$jobs_per_proposal" ./config_swarm
 cleanup_cmd="python3.11 cleanup.py --agents $num_agents"
 [[ -n "$topic" ]] && cleanup_cmd+=" --topic $topic"
 [[ -n "$broker" ]] && cleanup_cmd+=" --broker $broker"
-[[ -n "$redis" ]] && cleanup_cmd+=" --redis $redis"
+[[ -n "$redis" ]] && cleanup_cmd+=" --etcd-host $redis --cleanup-etcd"
 
 # Run cleanup
 eval "$cleanup_cmd"

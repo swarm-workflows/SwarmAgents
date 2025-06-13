@@ -21,7 +21,6 @@
 # SOFTWARE.
 #
 # Author: Komal Thareja(kthare10@renci.org)
-import random
 import time
 import traceback
 from typing import List
@@ -147,8 +146,8 @@ class SwarmAgent(Agent):
         return False, 0.0
 
     def execute_job(self, job: Job):
-        self.update_completed_jobs(jobs=[job])
-        self.redis_repo.save(obj=job.to_dict())
+        self.update_completed_jobs(jobs=[job.get_job_id()])
+        self.repo.save(obj=job.to_dict())
         super().execute_job(job=job)
 
     def __get_proposed_capacities(self):
@@ -235,53 +234,71 @@ class SwarmAgent(Agent):
                 # Push proposals to Redis
                 for p in proposals:
                     self.outgoing_proposals.add_proposal(p)
-                    self.redis_repo.push_pre_prepare(p.job_id, p.seed, self.agent_id)
+                    self.repo.push_pre_prepare(p.job_id, p.seed, self.agent_id)
 
                 # Handle skipped jobs for ongoing consensus
                 for j in skipped_jobs:
-                    min_cost_agent, _ = self.redis_repo.get_min_cost_agent_for_job(j)
+                    job_obj = self.queues.job_queue.get_job(j)
+                    min_cost_agent, _ = self.repo.get_min_cost_agent_for_job(j)
                     if self.is_job_commit(j):
-                        self.redis_repo.push_commit_vote(j, min_cost_agent, self.agent_id)
+                        if job_obj.is_commit():
+                            continue
+                        self.repo.push_commit_vote(j, min_cost_agent, self.agent_id)
                         self.queues.job_queue.get_job(j).change_state(JobState.COMMIT)
                     elif self.is_job_prepare(j):
-                        self.redis_repo.push_prepare_vote(j, min_cost_agent, self.agent_id)
+                        if job_obj.get_state() == JobState.PREPARE:
+                            continue
+                        self.repo.push_prepare_vote(j, min_cost_agent, self.agent_id)
                         self.queues.job_queue.get_job(j).change_state(JobState.PREPARE)
                     elif self.is_job_pre_prepare(j):
-                        self.redis_repo.push_pre_prepare(j, float('inf'), self.agent_id)
+                        if job_obj.get_state() == JobState.PRE_PREPARE:
+                            continue
+                        self.repo.push_pre_prepare(j, float('inf'), self.agent_id)
                         self.queues.job_queue.get_job(j).change_state(JobState.PRE_PREPARE)
 
                 # PRE_PREPARE → PREPARE
-                pre_prepare_jobs = self.redis_repo.get_all_ids(key_prefix=Repository.KEY_PRE_PREPARE)
+                pre_prepare_jobs = self.repo.get_all_ids(key_prefix=Repository.KEY_PRE_PREPARE)
                 for job_id in pre_prepare_jobs:
-                    pre_prepare_map = self.redis_repo.get_pre_prepare(job_id)
+                    job_obj = self.queues.job_queue.get_job(job_id)
+                    current_state = job_obj.get_state()
+                    if current_state in [JobState.PREPARE, JobState.COMMIT, JobState.READY]:
+                        continue
+                    if self.is_job_completed(job_id=job_id):
+                        continue
+
+                    pre_prepare_map = self.repo.get_pre_prepare(job_id)
 
                     # Only proceed if we've observed at least quorum number of pre_prepare votes
                     if len(pre_prepare_map) < self.calculate_quorum():
-                        self.logger.debug(f"[PREPARE-DELAY] Waiting for full pre_prepare quorum on job {job_id}")
+                        self.logger.info(f"[PREPARE-DELAY] Waiting for full pre_prepare quorum on job {job_id}")
                         continue
 
                     # Proceed with normal leader calculation
-                    min_agent, _ = self.redis_repo.get_min_cost_agent_for_job(job_id)
-                    job_obj = self.queues.job_queue.get_job(job_id)
-                    current_state = job_obj.get_state()
+                    min_agent, _ = self.repo.get_min_cost_agent_for_job(job_id)
 
                     # Now cast prepare vote deterministically knowing quorum-sized cost set is stable
                     if min_agent == self.agent_id:
                         if not self.is_job_prepare(job_id):
-                            self.logger.debug(f"[PREPARE] LEADER Quorum reached for job {job_id}, casting prepare vote.")
-                            self.redis_repo.push_prepare_vote(job_id, self.agent_id, self.agent_id)
+                            self.logger.info(f"[PREPARE] LEADER Quorum reached for job {job_id}, casting prepare vote.")
+                            self.repo.push_prepare_vote(job_id, self.agent_id, self.agent_id)
                             job_obj.change_state(JobState.PREPARE)
                     else:
-                        if current_state not in [JobState.PREPARE, JobState.COMMIT]:
-                            self.logger.debug(
-                                f"[PREPARE] PARTICIPANT Quorum reached for job {job_id}, casting prepare vote.")
-                            self.redis_repo.push_prepare_vote(job_id, min_agent, self.agent_id)
-                            job_obj.change_state(JobState.PREPARE)
+                        self.logger.info(
+                            f"[PREPARE] PARTICIPANT Quorum reached for job {job_id}, casting prepare vote.")
+                        self.repo.push_prepare_vote(job_id, min_agent, self.agent_id)
+                        job_obj.change_state(JobState.PREPARE)
 
                 # PREPARE → COMMIT (pick most voted leader)
-                prepare_jobs = self.redis_repo.get_all_ids(key_prefix=Repository.KEY_PREPARE)
+                prepare_jobs = self.repo.get_all_ids(key_prefix=Repository.KEY_PREPARE)
                 for job_id in prepare_jobs:
-                    prepare_map = self.redis_repo.get_prepare(job_id)
+                    job_obj = self.queues.job_queue.get_job(job_id)
+                    current_state = job_obj.get_state()
+                    if current_state in [JobState.COMMIT, JobState.READY]:
+                        continue
+                    if self.is_job_completed(job_id=job_id):
+                        continue
+
+                    prepare_map = self.repo.get_prepare(job_id)
 
                     leader_vote_count = {}
                     for voter, voted_leader in prepare_map.items():
@@ -295,24 +312,28 @@ class SwarmAgent(Agent):
                         if vote_count < self.calculate_quorum():
                             continue
 
-                        job_obj = self.queues.job_queue.get_job(job_id)
                         if most_voted_leader == self.agent_id:
-                            if not self.is_job_commit(job_id):
-                                self.logger.debug(
-                                    f"[COMMIT] LEADER Quorum reached for job {job_id} on leader {most_voted_leader}, casting commit vote.")
-                                self.redis_repo.push_commit_vote(job_id, most_voted_leader, self.agent_id)
-                                job_obj.change_state(JobState.COMMIT)
+                            self.logger.info(
+                                f"[COMMIT] LEADER Quorum reached for job {job_id} on leader {most_voted_leader}, casting commit vote.")
+                            self.repo.push_commit_vote(job_id, most_voted_leader, self.agent_id)
+                            job_obj.change_state(JobState.COMMIT)
                         else:
-                            if not job_obj.is_commit():
-                                self.logger.debug(
-                                    f"[COMMIT] PARTICIPANT Quorum reached for job {job_id} on leader {most_voted_leader}, casting commit vote.")
-                                self.redis_repo.push_commit_vote(job_id, most_voted_leader, self.agent_id)
-                                job_obj.change_state(JobState.COMMIT)
+                            self.logger.info(
+                                f"[COMMIT] PARTICIPANT Quorum reached for job {job_id} on leader {most_voted_leader}, casting commit vote.")
+                            self.repo.push_commit_vote(job_id, most_voted_leader, self.agent_id)
+                            job_obj.change_state(JobState.COMMIT)
 
                 # COMMIT → COMPLETED (pick most voted leader in commit phase)
-                commit_jobs = self.redis_repo.get_all_ids(key_prefix=Repository.KEY_COMMIT)
+                commit_jobs = self.repo.get_all_ids(key_prefix=Repository.KEY_COMMIT)
                 for job_id in commit_jobs:
-                    commit_map = self.redis_repo.get_commit(job_id)
+                    job_obj = self.queues.job_queue.get_job(job_id)
+                    current_state = job_obj.get_state()
+                    if current_state in [JobState.READY]:
+                        continue
+                    if self.is_job_completed(job_id=job_id):
+                        continue
+
+                    commit_map = self.repo.get_commit(job_id)
 
                     leader_vote_count = {}
                     for voter, committed_leader in commit_map.items():
@@ -326,7 +347,6 @@ class SwarmAgent(Agent):
                         if vote_count < self.calculate_quorum():
                             continue
 
-                        job_obj = self.queues.job_queue.get_job(job_id)
                         if not self.is_job_completed(job_id) and not job_obj.is_complete() and not job_obj.is_ready():
                             if most_voted_leader == self.agent_id:
                                 self.logger.info(
@@ -347,10 +367,10 @@ class SwarmAgent(Agent):
         while not self.shutdown:
             try:
                 agent_info = self.generate_agent_info()
-                self.redis_repo.save(agent_info.to_dict(), key_prefix="agent")
+                self.repo.save(agent_info.to_dict(), key_prefix="agent")
 
                 current_time = int(time.time())
-                peers = self.redis_repo.get_all_objects(key_prefix="agent")
+                peers = self.repo.get_all_objects(key_prefix="agent")
                 active_peer_ids = set()
 
                 for p in peers:
@@ -374,13 +394,15 @@ class SwarmAgent(Agent):
                     (Repository.KEY_PREPARE, self.update_prepare_jobs),
                     (Repository.KEY_COMMIT, self.update_commit_jobs),
                 ]:
-                    jobs = self.redis_repo.get_all_ids(key_prefix=prefix)
+                    jobs = self.repo.get_all_ids(key_prefix=prefix)
                     update_fn(jobs=jobs)
 
-                for _ in range(int(interval * 10)):
-                    if self.shutdown:
-                        break
-                    time.sleep(0.1)
+                #for _ in range(int(interval * 10)):
+                #    if self.shutdown:
+                #        break
+                #    time.sleep(0.1)
+
+                time.sleep(0.005)
 
                 self.check_queue()
                 if self.should_shutdown():

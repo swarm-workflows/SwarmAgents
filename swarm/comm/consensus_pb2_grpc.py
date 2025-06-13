@@ -5,7 +5,7 @@ import warnings
 
 from swarm.comm import consensus_pb2 as swarm_dot_comm_dot_consensus__pb2
 
-GRPC_GENERATED_VERSION = '1.71.0'
+GRPC_GENERATED_VERSION = '1.70.0'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 

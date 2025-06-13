@@ -44,6 +44,7 @@ from swarm.agents.data.queues import AgentQueues
 from swarm.comm.message_service_grpc import MessageServiceGrpc
 from swarm.comm.messages.message import MessageType
 from swarm.comm.message_service_kafka import Observer
+from swarm.database.etcd_repository import EtcdRepository
 from swarm.database.repository import Repository
 from swarm.models.capacities import Capacities
 from swarm.models.agent_info import AgentInfo
@@ -157,6 +158,7 @@ class Agent(Observer):
         self.grpc_config = self.config.get("grpc", {})
         self.log_config = self.config.get("logging", {})
         self.runtime_config = self.config.get("runtime", {})
+        self.etcd_config = self.config.get("etcd", {"host": "127.0.0.1", "port": 2379})
         self.redis_config = self.config.get("redis", {"host": "127.0.0.1", "port": 6379})
         self.peer_agents = self.config.get("topology", {}).get("peer_agents", [])
 
@@ -166,7 +168,8 @@ class Agent(Observer):
         self.redis_client = redis.StrictRedis(host=self.redis_config["host"],
                                               port=self.redis_config["port"],
                                               decode_responses=True)
-        self.redis_repo = Repository(redis_client=self.redis_client)
+        #self.repo = Repository(redis_client=self.redis_client)
+        self.repo = EtcdRepository(host=self.etcd_config["host"], port=self.etcd_config["port"])
 
         self.condition = threading.Condition()
         self.shutdown = False
@@ -340,10 +343,10 @@ class Agent(Observer):
         while not self.shutdown:
             try:
                 agent_info = self.generate_agent_info()
-                self.redis_repo.save(agent_info.to_dict(), key_prefix="agent")
+                self.repo.save(agent_info.to_dict(), key_prefix=Repository.KEY_AGENT)
 
                 current_time = int(time.time())
-                peers = self.redis_repo.get_all_objects(key_prefix="agent")
+                peers = self.repo.get_all_objects(key_prefix=Repository.KEY_AGENT)
                 active_peer_ids = set()
 
                 for p in peers:
@@ -519,7 +522,7 @@ class Agent(Observer):
     def is_job_in_state(self, job_id: str, job_set: set, redis_key_prefix: str, update_fn):
         if job_id in job_set:
             return True
-        update_fn(self.redis_repo.get_all_ids(key_prefix=redis_key_prefix))
+        update_fn(self.repo.get_all_ids(key_prefix=redis_key_prefix))
         return job_id in job_set
 
     # Unified update methods
