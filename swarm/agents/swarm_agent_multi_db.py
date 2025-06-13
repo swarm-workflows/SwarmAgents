@@ -26,7 +26,7 @@ import traceback
 from typing import List
 
 
-from swarm.agents.agentv2 import Agent
+from swarm.agents.agent_db import Agent
 from swarm.database.repository import Repository
 from swarm.models.capacities import Capacities
 from swarm.models.agent_info import AgentInfo
