@@ -120,7 +120,7 @@ class SwarmConfigGenerator:
             for agent_id in agent_peers:
                 agent_peers[agent_id] = sorted(set(agent_peers[agent_id]))
         else:
-            for agent_id, peers in agent_peers:
+            for agent_id, peers in agent_peers.items():
                 peers.remove(agent_id)
 
         config_prefix = self.get_config_prefix()
