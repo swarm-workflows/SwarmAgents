@@ -146,6 +146,9 @@ class Metrics:
 
 
 class Agent(Observer):
+    TOPOLOGY_RING = "ring"
+    TOPOLOGY_MESH = "mesh"
+
     def __init__(self, agent_id: int, config_file: str):
         self.agent_id = agent_id
         self.neighbor_map = {}
@@ -161,6 +164,7 @@ class Agent(Observer):
         self.etcd_config = self.config.get("etcd", {"host": "127.0.0.1", "port": 2379})
         self.redis_config = self.config.get("redis", {"host": "127.0.0.1", "port": 6379})
         self.peer_agents = self.config.get("topology", {}).get("peer_agents", [])
+        self.topology_type = self.config.get("topology", {}).get("type", self.TOPOLOGY_MESH)
 
         self._capacities = Capacities().from_dict(self.config.get("capacities", {}))
         self.logger = self._setup_logger()
@@ -168,22 +172,16 @@ class Agent(Observer):
         self.redis_client = redis.StrictRedis(host=self.redis_config["host"],
                                               port=self.redis_config["port"],
                                               decode_responses=True)
-        #self.repo = Repository(redis_client=self.redis_client)
-        self.repo = EtcdRepository(host=self.etcd_config["host"], port=self.etcd_config["port"])
+        self.repo = Repository(redis_client=self.redis_client)
+        #self.repo = EtcdRepository(host=self.etcd_config["host"], port=self.etcd_config["port"])
 
         self.condition = threading.Condition()
         self.shutdown = False
         self.shutdown_path = "./shutdown"
 
+        self.metrics = Metrics()
         self.completed_lock = threading.Lock()
         self.completed_jobs_set = set()
-        self.pre_prepare_lock = threading.Lock()
-        self.pre_prepare_jobs_set = set()
-        self.prepare_lock = threading.Lock()
-        self.prepare_jobs_set = set()
-        self.commit_lock = threading.Lock()
-        self.commit_jobs_set = set()
-        self.metrics = Metrics()
 
         self.grpc_thread = MessageServiceGrpc(port=self.grpc_port, logger=self.logger)
 
@@ -529,15 +527,6 @@ class Agent(Observer):
     def update_completed_jobs(self, jobs: list[str]):
         self.update_jobs(jobs, self.completed_jobs_set, self.completed_lock)
 
-    def update_pre_prepare_jobs(self, jobs: list[str]):
-        self.update_jobs(jobs, self.pre_prepare_jobs_set, self.pre_prepare_lock)
-
-    def update_prepare_jobs(self, jobs: list[str]):
-        self.update_jobs(jobs, self.prepare_jobs_set, self.prepare_lock)
-
-    def update_commit_jobs(self, jobs: list[str]):
-        self.update_jobs(jobs, self.commit_jobs_set, self.commit_lock)
-
     # Unified check methods
     def is_job_completed(self, job_id: str) -> bool:
         return self.is_job_in_state(
@@ -545,30 +534,6 @@ class Agent(Observer):
             self.completed_jobs_set,
             Repository.KEY_JOB,
             self.update_completed_jobs
-        )
-
-    def is_job_pre_prepare(self, job_id: str) -> bool:
-        return self.is_job_in_state(
-            job_id,
-            self.pre_prepare_jobs_set,
-            Repository.KEY_PRE_PREPARE,
-            self.update_pre_prepare_jobs
-        )
-
-    def is_job_prepare(self, job_id: str) -> bool:
-        return self.is_job_in_state(
-            job_id,
-            self.prepare_jobs_set,
-            Repository.KEY_PREPARE,
-            self.update_prepare_jobs
-        )
-
-    def is_job_commit(self, job_id: str) -> bool:
-        return self.is_job_in_state(
-            job_id,
-            self.commit_jobs_set,
-            Repository.KEY_COMMIT,
-            self.update_commit_jobs
         )
 
     def dispatch_message(self, message: str):

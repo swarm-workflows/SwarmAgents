@@ -88,11 +88,9 @@ class SwarmConfigGenerator:
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
 
-        agent_peers = None
+        agent_peers = {i: [] for i in range(1, self.num_agents + 1)}  # IDs start from 1
         if self.topology == "ring":
             self.print_ring_topology()  # Print rings before generating configs
-
-            agent_peers = {i: [] for i in range(1, self.num_agents + 1)}  # IDs start from 1
 
             # Assign peer connections based on ring topology
             for ring in self.rings:
@@ -121,6 +119,9 @@ class SwarmConfigGenerator:
             # Remove duplicate entries
             for agent_id in agent_peers:
                 agent_peers[agent_id] = sorted(set(agent_peers[agent_id]))
+        else:
+            for agent_id, peers in agent_peers:
+                peers.remove(agent_id)
 
         config_prefix = self.get_config_prefix()
 
@@ -135,7 +136,7 @@ class SwarmConfigGenerator:
             config['capacities']['disk'] = self.random_capacity(100, 500)
 
             config["redis"]["host"] = self.db_host
-            config["topology"] = {"peer_agents": agent_peers[agent_id] if agent_peers else "all"}
+            config["topology"] = {"peer_agents": agent_peers[agent_id], "type": self.topology}
             config["runtime"]["total_agents"] = self.num_agents
             config["runtime"]["jobs_per_proposal"] = self.jobs_per_proposal
 

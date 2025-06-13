@@ -161,6 +161,7 @@ class Agent(Observer):
         self.etcd_config = self.config.get("etcd", {"host": "127.0.0.1", "port": 2379})
         self.redis_config = self.config.get("redis", {"host": "127.0.0.1", "port": 6379})
         self.peer_agents = self.config.get("topology", {}).get("peer_agents", [])
+        self.topology_type = self.config.get("topology", {}).get("type", "mesh")
 
         self._capacities = Capacities().from_dict(self.config.get("capacities", {}))
         self.logger = self._setup_logger()

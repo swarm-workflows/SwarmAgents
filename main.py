@@ -109,7 +109,7 @@ if __name__ == '__main__':
         if local_topo:
             config_file = f"./config_swarm_multi_{agent_id}.yml"
         # Initialize your swarm-multi agent here using the config_file
-        from swarm.agents.swarm_agent_multi import SwarmAgent
+        from swarm.agents.swarm_agent_multi_grpc import SwarmAgent
         agent = SwarmAgent(agent_id=agent_id, config_file=config_file)
     elif agent_type == "redis-swarm-multi":
         config_file = "./config_swarm_multi.yml"

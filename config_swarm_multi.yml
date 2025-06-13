@@ -17,7 +17,10 @@ capacities:
   mtu: 0
 topology:
   # Possible values, all, or comma separated list neighbor agent ids
-  peer_agents: all
+  peer_agents:
+    - 1
+    - 2
+  type: mesh
 kafka:
   bootstrap_servers: zoo-0:9092,zoo-1:9092,zoo-2:9092
   topic: multi

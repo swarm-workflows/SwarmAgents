@@ -27,16 +27,15 @@ import traceback
 from typing import List
 
 
-from swarm.agents.agent import Agent
+from swarm.agents.agent_grpc import Agent
 from swarm.comm.messages.commit import Commit
-from swarm.comm.messages.heart_beat import HeartBeat
 from swarm.comm.messages.message_builder import MessageBuilder
 from swarm.comm.messages.prepare import Prepare
 from swarm.comm.messages.proposal import Proposal
 from swarm.comm.messages.job_status import JobStatus
+from swarm.database.repository import Repository
 from swarm.models.capacities import Capacities
 from swarm.models.agent_info import AgentInfo
-from swarm.models.profile import Profile
 from swarm.models.proposal_info import ProposalContainer, ProposalInfo
 from swarm.models.job import Job, JobState
 import numpy as np
@@ -48,35 +47,13 @@ class SwarmAgent(Agent):
         self.outgoing_proposals = ProposalContainer()
         self.incoming_proposals = ProposalContainer()
 
-    def _build_heart_beat(self, only_self: bool = False) -> dict:
-        agents = {}
-        my_load = self.compute_overall_load(proposed_jobs=self.outgoing_proposals.jobs())
-        agent = AgentInfo(agent_id=self.agent_id,
-                          capacities=self.capacities,
-                          capacity_allocations=self.queues.ready_queue.capacities(jobs=self.queues.ready_queue.get_jobs()),
-                          load=my_load,
-                          last_updated=time.time())
-        self._save_load_metric(self.agent_id, my_load)
-        if not only_self and isinstance(self.messaging.topology_peer_agent_list, list) and len(self.neighbor_map.values()):
-            for peer_agent_id, peer in self.neighbor_map.items():
-                if peer_agent_id is not None:
-                    agents[peer_agent_id] = peer
-
-        if self.agent_id is None:
-            self.logger.info("AGENT ID IS NONE")
-        agents[self.agent_id] = agent
-        return agents
-
-    def _process_messages(self, *, messages: List[dict]):
+    def _process(self, messages: list[dict]):
         for message in messages:
             try:
                 begin = time.time()
                 incoming = MessageBuilder.from_dict(message)
 
-                if isinstance(incoming, HeartBeat):
-                    self._receive_heartbeat(incoming=incoming)
-
-                elif isinstance(incoming, Prepare):
+                if isinstance(incoming, Prepare):
                     self.__receive_prepare(incoming=incoming)
 
                 elif isinstance(incoming, Commit):
@@ -98,7 +75,7 @@ class SwarmAgent(Agent):
 
     def job_selection_main(self):
         self.logger.info(f"Starting agent: {self}")
-        while self.agent_count != self.total_agents:
+        while self.live_agent_count != self.configured_agent_count:
             time.sleep(5)
             self.logger.info("[SEL_WAIT] Waiting for Peer map to be populated!")
 
@@ -148,7 +125,7 @@ class SwarmAgent(Agent):
                         # Begin election for Job leader for this job
                         job.change_state(new_state=JobState.PRE_PREPARE)
 
-                    if len(proposals) >= self.jobs_per_proposal:
+                    if len(proposals) >= self.proposal_job_batch_size:
                         msg = Proposal(source=self.agent_id,
                                        agents=[AgentInfo(agent_id=self.agent_id)],
                                        proposals=proposals)
@@ -179,7 +156,7 @@ class SwarmAgent(Agent):
             except Exception as e:
                 self.logger.error(f"Error occurred while executing e: {e}")
                 self.logger.error(traceback.format_exc())
-        self.logger.info(f"Agent: {self} stopped with restarts: {self.restart_job_selection_cnt}!")
+        self.logger.info(f"Agent: {self} stopped with restarts: {self.metrics.restart_job_selection_cnt}!")
 
     def __compute_cost_matrix(self, jobs: List[Job], caps_jobs_selected: Capacities) -> np.ndarray:
         """
@@ -200,7 +177,7 @@ class SwarmAgent(Agent):
                                                      proposed_caps=caps_jobs_selected)
 
         for j, job in enumerate(jobs):
-            cost_of_job = self.compute_job_cost(job=job, total=self.capacities, profile=self.profile)
+            cost_of_job = self.compute_job_cost(job=job, total=self.capacities)
             feasibility = self.is_job_feasible(total=self.capacities, job=job,
                                                projected_load=projected_load + cost_of_job)
             cost_matrix[0, j] = float('inf')
@@ -213,7 +190,7 @@ class SwarmAgent(Agent):
                                                          proposed_caps=caps_jobs_selected)
 
             for j, job in enumerate(jobs):
-                cost_of_job = self.compute_job_cost(job=job, total=peer.capacities, profile=self.profile)
+                cost_of_job = self.compute_job_cost(job=job, total=peer.capacities)
 
                 feasibility = self.is_job_feasible(total=peer.capacities, job=job,
                                                    projected_load=projected_load + cost_of_job)
@@ -281,11 +258,11 @@ class SwarmAgent(Agent):
             if my_proposal:
                 self.logger.debug(f"Job:{p.job_id} Agent:{self.agent_id} rejected Proposal: {p} from agent"
                                   f" {p.agent_id} - my proposal {my_proposal} has prepares or smaller seed")
-                self.conflicts += 1
+                self.metrics.conflicts += 1
             elif peer_proposal:
                 self.logger.debug(f"Job:{p.job_id} Agent:{self.agent_id} rejected Proposal: {p} from agent"
                                   f" {p.agent_id} - already accepted proposal {peer_proposal} with a smaller seed")
-                self.conflicts += 1
+                self.metrics.conflicts += 1
             else:
                 self.logger.debug(
                     f"Job:{p.job_id} Agent:{self.agent_id} accepted Proposal: {p} from agent"
@@ -310,7 +287,7 @@ class SwarmAgent(Agent):
                 # New proposal, forward to my peers
                 proposals_to_forward.append(p)
 
-        if len(proposals_to_forward):
+        if len(proposals_to_forward) and self.topology_type == Agent.TOPOLOGY_RING:
             msg = Proposal(source=incoming.agents[0].agent_id,
                            agents=[AgentInfo(agent_id=incoming.agents[0].agent_id)], proposals=proposals_to_forward,
                            forwarded_by=self.agent_id)
@@ -371,7 +348,7 @@ class SwarmAgent(Agent):
             msg = Commit(source=self.agent_id, agents=[AgentInfo(agent_id=self.agent_id)], proposals=proposals)
             self._send_message(json_message=msg.to_dict())
 
-        if len(proposals_to_forward):
+        if len(proposals_to_forward) and self.topology_type == Agent.TOPOLOGY_RING:
             # Use the originators agent agent_id when forwarding the Prepare
             msg = Prepare(source=incoming.agents[0].agent_id, agents=[AgentInfo(agent_id=incoming.agents[0].agent_id)],
                           proposals=proposals_to_forward,
@@ -425,7 +402,7 @@ class SwarmAgent(Agent):
                     job.change_state(new_state=JobState.COMMIT)
                     self.incoming_proposals.remove_job(job_id=p.job_id)
 
-        if len(proposals_to_forward):
+        if len(proposals_to_forward) and self.topology_type == Agent.TOPOLOGY_RING:
             msg = Commit(source=incoming.agents[0].agent_id, agents=[AgentInfo(agent_id=incoming.agents[0].agent_id)],
                          proposals=proposals_to_forward,
                          forwarded_by=self.agent_id)
@@ -461,7 +438,7 @@ class SwarmAgent(Agent):
 
         # Forward Job Status
         '''
-        if len(jobs_to_fwd):
+        if len(jobs_to_fwd) and self.topology_type == Agent.TOPOLOGY_RING:
             # Use the originators agent agent_id when forwarding the Prepare
             msg = JobStatus(agents=[AgentInfo(agent_id=incoming.agents[0].agent_id)], jobs=jobs_to_fwd,
                                     forwarded_by=self.agent_id)
@@ -472,7 +449,7 @@ class SwarmAgent(Agent):
 
     def execute_job(self, job: Job):
         self.update_completed_jobs(jobs=[job.get_job_id()])
-        self.job_repo.save(obj=job.to_dict())
+        self.repo.save(obj=job.to_dict())
         super().execute_job(job=job)
         '''
         msg = JobStatus(agents=[AgentInfo(agent_id=self.agent_id)], jobs=[JobInfo(job_id=job.get_job_id(),
@@ -490,38 +467,77 @@ class SwarmAgent(Agent):
         return proposed_capacities
 
     @staticmethod
-    def compute_job_cost(job: Job, total: Capacities, profile: Profile):
+    def compute_job_cost(job: Job, total: Capacities) -> float:
+        """
+        Computes job cost as the average load across core, RAM, and disk
+        relative to total available resources (equal weight, no profile).
+        """
         core_load = (job.capacities.core / total.core) * 100
         ram_load = (job.capacities.ram / total.ram) * 100
         disk_load = (job.capacities.disk / total.disk) * 100
 
-        cost = (core_load * profile.core_weight +
-                ram_load * profile.ram_weight +
-                disk_load * profile.disk_weight) / (profile.core_weight +
-                                                    profile.ram_weight +
-                                                    profile.disk_weight)
+        cost = (core_load + ram_load + disk_load) / 3
         return round(cost, 2)
 
-    def compute_projected_load(self, overall_load_actual: float, proposed_caps: Capacities):
+    def compute_projected_load(self, overall_load_actual: float, proposed_caps: Capacities) -> float:
+        """
+        Compute projected overall load using equal weighting for core, RAM, and disk.
+        """
         if not proposed_caps:
-            return round(overall_load_actual, 2)  # No proposed caps, so the load remains the same
+            return round(overall_load_actual, 2)
 
-        # Calculate the load contribution from the proposed capacities
-        core_load_increase = (proposed_caps.core / self.capacities.core) * 100
-        ram_load_increase = (proposed_caps.ram / self.capacities.ram) * 100
-        disk_load_increase = (proposed_caps.disk / self.capacities.disk) * 100
+        core_inc = (proposed_caps.core / self.capacities.core) * 100
+        ram_inc = (proposed_caps.ram / self.capacities.ram) * 100
+        disk_inc = (proposed_caps.disk / self.capacities.disk) * 100
 
-        # Adjust the overall load based on the increases
-        overall_load_projected = overall_load_actual + (
-                (core_load_increase * self.profile.core_weight +
-                 ram_load_increase * self.profile.ram_weight +
-                 disk_load_increase * self.profile.disk_weight) /
-                (self.profile.core_weight + self.profile.ram_weight + self.profile.disk_weight)
-        )
+        additional_load = (core_inc + ram_inc + disk_inc) / 3
+        projected_load = overall_load_actual + additional_load
 
-        return round(overall_load_projected, 2)
+        return round(projected_load, 2)
 
     def update_completed_jobs(self, jobs: list[str]):
         super().update_completed_jobs(jobs=jobs)
         for j in jobs:
             self.outgoing_proposals.remove_job(job_id=j)
+
+    def _do_periodic(self):
+        while not self.shutdown:
+            try:
+                agent_info = self.generate_agent_info()
+                self.repo.save(agent_info.to_dict(), key_prefix="agent")
+
+                current_time = int(time.time())
+                peers = self.repo.get_all_objects(key_prefix="agent")
+                active_peer_ids = set()
+
+                for p in peers:
+                    peer = AgentInfo.from_dict(p)
+                    self._add_peer(peer)
+                    active_peer_ids.add(peer.agent_id)
+
+                stale_peers = [
+                    peer.agent_id for peer in self.neighbor_map.values()
+                    if (current_time - peer.last_updated) >= self.peer_expiry_seconds and
+                       peer.agent_id not in active_peer_ids
+                ]
+
+                for agent_id in stale_peers:
+                    self._remove_peer(agent_id)
+
+                # Batch update job sets
+                for prefix, update_fn in [
+                    (Repository.KEY_JOB, self.update_completed_jobs)
+                ]:
+                    jobs = self.repo.get_all_ids(key_prefix=prefix)
+                    update_fn(jobs=jobs)
+
+                time.sleep(0.005)
+
+                self.check_queue()
+                if self.should_shutdown():
+                    print("[SHUTDOWN] Queue has been empty for too long. Triggering shutdown.")
+                    break
+            except Exception as e:
+                self.logger.error(f"Periodic update error: {e}\n{traceback.format_exc()}")
+
+        self.stop()
