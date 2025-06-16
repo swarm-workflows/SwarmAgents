@@ -7,6 +7,7 @@ AGENT_TYPES=("swarm-multi" "db-swarm-multi")
 MAX_RETRIES=1  # Number of repetitions per configuration
 TASKS=500
 JOBS_PER_PROPSAL=10
+DATABASE=database
 
 # Base output directory
 BASE_OUTPUT_DIR="results"
@@ -29,7 +30,7 @@ for agent_type in "${AGENT_TYPES[@]}"; do
             export TOPOLOGY="$topology"
 
             # Run the experiment
-            ./launch-runs.sh "$output_dir" "$MAX_RETRIES" "$agent_type" "$TASKS" "$JOBS_PER_PROPSAL"
+            ./launch-runs.sh "$output_dir" "$MAX_RETRIES" "$agent_type" "$TASKS" "$JOBS_PER_PROPSAL" "$num_agents" "$topology" "$DATABASE"
         done
     done
 done

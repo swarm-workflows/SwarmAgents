@@ -12,6 +12,9 @@ MAX_RETRIES="$2"
 AGENT_TYPE="$3"
 TASKS="$4"
 JOBS_PER_PROPOSAL="$5"
+NUM_AGENTS="$6"
+TOPOLOGY="$7"
+DATABASE="$8"
 SLEEP_INTERVAL=10
 
 # Read env vars for num_agents, topology, database
