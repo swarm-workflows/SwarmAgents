@@ -613,7 +613,7 @@ class Agent(Observer):
             job for job in self.queues.job_queue.get_jobs()
             if job.is_pending() and not self.is_job_completed(job_id=job.get_job_id())
         ]
-        if candidate_jobs < (total_jobs - 5):
+        if candidate_jobs:
             self.last_non_empty_time = time.time()
 
     def should_shutdown(self):
