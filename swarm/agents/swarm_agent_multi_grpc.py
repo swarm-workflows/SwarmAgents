@@ -93,7 +93,9 @@ class SwarmAgent(Agent):
                 allowed_new_proposals = max(0, self.max_pending_elections - total_in_progress)
 
                 if allowed_new_proposals == 0:
-                    self.logger.info(f"[CONSENSUS LIMIT] Max active consensus jobs in progress - {allowed_new_proposals}. Waiting...")
+                    self.logger.info(f"[CONSENSUS LIMIT] Max active consensus jobs in progress - "
+                                     f"{self.max_pending_elections} - {total_in_progress} {allowed_new_proposals}. "
+                                     f"Waiting...")
                     time.sleep(1)
                     continue
 
@@ -399,7 +401,7 @@ class SwarmAgent(Agent):
                     self.outgoing_proposals.remove_job(job_id=p.job_id)
                 else:
                     self.logger.info(f"[CON_PART] achieved for Job: {p.job_id} Leader: {p.agent_id}")
-                    job.change_state(new_state=JobState.COMMIT)
+                    job.change_state(new_state=JobState.COMPLETE)
                     self.incoming_proposals.remove_job(job_id=p.job_id)
 
         if len(proposals_to_forward) and self.topology_type == Agent.TOPOLOGY_RING:
@@ -497,7 +499,6 @@ class SwarmAgent(Agent):
         super().update_completed_jobs(jobs=jobs)
         for j in jobs:
             self.outgoing_proposals.remove_job(job_id=j)
-            self.queues.job_queue.get_job(j).change_state(JobState.COMPLETE)
 
     def _do_periodic(self):
         while not self.shutdown:
