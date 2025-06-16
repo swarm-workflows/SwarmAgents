@@ -45,7 +45,7 @@ class MessageServiceGrpc(Observer):
             o.dispatch_message(msg)
 
     def dispatch_message(self, message: Any):
-        self.logger.info(f"Received consensus message: {message}")
+        self.logger.debug(f"Received consensus message: {message}")
         self.notify_observers(msg=message.get("payload"))
 
     def start(self):

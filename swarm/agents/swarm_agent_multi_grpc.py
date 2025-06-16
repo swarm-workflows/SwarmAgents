@@ -375,7 +375,7 @@ class SwarmAgent(Agent):
             elif self.incoming_proposals.contains(job_id=p.job_id, p_id=p.p_id):
                 proposal = self.incoming_proposals.get_proposal(p_id=p.p_id)
             else:
-                self.logger.info(f"TBD: Job: {p.job_id} Agent: {self.agent_id} received commit without any Prepares")
+                self.logger.debug(f"TBD: Job: {p.job_id} Agent: {self.agent_id} received commit without any Prepares")
                 proposal = p
                 self.incoming_proposals.add_proposal(proposal=proposal)
 
@@ -387,7 +387,7 @@ class SwarmAgent(Agent):
             quorum_count = (len(self.neighbor_map) // 2) + 1  # Ensure a true majority
 
             if len(proposal.commits) >= quorum_count:
-                self.logger.info(
+                self.logger.debug(
                     f"Job: {p.job_id} Agent: {self.agent_id} received quorum commits Proposal: {proposal}: "
                     f"Job: {job.get_job_id()}")
                 if proposal.agent_id == self.agent_id:
@@ -417,7 +417,7 @@ class SwarmAgent(Agent):
         for t in incoming.jobs:
             job = self.queues.job_queue.get_job(job_id=t.job_id)
             if not job:
-                self.logger.info(f"Received Job Status for non-existent job: {t.job_id}")
+                self.logger.debug(f"Received Job Status for non-existent job: {t.job_id}")
                 continue
 
             if self.is_job_completed(job_id=job.get_job_id()):

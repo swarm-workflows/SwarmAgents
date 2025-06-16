@@ -186,7 +186,7 @@ class Agent(Observer):
         self.commit_jobs_set = set()
         self.metrics = Metrics()
 
-        self.grpc_thread = MessageServiceGrpc(port=self.grpc_port, logger=self.logger)
+        self.grpc_thread = MessageServiceGrpc(port=self.grpc_port + self.agent_id, logger=self.logger)
 
         self.threads = {
             "periodic": threading.Thread(target=self._do_periodic, daemon=True),

@@ -88,8 +88,8 @@ class SwarmConfigGenerator:
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
 
-        agent_peers = {i: [] for i in range(1, self.num_agents + 1)}  # IDs start from 1
         if self.topology == "ring":
+            agent_peers = {i: [] for i in range(1, self.num_agents + 1)}  # IDs start from 1
             self.print_ring_topology()  # Print rings before generating configs
 
             # Assign peer connections based on ring topology
@@ -120,8 +120,10 @@ class SwarmConfigGenerator:
             for agent_id in agent_peers:
                 agent_peers[agent_id] = sorted(set(agent_peers[agent_id]))
         else:
-            for agent_id, peers in agent_peers.items():
-                peers.remove(agent_id)
+            agent_peers = {
+                i: [j for j in range(1, self.num_agents + 1) if j != i]
+                for i in range(1, self.num_agents + 1)
+            }
 
         config_prefix = self.get_config_prefix()
 
@@ -149,6 +151,7 @@ class SwarmConfigGenerator:
     @staticmethod
     def random_capacity(min_val, max_val):
         return random.randint(min_val, max_val)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate agent configuration files with a structured ring topology.")

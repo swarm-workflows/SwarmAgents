@@ -172,8 +172,8 @@ class Agent(Observer):
         self.redis_client = redis.StrictRedis(host=self.redis_config["host"],
                                               port=self.redis_config["port"],
                                               decode_responses=True)
-        self.repo = Repository(redis_client=self.redis_client)
-        #self.repo = EtcdRepository(host=self.etcd_config["host"], port=self.etcd_config["port"])
+        #self.repo = Repository(redis_client=self.redis_client)
+        self.repo = EtcdRepository(host=self.etcd_config["host"], port=self.etcd_config["port"])
 
         self.condition = threading.Condition()
         self.shutdown = False
@@ -183,7 +183,7 @@ class Agent(Observer):
         self.completed_lock = threading.Lock()
         self.completed_jobs_set = set()
 
-        self.grpc_thread = MessageServiceGrpc(port=self.grpc_port, logger=self.logger)
+        self.grpc_thread = MessageServiceGrpc(port=self.grpc_port + self.agent_id, logger=self.logger)
 
         self.threads = {
             "periodic": threading.Thread(target=self._do_periodic, daemon=True),
