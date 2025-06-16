@@ -1,6 +1,9 @@
 redis:
   host: database 
   port: 6379
+etcd:
+  host: database
+  port: 2379
 queue:
   type: simple
   host: 127.0.0.1
