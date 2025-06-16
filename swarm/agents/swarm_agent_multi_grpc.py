@@ -87,7 +87,8 @@ class SwarmAgent(Agent):
                 # Compute current consensus load
                 in_progress_jobs = [
                     job for job in self.queues.job_queue.get_jobs()
-                    if not job.is_pending() and not self.is_job_completed(job.get_job_id())
+                    if job.get_state() in [JobState.PRE_PREPARE, JobState.PREPARE, JobState.COMMIT] and
+                       not self.is_job_completed(job.get_job_id())
                 ]
                 total_in_progress = len(in_progress_jobs)
                 allowed_new_proposals = max(0, self.max_pending_elections - total_in_progress)

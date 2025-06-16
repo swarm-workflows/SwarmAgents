@@ -32,6 +32,10 @@ class SimpleJobQueue(JobQueue):
         self.jobs = {}
         self.lock = threading.Lock()
 
+    def size(self):
+        with self.lock:
+            return len(self.jobs)
+
     def get_jobs(self, states: list[JobState] = None) -> list[Job]:
         with self.lock:
             if not states or not len(states):
