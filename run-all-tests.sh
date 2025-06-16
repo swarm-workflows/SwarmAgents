@@ -3,7 +3,7 @@
 # Configuration
 AGENT_COUNTS=(10 30 40 50 60 70 80 90 100)
 TOPOLOGIES=("mesh" "ring")
-AGENT_TYPES=("swarm-multi" "redis-swarm-multi")
+AGENT_TYPES=("swarm-multi" "db-swarm-multi")
 MAX_RETRIES=3  # Number of repetitions per configuration
 
 # Base output directory
