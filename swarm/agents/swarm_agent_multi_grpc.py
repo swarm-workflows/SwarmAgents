@@ -81,9 +81,21 @@ class SwarmAgent(Agent):
 
         while not self.shutdown:
             try:
-                processed = 0
                 proposals = []  # List to accumulate proposals for multiple jobs
                 caps_jobs_selected = Capacities()
+
+                # Compute current consensus load
+                in_progress_jobs = [
+                    job for job in self.queues.job_queue.get_jobs()
+                    if not job.is_pending() and not self.is_job_completed(job.get_job_id())
+                ]
+                total_in_progress = len(in_progress_jobs)
+                allowed_new_proposals = max(0, self.max_pending_elections - total_in_progress)
+
+                if allowed_new_proposals == 0:
+                    self.logger.info("[CONSENSUS LIMIT] Max active consensus jobs in progress. Waiting...")
+                    time.sleep(1)
+                    continue
 
                 for job in self.queues.job_queue.get_jobs():
                     if self.is_job_completed(job_id=job.get_job_id()):
@@ -108,8 +120,6 @@ class SwarmAgent(Agent):
                                 f"[SEL_SKIP] Job: {job.job_id} State: {job.state}; out: {proposal1} in: {proposal2} skipping it!")
                         continue
 
-                    processed += 1
-
                     # Trigger leader election for a job after random sleep
                     election_timeout = random.uniform(150, 300) / 1000
                     time.sleep(election_timeout)
@@ -121,25 +131,21 @@ class SwarmAgent(Agent):
                                                 agent_id=self.agent_id, seed=cost + self.agent_id)
                         proposals.append(proposal)
                         caps_jobs_selected += job.get_capacities()
+                        #job.change_state(new_state=JobState.PRE_PREPARE)
 
-                        # Begin election for Job leader for this job
-                        job.change_state(new_state=JobState.PRE_PREPARE)
-
-                    if len(proposals) >= self.proposal_job_batch_size:
+                    # ONLY PROPOSE UP TO ALLOWED LIMIT:
+                    if len(proposals) >= min(self.proposal_job_batch_size, allowed_new_proposals):
                         msg = Proposal(source=self.agent_id,
                                        agents=[AgentInfo(agent_id=self.agent_id)],
                                        proposals=proposals)
                         self._send_message(json_message=msg.to_dict())
                         for p in proposals:
                             self.outgoing_proposals.add_proposal(p)  # Add all proposals
+                            # Begin election for Job leader for this job
+                            job = self.queues.job_queue.get_job(job_id=p.job_id)
+                            job.change_state(new_state=JobState.PRE_PREPARE)
                         proposals.clear()
                         caps_jobs_selected = Capacities()
-
-                        #self.logger.debug(f"Added proposals: {proposals}")
-
-                    if processed >= 40:
-                        time.sleep(1)
-                        processed = 0
 
                 # Send remaining proposals if any exist
                 if proposals:
@@ -148,10 +154,9 @@ class SwarmAgent(Agent):
                     self._send_message(json_message=msg.to_dict())
                     for p in proposals:
                         self.outgoing_proposals.add_proposal(p)
-                    #self.logger.debug(f"Added remaining proposals: {proposals}")
                     proposals.clear()
 
-                time.sleep(1)  # Adjust the sleep duration as needed
+                time.sleep(0.005)
 
             except Exception as e:
                 self.logger.error(f"Error occurred while executing e: {e}")
@@ -242,8 +247,6 @@ class SwarmAgent(Agent):
         return False, 0.0
 
     def __receive_proposal(self, incoming: Proposal):
-        #self.logger.debug(f"Received Proposal from: {incoming.agents[0].agent_id}")
-
         proposals = []
         proposals_to_forward = []
         for p in incoming.proposals:
@@ -302,8 +305,6 @@ class SwarmAgent(Agent):
     def __receive_prepare(self, incoming: Prepare):
         proposals = []
         proposals_to_forward = []
-        #self.logger.debug(f"Received prepare from: {incoming.agents[0].agent_id}")
-
         for p in incoming.proposals:
             job = self.queues.job_queue.get_job(job_id=p.job_id)
             if self.is_job_completed(job_id=job.get_job_id()):
@@ -358,7 +359,6 @@ class SwarmAgent(Agent):
                                src=incoming.agents[0].agent_id, fwd=self.agent_id)
 
     def __receive_commit(self, incoming: Commit):
-        #self.logger.debug(f"Received commit from: {incoming.agents[0].agent_id}")
         proposals_to_forward = []
 
         for p in incoming.proposals:
@@ -411,8 +411,6 @@ class SwarmAgent(Agent):
                                src=incoming.agents[0].agent_id, fwd=self.agent_id)
 
     def __receive_job_status(self, incoming: JobStatus):
-        #self.logger.debug(f"Received Status from: {incoming.agents[0].agent_id}")
-
         jobs_to_fwd = []
         for t in incoming.jobs:
             job = self.queues.job_queue.get_job(job_id=t.job_id)

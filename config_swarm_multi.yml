@@ -37,7 +37,7 @@ grpc:
 runtime:
   profile: BalancedProfile
   data_transfer: False
-  max_pending_elections: 10
+  max_pending_elections: 50
   projected_queue_threshold: 300.00
   ready_queue_threshold: 100.00
   max_time_load_zero: 30
@@ -48,7 +48,7 @@ runtime:
   shutdown_mode: manual
   heartbeat_mode: redis
   total_agents: 5
-  jobs_per_proposal: 3
+  jobs_per_proposal: 10
 logging:
   ## The directory in which actor should create log files.
   ## This directory will be automatically created if it does not exist.

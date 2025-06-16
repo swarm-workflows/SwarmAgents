@@ -199,7 +199,11 @@ class Agent(Observer):
 
     @property
     def proposal_job_batch_size(self):
-        return self.runtime_config.get("jobs_per_proposal", 3)
+        return self.runtime_config.get("jobs_per_proposal", 10)
+
+    @property
+    def max_pending_elections(self):
+        return self.runtime_config.get("max_pending_elections", 50)
 
     @property
     def live_agent_count(self) -> int:

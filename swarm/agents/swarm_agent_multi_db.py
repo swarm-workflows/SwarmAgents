@@ -207,6 +207,22 @@ class SwarmAgent(Agent):
                 proposals, skipped_jobs = [], []
                 caps_jobs_selected = Capacities()
 
+                # NEW: check how many jobs are already in progress
+                pre_prepare_jobs = self.repo.get_all_ids(key_prefix=Repository.KEY_PRE_PREPARE)
+                prepare_jobs = self.repo.get_all_ids(key_prefix=Repository.KEY_PREPARE)
+                commit_jobs = self.repo.get_all_ids(key_prefix=Repository.KEY_COMMIT)
+                completed_jobs = [job.get_job_id() for job in job_queue.get_jobs() if job.is_ready()]
+
+                total_in_progress = len(pre_prepare_jobs) + len(prepare_jobs) + len(commit_jobs) + len(completed_jobs)
+
+                # calculate how many jobs you are allowed to propose
+                allowed_new_proposals = max(0, self.max_pending_elections - total_in_progress)
+
+                if allowed_new_proposals == 0:
+                    self.logger.info("[CONSENSUS LIMIT] All allowed jobs already in progress, waiting...")
+                    time.sleep(1)
+                    continue  # skip proposing if we are at capacity
+
                 candidate_jobs = [
                     job for job in job_queue.get_jobs()
                     if job.is_pending() and not self.is_job_completed(job.get_job_id())
@@ -228,7 +244,11 @@ class SwarmAgent(Agent):
                     else:
                         skipped_jobs.append(job_id)
 
-                    if len(proposals) >= batch_size:
+                    #if len(proposals) >= batch_size:
+                    #    break
+
+                    # NEW: stop proposing if reached allowed limit
+                    if len(proposals) >= min(batch_size, allowed_new_proposals):
                         break
 
                 # Push proposals to Redis
