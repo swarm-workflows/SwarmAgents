@@ -383,6 +383,9 @@ class Agent(Observer):
         while not self.shutdown:
             agents = {}
             try:
+                if self._can_shutdown(agents=agents):
+                    self.stop()
+
                 agents = self._build_heart_beat()
                 if self.heartbeat_mode != "kafka":
                     agent_info = agents[self.agent_id]
@@ -413,9 +416,6 @@ class Agent(Observer):
             except Exception as e:
                 self.logger.error(f"Error occurred while sending heartbeat e: {e}")
                 self.logger.error(traceback.format_exc())
-
-            if self._can_shutdown(agents=agents):
-                self.stop()
 
     def _send_message(self, json_message: dict, excluded_peers: list[int] = [], src: int = None, fwd: int = None):
         if src is None:
@@ -963,6 +963,9 @@ class Agent(Observer):
     def _can_shutdown(self, agents: dict):
         if not agents or len(agents) == 0:
             return False
+
+        if os.path.exists(self.shutdown_path):
+            return True
 
         if self.shutdown_mode != "auto":
             # Remove stale peers
