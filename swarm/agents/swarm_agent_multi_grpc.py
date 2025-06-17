@@ -93,12 +93,14 @@ class SwarmAgent(Agent):
                 total_in_progress = len(in_progress_jobs)
                 allowed_new_proposals = max(0, self.max_pending_elections - total_in_progress)
 
+                '''
                 if allowed_new_proposals == 0:
                     self.logger.info(f"[CONSENSUS LIMIT] Max active consensus jobs in progress - "
                                      f"{self.max_pending_elections} - {total_in_progress} {allowed_new_proposals}. "
                                      f"Waiting...")
                     time.sleep(1)
                     continue
+                '''
 
                 for job in self.queues.job_queue.get_jobs():
                     if self.is_job_completed(job_id=job.get_job_id()):
@@ -124,8 +126,8 @@ class SwarmAgent(Agent):
                         continue
 
                     # Trigger leader election for a job after random sleep
-                    election_timeout = random.uniform(150, 300) / 1000
-                    time.sleep(election_timeout)
+                    #election_timeout = random.uniform(150, 300) / 1000
+                    #time.sleep(election_timeout)
 
                     status, cost = self.__can_select_job(job=job, caps_jobs_selected=caps_jobs_selected)
                     if status:

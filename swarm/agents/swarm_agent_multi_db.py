@@ -218,10 +218,12 @@ class SwarmAgent(Agent):
                 # calculate how many jobs you are allowed to propose
                 allowed_new_proposals = max(0, self.max_pending_elections - total_in_progress)
 
+                '''
                 if allowed_new_proposals == 0:
                     self.logger.info("[CONSENSUS LIMIT] All allowed jobs already in progress, waiting...")
                     time.sleep(1)
                     continue  # skip proposing if we are at capacity
+                '''
 
                 candidate_jobs = [
                     job for job in job_queue.get_jobs()
