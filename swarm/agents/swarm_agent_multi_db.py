@@ -140,7 +140,7 @@ class SwarmAgent(Agent):
         if len(min_cost_agents):
             agent_id, cost = min_cost_agents[0]
             if agent_id == self.agent_id:
-                return True, cost
+                return True, float(cost)
         self.logger.debug(f"[SEL]: Not picked Job: {job.get_job_id()} - TIME: {job.no_op} "
                           f"MIN Cost Agents: {min_cost_agents}")
         return False, 0.0

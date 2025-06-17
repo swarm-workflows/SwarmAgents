@@ -22,7 +22,7 @@ base_index=0
 echo "Starting $num_agents agents with:"
 [[ -n "$database" ]] && echo "  Database: $database"
 
-pkill -f "main.py swarm-multi" || true
+pkill -f "main.py db-swarm-multi" || true
 rm -f shutdown
 
 #python3.11 -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. swarm/comm/consensus.proto
@@ -46,5 +46,5 @@ mkdir -p swarm-multi
 # Launch agents
 for i in $(seq 0 $(($num_agents - 1))); do
     agent_index=$(($base_index + $i + 1))
-    python3.11 main.py swarm-multi "$agent_index" "$tasks" "$num_agents" topo &
+    python3.11 main.py db-swarm-multi "$agent_index" "$tasks" "$num_agents" topo &
 done
