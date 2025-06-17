@@ -258,6 +258,9 @@ class SwarmAgent(Agent):
         proposals_to_forward = []
         for p in incoming.proposals:
             job = self.queues.job_queue.get_job(job_id=p.job_id)
+            if not job:
+                self.logger.error(f"ERROR ---- Skipping no job found for {p.job_id}")
+                continue
             if self.is_job_completed(job_id=job.get_job_id()):
                 self.logger.debug(f"Ignoring Proposal: {p} for job: {job.get_job_id()}")
                 continue
@@ -314,6 +317,9 @@ class SwarmAgent(Agent):
         proposals_to_forward = []
         for p in incoming.proposals:
             job = self.queues.job_queue.get_job(job_id=p.job_id)
+            if not job:
+                self.logger.error(f"ERROR ---- Skipping no job found for {p.job_id}")
+                continue
             if self.is_job_completed(job_id=job.get_job_id()):
                 self.logger.debug(f"Job: {job.get_job_id()} Ignoring Prepare: {p}")
                 continue
@@ -370,7 +376,9 @@ class SwarmAgent(Agent):
 
         for p in incoming.proposals:
             job = self.queues.job_queue.get_job(job_id=p.job_id)
-
+            if not job:
+                self.logger.error(f"ERROR ---- Skipping no job found for {p.job_id}")
+                continue
             if self.is_job_completed(job_id=job.get_job_id()):
                 self.logger.debug(f"Job: {job.get_job_id()} Ignoring Commit: {p}")
                 self.incoming_proposals.remove_job(job_id=p.job_id)
@@ -422,7 +430,7 @@ class SwarmAgent(Agent):
         for t in incoming.jobs:
             job = self.queues.job_queue.get_job(job_id=t.job_id)
             if not job:
-                self.logger.debug(f"Received Job Status for non-existent job: {t.job_id}")
+                self.logger.error(f"ERROR ---- Skipping no job found for {t.job_id}")
                 continue
 
             if self.is_job_completed(job_id=job.get_job_id()):
