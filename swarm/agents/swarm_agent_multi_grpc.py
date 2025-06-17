@@ -84,6 +84,7 @@ class SwarmAgent(Agent):
                 proposals = []  # List to accumulate proposals for multiple jobs
                 caps_jobs_selected = Capacities()
 
+                '''
                 # Compute current consensus load
                 in_progress_jobs = [
                     job for job in self.queues.job_queue.get_jobs()
@@ -93,7 +94,7 @@ class SwarmAgent(Agent):
                 total_in_progress = len(in_progress_jobs)
                 allowed_new_proposals = max(0, self.max_pending_elections - total_in_progress)
 
-                '''
+                
                 if allowed_new_proposals == 0:
                     self.logger.info(f"[CONSENSUS LIMIT] Max active consensus jobs in progress - "
                                      f"{self.max_pending_elections} - {total_in_progress} {allowed_new_proposals}. "
@@ -139,7 +140,8 @@ class SwarmAgent(Agent):
                         #job.change_state(new_state=JobState.PRE_PREPARE)
 
                     # ONLY PROPOSE UP TO ALLOWED LIMIT:
-                    if len(proposals) >= min(self.proposal_job_batch_size, allowed_new_proposals):
+                    #if len(proposals) >= min(self.proposal_job_batch_size, allowed_new_proposals):
+                    if len(proposals) >= self.proposal_job_batch_size:
                         msg = Proposal(source=self.agent_id,
                                        agents=[AgentInfo(agent_id=self.agent_id)],
                                        proposals=proposals)

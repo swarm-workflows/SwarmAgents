@@ -533,6 +533,14 @@ class Agent(Observer):
     # Unified update methods
     def update_completed_jobs(self, jobs: list[str]):
         self.update_jobs(jobs, self.completed_jobs_set, self.completed_lock)
+        
+        # Remove these jobs from other sets
+        with self.pre_prepare_lock:
+            self.pre_prepare_jobs_set.difference_update(jobs)
+        with self.prepare_lock:
+            self.prepare_jobs_set.difference_update(jobs)
+        with self.commit_lock:
+            self.commit_jobs_set.difference_update(jobs)
 
     def update_pre_prepare_jobs(self, jobs: list[str]):
         self.update_jobs(jobs, self.pre_prepare_jobs_set, self.pre_prepare_lock)
