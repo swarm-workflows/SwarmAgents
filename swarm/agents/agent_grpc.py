@@ -620,4 +620,6 @@ class Agent(Observer):
         """
         Returns True if queue has been empty for empty_timeout_seconds.
         """
+        if os.path.exists("./shutdown"):
+            return True
         return (time.time() - self.last_non_empty_time) >= self.empty_timeout_seconds
