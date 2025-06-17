@@ -127,8 +127,8 @@ class SwarmAgent(Agent):
                         continue
 
                     # Trigger leader election for a job after random sleep
-                    #election_timeout = random.uniform(150, 300) / 1000
-                    #time.sleep(election_timeout)
+                    election_timeout = random.uniform(150, 300) / 1000
+                    time.sleep(election_timeout)
 
                     status, cost = self.__can_select_job(job=job, caps_jobs_selected=caps_jobs_selected)
                     if status:
