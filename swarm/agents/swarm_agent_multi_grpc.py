@@ -300,7 +300,7 @@ class SwarmAgent(Agent):
                 # New proposal, forward to my peers
                 proposals_to_forward.append(p)
 
-        if len(proposals_to_forward) and self.topology_type == Agent.TOPOLOGY_RING:
+        if len(proposals_to_forward) and self.topology_type  in [Agent.TOPOLOGY_RING, Agent.TOPOLOGY_STAR]:
             msg = Proposal(source=incoming.agents[0].agent_id,
                            agents=[AgentInfo(agent_id=incoming.agents[0].agent_id)], proposals=proposals_to_forward,
                            forwarded_by=self.agent_id)
@@ -362,7 +362,7 @@ class SwarmAgent(Agent):
             msg = Commit(source=self.agent_id, agents=[AgentInfo(agent_id=self.agent_id)], proposals=proposals)
             self._send_message(json_message=msg.to_dict())
 
-        if len(proposals_to_forward) and self.topology_type == Agent.TOPOLOGY_RING:
+        if len(proposals_to_forward) and self.topology_type  in [Agent.TOPOLOGY_RING, Agent.TOPOLOGY_STAR]:
             # Use the originators agent agent_id when forwarding the Prepare
             msg = Prepare(source=incoming.agents[0].agent_id, agents=[AgentInfo(agent_id=incoming.agents[0].agent_id)],
                           proposals=proposals_to_forward,
@@ -417,7 +417,7 @@ class SwarmAgent(Agent):
                     job.change_state(new_state=JobState.COMPLETE)
                     self.incoming_proposals.remove_job(job_id=p.job_id)
 
-        if len(proposals_to_forward) and self.topology_type == Agent.TOPOLOGY_RING:
+        if len(proposals_to_forward) and self.topology_type in [Agent.TOPOLOGY_RING, Agent.TOPOLOGY_STAR]:
             msg = Commit(source=incoming.agents[0].agent_id, agents=[AgentInfo(agent_id=incoming.agents[0].agent_id)],
                          proposals=proposals_to_forward,
                          forwarded_by=self.agent_id)

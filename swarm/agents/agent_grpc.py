@@ -148,6 +148,7 @@ class Metrics:
 class Agent(Observer):
     TOPOLOGY_RING = "ring"
     TOPOLOGY_MESH = "mesh"
+    TOPOLOGY_STAR = "star"
 
     def __init__(self, agent_id: int, config_file: str):
         self.agent_id = agent_id
