@@ -119,6 +119,32 @@ class SwarmConfigGenerator:
             # Remove duplicate entries
             for agent_id in agent_peers:
                 agent_peers[agent_id] = sorted(set(agent_peers[agent_id]))
+        elif self.topology == "star":
+            core_agents = [1, 2, 3, 4, 5]
+            agent_peers = {}
+
+            # Step 1: Connect core agents in a ring
+            for i in range(len(core_agents)):
+                current = core_agents[i]
+                next_core = core_agents[(i + 1) % len(core_agents)]
+                prev_core = core_agents[(i - 1) % len(core_agents)]
+                agent_peers[current] = [prev_core, next_core]
+
+            # Step 2: Distribute leaf agents among core agents
+            leaf_agents = list(range(6, self.num_agents + 1))
+            for idx, leaf_id in enumerate(leaf_agents):
+                # Round-robin assignment to 2 core agents
+                primary = core_agents[idx % len(core_agents)]
+                secondary = core_agents[(idx + 1) % len(core_agents)]
+                agent_peers[leaf_id] = [primary, secondary]
+
+                # Add leaf to the assigned core agents' peer lists
+                agent_peers[primary].append(leaf_id)
+                agent_peers[secondary].append(leaf_id)
+
+            # Step 3: Deduplicate and sort peer lists
+            for agent_id in agent_peers:
+                agent_peers[agent_id] = sorted(set(agent_peers[agent_id]))
         else:
             agent_peers = {
                 i: [j for j in range(1, self.num_agents + 1) if j != i]

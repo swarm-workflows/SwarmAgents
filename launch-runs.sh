@@ -2,7 +2,7 @@
 
 # Check if the required parameters are provided
 if [ "$#" -lt 5 ]; then
-    echo "Usage: $0 DEST_DIR MAX_RETRIES AGENT_TYPE TASKS_CNT JOBS_PER_PROPOSAL"
+    echo "Usage: $0 DEST_DIR MAX_RETRIES AGENT_TYPE TASKS_CNT JOBS_PER_PROPOSAL NUM_AGENTS TOPOLOGY DATABASE"
     exit 1
 fi
 
