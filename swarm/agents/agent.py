@@ -386,6 +386,13 @@ class Agent(Observer):
                 if self._can_shutdown(agents=agents):
                     self.stop()
 
+                if os.path.exists("./shutdown"):
+                    self.stop()
+                    break
+
+                if os.path.exists("./plot"):
+                    self.plot_results()
+
                 agents = self._build_heart_beat()
                 if self.heartbeat_mode != "kafka":
                     agent_info = agents[self.agent_id]
@@ -963,9 +970,6 @@ class Agent(Observer):
     def _can_shutdown(self, agents: dict):
         if not agents or len(agents) == 0:
             return False
-
-        if os.path.exists(self.shutdown_path):
-            return True
 
         if self.shutdown_mode != "auto":
             # Remove stale peers
