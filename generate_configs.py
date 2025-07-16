@@ -66,7 +66,7 @@ class SwarmConfigGenerator:
         """
         Prints the ring topology in a clear format.
         """
-        print("\nRing Topology:")
+        print("\nRing TopologyType:")
         for i, ring in enumerate(self.rings):
             ring_display = " ⟶ ".join(map(str, ring)) + f" ⟶ {ring[0]}"  # Make it a closed loop
             print(f"Ring {i + 1}: {ring_display}")
@@ -89,6 +89,7 @@ class SwarmConfigGenerator:
             os.makedirs(self.output_dir)
 
         if self.topology == "ring":
+            agent_topo = {}
             agent_peers = {i: [] for i in range(1, self.num_agents + 1)}  # IDs start from 1
             self.print_ring_topology()  # Print rings before generating configs
 
@@ -118,10 +119,16 @@ class SwarmConfigGenerator:
 
             # Remove duplicate entries
             for agent_id in agent_peers:
-                agent_peers[agent_id] = sorted(set(agent_peers[agent_id]))
+                agent_topo[agent_id] = {
+                    "peers": sorted(set(agent_peers[agent_id])),
+                    "parent": None,
+                    "children": None,
+                    "level": 0
+                }
         elif self.topology == "star":
             core_agents = [1, 2, 3, 4, 5]
             agent_peers = {}
+            agent_topo = {}
 
             # Step 1: Connect core agents in a ring
             for i in range(len(core_agents)):
@@ -144,12 +151,31 @@ class SwarmConfigGenerator:
 
             # Step 3: Deduplicate and sort peer lists
             for agent_id in agent_peers:
-                agent_peers[agent_id] = sorted(set(agent_peers[agent_id]))
+                agent_topo[agent_id] = {
+                    "peers": sorted(set(agent_peers[agent_id])),
+                    "parent": None,
+                    "children": None,
+                    "level": 0
+                }
+        elif self.topology == "hierarchical":
+            if self.num_agents < 10:
+                print("Minimum number of agents for hierarchical topology is 10")
+                return
+
+
         else:
+            agent_topo = {}
             agent_peers = {
                 i: [j for j in range(1, self.num_agents + 1) if j != i]
                 for i in range(1, self.num_agents + 1)
             }
+            for agent_id in agent_peers:
+                agent_topo[agent_id] = {
+                    "peers": sorted(set(agent_peers[agent_id])),
+                    "parent": None,
+                    "children": None,
+                    "level": 0
+                }
 
         config_prefix = self.get_config_prefix()
 
@@ -164,7 +190,9 @@ class SwarmConfigGenerator:
             config['capacities']['disk'] = self.random_capacity(100, 500)
 
             config["redis"]["host"] = self.db_host
-            config["topology"] = {"peer_agents": agent_peers[agent_id], "type": self.topology}
+            config["topology"] = {"peer_agents": agent_topo[agent_id]["peers"], "type": self.topology,
+                                  "parent": agent_topo[agent_id]["parent"], "children": agent_topo[agent_id]["children"],
+                                  "level": agent_topo[agent_id]["level"]}
             config["runtime"]["total_agents"] = self.num_agents
             config["runtime"]["jobs_per_proposal"] = self.jobs_per_proposal
 
@@ -185,7 +213,7 @@ if __name__ == "__main__":
     parser.add_argument("jobs_per_proposal", type=int, help="Number of Jobs per proposal.")
     parser.add_argument("base_config_file", type=str, help="Path to the base configuration YAML file.")
     parser.add_argument("output_dir", type=str, help="Directory where generated configs should be saved.")
-    parser.add_argument("topology", type=str, default="all", help="Agent Topology: Possible values - all, ring")
+    parser.add_argument("topology", type=str, default="all", help="Agent TopologyType: Possible values - mesh, ring, star, hierarchical")
     parser.add_argument("database", type=str, default="all", help="Database Host")
 
 

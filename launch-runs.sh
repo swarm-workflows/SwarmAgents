@@ -25,7 +25,7 @@ fi
 
 # Function to check if agents are running
 are_agents_running() {
-    if pgrep -f "python3.11 main.py $AGENT_TYPE" > /dev/null; then
+    if pgrep -f "main.py $AGENT_TYPE" > /dev/null; then
         return 0
     else
         return 1

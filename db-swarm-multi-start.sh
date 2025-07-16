@@ -46,5 +46,5 @@ mkdir -p swarm-multi
 # Launch agents
 for i in $(seq 0 $(($num_agents - 1))); do
     agent_index=$(($base_index + $i + 1))
-    python3.11 main.py db-swarm-multi "$agent_index" "$tasks" "$num_agents" topo &
+    python3.11 main.py db-swarm-multi "$agent_index" "$tasks" "$num_agents" $topology &
 done

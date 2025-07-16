@@ -27,7 +27,7 @@ import traceback
 from typing import List
 
 
-from swarm.agents.agent_grpc import Agent
+from swarm.agents.agent_grpc import Agent, TopologyType
 from swarm.comm.messages.commit import Commit
 from swarm.comm.messages.message_builder import MessageBuilder
 from swarm.comm.messages.prepare import Prepare
@@ -224,6 +224,7 @@ class SwarmAgent(Agent):
 
         for j in range(cost_matrix.shape[1]):  # Iterate over each job (column)
             valid_costs = cost_matrix[:, j]  # Get the costs for job j
+            '''
             finite_indices = np.where(valid_costs != float('inf'))[0]  # Indices with finite costs
 
             if len(finite_indices) > 0:
@@ -231,6 +232,20 @@ class SwarmAgent(Agent):
                 candidate_indices = [i for i in finite_indices if valid_costs[i] == min_cost]
                 selected_index = candidate_indices[0]
                 min_cost_agents.append((agent_ids[selected_index], min_cost))
+            '''
+            finite_costs = valid_costs[valid_costs != float('inf')]  # Filter out infinite costs
+            if len(finite_costs) > 0:  # If there are any finite costs
+                selected_cost = np.min(finite_costs) # Get the minimum cost
+                min_indices = np.where(valid_costs == selected_cost)[0]  # Find all indices with min cost
+
+                # Check if self is in min_indices
+                self_index = 0  # Self agent is always at index 0
+                if self_index in min_indices:
+                    selected_index = self_index  # Prioritize selecting itself
+                else:
+                    selected_index = random.choice(min_indices)  # Randomly select from others
+                min_cost_agents.append(agent_ids[selected_index])
+
         return min_cost_agents
 
     def __can_select_job(self, job: Job, caps_jobs_selected: Capacities) -> tuple[bool, float]:
@@ -300,7 +315,7 @@ class SwarmAgent(Agent):
                 # New proposal, forward to my peers
                 proposals_to_forward.append(p)
 
-        if len(proposals_to_forward) and self.topology_type  in [Agent.TOPOLOGY_RING, Agent.TOPOLOGY_STAR]:
+        if len(proposals_to_forward) and self.topology.type in [TopologyType.Star, TopologyType.Ring]:
             msg = Proposal(source=incoming.agents[0].agent_id,
                            agents=[AgentInfo(agent_id=incoming.agents[0].agent_id)], proposals=proposals_to_forward,
                            forwarded_by=self.agent_id)
@@ -362,7 +377,7 @@ class SwarmAgent(Agent):
             msg = Commit(source=self.agent_id, agents=[AgentInfo(agent_id=self.agent_id)], proposals=proposals)
             self._send_message(json_message=msg.to_dict())
 
-        if len(proposals_to_forward) and self.topology_type  in [Agent.TOPOLOGY_RING, Agent.TOPOLOGY_STAR]:
+        if len(proposals_to_forward) and self.topology.type in [TopologyType.Star, TopologyType.Ring]:
             # Use the originators agent agent_id when forwarding the Prepare
             msg = Prepare(source=incoming.agents[0].agent_id, agents=[AgentInfo(agent_id=incoming.agents[0].agent_id)],
                           proposals=proposals_to_forward,
@@ -417,7 +432,7 @@ class SwarmAgent(Agent):
                     job.change_state(new_state=JobState.COMPLETE)
                     self.incoming_proposals.remove_job(job_id=p.job_id)
 
-        if len(proposals_to_forward) and self.topology_type in [Agent.TOPOLOGY_RING, Agent.TOPOLOGY_STAR]:
+        if len(proposals_to_forward) and self.topology.type in [TopologyType.Star, TopologyType.Ring]:
             msg = Commit(source=incoming.agents[0].agent_id, agents=[AgentInfo(agent_id=incoming.agents[0].agent_id)],
                          proposals=proposals_to_forward,
                          forwarded_by=self.agent_id)
@@ -462,7 +477,7 @@ class SwarmAgent(Agent):
 
     def execute_job(self, job: Job):
         self.update_completed_jobs(jobs=[job.get_job_id()])
-        self.repo.save(obj=job.to_dict())
+        self.repo.save(obj=job.to_dict(), level=self.topology.level)
         super().execute_job(job=job)
         '''
         msg = JobStatus(agents=[AgentInfo(agent_id=self.agent_id)], jobs=[JobInfo(job_id=job.get_job_id(),
@@ -517,10 +532,10 @@ class SwarmAgent(Agent):
         while not self.shutdown:
             try:
                 agent_info = self.generate_agent_info()
-                self.repo.save(agent_info.to_dict(), key_prefix="agent")
+                self.repo.save(agent_info.to_dict(), key_prefix="agent", level=self.topology.level)
 
                 current_time = int(time.time())
-                peers = self.repo.get_all_objects(key_prefix="agent")
+                peers = self.repo.get_all_objects(key_prefix="agent", level=self.topology.level)
                 active_peer_ids = set()
 
                 for p in peers:
@@ -541,7 +556,7 @@ class SwarmAgent(Agent):
                 for prefix, update_fn in [
                     (Repository.KEY_JOB, self.update_completed_jobs)
                 ]:
-                    jobs = self.repo.get_all_ids(key_prefix=prefix)
+                    jobs = self.repo.get_all_ids(key_prefix=prefix, level=self.topology.level)
                     update_fn(jobs=jobs)
 
                 time.sleep(0.005)

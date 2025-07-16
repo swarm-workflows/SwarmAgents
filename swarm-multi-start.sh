@@ -34,7 +34,8 @@ python3.11 generate_configs.py "$num_agents" "$jobs_per_proposal" ./config_swarm
 cleanup_cmd="python3.11 cleanup.py --agents $num_agents"
 [[ -n "$topic" ]] && cleanup_cmd+=" --topic $topic"
 [[ -n "$broker" ]] && cleanup_cmd+=" --broker $broker"
-[[ -n "$database" ]] && cleanup_cmd+=" --etcd-host $database --cleanup-etcd"
+#[[ -n "$database" ]] && cleanup_cmd+=" --etcd-host $database --cleanup-etcd"
+[[ -n "$database" ]] && cleanup_cmd+=" --redis-host $database --cleanup-redis"
 
 # Run cleanup
 eval "$cleanup_cmd"
@@ -46,5 +47,5 @@ mkdir -p swarm-multi
 # Launch agents
 for i in $(seq 0 $(($num_agents - 1))); do
     agent_index=$(($base_index + $i + 1))
-    python3.11 main.py swarm-multi "$agent_index" "$tasks" "$num_agents" topo &
+    python3.11 main.py swarm-multi "$agent_index" "$tasks" "$num_agents" $topology &
 done

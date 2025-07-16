@@ -1,13 +1,13 @@
 #!/bin/bash
 
 # Configuration
-AGENT_COUNTS=(10 30 40 50 60 70 80 90 100)
-TOPOLOGIES=("mesh" "ring")
+AGENT_COUNTS=(10)
+TOPOLOGIES=("mesh" "ring" "star")
 AGENT_TYPES=("swarm-multi" "db-swarm-multi")
 MAX_RETRIES=1  # Number of repetitions per configuration
-TASKS=500
+TASKS=100
 JOBS_PER_PROPSAL=10
-DATABASE=database
+DATABASE=localhost
 
 # Base output directory
 BASE_OUTPUT_DIR="results"

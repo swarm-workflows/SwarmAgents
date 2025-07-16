@@ -23,6 +23,7 @@
 # Author: Komal Thareja(kthare10@renci.org)
 
 import csv
+import enum
 import hashlib
 import json
 import logging
@@ -49,6 +50,39 @@ from swarm.database.repository import Repository
 from swarm.models.capacities import Capacities
 from swarm.models.agent_info import AgentInfo
 from swarm.models.job import Job
+
+
+class TopologyType(enum.Enum):
+    Ring = enum.auto(),
+    Star = enum.auto(),
+    Mesh = enum.auto(),
+    Hierarchical = enum.auto()
+
+    def __repr__(self):
+        return self.name
+
+    def __str__(self):
+        return self.name
+
+    @staticmethod
+    def from_str(topo: str):
+        if topo.lower() == str(TopologyType.Ring).lower():
+            return TopologyType.Ring
+        if topo.lower() == str(TopologyType.Star).lower():
+            return TopologyType.Star
+        if topo.lower() == str(TopologyType.Mesh).lower():
+            return TopologyType.Mesh
+        if topo.lower() == str(TopologyType.Hierarchical).lower():
+            return TopologyType.Hierarchical
+
+
+class Topology:
+    def __init__(self, topo: dict):
+        self.type = TopologyType.from_str(topo.get("type"))
+        self.parent = topo.get("parent", None)
+        self.children = topo.get("children", [])
+        self.level = topo.get("level", 0)
+        self.peers = topo.get("peer_agents", 0)
 
 
 class IterableQueue:
@@ -146,10 +180,6 @@ class Metrics:
 
 
 class Agent(Observer):
-    TOPOLOGY_RING = "ring"
-    TOPOLOGY_MESH = "mesh"
-    TOPOLOGY_STAR = "star"
-
     def __init__(self, agent_id: int, config_file: str):
         self.agent_id = agent_id
         self.neighbor_map = {}
@@ -164,8 +194,7 @@ class Agent(Observer):
         self.runtime_config = self.config.get("runtime", {})
         self.etcd_config = self.config.get("etcd", {"host": "127.0.0.1", "port": 2379})
         self.redis_config = self.config.get("redis", {"host": "127.0.0.1", "port": 6379})
-        self.peer_agents = self.config.get("topology", {}).get("peer_agents", [])
-        self.topology_type = self.config.get("topology", {}).get("type", self.TOPOLOGY_MESH)
+        self.topology = Topology(topo=self.config.get("topology", {}))
 
         self._capacities = Capacities().from_dict(self.config.get("capacities", {}))
         self.logger = self._setup_logger()
@@ -173,8 +202,9 @@ class Agent(Observer):
         self.redis_client = redis.StrictRedis(host=self.redis_config["host"],
                                               port=self.redis_config["port"],
                                               decode_responses=True)
-        #self.repo = Repository(redis_client=self.redis_client)
-        self.repo = EtcdRepository(host=self.etcd_config["host"], port=self.etcd_config["port"])
+        self.repo = Repository(redis_client=self.redis_client)
+
+        #self.repo = EtcdRepository(host=self.etcd_config["host"], port=self.etcd_config["port"])
 
         self.condition = threading.Condition()
         self.shutdown = False
@@ -346,10 +376,10 @@ class Agent(Observer):
         while not self.shutdown:
             try:
                 agent_info = self.generate_agent_info()
-                self.repo.save(agent_info.to_dict(), key_prefix=Repository.KEY_AGENT)
+                self.repo.save(agent_info.to_dict(), key_prefix=Repository.KEY_AGENT, level=self.topology.level)
 
                 current_time = int(time.time())
-                peers = self.repo.get_all_objects(key_prefix=Repository.KEY_AGENT)
+                peers = self.repo.get_all_objects(key_prefix=Repository.KEY_AGENT, level=self.topology.level)
                 active_peer_ids = set()
 
                 for p in peers:
@@ -525,7 +555,7 @@ class Agent(Observer):
     def is_job_in_state(self, job_id: str, job_set: set, redis_key_prefix: str, update_fn):
         if job_id in job_set:
             return True
-        update_fn(self.repo.get_all_ids(key_prefix=redis_key_prefix))
+        update_fn(self.repo.get_all_ids(key_prefix=redis_key_prefix, level=self.topology.level))
         return job_id in job_set
 
     # Unified update methods
@@ -578,7 +608,7 @@ class Agent(Observer):
         src = src or self.agent_id
         excluded = set(excluded_peers) if excluded_peers else set()
 
-        for peer_id in self.peer_agents:
+        for peer_id in self.topology.peers:
             if peer_id in excluded:
                 continue
 
