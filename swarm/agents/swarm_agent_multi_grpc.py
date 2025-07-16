@@ -212,6 +212,36 @@ class SwarmAgent(Agent):
 
         return cost_matrix
 
+    def __find_min_cost_agents(self, cost_matrix: np.ndarray) -> list[tuple[int, float]]:
+        """
+        Find the agents with the minimum cost for each job.
+        In case of ties, select the agent with the smallest (agent_id, cost) tuple.
+
+        :param cost_matrix: A 2D numpy array where entry [i, j] is the cost of agent i for job j.
+        :return: A list of (agent_id, min_cost) for each job.
+        """
+        min_cost_agents = []
+        agent_ids = [self.agent_id] + [peer.agent_id for peer in self.neighbor_map.values()]
+
+        for j in range(cost_matrix.shape[1]):  # Iterate over each job
+            valid_costs = cost_matrix[:, j]
+            finite_mask = np.isfinite(valid_costs)
+            if not np.any(finite_mask):
+                continue  # Skip job if no valid agent
+
+            min_cost = np.min(valid_costs[finite_mask])
+            min_indices = np.where(valid_costs == min_cost)[0]
+
+            # Collect all (agent_id, cost) pairs for the minimum cost
+            candidate_pairs = [(agent_ids[i], valid_costs[i]) for i in min_indices]
+
+            # Select the lexicographically smallest (agent_id, cost)
+            selected_agent, selected_cost = min(candidate_pairs)
+            min_cost_agents.append((selected_agent, selected_cost))
+
+        return min_cost_agents
+
+    '''
     def __find_min_cost_agents(self, cost_matrix: np.ndarray) -> list:
         """
         Find the agents with the minimum cost for each job, ensuring:
@@ -224,15 +254,15 @@ class SwarmAgent(Agent):
 
         for j in range(cost_matrix.shape[1]):  # Iterate over each job (column)
             valid_costs = cost_matrix[:, j]  # Get the costs for job j
-            '''
-            finite_indices = np.where(valid_costs != float('inf'))[0]  # Indices with finite costs
+            
+            #finite_indices = np.where(valid_costs != float('inf'))[0]  # Indices with finite costs
 
-            if len(finite_indices) > 0:
-                min_cost = np.min(valid_costs[finite_indices])
-                candidate_indices = [i for i in finite_indices if valid_costs[i] == min_cost]
-                selected_index = candidate_indices[0]
-                min_cost_agents.append((agent_ids[selected_index], min_cost))
-            '''
+            #if len(finite_indices) > 0:
+            #    min_cost = np.min(valid_costs[finite_indices])
+            #    candidate_indices = [i for i in finite_indices if valid_costs[i] == min_cost]
+            #    selected_index = candidate_indices[0]
+            #    min_cost_agents.append((agent_ids[selected_index], min_cost))
+            
             finite_costs = valid_costs[valid_costs != float('inf')]  # Filter out infinite costs
             if len(finite_costs) > 0:  # If there are any finite costs
                 min_cost = np.min(finite_costs) # Get the minimum cost
@@ -247,6 +277,7 @@ class SwarmAgent(Agent):
                 min_cost_agents.append((agent_ids[selected_index], min_cost))
 
         return min_cost_agents
+    '''
 
     def __can_select_job(self, job: Job, caps_jobs_selected: Capacities) -> tuple[bool, float]:
         """
