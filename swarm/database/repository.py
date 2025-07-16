@@ -95,7 +95,7 @@ class Repository:
         """
         key = f"{key_prefix}:{level}:{obj_id}"
         data = self.redis.get(key)
-        return json.loads(data.decode()) if data else {}
+        return json.loads(data) if data else {}
 
     def delete(self, obj_id: str, key_prefix: str = KEY_JOB, level: int = 0):
         """
@@ -121,7 +121,7 @@ class Repository:
             List[str]: List of object IDs.
         """
         all_keys = self.redis.keys(f'{key_prefix}:{level}:*')
-        return list(set(key.decode().split(":")[2] for key in all_keys))
+        return list(set(key.split(":")[2] for key in all_keys))
 
     def get_all_objects(self, key_prefix: str = KEY_JOB, level: int = 0) -> List[dict]:
         """
@@ -139,7 +139,7 @@ class Repository:
         for key in keys:
             val = self.redis.get(key)
             if val:
-                results.append(json.loads(val.decode()))
+                results.append(json.loads(val))
         return results
 
     def delete_all(self, key_prefix: str = KEY_JOB, level: int = 0):
@@ -203,7 +203,7 @@ class Repository:
         keys = self.redis.keys(pattern)
         result = {}
         for key in keys:
-            key_str = key.decode()
+            key_str = key
             parts = key_str.split(":")
             if len(parts) < 4:
                 continue
@@ -212,7 +212,7 @@ class Repository:
             if raw_value is None:
                 continue
             try:
-                decoded = raw_value.decode()
+                decoded = raw_value
                 value = float(decoded) if phase_prefix == self.KEY_PRE_PREPARE else int(decoded)
                 result[agent_id] = value
             except (ValueError, UnicodeDecodeError):
