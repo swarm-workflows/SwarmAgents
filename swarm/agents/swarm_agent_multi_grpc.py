@@ -235,8 +235,8 @@ class SwarmAgent(Agent):
             '''
             finite_costs = valid_costs[valid_costs != float('inf')]  # Filter out infinite costs
             if len(finite_costs) > 0:  # If there are any finite costs
-                selected_cost = np.min(finite_costs) # Get the minimum cost
-                min_indices = np.where(valid_costs == selected_cost)[0]  # Find all indices with min cost
+                min_cost = np.min(finite_costs) # Get the minimum cost
+                min_indices = np.where(valid_costs == min_cost)[0]  # Find all indices with min cost
 
                 # Check if self is in min_indices
                 self_index = 0  # Self agent is always at index 0
@@ -244,7 +244,7 @@ class SwarmAgent(Agent):
                     selected_index = self_index  # Prioritize selecting itself
                 else:
                     selected_index = random.choice(min_indices)  # Randomly select from others
-                min_cost_agents.append(agent_ids[selected_index])
+                min_cost_agents.append((agent_ids[selected_index], min_cost))
 
         return min_cost_agents
 
