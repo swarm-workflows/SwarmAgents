@@ -52,7 +52,7 @@ class GrpcServer:
     def __init__(self, port: int, observer: Observer, logger: logging.Logger = logging.getLogger()):
         self.port = port
         self.observer = observer
-        self.server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+        self.server = grpc.server(futures.ThreadPoolExecutor(max_workers=5))
         self._bind_services()
         self.logger = logger
 

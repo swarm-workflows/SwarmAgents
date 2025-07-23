@@ -22,13 +22,10 @@
 #
 # Author: Komal Thareja(kthare10@renci.org)
 
-import csv
-import enum
 import hashlib
 import json
 import logging
 import os
-import queue
 import random
 import socket
 import string
@@ -50,133 +47,9 @@ from swarm.database.repository import Repository
 from swarm.models.capacities import Capacities
 from swarm.models.agent_info import AgentInfo
 from swarm.models.job import Job
-
-
-class TopologyType(enum.Enum):
-    Ring = enum.auto(),
-    Star = enum.auto(),
-    Mesh = enum.auto(),
-    Hierarchical = enum.auto()
-
-    def __repr__(self):
-        return self.name
-
-    def __str__(self):
-        return self.name
-
-    @staticmethod
-    def from_str(topo: str):
-        if topo.lower() == str(TopologyType.Ring).lower():
-            return TopologyType.Ring
-        if topo.lower() == str(TopologyType.Star).lower():
-            return TopologyType.Star
-        if topo.lower() == str(TopologyType.Mesh).lower():
-            return TopologyType.Mesh
-        if topo.lower() == str(TopologyType.Hierarchical).lower():
-            return TopologyType.Hierarchical
-
-
-class Topology:
-    def __init__(self, topo: dict):
-        self.type = TopologyType.from_str(topo.get("type"))
-        self.parent = topo.get("parent", None)
-        self.children = topo.get("children", [])
-        self.level = topo.get("level", 0)
-        self.peers = topo.get("peer_agents", 0)
-
-
-class IterableQueue:
-    def __init__(self, source_queue: queue.Queue):
-        self.source_queue = source_queue
-
-    def __iter__(self):
-        while True:
-            try:
-                yield self.source_queue.get_nowait()
-            except queue.Empty:
-                return
-
-
-class Metrics:
-    def __init__(self):
-        self.load_per_agent = {}
-        self.idle_time = []
-        self.idle_start_time = None
-        self.total_idle_time = 0
-        self.restart_job_selection_cnt = 0
-        self.conflicts = 0
-
-    def save_load_metric(self, agent_id: int, load: float):
-        if agent_id not in self.load_per_agent:
-            self.load_per_agent[agent_id] = []
-        self.load_per_agent[agent_id].append(load)
-
-    def save_idle_time(self, path: str):
-        with open(path, 'w', newline='') as file:
-            writer = csv.writer(file)
-            writer.writerow(['Idle Time'])
-            for t in self.idle_time:
-                writer.writerow([t])
-
-    def save_misc(self, path: str):
-        with open(path, 'w') as file:
-            json.dump({
-                "restarts": self.restart_job_selection_cnt,
-                "conflicts": self.conflicts
-            }, file, indent=4)
-
-    def save_jobs_per_agent(self, jobs: list[Job], path: str):
-        jobs_per_agent = {}
-        for j in jobs:
-            if j.leader_agent_id is not None:
-                jobs_per_agent.setdefault(j.leader_agent_id, {"jobs": [], "job_count": 0})
-                jobs_per_agent[j.leader_agent_id]["job_count"] += 1
-                jobs_per_agent[j.leader_agent_id]["jobs"].append(j.job_id)
-
-        with open(path, 'w', newline='') as file:
-            writer = csv.writer(file)
-            writer.writerow(['Agent ID', 'Number of Jobs Selected', 'Jobs'])
-            for agent_id, info in jobs_per_agent.items():
-                writer.writerow([agent_id, info['job_count'], info['jobs']])
-
-    def save_scheduling_latency(self, jobs: list[Job], wait_path: str, sel_path: str, lat_path: str):
-        wait_times, selection_times, scheduling_latency = {}, {}, {}
-
-        for j in jobs:
-            if j.selection_started_at and j.created_at:
-                wait_times[j.job_id] = j.selection_started_at - j.created_at
-            if j.selected_by_agent_at and j.selection_started_at:
-                selection_times[j.job_id] = j.selected_by_agent_at - j.selection_started_at
-            if j.job_id in wait_times and j.job_id in selection_times:
-                scheduling_latency[j.job_id] = wait_times[j.job_id] + selection_times[j.job_id]
-
-        with open(wait_path, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(['job_id', 'wait_time'])
-            for k, v in wait_times.items():
-                writer.writerow([k, v])
-
-        with open(sel_path, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(['job_id', 'selection_time'])
-            for k, v in selection_times.items():
-                writer.writerow([k, v])
-
-        with open(lat_path, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(['job_id', 'scheduling_latency'])
-            for k, v in scheduling_latency.items():
-                writer.writerow([k, v])
-
-    def save_load_trace(self, path: str):
-        max_len = max((len(l) for l in self.load_per_agent.values()), default=0)
-        with open(path, 'w', newline='') as file:
-            writer = csv.writer(file)
-            writer.writerow(['Time Interval'] + [f'Agent {aid}' for aid in self.load_per_agent])
-            for i in range(max_len):
-                row = [i] + [self.load_per_agent[aid][i] if i < len(self.load_per_agent[aid]) else ''
-                             for aid in self.load_per_agent]
-                writer.writerow(row)
+from swarm.utils.topology import Topology
+from swarm.utils.metrics import Metrics
+from swarm.utils.iterable_queue import IterableQueue
 
 
 class Agent(Observer):
@@ -333,21 +206,30 @@ class Agent(Observer):
         return logger
 
     def start(self):
-        self.grpc_thread.register_observers(agent=self)
-        self.grpc_thread.start()
+        try:
+            self.grpc_thread.register_observers(agent=self)
+            self.grpc_thread.start()
 
-        for thread in self.threads.values():
-            thread.start()
+            for thread in self.threads.values():
+                thread.start()
 
-        for thread in self.threads.values():
-            thread.join()
+            for thread in self.threads.values():
+                thread.join()
+        except Exception as e:
+            self.logger.error(f"Exception occurred in startup: {e}")
+            self.logger.error(traceback.format_exc())
+            self.stop()
 
     def stop(self):
-        self.shutdown = True
-        self.grpc_thread.stop()
-        with self.condition:
-            self.condition.notify_all()
-        self.save_results()
+        try:
+            self.shutdown = True
+            self.grpc_thread.stop()
+            with self.condition:
+                self.condition.notify_all()
+            self.save_results()
+        except Exception as e:
+            self.logger.error(f"Exception occurred in shutdown: {e}")
+            self.logger.error(traceback.format_exc())
 
     def _add_peer(self, peer: AgentInfo):
         if peer.agent_id is None or peer.agent_id == self.agent_id:

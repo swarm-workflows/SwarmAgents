@@ -27,7 +27,8 @@ import traceback
 from typing import List
 
 
-from swarm.agents.agent_grpc import Agent, TopologyType
+from swarm.utils.topology import TopologyType
+from swarm.agents.agent_grpc import Agent
 from swarm.comm.messages.commit import Commit
 from swarm.comm.messages.message_builder import MessageBuilder
 from swarm.comm.messages.prepare import Prepare
@@ -240,44 +241,6 @@ class SwarmAgent(Agent):
             min_cost_agents.append((selected_agent, selected_cost))
 
         return min_cost_agents
-
-    '''
-    def __find_min_cost_agents(self, cost_matrix: np.ndarray) -> list:
-        """
-        Find the agents with the minimum cost for each job, ensuring:
-
-        :param cost_matrix: A 2D numpy array where each entry [i, j] is the cost of agent i for job j.
-        :return: A list of agent IDs corresponding to the minimum cost for each job.
-        """
-        min_cost_agents = []
-        agent_ids = [self.agent_id] + [peer.agent_id for peer in self.neighbor_map.values()]
-
-        for j in range(cost_matrix.shape[1]):  # Iterate over each job (column)
-            valid_costs = cost_matrix[:, j]  # Get the costs for job j
-            
-            #finite_indices = np.where(valid_costs != float('inf'))[0]  # Indices with finite costs
-
-            #if len(finite_indices) > 0:
-            #    min_cost = np.min(valid_costs[finite_indices])
-            #    candidate_indices = [i for i in finite_indices if valid_costs[i] == min_cost]
-            #    selected_index = candidate_indices[0]
-            #    min_cost_agents.append((agent_ids[selected_index], min_cost))
-            
-            finite_costs = valid_costs[valid_costs != float('inf')]  # Filter out infinite costs
-            if len(finite_costs) > 0:  # If there are any finite costs
-                min_cost = np.min(finite_costs) # Get the minimum cost
-                min_indices = np.where(valid_costs == min_cost)[0]  # Find all indices with min cost
-
-                # Check if self is in min_indices
-                self_index = 0  # Self agent is always at index 0
-                if self_index in min_indices:
-                    selected_index = self_index  # Prioritize selecting itself
-                else:
-                    selected_index = random.choice(min_indices)  # Randomly select from others
-                min_cost_agents.append((agent_ids[selected_index], min_cost))
-
-        return min_cost_agents
-    '''
 
     def __can_select_job(self, job: Job, caps_jobs_selected: Capacities) -> tuple[bool, float]:
         """
