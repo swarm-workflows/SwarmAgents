@@ -60,15 +60,9 @@ class SimpleJobQueue(JobQueue):
                 self.jobs.pop(job_id)
 
     def get_job(self, job_id: str) -> Job:
-        try:
-            self.lock.acquire()
+        with self.lock:
             return self.jobs.get(job_id)
-        finally:
-            self.lock.release()
 
     def __contains__(self, job_id):
-        try:
-            self.lock.acquire()
+        with self.lock:
             return job_id in self.jobs
-        finally:
-            self.lock.release()

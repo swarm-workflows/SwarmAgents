@@ -19,6 +19,9 @@ capacities:
   unit: 0
   mtu: 0
 topology:
+  children: null
+  level: 0
+  parent: null
   peer_agents:
     - 1
     - 2

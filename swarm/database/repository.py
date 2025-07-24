@@ -48,7 +48,6 @@ class Repository:
             redis_client (redis.Redis): Redis client connection object.
         """
         self.redis = redis_client
-        self.lock = threading.Lock()
 
     ##########################
     # GENERIC JOB OPERATIONS #
