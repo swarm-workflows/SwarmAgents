@@ -47,6 +47,7 @@ from swarm.database.repository import Repository
 from swarm.models.capacities import Capacities
 from swarm.models.agent_info import AgentInfo
 from swarm.models.job import Job, JobState
+from swarm.utils.thread_safe_dict import ThreadSafeDict
 from swarm.utils.topology import Topology
 from swarm.utils.metrics import Metrics
 from swarm.utils.iterable_queue import IterableQueue
@@ -55,8 +56,9 @@ from swarm.utils.iterable_queue import IterableQueue
 class Agent(Observer):
     def __init__(self, agent_id: int, config_file: str):
         self.agent_id = agent_id
-        self.neighbor_map = {}
-        self.neighbor_map_lock = threading.Lock()
+        self.neighbor_map = ThreadSafeDict[int, AgentInfo]()
+        self.children = ThreadSafeDict[int, AgentInfo]()
+        self.parents = ThreadSafeDict[int, AgentInfo]()
 
         with open(config_file, 'r') as f:
             self.config = yaml.safe_load(f)
@@ -234,14 +236,12 @@ class Agent(Observer):
     def _add_peer(self, peer: AgentInfo):
         if peer.agent_id is None or peer.agent_id == self.agent_id:
             return
-        with self.neighbor_map_lock:
-            current = self.neighbor_map.get(peer.agent_id)
-            if current is None or peer.last_updated > current.last_updated:
-                self.neighbor_map[peer.agent_id] = peer
+        current = self.neighbor_map.get(peer.agent_id)
+        if current is None or peer.last_updated > current.last_updated:
+            self.neighbor_map.set(peer.agent_id, peer)
 
     def _remove_peer(self, agent_id: str):
-        with self.neighbor_map_lock:
-            self.neighbor_map.pop(agent_id, None)
+        self.neighbor_map.remove(agent_id)
 
     def generate_agent_info(self):
         agent_info = AgentInfo(
@@ -442,7 +442,7 @@ class Agent(Observer):
         if job_id in job_set:
             return True
         update_fn(self.repo.get_all_ids(key_prefix=redis_key_prefix, level=self.topology.level,
-                                        state=state))
+                                        group=self.topology.group, state=state))
         return job_id in job_set
 
     # Unified update methods

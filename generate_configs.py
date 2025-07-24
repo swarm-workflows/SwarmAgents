@@ -123,6 +123,7 @@ class SwarmConfigGenerator:
                     "peers": sorted(set(agent_peers[agent_id])),
                     "parent": None,
                     "children": None,
+                    "group": 0,
                     "level": 0
                 }
         elif self.topology == "star":
@@ -155,6 +156,7 @@ class SwarmConfigGenerator:
                     "peers": sorted(set(agent_peers[agent_id])),
                     "parent": None,
                     "children": None,
+                    "group": 0,
                     "level": 0
                 }
         elif self.topology == "hierarchical":
@@ -174,6 +176,7 @@ class SwarmConfigGenerator:
                     "peers": sorted(set(agent_peers[agent_id])),
                     "parent": None,
                     "children": None,
+                    "group": 0,
                     "level": 0
                 }
 
@@ -192,7 +195,7 @@ class SwarmConfigGenerator:
             config["redis"]["host"] = self.db_host
             config["topology"] = {"peer_agents": agent_topo[agent_id]["peers"], "type": self.topology,
                                   "parent": agent_topo[agent_id]["parent"], "children": agent_topo[agent_id]["children"],
-                                  "level": agent_topo[agent_id]["level"]}
+                                  "level": agent_topo[agent_id]["level"], "group": agent_topo[agent_id]["group"]}
             config["runtime"]["total_agents"] = self.num_agents
             config["runtime"]["jobs_per_proposal"] = self.jobs_per_proposal
 

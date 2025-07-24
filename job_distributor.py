@@ -41,7 +41,8 @@ class JobDistributor(threading.Thread):
     """
 
     def __init__(self, redis_host: str, redis_port: int, jobs_dir: str,
-                 jobs_per_interval: int, interval: float, level: int) -> None:
+                 jobs_per_interval: int, interval: float, level: int,
+                 group: int) -> None:
         """
         Initialize the JobDistributor.
 
@@ -62,6 +63,7 @@ class JobDistributor(threading.Thread):
         self.job_repo = Repository(self.redis_client)
         self.file_iter = self._job_file_generator()
         self.level = level
+        self.group = group
 
     def _job_file_generator(self) -> Iterator[str]:
         """
@@ -109,7 +111,8 @@ class JobDistributor(threading.Thread):
                 if not batch:
                     break
             for job in batch:
-                self.job_repo.save(obj=job.to_dict(), key_prefix=Repository.KEY_JOB, level=self.level)
+                self.job_repo.save(obj=job.to_dict(), key_prefix=Repository.KEY_JOB, level=self.level,
+                                   group=self.group)
             time.sleep(self.interval)
 
     def stop(self) -> None:
@@ -132,6 +135,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--jobs-per-interval", type=int, required=True, help="Number of jobs to push per interval")
     parser.add_argument("--interval", type=float, default=1.0, help="Interval duration in seconds (default: 1.0)")
     parser.add_argument("--level", type=int, default=0, help="Topology level for which to add Jobs")
+    parser.add_argument("--group", type=int, default=0, help="Topology group at a level for which to add Jobs")
     return parser.parse_args()
 
 
@@ -144,7 +148,8 @@ if __name__ == "__main__":
         jobs_dir=args.jobs_dir,
         jobs_per_interval=args.jobs_per_interval,
         interval=args.interval,
-        level=args.level
+        level=args.level,
+        group=args.group
     )
     distributor.start()
 

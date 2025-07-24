@@ -21,6 +21,7 @@ capacities:
 topology:
   children: null
   level: 0
+  group: 0
   parent: null
   peer_agents:
     - 1

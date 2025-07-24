@@ -471,7 +471,7 @@ class SwarmAgent(Agent):
 
     def execute_job(self, job: Job):
         self.update_completed_jobs(jobs=[job.get_job_id()])
-        self.repo.save(obj=job.to_dict(), level=self.topology.level)
+        self.repo.save(obj=job.to_dict(), level=self.topology.level, group=self.topology.group)
         super().execute_job(job=job)
         '''
         msg = JobStatus(agents=[AgentInfo(agent_id=self.agent_id)], jobs=[JobInfo(job_id=job.get_job_id(),
@@ -518,10 +518,11 @@ class SwarmAgent(Agent):
         return round(projected_load, 2)
 
     def update_pending_jobs(self, jobs: list[str]):
-        for key in jobs:
-            job_id = key.split(":")[-1]
+        for job_id in jobs:
+            #job_id = key.split(":")[-1]
             if job_id not in self.queues.job_queue:
-                job = self.repo.get(obj_id=job_id, key_prefix=Repository.KEY_JOB, level=self.topology.level)
+                job = self.repo.get(obj_id=job_id, key_prefix=Repository.KEY_JOB, level=self.topology.level,
+                                    group=self.topology.group)
                 job_obj = Job()
                 job_obj.from_dict(job)
                 self.queues.job_queue.add_job(job_obj)
@@ -535,10 +536,12 @@ class SwarmAgent(Agent):
         while not self.shutdown:
             try:
                 agent_info = self.generate_agent_info()
-                self.repo.save(agent_info.to_dict(), key_prefix=Repository.KEY_AGENT, level=self.topology.level)
+                self.repo.save(agent_info.to_dict(), key_prefix=Repository.KEY_AGENT, level=self.topology.level,
+                               group=self.topology.group)
 
                 current_time = int(time.time())
-                peers = self.repo.get_all_objects(key_prefix=Repository.KEY_AGENT, level=self.topology.level)
+                peers = self.repo.get_all_objects(key_prefix=Repository.KEY_AGENT, level=self.topology.level,
+                                                  group=self.topology.group)
                 active_peer_ids = set()
 
                 for p in peers:
@@ -560,7 +563,8 @@ class SwarmAgent(Agent):
                     (Repository.KEY_JOB, self.update_pending_jobs, JobState.PENDING.value),
                     (Repository.KEY_JOB, self.update_completed_jobs, JobState.COMPLETE.value),
                 ]:
-                    jobs = self.repo.get_all_ids(key_prefix=prefix, level=self.topology.level, state=state)
+                    jobs = self.repo.get_all_ids(key_prefix=prefix, level=self.topology.level,
+                                                 group=self.topology.group, state=state)
                     update_fn(jobs=jobs)
 
                 time.sleep(0.005)

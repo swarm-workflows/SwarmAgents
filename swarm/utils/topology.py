@@ -31,4 +31,5 @@ class Topology:
         self.parent = topo.get("parent", None)
         self.children = topo.get("children", [])
         self.level = topo.get("level", 0)
+        self.group = topo.get("group", 0)
         self.peers = topo.get("peer_agents", 0)

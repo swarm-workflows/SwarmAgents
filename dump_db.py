@@ -26,10 +26,13 @@ def display(redis_host='localhost', redis_port=6379, obj_list='*', count=False):
         print(f"Total objects in '{obj_list}': {len(obj_keys)}")
     else:
         for key in obj_keys:
-            if "state" in key:
-                data = redis_client.smembers("state:0:1")
-            else:
+            key_type = redis_client.type(key)
+            if key_type == "set":
+                data = redis_client.smembers(key)
+            elif key_type == "string":
                 data = redis_client.get(key)
+            else:
+                data = f"[{key_type} not supported for display]"
             print(f"{key}: {data}")
 
 
