@@ -34,6 +34,7 @@ class Repository:
     (Pre-Prepare, Prepare, Commit) for decentralized job scheduling.
     """
 
+    KEY_STATE = "state"
     KEY_JOB = "job"
     KEY_AGENT = "agent"
     KEY_PRE_PREPARE = "pre_prepare"
@@ -73,9 +74,23 @@ class Repository:
         while True:
             try:
                 pipeline.watch(key)
+                old_data = pipeline.get(key)
                 pipeline.multi()
                 pipeline.set(key, json.dumps(obj))
                 pipeline.execute()
+
+                # Maintain secondary index by state
+                new_state = obj.get(self.KEY_STATE)
+                if new_state is not None:
+                    state_key = f"{self.KEY_STATE}:{level}:{new_state}"
+                    self.redis.sadd(state_key, key)
+
+                    if old_data:
+                        old_obj = json.loads(old_data)
+                        old_state = old_obj.get(self.KEY_STATE)
+                        if old_state is not None and old_state != new_state:
+                            old_state_key = f"{self.KEY_STATE}:{level}:{old_state}"
+                            self.redis.srem(old_state_key, key)
                 break
             except redis.WatchError:
                 continue
@@ -106,34 +121,51 @@ class Repository:
             level (int): Agent level in hierarchy.
         """
         key = f"{key_prefix}:{level}:{obj_id}"
+        data = self.redis.get(key)
+        if data:
+            job = json.loads(data)
+            state = job.get("state")
+            if state is not None:
+                state_key = f"state:{level}:{state}"
+                self.redis.srem(state_key, key)
         self.redis.delete(key)
 
-    def get_all_ids(self, key_prefix: str = KEY_JOB, level: int = 0) -> List[str]:
+    def get_all_ids(self, key_prefix: str = KEY_JOB, level: int = 0, state: int = None) -> List[str]:
         """
         Get list of all IDs under given key prefix.
 
         Args:
             key_prefix (str): Prefix to search.
             level (int): Agent level in hierarchy.
+            state (int): Job State
 
         Returns:
             List[str]: List of object IDs.
         """
-        all_keys = self.redis.keys(f'{key_prefix}:{level}:*')
+        if state:
+            state_key = f"state:{level}:{state}"
+            all_keys = self.redis.smembers(state_key)
+        else:
+            all_keys = self.redis.keys(f'{key_prefix}:{level}:*')
         return list(set(key.split(":")[2] for key in all_keys))
 
-    def get_all_objects(self, key_prefix: str = KEY_JOB, level: int = 0) -> List[dict]:
+    def get_all_objects(self, key_prefix: str = KEY_JOB, level: int = 0, state: int = None) -> List[dict]:
         """
         Retrieve all objects under given key prefix.
 
         Args:
             key_prefix (str): Prefix to search.
             level (int): Agent level in hierarchy.
+            state (int): Job State
 
         Returns:
             List[dict]: List of retrieved objects.
         """
-        keys = self.redis.keys(f'{key_prefix}:{level}:*')
+        if state:
+            state_key = f"state:{level}:{state}"
+            keys = self.redis.smembers(state_key)
+        else:
+            keys = self.redis.keys(f'{key_prefix}:{level}:*')
         results = []
         for key in keys:
             val = self.redis.get(key)

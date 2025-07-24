@@ -122,14 +122,16 @@ if __name__ == '__main__':
         print(f"Unknown agent type: {agent_type}")
         sys.exit(1)
 
+    '''
     task_pool = build_tasks_from_json('tasks.json')
     tasks_per_interval = 1  # Number of tasks to add each interval
     interval = 5  # Interval in seconds
 
     if isinstance(agent.queues.job_queue, SimpleJobQueue):
-        distributor = TaskDistributor(agent=agent, task_pool=task_pool, tasks_per_interval=tasks_per_interval,
+        distributor = JobDistributor(agent=agent, task_pool=task_pool, tasks_per_interval=tasks_per_interval,
                                       interval=interval)
 
         distributor.start()
+    '''
 
     agent.start()

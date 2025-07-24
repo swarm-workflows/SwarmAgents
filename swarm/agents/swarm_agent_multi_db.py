@@ -389,10 +389,10 @@ class SwarmAgent(Agent):
         while not self.shutdown:
             try:
                 agent_info = self.generate_agent_info()
-                self.repo.save(agent_info.to_dict(), key_prefix="agent")
+                self.repo.save(agent_info.to_dict(), key_prefix=Repository.KEY_AGENT)
 
                 current_time = int(time.time())
-                peers = self.repo.get_all_objects(key_prefix="agent")
+                peers = self.repo.get_all_objects(key_prefix=Repository.KEY_AGENT)
                 active_peer_ids = set()
 
                 for p in peers:

@@ -54,7 +54,7 @@ from swarm.database.repository import Repository
 from swarm.models.capacities import Capacities
 from swarm.models.agent_info import AgentInfo
 from swarm.models.profile import ProfileType, PROFILE_MAP
-from swarm.models.job import Job
+from swarm.models.job import Job, JobState
 
 
 class IterableQueue:
@@ -396,10 +396,10 @@ class Agent(Observer):
                 agents = self._build_heart_beat()
                 if self.heartbeat_mode != "kafka":
                     agent_info = agents[self.agent_id]
-                    self.agent_repo.save(obj=agent_info.to_dict(), key_prefix="agent")
+                    self.agent_repo.save(obj=agent_info.to_dict(), key_prefix=Repository.KEY_AGENT)
 
                     # Update Peer info
-                    peers = self.agent_repo.get_all_objects(key_prefix="agent")
+                    peers = self.agent_repo.get_all_objects(key_prefix=Repository.KEY_AGENT)
                     self.logger.debug(f"Fetched peers: {peers}")
                     for p in peers:
                         agent_info = AgentInfo.from_dict(p)
@@ -1039,6 +1039,6 @@ class Agent(Observer):
             return True
 
         # Update completed_jobs_set from job repository
-        self.update_completed_jobs(self.job_repo.get_all_ids())
+        self.update_completed_jobs(self.job_repo.get_all_ids(state=JobState.COMPLETE.value))
 
         return job_id in self.completed_jobs_set

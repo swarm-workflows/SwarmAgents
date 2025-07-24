@@ -517,6 +517,15 @@ class SwarmAgent(Agent):
 
         return round(projected_load, 2)
 
+    def update_pending_jobs(self, jobs: list[str]):
+        for key in jobs:
+            job_id = key.split(":")[-1]
+            if job_id not in self.queues.job_queue:
+                job = self.repo.get(obj_id=job_id, key_prefix=Repository.KEY_JOB, level=self.topology.level)
+                job_obj = Job()
+                job_obj.from_dict(job)
+                self.queues.job_queue.add_job(job_obj)
+
     def update_completed_jobs(self, jobs: list[str]):
         super().update_completed_jobs(jobs=jobs)
         for j in jobs:
@@ -526,10 +535,10 @@ class SwarmAgent(Agent):
         while not self.shutdown:
             try:
                 agent_info = self.generate_agent_info()
-                self.repo.save(agent_info.to_dict(), key_prefix="agent", level=self.topology.level)
+                self.repo.save(agent_info.to_dict(), key_prefix=Repository.KEY_AGENT, level=self.topology.level)
 
                 current_time = int(time.time())
-                peers = self.repo.get_all_objects(key_prefix="agent", level=self.topology.level)
+                peers = self.repo.get_all_objects(key_prefix=Repository.KEY_AGENT, level=self.topology.level)
                 active_peer_ids = set()
 
                 for p in peers:
@@ -547,10 +556,11 @@ class SwarmAgent(Agent):
                     self._remove_peer(agent_id)
 
                 # Batch update job sets
-                for prefix, update_fn in [
-                    (Repository.KEY_JOB, self.update_completed_jobs)
+                for prefix, update_fn, state in [
+                    (Repository.KEY_JOB, self.update_pending_jobs, JobState.PENDING.value),
+                    (Repository.KEY_JOB, self.update_completed_jobs, JobState.COMPLETE.value),
                 ]:
-                    jobs = self.repo.get_all_ids(key_prefix=prefix, level=self.topology.level)
+                    jobs = self.repo.get_all_ids(key_prefix=prefix, level=self.topology.level, state=state)
                     update_fn(jobs=jobs)
 
                 time.sleep(0.005)

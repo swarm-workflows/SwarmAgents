@@ -29,7 +29,8 @@ import redis
 import pyetcd  # Keep pyetcd as per your current script
 from confluent_kafka.admin import AdminClient, NewTopic
 
-from swarm.models.job import JobRepository
+from swarm.database.etcd_repository import EtcdRepository
+from swarm.database.repository import Repository
 
 
 def delete_topic(admin_client, topic_name):
@@ -198,9 +199,9 @@ if __name__ == '__main__':
             try:
                 redis_client = redis.StrictRedis(host=args.redis_host, port=args.redis_port, decode_responses=True)
                 redis_client.ping()  # Test connection
-                task_repo = JobRepository(redis_client=redis_client)
-                # Redis delete_all in JobRepository uses key_prefix="*" to delete all
-                task_repo.delete_all(key_prefix="*", client_type="redis")
+                task_repo = Repository(redis_client=redis_client)
+                # Redis delete_all in Repository uses key_prefix="*" to delete all
+                task_repo.delete_all(key_prefix="*")
             except redis.exceptions.ConnectionError as e:
                 print(f"Error connecting to Redis for cleanup: {e}")
             print(f"--- End Redis Cleanup ---")
@@ -212,13 +213,11 @@ if __name__ == '__main__':
         else:
             print(f"\n--- Cleaning up etcd at {args.etcd_host}:{args.etcd_port} ---")
             try:
-                etcd_client = pyetcd.client(host=args.etcd_host, port=args.etcd_port)
-                etcd_client.status()  # Test connection
-                task_repo = JobRepository(etcd_client=etcd_client)
+                task_repo = EtcdRepository(host=args.etcd_host, port=args.etcd_port)
 
                 # Determine the prefix for etcd cleanup
                 cleanup_prefix = args.cleanup_etcd_prefix if args.cleanup_etcd_prefix else "*"
-                task_repo.delete_all(key_prefix=cleanup_prefix, client_type="etcd")
+                task_repo.delete_all(key_prefix=cleanup_prefix)
 
             except Exception as e:
                 print(f"Error connecting to etcd for cleanup: {e}")

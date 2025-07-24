@@ -166,3 +166,4 @@ tasks.json
 # Swarm config files
 config_swarm_multi*.yml
 swarm-multi/**
+jobs/

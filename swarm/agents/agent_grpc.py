@@ -46,7 +46,7 @@ from swarm.database.etcd_repository import EtcdRepository
 from swarm.database.repository import Repository
 from swarm.models.capacities import Capacities
 from swarm.models.agent_info import AgentInfo
-from swarm.models.job import Job
+from swarm.models.job import Job, JobState
 from swarm.utils.topology import Topology
 from swarm.utils.metrics import Metrics
 from swarm.utils.iterable_queue import IterableQueue
@@ -253,7 +253,10 @@ class Agent(Observer):
         )
         return agent_info
 
+    @abstractmethod
     def _do_periodic(self):
+        pass
+    '''
         interval = 5
         while not self.shutdown:
             try:
@@ -285,6 +288,7 @@ class Agent(Observer):
                     time.sleep(0.1)
             except Exception as e:
                 self.logger.error(f"Periodic update error: {e}\n{traceback.format_exc()}")
+    '''
 
     @abstractmethod
     def job_selection_main(self):
@@ -434,10 +438,11 @@ class Agent(Observer):
         with lock:
             job_set.update(jobs)
 
-    def is_job_in_state(self, job_id: str, job_set: set, redis_key_prefix: str, update_fn):
+    def is_job_in_state(self, job_id: str, job_set: set, redis_key_prefix: str, update_fn, state):
         if job_id in job_set:
             return True
-        update_fn(self.repo.get_all_ids(key_prefix=redis_key_prefix, level=self.topology.level))
+        update_fn(self.repo.get_all_ids(key_prefix=redis_key_prefix, level=self.topology.level,
+                                        state=state))
         return job_id in job_set
 
     # Unified update methods
@@ -450,7 +455,8 @@ class Agent(Observer):
             job_id,
             self.completed_jobs_set,
             Repository.KEY_JOB,
-            self.update_completed_jobs
+            self.update_completed_jobs,
+            state=JobState.COMPLETE.value
         )
 
     def dispatch_message(self, message: str):
