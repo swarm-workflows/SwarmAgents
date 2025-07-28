@@ -1,5 +1,6 @@
 import csv
 import json
+from typing import Any
 
 from swarm.models.job import Job
 
@@ -32,13 +33,18 @@ class Metrics:
                 "conflicts": self.conflicts
             }, file, indent=4)
 
-    def save_jobs_per_agent(self, jobs: list[Job], path: str):
+    def save_jobs_per_agent(self, jobs: list[Any], path: str):
         jobs_per_agent = {}
-        for j in jobs:
-            if j.leader_agent_id is not None:
-                jobs_per_agent.setdefault(j.leader_agent_id, {"jobs": [], "job_count": 0})
-                jobs_per_agent[j.leader_agent_id]["job_count"] += 1
-                jobs_per_agent[j.leader_agent_id]["jobs"].append(j.job_id)
+        for job_data in jobs:
+            if isinstance(job_data, dict):
+                job = Job()
+                job.from_dict(job_data)
+            else:
+                job = job_data
+            if job.leader_agent_id is not None:
+                jobs_per_agent.setdefault(job.leader_agent_id, {"jobs": [], "job_count": 0})
+                jobs_per_agent[job.leader_agent_id]["job_count"] += 1
+                jobs_per_agent[job.leader_agent_id]["jobs"].append(job.job_id)
 
         with open(path, 'w', newline='') as file:
             writer = csv.writer(file)
@@ -46,16 +52,21 @@ class Metrics:
             for agent_id, info in jobs_per_agent.items():
                 writer.writerow([agent_id, info['job_count'], info['jobs']])
 
-    def save_scheduling_latency(self, jobs: list[Job], wait_path: str, sel_path: str, lat_path: str):
+    def save_scheduling_latency(self, jobs: list[Any], wait_path: str, sel_path: str, lat_path: str):
         wait_times, selection_times, scheduling_latency = {}, {}, {}
 
-        for j in jobs:
-            if j.selection_started_at and j.created_at:
-                wait_times[j.job_id] = j.selection_started_at - j.created_at
-            if j.selected_by_agent_at and j.selection_started_at:
-                selection_times[j.job_id] = j.selected_by_agent_at - j.selection_started_at
-            if j.job_id in wait_times and j.job_id in selection_times:
-                scheduling_latency[j.job_id] = wait_times[j.job_id] + selection_times[j.job_id]
+        for job_data in jobs:
+            if isinstance(job_data, dict):
+                job = Job()
+                job.from_dict(job_data)
+            else:
+                job = job_data
+            if job.selection_started_at and job.created_at:
+                wait_times[job.job_id] = job.selection_started_at - job.created_at
+            if job.selected_by_agent_at and job.selection_started_at:
+                selection_times[job.job_id] = job.selected_by_agent_at - job.selection_started_at
+            if job.job_id in wait_times and job.job_id in selection_times:
+                scheduling_latency[job.job_id] = wait_times[job.job_id] + selection_times[job.job_id]
 
         with open(wait_path, 'w', newline='') as f:
             writer = csv.writer(f)

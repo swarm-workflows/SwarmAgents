@@ -46,7 +46,7 @@ runtime:
   max_pending_elections: 100
   projected_queue_threshold: 300.00
   ready_queue_threshold: 100.00
-  max_time_load_zero: 30
+  max_time_load_zero: 300
   restart_job_selection: 300
   peer_heartbeat_timeout: 300
   results_dir: swarm-multi
@@ -64,7 +64,7 @@ logging:
   log-file: agent
 
   ## The default log level for actor.
-  log-level: INFO
+  log-level: INFO 
 
   ## actor rotates log files. You may specify how many archived log files to keep here.
   log-retain: 5

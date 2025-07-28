@@ -119,7 +119,8 @@ class Agent(Observer):
     @property
     def configured_agent_count(self) -> int:
         """Returns the expected total number of agents from the runtime configuration."""
-        return int(self.runtime_config.get("total_agents", 0))
+        #return int(self.runtime_config.get("total_agents", 0))
+        return 1 + len(self.topology.peers)
 
     @property
     def projected_queue_threshold(self) -> float:
@@ -168,6 +169,16 @@ class Agent(Observer):
         self.end_idle()
         return self.metrics.total_idle_time
 
+    @staticmethod
+    def resource_usage_score(allocated: Capacities, total: Capacities):
+        if allocated == total:
+            return 0
+        core = (allocated.core / total.core) * 100
+        ram = (allocated.ram / total.ram) * 100
+        disk = (allocated.disk / total.disk) * 100
+
+        return round((core + ram + disk) / 3, 2)
+
     def compute_overall_load(self, proposed_jobs: list[str] = None):
         proposed_jobs = proposed_jobs or []
         allocated_caps = Capacities()
@@ -180,11 +191,7 @@ class Agent(Observer):
                 job = self.queues.job_queue.get_job(job_id=job_id)
                 allocated_caps += job.capacities
 
-        core = (allocated_caps.core / self.capacities.core) * 100
-        ram = (allocated_caps.ram / self.capacities.ram) * 100
-        disk = (allocated_caps.disk / self.capacities.disk) * 100
-
-        return round((core + ram + disk) / 3, 2)
+        return self.resource_usage_score(allocated=allocated_caps, total=self.capacities)
 
     def _setup_logger(self):
         log_path = f"{self.log_config['log-directory']}/{self.log_config['log-file']}-{self.agent_id}.log"
@@ -233,62 +240,130 @@ class Agent(Observer):
             self.logger.error(f"Exception occurred in shutdown: {e}")
             self.logger.error(traceback.format_exc())
 
-    def _add_peer(self, peer: AgentInfo):
-        if peer.agent_id is None or peer.agent_id == self.agent_id:
-            return
-        current = self.neighbor_map.get(peer.agent_id)
-        if current is None or peer.last_updated > current.last_updated:
-            self.neighbor_map.set(peer.agent_id, peer)
+    def _refresh_neighbors(self, current_time: float):
+        """
+        Refresh the neighbor agent map by retrieving peer agents at the same level from Redis
+        and removing any that are stale or no longer present.
 
-    def _remove_peer(self, agent_id: str):
-        self.neighbor_map.remove(agent_id)
-
-    def generate_agent_info(self):
-        agent_info = AgentInfo(
-            agent_id=self.agent_id,
-            capacities=self.capacities,
-            capacity_allocations=self.queues.ready_queue.capacities(self.queues.ready_queue.get_jobs()),
-            load=self.compute_overall_load(),
-            last_updated=time.time()
+        :param current_time: The current timestamp used to check for staleness.
+        :type current_time: float
+        """
+        self._refresh_agent_map(
+            current_time=current_time,
+            target_dict=self.neighbor_map,
+            level=self.topology.level,
+            groups=[self.topology.group]
         )
+
+    def _refresh_children(self, current_time: float):
+        """
+        Refresh the children agent map by retrieving agents from the level below (level - 1)
+        and removing any that are stale or no longer present.
+
+        :param current_time: The current timestamp used to check for staleness.
+        :type current_time: float
+        """
+        if not self.topology.children or len(self.topology.children) == 0:
+            return
+        self._refresh_agent_map(
+            current_time=current_time,
+            target_dict=self.children,
+            level=self.topology.level - 1,
+            groups=self.topology.children  # assumed to be a List[int]
+        )
+
+    def _refresh_agent_map(
+            self,
+            current_time: float,
+            target_dict: ThreadSafeDict[int, AgentInfo],
+            level: int,
+            groups: list[int]
+    ):
+        """
+        Generic helper to refresh a target agent map (e.g., neighbors or children) by reading from Redis.
+
+        Updates the target map with agents that are fresh and present in Redis,
+        and removes agents that are stale or no longer in the store.
+
+        :param current_time: The current timestamp for evaluating staleness.
+        :type current_time: float
+        :param target_dict: A thread-safe dictionary mapping agent IDs to AgentInfo objects.
+        :type target_dict: ThreadSafeDict[int, AgentInfo]
+        :param level: The level of the agents to query in the hierarchy.
+        :type level: int
+        :param groups: group ID within that level to refresh.
+        :type groups: list[int]
+        """
+        active_ids = set()
+
+        for group in groups:
+            agent_dicts = self.repo.get_all_objects(
+                key_prefix=Repository.KEY_AGENT,
+                level=level,
+                group=group
+            )
+            for agent_data in agent_dicts:
+                agent = AgentInfo.from_dict(agent_data)
+                if agent.agent_id and agent.agent_id != self.agent_id:
+                    existing = target_dict.get(agent.agent_id)
+                    if existing is None or agent.last_updated > existing.last_updated:
+                        target_dict.set(agent.agent_id, agent)
+                    active_ids.add(agent.agent_id)
+
+        for agent_id, agent in list(target_dict.items()):
+            if agent_id not in active_ids and (current_time - agent.last_updated) >= self.peer_expiry_seconds:
+                target_dict.remove(agent_id)
+
+    def generate_agent_info(self) -> AgentInfo:
+        """
+        Generate and return the current AgentInfo object representing this agent.
+
+        For leaf agents (with no children), the info includes:
+          - self capacities
+          - capacity allocations based on ready queue jobs
+          - computed load
+
+        For non-leaf agents (with children), the info aggregates:
+          - cumulative capacities and allocations from children
+          - cumulative load computed from aggregated values
+
+        :return: An AgentInfo object with the current agent's state
+        :rtype: AgentInfo
+        """
+        current_time = time.time()
+
+        # Leaf agent: report its own resource info
+        if not self.topology.children:
+            agent_info = AgentInfo(
+                agent_id=self.agent_id,
+                capacities=self.capacities,
+                capacity_allocations=self.queues.ready_queue.capacities(self.queues.ready_queue.get_jobs()),
+                load=self.compute_overall_load(),
+                last_updated=current_time
+            )
+        # Non-leaf agent: aggregate info from all children
+        else:
+            total_capacities = Capacities()
+            total_allocations = Capacities()
+
+            for child in self.children.values():
+                total_capacities += child.capacities
+                total_allocations += child.capacity_allocations
+
+            agent_info = AgentInfo(
+                agent_id=self.agent_id,
+                capacities=total_capacities,
+                capacity_allocations=total_allocations,
+                load=self.resource_usage_score(total_allocations, total_capacities),
+                last_updated=current_time
+            )
+            self._capacities = total_capacities
+
         return agent_info
 
     @abstractmethod
     def _do_periodic(self):
         pass
-    '''
-        interval = 5
-        while not self.shutdown:
-            try:
-                agent_info = self.generate_agent_info()
-                self.repo.save(agent_info.to_dict(), key_prefix=Repository.KEY_AGENT, level=self.topology.level)
-
-                current_time = int(time.time())
-                peers = self.repo.get_all_objects(key_prefix=Repository.KEY_AGENT, level=self.topology.level)
-                active_peer_ids = set()
-
-                for p in peers:
-                    peer = AgentInfo.from_dict(p)
-                    if peer.agent_id == self.agent_id:
-                        continue
-                    self._add_peer(peer)
-                    active_peer_ids.add(peer.agent_id)
-
-                stale_peers = [
-                    peer.agent_id for peer in self.neighbor_map.values()
-                    if (current_time - peer.last_updated) >= self.peer_expiry_seconds and peer.agent_id not in active_peer_ids
-                ]
-
-                for agent_id in stale_peers:
-                    self._remove_peer(agent_id)
-
-                for _ in range(int(interval * 10)):
-                    if self.shutdown:
-                        break
-                    time.sleep(0.1)
-            except Exception as e:
-                self.logger.error(f"Periodic update error: {e}\n{traceback.format_exc()}")
-    '''
 
     @abstractmethod
     def job_selection_main(self):
@@ -378,10 +453,11 @@ class Agent(Observer):
             self.logger.error(f"[ERROR] Job {job_id} failed on agent {self.agent_id}: {e}")
             self.logger.error(traceback.format_exc())
 
-    def save_results(self, jobs: list[Job] = None):
+    def save_results(self):
         self.logger.info("Saving Results")
-        jobs = jobs or self.queues.job_queue.get_jobs()
-        completed_jobs = [j for j in jobs if j.leader_agent_id is not None]
+        completed_jobs = self.repo.get_all_objects(key_prefix=Repository.KEY_JOB,
+                                                   level=0,
+                                                   state=JobState.COMPLETE.value)
 
         self.metrics.save_misc(f"{self.results_dir}/misc_{self.agent_id}.json")
         self.metrics.save_jobs_per_agent(completed_jobs, f"{self.results_dir}/jobs_per_agent_{self.agent_id}.csv")
@@ -396,21 +472,47 @@ class Agent(Observer):
         self.logger.info("Results saved")
 
     def job_scheduling_main(self):
+        """
+        Main job scheduling loop. If this agent has children, forward the job to them.
+        Otherwise, schedule it locally if load permits.
+        """
         self.logger.info(f"Starting Job Scheduling Thread: {self}")
+
         while not self.shutdown:
             try:
                 for job in self.queues.selected_queue.get_jobs():
-                    ready_queue_load = self.compute_ready_queue_load()
-                    if ready_queue_load < self.ready_queue_threshold and self.can_schedule_job(job):
-                        self.queues.selected_queue.remove_job(job.get_job_id())
-                        self.schedule_job(job)
+                    job_id = job.get_job_id()
+
+                    # Multi-level: delegate job to children
+                    if self.topology.children:
+                        self.queues.selected_queue.remove_job(job_id)
+                        job.change_state(JobState.PENDING)
+
+                        for child_group in self.topology.children:
+                            self.repo.save(
+                                obj=job.to_dict(),
+                                key_prefix=Repository.KEY_JOB,
+                                level=self.topology.level - 1,
+                                group=child_group
+                            )
+                            self.logger.info(
+                                f"Delegated job {job_id} to level {self.topology.level - 1}, group {child_group}")
+
+                    # Leaf agent: schedule job if load allows
                     else:
-                        time.sleep(0.5)
+                        ready_queue_load = self.compute_ready_queue_load()
+                        if ready_queue_load < self.ready_queue_threshold and self.can_schedule_job(job):
+                            self.queues.selected_queue.remove_job(job_id)
+                            self.schedule_job(job)
+                        else:
+                            time.sleep(0.5)
 
                 time.sleep(1)
+
             except Exception as e:
-                self.logger.error(f"Error occurred while executing e: {e}")
+                self.logger.error(f"Error in job_scheduling_main: {e}")
                 self.logger.error(traceback.format_exc())
+
         self.logger.info(f"Stopped Job Scheduling Thread!")
 
     def compute_ready_queue_load(self):
@@ -518,6 +620,9 @@ class Agent(Observer):
     def select_job(self, job: Job):
         #print(f"Adding: {job.get_job_id()} on agent: {self.agent_id} to Select Queue")
         self.logger.info(f"[SELECTED]: {job.get_job_id()} on agent: {self.agent_id} to Select Queue")
+        job.change_state(new_state=JobState.READY)
+        self.repo.save(obj=job.to_dict(), key_prefix=Repository.KEY_JOB,
+                       level=self.topology.level, group=self.topology.group)
         # Add the job to the list of allocated jobs
         self.queues.selected_queue.add_job(job=job)
 
@@ -527,7 +632,6 @@ class Agent(Observer):
 
     def check_queue(self):
         """Call this periodically to monitor the queue."""
-        total_jobs = self.queues.job_queue.size()
         candidate_jobs = [
             job for job in self.queues.job_queue.get_jobs()
             if job.is_pending() and not self.is_job_completed(job_id=job.get_job_id())

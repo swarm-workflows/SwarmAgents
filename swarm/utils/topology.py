@@ -29,7 +29,7 @@ class Topology:
     def __init__(self, topo: dict):
         self.type = TopologyType.from_str(topo.get("type"))
         self.parent = topo.get("parent", None)
-        self.children = topo.get("children", [])
+        self.children = topo.get("children", None)
         self.level = topo.get("level", 0)
         self.group = topo.get("group", 0)
-        self.peers = topo.get("peer_agents", 0)
+        self.peers = topo.get("peer_agents", [])

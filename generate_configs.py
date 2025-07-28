@@ -160,11 +160,55 @@ class SwarmConfigGenerator:
                     "level": 0
                 }
         elif self.topology == "hierarchical":
-            if self.num_agents < 10:
-                print("Minimum number of agents for hierarchical topology is 10")
+            if self.num_agents < 30:
+                print("Minimum number of agents for hierarchical topology is 30")
                 return
 
+            agent_topo = {}
+            num_groups = 5
+            group_size = 5
 
+            # Level 0 (leaf agents)
+            for group in range(num_groups):
+                start = group * group_size + 1
+                end = start + group_size
+                parent_id = 26 + group
+                for agent_id in range(start, end):
+                    peers = list(range(start, end))
+                    peers.remove(agent_id)
+                    agent_topo[agent_id] = {
+                        "peers": peers,
+                        "parent": parent_id,
+                        "children": None,
+                        "group": group,
+                        "level": 0
+                    }
+
+            # Level 1 (parent agents)
+            for group in range(num_groups):
+                parent_id = 26 + group
+                agent_topo[parent_id] = {
+                    "peers": [26 + i for i in range(num_groups) if i != group],  # all other parents
+                    "parent": None,
+                    "children": [group],  # Just the group number this agent manages
+                    "group": 0,
+                    "level": 1
+                }
+            '''
+            # Level 1 (parents)
+            for group in range(num_groups):
+                parent_id = 26 + group
+                start = group * group_size + 1
+                end = start + group_size
+                children = list(range(start, end))
+                agent_topo[parent_id] = {
+                    "peers": [26 + i for i in range(num_groups) if i != group],  # connect all parents
+                    "parent": None,
+                    "children": children,
+                    "group": group,
+                    "level": 1
+                }
+            '''
         else:
             agent_topo = {}
             agent_peers = {

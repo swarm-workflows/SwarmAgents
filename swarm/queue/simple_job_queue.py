@@ -30,7 +30,7 @@ from swarm.queue.job_queue import JobQueue
 class SimpleJobQueue(JobQueue):
     def __init__(self):
         self.jobs = {}
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
 
     def size(self):
         with self.lock:

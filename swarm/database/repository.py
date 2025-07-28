@@ -167,10 +167,16 @@ class Repository:
             List[dict]: List of retrieved objects.
         """
         if state:
-            state_key = f"state:{level}:{group}:{state}"
+            if group is not None:
+                state_key = f"state:{level}:{group}:{state}"
+            else:
+                state_key = f"state:{level}:*:{state}"
             keys = self.redis.smembers(state_key)
         else:
-            keys = self.redis.scan_iter(f'{key_prefix}:{level}:{group}:*')
+            if group is not None:
+                keys = self.redis.scan_iter(f'{key_prefix}:{level}:{group}:*')
+            else:
+                keys = self.redis.scan_iter(f'{key_prefix}:{level}:*')
         results = []
         for key in keys:
             val = self.redis.get(key)
@@ -178,7 +184,7 @@ class Repository:
                 results.append(json.loads(val))
         return results
 
-    def delete_all(self, key_prefix: str = KEY_JOB, level: int = 0, group: int = 0):
+    def delete_all(self, key_prefix: str = KEY_JOB):
         """
         Delete all objects under given key prefix.
 
@@ -187,7 +193,7 @@ class Repository:
             group (int): Agent group in hierarchy at a level.
             level (int): Agent level in hierarchy.
         """
-        keys = self.redis.scan_iter(f'{key_prefix}:{level}:{group}:*')
+        keys = self.redis.scan_iter(f'{key_prefix}:*')
         for key in keys:
             self.redis.delete(key)
 
