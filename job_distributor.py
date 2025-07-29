@@ -67,13 +67,19 @@ class JobDistributor(threading.Thread):
 
     def _job_file_generator(self) -> Iterator[str]:
         """
-        Yields full paths to JSON job files in the directory, lazily.
-
-        :return: Iterator over file paths to job JSON files.
+        Lazily yields full paths to JSON job files in order of their creation time.
+        Uses os.scandir() and a generator to reduce memory use.
         """
-        for filename in sorted(os.listdir(self.jobs_dir)):
-            if filename.endswith(".json"):
-                yield os.path.join(self.jobs_dir, filename)
+
+        def file_iter():
+            with os.scandir(self.jobs_dir) as it:
+                for entry in it:
+                    if entry.name.endswith(".json") and entry.is_file():
+                        yield (entry.stat().st_ctime, entry.path)
+
+        # Lazily sort and yield just file paths
+        for _, path in sorted(file_iter()):
+            yield path
 
     def _load_job_from_file(self, file_path: str) -> Job:
         """
