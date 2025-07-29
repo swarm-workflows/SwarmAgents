@@ -43,8 +43,8 @@ import redis
 import yaml
 from matplotlib import pyplot as plt
 
-from swarm.agents.data.messaging_config import MessagingConfig
-from swarm.agents.data.queues import AgentQueues
+from swarm.utils.messaging_config import MessagingConfig
+from swarm.utils.queues import AgentQueues
 from swarm.comm.message_service_grpc import MessageServiceGrpc
 from swarm.comm.message_service_nats import MessageServiceNats
 from swarm.comm.messages.heart_beat import HeartBeat
@@ -73,7 +73,7 @@ class Agent(Observer):
     def __init__(self, agent_id: int, config_file: str):
         self.agent_id = agent_id
         self.neighbor_map = {}  # Store neighbor information
-        self.neighbor_map_lock = threading.Lock()
+        self.neighbor_map_lock = threading.RLock()
 
         self.config = {}
         with open(config_file, 'r') as f:
@@ -122,7 +122,7 @@ class Agent(Observer):
         self.restart_job_selection_cnt = 0
         self.conflicts = 0
         self.plot_figures = False
-        self.completed_lock = threading.Lock()
+        self.completed_lock = threading.RLock()
         self.completed_jobs_set = set()
 
     @property

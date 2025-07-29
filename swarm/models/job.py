@@ -98,7 +98,7 @@ class Job:
         self.prepares = 0
         self.commits = 0
         self.logger = logger if logger else logging.getLogger(self.__class__.__name__)
-        self.lock = threading.Lock()  # Lock for synchronization
+        self.lock = threading.RLock()  # Lock for synchronization
         self.created_at = time.time()
         self.selection_started_at = None
         self.selected_by_agent_at = None

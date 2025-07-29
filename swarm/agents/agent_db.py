@@ -40,7 +40,7 @@ from logging.handlers import RotatingFileHandler
 import redis
 import yaml
 
-from swarm.agents.data.queues import AgentQueues
+from swarm.utils.queues import AgentQueues
 from swarm.comm.message_service_grpc import MessageServiceGrpc
 from swarm.comm.messages.message import MessageType
 from swarm.comm.message_service_kafka import Observer
@@ -149,7 +149,7 @@ class Agent(Observer):
     def __init__(self, agent_id: int, config_file: str):
         self.agent_id = agent_id
         self.neighbor_map = {}
-        self.neighbor_map_lock = threading.Lock()
+        self.neighbor_map_lock = threading.RLock()
 
         with open(config_file, 'r') as f:
             self.config = yaml.safe_load(f)
@@ -176,13 +176,13 @@ class Agent(Observer):
         self.shutdown = False
         self.shutdown_path = "./shutdown"
 
-        self.completed_lock = threading.Lock()
+        self.completed_lock = threading.RLock()
         self.completed_jobs_set = set()
-        self.pre_prepare_lock = threading.Lock()
+        self.pre_prepare_lock = threading.RLock()
         self.pre_prepare_jobs_set = set()
-        self.prepare_lock = threading.Lock()
+        self.prepare_lock = threading.RLock()
         self.prepare_jobs_set = set()
-        self.commit_lock = threading.Lock()
+        self.commit_lock = threading.RLock()
         self.commit_jobs_set = set()
         self.metrics = Metrics()
 
@@ -520,7 +520,7 @@ class Agent(Observer):
         thread = threading.Thread(target=self.execute_job, args=(job,))
         thread.start()
 
-    def update_jobs(self, jobs: list[str], job_set: set, lock: threading.Lock):
+    def update_jobs(self, jobs: list[str], job_set: set, lock: threading.RLock):
         with lock:
             job_set.update(jobs)
 

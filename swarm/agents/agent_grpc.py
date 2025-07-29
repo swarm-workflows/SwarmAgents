@@ -38,11 +38,10 @@ from logging.handlers import RotatingFileHandler
 import redis
 import yaml
 
-from swarm.agents.data.queues import AgentQueues
+from swarm.utils.queues import AgentQueues
 from swarm.comm.message_service_grpc import MessageServiceGrpc
 from swarm.comm.messages.message import MessageType
 from swarm.comm.message_service_kafka import Observer
-from swarm.database.etcd_repository import EtcdRepository
 from swarm.database.repository import Repository
 from swarm.models.capacities import Capacities
 from swarm.models.agent_info import AgentInfo
@@ -86,7 +85,7 @@ class Agent(Observer):
         self.shutdown_path = "./shutdown"
 
         self.metrics = Metrics()
-        self.completed_lock = threading.Lock()
+        self.completed_lock = threading.RLock()
         self.completed_jobs_set = set()
 
         self.grpc_thread = MessageServiceGrpc(port=self.grpc_port + self.agent_id, logger=self.logger)
@@ -536,7 +535,7 @@ class Agent(Observer):
         thread = threading.Thread(target=self.execute_job, args=(job,))
         thread.start()
 
-    def update_jobs(self, jobs: list[str], job_set: set, lock: threading.Lock):
+    def update_jobs(self, jobs: list[str], job_set: set, lock: threading.RLock):
         with lock:
             job_set.update(jobs)
 
