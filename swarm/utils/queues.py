@@ -30,7 +30,7 @@ from swarm.queue.simple_job_queue import SimpleJobQueue
 
 @dataclass
 class AgentQueues:
-    def __init__(self, queue_config: dict):
+    def __init__(self):
         self.job_queue = SimpleJobQueue()
         self.selected_queue = SimpleJobQueue()
         self.ready_queue = SimpleJobQueue()

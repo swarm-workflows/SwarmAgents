@@ -93,6 +93,7 @@ class Job:
         self.data_in = []
         self.data_out = []
         self.state = JobState.PENDING
+        self.status = 0
         self.data_in_time = 0
         self.data_out_time = 0
         self.prepares = 0
@@ -106,6 +107,7 @@ class Job:
         self.completed_at = None
         self.leader_agent_id = None
         self.time_last_state_change = 0
+        self.no_op_count = 0
 
     def get_age(self) -> float:
         """
@@ -368,7 +370,7 @@ class Job:
         self.set_state(state=new_state)
         if new_state in [JobState.PRE_PREPARE, JobState.PREPARE]:
             self.set_selection_start_time()
-        elif new_state in [JobState.READY, JobState.COMMIT]:
+        elif new_state in [JobState.READY]:
             self.set_selection_end_time()
         elif new_state == JobState.RUNNING:
             self.set_scheduled_time()
@@ -384,6 +386,7 @@ class Job:
             'data_in': [data_node.to_dict() for data_node in self.data_in],
             'data_out': [data_node.to_dict() for data_node in self.data_out],
             'state': self.state.value,
+            'status': self.status,
             'data_in_time': self.data_in_time,
             'data_out_time': self.data_out_time,
             'prepares': self.prepares,
@@ -405,6 +408,7 @@ class Job:
         self.data_in = [DataNode.from_dict(data_in) for data_in in job_data['data_in']]
         self.data_out = [DataNode.from_dict(data_out) for data_out in job_data['data_out']]
         self.state = JobState(job_data['state']) if job_data.get('state') else JobState.PENDING
+        self.status = JobState(job_data['status']) if job_data.get('status') else 0
         self.data_in_time = job_data['data_in_time'] if job_data.get('data_in_time') is not None else None
         self.data_out_time = job_data['data_out_time'] if job_data.get('data_out_time') is not None else None
         self.prepares = job_data['prepares'] if job_data.get('prepares') else 0

@@ -45,6 +45,7 @@ runtime:
   heartbeat_mode: redis
   total_agents: 5
   jobs_per_proposal: 20
+  executor_workers: 10
 logging:
   ## The directory in which actor should create log files.
   ## This directory will be automatically created if it does not exist.

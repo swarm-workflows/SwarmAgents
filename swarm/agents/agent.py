@@ -78,7 +78,7 @@ class Agent(Observer):
         self.config = {}
         with open(config_file, 'r') as f:
             self.config = yaml.safe_load(f)
-        self.queues = AgentQueues(self.config.get("queue", {}))
+        self.queues = AgentQueues()
         self.messaging = self._build_messaging_config(config=self.config)
         self.log_config = self.config.get("logging", {})
         self.runtime_config = self.config.get("runtime", {})

@@ -33,6 +33,7 @@ import threading
 import time
 import traceback
 from abc import abstractmethod
+from concurrent.futures import ThreadPoolExecutor
 from logging.handlers import RotatingFileHandler
 
 import redis
@@ -62,7 +63,7 @@ class Agent(Observer):
         with open(config_file, 'r') as f:
             self.config = yaml.safe_load(f)
 
-        self.queues = AgentQueues(self.config.get("queue", {}))
+        self.queues = AgentQueues()
         self.grpc_config = self.config.get("grpc", {})
         self.log_config = self.config.get("logging", {})
         self.runtime_config = self.config.get("runtime", {})
@@ -97,6 +98,7 @@ class Agent(Observer):
             "scheduling": threading.Thread(target=self.job_scheduling_main, daemon=True)
         }
         self.last_non_empty_time = time.time()
+        self.executor = ThreadPoolExecutor(max_workers=self.runtime_config.get("executor_workers", 10))
 
     @property
     def empty_timeout_seconds(self):
@@ -120,6 +122,10 @@ class Agent(Observer):
         """Returns the expected total number of agents from the runtime configuration."""
         #return int(self.runtime_config.get("total_agents", 0))
         return 1 + len(self.topology.peers)
+
+    @property
+    def restart_job_selection(self) -> float:
+        return self.runtime_config.get("restart_job_selection", 60.00)
 
     @property
     def projected_queue_threshold(self) -> float:
@@ -231,6 +237,7 @@ class Agent(Observer):
     def stop(self):
         try:
             self.shutdown = True
+            self.executor.shutdown(wait=True)
             self.grpc_thread.stop()
             with self.condition:
                 self.condition.notify_all()
@@ -420,15 +427,6 @@ class Agent(Observer):
         available = self.capacities - ready_caps
         return self._has_sufficient_capacity(job, available)
 
-    def can_accommodate_job(self, job: Job, only_total: bool = False) -> bool:
-        if only_total:
-            available = self.capacities
-        else:
-            caps = self.queues.ready_queue.capacities(self.queues.ready_queue.get_jobs())
-            caps += self.queues.selected_queue.capacities(self.queues.selected_queue.get_jobs())
-            available = self.capacities - caps
-        return self._has_sufficient_capacity(job, available)
-
     def is_job_feasible(self, job: Job, total: Capacities, projected_load: float,
                         proposed_caps: Capacities = Capacities(),
                         allocated_caps: Capacities = Capacities()) -> bool:
@@ -439,11 +437,10 @@ class Agent(Observer):
         return self._has_sufficient_capacity(job, available)
 
     def execute_job(self, job: Job):
-        job_id = job.get_job_id()
-        self.logger.info(f"[EXECUTE] Starting job {job_id} on agent {self.agent_id}")
         try:
+            job_id = job.get_job_id()
+            self.logger.info(f"[EXECUTE] Starting job {job_id} on agent {self.agent_id}")
             job.execute(data_transfer=self.data_transfer)
-            self.queues.done_queue.add_job(job=job)
             self.queues.ready_queue.remove_job(job_id=job_id)
             self.logger.info(f"[COMPLETE] Job {job_id} completed on agent {self.agent_id}")
             if not self.queues.ready_queue.get_jobs():
@@ -451,23 +448,35 @@ class Agent(Observer):
         except Exception as e:
             self.logger.error(f"[ERROR] Job {job_id} failed on agent {self.agent_id}: {e}")
             self.logger.error(traceback.format_exc())
+        print(f"EXECUTED: {job.get_job_id()} on agent: {self.agent_id}")
 
     def save_results(self):
         self.logger.info("Saving Results")
-        completed_jobs = self.repo.get_all_objects(key_prefix=Repository.KEY_JOB,
-                                                   level=0,
-                                                   state=JobState.COMPLETE.value)
-
         self.metrics.save_misc(f"{self.results_dir}/misc_{self.agent_id}.json")
-        self.metrics.save_jobs_per_agent(completed_jobs, f"{self.results_dir}/jobs_per_agent_{self.agent_id}.csv")
-        self.metrics.save_scheduling_latency(
-            completed_jobs,
-            wait_path=f"{self.results_dir}/wait_time_{self.agent_id}.csv",
-            sel_path=f"{self.results_dir}/selection_time_{self.agent_id}.csv",
-            lat_path=f"{self.results_dir}/scheduling_latency_{self.agent_id}.csv"
-        )
         self.metrics.save_load_trace(f"{self.results_dir}/agent_loads_{self.agent_id}.csv")
         self.metrics.save_idle_time(f"{self.results_dir}/idle_time_per_agent_{self.agent_id}.csv")
+
+        lock_path = f"{self.results_dir}/result.lock"
+
+        try:
+            # Try to create the lock file atomically
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)  # Lock acquired
+        except FileExistsError:
+            self.logger.info("Another agent has started saving results")
+            return
+
+        completed_jobs = self.repo.get_all_objects(
+            key_prefix=Repository.KEY_JOB,
+            level=0,
+            state=JobState.COMPLETE.value
+        )
+
+        self.metrics.save_jobs_per_agent(completed_jobs, f"{self.results_dir}/jobs_per_agent.csv")
+        self.metrics.save_scheduling_latency(
+            completed_jobs,
+            path=f"{self.results_dir}/latency.csv"
+        )
         self.logger.info("Results saved")
 
     def job_scheduling_main(self):
@@ -532,8 +541,12 @@ class Agent(Observer):
         self.queues.ready_queue.add_job(job=job)
 
         # Launch a thread to execute the job
-        thread = threading.Thread(target=self.execute_job, args=(job,))
-        thread.start()
+        #thread = threading.Thread(target=self.execute_job, args=(job,))
+        #thread.start()
+        self.update_completed_jobs(jobs=[job.get_job_id()])
+        job.change_state(JobState.COMPLETE)
+        self.repo.save(obj=job.to_dict(), level=self.topology.level, group=self.topology.group)
+        self.executor.submit(self.execute_job, job)
 
     def update_jobs(self, jobs: list[str], job_set: set, lock: threading.RLock):
         with lock:
@@ -581,10 +594,7 @@ class Agent(Observer):
             self.logger.debug(log_msg)
 
             # Queue message
-            if message_type in (MessageType.HeartBeat.name, MessageType.HeartBeat.value):
-                self.queues.hb_message_queue.put_nowait(payload)
-            else:
-                self.queues.message_queue.put_nowait(payload)
+            self.queues.message_queue.put_nowait(payload)
 
             with self.condition:
                 self.condition.notify_all()
@@ -592,8 +602,7 @@ class Agent(Observer):
         except Exception as e:
             self.logger.debug(f"Failed to enqueue message: {message}, error: {e}")
 
-    def _send_message(self, json_message: dict, excluded_peers: list[int] = None,
-                       src: int = None, fwd: int = None):
+    def _send_message(self, json_message: dict, excluded_peers: list[int] = None, src: int = None, fwd: int = None):
         src = src or self.agent_id
         excluded = set(excluded_peers) if excluded_peers else set()
 
@@ -611,10 +620,6 @@ class Agent(Observer):
                 src=src,
                 fwd=fwd
             )
-
-    @staticmethod
-    def generate_id() -> str:
-        return hashlib.sha256(''.join(random.choices(string.ascii_lowercase, k=8)).encode()).hexdigest()[:8]
 
     def select_job(self, job: Job):
         #print(f"Adding: {job.get_job_id()} on agent: {self.agent_id} to Select Queue")

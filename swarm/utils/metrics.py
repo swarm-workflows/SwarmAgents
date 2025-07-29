@@ -52,8 +52,11 @@ class Metrics:
             for agent_id, info in jobs_per_agent.items():
                 writer.writerow([agent_id, info['job_count'], info['jobs']])
 
-    def save_scheduling_latency(self, jobs: list[Any], wait_path: str, sel_path: str, lat_path: str):
-        wait_times, selection_times, scheduling_latency = {}, {}, {}
+    def save_scheduling_latency(self, jobs: list[Any], path: str):
+        wait_times = {}
+        selection_times = {}
+        scheduling_latency = {}
+        detailed_latency = []  # For combined output
 
         for job_data in jobs:
             if isinstance(job_data, dict):
@@ -61,30 +64,37 @@ class Metrics:
                 job.from_dict(job_data)
             else:
                 job = job_data
+
+            job_id = job.job_id
+            leader_id = getattr(job, "leader_agent_id", "N/A")
+            wait_time = selection_time = latency = None
+
             if job.selection_started_at and job.created_at:
-                wait_times[job.job_id] = job.selection_started_at - job.created_at
+                wait_time = job.selection_started_at - job.created_at
+                wait_times[job_id] = wait_time
+
             if job.selected_by_agent_at and job.selection_started_at:
-                selection_times[job.job_id] = job.selected_by_agent_at - job.selection_started_at
-            if job.job_id in wait_times and job.job_id in selection_times:
-                scheduling_latency[job.job_id] = wait_times[job.job_id] + selection_times[job.job_id]
+                selection_time = job.selected_by_agent_at - job.selection_started_at
+                selection_times[job_id] = selection_time
 
-        with open(wait_path, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(['job_id', 'wait_time'])
-            for k, v in wait_times.items():
-                writer.writerow([k, v])
+            if wait_time is not None and selection_time is not None:
+                latency = wait_time + selection_time
+                scheduling_latency[job_id] = latency
 
-        with open(sel_path, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(['job_id', 'selection_time'])
-            for k, v in selection_times.items():
-                writer.writerow([k, v])
+            # Store all in one row
+            detailed_latency.append([
+                job_id,
+                wait_time if wait_time is not None else 0,
+                selection_time if selection_time is not None else 0,
+                latency if latency is not None else 0,
+                leader_id
+            ])
 
-        with open(lat_path, 'w', newline='') as f:
+        # Save combined CSV with leader_agent_id
+        with open(path, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['job_id', 'scheduling_latency'])
-            for k, v in scheduling_latency.items():
-                writer.writerow([k, v])
+            writer.writerow(['job_id', 'wait_time', 'selection_time', 'scheduling_latency', 'leader_agent_id'])
+            writer.writerows(detailed_latency)
 
     def save_load_trace(self, path: str):
         max_len = max((len(l) for l in self.load_per_agent.values()), default=0)

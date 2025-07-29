@@ -33,13 +33,14 @@ from swarm.comm.messages.commit import Commit
 from swarm.comm.messages.message_builder import MessageBuilder
 from swarm.comm.messages.prepare import Prepare
 from swarm.comm.messages.proposal import Proposal
-from swarm.comm.messages.job_status import JobStatus
 from swarm.database.repository import Repository
 from swarm.models.capacities import Capacities
 from swarm.models.agent_info import AgentInfo
 from swarm.models.proposal_info import ProposalContainer, ProposalInfo
 from swarm.models.job import Job, JobState
 import numpy as np
+
+from swarm.utils.utils import generate_id
 
 
 class SwarmAgent(Agent):
@@ -88,16 +89,16 @@ class SwarmAgent(Agent):
                     if self.is_job_completed(job_id=job.get_job_id()):
                         continue
 
-                    '''
                     diff = int(time.time() - job.time_last_state_change)
-                    if diff > self.restart_job_selection and job.get_state() in [JobState.PREPARE,
-                                                                                 JobState.PRE_PREPARE]:
+                    if diff > self.restart_job_selection and job.get_state() not in [JobState.PENDING,
+                                                                                     JobState.READY,
+                                                                                     JobState.COMPLETE,
+                                                                                     JobState.RUNNING]:
                         self.logger.info(f"RESTART: Job: {job} reset to Pending")
                         job.change_state(new_state=JobState.PENDING)
                         self.outgoing_proposals.remove_job(job_id=job.get_job_id())
                         self.incoming_proposals.remove_job(job_id=job.get_job_id())
-                        self.restart_job_selection_cnt += 1
-                    '''
+                        self.metrics.restart_job_selection_cnt += 1
 
                     if not job.is_pending():
                         if job.get_leader_agent_id() is None:
@@ -115,7 +116,7 @@ class SwarmAgent(Agent):
                     status, cost = self.__can_select_job(job=job, caps_jobs_selected=caps_jobs_selected)
                     if status:
                         # Send proposal to all neighbors
-                        proposal = ProposalInfo(p_id=self.generate_id(), job_id=job.get_job_id(),
+                        proposal = ProposalInfo(p_id=generate_id(), job_id=job.get_job_id(),
                                                 agent_id=self.agent_id, seed=cost + self.agent_id)
                         proposals.append(proposal)
                         caps_jobs_selected += job.get_capacities()
@@ -165,7 +166,8 @@ class SwarmAgent(Agent):
 
         # Compute costs for the current agent
         my_load = self.compute_overall_load(proposed_jobs=self.outgoing_proposals.jobs())
-        projected_load = self.compute_projected_load(overall_load_actual=my_load,
+        projected_load = self.compute_projected_load(total_capacities=self.capacities,
+                                                     overall_load_actual=my_load,
                                                      proposed_caps=caps_jobs_selected)
 
         for j, job in enumerate(jobs):
@@ -174,12 +176,13 @@ class SwarmAgent(Agent):
                                                projected_load=projected_load + cost_of_job)
             cost_matrix[0, j] = float('inf')
             if feasibility:
-                cost_matrix[0, j] = projected_load + feasibility * cost_of_job
+                cost_matrix[0, j] = round((projected_load + feasibility * cost_of_job), 2)
                 self.logger.info(f"Local Cost for Job: {job.get_job_id()}: {cost_matrix[0, j]} -- {projected_load}")
 
         # Compute costs for neighboring agents
         for i, peer in enumerate(self.neighbor_map.values(), start=1):
-            projected_load = self.compute_projected_load(overall_load_actual=peer.load,
+            projected_load = self.compute_projected_load(total_capacities=peer.capacities,
+                                                         overall_load_actual=peer.load,
                                                          proposed_caps=caps_jobs_selected)
 
             for j, job in enumerate(jobs):
@@ -189,7 +192,7 @@ class SwarmAgent(Agent):
                                                    projected_load=projected_load + cost_of_job)
                 cost_matrix[i, j] = float('inf')
                 if feasibility:
-                    cost_matrix[i, j] = projected_load + feasibility * cost_of_job
+                    cost_matrix[i, j] = round((projected_load + feasibility * cost_of_job), 2)
 
         return cost_matrix
 
@@ -334,7 +337,7 @@ class SwarmAgent(Agent):
             if job.is_commit():
                 continue
 
-            quorum_count = (len(self.neighbor_map) // 2) + 1  # Ensure a true majority
+            quorum_count = self.calculate_quorum()
             job.change_state(JobState.PREPARE)  # Consider the necessity of this state change
 
             if len(proposal.prepares) >= quorum_count:
@@ -388,7 +391,7 @@ class SwarmAgent(Agent):
                 if proposal.agent_id != self.agent_id:
                     proposals_to_forward.append(proposal)
 
-            quorum_count = (len(self.neighbor_map) // 2) + 1  # Ensure a true majority
+            quorum_count = self.calculate_quorum()
 
             if len(proposal.commits) >= quorum_count:
                 self.logger.debug(
@@ -398,6 +401,8 @@ class SwarmAgent(Agent):
                     job.set_leader(leader_agent_id=proposal.agent_id)
                 if self.outgoing_proposals.contains(job_id=p.job_id, p_id=p.p_id):
                     self.logger.info(f"[CON_LEADER] achieved for Job: {p.job_id} Leader: {self.agent_id}")
+                    print(f"SELECTED: {job.get_job_id()} on agent: {self.agent_id} proposal: {proposal.p_id} "
+                          f"commits: {proposal.commits} quorum: {quorum_count}")
                     self.select_job(job)
                     self.outgoing_proposals.remove_job(job_id=p.job_id)
                 else:
@@ -413,20 +418,6 @@ class SwarmAgent(Agent):
                                excluded_peers=[incoming.forwarded_by, incoming.agents[0].agent_id],
                                src=incoming.agents[0].agent_id, fwd=self.agent_id)
 
-    def execute_job(self, job: Job):
-        self.update_completed_jobs(jobs=[job.get_job_id()])
-        self.repo.save(obj=job.to_dict(), level=self.topology.level, group=self.topology.group)
-        super().execute_job(job=job)
-
-    def __get_proposed_capacities(self):
-        proposed_capacities = Capacities()
-        jobs = self.outgoing_proposals.jobs()
-        for job_id in jobs:
-            proposed_job = self.queues.job_queue.get_job(job_id=job_id)
-            proposed_capacities += proposed_job.get_capacities()
-        #self.logger.debug(f"Number of outgoing proposals: {len(jobs)}; Jobs: {jobs}")
-        return proposed_capacities
-
     @staticmethod
     def compute_job_cost(job: Job, total: Capacities) -> float:
         """
@@ -440,16 +431,17 @@ class SwarmAgent(Agent):
         cost = (core_load + ram_load + disk_load) / 3
         return round(cost, 2)
 
-    def compute_projected_load(self, overall_load_actual: float, proposed_caps: Capacities) -> float:
+    @staticmethod
+    def compute_projected_load(total_capacities: Capacities, overall_load_actual: float, proposed_caps: Capacities) -> float:
         """
         Compute projected overall load using equal weighting for core, RAM, and disk.
         """
         if not proposed_caps:
             return round(overall_load_actual, 2)
 
-        core_inc = (proposed_caps.core / self.capacities.core) * 100
-        ram_inc = (proposed_caps.ram / self.capacities.ram) * 100
-        disk_inc = (proposed_caps.disk / self.capacities.disk) * 100
+        core_inc = (proposed_caps.core / total_capacities.core) * 100
+        ram_inc = (proposed_caps.ram / total_capacities.ram) * 100
+        disk_inc = (proposed_caps.disk / total_capacities.disk) * 100
 
         additional_load = (core_inc + ram_inc + disk_inc) / 3
         projected_load = overall_load_actual + additional_load
@@ -469,6 +461,7 @@ class SwarmAgent(Agent):
     def update_completed_jobs(self, jobs: list[str]):
         super().update_completed_jobs(jobs=jobs)
         for j in jobs:
+            self.incoming_proposals.remove_job(job_id=j)
             self.outgoing_proposals.remove_job(job_id=j)
             self.queues.job_queue.remove_job(job_id=j)
 

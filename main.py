@@ -107,7 +107,7 @@ if __name__ == '__main__':
     elif agent_type == "swarm-multi":
         config_file = "./config_swarm_multi.yml"
         if local_topo:
-            config_file = f"./config_swarm_multi_{agent_id}.yml"
+            config_file = f"./configs/config_swarm_multi_{agent_id}.yml"
         # Initialize your swarm-multi agent here using the config_file
         from swarm.agents.swarm_agent_multi_grpc import SwarmAgent
         agent = SwarmAgent(agent_id=agent_id, config_file=config_file)

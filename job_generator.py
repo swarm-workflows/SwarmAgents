@@ -58,6 +58,7 @@ class JobGenerator:
         core = round(random.uniform(0.1, 4.0), 2)
         ram = round(random.uniform(0.1, 4.0), 2)
         disk = round(random.uniform(0.1, 4.0), 2)
+        status = random.choice([0, -1])
 
         remote_ips = ['192.158.2.1', '192.158.1.2', '192.158.4.2']
         input_files = ['/var/tmp/outgoing/file100M.txt', '/var/tmp/outgoing/file500M.txt', '/var/tmp/outgoing/file1G.txt']
@@ -81,7 +82,8 @@ class JobGenerator:
             'no_op': no_op,
             'capacities': {'core': core, 'ram': ram, 'disk': disk},
             'data_in': data_in,
-            'data_out': data_out
+            'data_out': data_out,
+            'status': status
         }
 
     def generate_job_files(self, output_dir: str) -> None:

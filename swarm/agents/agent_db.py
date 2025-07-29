@@ -154,7 +154,7 @@ class Agent(Observer):
         with open(config_file, 'r') as f:
             self.config = yaml.safe_load(f)
 
-        self.queues = AgentQueues(self.config.get("queue", {}))
+        self.queues = AgentQueues()
         self.grpc_config = self.config.get("grpc", {})
         self.log_config = self.config.get("logging", {})
         self.runtime_config = self.config.get("runtime", {})
