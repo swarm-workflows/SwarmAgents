@@ -27,16 +27,6 @@ topology:
     - 1
     - 2
   type: mesh
-kafka:
-  bootstrap_servers: zoo-0:9092,zoo-1:9092,zoo-2:9092
-  topic: multi
-  hb_topic: multi-hb
-  consumer_group_id: cg
-  batch_size: 10
-nats:
-  nats_servers: nats://127.0.0.1:4222
-  nats_topic: agent-swarm-multi
-  hb_nats_topic: agent-swarm-multi-hb
 grpc:
   port: 50051
   host: localhost
