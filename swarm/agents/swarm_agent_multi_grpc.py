@@ -409,8 +409,9 @@ class SwarmAgent(Agent):
                 if child.dtns:
                     dtn_map.update(child.dtns)
 
-            for name in dtn_map:
-                dtn_map[name] = dtn_map[name].to_dict()
+            dtns = []
+            for dtn in dtn_map.values():
+                dtns.append(dtn.to_dict())
 
             self._load = self.resource_usage_score(total_allocations, total_capacities)
             agent_info = AgentInfo(
@@ -419,7 +420,7 @@ class SwarmAgent(Agent):
                 capacity_allocations=total_allocations,
                 load=self._load,
                 last_updated=current_time,
-                dtns=dtn_map
+                dtns=dtns
             )
             self._capacities = total_capacities
 
