@@ -237,10 +237,10 @@ class SwarmConfigGenerator:
             config["dtns"] = self.assign_agent_dtns(dtn_pool, min_dtns=1, max_dtns=4)
 
             # Randomize capacities
-            config['capacities']['core'] = 8#self.random_capacity(1, 8)
-            config['capacities']['gpu'] = 8#self.random_capacity(1, 8)
-            config['capacities']['ram'] = 16#self.random_capacity(8, 64)
-            config['capacities']['disk'] = 500#self.random_capacity(100, 500)
+            config['capacities']['core'] = self.random_capacity(1, 8)
+            config['capacities']['gpu'] = self.random_capacity(1, 8)
+            config['capacities']['ram'] = self.random_capacity(8, 64)
+            config['capacities']['disk'] = self.random_capacity(100, 500)
 
             config["redis"]["host"] = self.db_host
             config["topology"] = {"peer_agents": agent_topo[agent_id]["peers"], "type": self.topology,
