@@ -117,11 +117,13 @@ class SwarmAgent(Agent):
             if my_proposal:
                 self.logger.debug(f"Job:{p.job_id} Agent:{self.agent_id} rejected Proposal: {p} from agent"
                                   f" {p.agent_id} - my proposal {my_proposal} has prepares or smaller seed")
-                self.metrics.conflicts += 1
+                job_id = job.get_job_id()
+                self.metrics.conflicts[job_id] = self.metrics.conflicts.get(job_id, 0) + 1
             elif peer_proposal:
                 self.logger.debug(f"Job:{p.job_id} Agent:{self.agent_id} rejected Proposal: {p} from agent"
                                   f" {p.agent_id} - already accepted proposal {peer_proposal} with a smaller seed")
-                self.metrics.conflicts += 1
+                job_id = job.get_job_id()
+                self.metrics.conflicts[job_id] = self.metrics.conflicts.get(job_id, 0) + 1
             else:
                 self.logger.debug(
                     f"Job:{p.job_id} Agent:{self.agent_id} accepted Proposal: {p} from agent"
@@ -326,7 +328,8 @@ class SwarmAgent(Agent):
                 job.change_state(new_state=JobState.PENDING)
                 self.outgoing_proposals.remove_job(job_id=job.get_job_id())
                 self.incoming_proposals.remove_job(job_id=job.get_job_id())
-                self.metrics.restart_job_selection_cnt += 1
+                job_id = job.get_job_id()
+                self.metrics.restarts[job_id] = self.metrics.restarts.get(job_id, 0) + 1
 
     def _do_periodic(self):
         while not self.shutdown:
@@ -869,4 +872,4 @@ class SwarmAgent(Agent):
             except Exception as e:
                 self.logger.error(f"Error occurred while executing e: {e}")
                 self.logger.error(traceback.format_exc())
-        self.logger.info(f"Agent: {self} stopped with restarts: {self.metrics.restart_job_selection_cnt}!")
+        self.logger.info(f"Agent: {self} stopped with restarts: {self.metrics.restarts}!")

@@ -12,8 +12,8 @@ class Metrics:
         self.idle_time = []
         self.idle_start_time = None
         self.total_idle_time = 0
-        self.restart_job_selection_cnt = 0
-        self.conflicts = 0
+        self.restarts = {}
+        self.conflicts = {}
 
     def save_load_metric(self, load: float):
         """
@@ -33,7 +33,7 @@ class Metrics:
     def save_misc(self, path: str):
         with open(path, 'w') as file:
             json.dump({
-                "restarts": self.restart_job_selection_cnt,
+                "restarts": self.restarts,
                 "conflicts": self.conflicts
             }, file, indent=4)
 

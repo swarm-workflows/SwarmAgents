@@ -382,7 +382,7 @@ class SwarmAgent(Agent):
             except Exception as e:
                 self.logger.error(f"Error occurred while executing: {e}\n{traceback.format_exc()}")
 
-        self.logger.info(f"Agent {self} stopped with restarts: {self.metrics.restart_job_selection_cnt}!")
+        self.logger.info(f"Agent {self} stopped with restarts: {self.metrics.restarts}!")
 
     def _do_periodic(self):
         interval = 5

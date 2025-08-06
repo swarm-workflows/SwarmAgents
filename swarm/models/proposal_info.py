@@ -147,7 +147,8 @@ class ProposalContainer:
     def has_better_proposal(self, proposal: ProposalInfo) -> ProposalInfo:
         better = None
         for p in self.get_proposals_by_job_id(proposal.job_id):
-            if p.seed <= proposal.seed:
+            if p.seed < proposal.seed or (p.seed == proposal.seed and p.agent_id < proposal.agent_id):
                 better = p
                 break
+
         return better
