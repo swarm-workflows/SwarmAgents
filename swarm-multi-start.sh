@@ -27,10 +27,10 @@ rm -f shutdown
 #python3.11 -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. swarm/comm/consensus.proto
 
 # Call generate_configs as-is
-python3.11 utils/generate_configs.py "$num_agents" "$jobs_per_proposal" ./config_swarm_multi.yml configs $topology $database
+python3.11 generate_configs.py "$num_agents" "$jobs_per_proposal" ./config_swarm_multi.yml configs $topology $database
 
 # Build cleanup command with optional args only if set
-cleanup_cmd="python3.11 utils/cleanup.py --agents $num_agents"
+cleanup_cmd="python3.11 cleanup.py --agents $num_agents"
 [[ -n "$topic" ]] && cleanup_cmd+=" --topic $topic"
 [[ -n "$broker" ]] && cleanup_cmd+=" --broker $broker"
 #[[ -n "$database" ]] && cleanup_cmd+=" --etcd-host $database --cleanup-etcd"
