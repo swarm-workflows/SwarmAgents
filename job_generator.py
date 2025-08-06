@@ -36,15 +36,21 @@ class JobGenerator:
     Generates random jobs and stores them in Redis or as JSON files.
     """
 
-    def __init__(self, job_count: int = 0) -> None:
+    def __init__(self, job_count: int = 0, dtn_json_path: str = None) -> None:
         """
         Initialize the JobGenerator.
 
-        :param host: Redis host
-        :param port: Redis port
         :param job_count: Number of jobs to generate
+        :param dtn_json_path: Optional path to JSON file mapping agent_id -> list of DTNs
         """
         self.job_count = job_count
+        self.agent_dtns_map = self._load_agent_dtns(dtn_json_path)
+
+    def _load_agent_dtns(self, path: str) -> dict[int, list[str]]:
+        if path and os.path.exists(path):
+            with open(path, "r") as f:
+                return json.load(f)
+        return {}
 
     def generate_job(self, x: int) -> Dict[str, Any]:
         """
@@ -62,8 +68,16 @@ class JobGenerator:
         status = random.choice([0, -1])
         dtn_count = 10
         dtns = []
-        for i in range(1, dtn_count + 1):
-            dtns.append(f"dtn{i}")
+        if self.agent_dtns_map:
+            # Choose a random agent to derive valid DTNs
+            agent_id = random.choice(list(self.agent_dtns_map.keys()))
+            candidate_dtns = self.agent_dtns_map[agent_id]
+            dtn_count = random.randint(1, len(candidate_dtns))
+            dtns = random.sample(candidate_dtns, dtn_count)
+        else:
+            # Fallback: random dtns
+            dtns = [f"dtn{random.randint(1, dtn_count)}"]
+
         input_files = ['/var/tmp/outgoing/file100M.txt',
                        '/var/tmp/outgoing/file500M.txt',
                        '/var/tmp/outgoing/file1G.txt']

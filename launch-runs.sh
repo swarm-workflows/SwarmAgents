@@ -44,7 +44,7 @@ copy_results_and_logs() {
 for ((i=1; i<=MAX_RETRIES; i++))
 do
     echo "Starting agents... (Attempt $i)"
-    ./"$AGENT_TYPE"-start.sh "$NUM_AGENTS" "$TOPOLOGY" "$DATABASE" "$TASKS" "$JOBS_PER_PROPOSAL"
+    ./"$AGENT_TYPE"-start.sh "$NUM_AGENTS" "$TOPOLOGY" "$TASKS" "$DATABASE" "$JOBS_PER_PROPOSAL"
 
     sleep $SLEEP_INTERVAL
 

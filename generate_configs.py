@@ -1,14 +1,18 @@
+import json
 import random
 
 import yaml
 import os
 import argparse
 
+from job_generator import JobGenerator
+
 
 class SwarmConfigGenerator:
     """
     A class to generate configuration files for agents in a structured ring topology.
     """
+    AGENT_DTNS = "agent_dtns.json"
 
     def __init__(self, num_agents, jobs_per_proposal, base_config_path, output_dir, topology,
                  db_host):
@@ -28,6 +32,7 @@ class SwarmConfigGenerator:
         self.rings = self.create_ring_topology()
         self.topology = topology
         self.db_host = db_host
+        self.agent_dtns_map = self._load_agent_dtns(path=self.AGENT_DTNS)
 
     def load_base_config(self):
         """
@@ -227,14 +232,21 @@ class SwarmConfigGenerator:
         config_prefix = self.get_config_prefix()
 
         # Step 1: Create a global DTN pool once
-        dtn_pool = self.generate_global_dtn_pool(total_count=10)
+        if len(self.agent_dtns_map) == 0:
+            dtn_pool = self.generate_global_dtn_pool(total_count=10)
+        else:
+            dtn_pool = None
 
         # Generate YAML files for each agent
         for agent_id in range(1, self.num_agents + 1):
             config = self.base_config.copy()
 
             # Step 3: Assign random DTNs from pool to this agent
-            config["dtns"] = self.assign_agent_dtns(dtn_pool, min_dtns=1, max_dtns=4)
+            if dtn_pool is not None:
+                config["dtns"] = self.assign_agent_dtns(dtn_pool, min_dtns=1, max_dtns=4)
+                self.agent_dtns_map[agent_id] = config["dtns"]
+            else:
+                config["dtns"] = self.agent_dtns_map[agent_id]
 
             # Randomize capacities
             config['capacities']['core'] = self.random_capacity(1, 8)
@@ -253,7 +265,18 @@ class SwarmConfigGenerator:
             with open(config_file_path, "w") as file:
                 yaml.dump(config, file, default_flow_style=False)
 
+        # Dump all agent DTNs to a JSON file
+        dtn_json_path = os.path.join(self.output_dir, self.AGENT_DTNS)
+        with open(dtn_json_path, 'w') as f:
+            json.dump(self.agent_dtns_map, f, indent=2)
+
         print(f"\nGenerated {self.num_agents} config files in {self.output_dir}")
+
+    def _load_agent_dtns(self, path: str) -> dict[int, list[str]]:
+        if path and os.path.exists(path):
+            with open(path, "r") as f:
+                return json.load(f)
+        return {}
 
     @staticmethod
     def random_capacity(min_val, max_val):
@@ -300,12 +323,17 @@ if __name__ == "__main__":
     parser.add_argument("jobs_per_proposal", type=int, help="Number of Jobs per proposal.")
     parser.add_argument("base_config_file", type=str, help="Path to the base configuration YAML file.")
     parser.add_argument("output_dir", type=str, help="Directory where generated configs should be saved.")
-    parser.add_argument("topology", type=str, default="all", help="Agent TopologyType: Possible values - mesh, ring, star, hierarchical")
+    parser.add_argument("topology", type=str, default="all", help="Agent TopologyType: "
+                                                                  "Possible values - mesh, ring, star, hierarchical")
     parser.add_argument("database", type=str, default="all", help="Database Host")
-
+    parser.add_argument("job_cnt", type=int, help="Job Count")
 
     args = parser.parse_args()
 
     generator = SwarmConfigGenerator(args.num_agents, args.jobs_per_proposal, args.base_config_file,
                                      args.output_dir, args.topology, args.database)
     generator.generate_configs()
+
+    if not os.path.exists("jobs"):
+        generator = JobGenerator(job_count=args.job_cnt)
+        generator.generate_job_files(output_dir="jobs")

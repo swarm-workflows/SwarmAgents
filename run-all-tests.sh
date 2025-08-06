@@ -9,6 +9,9 @@ TASKS=100
 JOBS_PER_PROPSAL=10
 DATABASE=localhost
 
+rm -rf jobs
+rm -rf agent_dtns.json
+
 # Base output directory
 BASE_OUTPUT_DIR="results"
 
