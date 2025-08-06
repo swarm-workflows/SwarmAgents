@@ -385,6 +385,7 @@ class SwarmAgent(Agent):
         # Leaf agent: report its own resource info
         if not self.topology.children:
             self._load = self.compute_overall_load()
+            self.metrics.save_load_metric(load=self._load)
             proposed_load = self.compute_proposed_load()
             agent_info = AgentInfo(
                 agent_id=self.agent_id,

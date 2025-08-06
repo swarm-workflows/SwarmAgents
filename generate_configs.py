@@ -261,7 +261,7 @@ class SwarmConfigGenerator:
             config["runtime"]["total_agents"] = self.num_agents
             config["runtime"]["jobs_per_proposal"] = self.jobs_per_proposal
 
-            config_file_path = os.path.join(f"{config_prefix}_{agent_id}.yml")
+            config_file_path = os.path.join(f"{self.output_dir}/{config_prefix}_{agent_id}.yml")
             with open(config_file_path, "w") as file:
                 yaml.dump(config, file, default_flow_style=False)
 
