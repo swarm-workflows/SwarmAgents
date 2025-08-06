@@ -246,7 +246,7 @@ class SwarmConfigGenerator:
                 config["dtns"] = self.assign_agent_dtns(dtn_pool, min_dtns=1, max_dtns=4)
                 self.agent_dtns_map[agent_id] = config["dtns"]
             else:
-                config["dtns"] = self.agent_dtns_map[agent_id]
+                config["dtns"] = self.adjust_scores(self.agent_dtns_map[agent_id])
 
             # Randomize capacities
             config['capacities']['core'] = self.random_capacity(1, 8)
@@ -296,6 +296,17 @@ class SwarmConfigGenerator:
                 "base_connectivity_score": round(random.uniform(0.6, 0.95), 2)
             })
         return pool
+
+    def adjust_scores(self, dtns: list):
+        """
+        adjusting connectivity scores slightly to reflect per-agent network differences.
+        :param dtns: list of dtns for the agent
+        """
+        for d in dtns:
+            # Add per-agent variation to score
+            adjusted_score = min(1.0, max(0.0, d["connectivity_score"] + random.uniform(-0.05, 0.05)))
+            d["connectivity_score"] = adjusted_score
+        return dtns
 
     def assign_agent_dtns(self, pool, min_dtns=1, max_dtns=4):
         """
