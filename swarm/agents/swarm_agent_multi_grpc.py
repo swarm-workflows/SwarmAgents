@@ -400,10 +400,16 @@ class SwarmAgent(Agent):
         else:
             total_capacities = Capacities()
             total_allocations = Capacities()
+            # Aggregate DTNs from children, keyed by DTN name to deduplicate
+            dtn_map = {}
 
             for child in self.children.values():
                 total_capacities += child.capacities
                 total_allocations += child.capacity_allocations
+                if child.dtns:
+                    dtn_map.update(child.dtns)
+
+            dtns = list(dtn_map.values())
 
             self._load = self.resource_usage_score(total_allocations, total_capacities)
             agent_info = AgentInfo(
@@ -411,13 +417,14 @@ class SwarmAgent(Agent):
                 capacities=total_capacities,
                 capacity_allocations=total_allocations,
                 load=self._load,
-                last_updated=current_time
+                last_updated=current_time,
+                dtns=dtns
             )
             self._capacities = total_capacities
 
         return agent_info
 
-    def is_job_feasible(self, job: Job, agent: AgentInfo, connectivity_threshold: float = 0.8) -> bool:
+    def is_job_feasible(self, job: Job, agent: AgentInfo) -> bool:
         """
         Check if a job is feasible for a given agent based on:
           - Current load threshold
@@ -428,8 +435,6 @@ class SwarmAgent(Agent):
         :type job: Job
         :param agent: The agent to check feasibility for.
         :type agent: AgentInfo
-        :param connectivity_threshold: Minimum acceptable connectivity score for DTNs.
-        :type connectivity_threshold: float
         :return: True if job is feasible for the agent, False otherwise.
         :rtype: bool
         """
