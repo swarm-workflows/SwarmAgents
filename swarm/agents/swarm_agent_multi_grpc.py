@@ -316,6 +316,18 @@ class SwarmAgent(Agent):
             )
             '''
 
+    def restart_selection(self):
+        jobs = self.queues.job_queue.get_jobs(states=[JobState.PREPARE, JobState.PRE_PREPARE,
+                                                      JobState.COMMIT])
+        for job in jobs:
+            diff = int(time.time() - job.time_last_state_change)
+            if diff > self.restart_job_selection:
+                self.logger.info(f"RESTART: Job: {job} reset to Pending")
+                job.change_state(new_state=JobState.PENDING)
+                self.outgoing_proposals.remove_job(job_id=job.get_job_id())
+                self.incoming_proposals.remove_job(job_id=job.get_job_id())
+                self.metrics.restart_job_selection_cnt += 1
+
     def _do_periodic(self):
         while not self.shutdown:
             try:
@@ -338,6 +350,8 @@ class SwarmAgent(Agent):
                     update_fn(jobs=jobs)
 
                 time.sleep(0.5)
+
+                self.restart_selection()
 
                 self.check_queue()
                 if self.should_shutdown():

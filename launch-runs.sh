@@ -48,6 +48,8 @@ do
 
     sleep $SLEEP_INTERVAL
 
+    python3.11 job_distributor.py --redis-host "$DATABASE" --jobs-dir jobs --level 0 --jobs-per-interval 20
+
     while are_agents_running; do
         echo "Agents are running... checking again in $SLEEP_INTERVAL seconds."
         sleep $SLEEP_INTERVAL
