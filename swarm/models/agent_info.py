@@ -53,7 +53,10 @@ class AgentInfo(JSONField):
                 self.dtns[dtn_info.get('name')] = dtn_info
         elif isinstance(value, dict):
             for key, dtn_info in value.items():
-                self.dtns[key] = DataNode.from_dict(dtn_info)
+                if isinstance(dtn_info, DataNode):
+                    self.dtns[key] = dtn_info
+                else:
+                    self.dtns[key] = DataNode.from_dict(dtn_info)
         else:
             raise ValueError("Unsupported value type for dtns")
 
