@@ -244,9 +244,9 @@ class SwarmConfigGenerator:
             # Step 3: Assign random DTNs from pool to this agent
             if dtn_pool is not None:
                 config["dtns"] = self.assign_agent_dtns(dtn_pool, min_dtns=1, max_dtns=4)
-                self.agent_dtns_map[agent_id] = config["dtns"]
+                self.agent_dtns_map[str(agent_id)] = config["dtns"]
             else:
-                config["dtns"] = self.adjust_scores(self.agent_dtns_map[agent_id])
+                config["dtns"] = self.adjust_scores(self.agent_dtns_map[str(agent_id)])
 
             # Randomize capacities
             config['capacities']['core'] = self.random_capacity(1, 8)
