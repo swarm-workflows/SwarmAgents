@@ -108,6 +108,7 @@ class Job:
         self.leader_agent_id = None
         self.time_last_state_change = 0
         self.no_op_count = 0
+        self.job_type = None  # default until classified
 
     def get_age(self) -> float:
         """
@@ -374,7 +375,8 @@ class Job:
             'scheduled_at': self.scheduled_at,
             'completed_at': self.completed_at,
             'leader_agent_id': self.leader_agent_id,
-            'time_last_state_change': self.time_last_state_change
+            'time_last_state_change': self.time_last_state_change,
+            'job_type': self.job_type
         }
 
     def from_dict(self, job_data: dict):
@@ -397,3 +399,34 @@ class Job:
         self.completed_at = job_data['completed_at'] if job_data.get('completed_at') is not None else None
         self.leader_agent_id = job_data['leader_agent_id'] if job_data.get('leader_agent_id') is not None else None
         self.time_last_state_change = job_data['time_last_state_change'] if job_data.get('time_last_state_change') is not None else None
+        self.classify_job_type()
+
+    def classify_job_type(self):
+        """
+        Classify the job into a job_type string based on its resource demand,
+        execution time, and data transfer requirements.
+        """
+        # ---- Resource dominance classification ----
+        resource_ratios = {
+            "cpu_bound": self.capacities.core,
+            "ram_bound": self.capacities.ram,
+            "disk_bound": self.capacities.disk,
+            "gpu_bound": getattr(self.capacities, "gpu", 0),
+        }
+        resource_class = max(resource_ratios, key=resource_ratios.get)
+
+        # ---- Execution time classification ----
+        if self.execution_time <= 5:
+            time_class = "short"
+        elif self.execution_time <= 20:
+            time_class = "medium"
+        else:
+            time_class = "long"
+
+        # ---- DTN / data I/O classification ----
+        required_dtns = (self.data_in or []) + (self.data_out or [])
+        io_class = "dtn_heavy" if len(required_dtns) > 1 else "dtn_light"
+
+        # ---- Combine ----
+        self.job_type = f"{resource_class}_{time_class}_{io_class}"
+        return self.job_type

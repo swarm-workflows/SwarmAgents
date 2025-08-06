@@ -24,6 +24,7 @@
 import random
 import time
 import traceback
+from collections import defaultdict
 
 from swarm.models.data_node import DataNode
 from swarm.utils.topology import TopologyType
@@ -66,6 +67,11 @@ class SwarmAgent(Agent):
         self.connectivity_penalty_factor = job_cfg.get("connectivity_penalty_factor", 1.0)
         # % above min cost allowed in candidate selection (lower = stricter, higher = more agents considered)
         self.selection_threshold_pct = job_cfg.get("selection_threshold_pct", 10.0)
+
+        self.q_table = defaultdict(lambda: 0.0)  # {(agent_id, job_type): score}
+        self.learning_rate = 0.1
+        self.discount_factor = 0.9
+        self.exploration_rate = 0.1  # epsilon-greedy
 
     def _process(self, messages: list[dict]):
         for message in messages:
@@ -292,6 +298,23 @@ class SwarmAgent(Agent):
             self.incoming_proposals.remove_job(job_id=j)
             self.outgoing_proposals.remove_job(job_id=j)
             self.queues.job_queue.remove_job(job_id=j)
+
+            '''
+            job = self.repo.get(obj_id=j, key_prefix=Repository.KEY_JOB,
+                                level=self.topology.level, group=self.topology.group)
+            job_obj = Job()
+            job_obj.from_dict(job)
+
+            # Reward: success vs failure
+            reward = 1.0 if job_obj.status == 0 else -1.0
+            key = (job_obj.leader_agent_id, job_obj.job_type)
+
+            # Q-learning update
+            old_q = self.q_table[key]
+            self.q_table[key] = old_q + self.learning_rate * (
+                    reward + self.discount_factor * 0 - old_q
+            )
+            '''
 
     def _do_periodic(self):
         while not self.shutdown:
@@ -524,6 +547,131 @@ class SwarmAgent(Agent):
         cost = (base_score + bottleneck_penalty) * time_penalty * connectivity_penalty * 100
         return round(cost, 2)
 
+    def compute_job_cost_job_type(
+            self,  # now uses self so it can read config defaults
+            job: Job,
+            total: Capacities,
+            dtns: dict[str, DataNode]
+    ) -> float:
+        """
+        Compute the cost of executing a job on an agent based on weighted resource usage,
+        bottleneck effects, execution time penalties, and DTN connectivity.
+
+        The cost is calculated as a weighted sum of resource usage ratios, penalized for:
+          - High single-resource utilization (bottleneck penalty)
+          - Long execution times beyond a configurable threshold
+          - Poor connectivity to DTNs required by the job
+
+        :param job: The job whose cost is to be computed.
+        :type job: Job
+        :param total: Total available resources.
+        :type total: Capacities
+        :param dtns: DTN info for the agent
+        :type dtns: dict[str, DataNode]
+        :return: Calculated job cost (higher is more expensive).
+        :rtype: float
+        """
+
+        # --- Start with defaults from config ---
+        cpu_weight = self.cpu_weight
+        ram_weight = self.ram_weight
+        disk_weight = self.disk_weight
+        gpu_weight = self.gpu_weight
+        long_job_threshold = self.long_job_threshold
+        connectivity_penalty_factor = self.connectivity_penalty_factor
+
+        if not total or total.core <= 0 or total.ram <= 0 or total.disk <= 0:
+            return float('inf')
+
+        # --- Dynamic tuning based on job_type ---
+        if hasattr(job, "job_type") and job.job_type:
+            jt = job.job_type
+
+            # Resource emphasis (scale relative to config)
+            if "cpu_bound" in jt:
+                cpu_weight *= 1.5
+                ram_weight *= 0.7
+                disk_weight *= 0.7
+                gpu_weight *= 0.7
+            elif "ram_bound" in jt:
+                ram_weight *= 1.5
+                cpu_weight *= 0.7
+                disk_weight *= 0.7
+                gpu_weight *= 0.7
+            elif "disk_bound" in jt:
+                disk_weight *= 1.5
+                cpu_weight *= 0.7
+                ram_weight *= 0.7
+                gpu_weight *= 0.7
+            elif "gpu_bound" in jt:
+                gpu_weight *= 1.5
+                cpu_weight *= 0.7
+                ram_weight *= 0.7
+                disk_weight *= 0.7
+
+            # Normalize weights to sum to ~1
+            total_w = cpu_weight + ram_weight + disk_weight + gpu_weight
+            cpu_weight /= total_w
+            ram_weight /= total_w
+            disk_weight /= total_w
+            gpu_weight /= total_w
+
+            # Execution time sensitivity
+            if "long" in jt:
+                long_job_threshold = max(5.0, long_job_threshold * 0.75)
+            elif "short" in jt:
+                long_job_threshold = long_job_threshold * 1.5
+
+            # Connectivity importance
+            if "dtn_heavy" in jt:
+                connectivity_penalty_factor *= 1.5
+            elif "dtn_light" in jt:
+                connectivity_penalty_factor *= 0.5
+
+        # Prevent division by zero for GPUs
+        total_gpu = getattr(total, "gpu", 0) or 1
+        job_gpu = getattr(job.capacities, "gpu", 0)
+
+        # Resource usage ratios
+        core_ratio = job.capacities.core / total.core
+        ram_ratio = job.capacities.ram / total.ram
+        disk_ratio = job.capacities.disk / total.disk
+        gpu_ratio = job_gpu / total_gpu
+
+        # Weighted base score
+        base_score = (
+                cpu_weight * core_ratio +
+                ram_weight * ram_ratio +
+                disk_weight * disk_ratio +
+                gpu_weight * gpu_ratio
+        )
+
+        # Bottleneck penalty
+        bottleneck_penalty = max(core_ratio, ram_ratio, disk_ratio, gpu_ratio) ** 2
+
+        # Execution time penalty
+        if job.execution_time > long_job_threshold:
+            time_penalty = 1.5 + (job.execution_time - long_job_threshold) / long_job_threshold
+        else:
+            time_penalty = 1 + (job.execution_time / long_job_threshold) ** 2
+
+        # DTN connectivity penalty
+        avg_conn = 1.0
+        if hasattr(job, "data_in") or hasattr(job, "data_out"):
+            required_dtns = {entry.name for entry in (job.data_in or [])} | \
+                            {entry.name for entry in (job.data_out or [])}
+            agent_dtn_scores = {dtn.name: getattr(dtn, "connectivity_score", 1.0)
+                                for dtn in dtns.values()}
+            scores = [agent_dtn_scores.get(dtn, 0.0) for dtn in required_dtns]
+            if scores:
+                avg_conn = sum(scores) / len(scores)
+
+        connectivity_penalty = 1 + connectivity_penalty_factor * (1 - avg_conn)
+
+        # Final cost
+        cost = (base_score + bottleneck_penalty) * time_penalty * connectivity_penalty * 100
+        return round(cost, 2)
+
     def compute_cost_matrix(self, jobs: list[Job]) -> np.ndarray:
         """
         Compute a cost matrix for assigning jobs to agents, with feasibility checks,
@@ -562,11 +710,7 @@ class SwarmAgent(Agent):
                 if not feasibility_map[agent_id][job.get_job_id()]:
                     continue
 
-                job_cost = self.compute_job_cost(job, total=agent.capacities, dtns=agent.dtns,
-                                                 cpu_weight=self.cpu_weight, ram_weight=self.ram_weight,
-                                                 disk_weight=self.disk_weight, gpu_weight=self.gpu_weight,
-                                                 long_job_threshold=self.long_job_threshold,
-                                                 connectivity_penalty_factor=self.connectivity_penalty_factor)
+                job_cost = self.compute_job_cost_job_type(job, total=agent.capacities, dtns=agent.dtns)
 
                 # Load penalty (synergy penalty for agents already busy)
                 load_penalty = 1 + (projected_load / 100) ** 1.5
@@ -615,6 +759,50 @@ class SwarmAgent(Agent):
                 f"Top 3: {', '.join(f'Agent {aid}: {cost:.2f}' for aid, cost in sorted_candidates)}"
             )
 
+        return min_cost_agents
+
+    def find_min_cost_agents_rl(self, cost_matrix: np.ndarray, job_types: list[str],
+                             threshold_pct: float = 10.0) -> list[tuple[int, float]]:
+        """
+        Determine the agent with the minimum cost for each job, allowing near-minimum costs
+        within a given percentage threshold, with optimized RL bias application.
+        """
+        agents = self.neighbor_map
+        agent_ids = list(agents.keys())
+        num_agents, num_jobs = cost_matrix.shape
+
+        # Build RL bias matrix in one pass
+        rl_bias_matrix = np.zeros((num_agents, num_jobs), dtype=float)
+        for ai, agent_id in enumerate(agent_ids):
+            for ji, job_type in enumerate(job_types):
+                if job_type:
+                    rl_bias_matrix[ai, ji] = self.q_table.get((agent_id, job_type), 0.0)
+
+        # Apply RL bias: higher Q → lower effective cost
+        adjusted_cost_matrix = cost_matrix * (1 - rl_bias_matrix)
+
+        min_cost_agents = []
+
+        # Loop per job, but no inner agent loop
+        for j in range(num_jobs):
+            valid_costs = adjusted_cost_matrix[:, j]
+            finite_mask = np.isfinite(valid_costs)
+            if not np.any(finite_mask):
+                continue
+
+            min_cost = np.min(valid_costs[finite_mask])
+            threshold = min_cost * (1 + threshold_pct / 100.0)
+
+            candidates_idx = np.where(valid_costs <= threshold)[0]
+            candidates = [(agent_ids[i], valid_costs[i]) for i in candidates_idx]
+
+            # Epsilon-greedy exploration
+            if self.exploration_rate > 0 and random.random() < self.exploration_rate:
+                selected_agent = random.choice(candidates)
+            else:
+                selected_agent = min(candidates, key=lambda x: (x[1], x[0]))
+
+            min_cost_agents.append(selected_agent)
         return min_cost_agents
 
     def job_selection_main(self):
