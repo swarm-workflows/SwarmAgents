@@ -331,6 +331,7 @@ class SwarmAgent(Agent):
     def _do_periodic(self):
         while not self.shutdown:
             try:
+                self.restart_selection()
                 current_time = int(time.time())
                 self._refresh_children(int(current_time))
                 agent_info = self.generate_agent_info()
@@ -350,8 +351,6 @@ class SwarmAgent(Agent):
                     update_fn(jobs=jobs)
 
                 time.sleep(0.5)
-
-                self.restart_selection()
 
                 self.check_queue()
                 if self.should_shutdown():
