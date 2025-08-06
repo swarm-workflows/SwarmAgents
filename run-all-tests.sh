@@ -3,7 +3,7 @@
 # Configuration
 AGENT_COUNTS=(10)
 TOPOLOGIES=("mesh" "ring" "star")
-AGENT_TYPES=("swarm-multi" "db-swarm-multi")
+AGENT_TYPES=("swarm-multi")
 MAX_RETRIES=1  # Number of repetitions per configuration
 TASKS=100
 JOBS_PER_PROPSAL=10
