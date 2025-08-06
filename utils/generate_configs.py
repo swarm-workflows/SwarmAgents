@@ -226,15 +226,21 @@ class SwarmConfigGenerator:
 
         config_prefix = self.get_config_prefix()
 
+        # Step 1: Create a global DTN pool once
+        dtn_pool = self.generate_global_dtn_pool(total_count=10)
+
         # Generate YAML files for each agent
         for agent_id in range(1, self.num_agents + 1):
             config = self.base_config.copy()
 
+            # Step 3: Assign random DTNs from pool to this agent
+            config["dtns"] = self.assign_agent_dtns(dtn_pool, min_dtns=1, max_dtns=4)
+
             # Randomize capacities
-            config['capacities']['cpu'] = self.random_capacity(1, 8)
-            config['capacities']['gpu'] = self.random_capacity(1, 8)
-            config['capacities']['ram'] = self.random_capacity(16, 64)
-            config['capacities']['disk'] = self.random_capacity(100, 500)
+            config['capacities']['core'] = 8#self.random_capacity(1, 8)
+            config['capacities']['gpu'] = 8#self.random_capacity(1, 8)
+            config['capacities']['ram'] = 16#self.random_capacity(8, 64)
+            config['capacities']['disk'] = 500#self.random_capacity(100, 500)
 
             config["redis"]["host"] = self.db_host
             config["topology"] = {"peer_agents": agent_topo[agent_id]["peers"], "type": self.topology,
@@ -252,6 +258,40 @@ class SwarmConfigGenerator:
     @staticmethod
     def random_capacity(min_val, max_val):
         return random.randint(min_val, max_val)
+
+    def generate_global_dtn_pool(self, total_count=10):
+        """
+        Create a global pool of DTNs with base connectivity scores.
+        These are later subsetted for each agent.
+        """
+        pool = []
+        for i in range(1, total_count + 1):
+            pool.append({
+                "name": f"dtn{i}",
+                "ip": f"192.168.100.{i}",
+                "user": f"dtn_user{i}",
+                "base_connectivity_score": round(random.uniform(0.6, 0.95), 2)
+            })
+        return pool
+
+    def assign_agent_dtns(self, pool, min_dtns=1, max_dtns=4):
+        """
+        Assign a random subset of DTNs to an agent, adjusting connectivity scores
+        slightly to reflect per-agent network differences.
+        """
+        count = random.randint(min_dtns, max_dtns)
+        selected = random.sample(pool, count)
+        agent_dtns = []
+        for d in selected:
+            # Add per-agent variation to score
+            adjusted_score = min(1.0, max(0.0, d["base_connectivity_score"] + random.uniform(-0.05, 0.05)))
+            agent_dtns.append({
+                "name": d["name"],
+                "ip": d["ip"],
+                "user": d["user"],
+                "connectivity_score": round(adjusted_score, 2)
+            })
+        return agent_dtns
 
 
 if __name__ == "__main__":

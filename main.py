@@ -21,76 +21,18 @@
 # SOFTWARE.
 #
 # Author: Komal Thareja(kthare10@renci.org)
-import json
 import sys
-import threading
-import time
-from typing import List
-
-from swarm.agents.agent import Agent
-from swarm.models.capacities import Capacities
-from swarm.models.data_node import DataNode
-from swarm.models.job import Job
-from swarm.queue.simple_job_queue import SimpleJobQueue
-
-
-class TaskDistributor(threading.Thread):
-    def __init__(self, agent: Agent, task_pool: List[Job], tasks_per_interval: int, interval: int):
-        super().__init__()
-        self.agent = agent
-        self.task_pool = task_pool
-        self.tasks_per_interval = tasks_per_interval
-        self.interval = interval
-        self.shutdown = False
-        self.total_tasks = len(self.task_pool)
-
-    def run(self):
-        print("Started Task Distributor")
-        total_tasks_added = 0
-        while not self.shutdown and self.task_pool:
-            tasks_to_add = [self.task_pool.pop() for _ in range(min(self.tasks_per_interval, len(self.task_pool)))]
-            for task in tasks_to_add:
-                self.agent.queues.job_queue.add_job(task)
-                total_tasks_added += 1
-            time.sleep(1)
-            if total_tasks_added == self.total_tasks:
-                break
-        print("Stopped Task Distributor")
-
-    def stop(self):
-        self.shutdown = True
-
-
-def build_tasks_from_json(json_file):
-    tasks = []
-    with open(json_file, 'r') as f:
-        data = json.load(f)
-        for task_data in data:
-            task = Job()
-            task.set_job_id(task_data['id'])
-            task.set_capacities(Capacities.from_dict(task_data['capacities']))
-            task.no_op = task_data['no_op']
-            for data_in in task_data['data_in']:
-                data_node = DataNode.from_dict(data_in)
-                task.add_incoming_data_dep(data_node)
-            for data_out in task_data['data_out']:
-                data_node = DataNode.from_dict(data_out)
-                task.add_outgoing_data_dep(data_node)
-            tasks.append(task)
-    return tasks
 
 
 if __name__ == '__main__':
-    if len(sys.argv) < 5:
-        print("Usage: python main.py <agent_type> <agent_id> <task_count> <agent_count> [<topo>]")
+    if len(sys.argv) < 3:
+        print("Usage: python main.py <agent_type> <agent_id> [<topo>]")
         sys.exit(1)
 
     agent_type = sys.argv[1].lower()
     agent_id = int(sys.argv[2])
-    task_count = int(sys.argv[3])
-    total_agents = int(sys.argv[4])
 
-    local_topo = True if len(sys.argv) > 5 else False
+    local_topo = True if len(sys.argv) > 3 else False
 
     # Load configuration based on agent type
     if agent_type == "pbft":
@@ -121,17 +63,5 @@ if __name__ == '__main__':
     else:
         print(f"Unknown agent type: {agent_type}")
         sys.exit(1)
-
-    '''
-    task_pool = build_tasks_from_json('tasks.json')
-    tasks_per_interval = 1  # Number of tasks to add each interval
-    interval = 5  # Interval in seconds
-
-    if isinstance(agent.queues.job_queue, SimpleJobQueue):
-        distributor = JobDistributor(agent=agent, task_pool=task_pool, tasks_per_interval=tasks_per_interval,
-                                      interval=interval)
-
-        distributor.start()
-    '''
 
     agent.start()

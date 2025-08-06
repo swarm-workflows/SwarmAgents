@@ -460,7 +460,7 @@ def plots(number_of_agents: int):
         data_raft = compute_metrics(run_directory=f"./raft/10/repeated",
                                     number_of_agents=10, algo="Raft")
         data_list = [data_pbft, data_swarm_single, data_raft, data_swarm_multi]
-        plot_means_median_line(number_of_agents=10, data_list=data_list, file_name_suffix="raft")
+        plot_means_median_line(number_of_agents=10, data_list=data_list, file_name_suffix="../runs/raft")
 
 
 if __name__ == '__main__':

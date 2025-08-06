@@ -54,33 +54,39 @@ class JobGenerator:
         :return: Dictionary representing a job
         """
         job_id = str(x)
-        no_op = round(random.uniform(0.1, 30.0), 2)
+        execution_time = round(random.uniform(0.1, 30.0), 2)
         core = round(random.uniform(0.1, 4.0), 2)
+        gpu = round(random.uniform(0.1, 4.0), 2)
         ram = round(random.uniform(0.1, 4.0), 2)
         disk = round(random.uniform(0.1, 4.0), 2)
         status = random.choice([0, -1])
+        dtn_count = 10
+        dtns = []
+        for i in range(1, dtn_count + 1):
+            dtns.append(f"dtn{i}")
+        input_files = ['/var/tmp/outgoing/file100M.txt',
+                       '/var/tmp/outgoing/file500M.txt',
+                       '/var/tmp/outgoing/file1G.txt']
 
-        remote_ips = ['192.158.2.1', '192.158.1.2', '192.158.4.2']
-        input_files = ['/var/tmp/outgoing/file100M.txt', '/var/tmp/outgoing/file500M.txt', '/var/tmp/outgoing/file1G.txt']
-        output_files = ['/var/tmp/outgoing/file100M.txt', '/var/tmp/outgoing/file500M.txt', '/var/tmp/outgoing/file1G.txt']
+        output_files = ['/var/tmp/outgoing/file100M.txt',
+                        '/var/tmp/outgoing/file500M.txt',
+                        '/var/tmp/outgoing/file1G.txt']
 
         data_in = [
-            {'remote_ip': random.choice(remote_ips),
-             'remote_file': random.choice(input_files),
-             'remote_user': 'root'}
+            {'name': random.choice(dtns),
+             'file': random.choice(input_files)}
             for _ in range(random.randint(0, 3))
         ]
         data_out = [
-            {'remote_ip': random.choice(remote_ips),
-             'remote_file': random.choice(output_files),
-             'remote_user': 'root'}
+            {'name': random.choice(dtns),
+             'file': random.choice(output_files)}
             for _ in range(random.randint(0, 3))
         ]
 
         return {
             'id': job_id,
-            'no_op': no_op,
-            'capacities': {'core': core, 'ram': ram, 'disk': disk},
+            'execution_time': execution_time,
+            'capacities': {'core': core, 'ram': ram, 'disk': disk, 'gpu': gpu},
             'data_in': data_in,
             'data_out': data_out,
             'status': status

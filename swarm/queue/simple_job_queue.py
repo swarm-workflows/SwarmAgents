@@ -36,14 +36,18 @@ class SimpleJobQueue(JobQueue):
         with self.lock:
             return len(self.jobs)
 
-    def get_jobs(self, states: list[JobState] = None) -> list[Job]:
+    def get_jobs(self, states: list[JobState] = None, count: int = None) -> list[Job]:
         with self.lock:
             if not states or not len(states):
                 return list(self.jobs.values())
             result = []
+            job_cnt = 0
             for j in self.jobs.values():
                 if j.get_state() in states:
                     result.append(j)
+                    job_cnt += 1
+                if count and job_cnt == count:
+                    break
             return result
 
     def add_job(self, job: Job):

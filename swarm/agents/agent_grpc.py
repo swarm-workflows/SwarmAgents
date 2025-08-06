@@ -22,13 +22,10 @@
 #
 # Author: Komal Thareja(kthare10@renci.org)
 
-import hashlib
 import json
 import logging
 import os
-import random
 import socket
-import string
 import threading
 import time
 import traceback
@@ -48,7 +45,7 @@ from swarm.models.capacities import Capacities
 from swarm.models.agent_info import AgentInfo
 from swarm.models.job import Job, JobState
 from swarm.utils.thread_safe_dict import ThreadSafeDict
-from swarm.utils.topology import Topology
+from swarm.utils.topology import Topology, TopologyType
 from swarm.utils.metrics import Metrics
 from swarm.utils.iterable_queue import IterableQueue
 
@@ -72,6 +69,7 @@ class Agent(Observer):
         self.topology = Topology(topo=self.config.get("topology", {}))
 
         self._capacities = Capacities().from_dict(self.config.get("capacities", {}))
+        self._load = 0
         self.logger = self._setup_logger()
 
         self.redis_client = redis.StrictRedis(host=self.redis_config["host"],
@@ -98,7 +96,7 @@ class Agent(Observer):
             "scheduling": threading.Thread(target=self.job_scheduling_main, daemon=True)
         }
         self.last_non_empty_time = time.time()
-        self.executor = ThreadPoolExecutor(max_workers=self.runtime_config.get("executor_workers", 10))
+        self.executor = ThreadPoolExecutor(max_workers=self.runtime_config.get("executor_workers", 3))
 
     @property
     def empty_timeout_seconds(self):
@@ -115,12 +113,15 @@ class Agent(Observer):
     @property
     def live_agent_count(self) -> int:
         """Returns the count of all known agents including self."""
-        return 1 + len(self.neighbor_map)
+        #return 1 + len(self.neighbor_map)
+        return len(self.neighbor_map)
 
     @property
     def configured_agent_count(self) -> int:
         """Returns the expected total number of agents from the runtime configuration."""
-        #return int(self.runtime_config.get("total_agents", 0))
+        if self.topology.type == TopologyType.Ring:
+            return int(self.runtime_config.get("total_agents", 0))
+
         return 1 + len(self.topology.peers)
 
     @property
@@ -159,6 +160,10 @@ class Agent(Observer):
     def capacities(self) -> Capacities:
         return self._capacities
 
+    @property
+    def capacity_allocations(self) -> Capacities:
+        return self.queues.selected_queue.capacities(self.queues.ready_queue.get_jobs())
+
     def start_idle(self):
         if self.metrics.idle_start_time is None:
             self.metrics.idle_start_time = time.time()
@@ -183,20 +188,6 @@ class Agent(Observer):
         disk = (allocated.disk / total.disk) * 100
 
         return round((core + ram + disk) / 3, 2)
-
-    def compute_overall_load(self, proposed_jobs: list[str] = None):
-        proposed_jobs = proposed_jobs or []
-        allocated_caps = Capacities()
-
-        allocated_caps += self.queues.ready_queue.capacities(self.queues.ready_queue.get_jobs())
-        allocated_caps += self.queues.selected_queue.capacities(self.queues.selected_queue.get_jobs())
-
-        for job_id in proposed_jobs:
-            if job_id not in self.queues.ready_queue and job_id not in self.queues.selected_queue:
-                job = self.queues.job_queue.get_job(job_id=job_id)
-                allocated_caps += job.capacities
-
-        return self.resource_usage_score(allocated=allocated_caps, total=self.capacities)
 
     def _setup_logger(self):
         log_path = f"{self.log_config['log-directory']}/{self.log_config['log-file']}-{self.agent_id}.log"
@@ -310,62 +301,15 @@ class Agent(Observer):
             )
             for agent_data in agent_dicts:
                 agent = AgentInfo.from_dict(agent_data)
-                if agent.agent_id and agent.agent_id != self.agent_id:
-                    existing = target_dict.get(agent.agent_id)
-                    if existing is None or agent.last_updated > existing.last_updated:
-                        target_dict.set(agent.agent_id, agent)
-                    active_ids.add(agent.agent_id)
+                #if agent.agent_id and agent.agent_id != self.agent_id:
+                existing = target_dict.get(agent.agent_id)
+                if existing is None or agent.last_updated > existing.last_updated:
+                    target_dict.set(agent.agent_id, agent)
+                active_ids.add(agent.agent_id)
 
         for agent_id, agent in list(target_dict.items()):
             if agent_id not in active_ids and (current_time - agent.last_updated) >= self.peer_expiry_seconds:
                 target_dict.remove(agent_id)
-
-    def generate_agent_info(self) -> AgentInfo:
-        """
-        Generate and return the current AgentInfo object representing this agent.
-
-        For leaf agents (with no children), the info includes:
-          - self capacities
-          - capacity allocations based on ready queue jobs
-          - computed load
-
-        For non-leaf agents (with children), the info aggregates:
-          - cumulative capacities and allocations from children
-          - cumulative load computed from aggregated values
-
-        :return: An AgentInfo object with the current agent's state
-        :rtype: AgentInfo
-        """
-        current_time = time.time()
-
-        # Leaf agent: report its own resource info
-        if not self.topology.children:
-            agent_info = AgentInfo(
-                agent_id=self.agent_id,
-                capacities=self.capacities,
-                capacity_allocations=self.queues.ready_queue.capacities(self.queues.ready_queue.get_jobs()),
-                load=self.compute_overall_load(),
-                last_updated=current_time
-            )
-        # Non-leaf agent: aggregate info from all children
-        else:
-            total_capacities = Capacities()
-            total_allocations = Capacities()
-
-            for child in self.children.values():
-                total_capacities += child.capacities
-                total_allocations += child.capacity_allocations
-
-            agent_info = AgentInfo(
-                agent_id=self.agent_id,
-                capacities=total_capacities,
-                capacity_allocations=total_allocations,
-                load=self.resource_usage_score(total_allocations, total_capacities),
-                last_updated=current_time
-            )
-            self._capacities = total_capacities
-
-        return agent_info
 
     @abstractmethod
     def _do_periodic(self):
@@ -382,7 +326,7 @@ class Agent(Observer):
                 messages = list(IterableQueue(self.queues.message_queue))
                 if messages:
                     self._process(messages=messages)
-                time.sleep(0.01)
+                time.sleep(0.5)
             except Exception as e:
                 self.logger.error(f"Inbound processing error: {e}\n{traceback.format_exc()}")
         self.logger.info("Inbound Message Handler - Stopped")
@@ -410,14 +354,14 @@ class Agent(Observer):
         """
         # Check if job fits into available capacities
         residual = available - job.get_capacities()
-        negative_fields = available.negative_fields()
+        negative_fields = residual.negative_fields()
         if len(negative_fields) > 0:
             return False
 
         # Check data transfer endpoints if required
         if self.data_transfer:
             for dn in job.get_data_in() + job.get_data_out():
-                if not self.is_reachable(hostname=dn.get_remote_ip()):
+                if not self.is_reachable(hostname=dn.get_dtn()):
                     return False
 
         return True
@@ -425,15 +369,6 @@ class Agent(Observer):
     def can_schedule_job(self, job: Job) -> bool:
         ready_caps = self.queues.ready_queue.capacities(self.queues.ready_queue.get_jobs())
         available = self.capacities - ready_caps
-        return self._has_sufficient_capacity(job, available)
-
-    def is_job_feasible(self, job: Job, total: Capacities, projected_load: float,
-                        proposed_caps: Capacities = Capacities(),
-                        allocated_caps: Capacities = Capacities()) -> bool:
-        if projected_load >= self.projected_queue_threshold:
-            return False
-        allocated_caps += proposed_caps
-        available = total - allocated_caps
         return self._has_sufficient_capacity(job, available)
 
     def execute_job(self, job: Job):
@@ -446,14 +381,14 @@ class Agent(Observer):
             if not self.queues.ready_queue.get_jobs():
                 self.start_idle()
         except Exception as e:
-            self.logger.error(f"[ERROR] Job {job_id} failed on agent {self.agent_id}: {e}")
+            self.logger.error(f"[ERROR] Job {job} failed on agent {self.agent_id}: {e}")
             self.logger.error(traceback.format_exc())
-        print(f"EXECUTED: {job.get_job_id()} on agent: {self.agent_id}")
+        #print(f"EXECUTED: {job.get_job_id()} on agent: {self.agent_id}")
 
     def save_results(self):
         self.logger.info("Saving Results")
         self.metrics.save_misc(f"{self.results_dir}/misc_{self.agent_id}.json")
-        self.metrics.save_load_trace(f"{self.results_dir}/agent_loads_{self.agent_id}.csv")
+        self.metrics.save_load_trace(self.agent_id, f"{self.results_dir}/agent_loads_{self.agent_id}.csv")
         self.metrics.save_idle_time(f"{self.results_dir}/idle_time_per_agent_{self.agent_id}.csv")
 
         lock_path = f"{self.results_dir}/result.lock"
@@ -466,17 +401,9 @@ class Agent(Observer):
             self.logger.info("Another agent has started saving results")
             return
 
-        completed_jobs = self.repo.get_all_objects(
-            key_prefix=Repository.KEY_JOB,
-            level=0,
-            state=JobState.COMPLETE.value
-        )
+        all_jobs = self.repo.get_all_objects(key_prefix=Repository.KEY_JOB, level=0)
 
-        self.metrics.save_jobs_per_agent(completed_jobs, f"{self.results_dir}/jobs_per_agent.csv")
-        self.metrics.save_scheduling_latency(
-            completed_jobs,
-            path=f"{self.results_dir}/latency.csv"
-        )
+        self.metrics.save_jobs(all_jobs, path=f"{self.results_dir}/all_jobs.csv")
         self.logger.info("Results saved")
 
     def job_scheduling_main(self):
@@ -488,7 +415,12 @@ class Agent(Observer):
 
         while not self.shutdown:
             try:
-                for job in self.queues.selected_queue.get_jobs():
+                selected_jobs = self.queues.selected_queue.get_jobs()
+                if not selected_jobs:
+                    time.sleep(0.5)
+                    continue
+
+                for job in selected_jobs:
                     job_id = job.get_job_id()
 
                     # Multi-level: delegate job to children
@@ -508,14 +440,11 @@ class Agent(Observer):
 
                     # Leaf agent: schedule job if load allows
                     else:
-                        ready_queue_load = self.compute_ready_queue_load()
-                        if ready_queue_load < self.ready_queue_threshold and self.can_schedule_job(job):
+                        if self.can_schedule_job(job):
                             self.queues.selected_queue.remove_job(job_id)
                             self.schedule_job(job)
-                        else:
-                            time.sleep(0.5)
 
-                time.sleep(1)
+                time.sleep(0.5)
 
             except Exception as e:
                 self.logger.error(f"Error in job_scheduling_main: {e}")
@@ -535,7 +464,7 @@ class Agent(Observer):
 
     def schedule_job(self, job: Job):
         self.end_idle()
-        print(f"SCHEDULED: {job.get_job_id()} on agent: {self.agent_id}")
+        #print(f"SCHEDULED: {job.get_job_id()} on agent: {self.agent_id}")
         self.logger.info(f"[SCHEDULED]: {job.get_job_id()} on agent: {self.agent_id}")
         # Add the job to the list of allocated jobs
         self.queues.ready_queue.add_job(job=job)

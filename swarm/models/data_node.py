@@ -30,28 +30,42 @@ class DataNode(JSONField):
     from JSON dictionaries of properties. Only ints are allowed.
     """
     def __init__(self, **kwargs):
-        self.remote_ip = None
-        self.remote_user = None
-        self.remote_file = None
+        self.name = None
+        self.file = None
+        self.ip = None
+        self.user = None
+        self.connectivity_score = 0.0
         self._set_fields(**kwargs)
 
-    def get_remote_ip(self) -> str:
-        return self.remote_ip
+    def get_ip(self) -> str:
+        return self.ip
 
-    def set_remote_ip(self, remote_ip):
-        self.remote_ip = remote_ip
+    def set_ip(self, ip):
+        self.ip = ip
 
-    def get_remote_user(self) -> str:
-        return self.remote_user
+    def get_user(self) -> str:
+        return self.user
 
-    def set_remote_user(self, remote_user):
-        self.remote_user = remote_user
+    def set_user(self, user):
+        self.user = user
 
-    def get_remote_file(self) -> str:
-        return self.remote_file
+    def get_connectivity_score(self) -> float:
+        return self.connectivity_score
 
-    def set_remote_file(self, remote_file):
-        self.remote_file = remote_file
+    def set_connectivity_score(self, connectivity_score):
+        self.connectivity_score = connectivity_score
+
+    def get_dtn(self) -> str:
+        return self.dtn
+
+    def set_dtn(self, dtn):
+        self.dtn = dtn
+
+    def get_file(self) -> str:
+        return self.file
+
+    def set_file(self, remote_file):
+        self.file = remote_file
 
     def _set_fields(self, forgiving=False, **kwargs):
         """
@@ -62,8 +76,6 @@ class DataNode(JSONField):
         :return: self to support call chaining
         """
         for k, v in kwargs.items():
-            if v is not None:
-                assert isinstance(v, str)
             try:
                 # will toss an exception if field is not defined
                 self.__getattribute__(k)

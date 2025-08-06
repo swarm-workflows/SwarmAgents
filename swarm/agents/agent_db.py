@@ -422,7 +422,7 @@ class Agent(Observer):
         # Check data transfer endpoints if required
         if self.data_transfer:
             for dn in job.get_data_in() + job.get_data_out():
-                if not self.is_reachable(hostname=dn.get_remote_ip()):
+                if not self.is_reachable(hostname=dn.get_dtn()):
                     return False
 
         return True

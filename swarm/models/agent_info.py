@@ -23,6 +23,7 @@
 # Author: Komal Thareja(kthare10@renci.org)
 
 from swarm.models.capacities import Capacities
+from swarm.models.data_node import DataNode
 from swarm.models.json_field import JSONField
 
 
@@ -34,10 +35,27 @@ class AgentInfo(JSONField):
     def __init__(self, **kwargs):
         self.agent_id = 0
         self.load = 0.0
+        self.proposed_load = 0.0
         self._capacities = Capacities()
         self._capacity_allocations = Capacities()
         self.last_updated = 0.0
+        self._dtns = {}
         self._set_fields(**kwargs)
+
+    @property
+    def dtns(self) -> dict[str, DataNode]:
+        return self._dtns
+
+    @dtns.setter
+    def dtns(self, value: dict):
+        if isinstance(value, list):
+            for dtn_info in value:
+                self.dtns[dtn_info.get('name')] = dtn_info
+        elif isinstance(value, dict):
+            for key, dtn_info in value.items():
+                self.dtns[key] = DataNode.from_dict(dtn_info)
+        else:
+            raise ValueError("Unsupported value type for dtns")
 
     @property
     def capacities(self) -> Capacities:
@@ -50,7 +68,7 @@ class AgentInfo(JSONField):
         elif isinstance(value, dict):
             self._capacities = Capacities.from_dict(value)
         else:
-            raise ValueError("Unsupported value type for capacity_allocations")
+            raise ValueError("Unsupported value type for capacities")
 
     @property
     def capacity_allocations(self) -> Capacities:
@@ -86,7 +104,8 @@ class AgentInfo(JSONField):
         return self
 
     def __str__(self):
-        result = f"agent_id: {self.agent_id}, load: {self.load}, capacities: {self.capacities}"
+        result = f"agent_id: {self.agent_id}, load: {self.load}, proposed_load: {self.proposed_load}," \
+                 f" capacities: {self.capacities}"
         if self.capacity_allocations:
             result += f" capacity_allocations: {self.capacity_allocations}"
         return result

@@ -30,6 +30,15 @@ topology:
 grpc:
   port: 50051
   host: localhost
+dtns:
+  - name: dtn1
+    ip: "192.168.1.10"
+    user: "dtn_user"
+    connectivity_score: 0.95
+  - name: dtn2
+    ip: "192.168.1.11"
+    user: "dtn_user2"
+    connectivity_score: 0.87
 runtime:
   profile: BalancedProfile
   data_transfer: False
@@ -65,3 +74,13 @@ logging:
   log-size: 5000000
 
   logger: agent
+job_selection:
+  cost_weights:
+    cpu: 0.4       # Relative importance of CPU utilization in job cost (0–1, sum of all weights should ≈ 1.0)
+    ram: 0.3       # Relative importance of RAM utilization in job cost (0–1)
+    disk: 0.2      # Relative importance of Disk utilization in job cost (0–1)
+    gpu: 0.1       # Relative importance of GPU utilization in job cost (0–1)
+
+  long_job_threshold: 20.0            # Execution time (in seconds) beyond which jobs incur extra penalty
+  connectivity_penalty_factor: 1.0    # Multiplier for DTN connectivity penalty (0=no effect, >1 increases penalty severity)
+  selection_threshold_pct: 10.0       # % above min cost allowed in candidate selection (lower = stricter, higher = more agents considered)

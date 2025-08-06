@@ -552,11 +552,11 @@ class Agent(Observer):
 
         if self.data_transfer:
             for data_node in job.get_data_in():
-                if not self.is_reachable(hostname=data_node.get_remote_ip()):
+                if not self.is_reachable(hostname=data_node.get_dtn()):
                     return 0
 
             for data_node in job.get_data_out():
-                if not self.is_reachable(hostname=data_node.get_remote_ip()):
+                if not self.is_reachable(hostname=data_node.get_dtn()):
                     return 0
         return 1
 
@@ -577,11 +577,11 @@ class Agent(Observer):
 
         if self.data_transfer:
             for data_node in job.get_data_in():
-                if not self.is_reachable(hostname=data_node.get_remote_ip()):
+                if not self.is_reachable(hostname=data_node.get_dtn()):
                     return False
 
             for data_node in job.get_data_out():
-                if not self.is_reachable(hostname=data_node.get_remote_ip()):
+                if not self.is_reachable(hostname=data_node.get_dtn()):
                     return False
 
         return True
@@ -599,11 +599,11 @@ class Agent(Observer):
 
         if self.data_transfer:
             for data_node in job.get_data_in():
-                if not self.is_reachable(hostname=data_node.get_remote_ip()):
+                if not self.is_reachable(hostname=data_node.get_dtn()):
                     return False
 
             for data_node in job.get_data_out():
-                if not self.is_reachable(hostname=data_node.get_remote_ip()):
+                if not self.is_reachable(hostname=data_node.get_dtn()):
                     return False
 
         return True

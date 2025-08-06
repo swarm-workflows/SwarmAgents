@@ -52,7 +52,7 @@ class JobState(enum.Enum):
 
 job = {
     "id": "job_id",
-    "no_op": 10,
+    "execution_time": 10,
     "capacities": {
         "core": 1,
         "ram": 100,
@@ -89,7 +89,7 @@ class Job:
         self.job_id = None
         self.capacities = None
         self.capacity_allocations = None
-        self.no_op = 0
+        self.execution_time = 0
         self.data_in = []
         self.data_out = []
         self.state = JobState.PENDING
@@ -133,11 +133,11 @@ class Job:
         with self.lock:
             self.completed_at = time.time()
 
-    def get_leader_agent_id(self) -> str:
+    def get_leader_agent_id(self) -> int:
         with self.lock:
             return self.leader_agent_id
 
-    def set_leader(self, leader_agent_id: str):
+    def set_leader(self, leader_agent_id: int):
         with self.lock:
             self.leader_agent_id = leader_agent_id
 
@@ -267,9 +267,9 @@ class Job:
     def __str__(self):
         return self.__repr__()
 
-    def get_no_op(self) -> float:
+    def get_execution_time(self) -> float:
         with self.lock:
-            return self.no_op
+            return self.execution_time
 
     def set_data_in_time(self, data_in_time: int):
         with self.lock:
@@ -283,37 +283,14 @@ class Job:
         try:
             self.logger.info(f"Starting execution for job: {self.job_id}")
             self.change_state(new_state=JobState.RUNNING)
-            if data_transfer:
-                begin = time.time()
-                # Transfer files from data_in nodes
-                for data_node in self.get_data_in():
-                    remote_ip = data_node.get_remote_ip()
-                    remote_user = data_node.get_remote_user()
-                    remote_file = data_node.get_remote_file()
-                    # Perform file transfer from remote node
-                    self.logger.info(f"Transferring file {remote_file} from {remote_user}@{remote_ip}")
-                    # Implement file transfer logic here, e.g., using SSH, SCP, or other file transfer protocols
-                    self.file_transfer(operation=Job.OP_GET, remote_ip=data_node.get_remote_ip(),
-                                       remote_user=data_node.get_remote_user(), remote_file=data_node.get_remote_file())
-                self.set_data_in_time(data_in_time=int(time.time() - begin))
+            # TODO: Transfer files from data_in nodes
 
-            # Simulate job execution by sleeping for no_op seconds
-            no_op = self.get_no_op()
-            self.logger.info(f"Sleeping for {no_op} seconds to simulate job execution")
-            time.sleep(no_op)
+            # Simulate job execution by sleeping for execution_time seconds
+            execution_time = self.get_execution_time()
+            self.logger.info(f"Sleeping for {execution_time} seconds to simulate job execution")
+            time.sleep(execution_time)
 
-            if data_transfer:
-                begin = time.time()
-                # Transfer files to data_out nodes
-                for data_node in self.get_data_out():
-                    remote_ip = data_node.get_remote_ip()
-                    remote_user = data_node.get_remote_user()
-                    remote_file = data_node.get_remote_file()
-                    # Perform file transfer to remote node
-                    self.logger.info(f"Transferring file {remote_file} to {remote_user}@{remote_ip}")
-                    self.file_transfer(operation=Job.OP_PUT, remote_ip=data_node.get_remote_ip(),
-                                       remote_user=data_node.get_remote_user(), remote_file=data_node.get_remote_file())
-                self.set_data_out_time(data_out_time=int(time.time() - begin))
+            # TODO: Transfer files from data_out nodes
 
             self.change_state(new_state=JobState.COMPLETE)
             self.logger.info(f"Completed execution for job: {self.job_id}")
@@ -382,7 +359,7 @@ class Job:
             'id': self.job_id,
             'capacities': self.capacities.to_dict() if self.capacities else None,
             'capacity_allocations': self.capacity_allocations,
-            'no_op': self.no_op,
+            'execution_time': self.execution_time,
             'data_in': [data_node.to_dict() for data_node in self.data_in],
             'data_out': [data_node.to_dict() for data_node in self.data_out],
             'state': self.state.value,
@@ -404,11 +381,11 @@ class Job:
         self.job_id = job_data['id']
         self.capacities = Capacities.from_dict(job_data['capacities']) if job_data.get('capacities') else None
         self.capacity_allocations = Capacities.from_dict(job_data['capacity_allocations']) if job_data.get('capacity_allocations') else None
-        self.no_op = job_data['no_op']
+        self.execution_time = job_data['execution_time']
         self.data_in = [DataNode.from_dict(data_in) for data_in in job_data['data_in']]
         self.data_out = [DataNode.from_dict(data_out) for data_out in job_data['data_out']]
         self.state = JobState(job_data['state']) if job_data.get('state') else JobState.PENDING
-        self.status = JobState(job_data['status']) if job_data.get('status') else 0
+        self.status = job_data['status'] if job_data.get('status') else 0
         self.data_in_time = job_data['data_in_time'] if job_data.get('data_in_time') is not None else None
         self.data_out_time = job_data['data_out_time'] if job_data.get('data_out_time') is not None else None
         self.prepares = job_data['prepares'] if job_data.get('prepares') else 0
