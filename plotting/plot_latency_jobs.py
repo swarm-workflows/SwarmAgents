@@ -7,37 +7,47 @@ import os
 def plot_scheduling_latency_and_jobs(csv_file, output_dir, agent_count):
     df = pd.read_csv(csv_file)
 
-    # Compute selection latency
+    # Compute scheduling latency
     df["scheduling_latency"] = df["selected_by_agent_at"] - df["created_at"]
 
     # Group by leader agent
     grouped = df.groupby("leader_agent_id")
 
-    # Plot selection latency per job
+    # Plot scheduling latency per job (scatter)
     plt.figure(figsize=(12, 6))
     for agent_id, group in grouped:
         plt.scatter(group["job_id"], group["scheduling_latency"], label=f"Agent {int(agent_id)}", s=12)
     plt.xlabel("Job ID")
     plt.ylabel("Scheduling Latency (s)")
-    plt.title(f"SWARm-MULTI: Scheduling Latency per Job (Mean: {df['scheduling_latency'].mean():.4f} s/ Agents {agent_count})")
+    plt.title(f"SWARM-MULTI: Scheduling Latency per Job "
+              f"(Mean: {df['scheduling_latency'].mean():.4f} s / Agents {agent_count})")
     plt.legend()
     plt.grid(True)
     plt.savefig(os.path.join(output_dir, "selection_latency_per_job.png"), bbox_inches="tight")
     plt.close()
 
-    # Jobs per agent (keep original order of IDs as in CSV)
+    # Jobs per agent (bar plot)
     jobs_per_agent = grouped.size()
     jobs_per_agent = jobs_per_agent.reindex(df["leader_agent_id"].unique())
 
-    # Plot
     plt.figure(figsize=(10, 6))
     plt.bar(jobs_per_agent.index, jobs_per_agent.values)
     plt.xlabel("Agent ID")
     plt.ylabel("Number of Jobs")
     plt.title("Jobs per Agent")
     plt.grid(axis="y")
-    plt.xticks(jobs_per_agent.index)  # Keep actual agent IDs as tick labels
+    plt.xticks(jobs_per_agent.index)
     plt.savefig(os.path.join(output_dir, "jobs_per_agent.png"), bbox_inches="tight")
+    plt.close()
+
+    # Histogram of scheduling latency
+    plt.figure(figsize=(10, 6))
+    plt.hist(df["scheduling_latency"], bins=20, edgecolor='black', alpha=0.7)
+    plt.xlabel("Scheduling Latency (s)")
+    plt.ylabel("Frequency")
+    plt.title("Distribution of Scheduling Latency")
+    plt.grid(axis="y")
+    plt.savefig(os.path.join(output_dir, "scheduling_latency_histogram.png"), bbox_inches="tight")
     plt.close()
 
     # Print summary
