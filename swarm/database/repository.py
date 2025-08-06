@@ -153,7 +153,7 @@ class Repository:
             all_keys = self.redis.scan_iter(f'{key_prefix}:{level}:{group}:*')
         return [key.split(":", 3)[-1] for key in all_keys]
 
-    def get_all_objects(self, key_prefix: str = KEY_JOB, level: int = 0, group: int = 0, state: int = None) -> List[dict]:
+    def get_all_objects(self, key_prefix: str = KEY_JOB, level: int = 0, group: int = None, state: int = None) -> List[dict]:
         """
         Retrieve all objects under given key prefix.
 

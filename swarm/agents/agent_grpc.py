@@ -391,19 +391,20 @@ class Agent(Observer):
         self.metrics.save_load_trace(self.agent_id, f"{self.results_dir}/agent_loads_{self.agent_id}.csv")
         self.metrics.save_idle_time(f"{self.results_dir}/idle_time_per_agent_{self.agent_id}.csv")
 
-        lock_path = f"{self.results_dir}/result.lock"
+        if self.topology.level == 0:
+            lock_path = f"{self.results_dir}/result.lock"
 
-        try:
-            # Try to create the lock file atomically
-            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.close(fd)  # Lock acquired
-        except FileExistsError:
-            self.logger.info("Another agent has started saving results")
-            return
+            try:
+                # Try to create the lock file atomically
+                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.close(fd)  # Lock acquired
+            except FileExistsError:
+                self.logger.info("Another agent has started saving results")
+                return
 
-        all_jobs = self.repo.get_all_objects(key_prefix=Repository.KEY_JOB, level=0)
+            all_jobs = self.repo.get_all_objects(key_prefix=Repository.KEY_JOB, level=0)
 
-        self.metrics.save_jobs(all_jobs, path=f"{self.results_dir}/all_jobs.csv")
+            self.metrics.save_jobs(all_jobs, path=f"{self.results_dir}/all_jobs.csv")
         self.logger.info("Results saved")
 
     def job_scheduling_main(self):
