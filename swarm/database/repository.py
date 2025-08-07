@@ -173,10 +173,13 @@ class Repository:
                 state_key = f"state:{level}:*:{state}"
             keys = self.redis.smembers(state_key)
         else:
-            if group is not None:
-                keys = self.redis.scan_iter(f'{key_prefix}:{level}:{group}:*')
+            if level is None:
+                keys = self.redis.scan_iter(f'{key_prefix}:*')
             else:
-                keys = self.redis.scan_iter(f'{key_prefix}:{level}:*')
+                if group is not None:
+                    keys = self.redis.scan_iter(f'{key_prefix}:{level}:{group}:*')
+                else:
+                    keys = self.redis.scan_iter(f'{key_prefix}:{level}:*')
         results = []
         for key in keys:
             val = self.redis.get(key)

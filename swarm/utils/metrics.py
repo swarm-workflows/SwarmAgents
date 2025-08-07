@@ -37,6 +37,11 @@ class Metrics:
                 "conflicts": self.conflicts
             }, file, indent=4)
 
+    def save_agents(self, agents: list[Any], path: str):
+        # Save combined CSV with leader_agent_id
+        with open(path, 'w', newline='') as f:
+            json.dump(agents, f, indent=2)
+
     def save_jobs(self, jobs: list[Any], path: str):
         detailed_latency = []  # For combined output
         for job_data in jobs:
