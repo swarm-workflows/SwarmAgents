@@ -210,7 +210,6 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    os.makedirs(args.output_dir, exist_ok=True)
     plot_scheduling_latency_and_jobs(args.run_dir, args.agents)
     plot_conflicts_and_restarts(args.run_dir)
     plot_conflicts_and_restarts_by_agent(args.run_dir)
