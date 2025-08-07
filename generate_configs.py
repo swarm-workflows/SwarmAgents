@@ -170,14 +170,15 @@ class SwarmConfigGenerator:
                 return
 
             agent_topo = {}
-            num_groups = 10#5
-            group_size = 10#5
+            num_groups = 10 if self.num_agents > 30 else 5
+            group_size = 10 if self.num_agents > 30 else 5
 
             # Level 0 (leaf agents)
             for group in range(num_groups):
                 start = group * group_size + 1
                 end = start + group_size
-                parent_id = 101 + group #26 + group
+                base = 101 if self.num_agents > 30 else 26
+                parent_id = base + group
                 for agent_id in range(start, end):
                     peers = list(range(start, end))
                     peers.remove(agent_id)
@@ -191,10 +192,10 @@ class SwarmConfigGenerator:
 
             # Level 1 (parent agents)
             for group in range(num_groups):
-                parent_id = 101 + group #26 + group
+                base = 101 if self.num_agents > 30 else 26
+                parent_id = base + group
                 agent_topo[parent_id] = {
-                    #"peers": [26 + i for i in range(num_groups) if i != group],  # all other parents
-                    "peers": [101 + i for i in range(num_groups) if i != group],  # all other parents
+                    "peers": [base + i for i in range(num_groups) if i != group],  # all other parents
                     "parent": None,
                     "children": [group],  # Just the group number this agent manages
                     "group": 0,
