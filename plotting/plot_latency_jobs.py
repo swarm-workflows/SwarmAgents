@@ -16,6 +16,12 @@ def plot_agent_loads_from_dir(run_dir):
         if filename.startswith("agent_loads_") and filename.endswith(".csv"):
             file_path = os.path.join(run_dir, filename)
             df = pd.read_csv(file_path)
+
+            # Skip empty files
+            if df.empty or "agent_id" not in df.columns:
+                print(f"Skipping empty or malformed file: {filename}")
+                continue
+
             agent_id = df["agent_id"].iloc[0]
             df["relative_time"] = df["timestamp"] - df["timestamp"].min()
             agent_data[agent_id] = df
