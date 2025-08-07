@@ -170,14 +170,14 @@ class SwarmConfigGenerator:
                 return
 
             agent_topo = {}
-            num_groups = 5
-            group_size = 5
+            num_groups = 10#5
+            group_size = 10#5
 
             # Level 0 (leaf agents)
             for group in range(num_groups):
                 start = group * group_size + 1
                 end = start + group_size
-                parent_id = 26 + group
+                parent_id = 101 + group #26 + group
                 for agent_id in range(start, end):
                     peers = list(range(start, end))
                     peers.remove(agent_id)
@@ -191,29 +191,15 @@ class SwarmConfigGenerator:
 
             # Level 1 (parent agents)
             for group in range(num_groups):
-                parent_id = 26 + group
+                parent_id = 101 + group #26 + group
                 agent_topo[parent_id] = {
-                    "peers": [26 + i for i in range(num_groups) if i != group],  # all other parents
+                    #"peers": [26 + i for i in range(num_groups) if i != group],  # all other parents
+                    "peers": [101 + i for i in range(num_groups) if i != group],  # all other parents
                     "parent": None,
                     "children": [group],  # Just the group number this agent manages
                     "group": 0,
                     "level": 1
                 }
-            '''
-            # Level 1 (parents)
-            for group in range(num_groups):
-                parent_id = 26 + group
-                start = group * group_size + 1
-                end = start + group_size
-                children = list(range(start, end))
-                agent_topo[parent_id] = {
-                    "peers": [26 + i for i in range(num_groups) if i != group],  # connect all parents
-                    "parent": None,
-                    "children": children,
-                    "group": group,
-                    "level": 1
-                }
-            '''
         else:
             agent_topo = {}
             agent_peers = {
