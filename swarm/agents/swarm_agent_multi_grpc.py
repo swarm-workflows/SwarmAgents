@@ -413,16 +413,18 @@ class SwarmAgent(Agent):
             for dtn in dtn_map.values():
                 dtns.append(dtn.to_dict())
 
+            self._capacities = total_capacities
             self._load = self.resource_usage_score(total_allocations, total_capacities)
+            proposed_load = self.compute_proposed_load()
             agent_info = AgentInfo(
                 agent_id=self.agent_id,
                 capacities=total_capacities,
                 capacity_allocations=total_allocations,
                 load=self._load,
                 last_updated=current_time,
-                dtns=dtns
+                dtns=dtns,
+                proposed_load=proposed_load
             )
-            self._capacities = total_capacities
 
         return agent_info
 
