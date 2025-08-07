@@ -6,7 +6,56 @@ import argparse
 import os
 
 
-def plot_conflicts_and_restarts_by_agent(misc_dir: str, output_dir: str):
+def plot_agent_loads_from_dir(run_dir):
+    agent_data = {}
+    mean_loads = {}
+    max_loads = {}
+
+    # Read all agent_loads_*.csv files
+    for filename in sorted(os.listdir(run_dir)):
+        if filename.startswith("agent_loads_") and filename.endswith(".csv"):
+            file_path = os.path.join(run_dir, filename)
+            df = pd.read_csv(file_path)
+            agent_id = df["agent_id"].iloc[0]
+            df["relative_time"] = df["timestamp"] - df["timestamp"].min()
+            agent_data[agent_id] = df
+            mean_loads[agent_id] = df["load"].mean()
+            max_loads[agent_id] = df["load"].max()
+
+    # Plot load over time
+    plt.figure(figsize=(12, 6))
+    for agent_id, df in agent_data.items():
+        plt.plot(df["relative_time"], df["load"], label=f"Agent {agent_id}")
+    plt.xlabel("Time (s since start)")
+    plt.ylabel("Load")
+    plt.title("Agent Load Over Time")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(run_dir, "agent_loads_over_time.png"))
+    print(f"Saved: {os.path.join(run_dir, 'agent_loads_over_time.png')}")
+
+    # Plot mean and max loads
+    fig, ax = plt.subplots(figsize=(10, 5))
+    x = list(mean_loads.keys())
+    mean_vals = [mean_loads[k] for k in x]
+    max_vals = [max_loads[k] for k in x]
+
+    width = 0.35
+    ax.bar([i - width/2 for i in range(len(x))], mean_vals, width, label='Mean Load')
+    ax.bar([i + width/2 for i in range(len(x))], max_vals, width, label='Max Load')
+
+    ax.set_xticks(range(len(x)))
+    ax.set_xticklabels([f"Agent {aid}" for aid in x])
+    ax.set_ylabel("Load")
+    ax.set_title("Mean and Max Load per Agent")
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(run_dir, "agent_loads_summary.png"))
+    print(f"Saved: {os.path.join(run_dir, 'agent_loads_summary.png')}")
+
+
+def plot_conflicts_and_restarts_by_agent(run_dir: str):
     """
     Parses misc_<agent_id>.json files and plots:
     - Total conflicts per agent
@@ -15,10 +64,10 @@ def plot_conflicts_and_restarts_by_agent(misc_dir: str, output_dir: str):
     agent_conflict_counts = {}
     agent_restart_counts = {}
 
-    for fname in os.listdir(misc_dir):
+    for fname in os.listdir(run_dir):
         if fname.startswith("misc_") and fname.endswith(".json"):
             agent_id = fname.split("_")[1].split(".")[0]
-            with open(os.path.join(misc_dir, fname), "r") as f:
+            with open(os.path.join(run_dir, fname), "r") as f:
                 data = json.load(f)
                 total_conflicts = sum(data.get("conflicts", {}).values())
                 total_restarts = sum(data.get("restarts", {}).values())
@@ -37,7 +86,7 @@ def plot_conflicts_and_restarts_by_agent(misc_dir: str, output_dir: str):
         plt.ylabel("Total Conflicts")
         plt.title("Total Conflicts per Agent")
         plt.grid(axis="y")
-        plt.savefig(os.path.join(output_dir, "conflicts_per_agent.png"), bbox_inches="tight")
+        plt.savefig(os.path.join(run_dir, "conflicts_per_agent.png"), bbox_inches="tight")
         plt.close()
 
     # Restarts per agent
@@ -52,19 +101,19 @@ def plot_conflicts_and_restarts_by_agent(misc_dir: str, output_dir: str):
         plt.ylabel("Total Restarts")
         plt.title("Total Restarts per Agent")
         plt.grid(axis="y")
-        plt.savefig(os.path.join(output_dir, "restarts_per_agent.png"), bbox_inches="tight")
+        plt.savefig(os.path.join(run_dir, "restarts_per_agent.png"), bbox_inches="tight")
         plt.close()
 
     return agent_conflict_counts, agent_restart_counts
 
 
-def plot_conflicts_and_restarts(misc_dir: str, output_dir: str):
+def plot_conflicts_and_restarts(run_dir: str):
     all_conflicts = {}
     all_restarts = {}
 
-    for fname in os.listdir(misc_dir):
+    for fname in os.listdir(run_dir):
         if fname.startswith("misc_") and fname.endswith(".json"):
-            with open(os.path.join(misc_dir, fname), "r") as f:
+            with open(os.path.join(run_dir, fname), "r") as f:
                 data = json.load(f)
                 for job_id, count in data.get("conflicts", {}).items():
                     all_conflicts[job_id] = all_conflicts.get(job_id, 0) + count
@@ -82,7 +131,7 @@ def plot_conflicts_and_restarts(misc_dir: str, output_dir: str):
         plt.ylabel("Conflict Count")
         plt.title("Conflicts per Job (aggregated across agents)")
         plt.grid(axis="y")
-        plt.savefig(os.path.join(output_dir, "conflicts_per_job.png"), bbox_inches="tight")
+        plt.savefig(os.path.join(run_dir, "conflicts_per_job.png"), bbox_inches="tight")
         plt.close()
 
     if not df_restarts.empty:
@@ -93,12 +142,14 @@ def plot_conflicts_and_restarts(misc_dir: str, output_dir: str):
         plt.ylabel("Restart Count")
         plt.title("Restarts per Job (aggregated across agents)")
         plt.grid(axis="y")
-        plt.savefig(os.path.join(output_dir, "restarts_per_job.png"), bbox_inches="tight")
+        plt.savefig(os.path.join(run_dir, "restarts_per_job.png"), bbox_inches="tight")
         plt.close()
 
     return df_conflicts, df_restarts
 
-def plot_scheduling_latency_and_jobs(csv_file, output_dir, agent_count):
+
+def plot_scheduling_latency_and_jobs(run_dir, agent_count):
+    csv_file = f"{run_dir}/all_jobs.csv"
     df = pd.read_csv(csv_file)
 
     # Compute scheduling latency
@@ -117,7 +168,7 @@ def plot_scheduling_latency_and_jobs(csv_file, output_dir, agent_count):
               f"(Mean: {df['scheduling_latency'].mean():.4f} s / Agents {agent_count})")
     plt.legend()
     plt.grid(True)
-    plt.savefig(os.path.join(output_dir, "selection_latency_per_job.png"), bbox_inches="tight")
+    plt.savefig(os.path.join(run_dir, "selection_latency_per_job.png"), bbox_inches="tight")
     plt.close()
 
     # Jobs per agent (bar plot)
@@ -131,7 +182,7 @@ def plot_scheduling_latency_and_jobs(csv_file, output_dir, agent_count):
     plt.title("Jobs per Agent")
     plt.grid(axis="y")
     plt.xticks(jobs_per_agent.index)
-    plt.savefig(os.path.join(output_dir, "jobs_per_agent.png"), bbox_inches="tight")
+    plt.savefig(os.path.join(run_dir, "jobs_per_agent.png"), bbox_inches="tight")
     plt.close()
 
     # Histogram of scheduling latency
@@ -141,7 +192,7 @@ def plot_scheduling_latency_and_jobs(csv_file, output_dir, agent_count):
     plt.ylabel("Frequency")
     plt.title("Distribution of Scheduling Latency")
     plt.grid(axis="y")
-    plt.savefig(os.path.join(output_dir, "scheduling_latency_histogram.png"), bbox_inches="tight")
+    plt.savefig(os.path.join(run_dir, "scheduling_latency_histogram.png"), bbox_inches="tight")
     plt.close()
 
     # Print summary
@@ -154,14 +205,13 @@ def plot_scheduling_latency_and_jobs(csv_file, output_dir, agent_count):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Plot scheduling latency and jobs per agent")
-    parser.add_argument("--csv_file", type=str, required=True, help="Path to CSV file")
     parser.add_argument("--run_dir", type=str, default=".", help="Directory where all files are present")
-    parser.add_argument("--output_dir", type=str, default=".", help="Directory to save plots")
     parser.add_argument("--agents", type=str, required=True, help="Number of agents")
 
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
-    plot_scheduling_latency_and_jobs(args.csv_file, args.output_dir, args.agents)
-    plot_conflicts_and_restarts(args.run_dir, args.output_dir)
-    plot_conflicts_and_restarts_by_agent(args.run_dir, args.output_dir)
+    plot_scheduling_latency_and_jobs(args.run_dir, args.agents)
+    plot_conflicts_and_restarts(args.run_dir)
+    plot_conflicts_and_restarts_by_agent(args.run_dir)
+    plot_agent_loads_from_dir(args.run_dir)
