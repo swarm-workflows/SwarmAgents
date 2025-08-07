@@ -25,7 +25,6 @@
 import json
 import logging
 import os
-import socket
 import threading
 import time
 import traceback
@@ -179,15 +178,6 @@ class Agent(Observer):
         self.end_idle()
         return self.metrics.total_idle_time
 
-    @staticmethod
-    def resource_usage_score(allocated: Capacities, total: Capacities):
-        if allocated == total:
-            return 0
-        core = (allocated.core / total.core) * 100
-        ram = (allocated.ram / total.ram) * 100
-        disk = (allocated.disk / total.disk) * 100
-
-        return round((core + ram + disk) / 3, 2)
 
     def _setup_logger(self):
         log_path = f"{self.log_config['log-directory']}/{self.log_config['log-file']}-{self.agent_id}.log"
@@ -237,80 +227,6 @@ class Agent(Observer):
             self.logger.error(f"Exception occurred in shutdown: {e}")
             self.logger.error(traceback.format_exc())
 
-    def _refresh_neighbors(self, current_time: float):
-        """
-        Refresh the neighbor agent map by retrieving peer agents at the same level from Redis
-        and removing any that are stale or no longer present.
-
-        :param current_time: The current timestamp used to check for staleness.
-        :type current_time: float
-        """
-        self._refresh_agent_map(
-            current_time=current_time,
-            target_dict=self.neighbor_map,
-            level=self.topology.level,
-            groups=[self.topology.group]
-        )
-
-    def _refresh_children(self, current_time: float):
-        """
-        Refresh the children agent map by retrieving agents from the level below (level - 1)
-        and removing any that are stale or no longer present.
-
-        :param current_time: The current timestamp used to check for staleness.
-        :type current_time: float
-        """
-        if not self.topology.children or len(self.topology.children) == 0:
-            return
-        self._refresh_agent_map(
-            current_time=current_time,
-            target_dict=self.children,
-            level=self.topology.level - 1,
-            groups=self.topology.children  # assumed to be a List[int]
-        )
-
-    def _refresh_agent_map(
-            self,
-            current_time: float,
-            target_dict: ThreadSafeDict[int, AgentInfo],
-            level: int,
-            groups: list[int]
-    ):
-        """
-        Generic helper to refresh a target agent map (e.g., neighbors or children) by reading from Redis.
-
-        Updates the target map with agents that are fresh and present in Redis,
-        and removes agents that are stale or no longer in the store.
-
-        :param current_time: The current timestamp for evaluating staleness.
-        :type current_time: float
-        :param target_dict: A thread-safe dictionary mapping agent IDs to AgentInfo objects.
-        :type target_dict: ThreadSafeDict[int, AgentInfo]
-        :param level: The level of the agents to query in the hierarchy.
-        :type level: int
-        :param groups: group ID within that level to refresh.
-        :type groups: list[int]
-        """
-        active_ids = set()
-
-        for group in groups:
-            agent_dicts = self.repo.get_all_objects(
-                key_prefix=Repository.KEY_AGENT,
-                level=level,
-                group=group
-            )
-            for agent_data in agent_dicts:
-                agent = AgentInfo.from_dict(agent_data)
-                #if agent.agent_id and agent.agent_id != self.agent_id:
-                existing = target_dict.get(agent.agent_id)
-                if existing is None or agent.last_updated > existing.last_updated:
-                    target_dict.set(agent.agent_id, agent)
-                active_ids.add(agent.agent_id)
-
-        for agent_id, agent in list(target_dict.items()):
-            if agent_id not in active_ids and (current_time - agent.last_updated) >= self.peer_expiry_seconds:
-                target_dict.remove(agent_id)
-
     @abstractmethod
     def _do_periodic(self):
         pass
@@ -335,36 +251,14 @@ class Agent(Observer):
     def _process(self, messages: list[dict]):
         pass
 
-    @staticmethod
-    def is_reachable(*, hostname: str, port: int = 22):
-        try:
-            # Attempt to resolve the hostname to an IP address
-            ip_address = socket.gethostbyname(hostname)
-
-            # Attempt to create a socket connection to the IP address and port 80
-            with socket.create_connection((ip_address, port), timeout=5):
-                return True
-        except (socket.gaierror, socket.timeout, OSError):
-            return False
-
-    def _has_sufficient_capacity(self, job: Job, available: Capacities) -> bool:
-        """
-        Returns True if the job can be accommodated by the available capacity.
-        Also checks data transfer feasibility if enabled.
-        """
-        # Check if job fits into available capacities
-        residual = available - job.get_capacities()
-        negative_fields = residual.negative_fields()
-        if len(negative_fields) > 0:
-            return False
-
-        # Check data transfer endpoints if required
-        if self.data_transfer:
-            for dn in job.get_data_in() + job.get_data_out():
-                if not self.is_reachable(hostname=dn.get_dtn()):
-                    return False
-
-        return True
+    def select_job(self, job: Job):
+        #print(f"Adding: {job.get_job_id()} on agent: {self.agent_id} to Select Queue")
+        self.logger.info(f"[SELECTED]: {job.get_job_id()} on agent: {self.agent_id} to Select Queue")
+        job.change_state(new_state=JobState.READY)
+        self.repo.save(obj=job.to_dict(), key_prefix=Repository.KEY_JOB,
+                       level=self.topology.level, group=self.topology.group)
+        # Add the job to the list of allocated jobs
+        self.queues.selected_queue.add_job(job=job)
 
     def can_schedule_job(self, job: Job) -> bool:
         ready_caps = self.queues.ready_queue.capacities(self.queues.ready_queue.get_jobs())
@@ -384,31 +278,6 @@ class Agent(Observer):
             self.logger.error(f"[ERROR] Job {job} failed on agent {self.agent_id}: {e}")
             self.logger.error(traceback.format_exc())
         #print(f"EXECUTED: {job.get_job_id()} on agent: {self.agent_id}")
-
-    def save_results(self):
-        self.logger.info("Saving Results")
-        self.metrics.save_misc(f"{self.results_dir}/misc_{self.agent_id}.json")
-        self.metrics.save_load_trace(self.agent_id, f"{self.results_dir}/agent_loads_{self.agent_id}.csv")
-        self.metrics.save_idle_time(f"{self.results_dir}/idle_time_per_agent_{self.agent_id}.csv")
-
-        if self.topology.level == 0:
-            lock_path = f"{self.results_dir}/result.lock"
-
-            try:
-                # Try to create the lock file atomically
-                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                os.close(fd)  # Lock acquired
-            except FileExistsError:
-                self.logger.info("Another agent has started saving results")
-                return
-
-            all_jobs = self.repo.get_all_objects(key_prefix=Repository.KEY_JOB, level=0)
-
-            self.metrics.save_jobs(all_jobs, path=f"{self.results_dir}/all_jobs.csv")
-
-            all_agents = self.repo.get_all_objects(key_prefix=Repository.KEY_AGENT, level=None)
-            self.metrics.save_agents(all_agents, path=f"{self.results_dir}/all_agents.csv")
-        self.logger.info("Results saved")
 
     def job_scheduling_main(self):
         """
@@ -456,16 +325,6 @@ class Agent(Observer):
 
         self.logger.info(f"Stopped Job Scheduling Thread!")
 
-    def compute_ready_queue_load(self):
-        allocated_caps = self.queues.ready_queue.capacities(jobs=self.queues.ready_queue.get_jobs())
-
-        core_load = (allocated_caps.core / self.capacities.core) * 100
-        ram_load = (allocated_caps.ram / self.capacities.ram) * 100
-        disk_load = (allocated_caps.disk / self.capacities.disk) * 100
-
-        overall_load = (core_load + ram_load + disk_load) / 3
-        return round(overall_load, 2)
-
     def schedule_job(self, job: Job):
         self.end_idle()
         #print(f"SCHEDULED: {job.get_job_id()} on agent: {self.agent_id}")
@@ -476,35 +335,10 @@ class Agent(Observer):
         # Launch a thread to execute the job
         #thread = threading.Thread(target=self.execute_job, args=(job,))
         #thread.start()
-        self.update_completed_jobs(jobs=[job.get_job_id()])
+        self._update_completed_jobs(jobs=[job.get_job_id()])
         job.change_state(JobState.COMPLETE)
         self.repo.save(obj=job.to_dict(), level=self.topology.level, group=self.topology.group)
         self.executor.submit(self.execute_job, job)
-
-    def update_jobs(self, jobs: list[str], job_set: set, lock: threading.RLock):
-        with lock:
-            job_set.update(jobs)
-
-    def is_job_in_state(self, job_id: str, job_set: set, redis_key_prefix: str, update_fn, state):
-        if job_id in job_set:
-            return True
-        update_fn(self.repo.get_all_ids(key_prefix=redis_key_prefix, level=self.topology.level,
-                                        group=self.topology.group, state=state))
-        return job_id in job_set
-
-    # Unified update methods
-    def update_completed_jobs(self, jobs: list[str]):
-        self.update_jobs(jobs, self.completed_jobs_set, self.completed_lock)
-
-    # Unified check methods
-    def is_job_completed(self, job_id: str) -> bool:
-        return self.is_job_in_state(
-            job_id,
-            self.completed_jobs_set,
-            Repository.KEY_JOB,
-            self.update_completed_jobs,
-            state=JobState.COMPLETE.value
-        )
 
     def dispatch_message(self, message: str):
         try:
@@ -554,14 +388,31 @@ class Agent(Observer):
                 fwd=fwd
             )
 
-    def select_job(self, job: Job):
-        #print(f"Adding: {job.get_job_id()} on agent: {self.agent_id} to Select Queue")
-        self.logger.info(f"[SELECTED]: {job.get_job_id()} on agent: {self.agent_id} to Select Queue")
-        job.change_state(new_state=JobState.READY)
-        self.repo.save(obj=job.to_dict(), key_prefix=Repository.KEY_JOB,
-                       level=self.topology.level, group=self.topology.group)
-        # Add the job to the list of allocated jobs
-        self.queues.selected_queue.add_job(job=job)
+    @staticmethod
+    def update_jobs(jobs: list[str], job_set: set, lock: threading.RLock):
+        with lock:
+            job_set.update(jobs)
+
+    def is_job_in_state(self, job_id: str, job_set: set, redis_key_prefix: str, update_fn, state):
+        if job_id in job_set:
+            return True
+        update_fn(self.repo.get_all_ids(key_prefix=redis_key_prefix, level=self.topology.level,
+                                        group=self.topology.group, state=state))
+        return job_id in job_set
+
+    # Unified update methods
+    def _update_completed_jobs(self, jobs: list[str]):
+        self.update_jobs(jobs, self.completed_jobs_set, self.completed_lock)
+
+    # Unified check methods
+    def is_job_completed(self, job_id: str) -> bool:
+        return self.is_job_in_state(
+            job_id,
+            self.completed_jobs_set,
+            Repository.KEY_JOB,
+            self._update_completed_jobs,
+            state=JobState.COMPLETE.value
+        )
 
     def calculate_quorum(self) -> int:
         # Simple majority quorum calculation
@@ -583,3 +434,51 @@ class Agent(Observer):
         if os.path.exists("./shutdown"):
             return True
         return (time.time() - self.last_non_empty_time) >= self.empty_timeout_seconds
+
+    @staticmethod
+    def _has_sufficient_capacity(job: Job, available: Capacities) -> bool:
+        """
+        Returns True if the job can be accommodated by the available capacity.
+        Also checks data transfer feasibility if enabled.
+        """
+        # Check if job fits into available capacities
+        residual = available - job.get_capacities()
+        negative_fields = residual.negative_fields()
+        if len(negative_fields) > 0:
+            return False
+        return True
+
+    @staticmethod
+    def resource_usage_score(allocated: Capacities, total: Capacities):
+        if allocated == total:
+            return 0
+        core = (allocated.core / total.core) * 100
+        ram = (allocated.ram / total.ram) * 100
+        disk = (allocated.disk / total.disk) * 100
+
+        return round((core + ram + disk) / 3, 2)
+
+    def save_results(self):
+        self.logger.info("Saving Results")
+        self.metrics.save_misc(f"{self.results_dir}/misc_{self.agent_id}.json")
+        self.metrics.save_load_trace(self.agent_id, f"{self.results_dir}/agent_loads_{self.agent_id}.csv")
+        self.metrics.save_idle_time(f"{self.results_dir}/idle_time_per_agent_{self.agent_id}.csv")
+
+        if self.topology.level == 0:
+            lock_path = f"{self.results_dir}/result.lock"
+
+            try:
+                # Try to create the lock file atomically
+                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.close(fd)  # Lock acquired
+            except FileExistsError:
+                self.logger.info("Another agent has started saving results")
+                return
+
+            all_jobs = self.repo.get_all_objects(key_prefix=Repository.KEY_JOB, level=0)
+
+            self.metrics.save_jobs(all_jobs, path=f"{self.results_dir}/all_jobs.csv")
+
+            all_agents = self.repo.get_all_objects(key_prefix=Repository.KEY_AGENT, level=None)
+            self.metrics.save_agents(all_agents, path=f"{self.results_dir}/all_agents.csv")
+        self.logger.info("Results saved")

@@ -27,6 +27,7 @@ import traceback
 from collections import defaultdict
 
 from swarm.models.data_node import DataNode
+from swarm.utils.thread_safe_dict import ThreadSafeDict
 from swarm.utils.topology import TopologyType
 from swarm.agents.agent_grpc import Agent
 from swarm.comm.messages.commit import Commit
@@ -72,30 +73,6 @@ class SwarmAgent(Agent):
         self.learning_rate = 0.1
         self.discount_factor = 0.9
         self.exploration_rate = 0.1  # epsilon-greedy
-
-    def _process(self, messages: list[dict]):
-        for message in messages:
-            try:
-                begin = time.time()
-                incoming = MessageBuilder.from_dict(message)
-
-                if isinstance(incoming, Prepare):
-                    self.__receive_prepare(incoming=incoming)
-
-                elif isinstance(incoming, Commit):
-                    self.__receive_commit(incoming=incoming)
-
-                elif isinstance(incoming, Proposal):
-                    self.__receive_proposal(incoming=incoming)
-
-                else:
-                    self.logger.info(f"Ignoring unsupported message: {message}")
-                diff = int(time.time() - begin)
-                if diff > 0:
-                    self.logger.info(f"Event {message.get('message_type')} TIME: {diff}")
-            except Exception as e:
-                self.logger.error(f"Error while processing message {type(message)}, {e}")
-                self.logger.error(traceback.format_exc())
 
     def __receive_proposal(self, incoming: Proposal):
         proposals = []
@@ -278,7 +255,31 @@ class SwarmAgent(Agent):
                                excluded_peers=[incoming.forwarded_by, incoming.agents[0].agent_id],
                                src=incoming.agents[0].agent_id, fwd=self.agent_id)
 
-    def update_pending_jobs(self, jobs: list[str]):
+    def _process(self, messages: list[dict]):
+        for message in messages:
+            try:
+                begin = time.time()
+                incoming = MessageBuilder.from_dict(message)
+
+                if isinstance(incoming, Prepare):
+                    self.__receive_prepare(incoming=incoming)
+
+                elif isinstance(incoming, Commit):
+                    self.__receive_commit(incoming=incoming)
+
+                elif isinstance(incoming, Proposal):
+                    self.__receive_proposal(incoming=incoming)
+
+                else:
+                    self.logger.info(f"Ignoring unsupported message: {message}")
+                diff = int(time.time() - begin)
+                if diff > 0:
+                    self.logger.info(f"Event {message.get('message_type')} TIME: {diff}")
+            except Exception as e:
+                self.logger.error(f"Error while processing message {type(message)}, {e}")
+                self.logger.error(traceback.format_exc())
+
+    def _update_pending_jobs(self, jobs: list[str]):
         for job_id in jobs:
             #job_id = key.split(":")[-1]
             if job_id not in self.queues.job_queue:
@@ -288,14 +289,14 @@ class SwarmAgent(Agent):
                 job_obj.from_dict(job)
                 self.queues.job_queue.add_job(job_obj)
 
-    def update_ready_jobs(self, jobs: list[str]):
+    def _update_ready_jobs(self, jobs: list[str]):
         for j in jobs:
             self.incoming_proposals.remove_job(job_id=j)
             self.outgoing_proposals.remove_job(job_id=j)
             self.queues.job_queue.remove_job(job_id=j)
 
-    def update_completed_jobs(self, jobs: list[str]):
-        super().update_completed_jobs(jobs=jobs)
+    def _update_completed_jobs(self, jobs: list[str]):
+        super()._update_completed_jobs(jobs=jobs)
         for j in jobs:
             self.incoming_proposals.remove_job(job_id=j)
             self.outgoing_proposals.remove_job(job_id=j)
@@ -318,7 +319,7 @@ class SwarmAgent(Agent):
             )
             '''
 
-    def restart_selection(self):
+    def _restart_selection(self):
         jobs = self.queues.job_queue.get_jobs(states=[JobState.PREPARE, JobState.PRE_PREPARE,
                                                       JobState.COMMIT])
         for job in jobs:
@@ -331,40 +332,81 @@ class SwarmAgent(Agent):
                 job_id = job.get_job_id()
                 self.metrics.restarts[job_id] = self.metrics.restarts.get(job_id, 0) + 1
 
-    def _do_periodic(self):
-        while not self.shutdown:
-            try:
-                self.restart_selection()
-                current_time = int(time.time())
-                self._refresh_children(int(current_time))
-                agent_info = self.generate_agent_info()
-                self.repo.save(agent_info.to_dict(), key_prefix=Repository.KEY_AGENT, level=self.topology.level,
-                               group=self.topology.group)
+    def _refresh_neighbors(self, current_time: float):
+        """
+        Refresh the neighbor agent map by retrieving peer agents at the same level from Redis
+        and removing any that are stale or no longer present.
 
-                self._refresh_neighbors(current_time=current_time)
+        :param current_time: The current timestamp used to check for staleness.
+        :type current_time: float
+        """
+        self._refresh_agent_map(
+            current_time=current_time,
+            target_dict=self.neighbor_map,
+            level=self.topology.level,
+            groups=[self.topology.group]
+        )
 
-                # Batch update job sets
-                for prefix, update_fn, state in [
-                    (Repository.KEY_JOB, self.update_pending_jobs, JobState.PENDING.value),
-                    (Repository.KEY_JOB, self.update_ready_jobs, JobState.READY.value),
-                    (Repository.KEY_JOB, self.update_completed_jobs, JobState.COMPLETE.value),
-                ]:
-                    jobs = self.repo.get_all_ids(key_prefix=prefix, level=self.topology.level,
-                                                 group=self.topology.group, state=state)
-                    update_fn(jobs=jobs)
+    def _refresh_children(self, current_time: float):
+        """
+        Refresh the children agent map by retrieving agents from the level below (level - 1)
+        and removing any that are stale or no longer present.
 
-                time.sleep(0.5)
+        :param current_time: The current timestamp used to check for staleness.
+        :type current_time: float
+        """
+        if not self.topology.children or len(self.topology.children) == 0:
+            return
+        self._refresh_agent_map(
+            current_time=current_time,
+            target_dict=self.children,
+            level=self.topology.level - 1,
+            groups=self.topology.children  # assumed to be a List[int]
+        )
 
-                self.check_queue()
-                if self.should_shutdown():
-                    print("[SHUTDOWN] Queue has been empty for too long. Triggering shutdown.")
-                    break
-            except Exception as e:
-                self.logger.error(f"Periodic update error: {e}\n{traceback.format_exc()}")
+    def _refresh_agent_map(
+            self,
+            current_time: float,
+            target_dict: ThreadSafeDict[int, AgentInfo],
+            level: int,
+            groups: list[int]
+    ):
+        """
+        Generic helper to refresh a target agent map (e.g., neighbors or children) by reading from Redis.
 
-        self.stop()
+        Updates the target map with agents that are fresh and present in Redis,
+        and removes agents that are stale or no longer in the store.
 
-    def generate_agent_info(self) -> AgentInfo:
+        :param current_time: The current timestamp for evaluating staleness.
+        :type current_time: float
+        :param target_dict: A thread-safe dictionary mapping agent IDs to AgentInfo objects.
+        :type target_dict: ThreadSafeDict[int, AgentInfo]
+        :param level: The level of the agents to query in the hierarchy.
+        :type level: int
+        :param groups: group ID within that level to refresh.
+        :type groups: list[int]
+        """
+        active_ids = set()
+
+        for group in groups:
+            agent_dicts = self.repo.get_all_objects(
+                key_prefix=Repository.KEY_AGENT,
+                level=level,
+                group=group
+            )
+            for agent_data in agent_dicts:
+                agent = AgentInfo.from_dict(agent_data)
+                #if agent.agent_id and agent.agent_id != self.agent_id:
+                existing = target_dict.get(agent.agent_id)
+                if existing is None or agent.last_updated > existing.last_updated:
+                    target_dict.set(agent.agent_id, agent)
+                active_ids.add(agent.agent_id)
+
+        for agent_id, agent in list(target_dict.items()):
+            if agent_id not in active_ids and (current_time - agent.last_updated) >= self.peer_expiry_seconds:
+                target_dict.remove(agent_id)
+
+    def _generate_agent_info(self) -> AgentInfo:
         """
         Generate and return the current AgentInfo object representing this agent.
 
@@ -427,6 +469,39 @@ class SwarmAgent(Agent):
             )
 
         return agent_info
+
+    def _do_periodic(self):
+        while not self.shutdown:
+            try:
+                self._restart_selection()
+                current_time = int(time.time())
+                self._refresh_children(int(current_time))
+                agent_info = self._generate_agent_info()
+                self.repo.save(agent_info.to_dict(), key_prefix=Repository.KEY_AGENT, level=self.topology.level,
+                               group=self.topology.group)
+
+                self._refresh_neighbors(current_time=current_time)
+
+                # Batch update job sets
+                for prefix, update_fn, state in [
+                    (Repository.KEY_JOB, self._update_pending_jobs, JobState.PENDING.value),
+                    (Repository.KEY_JOB, self._update_ready_jobs, JobState.READY.value),
+                    (Repository.KEY_JOB, self._update_completed_jobs, JobState.COMPLETE.value),
+                ]:
+                    jobs = self.repo.get_all_ids(key_prefix=prefix, level=self.topology.level,
+                                                 group=self.topology.group, state=state)
+                    update_fn(jobs=jobs)
+
+                time.sleep(0.5)
+
+                self.check_queue()
+                if self.should_shutdown():
+                    print("[SHUTDOWN] Queue has been empty for too long. Triggering shutdown.")
+                    break
+            except Exception as e:
+                self.logger.error(f"Periodic update error: {e}\n{traceback.format_exc()}")
+
+        self.stop()
 
     def is_job_feasible(self, job: Job, agent: AgentInfo) -> bool:
         """
