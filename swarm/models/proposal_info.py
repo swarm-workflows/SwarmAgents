@@ -138,8 +138,10 @@ class ProposalContainer:
     def remove_job(self, job_id: str):
         if job_id in self.proposals_by_job_id:
             for p in self.proposals_by_job_id[job_id]:
-                self.proposals_by_pid.pop(p.p_id)
-            self.proposals_by_job_id.pop(job_id)
+                if p.p_id in self.proposals_by_pid:
+                    self.proposals_by_pid.pop(p.p_id)
+            if job_id in self.proposals_by_job_id:
+                self.proposals_by_job_id.pop(job_id)
 
     def jobs(self) -> List[str]:
         return list(self.proposals_by_job_id.keys())
