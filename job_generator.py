@@ -66,17 +66,12 @@ class JobGenerator:
         ram = round(random.uniform(0.1, 4.0), 2)
         disk = round(random.uniform(0.1, 4.0), 2)
         status = random.choice([0, -1])
-        dtn_count = 10
-        dtns = []
-        if self.agent_dtns_map:
-            # Choose a random agent to derive valid DTNs
-            agent_id = random.choice(list(self.agent_dtns_map.keys()))
-            candidate_dtns = self.agent_dtns_map[agent_id]
-            dtn_count = random.randint(1, len(candidate_dtns))
-            dtns = random.sample(candidate_dtns, dtn_count)
-        else:
-            # Fallback: random dtns
-            dtns = [f"dtn{random.randint(1, dtn_count)}"]
+
+        # Choose a random agent to derive valid DTNs
+        agent_id = random.choice(list(self.agent_dtns_map.keys()))
+        candidate_dtns = self.agent_dtns_map[agent_id]
+        dtn_count = random.randint(1, len(candidate_dtns))
+        dtns = random.sample(candidate_dtns, dtn_count)
 
         input_files = ['/var/tmp/outgoing/file100M.txt',
                        '/var/tmp/outgoing/file500M.txt',

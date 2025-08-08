@@ -94,10 +94,12 @@ class JobDistributor(threading.Thread):
             job.set_job_id(job_data['id'])
             job.set_capacities(Capacities.from_dict(job_data['capacities']))
             job.execution_time = job_data['execution_time']
-            for data_in in job_data['data_in']:
-                job.add_incoming_data_dep(DataNode.from_dict(data_in))
-            for data_out in job_data['data_out']:
-                job.add_outgoing_data_dep(DataNode.from_dict(data_out))
+            if job_data.get('data_in'):
+                for data_in in job_data['data_in']:
+                    job.add_incoming_data_dep(DataNode.from_dict(data_in))
+            if job_data.get('data_out'):
+                for data_out in job_data['data_out']:
+                    job.add_outgoing_data_dep(DataNode.from_dict(data_out))
             return job
 
     def run(self) -> None:

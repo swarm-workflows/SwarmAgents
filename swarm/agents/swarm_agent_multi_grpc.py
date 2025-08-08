@@ -83,6 +83,7 @@ class SwarmAgent(Agent):
                 self.logger.error(f"ERROR ---- Skipping no job found for {p.job_id}")
                 self.outgoing_proposals.remove_job(job_id=p.job_id)
                 self.incoming_proposals.remove_job(job_id=p.job_id)
+                proposals_to_forward.append(p)
                 continue
             if self.is_job_completed(job_id=job.get_job_id()):
                 self.logger.debug(f"Ignoring Proposal: {p} for job: {job.get_job_id()}")
@@ -146,6 +147,7 @@ class SwarmAgent(Agent):
                 self.logger.error(f"ERROR ---- Skipping no job found for {p.job_id}")
                 self.outgoing_proposals.remove_job(job_id=p.job_id)
                 self.incoming_proposals.remove_job(job_id=p.job_id)
+                proposals_to_forward.append(p)
                 continue
             if self.is_job_completed(job_id=job.get_job_id()):
                 self.logger.debug(f"Job: {job.get_job_id()} Ignoring Prepare: {p}")
@@ -207,6 +209,7 @@ class SwarmAgent(Agent):
                 self.logger.error(f"ERROR ---- Skipping no job found for {p.job_id}")
                 self.outgoing_proposals.remove_job(job_id=p.job_id)
                 self.incoming_proposals.remove_job(job_id=p.job_id)
+                proposals_to_forward.append(p)
                 continue
             if self.is_job_completed(job_id=job.get_job_id()):
                 self.logger.debug(f"Job: {job.get_job_id()} Ignoring Commit: {p}")
@@ -518,8 +521,8 @@ class SwarmAgent(Agent):
         :rtype: bool
         """
         # Load check
-        if agent.load >= self.projected_queue_threshold:
-            return False
+        #if agent.load >= self.projected_queue_threshold:
+        #    return False
 
         # Capacity check
         available = agent.capacities - agent.capacity_allocations
@@ -811,12 +814,12 @@ class SwarmAgent(Agent):
                 if not feasibility_map[agent_id][job.get_job_id()]:
                     continue
 
-                job_cost = self.compute_job_cost_job_type(job, total=agent.capacities, dtns=agent.dtns)
+                job_cost = self.compute_job_cost(job, total=agent.capacities, dtns=agent.dtns)
 
                 # Load penalty (synergy penalty for agents already busy)
                 load_penalty = 1 + (projected_load / 100) ** 1.5
 
-                cost_matrix[row_idx, col_idx] = round(job_cost * load_penalty, 2)
+                cost_matrix[row_idx, col_idx] = round((job_cost * load_penalty), 2)
 
         return cost_matrix
 
@@ -849,6 +852,7 @@ class SwarmAgent(Agent):
             selected_agent = min(candidates, key=lambda x: (x[1], x[0]))
             min_cost_agents.append(selected_agent)
 
+            '''
             # Debug logging: top 3 candidates sorted by cost then agent_id
             sorted_candidates = sorted(
                 [(agent_ids[i], valid_costs[i]) for i in np.where(finite_mask)[0]],
@@ -859,11 +863,12 @@ class SwarmAgent(Agent):
                 f"[JOB {j}] Min cost: {min_cost} | "
                 f"Top 3: {', '.join(f'Agent {aid}: {cost:.2f}' for aid, cost in sorted_candidates)}"
             )
+            '''
 
         return min_cost_agents
 
     def find_min_cost_agents_rl(self, cost_matrix: np.ndarray, job_types: list[str],
-                             threshold_pct: float = 10.0) -> list[tuple[int, float]]:
+                                threshold_pct: float = 10.0) -> list[tuple[int, float]]:
         """
         Determine the agent with the minimum cost for each job, allowing near-minimum costs
         within a given percentage threshold, with optimized RL bias application.
@@ -935,7 +940,7 @@ class SwarmAgent(Agent):
                         # Send proposal to all neighbors
                         job = pending_jobs[job_idx]
                         proposal = ProposalInfo(p_id=generate_id(), job_id=job.get_job_id(),
-                                                agent_id=self.agent_id, seed=cost + self.agent_id)
+                                                agent_id=self.agent_id, seed=round((cost + self.agent_id), 2))
                         proposals.append(proposal)
                         # Begin election for Job leader for this job
                         job.change_state(new_state=JobState.PRE_PREPARE)
