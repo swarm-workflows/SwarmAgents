@@ -22,8 +22,10 @@
 #
 # Author: Komal Thareja(kthare10@renci.org)
 import random
+import threading
 from typing import List
 
+from swarm.models.capacities import Capacities
 from swarm.models.json_field import JSONField
 
 
@@ -78,79 +80,89 @@ class ProposalException(Exception):
 
 class ProposalContainer:
     def __init__(self):
+        self.lock = threading.RLock()
         self.proposals_by_job_id = {}
         self.proposals_by_pid = {}
 
     def add_proposal(self, proposal: ProposalInfo):
-        if proposal.job_id not in self.proposals_by_job_id:
-            self.proposals_by_job_id[proposal.job_id] = []
+        with self.lock:
+            if proposal.job_id not in self.proposals_by_job_id:
+                self.proposals_by_job_id[proposal.job_id] = []
 
-        self.proposals_by_job_id[proposal.job_id].append(proposal)
+            self.proposals_by_job_id[proposal.job_id].append(proposal)
 
-        self.proposals_by_pid[proposal.p_id] = proposal
+            self.proposals_by_pid[proposal.p_id] = proposal
 
     def contains(self, job_id: str = None, p_id: str = None):
         if job_id is None and p_id is None:
             return False
 
-        if job_id and job_id not in self.proposals_by_job_id:
-            return False
+        with self.lock:
+            if job_id and job_id not in self.proposals_by_job_id:
+                return False
 
-        if p_id and p_id not in self.proposals_by_pid:
-            return False
+            if p_id and p_id not in self.proposals_by_pid:
+                return False
 
-        if job_id and p_id:
-            for p in self.proposals_by_job_id[job_id]:
-                if p_id == p.p_id:
-                    return True
-            return False
-        else:
-            return True
+            if job_id and p_id:
+                for p in self.proposals_by_job_id[job_id]:
+                    if p_id == p.p_id:
+                        return True
+                return False
+            else:
+                return True
 
     def get_proposal(self, job_id: str = None, p_id: str = None) -> ProposalInfo:
-        if job_id is not None and p_id is not None:
-            for p in self.proposals_by_job_id[job_id]:
-                if p_id == p.p_id:
-                    return p
-        elif p_id is not None:
-            return self.proposals_by_pid.get(p_id)
-        elif job_id is not None:
-            proposals = self.proposals_by_job_id.get(job_id)
-            if proposals and len(proposals):
-                return next(iter(proposals))
+        with self.lock:
+            if job_id is not None and p_id is not None:
+                for p in self.proposals_by_job_id[job_id]:
+                    if p_id == p.p_id:
+                        return p
+            elif p_id is not None:
+                return self.proposals_by_pid.get(p_id)
+            elif job_id is not None:
+                proposals = self.proposals_by_job_id.get(job_id)
+                if proposals and len(proposals):
+                    return next(iter(proposals))
 
     def get_proposals_by_job_id(self, job_id: str) -> List[ProposalInfo]:
-        return self.proposals_by_job_id.get(job_id, [])
+        with self.lock:
+            return self.proposals_by_job_id.get(job_id, [])
 
     def size(self):
-        return len(self.proposals_by_pid)
+        with self.lock:
+            return len(self.proposals_by_pid)
 
     def remove_proposal(self, p_id: str, job_id: str):
-        if p_id in self.proposals_by_pid:
-            self.proposals_by_pid.pop(p_id)
+        with self.lock:
+            if p_id in self.proposals_by_pid:
+                self.proposals_by_pid.pop(p_id)
 
-        if job_id in self.proposals_by_job_id:
-            if p_id in self.proposals_by_job_id[job_id]:
-                self.proposals_by_job_id[job_id].pop(p_id)
-            if len(self.proposals_by_job_id[job_id]) == 0:
-                self.proposals_by_job_id.pop(job_id)
+            if job_id in self.proposals_by_job_id:
+                if p_id in self.proposals_by_job_id[job_id]:
+                    self.proposals_by_job_id[job_id].pop(p_id)
+                if len(self.proposals_by_job_id[job_id]) == 0:
+                    self.proposals_by_job_id.pop(job_id)
 
     def remove_job(self, job_id: str):
-        if job_id in self.proposals_by_job_id:
-            for p in self.proposals_by_job_id[job_id]:
-                if p.p_id in self.proposals_by_pid:
-                    self.proposals_by_pid.pop(p.p_id)
+        with self.lock:
             if job_id in self.proposals_by_job_id:
-                self.proposals_by_job_id.pop(job_id)
+                for p in self.proposals_by_job_id[job_id]:
+                    if p.p_id in self.proposals_by_pid:
+                        self.proposals_by_pid.pop(p.p_id)
+                if job_id in self.proposals_by_job_id:
+                    self.proposals_by_job_id.pop(job_id)
 
     def jobs(self) -> List[str]:
-        return list(self.proposals_by_job_id.keys())
+        with self.lock:
+            return list(self.proposals_by_job_id.keys())
 
     def has_better_proposal(self, proposal: ProposalInfo) -> ProposalInfo:
-        better = None
-        for p in self.get_proposals_by_job_id(proposal.job_id):
-            if p.seed < proposal.seed or (p.seed == proposal.seed and p.agent_id < proposal.agent_id):
-                better = p
-                break
+        with self.lock:
+            better = None
+            for p in self.get_proposals_by_job_id(proposal.job_id):
+                if p.seed < proposal.seed or (p.seed == proposal.seed and p.agent_id < proposal.agent_id):
+                    better = p
+                    break
 
-        return better
+            return better

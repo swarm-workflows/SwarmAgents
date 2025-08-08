@@ -15,7 +15,7 @@ class SwarmConfigGenerator:
     AGENT_DTNS = "agent_dtns.json"
 
     def __init__(self, num_agents, jobs_per_proposal, base_config_path, output_dir, topology,
-                 db_host):
+                 db_host, enable_dtns):
         """
         Initializes the generator with the number of agents, base config path, and output directory.
 
@@ -33,6 +33,7 @@ class SwarmConfigGenerator:
         self.topology = topology
         self.db_host = db_host
         self.agent_dtns_map = self._load_agent_dtns(path=self.AGENT_DTNS)
+        self.enable_dtns = enable_dtns
 
     def load_base_config(self):
         """
@@ -229,11 +230,12 @@ class SwarmConfigGenerator:
             config = self.base_config.copy()
 
             # Step 3: Assign random DTNs from pool to this agent
-            if dtn_pool is not None:
-                config["dtns"] = self.assign_agent_dtns(dtn_pool, min_dtns=1, max_dtns=4)
-                self.agent_dtns_map[str(agent_id)] = config["dtns"]
-            else:
-                config["dtns"] = self.adjust_scores(self.agent_dtns_map[str(agent_id)])
+            if self.enable_dtns:
+                if dtn_pool is not None:
+                    config["dtns"] = self.assign_agent_dtns(dtn_pool, min_dtns=1, max_dtns=4)
+                    self.agent_dtns_map[str(agent_id)] = config["dtns"]
+                else:
+                    config["dtns"] = self.adjust_scores(self.agent_dtns_map[str(agent_id)])
 
             # Randomize capacities
             config['capacities']['core'] = self.random_capacity(1, 8)
@@ -325,13 +327,14 @@ if __name__ == "__main__":
                                                                   "Possible values - mesh, ring, star, hierarchical")
     parser.add_argument("database", type=str, default="all", help="Database Host")
     parser.add_argument("job_cnt", type=int, help="Job Count")
+    parser.add_argument("--dtns", action="store_true", required=False, help="Enable DTNs")
 
     args = parser.parse_args()
 
     generator = SwarmConfigGenerator(args.num_agents, args.jobs_per_proposal, args.base_config_file,
-                                     args.output_dir, args.topology, args.database)
+                                     args.output_dir, args.topology, args.database, args.dtns)
     generator.generate_configs()
 
     if not os.path.exists("jobs"):
         generator = JobGenerator(job_count=args.job_cnt)
-        generator.generate_job_files(output_dir="jobs")
+        generator.generate_job_files(output_dir="jobs", enable_dtns=args.dtns)

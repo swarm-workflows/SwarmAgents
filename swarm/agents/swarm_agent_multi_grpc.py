@@ -74,13 +74,24 @@ class SwarmAgent(Agent):
         self.discount_factor = 0.9
         self.exploration_rate = 0.1  # epsilon-greedy
 
+        # ---- perf caches ----
+        self._feas_cache: dict[tuple, bool] = {}
+        self._base_cost_cache: dict[tuple, float] = {}
+
+        # optional: cap cache sizes if you have very long runs
+        self._feas_cache_max = 100_000
+        self._cost_cache_max = 100_000
+
+        # track proposed allocations incrementally to avoid recomputing each time
+        self._proposed_allocations = Capacities()
+
     def __receive_proposal(self, incoming: Proposal):
         proposals = []
         proposals_to_forward = []
         for p in incoming.proposals:
             job = self.queues.job_queue.get_job(job_id=p.job_id)
             if not job:
-                self.logger.error(f"ERROR ---- Skipping no job found for {p.job_id}")
+                self.logger.debug(f"ERROR ---- Skipping no job found for {p.job_id}")
                 self.outgoing_proposals.remove_job(job_id=p.job_id)
                 self.incoming_proposals.remove_job(job_id=p.job_id)
                 proposals_to_forward.append(p)
@@ -144,7 +155,7 @@ class SwarmAgent(Agent):
         for p in incoming.proposals:
             job = self.queues.job_queue.get_job(job_id=p.job_id)
             if not job:
-                self.logger.error(f"ERROR ---- Skipping no job found for {p.job_id}")
+                self.logger.debug(f"ERROR ---- Skipping no job found for {p.job_id}")
                 self.outgoing_proposals.remove_job(job_id=p.job_id)
                 self.incoming_proposals.remove_job(job_id=p.job_id)
                 proposals_to_forward.append(p)
@@ -206,7 +217,7 @@ class SwarmAgent(Agent):
         for p in incoming.proposals:
             job = self.queues.job_queue.get_job(job_id=p.job_id)
             if not job:
-                self.logger.error(f"ERROR ---- Skipping no job found for {p.job_id}")
+                self.logger.debug(f"ERROR ---- Skipping no job found for {p.job_id}")
                 self.outgoing_proposals.remove_job(job_id=p.job_id)
                 self.incoming_proposals.remove_job(job_id=p.job_id)
                 proposals_to_forward.append(p)
@@ -506,6 +517,7 @@ class SwarmAgent(Agent):
 
         self.stop()
 
+    '''
     def is_job_feasible(self, job: Job, agent: AgentInfo) -> bool:
         """
         Check if a job is feasible for a given agent based on:
@@ -542,6 +554,31 @@ class SwarmAgent(Agent):
                 return False
 
         return True
+    '''
+    def is_job_feasible(self, job: Job, agent: AgentInfo) -> bool:
+        # Capacity check first (cheapest)
+        available = agent.capacities - agent.capacity_allocations
+        if not self._has_sufficient_capacity(job, available):
+            return False
+
+        # DTN connectivity
+        if not hasattr(job, "_required_dtns_cache"):
+            rin = {e.name for e in (job.data_in or [])}
+            rout = {e.name for e in (job.data_out or [])}
+            job._required_dtns_cache = frozenset(rin | rout)
+
+        # normalize agent.dtns to a set of names once per agent signature (already in _agent_sig)
+        if isinstance(agent.dtns, dict):
+            agent_dtn_names = agent.dtns.keys()
+        else:
+            agent_dtn_names = [getattr(x, "name", None) or (x.get("name") if isinstance(x, dict) else None)
+                               for x in (agent.dtns or [])]
+
+        for d in job._required_dtns_cache:
+            if d not in agent_dtn_names:
+                return False
+
+        return True
 
     def compute_overall_load(self):
         allocations = Capacities()
@@ -558,6 +595,55 @@ class SwarmAgent(Agent):
                     allocations += job.capacities
 
         return self.resource_usage_score(allocated=allocations, total=self.capacities)
+
+    def _job_sig(self, job: Job) -> tuple:
+        # Required DTNs can be expensive to rebuild; compute once and reuse
+        if not hasattr(job, "_required_dtns_cache"):
+            rin = {e.name for e in (job.data_in or [])}
+            rout = {e.name for e in (job.data_out or [])}
+            job._required_dtns_cache = frozenset(rin | rout)
+        caps = job.capacities
+        return (
+            job.get_job_id(),
+            round(caps.core, 3), round(caps.ram, 3), round(caps.disk, 3), round(getattr(caps, "gpu", 0.0), 3),
+            round(job.execution_time or 0.0, 3),
+            job.job_type or "",
+            job._required_dtns_cache,
+            job.get_state().value,  # flips when PENDING→READY/COMPLETE, invalidates cache automatically
+        )
+
+    def _agent_sig(self, agent: AgentInfo) -> tuple:
+        caps = agent.capacities or Capacities()
+        # Represent DTNs by (name,score) so signature only changes when the set/scores change
+        if isinstance(agent.dtns, dict):
+            dtn_pairs = tuple(sorted((k, round(getattr(v, "connectivity_score", 1.0), 3)) for k, v in agent.dtns.items()))
+        else:
+            # if already list of dicts or DataNode, normalize
+            def _pair(x):
+                name = getattr(x, "name", None) or (x.get("name") if isinstance(x, dict) else None)
+                score = getattr(x, "connectivity_score", None) or (x.get("connectivity_score") if isinstance(x, dict) else 1.0)
+                return (name, round(float(score), 3))
+            dtn_pairs = tuple(sorted(_pair(x) for x in (agent.dtns or [])))
+
+        return (
+            agent.agent_id,
+            round(caps.core, 3), round(caps.ram, 3), round(caps.disk, 3), round(getattr(caps, "gpu", 0.0), 3),
+            dtn_pairs,
+        )
+
+    def _feas_key(self, agent: AgentInfo, job: Job) -> tuple:
+        return ("F", self._agent_sig(agent), self._job_sig(job))
+
+    def _cost_key(self, agent: AgentInfo, job: Job) -> tuple:
+        # base cost doesn’t depend on load; keep load out so cache survives load changes
+        return ("C", self._agent_sig(agent), self._job_sig(job))
+
+    def _maybe_trim_cache(self):
+        # very simple LRU-ish trim (cheap + good enough)
+        if len(self._feas_cache) > self._feas_cache_max:
+            self._feas_cache.clear()
+        if len(self._base_cost_cache) > self._cost_cache_max:
+            self._base_cost_cache.clear()
 
     @staticmethod
     def compute_job_cost(
@@ -777,6 +863,51 @@ class SwarmAgent(Agent):
         return round(cost, 2)
 
     def compute_cost_matrix(self, jobs: list[Job]) -> np.ndarray:
+        agents_map = self.neighbor_map
+
+        # Snapshot neighbors once (iteration order fixed)
+        agent_ids = list(agents_map.keys())
+        agents = [agents_map.get(aid) for aid in agent_ids]
+
+        num_agents = len(agent_ids)
+        num_jobs = len(jobs)
+        cost_matrix = np.full((num_agents, num_jobs), float('inf'))
+
+        # Prebuild job signatures once (also primes _required_dtns_cache)
+        job_sigs = [self._job_sig(j) for j in jobs]
+
+        for ai, agent in enumerate(agents):
+            if agent is None:
+                continue
+            agent_sig = self._agent_sig(agent)
+            projected_load = agent.load + agent.proposed_load
+            load_penalty = 1 + (projected_load / 100) ** 1.5
+
+            for ji, job in enumerate(jobs):
+                # ---- cached feasibility ----
+                fkey = ("F", agent_sig, job_sigs[ji])
+                feas = self._feas_cache.get(fkey)
+                if feas is None:
+                    feas = self.is_job_feasible(job, agent)
+                    self._feas_cache[fkey] = feas
+                if not feas:
+                    continue
+
+                # ---- cached base cost (no load) ----
+                ckey = ("C", agent_sig, job_sigs[ji])
+                base_cost = self._base_cost_cache.get(ckey)
+                if base_cost is None:
+                    # NOTE: if you want job-type aware costs, call compute_job_cost_job_type
+                    base_cost = self.compute_job_cost_job_type(job, total=agent.capacities, dtns=agent.dtns)
+                    self._base_cost_cache[ckey] = base_cost
+
+                cost_matrix[ai, ji] = round(base_cost * load_penalty, 2)
+
+        self._maybe_trim_cache()
+        return cost_matrix
+
+    '''
+    def compute_cost_matrix(self, jobs: list[Job]) -> np.ndarray:
         """
         Compute a cost matrix for assigning jobs to agents, with feasibility checks,
         bottleneck penalties, and load-aware scaling.
@@ -822,6 +953,7 @@ class SwarmAgent(Agent):
                 cost_matrix[row_idx, col_idx] = round((job_cost * load_penalty), 2)
 
         return cost_matrix
+    '''
 
     def find_min_cost_agents(self, cost_matrix: np.ndarray, threshold_pct: float = 10.0) -> list[tuple[int, float]]:
         """

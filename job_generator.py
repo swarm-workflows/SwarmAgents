@@ -52,7 +52,7 @@ class JobGenerator:
                 return json.load(f)
         return {}
 
-    def generate_job(self, x: int) -> Dict[str, Any]:
+    def generate_job(self, x: int, enable_dtns: bool) -> Dict[str, Any]:
         """
         Generate a single job dictionary with randomized fields.
 
@@ -67,11 +67,6 @@ class JobGenerator:
         disk = round(random.uniform(0.1, 4.0), 2)
         status = random.choice([0, -1])
 
-        # Choose a random agent to derive valid DTNs
-        agent_id = random.choice(list(self.agent_dtns_map.keys()))
-        candidate_dtns = self.agent_dtns_map[agent_id]
-        dtn_count = random.randint(1, len(candidate_dtns))
-        dtns = random.sample(candidate_dtns, dtn_count)
 
         input_files = ['/var/tmp/outgoing/file100M.txt',
                        '/var/tmp/outgoing/file500M.txt',
@@ -81,27 +76,33 @@ class JobGenerator:
                         '/var/tmp/outgoing/file500M.txt',
                         '/var/tmp/outgoing/file1G.txt']
 
-        data_in = [
-            {'name': random.choice(dtns),
-             'file': random.choice(input_files)}
-            for _ in range(random.randint(0, 3))
-        ]
-        data_out = [
-            {'name': random.choice(dtns),
-             'file': random.choice(output_files)}
-            for _ in range(random.randint(0, 3))
-        ]
+        if enable_dtns:
+            # Choose a random agent to derive valid DTNs
+            agent_id = random.choice(list(self.agent_dtns_map.keys()))
+            candidate_dtns = self.agent_dtns_map[agent_id]
+            dtn_count = random.randint(1, len(candidate_dtns))
+            dtns = random.sample(candidate_dtns, dtn_count)
+            data_in = [
+                {'name': random.choice(dtns),
+                 'file': random.choice(input_files)}
+                for _ in range(random.randint(0, 3))
+            ]
+            data_out = [
+                {'name': random.choice(dtns),
+                 'file': random.choice(output_files)}
+                for _ in range(random.randint(0, 3))
+            ]
 
         return {
             'id': job_id,
             'execution_time': execution_time,
             'capacities': {'core': core, 'ram': ram, 'disk': disk, 'gpu': gpu},
-            'data_in': data_in,
-            'data_out': data_out,
+            'data_in': data_in if enable_dtns else None,
+            'data_out': data_out if enable_dtns else None,
             'status': status
         }
 
-    def generate_job_files(self, output_dir: str) -> None:
+    def generate_job_files(self, output_dir: str, enable_dtns: bool) -> None:
         """
         Generate individual job JSON files and save to the specified directory.
 
@@ -109,14 +110,14 @@ class JobGenerator:
         """
         os.makedirs(output_dir, exist_ok=True)
         for x in range(self.job_count):
-            job_data = self.generate_job(x)
+            job_data = self.generate_job(x, enable_dtns)
             file_path = os.path.join(output_dir, f"job_{x}.json")
             with open(file_path, 'w') as f:
                 json.dump(job_data, f, indent=4)
         print(f"{self.job_count} jobs written to {output_dir}")
 
 
-def main(job_count: int, output_dir: str) -> None:
+def main(job_count: int, output_dir: str, enable_dtns: bool) -> None:
     """
     Entry point for generating jobs to a directory.
 
@@ -124,12 +125,14 @@ def main(job_count: int, output_dir: str) -> None:
     :param output_dir: Directory to save individual job JSON files
     """
     generator = JobGenerator(job_count=job_count)
-    generator.generate_job_files(output_dir)
+    generator.generate_job_files(output_dir, enable_dtns)
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Generate job JSON files.")
     parser.add_argument('job_count', type=int, help="Number of jobs to generate")
     parser.add_argument('output_dir', type=str, help="Directory to save generated job files")
+    parser.add_argument("--dtns", action="store_true", required=False, help="Enable DTNs")
+
     args = parser.parse_args()
-    main(job_count=args.job_count, output_dir=args.output_dir)
+    main(job_count=args.job_count, output_dir=args.output_dir, enable_dtns=args.dtns)
