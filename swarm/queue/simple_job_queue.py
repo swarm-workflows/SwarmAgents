@@ -22,6 +22,7 @@
 #
 # Author: Komal Thareja(kthare10@renci.org)
 import threading
+from itertools import islice
 
 from swarm.models.job import Job, JobState
 from swarm.queue.job_queue import JobQueue
@@ -37,18 +38,18 @@ class SimpleJobQueue(JobQueue):
             return len(self.jobs)
 
     def get_jobs(self, states: list[JobState] = None, count: int = None) -> list[Job]:
+        # Copy references while holding the lock, so iteration happens outside
         with self.lock:
-            if not states or not len(states):
-                return list(self.jobs.values())
-            result = []
-            job_cnt = 0
-            for j in self.jobs.values():
-                if j.get_state() in states:
-                    result.append(j)
-                    job_cnt += 1
-                if count and job_cnt == count:
-                    break
-            return result
+            all_jobs = list(self.jobs.values())
+
+        if states:
+            states_set = set(states)
+            all_jobs = (j for j in all_jobs if j.get_state() in states_set)
+
+        if count:
+            all_jobs = islice(all_jobs, count)
+
+        return list(all_jobs)
 
     def add_job(self, job: Job):
         with self.lock:
