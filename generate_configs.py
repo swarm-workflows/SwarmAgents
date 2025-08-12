@@ -336,5 +336,5 @@ if __name__ == "__main__":
     generator.generate_configs()
 
     if not os.path.exists("jobs"):
-        generator = JobGenerator(job_count=args.job_cnt)
+        generator = JobGenerator(job_count=args.job_cnt, dtn_json_path='agent_dtns.json')
         generator.generate_job_files(output_dir="jobs", enable_dtns=args.dtns)

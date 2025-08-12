@@ -128,7 +128,7 @@ def main(job_count: int, output_dir: str, enable_dtns: bool) -> None:
     :param job_count: Number of jobs to generate
     :param output_dir: Directory to save individual job JSON files
     """
-    generator = JobGenerator(job_count=job_count)
+    generator = JobGenerator(job_count=job_count, dtn_json_path='agent_dtns.json')
     generator.generate_job_files(output_dir, enable_dtns)
 
 
