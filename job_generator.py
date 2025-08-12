@@ -52,6 +52,11 @@ class JobGenerator:
                 return json.load(f)
         return {}
 
+    @staticmethod
+    def biased_uniform(min_val, max_val, bias_factor=3):
+        """Generate values skewed toward the lower range."""
+        return round(min_val + (max_val - min_val) * (random.random() ** bias_factor), 2)
+
     def generate_job(self, x: int, enable_dtns: bool) -> Dict[str, Any]:
         """
         Generate a single job dictionary with randomized fields.
@@ -60,13 +65,12 @@ class JobGenerator:
         :return: Dictionary representing a job
         """
         job_id = str(x)
-        execution_time = round(random.uniform(0.1, 30.0), 2)
-        core = round(random.uniform(0.1, 4.0), 2)
-        gpu = round(random.uniform(0.1, 4.0), 2)
-        ram = round(random.uniform(0.1, 4.0), 2)
-        disk = round(random.uniform(0.1, 4.0), 2)
+        execution_time = self.biased_uniform(0.1, 30.0)
+        core = self.biased_uniform(0.1, 0.8 * 8)
+        gpu = self.biased_uniform(0.1, 0.8 * 8)
+        ram = self.biased_uniform(0.1, 0.8 * 64)
+        disk = self.biased_uniform(1, 0.8 * 500)
         status = random.choice([0, -1])
-
 
         input_files = ['/var/tmp/outgoing/file100M.txt',
                        '/var/tmp/outgoing/file500M.txt',
