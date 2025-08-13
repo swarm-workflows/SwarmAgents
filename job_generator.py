@@ -87,12 +87,12 @@ class JobGenerator:
             dtn_count = random.randint(1, len(candidate_dtns))
             dtns = random.sample(candidate_dtns, dtn_count)
             data_in = [
-                {'name': random.choice(dtns),
+                {'name': random.choice(dtns).get("name"),
                  'file': random.choice(input_files)}
                 for _ in range(random.randint(0, 3))
             ]
             data_out = [
-                {'name': random.choice(dtns),
+                {'name': random.choice(dtns).get("name"),
                  'file': random.choice(output_files)}
                 for _ in range(random.randint(0, 3))
             ]
