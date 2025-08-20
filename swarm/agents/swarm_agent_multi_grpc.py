@@ -21,7 +21,6 @@
 # SOFTWARE.
 #
 # Author: Komal Thareja(kthare10@renci.org)
-import random
 import time
 import traceback
 from collections import defaultdict
@@ -316,23 +315,6 @@ class SwarmAgent(Agent):
             self.outgoing_proposals.remove_job(job_id=j)
             self.queues.job_queue.remove_job(job_id=j)
 
-            '''
-            job = self.repo.get(obj_id=j, key_prefix=Repository.KEY_JOB,
-                                level=self.topology.level, group=self.topology.group)
-            job_obj = Job()
-            job_obj.from_dict(job)
-
-            # Reward: success vs failure
-            reward = 1.0 if job_obj.status == 0 else -1.0
-            key = (job_obj.leader_agent_id, job_obj.job_type)
-
-            # Q-learning update
-            old_q = self.q_table[key]
-            self.q_table[key] = old_q + self.learning_rate * (
-                    reward + self.discount_factor * 0 - old_q
-            )
-            '''
-
     def _restart_selection(self):
         jobs = self.queues.job_queue.get_jobs(states=[JobState.PREPARE, JobState.PRE_PREPARE,
                                                       JobState.COMMIT])
@@ -517,7 +499,6 @@ class SwarmAgent(Agent):
 
         self.stop()
 
-    '''
     def is_job_feasible(self, job: Job, agent: AgentInfo) -> bool:
         """
         Check if a job is feasible for a given agent based on:
@@ -532,30 +513,6 @@ class SwarmAgent(Agent):
         :return: True if job is feasible for the agent, False otherwise.
         :rtype: bool
         """
-        # Load check
-        #if agent.load >= self.projected_queue_threshold:
-        #    return False
-
-        # Capacity check
-        available = agent.capacities - agent.capacity_allocations
-        if not self._has_sufficient_capacity(job, available):
-            return False
-
-        # DTN connectivity check
-        required_dtns = set()
-        for entry in (job.data_in or []):
-            required_dtns.add(entry.name)
-        for entry in (job.data_out or []):
-            required_dtns.add(entry.name)
-
-        for dtn in required_dtns:
-            if dtn not in agent.dtns:
-                self.logger.debug(f"Agent {agent.agent_id} failed DTN check for {dtn}")
-                return False
-
-        return True
-    '''
-    def is_job_feasible(self, job: Job, agent: AgentInfo) -> bool:
         # Capacity check first (cheapest)
         available = agent.capacities - agent.capacity_allocations
         if not self._has_sufficient_capacity(job, available):
@@ -645,99 +602,7 @@ class SwarmAgent(Agent):
         if len(self._base_cost_cache) > self._cost_cache_max:
             self._base_cost_cache.clear()
 
-    @staticmethod
     def compute_job_cost(
-            job: Job,
-            total: Capacities,
-            dtns: dict[str, DataNode],
-            cpu_weight: float = 0.4,
-            ram_weight: float = 0.3,
-            disk_weight: float = 0.2,
-            gpu_weight: float = 0.1,
-            long_job_threshold: float = 20.0,
-            connectivity_penalty_factor: float = 1.0
-    ) -> float:
-        """
-        Compute the cost of executing a job on an agent based on weighted resource usage,
-        bottleneck effects, execution time penalties, and DTN connectivity.
-
-        The cost is calculated as a weighted sum of resource usage ratios, penalized for:
-          - High single-resource utilization (bottleneck penalty)
-          - Long execution times beyond a configurable threshold
-          - Poor connectivity to DTNs required by the job
-
-        :param job: The job whose cost is to be computed.
-        :type job: Job
-        :param total: Total available resources.
-        :type total: Capacities
-        :param dtns: DTN info for the agent
-        :type dtns: dict[str, DataNode]
-        :param cpu_weight: Weight assigned to CPU utilization in the cost function.
-        :type cpu_weight: float
-        :param ram_weight: Weight assigned to RAM utilization in the cost function.
-        :type ram_weight: float
-        :param disk_weight: Weight assigned to Disk utilization in the cost function.
-        :type disk_weight: float
-        :param gpu_weight: Weight assigned to GPU utilization in the cost function.
-        :type gpu_weight: float
-        :param long_job_threshold: Execution time threshold (in seconds) above which a penalty is applied.
-        :type long_job_threshold: float
-        :param connectivity_penalty_factor: Multiplier controlling how much poor DTN connectivity affects cost.
-        :type connectivity_penalty_factor: float
-        :return: Calculated job cost (higher is more expensive).
-        :rtype: float
-        """
-        if not total or total.core <= 0 or total.ram <= 0 or total.disk <= 0:
-            return float('inf')
-
-        # Prevent division by zero for GPUs
-        total_gpu = getattr(total, "gpu", 0) or 1
-        job_gpu = getattr(job.capacities, "gpu", 0)
-
-        # Resource usage ratios
-        core_ratio = job.capacities.core / total.core
-        ram_ratio = job.capacities.ram / total.ram
-        disk_ratio = job.capacities.disk / total.disk
-        gpu_ratio = job_gpu / total_gpu
-
-        # Weighted base score
-        base_score = (
-                cpu_weight * core_ratio +
-                ram_weight * ram_ratio +
-                disk_weight * disk_ratio +
-                gpu_weight * gpu_ratio
-        )
-
-        # Bottleneck penalty for high single-resource usage
-        bottleneck_penalty = max(core_ratio, ram_ratio, disk_ratio, gpu_ratio) ** 2
-
-        # Long job penalty
-        if job.execution_time > long_job_threshold:
-            time_penalty = 1.5 + (job.execution_time - long_job_threshold) / long_job_threshold
-        else:
-            time_penalty = 1 + (job.execution_time / long_job_threshold) ** 2
-
-        # --- DTN connectivity penalty ---
-        avg_conn = 1.0  # default perfect connectivity
-        if hasattr(job, "data_in") or hasattr(job, "data_out"):
-            required_dtns = {entry.name for entry in (job.data_in or [])} | \
-                            {entry.name for entry in (job.data_out or [])}
-
-            agent_dtn_scores = {dtn.name: getattr(dtn, "connectivity_score", 1.0)
-                                for dtn in dtns.values()}
-
-            scores = [agent_dtn_scores.get(dtn, 0.0) for dtn in required_dtns]
-            if scores:
-                avg_conn = sum(scores) / len(scores)
-
-        # Penalty grows as connectivity worsens
-        connectivity_penalty = 1 + connectivity_penalty_factor * (1 - avg_conn)
-
-        # Final cost
-        cost = (base_score + bottleneck_penalty) * time_penalty * connectivity_penalty * 100
-        return round(cost, 2)
-
-    def compute_job_cost_job_type(
             self,  # now uses self so it can read config defaults
             job: Job,
             total: Capacities,
@@ -863,6 +728,19 @@ class SwarmAgent(Agent):
         return round(cost, 2)
 
     def compute_cost_matrix(self, jobs: list[Job]) -> np.ndarray:
+        """
+        Compute a cost matrix for assigning jobs to agents, with feasibility checks,
+        bottleneck penalties, and load-aware scaling.
+
+        Rows represent agents, columns represent jobs. Each entry [i, j] represents
+        the cost of agent `i` executing job `j`, or infinity if the job is not feasible
+        for that agent.
+
+        :param jobs: List of jobs to compute costs for.
+        :type jobs: list[Job]
+        :return: 2D numpy array of shape (num_agents, num_jobs) containing execution costs.
+        :rtype: np.ndarray
+        """
         agents_map = self.neighbor_map
 
         # Snapshot neighbors once (iteration order fixed)
@@ -897,63 +775,13 @@ class SwarmAgent(Agent):
                 ckey = ("C", agent_sig, job_sigs[ji])
                 base_cost = self._base_cost_cache.get(ckey)
                 if base_cost is None:
-                    # NOTE: if you want job-type aware costs, call compute_job_cost_job_type
-                    base_cost = self.compute_job_cost_job_type(job, total=agent.capacities, dtns=agent.dtns)
+                    base_cost = self.compute_job_cost(job, total=agent.capacities, dtns=agent.dtns)
                     self._base_cost_cache[ckey] = base_cost
 
                 cost_matrix[ai, ji] = round(base_cost * load_penalty, 2)
 
         self._maybe_trim_cache()
         return cost_matrix
-
-    '''
-    def compute_cost_matrix(self, jobs: list[Job]) -> np.ndarray:
-        """
-        Compute a cost matrix for assigning jobs to agents, with feasibility checks,
-        bottleneck penalties, and load-aware scaling.
-
-        Rows represent agents, columns represent jobs. Each entry [i, j] represents
-        the cost of agent `i` executing job `j`, or infinity if the job is not feasible
-        for that agent.
-
-        :param jobs: List of jobs to compute costs for.
-        :type jobs: list[Job]
-        :return: 2D numpy array of shape (num_agents, num_jobs) containing execution costs.
-        :rtype: np.ndarray
-        """
-        agents = self.neighbor_map
-        agent_ids = list(agents.keys())
-        num_agents = len(agent_ids)
-        num_jobs = len(jobs)
-
-        cost_matrix = np.full((num_agents, num_jobs), float('inf'))
-
-        # Precompute feasibility for each (agent, job) pair
-        feasibility_map = {
-            agent_id: {
-                job.get_job_id(): self.is_job_feasible(job, agents.get(agent_id))
-                for job in jobs
-            }
-            for agent_id in agent_ids
-        }
-
-        for row_idx, agent_id in enumerate(agent_ids):
-            agent = agents.get(agent_id)
-            projected_load = agent.load + agent.proposed_load
-
-            for col_idx, job in enumerate(jobs):
-                if not feasibility_map[agent_id][job.get_job_id()]:
-                    continue
-
-                job_cost = self.compute_job_cost(job, total=agent.capacities, dtns=agent.dtns)
-
-                # Load penalty (synergy penalty for agents already busy)
-                load_penalty = 1 + (projected_load / 100) ** 1.5
-
-                cost_matrix[row_idx, col_idx] = round((job_cost * load_penalty), 2)
-
-        return cost_matrix
-    '''
 
     def find_min_cost_agents(self, cost_matrix: np.ndarray, threshold_pct: float = 10.0) -> list[tuple[int, float]]:
         """
@@ -984,63 +812,6 @@ class SwarmAgent(Agent):
             selected_agent = min(candidates, key=lambda x: (x[1], x[0]))
             min_cost_agents.append(selected_agent)
 
-            '''
-            # Debug logging: top 3 candidates sorted by cost then agent_id
-            sorted_candidates = sorted(
-                [(agent_ids[i], valid_costs[i]) for i in np.where(finite_mask)[0]],
-                key=lambda x: (x[1], x[0])
-            )[:3]
-
-            self.logger.debug(
-                f"[JOB {j}] Min cost: {min_cost} | "
-                f"Top 3: {', '.join(f'Agent {aid}: {cost:.2f}' for aid, cost in sorted_candidates)}"
-            )
-            '''
-
-        return min_cost_agents
-
-    def find_min_cost_agents_rl(self, cost_matrix: np.ndarray, job_types: list[str],
-                                threshold_pct: float = 10.0) -> list[tuple[int, float]]:
-        """
-        Determine the agent with the minimum cost for each job, allowing near-minimum costs
-        within a given percentage threshold, with optimized RL bias application.
-        """
-        agents = self.neighbor_map
-        agent_ids = list(agents.keys())
-        num_agents, num_jobs = cost_matrix.shape
-
-        # Build RL bias matrix in one pass
-        rl_bias_matrix = np.zeros((num_agents, num_jobs), dtype=float)
-        for ai, agent_id in enumerate(agent_ids):
-            for ji, job_type in enumerate(job_types):
-                if job_type:
-                    rl_bias_matrix[ai, ji] = self.q_table.get((agent_id, job_type), 0.0)
-
-        # Apply RL bias: higher Q → lower effective cost
-        adjusted_cost_matrix = cost_matrix * (1 - rl_bias_matrix)
-
-        min_cost_agents = []
-
-        # Loop per job, but no inner agent loop
-        for j in range(num_jobs):
-            valid_costs = adjusted_cost_matrix[:, j]
-            finite_mask = np.isfinite(valid_costs)
-            if not np.any(finite_mask):
-                continue
-
-            min_cost = np.min(valid_costs[finite_mask])
-            threshold = min_cost * (1 + threshold_pct / 100.0)
-
-            candidates_idx = np.where(valid_costs <= threshold)[0]
-            candidates = [(agent_ids[i], valid_costs[i]) for i in candidates_idx]
-
-            # Epsilon-greedy exploration
-            if self.exploration_rate > 0 and random.random() < self.exploration_rate:
-                selected_agent = random.choice(candidates)
-            else:
-                selected_agent = min(candidates, key=lambda x: (x[1], x[0]))
-
-            min_cost_agents.append(selected_agent)
         return min_cost_agents
 
     def job_selection_main(self):
