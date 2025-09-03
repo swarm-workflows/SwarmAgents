@@ -2,16 +2,16 @@
 set -euo pipefail
 
 usage() {
-    echo "Usage: $0 <num_agents> <topology> <job_cnt> <database> <jobs_per_proposal>"
+    echo "Usage: $0 <num_agents> <topology> <job_cnt> <database> <jobs_per_proposal> <agents_per_host>"
     echo "  num_agents         Number of agents to start"
     echo "  topology           Topology type"
     echo "  job_cnt            Number of jobs"
-    echo "  database           (Optional) Database host"
-    echo "  jobs_per_proposal  (Optional) Jobs per proposal"
+    echo "  database           Database host"
+    echo "  jobs_per_proposal  Jobs per proposal"
+    echo "  agents_per_host    Agents per host"
     exit 1
 }
 
-# Check minimum required arguments
 if [[ $# -lt 3 ]]; then
     usage
 fi
@@ -21,6 +21,7 @@ topology="$1"; shift
 job_cnt="$1"; shift
 database="${1:-localhost}"
 jobs_per_proposal="${2:-10}"
+agents_per_host="${3:-1}"
 
 rm -rf jobs configs
 
@@ -28,19 +29,26 @@ echo "  Topology: $topology"
 echo "  Job count: $job_cnt"
 [[ -n "$database" ]] && echo "  Database: $database"
 
-# Call generate_configs as-is
 python3.11 generate_configs.py "$num_agents" "$jobs_per_proposal" ./config_swarm_multi.yml configs $topology $database $job_cnt
 
-# Build cleanup command with optional args only if set
 cleanup_cmd="python3.11 cleanup.py --agents $num_agents"
 [[ -n "$database" ]] && cleanup_cmd+=" --redis-host $database --cleanup-redis"
-
-# Run cleanup
 eval "$cleanup_cmd"
 
 # Transfer generated configs to each agent 
 for ((i=1; i<=num_agents; i++)); do
     agent_host="agent-$i"
-    scp configs/config_swarm_multi_$i.yml "${agent_host}:/root/SwarmAgents/"
+    ssh "${agent_host}" "mkdir -p /root/SwarmAgents/configs"
+    ssh "${agent_host}" "rm -rf /root/SwarmAgents/configs/*"
+
+    for ((j=1; j<=agents_per_host; j++)); do
+        config_file="config_swarm_multi_$(( (i-1)*agents_per_host + j )).yml"
+        scp "configs/$config_file" "${agent_host}:/root/SwarmAgents/configs/"
+    done
 done
 
+# Start agents on each host using swarm-multi-start.sh with --use-config-dir
+for ((i=1; i<=num_agents; i++)); do
+    agent_host="agent-$i"
+    ssh "${agent_host}" "cd /root/SwarmAgents && bash swarm-multi-start.sh $agents_per_host $topology $job_cnt $database $jobs_per_proposal --use-config-dir"
+done
