@@ -55,5 +55,5 @@ done
 # Start agents on each host using swarm-multi-start.sh with --use-config-dir
 for ((i=1; i<=num_agents; i++)); do
     agent_host="agent-$i"
-    ssh "${agent_host}" "cd /root/SwarmAgents && bash swarm-multi-start.sh $agents_per_host $topology $job_cnt $database $jobs_per_proposal --use-config-dir"
+    ssh "${agent_host}" "cd /root/SwarmAgents && nohup bash swarm-multi-start.sh $agents_per_host $topology $job_cnt $database $jobs_per_proposal --use-config-dir > agent_${i}_start.log 2>&1 &"
 done
