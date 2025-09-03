@@ -19,8 +19,8 @@ fi
 num_agents="$1"; shift
 topology="$1"; shift
 job_cnt="$1"; shift
-database="${1:-}"
-jobs_per_proposal="${2:-}"
+database="${1:-localhost}"
+jobs_per_proposal="${2:-10}"
 
 base_index=0
 
@@ -28,19 +28,16 @@ echo "Starting $num_agents agents with:"
 echo "  Topology: $topology"
 echo "  Job count: $job_cnt"
 [[ -n "$database" ]] && echo "  Database: $database"
-[[ -n "$jobs_per_proposal" ]] && echo "  Jobs per proposal: $jobs_per_proposal"
 
-# Clean up previous runs
 pkill -f "main.py db-swarm-multi" || true
 rm -f shutdown
 
-# Generate configs
-python3.11 generate_configs.py "$num_agents" "$jobs_per_proposal" ./config_swarm_multi.yml configs "$topology" "$database" "$job_cnt"
 
-# Build cleanup command
+# Call generate_configs as-is
+python3.11 generate_configs.py "$num_agents" "$jobs_per_proposal" ./config_swarm_multi.yml configs $topology $database $job_cnt
+
+# Build cleanup command with optional args only if set
 cleanup_cmd="python3.11 cleanup.py --agents $num_agents"
-[[ -n "${topic:-}" ]] && cleanup_cmd+=" --topic $topic"
-[[ -n "${broker:-}" ]] && cleanup_cmd+=" --broker $broker"
 [[ -n "$database" ]] && cleanup_cmd+=" --redis-host $database --cleanup-redis"
 
 # Run cleanup
@@ -50,11 +47,8 @@ eval "$cleanup_cmd"
 rm -rf swarm-multi
 mkdir -p swarm-multi
 
-# Trap for cleanup on exit
-trap 'pkill -f "main.py swarm-multi" || true' EXIT
-
 # Launch agents
-for i in $(seq 0 $((num_agents - 1))); do
-    agent_index=$((base_index + i + 1))
-    python3.11 main.py swarm-multi "$agent_index" "$topology" &
+for i in $(seq 0 $(($num_agents - 1))); do
+    agent_index=$(($base_index + $i + 1))
+    python3.11 main.py swarm-multi "$agent_index" $topology &
 done
