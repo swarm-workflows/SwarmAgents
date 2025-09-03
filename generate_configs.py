@@ -7,6 +7,13 @@ import argparse
 
 from job_generator import JobGenerator
 
+INSTANCE_FLAVORS = [
+    {"name": "small",      "core": 2,  "ram": 8,   "disk": 100,  "gpu": 0},
+    {"name": "medium",     "core": 4,  "ram": 16,  "disk": 250,  "gpu": 0},
+    {"name": "large",      "core": 8,  "ram": 32,  "disk": 500,  "gpu": 4},
+    {"name": "xtralarge",  "core": 16, "ram": 64,  "disk": 1000, "gpu": 4},
+    {"name": "xxtralarge", "core": 32, "ram": 128, "disk": 1000, "gpu": 4},
+]
 
 class SwarmConfigGenerator:
     """
@@ -34,6 +41,25 @@ class SwarmConfigGenerator:
         self.db_host = db_host
         self.agent_dtns_map = self._load_agent_dtns(path=self.AGENT_DTNS)
         self.enable_dtns = enable_dtns
+    
+    def assign_flavors(self, percentages):
+        """
+        Assign flavors to agents based on CLI percentages.
+        Returns a list of flavor dicts for each agent.
+        """
+        agent_flavors = []
+        total_agents = self.num_agents
+        assigned = 0
+        for idx, flavor in enumerate(INSTANCE_FLAVORS):
+            pct = percentages[idx]
+            count = int(pct * total_agents)
+            agent_flavors.extend([flavor] * count)
+            assigned += count
+        # Fill any remainder with the first flavor
+        while len(agent_flavors) < total_agents:
+            agent_flavors.append(INSTANCE_FLAVORS[0])
+        random.shuffle(agent_flavors)
+        return agent_flavors
 
     def load_base_config(self):
         """
@@ -87,7 +113,7 @@ class SwarmConfigGenerator:
         prefix, _ = os.path.splitext(filename)  # Extract name without extension
         return prefix
 
-    def generate_configs(self):
+    def generate_configs(self, flavor_percentages, agent_hosts):
         """
         Generates YAML configuration files for agents based on the ring topology.
         """
@@ -219,15 +245,22 @@ class SwarmConfigGenerator:
 
         config_prefix = self.get_config_prefix()
 
-        # Step 1: Create a global DTN pool once
+                # Step 1: Create a global DTN pool once
         if len(self.agent_dtns_map) == 0:
             dtn_pool = self.generate_global_dtn_pool(total_count=10)
         else:
             dtn_pool = None
 
+        # Assign flavors
+        if flavor_percentages is None:
+            # Default percentages: [small, medium, large, xtralarge, xxtralarge]
+            flavor_percentages = [0.4, 0.25, 0.15, 0.15, 0.05]
+        agent_flavors = self.assign_flavors(flavor_percentages)
+
         # Generate YAML files for each agent
         for agent_id in range(1, self.num_agents + 1):
             config = self.base_config.copy()
+            config['grpc']['host'] = agent_hosts[agent_id - 1]
 
             # Step 3: Assign random DTNs from pool to this agent
             if self.enable_dtns:
@@ -237,11 +270,12 @@ class SwarmConfigGenerator:
                 else:
                     config["dtns"] = self.adjust_scores(self.agent_dtns_map[str(agent_id)])
 
-            # Randomize capacities
-            config['capacities']['core'] = self.random_capacity(1, 8)
-            config['capacities']['gpu'] = self.random_capacity(1, 8)
-            config['capacities']['ram'] = self.random_capacity(8, 64)
-            config['capacities']['disk'] = self.random_capacity(100, 500)
+            # Assign capacities and gpus based on flavor
+            flavor = agent_flavors[agent_id - 1]
+            config['capacities']['core'] = flavor['core']
+            config['capacities']['gpu'] = flavor['gpu']
+            config['capacities']['ram'] = flavor['ram']
+            config['capacities']['disk'] = flavor['disk']
 
             config["redis"]["host"] = self.db_host
             config["topology"] = {"peer_agents": agent_topo[agent_id]["peers"], "type": self.topology,
@@ -316,6 +350,14 @@ class SwarmConfigGenerator:
             })
         return agent_dtns
 
+DEFAULT_FLAVOR_PERCENTAGES = [0.4, 0.25, 0.15, 0.15, 0.05]
+
+def load_agent_hosts(path, num_agents):
+    with open(path, "r") as f:
+        hosts = [line.strip() for line in f if line.strip()]
+    if len(hosts) < num_agents:
+        raise ValueError("Not enough hosts specified for agents")
+    return hosts[:num_agents]
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate agent configuration files with a structured ring topology.")
@@ -328,12 +370,30 @@ if __name__ == "__main__":
     parser.add_argument("database", type=str, default="all", help="Database Host")
     parser.add_argument("job_cnt", type=int, help="Job Count")
     parser.add_argument("--dtns", action="store_true", required=False, help="Enable DTNs")
-
+    parser.add_argument("--flavor-percentages", nargs='*', type=float, metavar='PERCENT',
+                    help="Percentages for small, medium, large, xtralarge, xxtralarge flavors (e.g. 0.4 0.25 0.15 0.15 0.05)")
+    parser.add_argument("--agent-hosts-file", type=str, help="Path to file with agent hosts (one per line)")
+    
     args = parser.parse_args()
 
-    generator = SwarmConfigGenerator(args.num_agents, args.jobs_per_proposal, args.base_config_file,
-                                     args.output_dir, args.topology, args.database, args.dtns)
-    generator.generate_configs()
+    if args.agent_hosts_file:
+        agent_hosts = load_agent_hosts(args.agent_hosts_file, args.num_agents)
+    else:
+        agent_hosts = ["localhost"] * args.num_agents
+
+    # Fill missing percentages with defaults
+    if args.flavor_percentages:
+        flavor_percentages = list(args.flavor_percentages) + DEFAULT_FLAVOR_PERCENTAGES[len(args.flavor_percentages):]
+        total = sum(flavor_percentages)
+        if abs(total - 1.0) > 0.01:
+            raise ValueError("Flavor percentages must sum to 1.0")
+        generator = SwarmConfigGenerator(args.num_agents, args.jobs_per_proposal, args.base_config_file,
+                                         args.output_dir, args.topology, args.database, args.dtns)
+        generator.generate_configs(flavor_percentages=flavor_percentages, agent_hosts=agent_hosts)
+    else:
+        generator = SwarmConfigGenerator(args.num_agents, args.jobs_per_proposal, args.base_config_file,
+                                         args.output_dir, args.topology, args.database, args.dtns)
+        generator.generate_configs(flavor_percentages=DEFAULT_FLAVOR_PERCENTAGES, agent_hosts=agent_hosts)
 
     if not os.path.exists("jobs"):
         generator = JobGenerator(job_count=args.job_cnt, dtn_json_path='agent_dtns.json')

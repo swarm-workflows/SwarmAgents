@@ -29,7 +29,12 @@ echo "  Topology: $topology"
 echo "  Job count: $job_cnt"
 [[ -n "$database" ]] && echo "  Database: $database"
 
-python3.11 generate_configs.py "$num_agents" "$jobs_per_proposal" ./config_swarm_multi.yml configs $topology $database $job_cnt
+# Generate agent hosts file
+rm -f agent_hosts.txt
+for ((i=1; i<=num_agents; i++)); do
+    echo "agent-$i" >> agent_hosts.txt
+done
+python3.11 generate_configs.py "$num_agents" "$jobs_per_proposal" ./config_swarm_multi.yml configs $topology $database $job_cnt --agent-hosts-file agent_hosts.txt
 
 cleanup_cmd="python3.11 cleanup.py --agents $num_agents"
 [[ -n "$database" ]] && cleanup_cmd+=" --redis-host $database --cleanup-redis"
