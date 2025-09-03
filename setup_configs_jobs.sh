@@ -40,6 +40,7 @@ eval "$cleanup_cmd"
 
 # Transfer generated configs to each agent 
 for ((i=0; i<num_agents; i++)); do
-    scp configs/config_agent_$i.yml "/root/SwarmAgents/"
+    agent_host="agent-$i"
+    scp configs/config_agent_$i.yml "${agent_host}:/root/SwarmAgents/"
 done
 
