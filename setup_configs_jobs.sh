@@ -22,16 +22,11 @@ job_cnt="$1"; shift
 database="${1:-localhost}"
 jobs_per_proposal="${2:-10}"
 
-base_index=0
+rm -rf jobs configs
 
-echo "Starting $num_agents agents with:"
 echo "  Topology: $topology"
 echo "  Job count: $job_cnt"
 [[ -n "$database" ]] && echo "  Database: $database"
-
-pkill -f "main.py swarm-multi" || true
-rm -f shutdown
-
 
 # Call generate_configs as-is
 python3.11 generate_configs.py "$num_agents" "$jobs_per_proposal" ./config_swarm_multi.yml configs $topology $database $job_cnt
@@ -43,12 +38,8 @@ cleanup_cmd="python3.11 cleanup.py --agents $num_agents"
 # Run cleanup
 eval "$cleanup_cmd"
 
-# Prepare agent run directory
-rm -rf swarm-multi
-mkdir -p swarm-multi
-
-# Launch agents
-for i in $(seq 0 $(($num_agents - 1))); do
-    agent_index=$(($base_index + $i + 1))
-    python3.11 main.py swarm-multi "$agent_index" $topology &
+# Transfer generated configs to each agent 
+for ((i=0; i<num_agents; i++)); do
+    scp configs/config_agent_$i.yml "/root/SwarmAgents/"
 done
+
