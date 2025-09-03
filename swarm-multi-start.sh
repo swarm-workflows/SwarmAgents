@@ -35,10 +35,10 @@ pkill -f "main.py db-swarm-multi" || true
 rm -f shutdown
 
 # Generate configs
-python3.13 generate_configs.py "$num_agents" "$jobs_per_proposal" ./config_swarm_multi.yml configs "$topology" "$database" "$job_cnt"
+python3.11 generate_configs.py "$num_agents" "$jobs_per_proposal" ./config_swarm_multi.yml configs "$topology" "$database" "$job_cnt"
 
 # Build cleanup command
-cleanup_cmd="python3.13 cleanup.py --agents $num_agents"
+cleanup_cmd="python3.11 cleanup.py --agents $num_agents"
 [[ -n "${topic:-}" ]] && cleanup_cmd+=" --topic $topic"
 [[ -n "${broker:-}" ]] && cleanup_cmd+=" --broker $broker"
 [[ -n "$database" ]] && cleanup_cmd+=" --redis-host $database --cleanup-redis"
@@ -56,5 +56,5 @@ trap 'pkill -f "main.py swarm-multi" || true' EXIT
 # Launch agents
 for i in $(seq 0 $((num_agents - 1))); do
     agent_index=$((base_index + i + 1))
-    python3.13 main.py swarm-multi "$agent_index" "$topology" &
+    python3.11 main.py swarm-multi "$agent_index" "$topology" &
 done
