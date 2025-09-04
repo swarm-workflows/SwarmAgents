@@ -378,7 +378,8 @@ class Agent(Observer):
             if peer_id in excluded:
                 continue
 
-            peer_host = f"agent-{peer_id}" if self.grpc_host != "localhost" else "localhost"
+            #peer_host = f"agent-{peer_id}" if self.grpc_host != "localhost" else "localhost"
+            peer_host = self.grpc_host
             topic = f"{peer_host}:{self.grpc_port + peer_id}"
 
             self.grpc_thread.produce_message(
