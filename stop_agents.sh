@@ -23,6 +23,8 @@ for agent_host in "${hosts[@]}"; do
     [[ -z "$agent_host" ]] && continue
 
     echo "Stopping agents on $agent_host..."
+    ssh "$agent_host" "touch /root/SwarmAgents/shutdown"
+    sleep 5
     ssh "$agent_host" "pkill -f 'main.py swarm-multi' || true" < /dev/null || echo "Warning: SSH to $agent_host failed"
 
     echo "Tarring swarm-multi directory on $agent_host..."
