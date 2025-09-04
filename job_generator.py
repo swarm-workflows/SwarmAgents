@@ -22,31 +22,32 @@
 #
 # Author: Komal Thareja(kthare10@renci.org)
 # MIT License
-# Author: Komal Thareja (kthare10@renci.org)
 
+import os
 import json
 import random
-import argparse
-import os
-from typing import Dict, Any
-
+from typing import Dict, Any, List, Optional
 
 class JobGenerator:
     """
-    Generates random jobs and stores them in Redis or as JSON files.
+    Generates random jobs and stores them as JSON files.
     """
 
-    def __init__(self, job_count: int = 0, dtn_json_path: str = None) -> None:
+    def __init__(self, job_count: int = 0, agent_profile_path: str = None) -> None:
         """
         Initialize the JobGenerator.
 
         :param job_count: Number of jobs to generate
-        :param dtn_json_path: Optional path to JSON file mapping agent_id -> list of DTNs
+        :param agent_profile_path: Path to JSON file mapping agent_id -> profile dict (capacities, dtns)
         """
         self.job_count = job_count
-        self.agent_dtns_map = self._load_agent_dtns(dtn_json_path)
+        self.agent_profiles = self._load_agent_profiles(agent_profile_path)
 
-    def _load_agent_dtns(self, path: str) -> dict[int, list[str]]:
+    def _load_agent_profiles(self, path: Optional[str]) -> Dict[str, Dict[str, Any]]:
+        """
+        Load agent profiles from a JSON file.
+        Each profile should include capacities and optionally DTNs.
+        """
         if path and os.path.exists(path):
             with open(path, "r") as f:
                 return json.load(f)
@@ -59,18 +60,22 @@ class JobGenerator:
 
     def generate_job(self, x: int, enable_dtns: bool) -> Dict[str, Any]:
         """
-        Generate a single job dictionary with randomized fields.
-
-        :param x: Job index (used as job ID)
-        :return: Dictionary representing a job
+        Generate a single job dictionary with randomized fields,
+        ensuring requirements fit within a randomly selected agent's profile.
         """
         job_id = str(x)
-        execution_time = self.biased_uniform(0.1, 30.0)
-        core = self.biased_uniform(0.1, 0.8 * 8)
-        gpu = self.biased_uniform(0.1, 0.8 * 8)
-        ram = self.biased_uniform(0.1, 0.8 * 64)
-        disk = self.biased_uniform(1, 0.8 * 500)
         status = random.choice([0, -1])
+
+        # Choose a random agent profile
+        agent_id = random.choice(list(self.agent_profiles.keys()))
+        agent_profile = self.agent_profiles[agent_id]
+
+        # Ensure job requirements do not exceed agent's capacities
+        core = self.biased_uniform(0.1, agent_profile.get("core", 2))
+        gpu = self.biased_uniform(0.1, agent_profile.get("gpu", 0)) if agent_profile.get("gpu", 0) > 0 else 0
+        ram = self.biased_uniform(0.1, agent_profile.get("ram", 8))
+        disk = self.biased_uniform(1, agent_profile.get("disk", 100))
+        execution_time = self.biased_uniform(0.1, 30.0)
 
         input_files = ['/var/tmp/outgoing/file100M.txt',
                        '/var/tmp/outgoing/file500M.txt',
@@ -80,25 +85,25 @@ class JobGenerator:
                         '/var/tmp/outgoing/file500M.txt',
                         '/var/tmp/outgoing/file1G.txt']
 
-        if enable_dtns:
-            # Choose a random agent to derive valid DTNs
-            agent_id = random.choice(list(self.agent_dtns_map.keys()))
-            candidate_dtns = self.agent_dtns_map[agent_id]
-            dtn_count = random.randint(1, len(candidate_dtns))
+        data_in, data_out = None, None
+        if enable_dtns and "dtns" in agent_profile and agent_profile["dtns"]:
+            candidate_dtns = agent_profile["dtns"]
+            dtn_count = min(random.randint(1, len(candidate_dtns)), len(candidate_dtns))
             dtns = random.sample(candidate_dtns, dtn_count)
             data_in = [
-                {'name': random.choice(dtns).get("name"),
+                {'name': dtn.get("name") if isinstance(dtn, dict) else dtn,
                  'file': random.choice(input_files)}
-                for _ in range(random.randint(0, 3))
+                for dtn in dtns
             ]
             data_out = [
-                {'name': random.choice(dtns).get("name"),
+                {'name': dtn.get("name") if isinstance(dtn, dict) else dtn,
                  'file': random.choice(output_files)}
-                for _ in range(random.randint(0, 3))
+                for dtn in dtns
             ]
 
         return {
             'id': job_id,
+            'agent_id': agent_id,
             'execution_time': execution_time,
             'capacities': {'core': core, 'ram': ram, 'disk': disk, 'gpu': gpu},
             'data_in': data_in if enable_dtns else None,
@@ -106,37 +111,25 @@ class JobGenerator:
             'status': status
         }
 
-    def generate_job_files(self, output_dir: str, enable_dtns: bool) -> None:
+    def generate_job_files(self, output_dir: str = "jobs", enable_dtns: bool = False) -> None:
         """
-        Generate individual job JSON files and save to the specified directory.
-
-        :param output_dir: Path to directory where job files will be written
+        Generate job files in the specified output directory.
         """
         os.makedirs(output_dir, exist_ok=True)
-        for x in range(self.job_count):
-            job_data = self.generate_job(x, enable_dtns)
-            file_path = os.path.join(output_dir, f"job_{x}.json")
-            with open(file_path, 'w') as f:
-                json.dump(job_data, f, indent=4)
-        print(f"{self.job_count} jobs written to {output_dir}")
+        for i in range(1, self.job_count + 1):
+            job = self.generate_job(i, enable_dtns)
+            job_path = os.path.join(output_dir, f"job_{i}.json")
+            with open(job_path, "w") as f:
+                json.dump(job, f, indent=2)
 
-
-def main(job_count: int, output_dir: str, enable_dtns: bool) -> None:
-    """
-    Entry point for generating jobs to a directory.
-
-    :param job_count: Number of jobs to generate
-    :param output_dir: Directory to save individual job JSON files
-    """
-    generator = JobGenerator(job_count=job_count, dtn_json_path='agent_dtns.json')
-    generator.generate_job_files(output_dir, enable_dtns)
-
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Generate job JSON files.")
-    parser.add_argument('job_count', type=int, help="Number of jobs to generate")
-    parser.add_argument('output_dir', type=str, help="Directory to save generated job files")
-    parser.add_argument("--dtns", action="store_true", required=False, help="Enable DTNs")
-
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Generate jobs matching agent profiles.")
+    parser.add_argument("--job-count", type=int, required=True, help="Number of jobs to generate")
+    parser.add_argument("--agent-profile-path", type=str, required=True, help="Path to agent profiles JSON")
+    parser.add_argument("--output-dir", type=str, default="jobs", help="Directory to save job files")
+    parser.add_argument("--enable-dtns", action="store_true", help="Assign DTNs to jobs based on agent profiles")
     args = parser.parse_args()
-    main(job_count=args.job_count, output_dir=args.output_dir, enable_dtns=args.dtns)
+
+    generator = JobGenerator(job_count=args.job_count, agent_profile_path=args.agent_profile_path)
+    generator.generate_job_files(output_dir=args.output_dir, enable_dtns=args.enable_dtns)

@@ -113,7 +113,7 @@ class SwarmConfigGenerator:
         prefix, _ = os.path.splitext(filename)  # Extract name without extension
         return prefix
 
-    def generate_configs(self, flavor_percentages, agent_hosts):
+    def generate_configs(self, flavor_percentages, agent_hosts, save_agent_profiles_path="agent_profiles.json"):
         """
         Generates YAML configuration files for agents based on the ring topology.
         """
@@ -257,6 +257,7 @@ class SwarmConfigGenerator:
             flavor_percentages = [0.4, 0.25, 0.15, 0.15, 0.05]
         agent_flavors = self.assign_flavors(flavor_percentages)
 
+        agent_profiles = {}
         # Generate YAML files for each agent
         for agent_id in range(1, self.num_agents + 1):
             config = self.base_config.copy()
@@ -285,6 +286,17 @@ class SwarmConfigGenerator:
             config["runtime"]["jobs_per_proposal"] = self.jobs_per_proposal
 
             config_file_path = os.path.join(f"{self.output_dir}/{config_prefix}_{agent_id}.yml")
+
+            # Assign DTNs if present
+            dtns = config.get("dtns", [])
+            # Save agent profile for this agent
+            agent_profiles[str(agent_id)] = {
+                "core": config['capacities']['core'],
+                "ram": config['capacities']['ram'],
+                "disk": config['capacities']['disk'],
+                "gpu": config['capacities']['gpu'],
+                "dtns": dtns
+            }
             with open(config_file_path, "w") as file:
                 yaml.dump(config, file, default_flow_style=False)
 
@@ -292,6 +304,11 @@ class SwarmConfigGenerator:
         dtn_json_path = os.path.join(self.AGENT_DTNS)
         with open(dtn_json_path, 'w') as f:
             json.dump(self.agent_dtns_map, f, indent=2)
+
+        # Save agent profiles JSON if requested
+        if save_agent_profiles_path:
+            with open(save_agent_profiles_path, "w") as f:
+                json.dump(agent_profiles, f, indent=2)
 
         print(f"\nGenerated {self.num_agents} config files in {self.output_dir}")
 
@@ -396,5 +413,5 @@ if __name__ == "__main__":
         generator.generate_configs(flavor_percentages=DEFAULT_FLAVOR_PERCENTAGES, agent_hosts=agent_hosts)
 
     if not os.path.exists("jobs"):
-        generator = JobGenerator(job_count=args.job_cnt, dtn_json_path='agent_dtns.json')
+        generator = JobGenerator(job_count=args.job_cnt, agent_profile_path='agent_profiles.json')
         generator.generate_job_files(output_dir="jobs", enable_dtns=args.dtns)

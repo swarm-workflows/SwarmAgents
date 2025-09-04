@@ -1,15 +1,11 @@
 psutil
 paramiko
 PyYAML
-confluent-kafka
 numpy
 matplotlib
 pyraft
 seaborn
 scipy
-nats-py
-zmq
-riak
 redis
 protobuf
 grpcio
