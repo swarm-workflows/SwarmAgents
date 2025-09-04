@@ -13,6 +13,46 @@ from swarm.database.repository import Repository
 from swarm.models.job import Job, JobState
 from collections import defaultdict
 
+from typing import Set
+
+def collect_restarted_job_ids(output_dir: str, repo: Repository | None = None) -> Set[int]:
+    """
+    Return the set of job_ids that experienced >=1 restart.
+
+    Prefers Redis metrics; falls back to misc_<agent_id>.json files in output_dir.
+    """
+    restarted: set[int] = set()
+
+    # Try Redis first
+    if repo is not None:
+        metrics = load_metrics_from_repo(repo)
+        if metrics:
+            for _agent_id, m in metrics.items():
+                for job_id, cnt in (m.get("restarts", {}) or {}).items():
+                    try:
+                        if int(cnt) > 0:
+                            restarted.add(int(job_id))
+                    except Exception:
+                        continue
+            if restarted:
+                return restarted
+
+    # Fallback: disk (misc_*.json)
+    for fname in os.listdir(output_dir):
+        if fname.startswith("misc_") and fname.endswith(".json"):
+            try:
+                with open(os.path.join(output_dir, fname), "r") as f:
+                    data = json.load(f)
+            except Exception:
+                continue
+            for job_id, cnt in (data.get("restarts", {}) or {}).items():
+                try:
+                    if int(cnt) > 0:
+                        restarted.add(int(job_id))
+                except Exception:
+                    continue
+
+    return restarted
 
 def load_metrics_from_repo(repo: Repository) -> dict[int, dict]:
     """
@@ -384,41 +424,61 @@ def plot_conflicts_and_restarts(output_dir: str, repo: Repository | None = None)
     return df_conflicts, df_restarts
 
 
-def plot_scheduling_latency_and_jobs(run_dir, agent_count):
+def plot_scheduling_latency_and_jobs(run_dir: str,
+                                     agent_count: int,
+                                     exclude_job_ids: set[int] | None = None,
+                                     label_suffix: str = ""):
+    """
+    Plot latency, jobs/agent, and histogram.
+    If exclude_job_ids is provided, the dataset is filtered to exclude those jobs.
+
+    label_suffix controls output filenames and plot titles (e.g., '_no_restarts').
+    """
     csv_file = f"{run_dir}/all_jobs.csv"
     df = pd.read_csv(csv_file)
 
     # Compute scheduling latency
     df["scheduling_latency"] = df["selected_by_agent_at"] - df["created_at"]
 
-    # Group by leader agent
-    grouped = df.groupby("leader_agent_id")
+    # Optional filter (e.g., exclude restarted jobs)
+    if exclude_job_ids:
+        df = df[~df["job_id"].isin(exclude_job_ids)].copy()
 
-    # Plot scheduling latency per job (scatter)
+    if df.empty:
+        print(f"No rows to plot for label_suffix='{label_suffix}'.")
+        return
+
+    # Group by leader agent
+    grouped = df.groupby("leader_agent_id", dropna=False)
+
+    # Scatter: scheduling latency per job
     plt.figure(figsize=(12, 6))
     for agent_id, group in grouped:
-        plt.scatter(group["job_id"], group["scheduling_latency"], label=f"Agent {int(agent_id)}", s=12)
+        plt.scatter(group["job_id"], group["scheduling_latency"],
+                    label=f"Agent {int(agent_id)}" if pd.notna(agent_id) else "Agent NA",
+                    s=12)
     plt.xlabel("Job ID")
     plt.ylabel("Scheduling Latency (s)")
+    title_extra = " (excluding restarted jobs)" if label_suffix else ""
     plt.title(f"SWARM-MULTI: Scheduling Latency per Job "
-              f"(Mean: {df['scheduling_latency'].mean():.4f} s / Agents {agent_count})")
+              f"(Mean: {df['scheduling_latency'].mean():.4f} s / Agents {agent_count}){title_extra}")
     plt.legend()
     plt.grid(True)
-    plt.savefig(os.path.join(run_dir, "selection_latency_per_job.png"), bbox_inches="tight")
+    plt.savefig(os.path.join(run_dir, f"selection_latency_per_job{label_suffix}.png"), bbox_inches="tight")
     plt.close()
 
-    # Jobs per agent (bar plot)
+    # Jobs per agent (bar plot) — for the filtered set
     jobs_per_agent = grouped.size()
-    jobs_per_agent = jobs_per_agent.reindex(df["leader_agent_id"].unique())
+    jobs_per_agent = jobs_per_agent.reindex(sorted(df["leader_agent_id"].dropna().unique()))
 
     plt.figure(figsize=(10, 6))
     plt.bar(jobs_per_agent.index, jobs_per_agent.values)
     plt.xlabel("Agent ID")
     plt.ylabel("Number of Jobs")
-    plt.title("Jobs per Agent")
+    plt.title(f"Jobs per Agent{title_extra}")
     plt.grid(axis="y")
     plt.xticks(jobs_per_agent.index)
-    plt.savefig(os.path.join(run_dir, "jobs_per_agent.png"), bbox_inches="tight")
+    plt.savefig(os.path.join(run_dir, f"jobs_per_agent{label_suffix}.png"), bbox_inches="tight")
     plt.close()
 
     # Histogram of scheduling latency
@@ -426,17 +486,20 @@ def plot_scheduling_latency_and_jobs(run_dir, agent_count):
     plt.hist(df["scheduling_latency"], bins=20, edgecolor='black', alpha=0.7)
     plt.xlabel("Scheduling Latency (s)")
     plt.ylabel("Frequency")
-    plt.title("Distribution of Scheduling Latency")
+    plt.title(f"Distribution of Scheduling Latency{title_extra}")
     plt.grid(axis="y")
-    plt.savefig(os.path.join(run_dir, "scheduling_latency_histogram.png"), bbox_inches="tight")
+    plt.savefig(os.path.join(run_dir, f"scheduling_latency_histogram{label_suffix}.png"), bbox_inches="tight")
     plt.close()
 
     # Print summary
-    print(f"Mean scheduling latency: {df['scheduling_latency'].mean():.4f} s")
-    print(f"Max scheduling latency: {df['scheduling_latency'].max():.4f} s")
-    print("\nJobs per agent:")
+    print(f"[{('no_restarts' if label_suffix else 'all')}] "
+          f"Mean scheduling latency: {df['scheduling_latency'].mean():.4f} s")
+    print(f"[{('no_restarts' if label_suffix else 'all')}] "
+          f"Max scheduling latency: {df['scheduling_latency'].max():.4f} s")
+    print(f"\n[{('no_restarts' if label_suffix else 'all')}] Jobs per agent:")
     for agent_id, count in jobs_per_agent.items():
-        print(f"  Agent {agent_id}: {count} jobs")
+        print(f"  Agent {int(agent_id)}: {int(count)} jobs")
+
 
 
 if __name__ == "__main__":
@@ -454,6 +517,7 @@ if __name__ == "__main__":
         decode_responses=True
     )
     repo = Repository(redis_client=redis_client)
+
     jobs_csv_file = f"{args.output_dir}/all_jobs.csv"
     agents_csv_file = f"{args.output_dir}/all_agents.csv"
     all_jobs = repo.get_all_objects(key_prefix=Repository.KEY_JOB, level=0)
@@ -461,8 +525,20 @@ if __name__ == "__main__":
     save_jobs(jobs=all_jobs, path=jobs_csv_file)
     save_agents(agents=all_agents, path=agents_csv_file)
 
-    # Scheduling latency & jobs (already using repo)
+    # Gather restarted jobs once
+    restarted_job_ids = collect_restarted_job_ids(args.output_dir, repo)
+
+    # Scheduling latency & jobs (ALL jobs)
     plot_scheduling_latency_and_jobs(args.output_dir, args.agents)
+
+    # Scheduling latency & jobs (EXCLUDING restarted jobs)
+    if restarted_job_ids:
+        plot_scheduling_latency_and_jobs(
+            args.output_dir,
+            args.agents,
+            exclude_job_ids=restarted_job_ids,
+            label_suffix="_no_restarts"
+        )
 
     # Conflicts/Restarts prefer Redis; fallback to files
     plot_conflicts_and_restarts(args.output_dir, repo)
