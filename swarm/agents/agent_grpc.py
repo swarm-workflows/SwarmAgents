@@ -507,4 +507,4 @@ class Agent(Observer):
         finally:
             dt_ms = (time.perf_counter() - t0) * 1000.0
             meta = " ".join(f"{k}={v}" for k, v in fields.items() if v is not None)
-            self.logger.debug(f"[TIMING] section={section} duration_ms={dt_ms:.3f} {meta}")
+            self.logger.info(f"[TIMING] section={section} duration_ms={dt_ms:.3f} {meta}")
