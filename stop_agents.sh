@@ -2,20 +2,23 @@
 set -u  # Don't exit on error
 
 usage() {
-    echo "Usage: $0 <agent_hosts_file>"
+    echo "Usage: $0 <agent_hosts_file> <output_dir>"
     exit 1
 }
 
-if [[ $# -lt 1 ]]; then
+if [[ $# -lt 2 ]]; then
     usage
 fi
 
 agent_hosts_file="$1"
+output_dir="$2"
 
 if [[ ! -f "$agent_hosts_file" ]]; then
     echo "Agent hosts file not found: $agent_hosts_file"
     exit 2
 fi
+
+mkdir -p "$output_dir"
 
 mapfile -t hosts < "$agent_hosts_file"
 
@@ -31,7 +34,7 @@ for agent_host in "${hosts[@]}"; do
     ssh "$agent_host" "tar czf /tmp/swarm-multi.tar.gz -C /root/SwarmAgents swarm-multi" < /dev/null || echo "Warning: Tar failed on $agent_host"
 
     echo "Transferring tarball from $agent_host..."
-    scp "$agent_host:/tmp/swarm-multi.tar.gz" "./swarm-multi_${agent_host}.tar.gz" < /dev/null || echo "Warning: SCP failed from $agent_host"
+    scp "$agent_host:/tmp/swarm-multi.tar.gz" "$output_dir/swarm-multi_${agent_host}.tar.gz" < /dev/null || echo "Warning: SCP failed from $agent_host"
 
     echo "Cleaning up tarball on $agent_host..."
     ssh "$agent_host" "rm -f /tmp/swarm-multi.tar.gz" < /dev/null || echo "Warning: Cleanup failed on $agent_host"
