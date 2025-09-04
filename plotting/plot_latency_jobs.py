@@ -1,10 +1,56 @@
+import csv
 import json
+from typing import Any
 
 import pandas as pd
 import matplotlib.pyplot as plt
 import argparse
 import os
 
+import redis
+
+from swarm.database.repository import Repository
+from swarm.models.job import Job, JobState
+
+
+def save_agents(agents: list[Any], path: str):
+    # Save combined CSV with leader_agent_id
+    with open(path, 'w', newline='') as f:
+        json.dump(agents, f, indent=2)
+
+def save_jobs(jobs: list[Any], path: str):
+    detailed_latency = []  # For combined output
+    for job_data in jobs:
+        if isinstance(job_data, dict):
+            job = Job()
+            job.from_dict(job_data)
+        else:
+            job = job_data
+        job_id = job.job_id
+        leader_id = getattr(job, "leader_agent_id", None)
+        if leader_id is None:
+            continue
+        if job.state not in [JobState.READY, JobState.RUNNING, JobState.COMPLETE]:
+            continue
+
+        # Store all in one row
+        detailed_latency.append([
+            job_id,
+            job.created_at if job.created_at is not None else 0,
+            job.selection_started_at if job.selection_started_at is not None else 0,
+            job.selected_by_agent_at if job.selected_by_agent_at is not None else 0,
+            job.scheduled_at if job.scheduled_at is not None else 0,
+            job.completed_at if job.completed_at is not None else 0,
+            job.status if job.status is not None else 0,
+            leader_id
+        ])
+
+    # Save combined CSV with leader_agent_id
+    with open(path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['job_id', 'created_at', 'selection_started_at', 'selected_by_agent_at', 'scheduled_at',
+                            'completed_at', 'exit_status', 'leader_agent_id'])
+        writer.writerows(detailed_latency)
 
 def plot_agent_loads_from_dir(run_dir):
     agent_data = {}
@@ -113,9 +159,11 @@ def plot_conflicts_and_restarts_by_agent(run_dir: str):
     return agent_conflict_counts, agent_restart_counts
 
 
-def plot_conflicts_and_restarts(run_dir: str):
+def plot_conflicts_and_restarts(run_dir: str, repo: Repository):
     all_conflicts = {}
     all_restarts = {}
+    all_misc = repo.get_all_objects(key_prefix="metrics", level=None)
+
 
     for fname in os.listdir(run_dir):
         if fname.startswith("misc_") and fname.endswith(".json"):
@@ -154,8 +202,11 @@ def plot_conflicts_and_restarts(run_dir: str):
     return df_conflicts, df_restarts
 
 
-def plot_scheduling_latency_and_jobs(run_dir, agent_count):
+def plot_scheduling_latency_and_jobs(run_dir, agent_count, repo):
     csv_file = f"{run_dir}/all_jobs.csv"
+    all_jobs = repo.get_all_objects(key_prefix=Repository.KEY_JOB, level=0)
+
+    save_jobs(jobs=all_jobs, path=csv_file)
     df = pd.read_csv(csv_file)
 
     # Compute scheduling latency
@@ -211,12 +262,18 @@ def plot_scheduling_latency_and_jobs(run_dir, agent_count):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Plot scheduling latency and jobs per agent")
-    parser.add_argument("--run_dir", type=str, default=".", help="Directory where all files are present")
+    parser.add_argument("--output_dir", type=str, default=".", help="Directory where plots and CSV files are saved")
     parser.add_argument("--agents", type=str, required=True, help="Number of agents")
+    parser.add_argument("--db_host", type=str, required=True, help="Database Host")
 
     args = parser.parse_args()
 
-    plot_scheduling_latency_and_jobs(args.run_dir, args.agents)
-    plot_conflicts_and_restarts(args.run_dir)
-    plot_conflicts_and_restarts_by_agent(args.run_dir)
-    plot_agent_loads_from_dir(args.run_dir)
+    redis_client = redis.StrictRedis(host=args.db_host,
+                                          port=6379,
+                                          decode_responses=True)
+    repo = Repository(redis_client=redis_client)
+
+    plot_scheduling_latency_and_jobs(args.run_dir, args.agents, repo)
+    plot_conflicts_and_restarts(args.run_dir, repo)
+    plot_conflicts_and_restarts_by_agent(args.run_dir, repo)
+    plot_agent_loads_from_dir(args.run_dir, repo)

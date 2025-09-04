@@ -103,7 +103,6 @@ class JobGenerator:
 
         return {
             'id': job_id,
-            'agent_id': agent_id,
             'execution_time': execution_time,
             'capacities': {'core': core, 'ram': ram, 'disk': disk, 'gpu': gpu},
             'data_in': data_in if enable_dtns else None,

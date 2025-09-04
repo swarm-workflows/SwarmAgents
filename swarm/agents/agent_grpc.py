@@ -460,6 +460,15 @@ class Agent(Observer):
 
     def save_results(self):
         self.logger.info("Saving Results")
+        agent_metrics = {
+            "id": self.agent_id,
+            "restarts": self.metrics.restarts,
+            "conflicts": self.metrics.conflicts,
+            "idle_time": self.metrics.idle_time,
+            "load_trace": self.metrics.load
+        }
+        self.repo.save(obj=agent_metrics, key=f"metrics:{self.agent_id}")
+        '''
         self.metrics.save_misc(f"{self.results_dir}/misc_{self.agent_id}.json")
         self.metrics.save_load_trace(self.agent_id, f"{self.results_dir}/agent_loads_{self.agent_id}.csv")
         self.metrics.save_idle_time(f"{self.results_dir}/idle_time_per_agent_{self.agent_id}.csv")
@@ -479,6 +488,7 @@ class Agent(Observer):
 
             self.metrics.save_jobs(all_jobs, path=f"{self.results_dir}/all_jobs.csv")
 
-            all_agents = self.repo.get_all_objects(key_prefix=Repository.KEY_AGENT, level=None)
+            all_agents = self.repo.get_all_objects(key_prefix=Repository.KEY_AGENT, level=None)0
             self.metrics.save_agents(all_agents, path=f"{self.results_dir}/all_agents.csv")
+        '''
         self.logger.info("Results saved")
