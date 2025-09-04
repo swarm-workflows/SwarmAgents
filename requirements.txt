@@ -11,3 +11,4 @@ protobuf
 grpcio
 grpcio-tools
 etcd-sdk-python
+confluent-kafka

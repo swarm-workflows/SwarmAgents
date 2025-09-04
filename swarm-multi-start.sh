@@ -44,7 +44,8 @@ pkill -f "main.py swarm-multi" || true
 rm -f shutdown
 
 if [[ "$use_config_dir" == false ]]; then
-    python3.11 generate_configs.py "$num_agents" "$jobs_per_proposal" ./config_swarm_multi.yml configs $topology $database $job_cnt
+    rm -rf configs jobs
+    python3.11 generate_configs.py "$num_agents" "$jobs_per_proposal" ./config_swarm_multi.yml configs $topology $database $job_cnt --dtns
 
     cleanup_cmd="python3.11 cleanup.py --agents $num_agents"
     [[ -n "$database" ]] && cleanup_cmd+=" --redis-host $database --cleanup-redis"

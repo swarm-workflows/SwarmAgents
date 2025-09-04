@@ -401,7 +401,7 @@ if __name__ == "__main__":
     if args.agent_hosts_file:
         agent_hosts = load_agent_hosts(args.agent_hosts_file)
     else:
-        agent_hosts = ["localhost"]
+        agent_hosts = None
 
     # Normalize flavor percentages: fill missing with defaults
     if args.flavor_percentages:
