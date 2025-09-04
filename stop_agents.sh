@@ -21,7 +21,8 @@ while read -r agent_host; do
     if [[ -z "$agent_host" ]]; then continue; fi
 
     echo "Stopping agents on $agent_host..."
-    ssh "$agent_host" "pkill -f 'main.py swarm-multi' || true"
+    ssh "$agent_host" "touch /root/SwarmAgents/shutdown"
+    ssh "$agent_host" "pkill -f 'main.py swarm-multi'"
 
     echo "Tarring swarm-multi directory on $agent_host..."
     ssh "$agent_host" "tar czf /tmp/swarm-multi.tar.gz -C /root/SwarmAgents swarm-multi"
