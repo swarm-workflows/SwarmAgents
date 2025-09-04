@@ -395,6 +395,8 @@ class Agent(Observer):
             job_set.update(jobs)
 
     def is_job_in_state(self, job_id: str, job_set: set, redis_key_prefix: str, update_fn, state):
+        return job_id in job_set
+        # deliberate skip updates for now
         if job_id in job_set:
             return True
         update_fn(self.repo.get_all_ids(key_prefix=redis_key_prefix, level=self.topology.level,
