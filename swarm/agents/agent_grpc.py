@@ -30,7 +30,6 @@ import time
 import traceback
 from abc import abstractmethod
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
 from logging.handlers import RotatingFileHandler
 
 import redis
@@ -48,6 +47,7 @@ from swarm.utils.thread_safe_dict import ThreadSafeDict
 from swarm.utils.topology import Topology, TopologyType
 from swarm.utils.metrics import Metrics
 from swarm.utils.iterable_queue import IterableQueue
+from swarm.utils.utils import timed
 
 
 class Agent(Observer):
@@ -370,6 +370,7 @@ class Agent(Observer):
         except Exception as e:
             self.logger.debug(f"Failed to enqueue message: {message}, error: {e}")
 
+    '''
     def _send_message(self, json_message: dict, excluded_peers: list[int] = None, src: int = None, fwd: int = None):
         src = src or self.agent_id
         excluded = set(excluded_peers) if excluded_peers else set()
@@ -388,6 +389,42 @@ class Agent(Observer):
                 src=src,
                 fwd=fwd
             )
+        '''
+
+    def _send_message(
+            self,
+            json_message: dict,
+            excluded_peers: list[int] = None,
+            src: int = None,
+            fwd: int = None
+    ):
+        src = src or self.agent_id
+        excluded = set(excluded_peers) if excluded_peers else set()
+
+        with timed(self.logger, "_send_message.total",
+                         src=src,
+                         fwd=fwd,
+                         excluded=list(excluded) if excluded else None,
+                         num_peers=len(self.topology.peers)):
+            for peer_id in self.topology.peers:
+                if peer_id in excluded:
+                    continue
+
+                with timed(self.logger, "_send_message.per_peer", dest=peer_id, src=src, fwd=fwd):
+                    peer_host = (
+                        f"agent-{peer_id}"
+                        if self.grpc_host != "localhost"
+                        else "localhost"
+                    )
+                    topic = f"{peer_host}:{self.grpc_port + peer_id}"
+
+                    self.grpc_thread.produce_message(
+                        json_message=json_message,
+                        topic=topic,
+                        dest=peer_id,
+                        src=src,
+                        fwd=fwd
+                    )
 
     @staticmethod
     def update_jobs(jobs: list[str], job_set: set, lock: threading.RLock):
@@ -496,17 +533,3 @@ class Agent(Observer):
         '''
         self.logger.info("Results saved")
 
-    @contextmanager
-    def _timed(self, section: str, **fields):
-        """
-        Usage:
-            with self._timed("proposal.loop", job_id=p.job_id, p_id=p.p_id):
-                ...code...
-        """
-        t0 = time.perf_counter()
-        try:
-            yield
-        finally:
-            dt_ms = (time.perf_counter() - t0) * 1000.0
-            meta = " ".join(f"{k}={v}" for k, v in fields.items() if v is not None)
-            self.logger.info(f"[TIMING] section={section} duration_ms={dt_ms:.3f} {meta}")

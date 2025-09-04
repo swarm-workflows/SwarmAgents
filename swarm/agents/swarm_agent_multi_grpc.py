@@ -41,7 +41,7 @@ from swarm.models.proposal_info import ProposalContainer, ProposalInfo
 from swarm.models.job import Job, JobState
 import numpy as np
 
-from swarm.utils.utils import generate_id
+from swarm.utils.utils import generate_id, timed
 
 
 class SwarmAgent(Agent):
@@ -273,7 +273,7 @@ class SwarmAgent(Agent):
     '''
 
     def __receive_proposal(self, incoming: Proposal):
-        with self._timed("__receive_proposal.total",
+        with timed(self.logger, "__receive_proposal.total",
                          src=incoming.agents[0].agent_id if incoming.agents else None,
                          fwd=incoming.forwarded_by,
                          num_props=len(incoming.proposals)):
@@ -281,8 +281,8 @@ class SwarmAgent(Agent):
             proposals_to_forward = []
 
             for p in incoming.proposals:
-                with self._timed("proposal.loop", job_id=p.job_id, p_id=p.p_id, from_agent=p.agent_id):
-                    with self._timed("proposal.lookup_job", job_id=p.job_id):
+                with timed(self.logger, "proposal.loop", job_id=p.job_id, p_id=p.p_id, from_agent=p.agent_id):
+                    with timed(self.logger, "proposal.lookup_job", job_id=p.job_id):
                         job = self.queues.job_queue.get_job(job_id=p.job_id)
 
                     if not job:
@@ -292,12 +292,12 @@ class SwarmAgent(Agent):
                         proposals_to_forward.append(p)
                         continue
 
-                    with self._timed("proposal.completed_check", job_id=job.get_job_id()):
+                    with timed(self.logger, "proposal.completed_check", job_id=job.get_job_id()):
                         if self.is_job_completed(job_id=job.get_job_id()):
                             self.logger.debug(f"Ignoring Proposal: {p} for job: {job.get_job_id()}")
                             continue
 
-                    with self._timed("proposal.compare", job_id=p.job_id, p_id=p.p_id):
+                    with timed(self.logger, "proposal.compare", job_id=p.job_id, p_id=p.p_id):
                         my_proposal = self.outgoing_proposals.has_better_proposal(proposal=p)
                         peer_proposal = self.incoming_proposals.has_better_proposal(proposal=p)
 
@@ -323,7 +323,7 @@ class SwarmAgent(Agent):
                             f"{p.agent_id} and is now the leader"
                         )
 
-                        with self._timed("proposal.accept_path", job_id=p.job_id, p_id=p.p_id):
+                        with timed(self.logger, "proposal.accept_path", job_id=p.job_id, p_id=p.p_id):
                             p.prepares = []
                             if my_proposal:
                                 self.logger.debug(f"Removed my Proposal: {my_proposal} in favor of incoming proposal")
@@ -337,16 +337,16 @@ class SwarmAgent(Agent):
                             if incoming.agents and incoming.agents[0].agent_id not in p.prepares:
                                 p.prepares.append(incoming.agents[0].agent_id)
 
-                            with self._timed("proposal.add_incoming", job_id=p.job_id):
+                            with timed(self.logger, "proposal.add_incoming", job_id=p.job_id):
                                 self.incoming_proposals.add_proposal(proposal=p)
 
-                            with self._timed("proposal.state_prepare", job_id=p.job_id):
+                            with timed(self.logger, "proposal.state_prepare", job_id=p.job_id):
                                 job.change_state(JobState.PREPARE)
 
                             proposals_to_forward.append(p)
 
             if len(proposals_to_forward) and self.topology.type in [TopologyType.Star, TopologyType.Ring]:
-                with self._timed("proposal.forward_proposals", count=len(proposals_to_forward)):
+                with timed(self.logger, "proposal.forward_proposals", count=len(proposals_to_forward)):
                     msg = Proposal(
                         source=incoming.agents[0].agent_id,
                         agents=[AgentInfo(agent_id=incoming.agents[0].agent_id)],
@@ -361,12 +361,12 @@ class SwarmAgent(Agent):
                     )
 
             if len(proposals):
-                with self._timed("proposal.send_prepare", count=len(proposals)):
+                with timed(self.logger, "proposal.send_prepare", count=len(proposals)):
                     msg = Prepare(source=self.agent_id, agents=[AgentInfo(agent_id=self.agent_id)], proposals=proposals)
                     self._send_message(json_message=msg.to_dict())
 
     def __receive_prepare(self, incoming: Prepare):
-        with self._timed("__receive_prepare.total",
+        with timed(self.logger, "__receive_prepare.total",
                          src=incoming.agents[0].agent_id if incoming.agents else None,
                          fwd=incoming.forwarded_by,
                          num_props=len(incoming.proposals)):
@@ -374,8 +374,8 @@ class SwarmAgent(Agent):
             proposals_to_forward = []
 
             for p in incoming.proposals:
-                with self._timed("prepare.loop", job_id=p.job_id, p_id=p.p_id):
-                    with self._timed("prepare.lookup_job", job_id=p.job_id):
+                with timed(self.logger, "prepare.loop", job_id=p.job_id, p_id=p.p_id):
+                    with timed(self.logger, "prepare.lookup_job", job_id=p.job_id):
                         job = self.queues.job_queue.get_job(job_id=p.job_id)
 
                     if not job:
@@ -385,12 +385,12 @@ class SwarmAgent(Agent):
                         proposals_to_forward.append(p)
                         continue
 
-                    with self._timed("prepare.completed_check", job_id=job.get_job_id()):
+                    with timed(self.logger, "prepare.completed_check", job_id=job.get_job_id()):
                         if self.is_job_completed(job_id=job.get_job_id()):
                             self.logger.debug(f"Job: {job.get_job_id()} Ignoring Prepare: {p}")
                             continue
 
-                    with self._timed("prepare.fetch_or_add", job_id=p.job_id, p_id=p.p_id):
+                    with timed(self.logger, "prepare.fetch_or_add", job_id=p.job_id, p_id=p.p_id):
                         if self.outgoing_proposals.contains(job_id=p.job_id, p_id=p.p_id):
                             proposal = self.outgoing_proposals.get_proposal(p_id=p.p_id)
                         elif self.incoming_proposals.contains(job_id=p.job_id, p_id=p.p_id):
@@ -399,7 +399,7 @@ class SwarmAgent(Agent):
                             proposal = p
                             self.incoming_proposals.add_proposal(proposal=p)
 
-                    with self._timed("prepare.add_sender", job_id=p.job_id, p_id=p.p_id):
+                    with timed(self.logger, "prepare.add_sender", job_id=p.job_id, p_id=p.p_id):
                         if incoming.agents and incoming.agents[0].agent_id not in proposal.prepares:
                             proposal.prepares.append(incoming.agents[0].agent_id)
                             if proposal.agent_id != self.agent_id:
@@ -408,7 +408,7 @@ class SwarmAgent(Agent):
                     if job.is_commit():
                         continue
 
-                    with self._timed("prepare.quorum_and_state", job_id=p.job_id, p_id=p.p_id):
+                    with timed(self.logger, "prepare.quorum_and_state", job_id=p.job_id, p_id=p.p_id):
                         quorum_count = self.calculate_quorum()
                         job.change_state(JobState.PREPARE)
 
@@ -417,17 +417,17 @@ class SwarmAgent(Agent):
                             f"Job: {p.job_id} Agent: {self.agent_id} received quorum "
                             f"prepares: {proposal.prepares}, starting commit!"
                         )
-                        with self._timed("prepare.to_commit_queue", job_id=p.job_id, p_id=p.p_id):
+                        with timed(self.logger, "prepare.to_commit_queue", job_id=p.job_id, p_id=p.p_id):
                             proposals.append(proposal)
                             job.change_state(JobState.COMMIT)
 
             if len(proposals):
-                with self._timed("prepare.send_commit", count=len(proposals)):
+                with timed(self.logger, "prepare.send_commit", count=len(proposals)):
                     msg = Commit(source=self.agent_id, agents=[AgentInfo(agent_id=self.agent_id)], proposals=proposals)
                     self._send_message(json_message=msg.to_dict())
 
             if len(proposals_to_forward) and self.topology.type in [TopologyType.Star, TopologyType.Ring]:
-                with self._timed("prepare.forward", count=len(proposals_to_forward)):
+                with timed(self.logger, "prepare.forward", count=len(proposals_to_forward)):
                     msg = Prepare(
                         source=incoming.agents[0].agent_id,
                         agents=[AgentInfo(agent_id=incoming.agents[0].agent_id)],
@@ -442,15 +442,15 @@ class SwarmAgent(Agent):
                     )
 
     def __receive_commit(self, incoming: Commit):
-        with self._timed("__receive_commit.total",
+        with timed(self.logger, "__receive_commit.total",
                          src=incoming.agents[0].agent_id if incoming.agents else None,
                          fwd=incoming.forwarded_by,
                          num_props=len(incoming.proposals)):
             proposals_to_forward = []
 
             for p in incoming.proposals:
-                with self._timed("commit.loop", job_id=p.job_id, p_id=p.p_id):
-                    with self._timed("commit.lookup_job", job_id=p.job_id):
+                with timed(self.logger, "commit.loop", job_id=p.job_id, p_id=p.p_id):
+                    with timed(self.logger, "commit.lookup_job", job_id=p.job_id):
                         job = self.queues.job_queue.get_job(job_id=p.job_id)
 
                     if not job:
@@ -466,7 +466,7 @@ class SwarmAgent(Agent):
                         self.outgoing_proposals.remove_job(job_id=p.job_id)
                         continue
 
-                    with self._timed("commit.fetch_or_add", job_id=p.job_id, p_id=p.p_id):
+                    with timed(self.logger, "commit.fetch_or_add", job_id=p.job_id, p_id=p.p_id):
                         if self.outgoing_proposals.contains(job_id=p.job_id, p_id=p.p_id):
                             proposal = self.outgoing_proposals.get_proposal(p_id=p.p_id)
                         elif self.incoming_proposals.contains(job_id=p.job_id, p_id=p.p_id):
@@ -477,17 +477,17 @@ class SwarmAgent(Agent):
                             proposal = p
                             self.incoming_proposals.add_proposal(proposal=proposal)
 
-                    with self._timed("commit.add_sender", job_id=p.job_id, p_id=p.p_id):
+                    with timed(self.logger, "commit.add_sender", job_id=p.job_id, p_id=p.p_id):
                         if incoming.agents and incoming.agents[0].agent_id not in proposal.commits:
                             proposal.commits.append(incoming.agents[0].agent_id)
                             if proposal.agent_id != self.agent_id:
                                 proposals_to_forward.append(proposal)
 
-                    with self._timed("commit.quorum_check", job_id=p.job_id, p_id=p.p_id):
+                    with timed(self.logger, "commit.quorum_check", job_id=p.job_id, p_id=p.p_id):
                         quorum_count = self.calculate_quorum()
 
                     if len(proposal.commits) >= quorum_count:
-                        with self._timed("commit.finalize", job_id=p.job_id, p_id=p.p_id, quorum=quorum_count):
+                        with timed(self.logger, "commit.finalize", job_id=p.job_id, p_id=p.p_id, quorum=quorum_count):
                             self.logger.debug(
                                 f"Job: {p.job_id} Agent: {self.agent_id} received quorum commits Proposal: {proposal}: "
                                 f"Job: {job.get_job_id()}"
@@ -501,7 +501,7 @@ class SwarmAgent(Agent):
                                     f"SELECTED: {job.get_job_id()} on agent: {self.agent_id} proposal: {proposal.p_id} "
                                     f"commits: {proposal.commits} quorum: {quorum_count}")
                                 # Selecting the job may take time; measure it:
-                                with self._timed("commit.select_job", job_id=p.job_id):
+                                with timed(self.logger, "commit.select_job", job_id=p.job_id):
                                     self.select_job(job)
                                 self.outgoing_proposals.remove_job(job_id=p.job_id)
                             else:
@@ -510,7 +510,7 @@ class SwarmAgent(Agent):
                                 self.incoming_proposals.remove_job(job_id=p.job_id)
 
             if len(proposals_to_forward) and self.topology.type in [TopologyType.Star, TopologyType.Ring]:
-                with self._timed("commit.forward", count=len(proposals_to_forward)):
+                with timed(self.logger, "commit.forward", count=len(proposals_to_forward)):
                     msg = Commit(
                         source=incoming.agents[0].agent_id,
                         agents=[AgentInfo(agent_id=incoming.agents[0].agent_id)],
