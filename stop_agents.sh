@@ -2,16 +2,18 @@
 set -u  # Don't exit on error
 
 usage() {
-    echo "Usage: $0 <agent_hosts_file> <output_dir>"
+    echo "Usage: $0 <agent_hosts_file> <output_dir> <agent_count> <database_host>"
     exit 1
 }
 
-if [[ $# -lt 2 ]]; then
+if [[ $# -lt 4 ]]; then
     usage
 fi
 
 agent_hosts_file="$1"
 output_dir="$2"
+agents="$3"
+database="$4"
 
 if [[ ! -f "$agent_hosts_file" ]]; then
     echo "Agent hosts file not found: $agent_hosts_file"
@@ -39,5 +41,8 @@ for agent_host in "${hosts[@]}"; do
     echo "Cleaning up tarball on $agent_host..."
     ssh "$agent_host" "rm -f /tmp/swarm-multi.tar.gz" < /dev/null || echo "Warning: Cleanup failed on $agent_host"
 done
+
+echo "Plotting the results"
+python3.11 plot_latency_jobs.py --output_dir "$output_dir" --agents "$agents" --db_host "$database"
 
 echo "Done."
