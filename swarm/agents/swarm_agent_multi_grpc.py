@@ -1105,6 +1105,7 @@ class SwarmAgent(Agent):
                         job.change_state(new_state=JobState.PRE_PREPARE)
 
                 if len(proposals):
+                    self.logger.debug(f"Identified jobs to propose: {proposals}")
                     msg = Proposal(source=self.agent_id,
                                    agents=[AgentInfo(agent_id=self.agent_id)],
                                    proposals=proposals)
