@@ -382,6 +382,7 @@ class Agent(Observer):
             peer_host = self.grpc_host
             topic = f"{peer_host}:{self.grpc_port + peer_id}"
 
+            self.logger.debug(f"Sending message: {json_message.get("message_type")} to {topic}")
             self.grpc_thread.produce_message(
                 json_message=json_message,
                 topic=topic,
