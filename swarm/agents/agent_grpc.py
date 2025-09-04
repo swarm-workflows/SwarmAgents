@@ -488,7 +488,7 @@ class Agent(Observer):
 
             self.metrics.save_jobs(all_jobs, path=f"{self.results_dir}/all_jobs.csv")
 
-            all_agents = self.repo.get_all_objects(key_prefix=Repository.KEY_AGENT, level=None)0
+            all_agents = self.repo.get_all_objects(key_prefix=Repository.KEY_AGENT, level=None)
             self.metrics.save_agents(all_agents, path=f"{self.results_dir}/all_agents.csv")
         '''
         self.logger.info("Results saved")
