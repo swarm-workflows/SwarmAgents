@@ -30,6 +30,7 @@ import time
 import traceback
 from abc import abstractmethod
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from logging.handlers import RotatingFileHandler
 
 import redis
@@ -492,3 +493,18 @@ class Agent(Observer):
             self.metrics.save_agents(all_agents, path=f"{self.results_dir}/all_agents.csv")
         '''
         self.logger.info("Results saved")
+
+    @contextmanager
+    def _timed(self, section: str, **fields):
+        """
+        Usage:
+            with self._timed("proposal.loop", job_id=p.job_id, p_id=p.p_id):
+                ...code...
+        """
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            dt_ms = (time.perf_counter() - t0) * 1000.0
+            meta = " ".join(f"{k}={v}" for k, v in fields.items() if v is not None)
+            self.logger.debug(f"[TIMING] section={section} duration_ms={dt_ms:.3f} {meta}")

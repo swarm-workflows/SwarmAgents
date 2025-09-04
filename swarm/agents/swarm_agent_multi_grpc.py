@@ -25,6 +25,7 @@ import time
 import traceback
 from collections import defaultdict
 
+from swarm.comm.messages.message import MessageType
 from swarm.models.data_node import DataNode
 from swarm.utils.thread_safe_dict import ThreadSafeDict
 from swarm.utils.topology import TopologyType
@@ -84,6 +85,7 @@ class SwarmAgent(Agent):
         # track proposed allocations incrementally to avoid recomputing each time
         self._proposed_allocations = Capacities()
 
+    '''
     def __receive_proposal(self, incoming: Proposal):
         proposals = []
         proposals_to_forward = []
@@ -268,12 +270,266 @@ class SwarmAgent(Agent):
                                excluded_peers=[incoming.forwarded_by, incoming.agents[0].agent_id],
                                src=incoming.agents[0].agent_id, fwd=self.agent_id)
 
+    '''
+
+    def __receive_proposal(self, incoming: Proposal):
+        with self._timed("__receive_proposal.total",
+                         src=incoming.agents[0].agent_id if incoming.agents else None,
+                         fwd=incoming.forwarded_by,
+                         num_props=len(incoming.proposals)):
+            proposals = []
+            proposals_to_forward = []
+
+            for p in incoming.proposals:
+                with self._timed("proposal.loop", job_id=p.job_id, p_id=p.p_id, from_agent=p.agent_id):
+                    with self._timed("proposal.lookup_job", job_id=p.job_id):
+                        job = self.queues.job_queue.get_job(job_id=p.job_id)
+
+                    if not job:
+                        self.logger.debug(f"ERROR ---- Skipping no job found for {p.job_id}")
+                        self.outgoing_proposals.remove_job(job_id=p.job_id)
+                        self.incoming_proposals.remove_job(job_id=p.job_id)
+                        proposals_to_forward.append(p)
+                        continue
+
+                    with self._timed("proposal.completed_check", job_id=job.get_job_id()):
+                        if self.is_job_completed(job_id=job.get_job_id()):
+                            self.logger.debug(f"Ignoring Proposal: {p} for job: {job.get_job_id()}")
+                            continue
+
+                    with self._timed("proposal.compare", job_id=p.job_id, p_id=p.p_id):
+                        my_proposal = self.outgoing_proposals.has_better_proposal(proposal=p)
+                        peer_proposal = self.incoming_proposals.has_better_proposal(proposal=p)
+
+                    if my_proposal:
+                        self.logger.debug(
+                            f"Job:{p.job_id} Agent:{self.agent_id} rejected Proposal: {p} from agent "
+                            f"{p.agent_id} - my proposal {my_proposal} has prepares or smaller seed"
+                        )
+                        job_id = job.get_job_id()
+                        self.metrics.conflicts[job_id] = self.metrics.conflicts.get(job_id, 0) + 1
+
+                    elif peer_proposal:
+                        self.logger.debug(
+                            f"Job:{p.job_id} Agent:{self.agent_id} rejected Proposal: {p} from agent "
+                            f"{p.agent_id} - already accepted proposal {peer_proposal} with a smaller seed"
+                        )
+                        job_id = job.get_job_id()
+                        self.metrics.conflicts[job_id] = self.metrics.conflicts.get(job_id, 0) + 1
+
+                    else:
+                        self.logger.debug(
+                            f"Job:{p.job_id} Agent:{self.agent_id} accepted Proposal: {p} from agent "
+                            f"{p.agent_id} and is now the leader"
+                        )
+
+                        with self._timed("proposal.accept_path", job_id=p.job_id, p_id=p.p_id):
+                            p.prepares = []
+                            if my_proposal:
+                                self.logger.debug(f"Removed my Proposal: {my_proposal} in favor of incoming proposal")
+                                self.outgoing_proposals.remove_proposal(p_id=my_proposal.p_id, job_id=p.job_id)
+                            if peer_proposal:
+                                self.logger.debug(
+                                    f"Removed peer Proposal: {peer_proposal} in favor of incoming proposal")
+                                self.incoming_proposals.remove_proposal(p_id=peer_proposal.p_id, job_id=p.job_id)
+
+                            proposals.append(p)
+                            if incoming.agents and incoming.agents[0].agent_id not in p.prepares:
+                                p.prepares.append(incoming.agents[0].agent_id)
+
+                            with self._timed("proposal.add_incoming", job_id=p.job_id):
+                                self.incoming_proposals.add_proposal(proposal=p)
+
+                            with self._timed("proposal.state_prepare", job_id=p.job_id):
+                                job.change_state(JobState.PREPARE)
+
+                            proposals_to_forward.append(p)
+
+            if len(proposals_to_forward) and self.topology.type in [TopologyType.Star, TopologyType.Ring]:
+                with self._timed("proposal.forward_proposals", count=len(proposals_to_forward)):
+                    msg = Proposal(
+                        source=incoming.agents[0].agent_id,
+                        agents=[AgentInfo(agent_id=incoming.agents[0].agent_id)],
+                        proposals=proposals_to_forward,
+                        forwarded_by=self.agent_id
+                    )
+                    self._send_message(
+                        json_message=msg.to_dict(),
+                        excluded_peers=[incoming.forwarded_by, incoming.agents[0].agent_id],
+                        src=incoming.agents[0].agent_id,
+                        fwd=self.agent_id
+                    )
+
+            if len(proposals):
+                with self._timed("proposal.send_prepare", count=len(proposals)):
+                    msg = Prepare(source=self.agent_id, agents=[AgentInfo(agent_id=self.agent_id)], proposals=proposals)
+                    self._send_message(json_message=msg.to_dict())
+
+    def __receive_prepare(self, incoming: Prepare):
+        with self._timed("__receive_prepare.total",
+                         src=incoming.agents[0].agent_id if incoming.agents else None,
+                         fwd=incoming.forwarded_by,
+                         num_props=len(incoming.proposals)):
+            proposals = []
+            proposals_to_forward = []
+
+            for p in incoming.proposals:
+                with self._timed("prepare.loop", job_id=p.job_id, p_id=p.p_id):
+                    with self._timed("prepare.lookup_job", job_id=p.job_id):
+                        job = self.queues.job_queue.get_job(job_id=p.job_id)
+
+                    if not job:
+                        self.logger.debug(f"ERROR ---- Skipping no job found for {p.job_id}")
+                        self.outgoing_proposals.remove_job(job_id=p.job_id)
+                        self.incoming_proposals.remove_job(job_id=p.job_id)
+                        proposals_to_forward.append(p)
+                        continue
+
+                    with self._timed("prepare.completed_check", job_id=job.get_job_id()):
+                        if self.is_job_completed(job_id=job.get_job_id()):
+                            self.logger.debug(f"Job: {job.get_job_id()} Ignoring Prepare: {p}")
+                            continue
+
+                    with self._timed("prepare.fetch_or_add", job_id=p.job_id, p_id=p.p_id):
+                        if self.outgoing_proposals.contains(job_id=p.job_id, p_id=p.p_id):
+                            proposal = self.outgoing_proposals.get_proposal(p_id=p.p_id)
+                        elif self.incoming_proposals.contains(job_id=p.job_id, p_id=p.p_id):
+                            proposal = self.incoming_proposals.get_proposal(p_id=p.p_id)
+                        else:
+                            proposal = p
+                            self.incoming_proposals.add_proposal(proposal=p)
+
+                    with self._timed("prepare.add_sender", job_id=p.job_id, p_id=p.p_id):
+                        if incoming.agents and incoming.agents[0].agent_id not in proposal.prepares:
+                            proposal.prepares.append(incoming.agents[0].agent_id)
+                            if proposal.agent_id != self.agent_id:
+                                proposals_to_forward.append(p)
+
+                    if job.is_commit():
+                        continue
+
+                    with self._timed("prepare.quorum_and_state", job_id=p.job_id, p_id=p.p_id):
+                        quorum_count = self.calculate_quorum()
+                        job.change_state(JobState.PREPARE)
+
+                    if len(proposal.prepares) >= quorum_count:
+                        self.logger.debug(
+                            f"Job: {p.job_id} Agent: {self.agent_id} received quorum "
+                            f"prepares: {proposal.prepares}, starting commit!"
+                        )
+                        with self._timed("prepare.to_commit_queue", job_id=p.job_id, p_id=p.p_id):
+                            proposals.append(proposal)
+                            job.change_state(JobState.COMMIT)
+
+            if len(proposals):
+                with self._timed("prepare.send_commit", count=len(proposals)):
+                    msg = Commit(source=self.agent_id, agents=[AgentInfo(agent_id=self.agent_id)], proposals=proposals)
+                    self._send_message(json_message=msg.to_dict())
+
+            if len(proposals_to_forward) and self.topology.type in [TopologyType.Star, TopologyType.Ring]:
+                with self._timed("prepare.forward", count=len(proposals_to_forward)):
+                    msg = Prepare(
+                        source=incoming.agents[0].agent_id,
+                        agents=[AgentInfo(agent_id=incoming.agents[0].agent_id)],
+                        proposals=proposals_to_forward,
+                        forwarded_by=self.agent_id
+                    )
+                    self._send_message(
+                        json_message=msg.to_dict(),
+                        excluded_peers=[incoming.forwarded_by, incoming.agents[0].agent_id],
+                        src=incoming.agents[0].agent_id,
+                        fwd=self.agent_id
+                    )
+
+    def __receive_commit(self, incoming: Commit):
+        with self._timed("__receive_commit.total",
+                         src=incoming.agents[0].agent_id if incoming.agents else None,
+                         fwd=incoming.forwarded_by,
+                         num_props=len(incoming.proposals)):
+            proposals_to_forward = []
+
+            for p in incoming.proposals:
+                with self._timed("commit.loop", job_id=p.job_id, p_id=p.p_id):
+                    with self._timed("commit.lookup_job", job_id=p.job_id):
+                        job = self.queues.job_queue.get_job(job_id=p.job_id)
+
+                    if not job:
+                        self.logger.debug(f"ERROR ---- Skipping no job found for {p.job_id}")
+                        self.outgoing_proposals.remove_job(job_id=p.job_id)
+                        self.incoming_proposals.remove_job(job_id=p.job_id)
+                        proposals_to_forward.append(p)
+                        continue
+
+                    if self.is_job_completed(job_id=job.get_job_id()):
+                        self.logger.debug(f"Job: {job.get_job_id()} Ignoring Commit: {p}")
+                        self.incoming_proposals.remove_job(job_id=p.job_id)
+                        self.outgoing_proposals.remove_job(job_id=p.job_id)
+                        continue
+
+                    with self._timed("commit.fetch_or_add", job_id=p.job_id, p_id=p.p_id):
+                        if self.outgoing_proposals.contains(job_id=p.job_id, p_id=p.p_id):
+                            proposal = self.outgoing_proposals.get_proposal(p_id=p.p_id)
+                        elif self.incoming_proposals.contains(job_id=p.job_id, p_id=p.p_id):
+                            proposal = self.incoming_proposals.get_proposal(p_id=p.p_id)
+                        else:
+                            self.logger.debug(
+                                f"TBD: Job: {p.job_id} Agent: {self.agent_id} received commit without any Prepares")
+                            proposal = p
+                            self.incoming_proposals.add_proposal(proposal=proposal)
+
+                    with self._timed("commit.add_sender", job_id=p.job_id, p_id=p.p_id):
+                        if incoming.agents and incoming.agents[0].agent_id not in proposal.commits:
+                            proposal.commits.append(incoming.agents[0].agent_id)
+                            if proposal.agent_id != self.agent_id:
+                                proposals_to_forward.append(proposal)
+
+                    with self._timed("commit.quorum_check", job_id=p.job_id, p_id=p.p_id):
+                        quorum_count = self.calculate_quorum()
+
+                    if len(proposal.commits) >= quorum_count:
+                        with self._timed("commit.finalize", job_id=p.job_id, p_id=p.p_id, quorum=quorum_count):
+                            self.logger.debug(
+                                f"Job: {p.job_id} Agent: {self.agent_id} received quorum commits Proposal: {proposal}: "
+                                f"Job: {job.get_job_id()}"
+                            )
+                            if proposal.agent_id == self.agent_id:
+                                job.set_leader(leader_agent_id=proposal.agent_id)
+
+                            if self.outgoing_proposals.contains(job_id=p.job_id, p_id=p.p_id):
+                                self.logger.info(f"[CON_LEADER] achieved for Job: {p.job_id} Leader: {self.agent_id}")
+                                print(
+                                    f"SELECTED: {job.get_job_id()} on agent: {self.agent_id} proposal: {proposal.p_id} "
+                                    f"commits: {proposal.commits} quorum: {quorum_count}")
+                                # Selecting the job may take time; measure it:
+                                with self._timed("commit.select_job", job_id=p.job_id):
+                                    self.select_job(job)
+                                self.outgoing_proposals.remove_job(job_id=p.job_id)
+                            else:
+                                self.logger.info(f"[CON_PART] achieved for Job: {p.job_id} Leader: {p.agent_id}")
+                                job.change_state(new_state=JobState.COMPLETE)
+                                self.incoming_proposals.remove_job(job_id=p.job_id)
+
+            if len(proposals_to_forward) and self.topology.type in [TopologyType.Star, TopologyType.Ring]:
+                with self._timed("commit.forward", count=len(proposals_to_forward)):
+                    msg = Commit(
+                        source=incoming.agents[0].agent_id,
+                        agents=[AgentInfo(agent_id=incoming.agents[0].agent_id)],
+                        proposals=proposals_to_forward,
+                        forwarded_by=self.agent_id
+                    )
+                    self._send_message(
+                        json_message=msg.to_dict(),
+                        excluded_peers=[incoming.forwarded_by, incoming.agents[0].agent_id],
+                        src=incoming.agents[0].agent_id,
+                        fwd=self.agent_id
+                    )
+
     def _process(self, messages: list[dict]):
         for message in messages:
+            message_type = MessageType(message.get('message_type'))
             try:
                 begin = time.time()
                 incoming = MessageBuilder.from_dict(message)
-
                 if isinstance(incoming, Prepare):
                     self.__receive_prepare(incoming=incoming)
 
@@ -287,7 +543,7 @@ class SwarmAgent(Agent):
                     self.logger.info(f"Ignoring unsupported message: {message}")
                 diff = int(time.time() - begin)
                 if diff > 0:
-                    self.logger.info(f"Event {message.get('message_type')} TIME: {diff}")
+                    self.logger.info(f"Event {message_type} TIME: {diff}")
             except Exception as e:
                 self.logger.error(f"Error while processing message {type(message)}, {e}")
                 self.logger.error(traceback.format_exc())
