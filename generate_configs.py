@@ -28,7 +28,7 @@ class SwarmConfigGenerator:
     AGENT_DTNS = "agent_dtns.json"
 
     def __init__(self, num_agents, jobs_per_proposal, base_config_path, output_dir, topology,
-                 db_host, enable_dtns):
+                 db_host, enable_dtns, agents_per_host:int = 1):
         self.num_agents = num_agents
         self.jobs_per_proposal = jobs_per_proposal
         self.base_config_path = base_config_path
@@ -39,6 +39,7 @@ class SwarmConfigGenerator:
         self.db_host = db_host
         self.agent_dtns_map: Dict[str, List[dict]] = self._load_agent_dtns(path=self.AGENT_DTNS)
         self.enable_dtns = enable_dtns
+        self.agents_per_host = agents_per_host
 
     def assign_flavors(self, percentages):
         """
@@ -244,16 +245,22 @@ class SwarmConfigGenerator:
         agent_flavors = self.assign_flavors(flavor_percentages)
 
         agent_profiles = {}
-        host_count = len(agent_hosts)
-        if host_count == 0:
-            raise ValueError("agent_hosts is empty; provide at least one host")
+
+        if agent_hosts:
+            host_count = len(agent_hosts)
+            if host_count * self.agents_per_host < self.num_agents:
+                raise ValueError(
+                    f"Not enough hosts ({host_count}) for {self.num_agents} agents "
+                    f"with {self.agents_per_host} per host"
+                )
 
         for agent_id in range(1, self.num_agents + 1):
-            # round-robin host assignment across provided hosts
-            host = agent_hosts[(agent_id - 1) % host_count]
-
             config = copy.deepcopy(self.base_config)
-            config['grpc']['host'] = host
+            if agent_hosts:
+                # integer division: every group of agents_per_host agents goes to the same host
+                host_idx = (agent_id - 1) // self.agents_per_host
+                host = agent_hosts[host_idx]
+                config['grpc']['host'] = host
 
             # DTNs
             if self.enable_dtns:
@@ -386,6 +393,9 @@ if __name__ == "__main__":
     parser.add_argument("--flavor-percentages", nargs='*', type=float, metavar='PERCENT',
                         help="Percentages for small, medium, large, xtralarge, xxtralarge (e.g. 0.4 0.25 0.15 0.15 0.05)")
     parser.add_argument("--agent-hosts-file", type=str, help="Path to file with agent hosts (one per line)")
+    parser.add_argument("--agents-per-host", type=int, default=1,
+                        help="Number of agents per host (for grpc.host assignment)")
+
     args = parser.parse_args()
 
     if args.agent_hosts_file:
@@ -409,7 +419,8 @@ if __name__ == "__main__":
         args.output_dir,
         args.topology,
         args.database,
-        args.dtns
+        args.dtns,
+        args.agents_per_host
     )
     generator.generate_configs(flavor_percentages=flavor_percentages, agent_hosts=agent_hosts)
 
