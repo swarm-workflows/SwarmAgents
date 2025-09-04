@@ -23,7 +23,7 @@ database="${1:-localhost}"
 jobs_per_proposal="${2:-10}"
 agents_per_host="${3:-1}"
 
-rm -rf jobs configs
+rm -rf jobs configs agent_hosts.txt agent_profiles.json agent_dtns.json
 
 echo "  Topology: $topology"
 echo "  Job count: $job_cnt"
@@ -33,7 +33,6 @@ echo "  Job count: $job_cnt"
 num_hosts=$(( num_agents / agents_per_host ))
 
 # Generate agent hosts file (one entry per host)
-rm -f agent_hosts.txt
 for ((i=1; i<=num_hosts; i++)); do
     echo "agent-$i" >> agent_hosts.txt
 done
