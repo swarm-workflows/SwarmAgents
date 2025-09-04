@@ -370,7 +370,6 @@ class Agent(Observer):
         except Exception as e:
             self.logger.debug(f"Failed to enqueue message: {message}, error: {e}")
 
-    '''
     def _send_message(self, json_message: dict, excluded_peers: list[int] = None, src: int = None, fwd: int = None):
         src = src or self.agent_id
         excluded = set(excluded_peers) if excluded_peers else set()
@@ -389,8 +388,7 @@ class Agent(Observer):
                 src=src,
                 fwd=fwd
             )
-        '''
-
+    '''
     def _send_message(
             self,
             json_message: dict,
@@ -426,6 +424,7 @@ class Agent(Observer):
                         fwd=fwd
                     )
 
+    '''
     @staticmethod
     def update_jobs(jobs: list[str], job_set: set, lock: threading.RLock):
         with lock:

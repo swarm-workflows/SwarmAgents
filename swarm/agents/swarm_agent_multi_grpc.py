@@ -85,7 +85,6 @@ class SwarmAgent(Agent):
         # track proposed allocations incrementally to avoid recomputing each time
         self._proposed_allocations = Capacities()
 
-    '''
     def __receive_proposal(self, incoming: Proposal):
         proposals = []
         proposals_to_forward = []
@@ -523,6 +522,7 @@ class SwarmAgent(Agent):
                         src=incoming.agents[0].agent_id,
                         fwd=self.agent_id
                     )
+    '''
 
     def _process(self, messages: list[dict]):
         for message in messages:
