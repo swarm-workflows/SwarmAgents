@@ -1,5 +1,5 @@
 #!/bin/bash
-set -euo pipefail
+set -u  # Don't exit on error
 
 usage() {
     echo "Usage: $0 <agent_hosts_file>"
@@ -17,21 +17,22 @@ if [[ ! -f "$agent_hosts_file" ]]; then
     exit 2
 fi
 
-while read -r agent_host; do
-    if [[ -z "$agent_host" ]]; then continue; fi
+mapfile -t hosts < "$agent_hosts_file"
+
+for agent_host in "${hosts[@]}"; do
+    [[ -z "$agent_host" ]] && continue
 
     echo "Stopping agents on $agent_host..."
-    ssh "$agent_host" "touch /root/SwarmAgents/shutdown"
-    ssh "$agent_host" "pkill -f 'main.py swarm-multi'"
+    ssh "$agent_host" "pkill -f 'main.py swarm-multi' || true" < /dev/null || echo "Warning: SSH to $agent_host failed"
 
     echo "Tarring swarm-multi directory on $agent_host..."
-    ssh "$agent_host" "tar czf /tmp/swarm-multi.tar.gz -C /root/SwarmAgents swarm-multi"
+    ssh "$agent_host" "tar czf /tmp/swarm-multi.tar.gz -C /root/SwarmAgents swarm-multi" < /dev/null || echo "Warning: Tar failed on $agent_host"
 
     echo "Transferring tarball from $agent_host..."
-    scp "$agent_host:/tmp/swarm-multi.tar.gz" "./swarm-multi_${agent_host}.tar.gz"
+    scp "$agent_host:/tmp/swarm-multi.tar.gz" "./swarm-multi_${agent_host}.tar.gz" < /dev/null || echo "Warning: SCP failed from $agent_host"
 
     echo "Cleaning up tarball on $agent_host..."
-    ssh "$agent_host" "rm -f /tmp/swarm-multi.tar.gz"
-done < "$agent_hosts_file"
+    ssh "$agent_host" "rm -f /tmp/swarm-multi.tar.gz" < /dev/null || echo "Warning: Cleanup failed on $agent_host"
+done
 
 echo "Done."
