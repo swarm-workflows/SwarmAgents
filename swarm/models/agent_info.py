@@ -47,7 +47,7 @@ class AgentInfo(JSONField):
     def host(self) -> str:
         return self._host
 
-    @property.setter
+    @host.setter
     def host(self, value: str):
         self._host = value
 
