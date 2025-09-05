@@ -34,6 +34,7 @@ class AgentInfo(JSONField):
     """
     def __init__(self, **kwargs):
         self.agent_id = 0
+        self._host = None
         self.load = 0.0
         self.proposed_load = 0.0
         self._capacities = Capacities()
@@ -41,6 +42,14 @@ class AgentInfo(JSONField):
         self.last_updated = 0.0
         self._dtns = {}
         self._set_fields(**kwargs)
+
+    @property
+    def host(self) -> str:
+        return self._host
+
+    @property.setter
+    def host(self, value: str):
+        self._host = value
 
     @property
     def dtns(self) -> dict[str, DataNode]:

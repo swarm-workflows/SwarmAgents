@@ -23,6 +23,7 @@ class TopologyType(enum.Enum):
             return TopologyType.Mesh
         if topo.lower() == str(TopologyType.Hierarchical).lower():
             return TopologyType.Hierarchical
+        return None
 
 
 class Topology:

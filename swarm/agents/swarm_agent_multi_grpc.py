@@ -682,6 +682,7 @@ class SwarmAgent(Agent):
             self.metrics.save_load_metric(load=self._load)
             proposed_load = self.compute_proposed_load()
             agent_info = AgentInfo(
+                host = self.grpc_host,
                 agent_id=self.agent_id,
                 capacities=self.capacities,
                 capacity_allocations=self.capacity_allocations,
@@ -711,6 +712,7 @@ class SwarmAgent(Agent):
             self._load = self.resource_usage_score(total_allocations, total_capacities)
             proposed_load = self.compute_proposed_load()
             agent_info = AgentInfo(
+                host=self.grpc_host,
                 agent_id=self.agent_id,
                 capacities=total_capacities,
                 capacity_allocations=total_allocations,

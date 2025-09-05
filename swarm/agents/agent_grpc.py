@@ -379,8 +379,10 @@ class Agent(Observer):
                 continue
 
             #peer_host = f"agent-{peer_id}" if self.grpc_host != "localhost" else "localhost"
-            peer_host = self.grpc_host
-            topic = f"{peer_host}:{self.grpc_port + peer_id}"
+            peer_info = self.neighbor_map.get(peer_id)
+            if not peer_info:
+                continue
+            topic = f"{peer_info.host}:{self.grpc_port + peer_id}"
 
             self.logger.debug(f"Sending message: {json_message.get('message_type')} to {topic}")
             self.grpc_thread.produce_message(
