@@ -162,3 +162,9 @@ cython_debug/
 agent_pids.txt
 redis-data/
 *.log*
+tasks.json
+# Swarm config files
+config_swarm_multi*.yml
+swarm-multi/**
+jobs/
+*.json

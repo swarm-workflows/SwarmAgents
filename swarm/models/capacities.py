@@ -32,7 +32,7 @@ class Capacities(JSONField):
     from JSON dictionaries of properties.
     """
     UNITS = {'cpu': '', 'unit': '',
-             'core': '', 'ram': 'G',
+             'core': '', 'gpu': '', 'ram': 'G',
              'disk': 'G', 'bw': 'Gbps',
              'burst_size': 'Mbits',
              'mtu': 'B'}
@@ -40,6 +40,7 @@ class Capacities(JSONField):
     def __init__(self, **kwargs):
         self.cpu = 0
         self.core = 0
+        self.gpu = 0
         self.ram = 0
         self.disk = 0
         self.bw = 0
@@ -59,7 +60,7 @@ class Capacities(JSONField):
         for k, v in kwargs.items():
             if v is not None:
                 assert v >= 0
-                assert isinstance(v, float)
+                #assert isinstance(v, float)
             try:
                 # will toss an exception if field is not defined
                 self.__getattribute__(k)

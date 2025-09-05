@@ -23,11 +23,10 @@
 # Author: Komal Thareja(kthare10@renci.org)
 import logging
 import sys
-import time
 from typing import Dict
 
 from swarm.agents.raft_agent import RaftAgent
-from task_generator import TaskGenerator
+from job_generator import TaskGenerator
 
 
 def generate_peers(agent_id: int, total_agents: int, port: int = 5010) -> Dict[str, str]:

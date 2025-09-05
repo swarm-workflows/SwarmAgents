@@ -52,7 +52,7 @@ class JobState(enum.Enum):
 
 job = {
     "id": "job_id",
-    "no_op": 10,
+    "execution_time": 10,
     "capacities": {
         "core": 1,
         "ram": 100,
@@ -89,16 +89,17 @@ class Job:
         self.job_id = None
         self.capacities = None
         self.capacity_allocations = None
-        self.no_op = 0
+        self.execution_time = 0
         self.data_in = []
         self.data_out = []
         self.state = JobState.PENDING
+        self.status = 0
         self.data_in_time = 0
         self.data_out_time = 0
         self.prepares = 0
         self.commits = 0
         self.logger = logger if logger else logging.getLogger(self.__class__.__name__)
-        self.lock = threading.Lock()  # Lock for synchronization
+        self.lock = threading.RLock()  # Lock for synchronization
         self.created_at = time.time()
         self.selection_started_at = None
         self.selected_by_agent_at = None
@@ -106,6 +107,8 @@ class Job:
         self.completed_at = None
         self.leader_agent_id = None
         self.time_last_state_change = 0
+        self.no_op_count = 0
+        self.job_type = None  # default until classified
 
     def get_age(self) -> float:
         """
@@ -131,11 +134,11 @@ class Job:
         with self.lock:
             self.completed_at = time.time()
 
-    def get_leader_agent_id(self) -> str:
+    def get_leader_agent_id(self) -> int:
         with self.lock:
             return self.leader_agent_id
 
-    def set_leader(self, leader_agent_id: str):
+    def set_leader(self, leader_agent_id: int):
         with self.lock:
             self.leader_agent_id = leader_agent_id
 
@@ -265,9 +268,9 @@ class Job:
     def __str__(self):
         return self.__repr__()
 
-    def get_no_op(self) -> float:
+    def get_execution_time(self) -> float:
         with self.lock:
-            return self.no_op
+            return self.execution_time
 
     def set_data_in_time(self, data_in_time: int):
         with self.lock:
@@ -281,37 +284,14 @@ class Job:
         try:
             self.logger.info(f"Starting execution for job: {self.job_id}")
             self.change_state(new_state=JobState.RUNNING)
-            if data_transfer:
-                begin = time.time()
-                # Transfer files from data_in nodes
-                for data_node in self.get_data_in():
-                    remote_ip = data_node.get_remote_ip()
-                    remote_user = data_node.get_remote_user()
-                    remote_file = data_node.get_remote_file()
-                    # Perform file transfer from remote node
-                    self.logger.info(f"Transferring file {remote_file} from {remote_user}@{remote_ip}")
-                    # Implement file transfer logic here, e.g., using SSH, SCP, or other file transfer protocols
-                    self.file_transfer(operation=Job.OP_GET, remote_ip=data_node.get_remote_ip(),
-                                       remote_user=data_node.get_remote_user(), remote_file=data_node.get_remote_file())
-                self.set_data_in_time(data_in_time=int(time.time() - begin))
+            # TODO: Transfer files from data_in nodes
 
-            # Simulate job execution by sleeping for no_op seconds
-            no_op = self.get_no_op()
-            self.logger.info(f"Sleeping for {no_op} seconds to simulate job execution")
-            time.sleep(no_op)
+            # Simulate job execution by sleeping for execution_time seconds
+            execution_time = self.get_execution_time()
+            self.logger.info(f"Sleeping for {execution_time} seconds to simulate job execution")
+            time.sleep(execution_time)
 
-            if data_transfer:
-                begin = time.time()
-                # Transfer files to data_out nodes
-                for data_node in self.get_data_out():
-                    remote_ip = data_node.get_remote_ip()
-                    remote_user = data_node.get_remote_user()
-                    remote_file = data_node.get_remote_file()
-                    # Perform file transfer to remote node
-                    self.logger.info(f"Transferring file {remote_file} to {remote_user}@{remote_ip}")
-                    self.file_transfer(operation=Job.OP_PUT, remote_ip=data_node.get_remote_ip(),
-                                       remote_user=data_node.get_remote_user(), remote_file=data_node.get_remote_file())
-                self.set_data_out_time(data_out_time=int(time.time() - begin))
+            # TODO: Transfer files from data_out nodes
 
             self.change_state(new_state=JobState.COMPLETE)
             self.logger.info(f"Completed execution for job: {self.job_id}")
@@ -368,7 +348,7 @@ class Job:
         self.set_state(state=new_state)
         if new_state in [JobState.PRE_PREPARE, JobState.PREPARE]:
             self.set_selection_start_time()
-        elif new_state in [JobState.READY, JobState.COMMIT]:
+        elif new_state in [JobState.READY]:
             self.set_selection_end_time()
         elif new_state == JobState.RUNNING:
             self.set_scheduled_time()
@@ -380,10 +360,11 @@ class Job:
             'id': self.job_id,
             'capacities': self.capacities.to_dict() if self.capacities else None,
             'capacity_allocations': self.capacity_allocations,
-            'no_op': self.no_op,
+            'execution_time': self.execution_time,
             'data_in': [data_node.to_dict() for data_node in self.data_in],
             'data_out': [data_node.to_dict() for data_node in self.data_out],
             'state': self.state.value,
+            'status': self.status,
             'data_in_time': self.data_in_time,
             'data_out_time': self.data_out_time,
             'prepares': self.prepares,
@@ -394,17 +375,19 @@ class Job:
             'scheduled_at': self.scheduled_at,
             'completed_at': self.completed_at,
             'leader_agent_id': self.leader_agent_id,
-            'time_last_state_change': self.time_last_state_change
+            'time_last_state_change': self.time_last_state_change,
+            'job_type': self.job_type
         }
 
     def from_dict(self, job_data: dict):
         self.job_id = job_data['id']
         self.capacities = Capacities.from_dict(job_data['capacities']) if job_data.get('capacities') else None
         self.capacity_allocations = Capacities.from_dict(job_data['capacity_allocations']) if job_data.get('capacity_allocations') else None
-        self.no_op = job_data['no_op']
+        self.execution_time = job_data['execution_time']
         self.data_in = [DataNode.from_dict(data_in) for data_in in job_data['data_in']]
         self.data_out = [DataNode.from_dict(data_out) for data_out in job_data['data_out']]
         self.state = JobState(job_data['state']) if job_data.get('state') else JobState.PENDING
+        self.status = job_data['status'] if job_data.get('status') else 0
         self.data_in_time = job_data['data_in_time'] if job_data.get('data_in_time') is not None else None
         self.data_out_time = job_data['data_out_time'] if job_data.get('data_out_time') is not None else None
         self.prepares = job_data['prepares'] if job_data.get('prepares') else 0
@@ -416,66 +399,34 @@ class Job:
         self.completed_at = job_data['completed_at'] if job_data.get('completed_at') is not None else None
         self.leader_agent_id = job_data['leader_agent_id'] if job_data.get('leader_agent_id') is not None else None
         self.time_last_state_change = job_data['time_last_state_change'] if job_data.get('time_last_state_change') is not None else None
+        self.classify_job_type()
 
-
-class JobRepository:
-    def __init__(self, redis_client):
-        self.redis = redis_client
-        self.lock = threading.Lock()
-
-    def save_job(self, job: Job, key_prefix: str = "job"):
-        if job.job_id is None:
-            raise ValueError("job_id must be set to save a job")
-        key = f"{key_prefix}:{job.job_id}"
-        with self.lock:
-            pipeline = self.redis.pipeline()
-            while True:
-                try:
-                    pipeline.watch(key)
-                    pipeline.multi()
-                    pipeline.set(key, json.dumps(job.to_dict()))
-                    pipeline.execute()
-                    break
-                except redis.WatchError:
-                    continue
-
-    def get_job(self, job_id: str, key_prefix: str = "job") -> Job:
-        key = f"{key_prefix}:{job_id}"
-        with self.lock:
-            data = self.redis.get(key)
-            if data is not None:
-                job = Job()
-                job.from_dict(json.loads(data))
-                return job
-
-    def delete_job(self, job_id: str, key_prefix: str = "job"):
-        key = f"{key_prefix}:{job_id}"
-        with self.lock:
-            self.redis.delete(key)
-
-    def get_all_job_ids(self, key_prefix: str = "job") -> list:
+    def classify_job_type(self):
         """
-        Retrieves all job IDs from Redis, stripping the key prefix.
+        Classify the job into a job_type string based on its resource demand,
+        execution time, and data transfer requirements.
         """
-        with self.lock:
-            job_keys = self.redis.keys(f'{key_prefix}:*')  # Fetch all keys with prefix
-            job_ids = [key.split(f"{key_prefix}:")[1] for key in job_keys]  # Extract job_id
-        return job_ids
+        # ---- Resource dominance classification ----
+        resource_ratios = {
+            "cpu_bound": self.capacities.core,
+            "ram_bound": self.capacities.ram,
+            "disk_bound": self.capacities.disk,
+            "gpu_bound": getattr(self.capacities, "gpu", 0),
+        }
+        resource_class = max(resource_ratios, key=resource_ratios.get)
 
-    def get_all_jobs(self, key_prefix: str = "job") -> list:
-        with self.lock:
-            job_keys = self.redis.keys(f'{key_prefix}:*')  # Assuming job keys are prefixed with 'job:'
-            jobs = []
-            for key in job_keys:
-                data = self.redis.get(key)
-                if data:
-                    job = Job()
-                    job.from_dict(json.loads(data))  # Redis stores data as bytes, so using eval to convert back to dict
-                    jobs.append(job)
-            return jobs
+        # ---- Execution time classification ----
+        if self.execution_time <= 5:
+            time_class = "short"
+        elif self.execution_time <= 20:
+            time_class = "medium"
+        else:
+            time_class = "long"
 
-    def delete_all(self, key_prefix: str = "job"):
-        with self.lock:
-            job_keys = self.redis.keys(f'{key_prefix}:*')  # Assuming job keys are prefixed with 'job:'
-            for key in job_keys:
-                self.redis.delete(key)
+        # ---- DTN / data I/O classification ----
+        required_dtns = (self.data_in or []) + (self.data_out or [])
+        io_class = "dtn_heavy" if len(required_dtns) > 1 else "dtn_light"
+
+        # ---- Combine ----
+        self.job_type = f"{resource_class}_{time_class}_{io_class}"
+        return self.job_type

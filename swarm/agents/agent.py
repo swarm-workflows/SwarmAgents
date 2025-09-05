@@ -43,8 +43,8 @@ import redis
 import yaml
 from matplotlib import pyplot as plt
 
-from swarm.agents.data.messaging_config import MessagingConfig
-from swarm.agents.data.queues import AgentQueues
+from swarm.utils.messaging_config import MessagingConfig
+from swarm.utils.queues import AgentQueues
 from swarm.comm.message_service_grpc import MessageServiceGrpc
 from swarm.comm.message_service_nats import MessageServiceNats
 from swarm.comm.messages.heart_beat import HeartBeat
@@ -54,7 +54,7 @@ from swarm.database.repository import Repository
 from swarm.models.capacities import Capacities
 from swarm.models.agent_info import AgentInfo
 from swarm.models.profile import ProfileType, PROFILE_MAP
-from swarm.models.job import Job
+from swarm.models.job import Job, JobState
 
 
 class IterableQueue:
@@ -73,12 +73,12 @@ class Agent(Observer):
     def __init__(self, agent_id: int, config_file: str):
         self.agent_id = agent_id
         self.neighbor_map = {}  # Store neighbor information
-        self.neighbor_map_lock = threading.Lock()
+        self.neighbor_map_lock = threading.RLock()
 
         self.config = {}
         with open(config_file, 'r') as f:
             self.config = yaml.safe_load(f)
-        self.queues = AgentQueues(self.config.get("queue", {}))
+        self.queues = AgentQueues()
         self.messaging = self._build_messaging_config(config=self.config)
         self.log_config = self.config.get("logging", {})
         self.runtime_config = self.config.get("runtime", {})
@@ -122,7 +122,7 @@ class Agent(Observer):
         self.restart_job_selection_cnt = 0
         self.conflicts = 0
         self.plot_figures = False
-        self.completed_lock = threading.Lock()
+        self.completed_lock = threading.RLock()
         self.completed_jobs_set = set()
 
     @property
@@ -261,7 +261,7 @@ class Agent(Observer):
     def _create_control_message_service(self):
         if self.message_service_type == "nats":
             return MessageServiceNats(config=self.messaging.nat_config, logger=self.logger)
-        elif self.message_service_type == "grpc":
+        elif self.message_service_type in ["grpc", "grpc_redis"]:
             port = self.grpc_port + self.agent_id
             return MessageServiceGrpc(port=port, logger=self.logger)
         else:  # Default to Kafka
@@ -274,8 +274,8 @@ class Agent(Observer):
                 MessageServiceNats(config=self.messaging.nat_config_hb, logger=self.logger),
                 None
             )
-        elif self.message_service_type == "grpc":
-            return (None, None)  # No heartbeat service for gRPC
+        elif self.message_service_type in ["grpc", "grpc_redis"]:
+            return None, None  # No heartbeat service for gRPC
         else:  # Kafka
             if self.heartbeat_mode == "kafka":
                 thread = threading.Thread(target=self._heartbeat_processor_main,
@@ -285,7 +285,7 @@ class Agent(Observer):
                     thread
                 )
             else:
-                return (None, None)
+                return None, None
 
     def start_idle(self):
         if self.idle_start_time is None:
@@ -348,7 +348,7 @@ class Agent(Observer):
                 self.logger.error(traceback.format_exc())
         return events
 
-    def process_message(self, message: str):
+    def dispatch_message(self, message: str):
         self.__enqueue(incoming=message)
 
     def _receive_heartbeat(self, incoming: HeartBeat):
@@ -383,13 +383,23 @@ class Agent(Observer):
         while not self.shutdown:
             agents = {}
             try:
+                if self._can_shutdown(agents=agents):
+                    self.stop()
+
+                if os.path.exists("./shutdown"):
+                    self.stop()
+                    break
+
+                if os.path.exists("./plot"):
+                    self.plot_results()
+
                 agents = self._build_heart_beat()
                 if self.heartbeat_mode != "kafka":
                     agent_info = agents[self.agent_id]
-                    self.agent_repo.save(obj=agent_info.to_dict(), key_prefix="agent")
+                    self.agent_repo.save(obj=agent_info.to_dict(), key_prefix=Repository.KEY_AGENT)
 
                     # Update Peer info
-                    peers = self.agent_repo.get_all_objects(key_prefix="agent")
+                    peers = self.agent_repo.get_all_objects(key_prefix=Repository.KEY_AGENT)
                     self.logger.debug(f"Fetched peers: {peers}")
                     for p in peers:
                         agent_info = AgentInfo.from_dict(p)
@@ -414,9 +424,6 @@ class Agent(Observer):
                 self.logger.error(f"Error occurred while sending heartbeat e: {e}")
                 self.logger.error(traceback.format_exc())
 
-            if self._can_shutdown(agents=agents):
-                self.stop()
-
     def _send_message(self, json_message: dict, excluded_peers: list[int] = [], src: int = None, fwd: int = None):
         if src is None:
             src = self.agent_id
@@ -428,7 +435,7 @@ class Agent(Observer):
             for peer_agent_id in self.messaging.topology_peer_agent_list:
                 if peer_agent_id in excluded_peers:
                     continue
-                if self.message_service_type == "grpc":
+                if self.message_service_type in ["grpc", "grpc_redis"]:
                     peer_host = "localhost"
                     if self.grpc_host != peer_host:
                         peer_host = f"agent-{peer_agent_id}"
@@ -545,11 +552,11 @@ class Agent(Observer):
 
         if self.data_transfer:
             for data_node in job.get_data_in():
-                if not self.is_reachable(hostname=data_node.get_remote_ip()):
+                if not self.is_reachable(hostname=data_node.get_dtn()):
                     return 0
 
             for data_node in job.get_data_out():
-                if not self.is_reachable(hostname=data_node.get_remote_ip()):
+                if not self.is_reachable(hostname=data_node.get_dtn()):
                     return 0
         return 1
 
@@ -570,11 +577,11 @@ class Agent(Observer):
 
         if self.data_transfer:
             for data_node in job.get_data_in():
-                if not self.is_reachable(hostname=data_node.get_remote_ip()):
+                if not self.is_reachable(hostname=data_node.get_dtn()):
                     return False
 
             for data_node in job.get_data_out():
-                if not self.is_reachable(hostname=data_node.get_remote_ip()):
+                if not self.is_reachable(hostname=data_node.get_dtn()):
                     return False
 
         return True
@@ -592,11 +599,11 @@ class Agent(Observer):
 
         if self.data_transfer:
             for data_node in job.get_data_in():
-                if not self.is_reachable(hostname=data_node.get_remote_ip()):
+                if not self.is_reachable(hostname=data_node.get_dtn()):
                     return False
 
             for data_node in job.get_data_out():
-                if not self.is_reachable(hostname=data_node.get_remote_ip()):
+                if not self.is_reachable(hostname=data_node.get_dtn()):
                     return False
 
         return True
@@ -1032,6 +1039,6 @@ class Agent(Observer):
             return True
 
         # Update completed_jobs_set from job repository
-        self.update_completed_jobs(self.job_repo.get_all_ids())
+        self.update_completed_jobs(self.job_repo.get_all_ids(state=JobState.COMPLETE.value))
 
         return job_id in self.completed_jobs_set

@@ -39,7 +39,7 @@ However, it's resilient and fault tolerant.
 
 Performance results for PBFT can be found [here](./runs/pbft).
 
-![Overall scheduling latency vs number of agents](./runs/pbft/overall-scheduling-latency.png)
+![Overall scheduling latency vs number of agents](./runs/ccgrid/pbft/overall-scheduling-latency.png)
 
 ### Usage
 - Set up the python environment by installing all the dependencies:
@@ -54,7 +54,7 @@ sh pbft-start.sh
 ```
 - Launch Log Runs
 ```
-nohup sh launch-runs.sh runs/pbft/3/repeated 100 pbft & disown
+nohup sh launch-runs.sh runs/ccgrid/pbft/3/repeated 100 pbft & disown
 ```
 - Analyze results and generate plots
 ```
@@ -84,7 +84,7 @@ SWARM algorithm extends PBFT consensus to the swarm topology and implemented in 
     - Improved real-time responsiveness 
     - Simplified protocol semantics
 
-New results based on these changes can be found [here](./runs/swarm/topology/)
+New results based on these changes can be found [here](./runs/ccgrid/swarm/topology/)
 
 ![Agent](./images/agent-overview.png)
 
@@ -108,17 +108,17 @@ Each agent utilizes a cost matrix to determine whether it should become the lead
 - Greedy approach with random seed used to resolve proposal collisions shows improvement over basic PBFT.
 - Job selection is triggered for only single job at a time
 
-Performance results for SWARM with single job selection can be found [here](./runs/swarm/single-job).
+Performance results for SWARM with single job selection can be found [here](./runs/ccgrid/swarm/single-job).
 
-![Overall scheduling latency vs number of agents](./runs/swarm/single-job/overall-scheduling-latency.png)
+![Overall scheduling latency vs number of agents](./runs/ccgrid/swarm/single-job/overall-scheduling-latency.png)
 
 #### Greedy Approach with Random seed and multiple job
 - Greedy approach with random seed used to resolve proposal collisions shows improvement over basic PBFT.
 - Job selection is triggered for upto 3 jobs at a time
 
-Performance results for SWARM with mulyiple job selection at a time can be found [here](./runs/swarm/multi-jobs).
+Performance results for SWARM with mulyiple job selection at a time can be found [here](./runs/ccgrid/swarm/multi-jobs).
 
-![Overall scheduling latency vs number of agents](./runs/swarm/multi-jobs/overall-scheduling-latency.png)
+![Overall scheduling latency vs number of agents](./runs/ccgrid/swarm/multi-jobs/overall-scheduling-latency.png)
 
 ### Usage
 - Set up the python environment by installing all the dependencies:
@@ -139,21 +139,21 @@ sh swarm-single-start.sh
 - Launch Log Runs
   - Multi Jobs
 ```
-  nohup sh launch-runs.sh runs/swarm/multi-jobs/3/repeated 100 swarm-multi & disown
+  nohup sh launch-runs.sh runs/ccgrid/swarm/multi-jobs/3/repeated 100 swarm-multi & disown
 ```
   - Single Jobs
 ```
-nohup sh launch-runs.sh runs/swarm/single-job/3/repeated 100 swarm-single & disown
+nohup sh launch-runs.sh runs/ccgrid/swarm/single-job/3/repeated 100 swarm-single & disown
 ```
 
 - Analyze results and generate plots
   - Multi Jobs
 ```
-python analyze_results.py --number_of_agents 3 --run_directory swarm/multi-jobs/3/repeated/ --algo SWARM-MULTI
+python analyze_results.py --number_of_agents 3 --run_directory swarm/ccgrid/multi-jobs/3/repeated/ --algo SWARM-MULTI
 ```
   - Single Jobs
 ```
-python analyze_results.py --number_of_agents 3 --run_directory swarm/single-job/3/repeated/ --algo SWARM-SINGLE
+python analyze_results.py --number_of_agents 3 --run_directory swarm/ccgrid/single-job/3/repeated/ --algo SWARM-SINGLE
 ```
 
 ## Comparison PBFT vs SWARM Single vs SWARM Multi
@@ -163,14 +163,14 @@ python comparison.py --number_of_agents <number of agents>
 ```
 
 ### Results with 3 Agents
-![Idle Time](./runs/histogram_idle_time_with_bootstrap_ci_3.png)
-![CI Plot](./runs/comparison_line_plot_with_ci_3.png)
+![Idle Time](./runs/ccgrid/histogram_idle_time_with_bootstrap_ci_3.png)
+![CI Plot](./runs/ccgrid/comparison_line_plot_with_ci_3.png)
 ### Results with 5 Agents
-![Idle Time](./runs/histogram_idle_time_with_bootstrap_ci_5.png)
-![CI Plot](./runs/comparison_line_plot_with_ci_5.png)
+![Idle Time](./runs/ccgrid/histogram_idle_time_with_bootstrap_ci_5.png)
+![CI Plot](./runs/ccgrid/comparison_line_plot_with_ci_5.png)
 ### Results with 10 Agents
-![Idle Time](./runs/histogram_idle_time_with_bootstrap_ci_10.png)
-![CI Plot](./runs/comparison_line_plot_with_ci_10.png)
+![Idle Time](./runs/ccgrid/histogram_idle_time_with_bootstrap_ci_10.png)
+![CI Plot](./runs/ccgrid/comparison_line_plot_with_ci_10.png)
 
 ## Raft Consensus Algorithm
 RAFT algorithm is explored and implemented in `raft_agent.py`. This agent works as follows:
@@ -219,4 +219,4 @@ python comparison.py --number_of_agents 10
 ```
 
 
-![Scheduling latency comparison - Number of agents](./runs/comparison_line_plot_with_ci_10raft.png)
+![Scheduling latency comparison - Number of agents](./runs/ccgrid/comparison_line_plot_with_ci_10raft.png)

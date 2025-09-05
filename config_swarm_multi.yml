@@ -1,33 +1,51 @@
 redis:
-  host: database
+  host: database 
   port: 6379
+etcd:
+  host: database
+  port: 2379
 queue:
   type: simple
   host: 127.0.0.1
   port: 8098
+capacities:
+  cpu: 2
+  core: 8
+  gpu: 8
+  ram: 32
+  disk: 100
+  bw: 0
+  burst_size: 0
+  unit: 0
+  mtu: 0
 topology:
-  # Possible values, all, or comma separated list neighbor agent ids
-  peer_agents: all
-kafka:
-  bootstrap_servers: zoo-0:9092,zoo-1:9092,zoo-2:9092
-  topic: multi
-  hb_topic: multi-hb
-  consumer_group_id: cg
-  batch_size: 10
-nats:
-  nats_servers: nats://127.0.0.1:4222
-  nats_topic: agent-swarm-multi
-  hb_nats_topic: agent-swarm-multi-hb
+  children: null
+  level: 0
+  group: 0
+  parent: null
+  peer_agents:
+    - 1
+    - 2
+  type: mesh
 grpc:
   port: 50051
   host: localhost
+dtns:
+  - name: dtn1
+    ip: "192.168.1.10"
+    user: "dtn_user"
+    connectivity_score: 0.95
+  - name: dtn2
+    ip: "192.168.1.11"
+    user: "dtn_user2"
+    connectivity_score: 0.87
 runtime:
   profile: BalancedProfile
   data_transfer: False
-  max_pending_elections: 10
+  max_pending_elections: 100
   projected_queue_threshold: 300.00
   ready_queue_threshold: 100.00
-  max_time_load_zero: 30
+  max_time_load_zero: 300
   restart_job_selection: 300
   peer_heartbeat_timeout: 300
   results_dir: swarm-multi
@@ -35,7 +53,8 @@ runtime:
   shutdown_mode: manual
   heartbeat_mode: redis
   total_agents: 5
-  jobs_per_proposal: 3
+  jobs_per_proposal: 20
+  executor_workers: 10
 logging:
   ## The directory in which actor should create log files.
   ## This directory will be automatically created if it does not exist.
@@ -45,7 +64,7 @@ logging:
   log-file: agent
 
   ## The default log level for actor.
-  log-level: INFO
+  log-level: INFO 
 
   ## actor rotates log files. You may specify how many archived log files to keep here.
   log-retain: 5
@@ -55,3 +74,13 @@ logging:
   log-size: 5000000
 
   logger: agent
+job_selection:
+  cost_weights:
+    cpu: 0.4       # Relative importance of CPU utilization in job cost (0–1, sum of all weights should ≈ 1.0)
+    ram: 0.3       # Relative importance of RAM utilization in job cost (0–1)
+    disk: 0.2      # Relative importance of Disk utilization in job cost (0–1)
+    gpu: 0.1       # Relative importance of GPU utilization in job cost (0–1)
+
+  long_job_threshold: 20.0            # Execution time (in seconds) beyond which jobs incur extra penalty
+  connectivity_penalty_factor: 1.0    # Multiplier for DTN connectivity penalty (0=no effect, >1 increases penalty severity)
+  selection_threshold_pct: 10.0       # % above min cost allowed in candidate selection (lower = stricter, higher = more agents considered)

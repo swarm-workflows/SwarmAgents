@@ -100,7 +100,7 @@ class MessageServiceKafka:
     def notify_observers(self, msg):
         message = msg.value().decode('utf-8')
         for o in self.observers:
-            o.process_message(message)
+            o.dispatch_message(message)
 
     def consume_messages(self):
         msg_count = 0

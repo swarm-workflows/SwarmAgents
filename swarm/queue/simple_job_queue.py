@@ -22,6 +22,7 @@
 #
 # Author: Komal Thareja(kthare10@renci.org)
 import threading
+from itertools import islice
 
 from swarm.models.job import Job, JobState
 from swarm.queue.job_queue import JobQueue
@@ -30,17 +31,25 @@ from swarm.queue.job_queue import JobQueue
 class SimpleJobQueue(JobQueue):
     def __init__(self):
         self.jobs = {}
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
 
-    def get_jobs(self, states: list[JobState] = None) -> list[Job]:
+    def size(self):
         with self.lock:
-            if not states or not len(states):
-                return list(self.jobs.values())
-            result = []
-            for j in self.jobs.values():
-                if j.get_state() in states:
-                    result.append(j)
-            return result
+            return len(self.jobs)
+
+    def get_jobs(self, states: list[JobState] = None, count: int = None) -> list[Job]:
+        # Copy references while holding the lock, so iteration happens outside
+        with self.lock:
+            all_jobs = list(self.jobs.values())
+
+        if states:
+            states_set = set(states)
+            all_jobs = (j for j in all_jobs if j.get_state() in states_set)
+
+        if count:
+            all_jobs = islice(all_jobs, count)
+
+        return list(all_jobs)
 
     def add_job(self, job: Job):
         with self.lock:
@@ -56,15 +65,9 @@ class SimpleJobQueue(JobQueue):
                 self.jobs.pop(job_id)
 
     def get_job(self, job_id: str) -> Job:
-        try:
-            self.lock.acquire()
+        with self.lock:
             return self.jobs.get(job_id)
-        finally:
-            self.lock.release()
 
     def __contains__(self, job_id):
-        try:
-            self.lock.acquire()
+        with self.lock:
             return job_id in self.jobs
-        finally:
-            self.lock.release()

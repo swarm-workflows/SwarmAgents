@@ -60,7 +60,7 @@ class MessageServiceNats:
     def notify_observers(self, message):
         decoded_message = message.decode('utf-8')
         for observer in self.observers:
-            observer.process_message(decoded_message)
+            observer.dispatch_message(decoded_message)
 
     async def consume_messages(self):
         async def message_handler(msg):

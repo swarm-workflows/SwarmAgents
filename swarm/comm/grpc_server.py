@@ -44,7 +44,7 @@ class ConsensusServiceServicer(consensus_pb2_grpc.ConsensusServiceServicer):
             "payload": json.loads(request.payload),
             "timestamp": request.timestamp
         }
-        self.observer.process_message(msg)
+        self.observer.dispatch_message(msg)
         return consensus_pb2.Ack(success=True, info="Processed")
 
 
@@ -52,7 +52,7 @@ class GrpcServer:
     def __init__(self, port: int, observer: Observer, logger: logging.Logger = logging.getLogger()):
         self.port = port
         self.observer = observer
-        self.server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+        self.server = grpc.server(futures.ThreadPoolExecutor(max_workers=5))
         self._bind_services()
         self.logger = logger
 
