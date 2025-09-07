@@ -63,7 +63,7 @@ def main():
     ap.add_argument("--watch-bucket", type=int, default=1)
     ap.add_argument("--threshold", type=int, default=5)
     ap.add_argument("--stable-seconds", type=int, default=90)
-    ap.add_argument("--check-interval", type=float, default=5.0)
+    ap.add_argument("--check-interval", type=float, default=5)
     ap.add_argument("--grace-seconds", type=int, default=30)
     ap.add_argument("--max-misses", type=int, default=10)
     ap.add_argument("--wait-port-regex", default=r":50[0-9]{3}\b", help="Regex to detect sockets to avoid (default matches :50000–:50999 etc.)")
