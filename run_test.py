@@ -1,5 +1,5 @@
 #!/usr/bin/env python3.11
-import argparse, os, re, subprocess, time, signal
+import argparse, os, re, subprocess, time
 from datetime import datetime
 
 LINE_RE = re.compile(r"^state:\d+:\d+:(\d+):\s*\{([^}]*)\}\s*$")
@@ -7,23 +7,18 @@ LINE_RE = re.compile(r"^state:\d+:\d+:(\d+):\s*\{([^}]*)\}\s*$")
 def log(msg: str):
     print(f"[{datetime.now():%H:%M:%S}] {msg}", flush=True)
 
-def start_proc(cmd, log_file=None):
-    log(f"Starting: {' '.join(cmd)}")
+def run_blocking(cmd, log_file=None):
+    """
+    Run a command to completion. If log_file is provided, write stdout/stderr there.
+    Otherwise, discard output cleanly.
+    """
     if log_file:
-        f = open(log_file, "w")
-        # keep a reference on proc for later closing f
-        p = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT)
-        p._attached_log = f  # type: ignore[attr-defined]
-        return p
-    return subprocess.Popen(cmd)
-
-def close_attached_log(p):
-    f = getattr(p, "_attached_log", None)
-    if f:
-        try:
-            f.flush(); f.close()
-        except Exception:
-            pass
+        with open(log_file, "w") as f:
+            return subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, text=True)
+    else:
+        # Use a real file handle to /dev/null as a context manager
+        with open(os.devnull, "w") as devnull:
+            return subprocess.run(cmd, stdout=devnull, stderr=subprocess.STDOUT, text=True)
 
 def run_once(cmd):
     p = subprocess.run(cmd, capture_output=True, text=True, check=False)
@@ -50,107 +45,77 @@ def touch(path: str):
         os.utime(path, None)
 
 def main():
-    ap = argparse.ArgumentParser(description="Start swarm, run job distributor, wait for distributor + state, shutdown, plot.")
+    ap = argparse.ArgumentParser(description="Run swarm, job distributor (blocking), then shutdown + plot.")
     ap.add_argument("--agents", type=int, required=True)
     ap.add_argument("--topology", default="mesh")
     ap.add_argument("--jobs", type=int, required=True)
     ap.add_argument("--db-host", default="database")
     ap.add_argument("--jobs-per-interval", type=int, default=20)
-    ap.add_argument("--run-dir", required=True, help="Output dir for plots")
+    ap.add_argument("--run-dir", required=True)
     ap.add_argument("--watch-bucket", type=int, default=1)
     ap.add_argument("--threshold", type=int, default=5)
     ap.add_argument("--stable-seconds", type=int, default=90)
     ap.add_argument("--check-interval", type=float, default=5.0)
     ap.add_argument("--grace-seconds", type=int, default=30)
-    ap.add_argument("--max-misses", type=int, default=10, help="Consecutive times bucket not found => force condition")
-    ap.add_argument("--require-job-dist-exit", action="store_true", default=True,
-                    help="Require job_distributor to exit before shutdown (default: True)")
-    ap.add_argument("--job-dist-timeout-seconds", type=int, default=0,
-                    help="Max seconds to wait for job_distributor to exit (0 = unlimited).")
-    ap.add_argument("--keep-running", action="store_true")
+    ap.add_argument("--max-misses", type=int, default=10)
     ap.add_argument("--log-dir", default=None)
     args = ap.parse_args()
 
     os.makedirs(args.log_dir, exist_ok=True) if args.log_dir else None
 
-    # 1) Start swarm
+    # 1) Run swarm start (blocking)
     swarm_cmd = ["./swarm-multi-start.sh", str(args.agents), args.topology, str(args.jobs), args.db_host, "10"]
-    swarm = start_proc(swarm_cmd, os.path.join(args.log_dir, "swarm.log") if args.log_dir else None)
+    swarm_log = os.path.join(args.log_dir, "swarm.log") if args.log_dir else None
+    rc = run_blocking(swarm_cmd, swarm_log)
+    if rc.returncode != 0:
+        log(f"ERROR: swarm-multi-start.sh exited {rc.returncode}")
+        return
 
-    # 2) Start job distributor
+    # 2) Run job distributor (blocking)
     job_dist_cmd = [
         "python3.11", "job_distributor.py",
         "--redis-host", args.db_host,
         "--jobs-dir", "jobs",
         "--jobs-per-interval", str(args.jobs_per_interval),
     ]
-    job_dist = start_proc(job_dist_cmd, os.path.join(args.log_dir, "job_dist.log") if args.log_dir else None)
-    job_dist_start = time.time()
+    job_log = os.path.join(args.log_dir, "job_dist.log") if args.log_dir else None
+    rc = run_blocking(job_dist_cmd, job_log)
+    if rc.returncode != 0:
+        log(f"ERROR: job_distributor.py exited {rc.returncode}")
+        return
 
-    # 3) Watch: (A) state condition AND (B) job distributor exit (unless disabled/timeout)
+    # 3) Wait for Redis state bucket condition
     low_since = None
     consecutive_misses = 0
-    condition_a_met = False
-    condition_b_met = False
-
     while True:
-        # A) Check state bucket
         out = run_once(["python3.11", "dump_db.py", "--host", args.db_host, "--type", "redis", "--key", "state"])
         size = parse_bucket_set_count(out, args.watch_bucket)
-
         if size is None:
             consecutive_misses += 1
-            log(f"WARN: state:*:*:{args.watch_bucket}: not found (miss {consecutive_misses}/{args.max_misses})")
+            log(f"WARN: state:*:*:{args.watch_bucket} not found (miss {consecutive_misses}/{args.max_misses})")
             if consecutive_misses > args.max_misses:
-                log(f"Bucket missing > {args.max_misses} times → treating as drained.")
-                condition_a_met = True
-            else:
-                # keep waiting
-                condition_a_met = False
-                low_since = None
+                log("Bucket missing too often → treating as done.")
+                break
         else:
-            consecutive_misses = 0
             cond = size < args.threshold
-            log(f"state:*:*:{args.watch_bucket}: size={size} → {'LOW' if cond else 'OK'} (threshold {args.threshold})")
+            log(f"Bucket {args.watch_bucket} size={size} (thr={args.threshold}) → {'LOW' if cond else 'OK'}")
             if cond:
                 if low_since is None:
                     low_since = time.time()
                 elif time.time() - low_since >= args.stable_seconds:
-                    condition_a_met = True
+                    log("Condition stable → proceed.")
+                    break
             else:
-                condition_a_met = False
                 low_since = None
-
-        # B) Check job distributor exit
-        if args.require_job_dist_exit:
-            if job_dist.poll() is not None:
-                condition_b_met = True
-            else:
-                if args.job_dist_timeout_seconds > 0:
-                    elapsed = time.time() - job_dist_start
-                    if elapsed >= args.job_dist_timeout_seconds:
-                        log(f"WARN: job_distributor running > {args.job_dist_timeout_seconds}s → proceeding anyway.")
-                        condition_b_met = True
-                    else:
-                        condition_b_met = False
-                else:
-                    condition_b_met = False
-        else:
-            condition_b_met = True  # not required
-
-        if condition_a_met and condition_b_met:
-            log("Both conditions met → proceeding to shutdown.")
-            break
-
         time.sleep(args.check_interval)
 
     # 4) Touch shutdown
     touch("shutdown")
-    log("Touched 'shutdown'")
+    log("Touched shutdown")
 
-    # 5) Grace period
+    # 5) Grace
     if args.grace_seconds > 0:
-        log(f"Waiting {args.grace_seconds}s for graceful stop …")
+        log(f"Sleeping {args.grace_seconds}s …")
         time.sleep(args.grace_seconds)
 
     # 6) Plot
@@ -162,32 +127,6 @@ def main():
     ]
     log(f"Running plot: {' '.join(plot_cmd)}")
     subprocess.run(plot_cmd, check=False)
-
-    # 7) Cleanup
-    if not args.keep_running:
-        # Ask job_dist to stop if still alive
-        if job_dist.poll() is None:
-            try:
-                job_dist.terminate()
-                job_dist.wait(timeout=10)
-            except Exception:
-                try:
-                    job_dist.kill()
-                except Exception:
-                    pass
-        close_attached_log(job_dist)
-
-        # Stop swarm
-        if swarm.poll() is None:
-            try:
-                swarm.terminate()
-                swarm.wait(timeout=10)
-            except Exception:
-                try:
-                    swarm.kill()
-                except Exception:
-                    pass
-        close_attached_log(swarm)
 
     log("Done.")
 
