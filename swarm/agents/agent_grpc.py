@@ -31,13 +31,14 @@ import traceback
 from abc import abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 from logging.handlers import RotatingFileHandler
+from pyexpat.errors import messages
 
 import redis
 import yaml
 
 from swarm.utils.queues import AgentQueues
 from swarm.comm.message_service_grpc import MessageServiceGrpc
-from swarm.comm.messages.message import MessageType
+from swarm.comm.messages.message import MessageType, Message
 from swarm.comm.message_service_kafka import Observer
 from swarm.database.repository import Repository
 from swarm.models.capacities import Capacities
@@ -372,7 +373,8 @@ class Agent(Observer):
 
     def _send_message(self, json_message: dict, excluded_peers: list[int] = None, src: int = None, fwd: int = None):
         src = src or self.agent_id
-        excluded = set(excluded_peers) if excluded_peers else set()
+        #excluded = set(excluded_peers) if excluded_peers else set()
+        excluded = {p for p in (excluded_peers or []) if isinstance(p, int)}
 
         for peer_id in self.topology.peers:
             if peer_id in excluded:
@@ -536,3 +538,39 @@ class Agent(Observer):
         '''
         self.logger.info("Results saved")
 
+    def _prepare_ttl_and_path(self, payload: dict) -> bool:
+        """
+        Enforce TTL and visited-set for ring/neighbor forwarding.
+        - payload["hops"]: int remaining forwards (if absent => unbounded)
+        - payload["path"]: list[int] of visited agents
+        Returns True if we should forward; False to drop.
+        """
+        # Ensure a path list exists
+        path = payload.get("path")
+        if path is None:
+          path = []
+          payload["path"] = path
+
+        # Drop if we've already seen this message here
+        if self.agent_id in path:
+          return False
+        path.append(self.agent_id)
+
+        # If hops present, decrement and drop when exhausted
+        if "hops" in payload:
+          try:
+              hops = int(payload["hops"])
+          except Exception:
+              return False  # bad value => be safe and stop
+          if hops <= 0:
+              return False
+          payload["hops"] = hops - 1
+        return True
+
+    def _should_forward(self, msg: Message) -> bool:
+        path = msg.path if msg.path else []
+        if self.agent_id in path:
+            # already seen me — don’t forward again
+            return False
+        path.append(self.agent_id)
+        return True

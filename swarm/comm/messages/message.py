@@ -57,7 +57,16 @@ class Message(JSONField):
         self._forwarded_by = None
         self._message_type = None
         self._agents = []  # List of agents
+        self._path = []
         self._set_fields(**kwargs)
+
+    @property
+    def path(self) -> List[int]:
+        return self._path
+
+    @path.setter
+    def path(self, path: List[int]) -> None:
+        self._path = path
 
     @property
     def source(self) -> str:

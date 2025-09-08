@@ -87,14 +87,14 @@ class SwarmAgent(Agent):
 
     def __receive_proposal(self, incoming: Proposal):
         proposals = []
-        proposals_to_forward = []
+        #proposals_to_forward = []
         for p in incoming.proposals:
             job = self.queues.job_queue.get_job(job_id=p.job_id)
             if not job:
                 self.logger.debug(f"ERROR ---- Skipping no job found for {p.job_id}")
                 self.outgoing_proposals.remove_job(job_id=p.job_id)
                 self.incoming_proposals.remove_job(job_id=p.job_id)
-                proposals_to_forward.append(p)
+                #proposals_to_forward.append(p)
                 continue
             if self.is_job_completed(job_id=job.get_job_id()):
                 self.logger.debug(f"Ignoring Proposal: {p} for job: {job.get_job_id()}")
@@ -135,8 +135,9 @@ class SwarmAgent(Agent):
                 job.change_state(JobState.PREPARE)  # Ensure this is where you want the state to change
 
                 # New proposal, forward to my peers
-                proposals_to_forward.append(p)
+                #proposals_to_forward.append(p)
 
+        '''
         if len(proposals_to_forward) and self.topology.type in [TopologyType.Star, TopologyType.Ring]:
             msg = Proposal(source=incoming.agents[0].agent_id,
                            agents=[AgentInfo(agent_id=incoming.agents[0].agent_id)], proposals=proposals_to_forward,
@@ -144,21 +145,26 @@ class SwarmAgent(Agent):
             self._send_message(json_message=msg.to_dict(),
                                excluded_peers=[incoming.forwarded_by, incoming.agents[0].agent_id],
                                src=incoming.agents[0].agent_id, fwd=self.agent_id)
-
+        '''
         if len(proposals):
             msg = Prepare(source=self.agent_id, agents=[AgentInfo(agent_id=self.agent_id)], proposals=proposals)
             self._send_message(json_message=msg.to_dict())
 
+        if self.topology.type in [TopologyType.Star, TopologyType.Ring] and self._should_forward(msg=incoming):
+            self._send_message(json_message=incoming.to_dict(),
+                               excluded_peers=[incoming.forwarded_by, incoming.agents[0].agent_id],
+                               src=incoming.agents[0].agent_id, fwd=self.agent_id)
+
     def __receive_prepare(self, incoming: Prepare):
         proposals = []
-        proposals_to_forward = []
+        #proposals_to_forward = []
         for p in incoming.proposals:
             job = self.queues.job_queue.get_job(job_id=p.job_id)
             if not job:
                 self.logger.debug(f"ERROR ---- Skipping no job found for {p.job_id}")
                 self.outgoing_proposals.remove_job(job_id=p.job_id)
                 self.incoming_proposals.remove_job(job_id=p.job_id)
-                proposals_to_forward.append(p)
+                #proposals_to_forward.append(p)
                 continue
             if self.is_job_completed(job_id=job.get_job_id()):
                 self.logger.debug(f"Job: {job.get_job_id()} Ignoring Prepare: {p}")
@@ -178,8 +184,8 @@ class SwarmAgent(Agent):
             if incoming.agents[0].agent_id not in proposal.prepares:
                 proposal.prepares.append(incoming.agents[0].agent_id)
                 # Forward Prepare for peer proposals
-                if proposal.agent_id != self.agent_id:
-                    proposals_to_forward.append(p)
+                #if proposal.agent_id != self.agent_id:
+                #    proposals_to_forward.append(p)
 
             # Commit has already been triggered
             if job.is_commit():
@@ -202,6 +208,7 @@ class SwarmAgent(Agent):
             msg = Commit(source=self.agent_id, agents=[AgentInfo(agent_id=self.agent_id)], proposals=proposals)
             self._send_message(json_message=msg.to_dict())
 
+        '''
         if len(proposals_to_forward) and self.topology.type in [TopologyType.Star, TopologyType.Ring]:
             # Use the originators agent agent_id when forwarding the Prepare
             msg = Prepare(source=incoming.agents[0].agent_id, agents=[AgentInfo(agent_id=incoming.agents[0].agent_id)],
@@ -210,9 +217,14 @@ class SwarmAgent(Agent):
             self._send_message(json_message=msg.to_dict(),
                                excluded_peers=[incoming.forwarded_by, incoming.agents[0].agent_id],
                                src=incoming.agents[0].agent_id, fwd=self.agent_id)
+        '''
+        if self.topology.type in [TopologyType.Star, TopologyType.Ring] and self._should_forward(msg=incoming):
+            self._send_message(json_message=incoming.to_dict(),
+                               excluded_peers=[incoming.forwarded_by, incoming.agents[0].agent_id],
+                               src=incoming.agents[0].agent_id, fwd=self.agent_id)
 
     def __receive_commit(self, incoming: Commit):
-        proposals_to_forward = []
+        #proposals_to_forward = []
 
         for p in incoming.proposals:
             job = self.queues.job_queue.get_job(job_id=p.job_id)
@@ -220,7 +232,7 @@ class SwarmAgent(Agent):
                 self.logger.debug(f"ERROR ---- Skipping no job found for {p.job_id}")
                 self.outgoing_proposals.remove_job(job_id=p.job_id)
                 self.incoming_proposals.remove_job(job_id=p.job_id)
-                proposals_to_forward.append(p)
+                #proposals_to_forward.append(p)
                 continue
             if self.is_job_completed(job_id=job.get_job_id()):
                 self.logger.debug(f"Job: {job.get_job_id()} Ignoring Commit: {p}")
@@ -239,8 +251,8 @@ class SwarmAgent(Agent):
 
             if incoming.agents[0].agent_id not in proposal.commits:
                 proposal.commits.append(incoming.agents[0].agent_id)
-                if proposal.agent_id != self.agent_id:
-                    proposals_to_forward.append(proposal)
+                #if proposal.agent_id != self.agent_id:
+                #    proposals_to_forward.append(proposal)
 
             quorum_count = self.calculate_quorum()
 
@@ -260,12 +272,18 @@ class SwarmAgent(Agent):
                     self.logger.info(f"[CON_PART] achieved for Job: {p.job_id} Leader: {p.agent_id}")
                     job.change_state(new_state=JobState.COMPLETE)
                     self.incoming_proposals.remove_job(job_id=p.job_id)
-
+        '''
         if len(proposals_to_forward) and self.topology.type in [TopologyType.Star, TopologyType.Ring]:
-            msg = Commit(source=incoming.agents[0].agent_id, agents=[AgentInfo(agent_id=incoming.agents[0].agent_id)],
+            msg = Commit(source=incoming.agents[0].agent_id,
+                         agents=[AgentInfo(agent_id=incoming.agents[0].agent_id)],
                          proposals=proposals_to_forward,
                          forwarded_by=self.agent_id)
             self._send_message(json_message=msg.to_dict(),
+                               excluded_peers=[incoming.forwarded_by, incoming.agents[0].agent_id],
+                               src=incoming.agents[0].agent_id, fwd=self.agent_id)
+        '''
+        if self.topology.type in [TopologyType.Star, TopologyType.Ring] and self._should_forward(msg=incoming):
+            self._send_message(json_message=incoming.to_dict(),
                                excluded_peers=[incoming.forwarded_by, incoming.agents[0].agent_id],
                                src=incoming.agents[0].agent_id, fwd=self.agent_id)
 
