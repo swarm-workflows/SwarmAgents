@@ -168,3 +168,4 @@ config_swarm_multi*.yml
 swarm-multi/**
 jobs/
 *.json
+shutdown

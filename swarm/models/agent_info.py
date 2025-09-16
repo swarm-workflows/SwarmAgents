@@ -35,6 +35,7 @@ class AgentInfo(JSONField):
     def __init__(self, **kwargs):
         self.agent_id = 0
         self._host = None
+        self._port = None
         self.load = 0.0
         self.proposed_load = 0.0
         self._capacities = Capacities()
@@ -42,6 +43,14 @@ class AgentInfo(JSONField):
         self.last_updated = 0.0
         self._dtns = {}
         self._set_fields(**kwargs)
+
+    @property
+    def port(self) -> int:
+        return self._port
+
+    @port.setter
+    def port(self, port: int) -> None:
+        self._port = port
 
     @property
     def host(self) -> str:

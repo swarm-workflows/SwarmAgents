@@ -24,7 +24,7 @@
 from typing import List, Tuple
 
 from swarm.comm.messages.message import Message, MessageType
-from swarm.models.proposal_info import ProposalInfo
+from swarm.models.proposal_infov2 import ProposalInfo
 
 
 class Proposal(Message):
@@ -46,16 +46,16 @@ class Proposal(Message):
                 elif isinstance(v, dict):
                     self._proposals.append(ProposalInfo.from_dict(v))
                 else:
-                    raise ValueError("Unsupported value type for proposals")
+                    raise ValueError(f"Unsupported value {type(v)} for proposals")
         else:
-            raise ValueError("Unsupported value type for proposals")
+            raise ValueError(f"Unsupported value type {type(values)} for proposals")
 
     def __str__(self):
         return f"[agent: {self.agents}, proposals: {self.proposals}]"
 
 
 if __name__ == '__main__':
-    p_info = ProposalInfo(p_id="pid_1", job_id='t-1', seed=0.6, agent_id="0")
+    p_info = ProposalInfo(p_id="pid_1", object_id='t-1', seed=0.6, agent_id="0")
     print(p_info)
     print(p_info.to_dict())
     proposal = Proposal(proposals=[p_info])
@@ -65,4 +65,4 @@ if __name__ == '__main__':
 
     new_p = Proposal.from_dict(proposal.to_dict())
     print(new_p)
-    print(new_p.proposals[0].job_id)
+    print(new_p.proposals[0].object_id)

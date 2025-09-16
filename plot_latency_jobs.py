@@ -10,7 +10,7 @@ import os
 import redis
 
 from swarm.database.repository import Repository
-from swarm.models.job import Job, JobState
+from swarm.models.job import Job, ObjectState
 from collections import defaultdict
 
 from typing import Set
@@ -127,7 +127,7 @@ def save_jobs(jobs: list[Any], path: str):
         leader_id = getattr(job, "leader_agent_id", None)
         if leader_id is None:
             continue
-        if job.state not in [JobState.READY, JobState.RUNNING, JobState.COMPLETE]:
+        if job.state not in [ObjectState.READY, ObjectState.RUNNING, ObjectState.COMPLETE]:
             continue
 
         # Store all in one row

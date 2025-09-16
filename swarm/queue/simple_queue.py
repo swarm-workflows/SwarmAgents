@@ -24,50 +24,51 @@
 import threading
 from itertools import islice
 
-from swarm.models.job import Job, JobState
-from swarm.queue.job_queue import JobQueue
+from swarm.models.job import Job, ObjectState
+from swarm.models.object import Object
+from swarm.queue.object_queue import ObjectQueue
 
 
-class SimpleJobQueue(JobQueue):
+class SimpleQueue(ObjectQueue):
     def __init__(self):
-        self.jobs = {}
+        self.objects = {}
         self.lock = threading.RLock()
 
     def size(self):
         with self.lock:
-            return len(self.jobs)
+            return len(self.objects)
 
-    def get_jobs(self, states: list[JobState] = None, count: int = None) -> list[Job]:
+    def gets(self, states: list[ObjectState] = None, count: int = None) -> list[Job]:
         # Copy references while holding the lock, so iteration happens outside
         with self.lock:
-            all_jobs = list(self.jobs.values())
+            all_objects = list(self.objects.values())
 
         if states:
             states_set = set(states)
-            all_jobs = (j for j in all_jobs if j.get_state() in states_set)
+            all_objects = (j for j in all_objects if j.state in states_set)
 
         if count:
-            all_jobs = islice(all_jobs, count)
+            all_objects = islice(all_objects, count)
 
-        return list(all_jobs)
+        return list(all_objects)
 
-    def add_job(self, job: Job):
+    def add(self, object: Object):
         with self.lock:
-            self.jobs[job.get_job_id()] = job
+            self.objects[object.object_id] = object
 
-    def update_job(self, job: Job):
+    def update(self, object: Object):
         with self.lock:
-            self.jobs[job.get_job_id()] = job
+            self.objects[object.object_id] = object
 
-    def remove_job(self, job_id: str):
+    def remove(self, object_id: str):
         with self.lock:
-            if job_id in self.jobs:
-                self.jobs.pop(job_id)
+            if object_id in self.objects:
+                self.objects.pop(object_id)
 
-    def get_job(self, job_id: str) -> Job:
+    def get(self, object_id: str) -> Job:
         with self.lock:
-            return self.jobs.get(job_id)
+            return self.objects.get(object_id)
 
-    def __contains__(self, job_id):
+    def __contains__(self, object_id):
         with self.lock:
-            return job_id in self.jobs
+            return object_id in self.objects

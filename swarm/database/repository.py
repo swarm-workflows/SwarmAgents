@@ -40,6 +40,7 @@ class Repository:
     KEY_PRE_PREPARE = "pre_prepare"
     KEY_PREPARE = "prepare"
     KEY_COMMIT = "commit"
+    KEY_METRICS = "metrics"
 
     def __init__(self, redis_client: redis.Redis):
         """
@@ -199,68 +200,3 @@ class Repository:
         keys = self.redis.scan_iter(f'{key_prefix}:*')
         for key in keys:
             self.redis.delete(key)
-
-    ################################
-    # PRE-PREPARE PHASE OPERATIONS #
-    ################################
-
-    def push_pre_prepare(self, job_id: str, cost: float, agent_id: int, level: int = 0, group: int = 0):
-        redis_key = f"{self.KEY_PRE_PREPARE}:{level}:{group}:{job_id}:{agent_id}"
-        self.redis.set(redis_key, round(float(cost), 2))
-
-    def get_pre_prepare(self, job_id: str, level: int = 0, group: int = 0) -> Dict[str, float]:
-        return self._get_votes(self.KEY_PRE_PREPARE, job_id, level, group)
-
-    def get_min_cost_agent_for_job(self, job_id: str, level: int = 0, group: int = 0) -> Tuple[Optional[int], float]:
-        job_costs = self.get_pre_prepare(job_id, level, group)
-        if not job_costs:
-            return None, float('inf')
-        min_agent = min(job_costs, key=job_costs.get)
-        return int(min_agent), job_costs[min_agent]
-
-    ##############################
-    # PREPARE PHASE OPERATIONS   #
-    ##############################
-
-    def push_prepare_vote(self, job_id: str, leader_agent_id: int, agent_id: int, level: int = 0, group: int = 0):
-        redis_key = f"{self.KEY_PREPARE}:{level}:{group}:{job_id}:{agent_id}"
-        self.redis.set(redis_key, leader_agent_id)
-
-    def get_prepare(self, job_id: str, level: int = 0, group: int = 0) -> Dict[str, int]:
-        return self._get_votes(self.KEY_PREPARE, job_id, level, group)
-
-    ##############################
-    # COMMIT PHASE OPERATIONS    #
-    ##############################
-
-    def push_commit_vote(self, job_id: str, leader_agent_id: int, agent_id: int, level: int = 0, group: int = 0):
-        redis_key = f"{self.KEY_COMMIT}:{level}:{group}:{job_id}:{agent_id}"
-        self.redis.set(redis_key, leader_agent_id)
-
-    def get_commit(self, job_id: str, level: int = 0, group: int = 0) -> Dict[str, int]:
-        return self._get_votes(self.KEY_COMMIT, job_id, level, group)
-
-    #####################
-    # INTERNAL UTILITIES #
-    #####################
-
-    def _get_votes(self, phase_prefix: str, job_id: str, level: int = 0, group: int = 0) -> Dict[str, Union[float, int]]:
-        pattern = f"{phase_prefix}:{level}:{group}:{job_id}:*"
-        keys = self.redis.scan_iter(pattern)
-        result = {}
-        for key in keys:
-            key_str = key
-            parts = key_str.split(":")
-            if len(parts) < 5:
-                continue
-            agent_id = parts[4]
-            raw_value = self.redis.get(key)
-            if raw_value is None:
-                continue
-            try:
-                decoded = raw_value
-                value = float(decoded) if phase_prefix == self.KEY_PRE_PREPARE else int(decoded)
-                result[agent_id] = value
-            except (ValueError, UnicodeDecodeError):
-                print(f"Invalid value for key {key_str}: {raw_value}")
-        return result

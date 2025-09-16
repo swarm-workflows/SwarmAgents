@@ -34,20 +34,9 @@ from typing import Tuple, Any, List
 import paramiko
 import redis
 
+from swarm.models.object import Object, ObjectState
 from swarm.models.capacities import Capacities
 from swarm.models.data_node import DataNode
-
-
-class JobState(enum.Enum):
-    PENDING = enum.auto()
-    PRE_PREPARE = enum.auto()
-    PREPARE = enum.auto()
-    COMMIT = enum.auto()
-    READY = enum.auto()
-    RUNNING = enum.auto()
-    IDLE = enum.auto()
-    COMPLETE = enum.auto()
-    FAILED = enum.auto()
 
 
 job = {
@@ -81,32 +70,29 @@ job = {
 }
 
 
-class Job:
+class Job(Object):
     OP_GET = "GET"
     OP_PUT = "PUT"
 
     def __init__(self, logger: logging.Logger = None):
-        self.job_id = None
+        super().__init__()
         self.capacities = None
         self.capacity_allocations = None
         self.execution_time = 0
         self.data_in = []
         self.data_out = []
-        self.state = JobState.PENDING
         self.status = 0
         self.data_in_time = 0
         self.data_out_time = 0
         self.prepares = 0
         self.commits = 0
         self.logger = logger if logger else logging.getLogger(self.__class__.__name__)
-        self.lock = threading.RLock()  # Lock for synchronization
         self.created_at = time.time()
         self.selection_started_at = None
         self.selected_by_agent_at = None
         self.scheduled_at = None
         self.completed_at = None
         self.leader_agent_id = None
-        self.time_last_state_change = 0
         self.no_op_count = 0
         self.job_type = None  # default until classified
 
@@ -142,13 +128,15 @@ class Job:
         with self.lock:
             self.leader_agent_id = leader_agent_id
 
-    def set_job_id(self, job_id: str):
+    @property
+    def job_id(self) -> str:
         with self.lock:
-            self.job_id = job_id
+            return self.object_id
 
-    def get_job_id(self) -> str:
+    @job_id.setter
+    def job_id(self, value):
         with self.lock:
-            return self.job_id
+            self.object_id = value
 
     def set_capacities(self, cap: Capacities) -> None:
         with self.lock:
@@ -185,12 +173,7 @@ class Job:
         with self.lock:
             return self.data_out.copy()
 
-    def set_state(self, state: JobState):
-        with self.lock:
-            self.state = state
-            self.time_last_state_change = time.time()
-
-    def get_state(self) -> JobState:
+    def get_state(self) -> ObjectState:
         return self.state
 
     def set_properties(self, **kwargs):
@@ -283,7 +266,7 @@ class Job:
     def execute(self, data_transfer: bool = True):
         try:
             self.logger.info(f"Starting execution for job: {self.job_id}")
-            self.change_state(new_state=JobState.RUNNING)
+            self.state = ObjectState.RUNNING
             # TODO: Transfer files from data_in nodes
 
             # Simulate job execution by sleeping for execution_time seconds
@@ -292,8 +275,7 @@ class Job:
             time.sleep(execution_time)
 
             # TODO: Transfer files from data_out nodes
-
-            self.change_state(new_state=JobState.COMPLETE)
+            self.state = ObjectState.COMPLETE
             self.logger.info(f"Completed execution for job: {self.job_id}")
         except Exception as e:
             self.logger.error(f"Error occurred while executing Task: {self.get_job_id()} e: {e}")
@@ -328,31 +310,17 @@ class Job:
         finally:
             ssh_client.close()
 
-    def is_pending(self):
-        return self.get_state() == JobState.PENDING
-
-    def is_running(self):
-        return self.get_state() == JobState.RUNNING
-
-    def is_ready(self):
-        return self.get_state() == JobState.READY
-
-    def is_commit(self):
-        return self.get_state() == JobState.COMMIT
-
-    def is_complete(self):
-        return self.get_state() == JobState.COMPLETE
-
-    def change_state(self, new_state: JobState):
-        self.logger.debug(f"Transitioning job {self.job_id} from {self.state} to {new_state}")
-        self.set_state(state=new_state)
-        if new_state in [JobState.PRE_PREPARE, JobState.PREPARE]:
+    def on_state_changed(self, old_state, new_state):
+        self.logger.debug(
+            f"Transitioning job {self.job_id} from {old_state} to {new_state}"
+        )
+        if new_state in (ObjectState.PRE_PREPARE, ObjectState.PREPARE):
             self.set_selection_start_time()
-        elif new_state in [JobState.READY]:
+        elif new_state is ObjectState.READY:
             self.set_selection_end_time()
-        elif new_state == JobState.RUNNING:
+        elif new_state is ObjectState.RUNNING:
             self.set_scheduled_time()
-        elif new_state == JobState.COMPLETE:
+        elif new_state is ObjectState.COMPLETE:
             self.set_completed_time()
 
     def to_dict(self):
@@ -386,7 +354,7 @@ class Job:
         self.execution_time = job_data['execution_time']
         self.data_in = [DataNode.from_dict(data_in) for data_in in job_data['data_in']]
         self.data_out = [DataNode.from_dict(data_out) for data_out in job_data['data_out']]
-        self.state = JobState(job_data['state']) if job_data.get('state') else JobState.PENDING
+        self.state = ObjectState(job_data['state']) if job_data.get('state') else ObjectState.PENDING
         self.status = job_data['status'] if job_data.get('status') else 0
         self.data_in_time = job_data['data_in_time'] if job_data.get('data_in_time') is not None else None
         self.data_out_time = job_data['data_out_time'] if job_data.get('data_out_time') is not None else None

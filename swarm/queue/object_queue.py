@@ -23,39 +23,31 @@
 # Author: Komal Thareja(kthare10@renci.org)
 from abc import ABC, abstractmethod
 
-from swarm.models.capacities import Capacities
-from swarm.models.job import JobState, Job
+from swarm.models.object import ObjectState, Object
 
 
-class JobQueue(ABC):
+class ObjectQueue(ABC):
     @abstractmethod
-    def get_jobs(self, states: list[JobState] = None) -> list[Job]:
+    def gets(self, states: list[ObjectState] = None) -> list[Object]:
         pass
 
     @abstractmethod
-    def add_job(self, job: Job):
+    def add(self, object: Object):
         pass
 
     @abstractmethod
-    def remove_job(self, job_id: str):
+    def remove(self, object_id: str):
         pass
 
     @abstractmethod
-    def update_job(self, job: Job):
-        pass
-
-    @staticmethod
-    def capacities(jobs: list[Job]):
-        allocated_caps = Capacities()
-        for t in jobs:
-            allocated_caps += t.get_capacities()
-        return allocated_caps
-
-    @abstractmethod
-    def get_job(self, job_id: str) -> Job:
+    def update(self, object: Object):
         pass
 
     @abstractmethod
-    def __contains__(self, job_id: str):
+    def get(self, object_id: str) -> Object:
+        pass
+
+    @abstractmethod
+    def __contains__(self, object_id: str):
         pass
 

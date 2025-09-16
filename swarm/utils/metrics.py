@@ -3,7 +3,7 @@ import json
 import time
 from typing import Any
 
-from swarm.models.job import Job, JobState
+from swarm.models.job import Job, ObjectState
 
 
 class Metrics:
@@ -54,7 +54,7 @@ class Metrics:
             leader_id = getattr(job, "leader_agent_id", None)
             if leader_id is None:
                 continue
-            if job.state not in [JobState.READY, JobState.RUNNING, JobState.COMPLETE]:
+            if job.state not in [ObjectState.READY, ObjectState.RUNNING, ObjectState.COMPLETE]:
                 continue
 
             # Store all in one row

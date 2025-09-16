@@ -66,7 +66,7 @@ def main():
     ap.add_argument("--check-interval", type=float, default=5)
     ap.add_argument("--grace-seconds", type=int, default=30)
     ap.add_argument("--max-misses", type=int, default=10)
-    ap.add_argument("--wait-port-regex", default=r":50[0-9]{3}\b", help="Regex to detect sockets to avoid (default matches :50000–:50999 etc.)")
+    ap.add_argument("--wait-port-regex", default=r":20[0-9]{3}\b", help="Regex to detect sockets to avoid (default matches :20000–:20999 etc.)")
     ap.add_argument("--wait-timeout", type=int, default=120, help="Max seconds to wait for ports to clear between runs")
     ap.add_argument("--wait-interval", type=float, default=2.0, help="Polling interval while waiting for ports to clear")
     ap.add_argument("--tar-after", action="store_true", help="Tar.gz each run directory after completion")

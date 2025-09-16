@@ -22,6 +22,7 @@
 #
 # Author: Komal Thareja(kthare10@renci.org)
 import logging
+import traceback
 from typing import Any
 
 from swarm.comm.grpc_client import GrpcClientManager
@@ -55,18 +56,22 @@ class MessageServiceGrpc(Observer):
         self.server.stop()
         self.server.wait_for_termination()
 
-    def produce_message(self, json_message: dict, topic: str = None, src: int = None,
-                        dest: int = None, fwd: int = None):
-        host, port = topic.split(":")
+    def send(self, json_message: dict, destination: str = None, src: int = None,
+             dest: int = None, fwd: int = None):
+        try:
+            host, port = destination.split(":")
 
-        sender = src
-        if fwd:
             sender = src
-        self.client.send_consensus_message(host=host,
-                                           port=port,
-                                           message_dict={
-                                               "sender_id": str(sender),
-                                               "receiver_id": str(dest),
-                                               "message_type": "consensus",
-                                               "payload": json_message
-                                           })
+            if fwd:
+                sender = src
+            self.client.send_consensus_message(host=host,
+                                               port=port,
+                                               message_dict={
+                                                   "sender_id": str(sender),
+                                                   "receiver_id": str(dest),
+                                                   "message_type": "consensus",
+                                                   "payload": json_message
+                                               })
+        except Exception as e:
+            self.logger.error(e)
+            self.logger.error(traceback.format_exc())

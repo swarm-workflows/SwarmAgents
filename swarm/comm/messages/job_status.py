@@ -55,8 +55,8 @@ class JobStatus(Message):
 
 
 if __name__ == '__main__':
-    from swarm.models.job import JobState
-    t_info = JobInfo(job_id="t1", state=JobState.FAILED)
+    from swarm.models.job import ObjectState
+    t_info = JobInfo(job_id="t1", state=ObjectState.FAILED)
     print(t_info)
     print(t_info.to_dict())
     job_status = JobStatus(jobs=[t_info])
