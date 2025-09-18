@@ -69,10 +69,10 @@ class ConsensusEngine:
                 proposals.append(proposal)
                 if msg.agents[0].agent_id not in proposal.prepares:
                     proposal.prepares.append(msg.agents[0].agent_id)
-                #self.incoming.add_proposal(proposal)
-                object.state = ObjectState.PREPARE
-            if not self.incoming.contains(p_id=proposal.p_id, object_id=object.object_id):
                 self.incoming.add_proposal(proposal)
+                object.state = ObjectState.PREPARE
+            #if not self.incoming.contains(p_id=proposal.p_id, object_id=object.object_id):
+            #    self.incoming.add_proposal(proposal)
 
         # respond with PREPARE
         if len(proposals):
@@ -103,10 +103,10 @@ class ConsensusEngine:
             # New proposal
             else:
                 proposal = p
-                #self.incoming.add_proposal(proposal=proposal)
+                self.incoming.add_proposal(proposal=proposal)
 
-            if not self.incoming.contains(p_id=proposal.p_id, object_id=object.object_id):
-                self.incoming.add_proposal(proposal)
+            #if not self.incoming.contains(p_id=proposal.p_id, object_id=object.object_id):
+            #    self.incoming.add_proposal(proposal)
 
             if msg.agents[0].agent_id not in p.prepares:
                 proposal.prepares.append(msg.agents[0].agent_id)
@@ -151,9 +151,9 @@ class ConsensusEngine:
             # New proposal
             else:
                 proposal = p
-                #self.incoming.add_proposal(proposal=proposal)
-            if not self.incoming.contains(p_id=proposal.p_id, object_id=object.object_id):
-                self.incoming.add_proposal(proposal)
+                self.incoming.add_proposal(proposal=proposal)
+            #if not self.incoming.contains(p_id=proposal.p_id, object_id=object.object_id):
+            #    self.incoming.add_proposal(proposal)
 
             if msg.agents[0].agent_id not in proposal.commits:
                 proposal.commits.append(msg.agents[0].agent_id)

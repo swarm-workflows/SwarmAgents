@@ -203,13 +203,13 @@ class ResourceAgent(Agent):
 
         return round((core + ram + disk) / 3, 2)
 
-    def __receive_proposal(self, incoming: Proposal):
+    def __on_proposal(self, incoming: Proposal):
         self.engine.on_proposal(incoming)
 
-    def __receive_prepare(self, incoming: Prepare):
+    def __on_prepare(self, incoming: Prepare):
         self.engine.on_prepare(incoming)
 
-    def __receive_commit(self, incoming: Commit):
+    def __on_commit(self, incoming: Commit):
         self.engine.on_commit(incoming)
 
     def _process(self, messages: list[dict]):
@@ -221,13 +221,13 @@ class ResourceAgent(Agent):
                 if not self.should_process(msg=incoming):
                     continue
                 if isinstance(incoming, Prepare):
-                    self.__receive_prepare(incoming=incoming)
+                    self.__on_prepare(incoming=incoming)
 
                 elif isinstance(incoming, Commit):
-                    self.__receive_commit(incoming=incoming)
+                    self.__on_commit(incoming=incoming)
 
                 elif isinstance(incoming, Proposal):
-                    self.__receive_proposal(incoming=incoming)
+                    self.__on_proposal(incoming=incoming)
 
                 else:
                     self.logger.info(f"Ignoring unsupported message: {message}")
@@ -274,6 +274,8 @@ class ResourceAgent(Agent):
                 job_id = job.job_id
                 self.metrics.restarts[job_id] = self.metrics.restarts.get(job_id, 0) + 1
 
+                # TODO restart selection for jobs which were assigned to neighbor which just went down
+
     def _refresh_neighbors(self, current_time: float):
         """
         Refresh the neighbor agent map by retrieving peer agents at the same level from Redis
@@ -288,6 +290,25 @@ class ResourceAgent(Agent):
             level=self.topology.level,
             groups=[self.topology.group]
         )
+
+        '''
+        current_endpoints: set[tuple[str, int]] = set()
+        for agent_info in self.neighbor_map.values():
+            key = (agent_info.host, agent_info.port)
+            current_endpoints.add(key)
+
+            # If the endpoint is new or the agent behind it changed, update it
+            # (setdefault wouldn't update an existing mismatched mapping)
+            peer_id, is_up = self.peer_by_endpoint.get(key, (None, None))
+            if peer_id is None:
+                self.peer_by_endpoint.set(key, (agent_info.agent_id, True))
+
+        
+        # 4) Prune endpoints that no longer exist
+        to_delete = [k for k in self.peer_by_endpoint.keys() if k not in current_endpoints]
+        for k in to_delete:
+            self.peer_by_endpoint.pop(k, None)
+        '''
 
     def _refresh_children(self, current_time: float):
         """
@@ -338,15 +359,71 @@ class ResourceAgent(Agent):
             )
             for agent_data in agent_dicts:
                 agent = AgentInfo.from_dict(agent_data)
-                #if agent.agent_id and agent.agent_id != self.agent_id:
                 existing = target_dict.get(agent.agent_id)
                 if existing is None or agent.last_updated > existing.last_updated:
                     target_dict.set(agent.agent_id, agent)
                 active_ids.add(agent.agent_id)
 
+    '''
+    def _refresh_agent_map(
+            self,
+            current_time: float,
+            target_dict: "ThreadSafeDict[int, AgentInfo]",
+            level: int,
+            groups: list[int],
+    ):
+        """
+        Refresh target agent map (neighbors/children) from the repository.
+
+        - Only add/refresh peers that are UP (per peer_by_endpoint).
+        - Remove peers that are stale or marked DOWN.
+        - Do not re-add DOWN peers even if they appear in the repository.
+        """
+        active_ids: set[int] = set()
+
+        # --- Add or refresh entries from repository (but only if transport is UP) ---
+        for group in groups:
+            agent_dicts = self.repository.get_all_objects(
+                key_prefix=Repository.KEY_AGENT,
+                level=level,
+                group=group,
+            )
+            for agent_data in agent_dicts:
+                agent = AgentInfo.from_dict(agent_data)
+
+                # Check transport/health by endpoint
+                peer_id, is_up = self._get_peer_state_for_endpoint(agent.host, agent.port)
+
+                # If we have a known entry for this endpoint and it's DOWN, skip adding/updating
+                if peer_id is not None and is_up is False:
+                    # If it already exists in the map, proactively evict it so it doesn't linger
+                    if target_dict.get(agent.agent_id) is not None:
+                        target_dict.remove(agent.agent_id)
+                    # Do NOT mark as active; we want it removable in the cleanup phase
+                    continue
+
+                # OK to insert/update (unknown endpoints or known-UP endpoints)
+                existing = target_dict.get(agent.agent_id)
+                if existing is None or (agent.last_updated or 0) > (existing.last_updated or 0):
+                    target_dict.set(agent.agent_id, agent)
+
+                # Count as active only if we actually accepted it
+                active_ids.add(agent.agent_id)
+
+        # --- Evict stale or DOWN entries ---
         for agent_id, agent in list(target_dict.items()):
-            if agent_id not in active_ids and (current_time - agent.last_updated) >= self.peer_expiry_seconds:
+            # Evaluate staleness
+            is_stale = (current_time - (agent.last_updated or 0)) >= self.peer_expiry_seconds
+
+            # Evaluate transport down by endpoint (fixes the original bug: look up by endpoint)
+            peer_id, is_up = self._get_peer_state_for_endpoint(agent.host, agent.port)
+            is_down = (peer_id is not None and is_up is False)
+
+            # Remove if not seen as active this cycle, or stale, or reported DOWN
+            if (agent_id not in active_ids) or is_stale or is_down:
                 target_dict.remove(agent_id)
+                
+    '''
 
     def _generate_agent_info(self) -> AgentInfo:
         """
@@ -416,41 +493,31 @@ class ResourceAgent(Agent):
 
         return agent_info
 
-    def _do_periodic(self):
-        while not self.shutdown:
-            try:
-                self._restart_selection()
-                current_time = int(time.time())
-                self._refresh_children(int(current_time))
-                agent_info = self._generate_agent_info()
-                self.repository.save(agent_info.to_dict(), key_prefix=Repository.KEY_AGENT, level=self.topology.level,
-                                     group=self.topology.group)
+    def on_periodic(self):
+        self._restart_selection()
+        current_time = int(time.time())
+        self._refresh_children(int(current_time))
+        agent_info = self._generate_agent_info()
+        self.repository.save(agent_info.to_dict(), key_prefix=Repository.KEY_AGENT, level=self.topology.level,
+                             group=self.topology.group)
 
-                self._refresh_neighbors(current_time=current_time)
+        self._refresh_neighbors(current_time=current_time)
 
-                # Batch update job sets
-                for prefix, update_fn, state in [
-                    (Repository.KEY_JOB, self._update_pending_jobs, ObjectState.PENDING.value),
-                    (Repository.KEY_JOB, self._update_ready_jobs, ObjectState.READY.value),
-                    (Repository.KEY_JOB, self._update_completed_jobs, ObjectState.COMPLETE.value),
-                ]:
-                    jobs = self.repository.get_all_ids(key_prefix=prefix, level=self.topology.level,
-                                                       group=self.topology.group, state=state)
-                    update_fn(jobs=jobs)
+        # Batch update job sets
+        for prefix, update_fn, state in [
+            (Repository.KEY_JOB, self._update_pending_jobs, ObjectState.PENDING.value),
+            (Repository.KEY_JOB, self._update_ready_jobs, ObjectState.READY.value),
+            (Repository.KEY_JOB, self._update_completed_jobs, ObjectState.COMPLETE.value),
+        ]:
+            jobs = self.repository.get_all_ids(key_prefix=prefix, level=self.topology.level,
+                                               group=self.topology.group, state=state)
+            update_fn(jobs=jobs)
 
-                time.sleep(0.5)
+        if self.debug:
+            self.save_consensus_votes()
+        self.save_neighbors()
 
-                if self.debug:
-                    self.save_consensus_votes()
-
-                self.check_queue()
-                if self.should_shutdown():
-                    print("[SHUTDOWN] Queue has been empty for too long. Triggering shutdown.")
-                    break
-            except Exception as e:
-                self.logger.error(f"Periodic update error: {e}\n{traceback.format_exc()}")
-
-        self.stop()
+        self.check_queue()
 
     def is_job_feasible(self, job: Job, agent: AgentInfo) -> bool:
         """
@@ -842,6 +909,28 @@ class ResourceAgent(Agent):
         }
         self.repository.save(obj=agent_metrics, key=f"{Repository.KEY_METRICS}:{self.agent_id}")
         self.logger.info("Results saved")
+
+    def save_neighbors(self):
+        try:
+            neighbors = []
+            for neighbor in self.neighbor_map.values():
+                neighbors.append(neighbor.to_dict())
+            entry = {
+                "agent_id": self.agent_id,
+                "neighbors": neighbors,
+                "timestamp": time.time(),
+            }
+            self.repository.save(obj=entry,
+                    key=f"peers:{self.agent_id}",
+                    level=self.topology.level,
+                    group=self.topology.group,
+                )
+
+            self.logger.debug(f"Saved neighbors for {self.agent_id}")
+
+        except Exception as e:
+            # Never let debugging persist crash the agent loop
+            self.logger.error(f"save_neighbors failed: {e}", exc_info=True)
 
     def save_consensus_votes(self):
         """

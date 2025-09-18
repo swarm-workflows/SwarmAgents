@@ -1,7 +1,7 @@
 # MIT License
 #
 # Copyright (c) 2024 swarm-workflows
-
+#
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
 # in the Software without restriction, including without limitation the rights
@@ -11,6 +11,7 @@
 #
 # The above copyright notice and this permission notice shall be included in all
 # copies or substantial portions of the Software.
+from fontTools.misc.timeTools import DAYNAMES
 
 # THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 # IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
@@ -30,42 +31,52 @@ class DataNode(JSONField):
     from JSON dictionaries of properties. Only ints are allowed.
     """
     def __init__(self, **kwargs):
-        self.name = None
-        self.file = None
-        self.ip = None
-        self.user = None
-        self.connectivity_score = 0.0
+        self._name = None
+        self._file = None
+        self._ip = None
+        self._user = None
+        self._connectivity_score = 0.0
         self._set_fields(**kwargs)
 
-    def get_ip(self) -> str:
-        return self.ip
+    @property
+    def name(self) -> str:
+        return self._name
 
-    def set_ip(self, ip):
-        self.ip = ip
+    @name.setter
+    def name(self, name: str):
+        self._name = name
 
-    def get_user(self) -> str:
-        return self.user
+    @property
+    def file(self):
+        return self._file
 
-    def set_user(self, user):
-        self.user = user
+    @file.setter
+    def file(self, file: str):
+        self._file = file
 
-    def get_connectivity_score(self) -> float:
-        return self.connectivity_score
+    @property
+    def ip(self):
+        return self._ip
 
-    def set_connectivity_score(self, connectivity_score):
-        self.connectivity_score = connectivity_score
+    @ip.setter
+    def ip(self, ip: str):
+        self._ip = ip
 
-    def get_dtn(self) -> str:
-        return self.dtn
+    @property
+    def user(self):
+        return self._user
 
-    def set_dtn(self, dtn):
-        self.dtn = dtn
+    @user.setter
+    def user(self, user: str):
+        self._user = user
 
-    def get_file(self) -> str:
-        return self.file
+    @property
+    def connectivity_score(self):
+        return self._connectivity_score
 
-    def set_file(self, remote_file):
-        self.file = remote_file
+    @connectivity_score.setter
+    def connectivity_score(self, connectivity_score: float):
+        self._connectivity_score = connectivity_score
 
     def _set_fields(self, forgiving=False, **kwargs):
         """
@@ -81,7 +92,7 @@ class DataNode(JSONField):
                 self.__getattribute__(k)
                 self.__setattr__(k, v)
             except AttributeError:
-                report = f"Unable to set field {k} of capacity, no such field available "\
+                report = f"Unable to set field {k} of data_node, no such field available "\
                        f"{[k for k in self.__dict__.keys()]}"
                 if forgiving:
                     print(report)
@@ -92,8 +103,17 @@ class DataNode(JSONField):
 
 class DataNodeException(Exception):
     """
-    Exception with a capacity
+    Exception with a DataNodeException
     """
     def __init__(self, msg: str):
         assert msg is not None
         super().__init__(f"DataNode exception: {msg}")
+
+
+if __name__ == "__main__":
+    json_dtn = {"name": "dtn7", "ip": "192.168.100.7", "user": "dtn_user7", "connectivity_score": 0.64}
+    #dtn = DataNode(**json_dtn)
+    dtn = DataNode().from_dict(json_dtn)
+    print(dtn)
+    print(dtn.to_dict())
+    print(dtn.to_json())

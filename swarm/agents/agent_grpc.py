@@ -43,6 +43,7 @@ from swarm.models.agent_info import AgentInfo
 from swarm.utils.thread_safe_dict import ThreadSafeDict
 from swarm.topology.topology import Topology, TopologyType
 from swarm.utils.iterable_queue import IterableQueue
+from swarm.utils.utils import normalize_host
 
 
 class Agent(Observer):
@@ -52,7 +53,7 @@ class Agent(Observer):
         self.neighbor_map = ThreadSafeDict[int, AgentInfo]()
         self.children = ThreadSafeDict[int, AgentInfo]()
         self.parents = ThreadSafeDict[int, AgentInfo]()
-        self.peer_by_endpoint = ThreadSafeDict[(str, int), int]()
+        self.peer_by_endpoint = ThreadSafeDict[(str, int), (int, bool)]()
 
         with open(config_file, 'r') as f:
             self.config = yaml.safe_load(f)
@@ -79,7 +80,7 @@ class Agent(Observer):
 
         self.threads = {
             "periodic": threading.Thread(target=self._do_periodic, daemon=True),
-            "inbound": threading.Thread(target=self._process_messages, daemon=True),
+            "inbound": threading.Thread(target=self._do_inbound, daemon=True),
         }
         self.last_non_empty_time = time.time()
 
@@ -90,7 +91,6 @@ class Agent(Observer):
     @property
     def live_agent_count(self) -> int:
         """Returns the count of all known agents including self."""
-        #return 1 + len(self.neighbor_map)
         return len(self.neighbor_map)
 
     @property
@@ -163,11 +163,24 @@ class Agent(Observer):
     def on_shutdown(self):
         pass
 
-    @abstractmethod
     def _do_periodic(self):
+        while not self.shutdown:
+            try:
+                self.on_periodic()
+
+                time.sleep(0.5)
+                if self.should_shutdown():
+                    print("[SHUTDOWN] Queue has been empty for too long. Triggering shutdown.")
+                    break
+            except Exception as e:
+                self.logger.error(f"Periodic update error: {e}\n{traceback.format_exc()}")
+
+        self.stop()
+
+    def on_periodic(self):
         pass
 
-    def _process_messages(self):
+    def _do_inbound(self):
         self.logger.info("Inbound Message Handler - Start")
         while not self.shutdown:
             try:
@@ -247,51 +260,21 @@ class Agent(Observer):
         """Called by GrpcClient/ChannelPool when a channel moves UP/DOWN."""
         if not up:
             self.logger.info(f"Peer {target} health {up} reason {reason}")
-        '''
-        try:
-            host, port_s = target.rsplit(":", 1)
-            host = normalize_host(host)
-            port = int(port_s)
-        except Exception:
-            self.logger.warning("on_peer_status: bad target %r", target)
-        else:
-            with self._peer_lock:
-                pid = self.peer_by_endpoint.get((host, port))
+            '''
+            try:
+                host, port_s = target.rsplit(":", 1)
+                host = normalize_host(host)
+                port = int(port_s)
+                peer_id, transport_state = self._get_peer_state_for_endpoint(host, port)
+                if peer_id is not None:
+                    self.peer_by_endpoint.set((host, port), (peer_id, up))
+            except Exception:
+                self.logger.warning("on_peer_status: bad target %r", target)
+            '''
 
-            if pid is None:
-                # Endpoint is not known anymore; likely neighbor_map update already moved it.
-                self.logger.debug("on_peer_status: ignoring unknown endpoint %s", target)
-                return
-
-            with self._peer_lock:
-                st = self.peer_state.get(pid)
-                if not st:
-                    # peer removed
-                    return
-                if st["up"] == up:
-                    return  # no change
-                st["up"] = up
-                st["last_change"] = time.time()
-
-            if up:
-                self.logger.info("Peer %s (%s) is UP (%s)", pid, target, reason)
-                # Drain buffered messages
-                drained = 0
-                while True:
-                    with self._peer_lock:
-                        if not st["retry_q"]:
-                            break
-                        msg, src, fwd = st["retry_q"].popleft()
-                    try:
-                        self._send_to_peer(pid, msg, src=src, fwd=fwd)
-                        drained += 1
-                    except Exception as e:
-                        with self._peer_lock:
-                            st["retry_q"].appendleft((msg, src, fwd))
-                        self.logger.warning("Drain to peer %s failed (%s); stopping drain", pid, e)
-                        break
-                if drained:
-                    self.logger.info("Drained %d buffered message(s) to peer %s", drained, pid)
-            else:
-                self.logger.warning("Peer %s (%s) is DOWN (%s)", pid, target, reason)
-        '''
+    def _get_peer_state_for_endpoint(self, host: str, port: int):
+        """
+        Returns (agent_id, is_up) for a given endpoint, or (None, None) if unknown.
+        Expect self.peer_by_endpoint to be keyed by (host, port) -> (agent_id, is_up_bool)
+        """
+        return self.peer_by_endpoint.get((host, port), (None, None))
