@@ -27,7 +27,7 @@ from typing import Any
 
 class Observer(ABC):
     @abstractmethod
-    def dispatch_message(self, message: Any):
+    def on_message(self, message: Any):
         """
         Process incoming message
         :param message:

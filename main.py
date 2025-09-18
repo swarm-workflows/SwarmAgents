@@ -37,6 +37,7 @@ if __name__ == '__main__':
     config_file = f"./configs/config_swarm_multi_{agent_id}.yml"
 
     from swarm.agents.resource_agent import ResourceAgent
+    #from swarm.agents.resource_agent_v1 import ResourceAgent
     agent = ResourceAgent(agent_id=agent_id, config_file=config_file, debug=debug)
 
     agent.start()

@@ -1,19 +1,12 @@
 # consensus/engine.py
-from typing import Dict, Set, Optional
-from dataclasses import dataclass, field
 from swarm.models.proposal_info import ProposalContainer, ProposalInfo
-from swarm.comm.messages.proposal import Proposal
-from swarm.comm.messages.prepare import Prepare
-from swarm.comm.messages.commit import Commit
-from .interfaces import ConsensusHost, ConsensusTransport
+from swarm.messages.proposal import Proposal
+from swarm.messages.prepare import Prepare
+from swarm.messages.commit import Commit
+from .interfaces import ConsensusHost, ConsensusTransport, TopologyRouter
+from ..models.agent_info import AgentInfo
 from ..models.object import ObjectState
 
-
-@dataclass
-class ProposalState:
-    proposal: ProposalInfo
-    prepares: Set[int] = field(default_factory=set)
-    commits: Set[int]  = field(default_factory=set)
 
 class ConsensusEngine:
     """
@@ -21,39 +14,37 @@ class ConsensusEngine:
     - framework-agnostic (no direct Agent dependencies)
     - uses host+transport callbacks for I/O and side effects
     """
-    def __init__(self, agent_id: int, host: ConsensusHost, transport: ConsensusTransport):
+    def __init__(self, agent_id: int, host: ConsensusHost, transport: ConsensusTransport,
+                 router: TopologyRouter):
         self.agent_id = agent_id
         self.host = host
         self.transport = transport
+        self.router = router
 
         # Local state
         self.outgoing = ProposalContainer()  # proposals initiated by me
         self.incoming = ProposalContainer()  # proposals initiated by peers
-        self._states: Dict[tuple[str, str], ProposalState] = {}  # (job_id, p_id) -> state
         self.conflicts = {}
 
     # ---------- API exposed to the agent/framework ----------
-    def propose(self, object_id: str, p: Proposal) -> None:
-        for proposal in p.proposals:
-            key = (object_id, proposal.p_id)
-            self._states[key] = ProposalState(proposal=proposal)
-            self.outgoing.add_proposal(proposal)
+    def propose(self, proposals: list[ProposalInfo]) -> None:
         # send PROPOSAL to peers
-        self.transport.broadcast(p, include_self=False)
+        msg = Proposal(source=self.agent_id,
+                       agents=[AgentInfo(agent_id=self.agent_id)],
+                       proposals=proposals)
+        self.transport.broadcast(payload=msg)
+        for proposal in proposals:
+            self.outgoing.add_proposal(proposal)
 
-    def on_proposal(self, incoming: Proposal) -> None:
+    def on_proposal(self, msg: Proposal) -> None:
         proposals = []
-        for proposal in incoming.proposals:
+        for proposal in msg.proposals:
             object = self.host.get_object(proposal.object_id)
-            if not object or self.host.has_object_action_completed(object.object_id):
-                self.host.log_debug(f"Skip proposal {proposal.p_id} (missing or complete)")
+            if not object or self.host.is_agreement_achieved(object.object_id):
+                self.host.log_debug(f"Skip proposal {proposal.p_id} for {proposal.object_id} (missing or complete)")
+                self.outgoing.remove_object(object_id=proposal.object_id)
+                self.incoming.remove_object(object_id=proposal.object_id)
                 continue
-
-            key = (object.object_id, proposal.p_id)
-            state = self._states.get(key)
-            if not state:
-                state = self._states[key] = ProposalState(proposal=proposal)
-                self.incoming.add_proposal(proposal)
 
             # Basic dominance check using your existing helpers
             my_better = self.outgoing.has_better_proposal(proposal)
@@ -75,59 +66,111 @@ class ConsensusEngine:
                     self.host.log_debug(f"Removed peer Proposal: {peer_better} in favor of incoming proposal {proposal}")
                     self.incoming.remove_proposal(p_id=peer_better.p_id, object_id=object.object_id)
 
-                if incoming.agents[0].agent_id not in proposal.prepares:
-                    proposal.prepares.append(incoming.agents[0].agent_id)
-                self.incoming.add_proposal(proposal=proposal)
+                proposals.append(proposal)
+                if msg.agents[0].agent_id not in proposal.prepares:
+                    proposal.prepares.append(msg.agents[0].agent_id)
+                #self.incoming.add_proposal(proposal)
                 object.state = ObjectState.PREPARE
+            if not self.incoming.contains(p_id=proposal.p_id, object_id=object.object_id):
+                self.incoming.add_proposal(proposal)
 
-            # respond with PREPARE
-            prepare = Prepare(source=self.agent_id, agents=[incoming.agents[0]], proposals=[incoming])
-            self.transport.broadcast(prepare, include_self=False)
+        # respond with PREPARE
+        if len(proposals):
+            prepare = Prepare(source=self.agent_id,
+                              agents=[AgentInfo(agent_id=self.agent_id)],
+                              proposals=proposals)
+            self.transport.broadcast(prepare)
+
+        if self.router.should_forward():
+            self.transport.broadcast(payload=msg)
 
     def on_prepare(self, msg: Prepare) -> None:
+        proposals = []
         for p in msg.proposals:
-            key = (p.object_id, p.p_id)
-            state = self._states.get(key)
-            if not state:
-                state = self._states[key] = ProposalState(proposal=p)
-                self.incoming.add_proposal(p)
+            object = self.host.get_object(p.object_id)
+            if not object or self.host.is_agreement_achieved(object.object_id):
+                self.host.log_debug(f"Skip proposal {p.p_id}/{p.object_id} (missing or complete)")
+                self.outgoing.remove_object(object_id=p.object_id)
+                self.incoming.remove_object(object_id=p.object_id)
+                continue
 
-            # mark prepare
-            sender = msg.agents[0].agent_id
-            if sender not in state.prepares:
-                state.prepares.add(sender)
+            # I have sent this proposal
+            if self.outgoing.contains(object_id=p.object_id, p_id=p.p_id):
+                proposal = self.outgoing.get_proposal(p_id=p.p_id)
+            # Received this proposal
+            elif self.incoming.contains(object_id=p.object_id, p_id=p.p_id):
+                proposal = self.incoming.get_proposal(p_id=p.p_id)
+            # New proposal
+            else:
+                proposal = p
+                #self.incoming.add_proposal(proposal=proposal)
 
-            # forward if needed (ring/star), omitted here
+            if not self.incoming.contains(p_id=proposal.p_id, object_id=object.object_id):
+                self.incoming.add_proposal(proposal)
 
-            # when enough prepares, issue COMMIT
-            if len(state.prepares) >= self.host.calculate_quorum():
-                commit = Commit(source=self.agent_id, agents=msg.agents, proposals=[p])
-                self.transport.broadcast(commit, include_self=False)
+            if msg.agents[0].agent_id not in p.prepares:
+                proposal.prepares.append(msg.agents[0].agent_id)
+
+            # Commit has already been triggered
+            if object.is_commit:
+                continue
+
+            quorum_count = self.host.calculate_quorum()
+            object.state = ObjectState.PREPARE
+
+            if len(proposal.prepares) >= quorum_count:
+                self.host.log_debug(f"Object: {p.object_id} Agent: {self.agent_id} received quorum "
+                                  f"prepares: {p.prepares}, starting commit!")
+
+                # Increment the number of commits to count the commit being sent
+                proposals.append(proposal)
+                object.state = ObjectState.COMMIT
+
+        if len(proposals):
+            commit = Commit(source=self.agent_id, agents=[AgentInfo(agent_id=self.agent_id)], proposals=proposals)
+            self.transport.broadcast(payload=commit)
+
+        if self.router.should_forward():
+            self.transport.broadcast(payload=msg)
 
     def on_commit(self, msg: Commit) -> None:
         for p in msg.proposals:
-            key = (p.object_id, p.p_id)
-            state = self._states.get(key)
-            if not state:
-                state = self._states[key] = ProposalState(proposal=p)
-                self.incoming.add_proposal(p)
+            object = self.host.get_object(p.object_id)
+            if not object or self.host.is_agreement_achieved(object.object_id):
+                self.host.log_debug(f"Skip proposal {p.p_id}/{p.object_id} (missing or complete)")
+                self.outgoing.remove_object(object_id=p.object_id)
+                self.incoming.remove_object(object_id=p.object_id)
+                continue
 
-            sender = msg.agents[0].agent_id
-            if sender not in state.commits:
-                state.commits.add(sender)
+            # I have sent this proposal
+            if self.outgoing.contains(object_id=p.object_id, p_id=p.p_id):
+                proposal = self.outgoing.get_proposal(p_id=p.p_id)
+            # Received this proposal
+            elif self.incoming.contains(object_id=p.object_id, p_id=p.p_id):
+                proposal = self.incoming.get_proposal(p_id=p.p_id)
+            # New proposal
+            else:
+                proposal = p
+                #self.incoming.add_proposal(proposal=proposal)
+            if not self.incoming.contains(p_id=proposal.p_id, object_id=object.object_id):
+                self.incoming.add_proposal(proposal)
+
+            if msg.agents[0].agent_id not in proposal.commits:
+                proposal.commits.append(msg.agents[0].agent_id)
 
             quorum = self.host.calculate_quorum()
-            if len(state.commits) >= quorum:
+            if len(proposal.commits) >= quorum:
                 # leader vs participant path
-                job = self.host.get_object(p.object_id)
-                if not job:
-                    continue
-                if p.agent_id == self.agent_id and self.outgoing.contains(object_id=p.object_id, p_id=p.p_id):
+                if proposal.agent_id == self.agent_id and self.outgoing.contains(object_id=proposal.object_id, p_id=proposal.p_id):
                     # I am leader, do selection
-                    self.host.log_info(f"[CON_LEADER] Job:{p.object_id} Leader:{self.agent_id} p:{p.p_id}")
-                    self.host.on_leader_elected(job, p.p_id)
-                    self.outgoing.remove_object(object_id=p.object_id)
+                    object.leader_id = proposal.agent_id
+                    self.host.log_info(f"[CON_LEADER] Object:{proposal.object_id} Leader:{self.agent_id} p:{proposal.p_id}")
+                    self.host.on_leader_elected(object, proposal.p_id)
                 else:
-                    self.host.log_info(f"[CON_PART] Job:{p.object_id} Leader:{p.agent_id} p:{p.p_id}")
-                    self.host.on_participant_commit(job, p.agent_id, p.p_id)
-                    self.incoming.remove_object(object_id=p.object_id)
+                    self.host.log_info(f"[CON_PART] Object:{proposal.object_id} Leader:{proposal.agent_id} p:{proposal.p_id}")
+                    self.host.on_participant_commit(object, msg.agents[0].agent_id, proposal.p_id)
+                self.outgoing.remove_object(object_id=proposal.object_id)
+                self.incoming.remove_object(object_id=proposal.object_id)
+
+        if self.router.should_forward():
+            self.transport.broadcast(payload=msg)

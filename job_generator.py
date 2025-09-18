@@ -64,7 +64,7 @@ class JobGenerator:
         ensuring requirements fit within a randomly selected agent's profile.
         """
         job_id = str(x)
-        status = random.choice([0, -1])
+        exit_status = random.choice([0, -1])
 
         # Choose a random agent profile
         agent_id = random.choice(list(self.agent_profiles.keys()))
@@ -107,7 +107,7 @@ class JobGenerator:
             'capacities': {'core': core, 'ram': ram, 'disk': disk, 'gpu': gpu},
             'data_in': data_in if enable_dtns else None,
             'data_out': data_out if enable_dtns else None,
-            'status': status
+            'exit_status': exit_status
         }
 
     def generate_job_files(self, output_dir: str = "jobs", enable_dtns: bool = False) -> None:

@@ -155,12 +155,13 @@ class Agent(Observer):
             self.transport.stop()
             with self.condition:
                 self.condition.notify_all()
-            self.on_shutdown()
+            self.save_results()
         except Exception as e:
             self.logger.error(f"Exception occurred in shutdown: {e}")
             self.logger.error(traceback.format_exc())
 
-    def on_shutdown(self):
+    @abstractmethod
+    def save_results(self):
         pass
 
     @abstractmethod
@@ -218,11 +219,6 @@ class Agent(Observer):
                                  neighbor_map=self.neighbor_map,
                                  sender=self.agent_id)
 
-    def send(self, dest: int, payload: object) -> None:
-        peer_info = self.neighbor_map.get(dest)
-        self.transport.send(host=peer_info.host, port=peer_info.port, payload=payload,
-                      dest=peer_info.agent_id, src=self.agent_id)
-
     def calculate_quorum(self) -> int:
         # Simple majority quorum calculation
         return (self.live_agent_count // 2) + 1
@@ -245,8 +241,7 @@ class Agent(Observer):
 
     def on_peer_status(self, target: str, up: bool, reason: str):
         """Called by GrpcClient/ChannelPool when a channel moves UP/DOWN."""
-        if not up:
-            self.logger.info(f"Peer {target} health {up} reason {reason}")
+        self.logger.info(f"Peer {target} health {up} reason {reason}")
         '''
         try:
             host, port_s = target.rsplit(":", 1)

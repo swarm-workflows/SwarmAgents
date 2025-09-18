@@ -1,5 +1,4 @@
 import json
-import pyetcd
 import redis
 import argparse
 # You may need to import specific exceptions for pyetcd if they are custom
@@ -36,58 +35,15 @@ def display(redis_host='localhost', redis_port=6379, obj_list='*', count=False):
             print(f"{key}: {data}")
 
 
-def display_etcd(etcd_host='localhost', etcd_port=2379, obj_list='*', count=False):
-    try:
-        etcd_client = pyetcd.client(host=etcd_host, port=etcd_port)
-        # You might need a more robust way to test connection with pyetcd,
-        # as its initial client creation might not immediately raise an error.
-        # A simple way is to perform a quick, non-disruptive operation:
-        etcd_client.status() # This is a common method to check cluster status
-    except Exception as e: # Catch a broader exception if pyetcd doesn't have a specific ConnectionError
-        print(f"Error connecting to etcd at {etcd_host}:{etcd_port}: {e}")
-        return
-
-    if obj_list == "*":
-        prefix = "*"
-    else:
-        prefix = f"{obj_list}/"
-
-    # Encode prefix to bytes
-    # Consider removing or commenting out this line unless you specifically want
-    # to see ALL etcd entries at the root before your filtered results.
-    # print(etcd_client.get_prefix("/"))
-    if prefix == "*":
-        entries = list(etcd_client.get_all())
-    else:
-        entries = list(etcd_client.get_prefix(prefix.encode()))
-
-    if not entries:
-        print(f"No entries found for prefix '{obj_list}'.")
-        return
-
-    if count:
-        print(f"Total entries for prefix '{obj_list}': {len(entries)}")
-    else:
-        for value, meta in entries:
-            key = meta.key.decode()
-            try:
-                decoded_value = json.loads(value.decode())
-            except:
-                decoded_value = value.decode()
-            print(f"{key}: {decoded_value}")
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Display Redis queue or count.")
     parser.add_argument("--host", default="localhost", help="Host (default: localhost)")
     parser.add_argument("--key", default="*", help="Key prefix to match (default: *)")
     parser.add_argument("--count", action="store_true", help="Only display the count of entries")
-    parser.add_argument("--type", choices=['redis', 'etcd'], default='etcd',
+    parser.add_argument("--type", choices=['redis', 'etcd'], default='redis',
                         help="Type of data store to query (default: etcd)")
 
     args = parser.parse_args()
 
     if args.type == 'redis':
         display(redis_host=args.host, obj_list=args.key, count=args.count)
-    elif args.type == 'etcd':
-        display_etcd(etcd_host=args.host, obj_list=args.key, count=args.count)

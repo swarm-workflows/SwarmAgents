@@ -193,7 +193,7 @@ class SelectionAlgo:
             job = jobs[j]
             agent = self.agents.get(agent_id)
             if agent:
-                job.set_leader(agent.agent_id)
+                job.leader_id = agent_id
                 job.state = ObjectState.READY
                 completed_jobs.append(job)
                 agent.select_queue.add(job)
@@ -362,7 +362,7 @@ def agent_selection_thread(agent: Agent, algo: SelectionAlgo):
 
                 # Finalize on commit quorum
                 if leader_id == agent.agent_id and len(proposal["commits"]) >= quorum_threshold:
-                    job.set_leader(leader_id)
+                    job.leader_id = leader_id
                     job.state = ObjectState.READY
                     completed_jobs.append(job)
                     agent.select_queue.add(job)
@@ -417,7 +417,7 @@ if __name__ == '__main__':
             execution_latency = (job.completed_at - job.scheduled_at) if job.completed_at and job.scheduled_at else None
             total_latency = (job.completed_at - job.created_at) if job.completed_at else None
             writer.writerow([
-                job.job_id, job.get_leader_agent_id(),
+                job.job_id, job.leader_id,
                 job.created_at, job.selected_by_agent_at, job.scheduled_at, job.completed_at,
                 selection_latency, execution_latency, total_latency
             ])
@@ -447,7 +447,7 @@ if __name__ == '__main__':
     # --- Plot Job Distribution ---
     job_counts = defaultdict(int)
     for job in completed_jobs:
-        job_counts[job.get_leader_agent_id()] += 1
+        job_counts[job.leader_id] += 1
     plt.figure(figsize=(10, 6))
     plt.bar([f"Agent-{aid}" for aid in job_counts.keys()], job_counts.values())
     plt.xlabel("Leader Agent ID")

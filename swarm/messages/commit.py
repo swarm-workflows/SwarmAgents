@@ -21,27 +21,25 @@
 # SOFTWARE.
 #
 # Author: Komal Thareja(kthare10@renci.org)
-from swarm.comm.messages.message import Message, MessageType
-from swarm.models.agent_info import AgentInfo
+from swarm.messages.message import MessageType
+from swarm.messages.proposal import Proposal
 
 
-class HeartBeat(Message):
+class Commit(Proposal):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.message_type = MessageType.HeartBeat
+        self.message_type = MessageType.Commit
 
 
 if __name__ == '__main__':
-    from swarm.models.capacities import Capacities
+    from swarm.models.proposal_info import ProposalInfo
+    p_info = ProposalInfo(p_id="pid_1", job_id='t-1', seed=0.6, agent_id="0", commits=1)
+    print(p_info)
+    print(p_info.to_dict())
+    commit = Commit(proposals=[p_info], forwarded_by="1")
+    print(commit)
+    print(commit.to_dict())
+    print(commit.to_json())
 
-    agent = AgentInfo(agent_id="agent-1", load=0.1, capacities=Capacities(core=1.0, disk=1.0, ram=1.0),)
-    print(agent)
-    print(agent.to_dict())
-
-    heartbeat = HeartBeat(agents=[agent])
-    print(heartbeat)
-    print(heartbeat.to_dict())
-    print(heartbeat.to_json())
-
-    h = HeartBeat.from_dict(heartbeat.to_dict())
-    print(f"Heartbeat object: {h}")
+    new_c = Commit.from_dict(commit.to_dict())
+    print(new_c)

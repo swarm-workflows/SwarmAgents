@@ -20,6 +20,7 @@ class Object(ABC):
         self._object_id = None
         self._state = ObjectState.PENDING
         self._time_last_state_change = 0
+        self._leader_id = None
         self.lock = threading.RLock()  # Lock for synchronization
 
     @property
@@ -61,20 +62,35 @@ class Object(ABC):
 
     @property
     def is_pending(self):
-        return self.state == ObjectState.PENDING
+        with self.lock:
+            return self.state == ObjectState.PENDING
 
     @property
     def is_running(self):
-        return self.state == ObjectState.RUNNING
+        with self.lock:
+            return self.state == ObjectState.RUNNING
 
     @property
     def is_ready(self):
-        return self.state == ObjectState.READY
+        with self.lock:
+            return self.state == ObjectState.READY
 
     @property
     def is_commit(self):
-        return self.state == ObjectState.COMMIT
+        with self.lock:
+            return self.state == ObjectState.COMMIT
 
     @property
     def is_complete(self):
-        return self.state == ObjectState.COMPLETE
+        with self.lock:
+            return self.state == ObjectState.COMPLETE
+
+    @property
+    def leader_id(self):
+        with self.lock:
+            return self._leader_id
+
+    @leader_id.setter
+    def leader_id(self, value):
+        with self.lock:
+            self._leader_id = value

@@ -21,25 +21,35 @@
 # SOFTWARE.
 #
 # Author: Komal Thareja(kthare10@renci.org)
-from swarm.comm.messages.message import MessageType
-from swarm.comm.messages.proposal import Proposal
+from typing import Union
+
+from swarm.messages.commit import Commit
+from swarm.messages.heart_beat import HeartBeat
+from swarm.messages.message import MessageType, MessageException
+from swarm.messages.prepare import Prepare
+from swarm.messages.proposal import Proposal
+from swarm.messages.job_status import JobStatus
 
 
-class Commit(Proposal):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.message_type = MessageType.Commit
+class MessageBuilder:
+    @staticmethod
+    def from_dict(message: dict) -> Union[HeartBeat, Proposal, Prepare, Commit, JobStatus]:
+        message_type = MessageType(message.get('message_type'))
 
+        if message_type == MessageType.HeartBeat:
+            return HeartBeat.from_dict(message)
 
-if __name__ == '__main__':
-    from swarm.models.proposal_infov2 import ProposalInfo
-    p_info = ProposalInfo(p_id="pid_1", job_id='t-1', seed=0.6, agent_id="0", commits=1)
-    print(p_info)
-    print(p_info.to_dict())
-    commit = Commit(proposals=[p_info], forwarded_by="1")
-    print(commit)
-    print(commit.to_dict())
-    print(commit.to_json())
+        elif message_type == MessageType.Proposal:
+            return Proposal.from_dict(message)
 
-    new_c = Commit.from_dict(commit.to_dict())
-    print(new_c)
+        elif message_type == MessageType.Prepare:
+            return Prepare.from_dict(message)
+
+        elif message_type == MessageType.Commit:
+            return Commit.from_dict(message)
+
+        elif message_type == MessageType.JobStatus:
+            return JobStatus.from_dict(message)
+
+        else:
+            raise MessageException(f"Unsupported Message: {message}")

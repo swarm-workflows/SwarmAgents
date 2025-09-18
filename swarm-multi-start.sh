@@ -32,11 +32,11 @@ for arg in "$@"; do
     esac
 done
 
-set -- "${args[@]}"
-
 if [[ $# -lt 3 ]]; then
     usage
 fi
+
+set -- "${args[@]}"
 
 num_agents="$1"; shift
 topology="$1"; shift

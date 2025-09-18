@@ -23,32 +23,34 @@ import json
 # Author: Komal Thareja(kthare10@renci.org)
 import logging
 import time
-import traceback
 from typing import Any
 
 from swarm.comm import consensus_pb2
 from swarm.comm.consensus_pb2_grpc import add_ConsensusServiceServicer_to_server
-from swarm.comm.grpc_clientv2 import GrpcClientV2
-from swarm.comm.grpc_serverv2 import GrpcServerV2, ConsensusServiceServicer
+from swarm.comm.grpc_client import GrpcClient
+from swarm.comm.grpc_server import GrpcServer, ConsensusServiceServicer
+from swarm.messages.message import Message
 from swarm.comm.observer import Observer
+from swarm.utils.thread_safe_dict import ThreadSafeDict
 
 
-class MessageServiceGrpcV2(Observer):
-    def __init__(self, host: str, port: int, logger: logging.Logger = logging.getLogger(), on_peer_status = None):
-        self.server = GrpcServerV2(observer=self, bind_host=host, bind_port=port)
-        self.client = GrpcClientV2(on_peer_status=on_peer_status)
+class GrpcTransport(Observer):
+    def __init__(self, host: str, port: int, logger: logging.Logger = logging.getLogger(),
+                 on_peer_status = None):
+        self.server = GrpcServer(on_message=self.on_message, bind_host=host, bind_port=port)
+        self.client = GrpcClient(on_peer_status=on_peer_status)
         self.observers = []
         self.logger = logger
 
-    def register_observers(self, agent: Observer):
-        if agent not in self.observers:
-            self.observers.append(agent)
+    def register_observers(self, observer: Observer):
+        if observer not in self.observers:
+            self.observers.append(observer)
 
     def notify_observers(self, msg: dict):
         for o in self.observers:
-            o.dispatch_message(msg)
+            o.on_message(msg)
 
-    def dispatch_message(self, message: Any):
+    def on_message(self, message: Any):
         self.logger.debug(f"Received consensus message: {message}")
         self.notify_observers(msg=message.get("payload"))
 
@@ -59,15 +61,14 @@ class MessageServiceGrpcV2(Observer):
     def stop(self):
         self.server.stop()
 
-    def send(self, host: str, port: int, msg: dict, dest: int, src: int = None, fwd: int = None):
-        sender = src
-        if fwd:
-            sender = src
+    def send(self, host: str, port: int, src: int, dest: int, payload: object) -> None:
+        if not isinstance(payload, Message):
+            raise TypeError("Payload must be of Message type")
         message_dict = {
-            "sender_id": str(sender),
+            "sender_id": str(src),
             "receiver_id": str(dest),
-            "message_type": "consensus",
-            "payload": msg
+            "message_type": str(payload.message_type),
+            "payload": payload.to_dict()
         }
         req = consensus_pb2.ConsensusMessage(
             sender_id=message_dict["sender_id"],
@@ -76,4 +77,23 @@ class MessageServiceGrpcV2(Observer):
             payload=json.dumps(message_dict["payload"]),
             timestamp=message_dict.get("timestamp", int(time.time()))
         )
-        return self.client.call_unary(host, port, "SendMessage", req)
+        self.client.call_unary(host, port, "SendMessage", req, timeout=2.0, retries=4)
+
+    def broadcast(self, payload: object, peers: list[int], neighbor_map: object, sender: int) -> None:
+        if not isinstance(payload, Message):
+            raise TypeError("Payload must be of Message type")
+
+        if not isinstance(neighbor_map, ThreadSafeDict):
+            raise TypeError("Neighbor map must be ThreadSafeDict")
+
+        payload.path.append(sender)
+        for peer_id in peers:
+            if peer_id in payload.path:
+                continue
+
+            peer_info = neighbor_map.get(peer_id)
+            if not peer_info:
+                continue
+
+            self.send(host=peer_info.host, port=peer_info.port, payload=payload,
+                      dest=peer_info.agent_id, src=sender)

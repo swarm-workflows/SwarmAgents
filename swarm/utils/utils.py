@@ -34,7 +34,9 @@ def job_capacities(jobs: list[Job]):
     return allocated_caps
 
 
-def normalize(host: str, port: int) -> str:
+def normalize_host(host: str, port: int = None) -> str:
     # Always dial IPv4 loopback if given localhost/::1 to avoid cache split
     host = "127.0.0.1" if host in ("localhost", "::1") else host
-    return f"{host}:{int(port)}"
+    if port is not None:
+        return f"{host}:{int(port)}"
+    return host

@@ -21,35 +21,27 @@
 # SOFTWARE.
 #
 # Author: Komal Thareja(kthare10@renci.org)
-from typing import Tuple
-
-from swarm.comm.messages.commit import Commit
-from swarm.comm.messages.heart_beat import HeartBeat
-from swarm.comm.messages.message import MessageType, MessageException
-from swarm.comm.messages.prepare import Prepare
-from swarm.comm.messages.proposal import Proposal
-from swarm.comm.messages.job_status import JobStatus
+from swarm.messages.message import Message, MessageType
+from swarm.models.agent_info import AgentInfo
 
 
-class MessageBuilder:
-    @staticmethod
-    def from_dict(message: dict) -> Tuple[HeartBeat, Proposal, Prepare, Commit, JobStatus]:
-        message_type = MessageType(message.get('message_type'))
+class HeartBeat(Message):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.message_type = MessageType.HeartBeat
 
-        if message_type == MessageType.HeartBeat:
-            return HeartBeat.from_dict(message)
 
-        elif message_type == MessageType.Proposal:
-            return Proposal.from_dict(message)
+if __name__ == '__main__':
+    from swarm.models.capacities import Capacities
 
-        elif message_type == MessageType.Prepare:
-            return Prepare.from_dict(message)
+    agent = AgentInfo(agent_id="agent-1", load=0.1, capacities=Capacities(core=1.0, disk=1.0, ram=1.0),)
+    print(agent)
+    print(agent.to_dict())
 
-        elif message_type == MessageType.Commit:
-            return Commit.from_dict(message)
+    heartbeat = HeartBeat(agents=[agent])
+    print(heartbeat)
+    print(heartbeat.to_dict())
+    print(heartbeat.to_json())
 
-        elif message_type == MessageType.JobStatus:
-            return JobStatus.from_dict(message)
-
-        else:
-            raise MessageException(f"Unsupported Message: {message}")
+    h = HeartBeat.from_dict(heartbeat.to_dict())
+    print(f"Heartbeat object: {h}")
