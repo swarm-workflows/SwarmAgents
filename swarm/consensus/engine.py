@@ -1,8 +1,8 @@
 # consensus/engine.py
-from swarm.models.proposal_info import ProposalContainer, ProposalInfo
-from swarm.messages.proposal import Proposal
-from swarm.messages.prepare import Prepare
-from swarm.messages.commit import Commit
+from swarm.consensus.messages.proposal_info import ProposalContainer, ProposalInfo
+from swarm.consensus.messages.proposal import Proposal
+from swarm.consensus.messages.prepare import Prepare
+from swarm.consensus.messages.commit import Commit
 from .interfaces import ConsensusHost, ConsensusTransport, TopologyRouter
 from ..models.agent_info import AgentInfo
 from ..models.object import ObjectState
@@ -108,7 +108,7 @@ class ConsensusEngine:
             #if not self.incoming.contains(p_id=proposal.p_id, object_id=object.object_id):
             #    self.incoming.add_proposal(proposal)
 
-            if msg.agents[0].agent_id not in p.prepares:
+            if msg.agents[0].agent_id not in proposal.prepares:
                 proposal.prepares.append(msg.agents[0].agent_id)
 
             # Commit has already been triggered
@@ -165,6 +165,7 @@ class ConsensusEngine:
                     # I am leader, do selection
                     object.leader_id = proposal.agent_id
                     self.host.log_info(f"[CON_LEADER] Object:{proposal.object_id} Leader:{self.agent_id} p:{proposal.p_id}")
+                    print(f"[CON_LEADER] Object:{proposal.object_id} Leader:{self.agent_id} p:{proposal.p_id} quotum: {len(proposal.commits)}")
                     self.host.on_leader_elected(object, proposal.p_id)
                 else:
                     self.host.log_info(f"[CON_PART] Object:{proposal.object_id} Leader:{proposal.agent_id} p:{proposal.p_id}")

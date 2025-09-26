@@ -29,7 +29,7 @@ from swarm.comm import consensus_pb2
 from swarm.comm.consensus_pb2_grpc import add_ConsensusServiceServicer_to_server
 from swarm.comm.grpc_client import GrpcClient
 from swarm.comm.grpc_server import GrpcServer, ConsensusServiceServicer
-from swarm.messages.message import Message
+from swarm.consensus.messages.message import Message
 from swarm.comm.observer import Observer
 from swarm.utils.thread_safe_dict import ThreadSafeDict
 

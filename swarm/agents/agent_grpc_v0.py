@@ -36,7 +36,7 @@ import yaml
 
 from swarm.comm.grpc_transport import GrpcTransport
 from swarm.utils.queues import AgentQueues
-from swarm.messages.message import MessageType, Message
+from swarm.consensus.messages.message import MessageType, Message
 from swarm.comm.observer import Observer
 from swarm.database.repository import Repository
 from swarm.models.agent_info import AgentInfo

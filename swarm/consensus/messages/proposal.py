@@ -23,46 +23,46 @@
 # Author: Komal Thareja(kthare10@renci.org)
 from typing import List, Tuple
 
-from swarm.messages.message import MessageType, Message
-from swarm.messages.job_info import JobInfo
+from swarm.consensus.messages.message import Message, MessageType
+from swarm.consensus.messages.proposal_info import ProposalInfo
 
 
-class JobStatus(Message):
+class Proposal(Message):
     def __init__(self, **kwargs):
-        self._jobs = []
+        self._proposals = []
         super().__init__(**kwargs)
-        self._message_type = MessageType.JobStatus
+        self._message_type = MessageType.Proposal
 
     @property
-    def jobs(self) -> List[JobInfo]:
-        return self._jobs
+    def proposals(self) -> List[ProposalInfo]:
+        return self._proposals
 
-    @jobs.setter
-    def jobs(self, values: List[Tuple[JobInfo, dict]]):
+    @proposals.setter
+    def proposals(self, values: List[Tuple[ProposalInfo, dict]]):
         if isinstance(values, list):
             for v in values:
-                if isinstance(v, JobInfo):
-                    self._jobs.append(v)
+                if isinstance(v, ProposalInfo):
+                    self._proposals.append(v)
                 elif isinstance(v, dict):
-                    self._jobs.append(JobInfo.from_dict(v))
+                    self._proposals.append(ProposalInfo.from_dict(v))
                 else:
-                    raise ValueError("Unsupported value type for proposals")
+                    raise ValueError(f"Unsupported value {type(v)} for proposals")
         else:
-            raise ValueError("Unsupported value type for proposals")
+            raise ValueError(f"Unsupported value type {type(values)} for proposals")
 
     def __str__(self):
-        return f"[jobs: {self.jobs}]"
+        return f"[agent: {self.agents}, proposals: {self.proposals}]"
 
 
 if __name__ == '__main__':
-    from swarm.models.job import ObjectState
-    t_info = JobInfo(job_id="t1", state=ObjectState.FAILED)
-    print(t_info)
-    print(t_info.to_dict())
-    job_status = JobStatus(jobs=[t_info])
-    print(job_status)
-    print(job_status.to_dict())
-    print(job_status.to_json())
+    p_info = ProposalInfo(p_id="pid_1", object_id='t-1', seed=0.6, agent_id="0")
+    print(p_info)
+    print(p_info.to_dict())
+    proposal = Proposal(proposals=[p_info])
+    print(proposal)
+    print(proposal.to_dict())
+    print(proposal.to_json())
 
-    new_t = JobStatus.from_dict(job_status.to_dict())
-    print(new_t)
+    new_p = Proposal.from_dict(proposal.to_dict())
+    print(new_p)
+    print(new_p.proposals[0].object_id)

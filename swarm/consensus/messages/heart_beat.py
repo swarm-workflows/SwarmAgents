@@ -21,25 +21,27 @@
 # SOFTWARE.
 #
 # Author: Komal Thareja(kthare10@renci.org)
-from swarm.messages.message import MessageType
-from swarm.messages.proposal import Proposal
+from swarm.consensus.messages.message import Message, MessageType
+from swarm.models.agent_info import AgentInfo
 
 
-class Prepare(Proposal):
+class HeartBeat(Message):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self._message_type = MessageType.Prepare
+        self.message_type = MessageType.HeartBeat
 
 
 if __name__ == '__main__':
-    from swarm.models.proposal_info import ProposalInfo
-    p_info = ProposalInfo(p_id="pid_1", job_id='t-1', seed=0.6, agent_id="0", commits=["1"])
-    print(p_info)
-    print(p_info.to_dict())
-    prepare = Prepare(proposals=[p_info])
-    print(prepare)
-    print(prepare.to_dict())
-    print(prepare.to_json())
+    from swarm.models.capacities import Capacities
 
-    new_p = Proposal.from_dict(prepare.to_dict())
-    print(new_p)
+    agent = AgentInfo(agent_id="agent-1", load=0.1, capacities=Capacities(core=1.0, disk=1.0, ram=1.0),)
+    print(agent)
+    print(agent.to_dict())
+
+    heartbeat = HeartBeat(agents=[agent])
+    print(heartbeat)
+    print(heartbeat.to_dict())
+    print(heartbeat.to_json())
+
+    h = HeartBeat.from_dict(heartbeat.to_dict())
+    print(f"Heartbeat object: {h}")

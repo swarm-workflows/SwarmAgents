@@ -133,8 +133,8 @@ class ChannelPool:
                     )
                     self._set_up(
                         e.target,
-                        resp.exit_status == health_pb2.HealthCheckResponse.SERVING,
-                        f"health={resp.exit_status}"
+                        resp.status == health_pb2.HealthCheckResponse.SERVING,
+                        f"health={resp.status}"
                     )
                 except grpc.RpcError as ex:
                     # Treat UNAVAILABLE/DEADLINE as down until reconnect

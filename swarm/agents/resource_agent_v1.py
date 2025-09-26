@@ -26,30 +26,69 @@ import time
 import traceback
 from concurrent.futures.thread import ThreadPoolExecutor
 
-from swarm.messages.message import MessageType
+from swarm.consensus.engine import ConsensusEngine
+from swarm.consensus.interfaces import ConsensusHost, ConsensusTransport, TopologyRouter
+from swarm.consensus.messages.message import MessageType
 from swarm.models.data_node import DataNode
+from swarm.models.object import Object
+from swarm.topology.topology import TopologyType
 from swarm.utils.metrics import Metrics
 from swarm.utils.resource_queues import ResourceAgentQueues
 from swarm.utils.thread_safe_dict import ThreadSafeDict
-from swarm.topology.topology import TopologyType
-from swarm.agents.agent_grpc_v1 import Agent
-from swarm.messages.commit import Commit
-from swarm.messages.message_builder import MessageBuilder
-from swarm.messages.prepare import Prepare
-from swarm.messages.proposal import Proposal
+from swarm.agents.agent_grpc import Agent
+from swarm.consensus.messages.commit import Commit
+from swarm.consensus.messages.message_builder import MessageBuilder
+from swarm.consensus.messages.prepare import Prepare
+from swarm.consensus.messages.proposal import Proposal
 from swarm.database.repository import Repository
 from swarm.models.capacities import Capacities
 from swarm.models.agent_info import AgentInfo
-from swarm.models.proposal_info import ProposalContainer, ProposalInfo
+from swarm.consensus.messages.proposal_info import ProposalInfo
 from swarm.models.job import Job, ObjectState
 import numpy as np
 
 from swarm.utils.utils import generate_id, job_capacities
 
 
+class _HostAdapter(ConsensusHost):
+    def __init__(self, agent: "SwarmAgent"):
+        self.agent = agent
+    def get_object(self, object_id: str): return self.agent.queues.pending_queue.get(object_id)
+    def is_agreement_achieved(self, object_id: str): return self.agent.is_job_completed(object_id)
+    def calculate_quorum(self): return self.agent.calculate_quorum()
+    def on_leader_elected(self, obj: Object, proposal_id: str): self.agent.select_job(obj)
+    def on_participant_commit(self, obj: Object, leader_id: int, proposal_id: str): obj.state = ObjectState.COMMIT
+    def now(self): import time; return time.time()
+    def log_debug(self, m): self.agent.logger.debug(m)
+    def log_info(self, m): self.agent.logger.info(m)
+    def log_warn(self, m): self.agent.logger.warning(m)
+
+
+class _TransportAdapter(ConsensusTransport):
+    def __init__(self, agent: "SwarmAgent"):
+        self.agent = agent
+    def send(self, dest: int, payload: object) -> None:
+        self.agent.send(dest, payload)
+    def broadcast(self, payload: object) -> None:
+        self.agent.broadcast(payload)
+
+
+class _RouteAdapter(TopologyRouter):
+    def __init__(self, agent: "SwarmAgent"):
+        self.agent = agent
+
+    def should_forward(self) -> bool:
+        if self.agent.topology.type in [TopologyType.Star, TopologyType.Ring]:
+            return True
+        return False
+
+
 class ResourceAgent(Agent):
     def __init__(self, agent_id: int, config_file: str, debug: bool = False):
         super().__init__(agent_id, config_file, debug)
+        self.engine = ConsensusEngine(agent_id, _HostAdapter(self), _TransportAdapter(self),
+                                      router=_RouteAdapter(self))
+
         self._capacities = Capacities().from_dict(self.config.get("capacities", {}))
         self._load = 0
         self.metrics = Metrics()
@@ -58,13 +97,10 @@ class ResourceAgent(Agent):
         self.queues = ResourceAgentQueues()
 
         self.threads.update({
-            "selection": threading.Thread(target=self.job_selection_main, daemon=True),
-            "scheduling": threading.Thread(target=self.job_scheduling_main, daemon=True)
+            "selection": threading.Thread(target=self.selection_main, daemon=True),
+            "scheduling": threading.Thread(target=self.scheduling_main, daemon=True)
         })
         self.executor = ThreadPoolExecutor(max_workers=self.runtime_config.get("executor_workers", 3))
-
-        self.outgoing_proposals = ProposalContainer()
-        self.incoming_proposals = ProposalContainer()
 
         # Read job cost parameters from config
         job_cfg = self.config.get("job_selection", {})
@@ -167,156 +203,14 @@ class ResourceAgent(Agent):
 
         return round((core + ram + disk) / 3, 2)
 
-    def __receive_proposal(self, incoming: Proposal):
-        proposals = []
-        for p in incoming.proposals:
-            job = self.queues.pending_queue.get(p.object_id)
-            if not job:
-                self.logger.debug(f"ERROR ---- Skipping no job found for {p.object_id}")
-                self.outgoing_proposals.remove_object(object_id=p.object_id)
-                self.incoming_proposals.remove_object(object_id=p.object_id)
-                continue
-            if self.is_job_completed(job_id=job.job_id):
-                self.logger.debug(f"Ignoring Proposal: {p} for job: {job.job_id}")
-                continue
+    def __on_proposal(self, incoming: Proposal):
+        self.engine.on_proposal(incoming)
 
-            my_proposal = self.outgoing_proposals.has_better_proposal(proposal=p)
-            peer_proposal = self.incoming_proposals.has_better_proposal(proposal=p)
+    def __on_prepare(self, incoming: Prepare):
+        self.engine.on_prepare(incoming)
 
-            if my_proposal:
-                self.logger.debug(f"Job:{p.object_id} Agent:{self.agent_id} rejected Proposal: {p} from agent"
-                                  f" {p.agent_id} - my proposal {my_proposal} has prepares or smaller seed")
-                job_id = job.job_id
-                self.metrics.conflicts[job_id] = self.metrics.conflicts.get(job_id, 0) + 1
-            elif peer_proposal:
-                self.logger.debug(f"Job:{p.object_id} Agent:{self.agent_id} rejected Proposal: {p} from agent"
-                                  f" {p.agent_id} - already accepted proposal {peer_proposal} with a smaller seed")
-                job_id = job.job_id
-                self.metrics.conflicts[job_id] = self.metrics.conflicts.get(job_id, 0) + 1
-            else:
-                self.logger.debug(
-                    f"Job:{p.object_id} Agent:{self.agent_id} accepted Proposal: {p} from agent"
-                    f" {p.agent_id} and is now the leader")
-
-                p.prepares = []
-                if my_proposal:
-                    self.logger.debug(f"Removed my Proposal: {my_proposal} in favor of incoming proposal")
-                    self.outgoing_proposals.remove_proposal(p_id=my_proposal.p_id, object_id=p.object_id)
-                if peer_proposal:
-                    self.logger.debug(f"Removed peer Proposal: {peer_proposal} in favor of incoming proposal")
-                    self.incoming_proposals.remove_proposal(p_id=peer_proposal.p_id, object_id=p.object_id)
-
-                # Increment the number of prepares to count the prepare being sent
-                # Needed to handle 3 agent case
-                proposals.append(p)
-                if incoming.agents[0].agent_id not in p.prepares:
-                    p.prepares.append(incoming.agents[0].agent_id)
-                self.incoming_proposals.add_proposal(proposal=p)
-                job.state = ObjectState.PREPARE
-
-        if len(proposals):
-            msg = Prepare(source=self.agent_id, agents=[AgentInfo(agent_id=self.agent_id)], proposals=proposals)
-            self.broadcast(message=msg)
-
-        if self.topology.type in [TopologyType.Star, TopologyType.Ring]:
-            self.broadcast(message=incoming)
-
-    def __receive_prepare(self, incoming: Prepare):
-        proposals = []
-        for p in incoming.proposals:
-            job = self.queues.pending_queue.get(p.object_id)
-            if not job:
-                self.logger.debug(f"ERROR ---- Skipping no job found for {p.object_id}")
-                self.outgoing_proposals.remove_object(object_id=p.object_id)
-                self.incoming_proposals.remove_object(object_id=p.object_id)
-                continue
-            if self.is_job_completed(job_id=job.job_id):
-                self.logger.debug(f"Job: {job.job_id} Ignoring Prepare: {p}")
-                continue
-
-            # I have sent this proposal
-            if self.outgoing_proposals.contains(object_id=p.object_id, p_id=p.p_id):
-                proposal = self.outgoing_proposals.get_proposal(p_id=p.p_id)
-            # Received this proposal
-            elif self.incoming_proposals.contains(object_id=p.object_id, p_id=p.p_id):
-                proposal = self.incoming_proposals.get_proposal(p_id=p.p_id)
-            # New proposal
-            else:
-                proposal = p
-                self.incoming_proposals.add_proposal(proposal=p)
-
-            if incoming.agents[0].agent_id not in proposal.prepares:
-                proposal.prepares.append(incoming.agents[0].agent_id)
-
-            # Commit has already been triggered
-            if job.is_commit:
-                continue
-
-            quorum_count = self.calculate_quorum()
-            job.state = ObjectState.PREPARE
-
-            if len(proposal.prepares) >= quorum_count:
-                self.logger.debug(f"Job: {proposal.object_id} Agent: {self.agent_id} received quorum "
-                                  f"prepares: {proposal.prepares}, starting commit!")
-
-                # Increment the number of commits to count the commit being sent
-                proposals.append(proposal)
-                job.state = ObjectState.COMMIT
-
-        if len(proposals):
-            msg = Commit(source=self.agent_id, agents=[AgentInfo(agent_id=self.agent_id)], proposals=proposals)
-            self.broadcast(message=msg)
-
-        if self.topology.type in [TopologyType.Star, TopologyType.Ring]:
-            self.broadcast(message=incoming)
-
-    def __receive_commit(self, incoming: Commit):
-        for p in incoming.proposals:
-            job = self.queues.pending_queue.get(p.object_id)
-            if not job:
-                self.logger.debug(f"ERROR ---- Skipping no job found for {p.object_id}")
-                self.outgoing_proposals.remove_object(object_id=p.object_id)
-                self.incoming_proposals.remove_object(object_id=p.object_id)
-                continue
-            if self.is_job_completed(job_id=job.job_id):
-                self.logger.debug(f"Job: {job.job_id} Ignoring Commit: {p}")
-                self.incoming_proposals.remove_object(object_id=p.object_id)
-                self.outgoing_proposals.remove_object(object_id=p.object_id)
-                continue  # Continue instead of return to process other proposals
-
-            if self.outgoing_proposals.contains(object_id=p.object_id, p_id=p.p_id):
-                proposal = self.outgoing_proposals.get_proposal(p_id=p.p_id)
-            elif self.incoming_proposals.contains(object_id=p.object_id, p_id=p.p_id):
-                proposal = self.incoming_proposals.get_proposal(p_id=p.p_id)
-            else:
-                self.logger.debug(f"TBD: Job: {p.object_id} Agent: {self.agent_id} received commit without any Prepares")
-                proposal = p
-                self.incoming_proposals.add_proposal(proposal=proposal)
-
-            if incoming.agents[0].agent_id not in proposal.commits:
-                proposal.commits.append(incoming.agents[0].agent_id)
-
-            quorum_count = self.calculate_quorum()
-
-            if len(proposal.commits) >= quorum_count:
-                self.logger.debug(
-                    f"Job: {proposal.object_id} Agent: {self.agent_id} received quorum commits Proposal: {proposal}: "
-                    f"Job: {job.job_id}")
-                if proposal.agent_id == self.agent_id:
-                    job.leader_id = proposal.agent_id
-                if self.outgoing_proposals.contains(object_id=proposal.object_id, p_id=proposal.p_id):
-                    self.logger.info(f"[CON_LEADER] achieved for Job: {proposal.object_id} Leader: {self.agent_id}")
-                    print(f"SELECTED: {job.job_id} on agent: {self.agent_id} proposal: {proposal.p_id} "
-                          f"commits: {proposal.commits} quorum: {quorum_count}")
-                    self.select_job(job)
-                    self.outgoing_proposals.remove_object(object_id=proposal.object_id)
-                else:
-                    self.logger.info(f"[CON_PART] achieved for Job: {proposal.object_id} Leader: {proposal.agent_id}")
-                    job.state = ObjectState.COMPLETE
-                    self.incoming_proposals.remove_object(object_id=proposal.object_id)
-
-        if self.topology.type in [TopologyType.Star, TopologyType.Ring]:
-            self.broadcast(message=incoming)
+    def __on_commit(self, incoming: Commit):
+        self.engine.on_commit(incoming)
 
     def _process(self, messages: list[dict]):
         for message in messages:
@@ -327,13 +221,13 @@ class ResourceAgent(Agent):
                 if not self.should_process(msg=incoming):
                     continue
                 if isinstance(incoming, Prepare):
-                    self.__receive_prepare(incoming=incoming)
+                    self.__on_prepare(incoming=incoming)
 
                 elif isinstance(incoming, Commit):
-                    self.__receive_commit(incoming=incoming)
+                    self.__on_commit(incoming=incoming)
 
                 elif isinstance(incoming, Proposal):
-                    self.__receive_proposal(incoming=incoming)
+                    self.__on_proposal(incoming=incoming)
 
                 else:
                     self.logger.info(f"Ignoring unsupported message: {message}")
@@ -356,15 +250,15 @@ class ResourceAgent(Agent):
 
     def _update_ready_jobs(self, jobs: list[str]):
         for j in jobs:
-            self.incoming_proposals.remove_object(object_id=j)
-            self.outgoing_proposals.remove_object(object_id=j)
+            self.engine.incoming.remove_object(object_id=j)
+            self.engine.outgoing.remove_object(object_id=j)
             self.queues.pending_queue.remove(j)
 
     def _update_completed_jobs(self, jobs: list[str]):
         self.update_jobs(jobs, self.completed_jobs_set, self.completed_lock)
         for j in jobs:
-            self.incoming_proposals.remove_object(object_id=j)
-            self.outgoing_proposals.remove_object(object_id=j)
+            self.engine.incoming.remove_object(object_id=j)
+            self.engine.outgoing.remove_object(object_id=j)
             self.queues.pending_queue.remove(j)
 
     def _restart_selection(self):
@@ -375,10 +269,12 @@ class ResourceAgent(Agent):
             if diff > self.restart_job_selection:
                 self.logger.info(f"RESTART: Job: {job} reset to Pending")
                 job.state = ObjectState.PENDING
-                self.outgoing_proposals.remove_object(object_id=job.job_id)
-                self.incoming_proposals.remove_object(object_id=job.job_id)
+                self.engine.outgoing.remove_object(object_id=job.job_id)
+                self.engine.incoming.remove_object(object_id=job.job_id)
                 job_id = job.job_id
                 self.metrics.restarts[job_id] = self.metrics.restarts.get(job_id, 0) + 1
+
+                # TODO restart selection for jobs which were assigned to neighbor which just went down
 
     def _refresh_neighbors(self, current_time: float):
         """
@@ -394,6 +290,25 @@ class ResourceAgent(Agent):
             level=self.topology.level,
             groups=[self.topology.group]
         )
+
+        '''
+        current_endpoints: set[tuple[str, int]] = set()
+        for agent_info in self.neighbor_map.values():
+            key = (agent_info.host, agent_info.port)
+            current_endpoints.add(key)
+
+            # If the endpoint is new or the agent behind it changed, update it
+            # (setdefault wouldn't update an existing mismatched mapping)
+            peer_id, is_up = self.peer_by_endpoint.get(key, (None, None))
+            if peer_id is None:
+                self.peer_by_endpoint.set(key, (agent_info.agent_id, True))
+
+        
+        # 4) Prune endpoints that no longer exist
+        to_delete = [k for k in self.peer_by_endpoint.keys() if k not in current_endpoints]
+        for k in to_delete:
+            self.peer_by_endpoint.pop(k, None)
+        '''
 
     def _refresh_children(self, current_time: float):
         """
@@ -444,15 +359,71 @@ class ResourceAgent(Agent):
             )
             for agent_data in agent_dicts:
                 agent = AgentInfo.from_dict(agent_data)
-                #if agent.agent_id and agent.agent_id != self.agent_id:
                 existing = target_dict.get(agent.agent_id)
                 if existing is None or agent.last_updated > existing.last_updated:
                     target_dict.set(agent.agent_id, agent)
                 active_ids.add(agent.agent_id)
 
+    '''
+    def _refresh_agent_map(
+            self,
+            current_time: float,
+            target_dict: "ThreadSafeDict[int, AgentInfo]",
+            level: int,
+            groups: list[int],
+    ):
+        """
+        Refresh target agent map (neighbors/children) from the repository.
+
+        - Only add/refresh peers that are UP (per peer_by_endpoint).
+        - Remove peers that are stale or marked DOWN.
+        - Do not re-add DOWN peers even if they appear in the repository.
+        """
+        active_ids: set[int] = set()
+
+        # --- Add or refresh entries from repository (but only if transport is UP) ---
+        for group in groups:
+            agent_dicts = self.repository.get_all_objects(
+                key_prefix=Repository.KEY_AGENT,
+                level=level,
+                group=group,
+            )
+            for agent_data in agent_dicts:
+                agent = AgentInfo.from_dict(agent_data)
+
+                # Check transport/health by endpoint
+                peer_id, is_up = self._get_peer_state_for_endpoint(agent.host, agent.port)
+
+                # If we have a known entry for this endpoint and it's DOWN, skip adding/updating
+                if peer_id is not None and is_up is False:
+                    # If it already exists in the map, proactively evict it so it doesn't linger
+                    if target_dict.get(agent.agent_id) is not None:
+                        target_dict.remove(agent.agent_id)
+                    # Do NOT mark as active; we want it removable in the cleanup phase
+                    continue
+
+                # OK to insert/update (unknown endpoints or known-UP endpoints)
+                existing = target_dict.get(agent.agent_id)
+                if existing is None or (agent.last_updated or 0) > (existing.last_updated or 0):
+                    target_dict.set(agent.agent_id, agent)
+
+                # Count as active only if we actually accepted it
+                active_ids.add(agent.agent_id)
+
+        # --- Evict stale or DOWN entries ---
         for agent_id, agent in list(target_dict.items()):
-            if agent_id not in active_ids and (current_time - agent.last_updated) >= self.peer_expiry_seconds:
+            # Evaluate staleness
+            is_stale = (current_time - (agent.last_updated or 0)) >= self.peer_expiry_seconds
+
+            # Evaluate transport down by endpoint (fixes the original bug: look up by endpoint)
+            peer_id, is_up = self._get_peer_state_for_endpoint(agent.host, agent.port)
+            is_down = (peer_id is not None and is_up is False)
+
+            # Remove if not seen as active this cycle, or stale, or reported DOWN
+            if (agent_id not in active_ids) or is_stale or is_down:
                 target_dict.remove(agent_id)
+                
+    '''
 
     def _generate_agent_info(self) -> AgentInfo:
         """
@@ -522,41 +493,31 @@ class ResourceAgent(Agent):
 
         return agent_info
 
-    def _do_periodic(self):
-        while not self.shutdown:
-            try:
-                self._restart_selection()
-                current_time = int(time.time())
-                self._refresh_children(int(current_time))
-                agent_info = self._generate_agent_info()
-                self.repository.save(agent_info.to_dict(), key_prefix=Repository.KEY_AGENT, level=self.topology.level,
-                                     group=self.topology.group)
+    def on_periodic(self):
+        self._restart_selection()
+        current_time = int(time.time())
+        self._refresh_children(int(current_time))
+        agent_info = self._generate_agent_info()
+        self.repository.save(agent_info.to_dict(), key_prefix=Repository.KEY_AGENT, level=self.topology.level,
+                             group=self.topology.group)
 
-                self._refresh_neighbors(current_time=current_time)
+        self._refresh_neighbors(current_time=current_time)
 
-                # Batch update job sets
-                for prefix, update_fn, state in [
-                    (Repository.KEY_JOB, self._update_pending_jobs, ObjectState.PENDING.value),
-                    (Repository.KEY_JOB, self._update_ready_jobs, ObjectState.READY.value),
-                    (Repository.KEY_JOB, self._update_completed_jobs, ObjectState.COMPLETE.value),
-                ]:
-                    jobs = self.repository.get_all_ids(key_prefix=prefix, level=self.topology.level,
-                                                       group=self.topology.group, state=state)
-                    update_fn(jobs=jobs)
+        # Batch update job sets
+        for prefix, update_fn, state in [
+            (Repository.KEY_JOB, self._update_pending_jobs, ObjectState.PENDING.value),
+            (Repository.KEY_JOB, self._update_ready_jobs, ObjectState.READY.value),
+            (Repository.KEY_JOB, self._update_completed_jobs, ObjectState.COMPLETE.value),
+        ]:
+            jobs = self.repository.get_all_ids(key_prefix=prefix, level=self.topology.level,
+                                               group=self.topology.group, state=state)
+            update_fn(jobs=jobs)
 
-                time.sleep(0.5)
+        if self.debug:
+            self.save_consensus_votes()
+        self.save_neighbors()
 
-                if self.debug:
-                    self.save_consensus_votes()
-
-                self.check_queue()
-                if self.should_shutdown():
-                    print("[SHUTDOWN] Queue has been empty for too long. Triggering shutdown.")
-                    break
-            except Exception as e:
-                self.logger.error(f"Periodic update error: {e}\n{traceback.format_exc()}")
-
-        self.stop()
+        self.check_queue()
 
     def is_job_feasible(self, job: Job, agent: AgentInfo) -> bool:
         """
@@ -606,7 +567,7 @@ class ResourceAgent(Agent):
 
     def compute_proposed_load(self):
         allocations = Capacities()
-        for j in self.outgoing_proposals.objects():
+        for j in self.engine.outgoing.objects():
             if j not in self.queues.ready_queue and j not in self.queues.selected_queue:
                 job = self.queues.pending_queue.get(j)
                 if job:
@@ -876,7 +837,7 @@ class ResourceAgent(Agent):
 
         return min_cost_agents
 
-    def job_selection_main(self):
+    def selection_main(self):
         self.logger.info(f"Starting agent: {self}")
         while self.live_agent_count != self.configured_agent_count:
             time.sleep(0.5)
@@ -911,23 +872,20 @@ class ResourceAgent(Agent):
                         proposals.append(proposal)
                         # Begin election for Job leader for this job
                         job.state = ObjectState.PRE_PREPARE
-                    '''
+
                     else:
-                        job = pending_jobs[job_idx]
-                        self.logger.debug(f"Agent {selected_agent_id} has chosen job {job.job_id} with cost: {cost}")
-                    
-                    jobs.append(job.job_id)
-                    '''
+                        if self.debug:
+                            job = pending_jobs[job_idx]
+                            self.logger.debug(f"Agent {selected_agent_id} has chosen job {job.job_id} with cost: {cost}")
+
+                    if self.debug:
+                        jobs.append(job.job_id)
 
                 if len(proposals):
                     self.logger.debug(f"Identified jobs to propose: {proposals}")
-                    #self.logger.info(f"Identified jobs to select: {jobs}")
-                    msg = Proposal(source=self.agent_id,
-                                   agents=[AgentInfo(agent_id=self.agent_id)],
-                                   proposals=proposals)
-                    self.broadcast(message=msg)
-                    for p in proposals:
-                        self.outgoing_proposals.add_proposal(p)  # Add all proposals
+                    if self.debug:
+                        self.logger.info(f"Identified jobs to select: {jobs}")
+                    self.engine.propose(proposals=proposals)
                     proposals.clear()
 
                 # Trigger leader election for a job after random sleep
@@ -945,12 +903,34 @@ class ResourceAgent(Agent):
         agent_metrics = {
             "id": self.agent_id,
             "restarts": self.metrics.restarts,
-            "conflicts": self.metrics.conflicts,
+            "conflicts": self.engine.conflicts,
             "idle_time": self.metrics.idle_time,
             "load_trace": self.metrics.load
         }
         self.repository.save(obj=agent_metrics, key=f"{Repository.KEY_METRICS}:{self.agent_id}")
         self.logger.info("Results saved")
+
+    def save_neighbors(self):
+        try:
+            neighbors = []
+            for neighbor in self.neighbor_map.values():
+                neighbors.append(neighbor.to_dict())
+            entry = {
+                "agent_id": self.agent_id,
+                "neighbors": neighbors,
+                "timestamp": time.time(),
+            }
+            self.repository.save(obj=entry,
+                    key=f"peers:{self.agent_id}",
+                    level=self.topology.level,
+                    group=self.topology.group,
+                )
+
+            self.logger.debug(f"Saved neighbors for {self.agent_id}")
+
+        except Exception as e:
+            # Never let debugging persist crash the agent loop
+            self.logger.error(f"save_neighbors failed: {e}", exc_info=True)
 
     def save_consensus_votes(self):
         """
@@ -972,7 +952,7 @@ class ResourceAgent(Agent):
             ts = int(time.time())
 
             # Collect all job ids we have any proposals for
-            job_ids = set(self.outgoing_proposals.objects()) | set(self.incoming_proposals.objects())
+            job_ids = set(self.engine.outgoing.objects()) | set(self.engine.incoming.objects())
             #pending_jobs = len(self.queues.pending_queue.gets(states=[ObjectState.PENDING]))
 
             for job_id in job_ids:
@@ -983,8 +963,8 @@ class ResourceAgent(Agent):
                        None)
 
                 # Gather proposals
-                out_props = self.outgoing_proposals.get_proposals_by_object_id(job_id) or []
-                in_props = self.incoming_proposals.get_proposals_by_object_id(job_id) or []
+                out_props = self.engine.outgoing.get_proposals_by_object_id(job_id) or []
+                in_props = self.engine.incoming.get_proposals_by_object_id(job_id) or []
 
                 def _ser(p):
                     # commits might be a list (ids) or an int in some paths—normalize
@@ -1063,7 +1043,7 @@ class ResourceAgent(Agent):
             state=ObjectState.COMPLETE.value
         )
 
-    def job_scheduling_main(self):
+    def scheduling_main(self):
         """
         Main job scheduling loop. If this agent has children, forward the job to them.
         Otherwise, schedule it locally if load permits.
@@ -1121,6 +1101,7 @@ class ResourceAgent(Agent):
         self.executor.submit(self.execute_job, job)
 
     def select_job(self, job: Job):
+        print(f"[SELECTED]: {job.job_id} on agent: {self.agent_id}")
         self.logger.info(f"[SELECTED]: {job.job_id} on agent: {self.agent_id} to Select Queue")
         job.state = ObjectState.READY
         self.repository.save(obj=job.to_dict(), key_prefix=Repository.KEY_JOB,
@@ -1146,10 +1127,7 @@ class ResourceAgent(Agent):
             self.logger.error(f"[ERROR] Job {job} failed on agent {self.agent_id}: {e}")
             self.logger.error(traceback.format_exc())
 
-    def stop(self):
-        try:
-            super().stop()
-            self.executor.shutdown(wait=True)
-        except Exception as e:
-            self.logger.error(f"Exception occurred in shutdown: {e}")
-            self.logger.error(traceback.format_exc())
+
+    def on_shutdown(self):
+        self.executor.shutdown(wait=True)
+        self.save_results()

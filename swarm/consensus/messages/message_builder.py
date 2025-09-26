@@ -21,22 +21,35 @@
 # SOFTWARE.
 #
 # Author: Komal Thareja(kthare10@renci.org)
-import sys
+from typing import Union
 
-if __name__ == '__main__':
-    if len(sys.argv) < 2:
-        print("Usage: python main.py <agent_id> [--debug]")
-        sys.exit(1)
+from swarm.consensus.messages.commit import Commit
+from swarm.consensus.messages.heart_beat import HeartBeat
+from swarm.consensus.messages.message import MessageType, MessageException
+from swarm.consensus.messages.prepare import Prepare
+from swarm.consensus.messages.proposal import Proposal
+from swarm.consensus.messages.job_status import JobStatus
 
-    agent_id = int(sys.argv[1])
 
-    debug = False
-    if len(sys.argv) > 2 and sys.argv[2] == "--debug":
-        debug = True
+class MessageBuilder:
+    @staticmethod
+    def from_dict(message: dict) -> Union[HeartBeat, Proposal, Prepare, Commit, JobStatus]:
+        message_type = MessageType(message.get('message_type'))
 
-    config_file = f"./configs/config_swarm_multi_{agent_id}.yml"
+        if message_type == MessageType.HeartBeat:
+            return HeartBeat.from_dict(message)
 
-    from swarm.agents.resource_agent import ResourceAgent
-    agent = ResourceAgent(agent_id=agent_id, config_file=config_file, debug=debug)
+        elif message_type == MessageType.Proposal:
+            return Proposal.from_dict(message)
 
-    agent.start()
+        elif message_type == MessageType.Prepare:
+            return Prepare.from_dict(message)
+
+        elif message_type == MessageType.Commit:
+            return Commit.from_dict(message)
+
+        elif message_type == MessageType.JobStatus:
+            return JobStatus.from_dict(message)
+
+        else:
+            raise MessageException(f"Unsupported Message: {message}")
