@@ -123,14 +123,6 @@ class ResourceAgent(Agent):
         # % above min cost allowed in candidate selection (lower = stricter, higher = more agents considered)
         self.selection_threshold_pct = job_cfg.get("selection_threshold_pct", 10.0)
 
-        # ---- perf caches ----
-        self._feas_cache: dict[tuple, bool] = {}
-        self._base_cost_cache: dict[tuple, float] = {}
-
-        # optional: cap cache sizes if you have very long runs
-        self._feas_cache_max = 100_000
-        self._cost_cache_max = 100_000
-
         self.selector = SelectionEngine(
             feasible=lambda job, agent: self.is_job_feasible(job, agent),
             cost=self._cost_job_on_agent,
@@ -546,20 +538,6 @@ class ResourceAgent(Agent):
             #round(caps.core, 3), round(caps.ram, 3), round(caps.disk, 3), round(getattr(caps, "gpu", 0.0), 3),
             dtn_pairs,
         )
-
-    def _feas_key(self, agent: AgentInfo, job: Job) -> tuple:
-        return ("F", self._agent_sig(agent), self._job_sig(job))
-
-    def _cost_key(self, agent: AgentInfo, job: Job) -> tuple:
-        # base cost doesn’t depend on load; keep load out so cache survives load changes
-        return ("C", self._agent_sig(agent), self._job_sig(job))
-
-    def _maybe_trim_cache(self):
-        # very simple LRU-ish trim (cheap + good enough)
-        if len(self._feas_cache) > self._feas_cache_max:
-            self._feas_cache.clear()
-        if len(self._base_cost_cache) > self._cost_cache_max:
-            self._base_cost_cache.clear()
 
     def compute_job_cost(
             self,  # now uses self so it can read config defaults
