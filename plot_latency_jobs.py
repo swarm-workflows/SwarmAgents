@@ -10,7 +10,7 @@ import os
 import redis
 
 from swarm.database.repository import Repository
-from swarm.models.job import Job, JobState
+from swarm.models.job import Job, ObjectState
 from collections import defaultdict
 
 from typing import Set
@@ -105,13 +105,13 @@ def load_metrics_from_repo(repo: Repository) -> dict[int, dict]:
     return metrics_by_agent
 
 def save_metrics(metrics: dict[int, dict], path: str):
-    # Save combined CSV with leader_agent_id
+    # Save combined CSV with leader_id
     with open(path, 'w', newline='') as f:
         json.dump(metrics, f, indent=2)
 
 
 def save_agents(agents: list[Any], path: str):
-    # Save combined CSV with leader_agent_id
+    # Save combined CSV with leader_id
     with open(path, 'w', newline='') as f:
         json.dump(agents, f, indent=2)
 
@@ -124,10 +124,10 @@ def save_jobs(jobs: list[Any], path: str):
         else:
             job = job_data
         job_id = job.job_id
-        leader_id = getattr(job, "leader_agent_id", None)
+        leader_id = getattr(job, "leader_id", None)
         if leader_id is None:
             continue
-        if job.state not in [JobState.READY, JobState.RUNNING, JobState.COMPLETE]:
+        if job.state not in [ObjectState.READY, ObjectState.RUNNING, ObjectState.COMPLETE]:
             continue
 
         # Store all in one row
@@ -138,15 +138,15 @@ def save_jobs(jobs: list[Any], path: str):
             job.selected_by_agent_at if job.selected_by_agent_at is not None else 0,
             job.scheduled_at if job.scheduled_at is not None else 0,
             job.completed_at if job.completed_at is not None else 0,
-            job.status if job.status is not None else 0,
+            job.exit_status if job.exit_status is not None else 0,
             leader_id
         ])
 
-    # Save combined CSV with leader_agent_id
+    # Save combined CSV with leader_id
     with open(path, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(['job_id', 'created_at', 'selection_started_at', 'selected_by_agent_at', 'scheduled_at',
-                            'completed_at', 'exit_status', 'leader_agent_id'])
+                            'completed_at', 'exit_status', 'leader_id'])
         writer.writerows(detailed_latency)
 
 def plot_agent_loads_from_dir(run_dir):
@@ -449,7 +449,7 @@ def plot_scheduling_latency_and_jobs(run_dir: str,
         return
 
     # Group by leader agent
-    grouped = df.groupby("leader_agent_id", dropna=False)
+    grouped = df.groupby("leader_id", dropna=False)
 
     # Scatter: scheduling latency per job
     plt.figure(figsize=(12, 6))
@@ -469,7 +469,7 @@ def plot_scheduling_latency_and_jobs(run_dir: str,
 
     # Jobs per agent (bar plot) — for the filtered set
     jobs_per_agent = grouped.size()
-    jobs_per_agent = jobs_per_agent.reindex(sorted(df["leader_agent_id"].dropna().unique()))
+    jobs_per_agent = jobs_per_agent.reindex(sorted(df["leader_id"].dropna().unique()))
 
     plt.figure(figsize=(10, 6))
     plt.bar(jobs_per_agent.index, jobs_per_agent.values)

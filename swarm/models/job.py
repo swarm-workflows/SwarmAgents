@@ -21,92 +21,32 @@
 # SOFTWARE.
 #
 # Author: Komal Thareja(kthare10@renci.org)
-import enum
-import json
 import logging
-import os
-import threading
 import time
 import traceback
-import uuid
 from typing import Tuple, Any, List
 
-import paramiko
-import redis
-
+from swarm.models.object import Object, ObjectState
 from swarm.models.capacities import Capacities
 from swarm.models.data_node import DataNode
 
-
-class JobState(enum.Enum):
-    PENDING = enum.auto()
-    PRE_PREPARE = enum.auto()
-    PREPARE = enum.auto()
-    COMMIT = enum.auto()
-    READY = enum.auto()
-    RUNNING = enum.auto()
-    IDLE = enum.auto()
-    COMPLETE = enum.auto()
-    FAILED = enum.auto()
-
-
-job = {
-    "id": "job_id",
-    "execution_time": 10,
-    "capacities": {
-        "core": 1,
-        "ram": 100,
-        "disk": 10,
-    },
-    "data_in": [{
-        "remote_ip": "1.2.3.4",
-        "remote_user": "rocky",
-        "remote_file": "/tmp/input1.txt"
-    },
-    {
-            "remote_ip": "1.2.3.4",
-            "remote_user": "rocky",
-            "remote_file": "/tmp/input1.txt"
-    }],
-    "data_out": [{
-        "remote_ip": "1.2.3.4",
-        "remote_user": "rocky",
-        "remote_file": "/tmp/output1.txt"
-    },
-        {
-            "remote_ip": "1.2.3.4",
-            "remote_user": "rocky",
-            "remote_file": "/tmp/output2.txt"
-        }]
-}
-
-
-class Job:
-    OP_GET = "GET"
-    OP_PUT = "PUT"
-
+class Job(Object):
     def __init__(self, logger: logging.Logger = None):
-        self.job_id = None
+        super().__init__()
         self.capacities = None
         self.capacity_allocations = None
         self.execution_time = 0
         self.data_in = []
         self.data_out = []
-        self.state = JobState.PENDING
-        self.status = 0
+        self.exit_status = 0
         self.data_in_time = 0
         self.data_out_time = 0
-        self.prepares = 0
-        self.commits = 0
         self.logger = logger if logger else logging.getLogger(self.__class__.__name__)
-        self.lock = threading.RLock()  # Lock for synchronization
         self.created_at = time.time()
         self.selection_started_at = None
         self.selected_by_agent_at = None
         self.scheduled_at = None
         self.completed_at = None
-        self.leader_agent_id = None
-        self.time_last_state_change = 0
         self.no_op_count = 0
         self.job_type = None  # default until classified
 
@@ -134,21 +74,15 @@ class Job:
         with self.lock:
             self.completed_at = time.time()
 
-    def get_leader_agent_id(self) -> int:
+    @property
+    def job_id(self) -> str:
         with self.lock:
-            return self.leader_agent_id
+            return self.object_id
 
-    def set_leader(self, leader_agent_id: int):
+    @job_id.setter
+    def job_id(self, value):
         with self.lock:
-            self.leader_agent_id = leader_agent_id
-
-    def set_job_id(self, job_id: str):
-        with self.lock:
-            self.job_id = job_id
-
-    def get_job_id(self) -> str:
-        with self.lock:
-            return self.job_id
+            self.object_id = value
 
     def set_capacities(self, cap: Capacities) -> None:
         with self.lock:
@@ -185,12 +119,7 @@ class Job:
         with self.lock:
             return self.data_out.copy()
 
-    def set_state(self, state: JobState):
-        with self.lock:
-            self.state = state
-            self.time_last_state_change = time.time()
-
-    def get_state(self) -> JobState:
+    def get_state(self) -> ObjectState:
         return self.state
 
     def set_properties(self, **kwargs):
@@ -283,7 +212,7 @@ class Job:
     def execute(self, data_transfer: bool = True):
         try:
             self.logger.info(f"Starting execution for job: {self.job_id}")
-            self.change_state(new_state=JobState.RUNNING)
+            self.state = ObjectState.RUNNING
             # TODO: Transfer files from data_in nodes
 
             # Simulate job execution by sleeping for execution_time seconds
@@ -292,67 +221,23 @@ class Job:
             time.sleep(execution_time)
 
             # TODO: Transfer files from data_out nodes
-
-            self.change_state(new_state=JobState.COMPLETE)
+            self.state = ObjectState.COMPLETE
             self.logger.info(f"Completed execution for job: {self.job_id}")
         except Exception as e:
-            self.logger.error(f"Error occurred while executing Task: {self.get_job_id()} e: {e}")
+            self.logger.error(f"Error occurred while executing Task: {self.job_id} e: {e}")
             self.logger.error(traceback.format_exc())
 
-    @staticmethod
-    def file_transfer(operation: str, remote_ip: str, remote_user: str, remote_file: str):
-        ssh_client = paramiko.SSHClient()
-        try:
-            ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            ssh_client.connect(hostname=remote_ip, username=remote_user, key_filename="~/.ssh/id_rsa")
-
-            file_name_with_ext = os.path.basename(remote_file)
-            remote_dir = os.path.dirname(remote_file)
-            file_name, file_ext = os.path.splitext(file_name_with_ext)
-            random_uuid = str(uuid.uuid4())
-
-            random_file = f"{file_name}_{random_uuid}{file_ext}"
-
-            if operation == Job.OP_GET:
-                # Open an SFTP session
-                with ssh_client.open_sftp() as sftp:
-                    # Transfer the file from the remote node
-                    sftp.get(remote_file, random_file)
-            elif operation == Job.OP_PUT:
-                # Open an SFTP session
-                with ssh_client.open_sftp() as sftp:
-                    # Transfer the file to the remote node
-                    sftp.put(file_name_with_ext, f"{remote_dir}/{random_file}")
-        except Exception as e:
-            print(f"Failed to get the file: {e}")
-        finally:
-            ssh_client.close()
-
-    def is_pending(self):
-        return self.get_state() == JobState.PENDING
-
-    def is_running(self):
-        return self.get_state() == JobState.RUNNING
-
-    def is_ready(self):
-        return self.get_state() == JobState.READY
-
-    def is_commit(self):
-        return self.get_state() == JobState.COMMIT
-
-    def is_complete(self):
-        return self.get_state() == JobState.COMPLETE
-
-    def change_state(self, new_state: JobState):
-        self.logger.debug(f"Transitioning job {self.job_id} from {self.state} to {new_state}")
-        self.set_state(state=new_state)
-        if new_state in [JobState.PRE_PREPARE, JobState.PREPARE]:
+    def on_state_changed(self, old_state, new_state):
+        self.logger.debug(
+            f"Transitioning job {self.job_id} from {old_state} to {new_state}"
+        )
+        if new_state in (ObjectState.PRE_PREPARE, ObjectState.PREPARE):
             self.set_selection_start_time()
-        elif new_state in [JobState.READY]:
+        elif new_state is ObjectState.READY:
             self.set_selection_end_time()
-        elif new_state == JobState.RUNNING:
+        elif new_state is ObjectState.RUNNING:
             self.set_scheduled_time()
-        elif new_state == JobState.COMPLETE:
+        elif new_state is ObjectState.COMPLETE:
             self.set_completed_time()
 
     def to_dict(self):
@@ -364,17 +249,15 @@ class Job:
             'data_in': [data_node.to_dict() for data_node in self.data_in],
             'data_out': [data_node.to_dict() for data_node in self.data_out],
             'state': self.state.value,
-            'status': self.status,
+            'exit_status': self.exit_status,
             'data_in_time': self.data_in_time,
             'data_out_time': self.data_out_time,
-            'prepares': self.prepares,
-            'commits': self.commits,
             'created_at': self.created_at,
             'selection_started_at': self.selection_started_at,
             'selected_by_agent_at': self.selected_by_agent_at,
             'scheduled_at': self.scheduled_at,
             'completed_at': self.completed_at,
-            'leader_agent_id': self.leader_agent_id,
+            'leader_id': self.leader_id,
             'time_last_state_change': self.time_last_state_change,
             'job_type': self.job_type
         }
@@ -386,18 +269,16 @@ class Job:
         self.execution_time = job_data['execution_time']
         self.data_in = [DataNode.from_dict(data_in) for data_in in job_data['data_in']]
         self.data_out = [DataNode.from_dict(data_out) for data_out in job_data['data_out']]
-        self.state = JobState(job_data['state']) if job_data.get('state') else JobState.PENDING
-        self.status = job_data['status'] if job_data.get('status') else 0
+        self.state = ObjectState(job_data['state']) if job_data.get('state') else ObjectState.PENDING
+        self.exit_status = job_data['exit_status'] if job_data.get('exit_status') else 0
         self.data_in_time = job_data['data_in_time'] if job_data.get('data_in_time') is not None else None
         self.data_out_time = job_data['data_out_time'] if job_data.get('data_out_time') is not None else None
-        self.prepares = job_data['prepares'] if job_data.get('prepares') else 0
-        self.commits = job_data['commits'] if job_data.get('commits') else 0
         self.created_at = job_data['created_at'] if job_data.get('created_at') is not None else time.time()
         self.selection_started_at = job_data['selection_started_at'] if job_data.get('selection_started_at') is not None else time.time()
         self.selected_by_agent_at = job_data['selected_by_agent_at'] if job_data.get('selected_by_agent_at') is not None else None
         self.scheduled_at = job_data['scheduled_at'] if job_data.get('scheduled_at') is not None else None
         self.completed_at = job_data['completed_at'] if job_data.get('completed_at') is not None else None
-        self.leader_agent_id = job_data['leader_agent_id'] if job_data.get('leader_agent_id') is not None else None
+        self.leader_id = job_data['leader_id'] if job_data.get('leader_id') is not None else None
         self.time_last_state_change = job_data['time_last_state_change'] if job_data.get('time_last_state_change') is not None else None
         self.classify_job_type()
 
@@ -430,3 +311,5 @@ class Job:
         # ---- Combine ----
         self.job_type = f"{resource_class}_{time_class}_{io_class}"
         return self.job_type
+
+

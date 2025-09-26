@@ -180,7 +180,7 @@ if __name__ == "__main__":
     elif args.db_type == 'etcd':
         try:
             client = pyetcd.client(host=args.db_host, port=args.db_port)
-            client.status()
+            client.exit_status()
             print(f"Connected to etcd at {args.db_host}:{args.db_port}")
             data_by_phase, all_known_job_ids = parse_etcd_db(client)
         except Exception as e:

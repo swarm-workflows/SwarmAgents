@@ -24,16 +24,13 @@
 from dataclasses import dataclass, field
 import queue
 
-from swarm.queue.job_queue import JobQueue
-from swarm.queue.simple_job_queue import SimpleJobQueue
+from swarm.queue.object_queue import ObjectQueue
+from swarm.queue.simple_queue import SimpleQueue
 
 
 @dataclass
 class AgentQueues:
     def __init__(self):
-        self.job_queue = SimpleJobQueue()
-        self.selected_queue = SimpleJobQueue()
-        self.ready_queue = SimpleJobQueue()
-        self.done_queue = SimpleJobQueue()
         self.message_queue = queue.Queue()
-        self.hb_message_queue = queue.Queue()
+        self.pending_queue = SimpleQueue()
+        self.selected_queue = SimpleQueue()

@@ -22,15 +22,31 @@
 #
 # Author: Komal Thareja(kthare10@renci.org)
 # File: swarm/comm/grpc_consensus_server.py
+# grpc_server.py
+from __future__ import annotations
+
+import json
 import logging
+from typing import Any
 
 import grpc
 from concurrent import futures
-import json
-
 from swarm.comm import consensus_pb2_grpc, consensus_pb2
+# Standard gRPC health service
+from grpc_health.v1 import health, health_pb2, health_pb2_grpc
+
 from swarm.comm.observer import Observer
 
+LOG = logging.getLogger(__name__)
+
+_DEFAULT_OPTS = [
+    ('grpc.keepalive_time_ms', 30000),
+    ('grpc.keepalive_timeout_ms', 10000),
+    ('grpc.keepalive_permit_without_calls', 1),
+    ('grpc.http2.max_pings_without_data', 0),
+    ('grpc.max_send_message_length', 50 * 1024 * 1024),
+    ('grpc.max_receive_message_length', 50 * 1024 * 1024),
+]
 
 class ConsensusServiceServicer(consensus_pb2_grpc.ConsensusServiceServicer):
     def __init__(self, observer: Observer):
@@ -44,30 +60,50 @@ class ConsensusServiceServicer(consensus_pb2_grpc.ConsensusServiceServicer):
             "payload": json.loads(request.payload),
             "timestamp": request.timestamp
         }
-        self.observer.dispatch_message(msg)
+        self.observer.on_message(msg)
         return consensus_pb2.Ack(success=True, info="Processed")
 
-
 class GrpcServer:
-    def __init__(self, port: int, observer: Observer, logger: logging.Logger = logging.getLogger()):
-        self.port = port
-        self.observer = observer
-        self.server = grpc.server(futures.ThreadPoolExecutor(max_workers=5))
-        self._bind_services()
-        self.logger = logger
+    def __init__(self, on_message: Any, bind_host: str, bind_port: int, max_workers: int = 32, options=None):
+        self.on_message = on_message
+        self.bind_host = bind_host or "127.0.0.1"     # normalize to IPv4 loopback
+        self.bind_port = int(bind_port)
+        self._server = grpc.server(futures.ThreadPoolExecutor(max_workers=max_workers),
+                                   options=options or _DEFAULT_OPTS)
+        self._health = health.HealthServicer()
+        health_pb2_grpc.add_HealthServicer_to_server(self._health, self._server)
+        self._serving = False
 
-    def _bind_services(self):
-        consensus_pb2_grpc.add_ConsensusServiceServicer_to_server(
-            ConsensusServiceServicer(self.observer), self.server)
-        self.server.add_insecure_port(f"[::]:{self.port}")
+    def add_service(self, add_servicer_fn, servicer_impl):
+        """
+        add_servicer_fn: the generated `add_<Service>Servicer_to_server`
+        servicer_impl: your Servicer implementation instance
+        """
+        add_servicer_fn(servicer_impl, self._server)
 
     def start(self):
-        self.logger.info(f"[gRPC] Server starting on port {self.port}...")
-        self.server.start()
+        # Mark health as SERVING only after we’ve registered all services
+        self._health.set('', health_pb2.HealthCheckResponse.SERVING)
+        endpoint = f"{self.bind_host}:{self.bind_port}"
+        self._server.add_insecure_port(endpoint)
+        self._server.start()
+        self._serving = True
+        LOG.info("gRPC server listening on %s", endpoint)
 
-    def wait_for_termination(self):
-        self.server.wait_for_termination()
+    def stop(self, grace: float = 1.0):
+        if self._serving:
+            try:
+                self._health.set('', health_pb2.HealthCheckResponse.NOT_SERVING)
+            except Exception:
+                pass
+        self._server.stop(grace)
+        self._serving = False
+        LOG.info("gRPC server stopped (%s)", f"{self.bind_host}:{self.bind_port}")
 
-    def stop(self, grace: int = 1):
-        self.logger.info(f"[gRPC] Server shutting down...")
-        self.server.stop(grace)
+    @property
+    def health(self) -> health.HealthServicer:
+        return self._health
+
+    @property
+    def server(self):
+        return self._server

@@ -23,45 +23,20 @@
 # Author: Komal Thareja(kthare10@renci.org)
 import sys
 
-
 if __name__ == '__main__':
-    if len(sys.argv) < 3:
-        print("Usage: python main.py <agent_type> <agent_id> [<topo>]")
+    if len(sys.argv) < 2:
+        print("Usage: python main.py <agent_id> [--debug]")
         sys.exit(1)
 
-    agent_type = sys.argv[1].lower()
-    agent_id = int(sys.argv[2])
+    agent_id = int(sys.argv[1])
 
-    local_topo = True if len(sys.argv) > 3 else False
+    debug = False
+    if len(sys.argv) > 2 and sys.argv[2] == "--debug":
+        debug = True
 
-    # Load configuration based on agent type
-    if agent_type == "pbft":
-        config_file = "./config_pbft.yml"
-        from swarm.agents.pbft_agentv2 import PBFTAgent
-        agent = PBFTAgent(agent_id=agent_id, config_file=config_file)
-    elif agent_type == "swarm-single":
-        config_file = "./config_swarm_single.yml"
-        if local_topo:
-            config_file = f"./config_swarm_single_{agent_id}.yml"
-        # Initialize your swarm-single agent here using the config_file
-        from swarm.agents.swarm_agent import SwarmAgent
-        agent = SwarmAgent(agent_id=agent_id, config_file=config_file)
-    elif agent_type == "swarm-multi":
-        config_file = "./config_swarm_multi.yml"
-        if local_topo:
-            config_file = f"./configs/config_swarm_multi_{agent_id}.yml"
-        # Initialize your swarm-multi agent here using the config_file
-        from swarm.agents.swarm_agent_multi_grpc import SwarmAgent
-        agent = SwarmAgent(agent_id=agent_id, config_file=config_file)
-    elif agent_type == "db-swarm-multi":
-        config_file = "./config_swarm_multi.yml"
-        if local_topo:
-            config_file = f"./config_swarm_multi_{agent_id}.yml"
-        # Initialize your swarm-multi agent here using the config_file
-        from swarm.agents.swarm_agent_multi_db import SwarmAgent
-        agent = SwarmAgent(agent_id=agent_id, config_file=config_file)
-    else:
-        print(f"Unknown agent type: {agent_type}")
-        sys.exit(1)
+    config_file = f"./configs/config_swarm_multi_{agent_id}.yml"
+
+    from swarm.agents.resource_agent import ResourceAgent
+    agent = ResourceAgent(agent_id=agent_id, config_file=config_file, debug=debug)
 
     agent.start()

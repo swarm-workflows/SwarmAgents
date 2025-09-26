@@ -12,3 +12,4 @@ grpcio
 grpcio-tools
 etcd-sdk-python
 confluent-kafka
+grpcio-health-checking

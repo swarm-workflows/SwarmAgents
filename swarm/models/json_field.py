@@ -130,6 +130,17 @@ class JSONField(ABC):
                         new_value.append(x)
                 if len(new_value):
                     new_dict[new_key] = new_value
+            elif isinstance(v, dict):
+                new_value = {}
+                for x, y in v.items():
+                    if isinstance(y, JSONField):
+                        new_y = y.to_dict()
+                        if new_y:
+                            new_value[x] = new_y
+                    else:
+                        new_value[x] = y
+                if len(new_value):
+                    new_dict[new_key] = new_value
             else:
                 new_dict[new_key] = v
 

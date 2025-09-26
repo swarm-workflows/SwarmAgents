@@ -1,222 +1,170 @@
-# SwarmAgents-Consensus
+# SwarmAgents
 
-This repository contains code for emulating SWARM agents and exploring multi-agent consensus for job selection. It leverages existing algorithms commonly used in blockchain and extends them, adding novel approaches tailored for SWARM and enhancing resilience.
+This repository provides a framework for implementing greedy distributed consensus and selection algorithms. It is designed to support scalable, resilient, and efficient decision-making across multiple agents in a distributed system.
 
-## Practical Byzantine Fault Tolerance (PBFT)
-PBFT algorithm is explored and implemented in `pbft_agentv2.py`. This agent works as follows:
+The core logic enables agents to reach consensus and make selections (such as job assignments) using PBFT-like protocols and cost-based selection strategies. The framework is modular, allowing for flexible integration of custom consensus, selection, and penalty mechanisms.
 
-### Design Overview
-
-- Each agent maintains its own copy of the job queue.
-- Agents work together to decide which jobs to schedule, taking into account:
-  - Data dependencies of the jobs
-  - Resource requirements specified for each job
-  - The agent's available resources
-  - Load status of neighboring agents
-
-- Communication between agents occurs via Kafka using broadcast messaging. 
-- Agents share load and resource information through heartbeat messages.
-
-#### Leader Election
-Each agent strives to become the leader for executing a job based on the following conditions:
-
-- The agent has sufficient resources to handle the job.
-- The agent has access to the required data dependencies for the job.
-- The agent's load is less than that of all its neighboring agents.
-
-#### Proposal Process
-- When the conditions for leadership are met, the agent sends a Proposal to all other agents in the network.
-- Each Proposal includes a seed value, a random number between 0 and 1, to help resolve conflicts.
-- Proposal collisions are resolved by selecting the agent with the lowest seed value.
-- After sending a Proposal, the agent awaits Prepare messages indicating acceptance of its proposal.
-- If a quorum of Prepare messages is received, the agent sends Commit messages to the network to indicate the leader election.
-- Once a quorum of Commit messages is received, the agent finalizes the leader election, and the job is scheduled for execution.
+## Key Features
+- Greedy distributed selection and consensus algorithms
+- Modular design for consensus, selection, and penalty logic
+- Example application for job selection
+- Extensible for other distributed resource allocation problems
 
 
-### Performance
-PBFT consensus works with smaller number of agents but struggles to scale efficiently as the number of agents increases, due to its communication complexity.
-However, it's resilient and fault tolerant.
+## Core Modules
 
-Performance results for PBFT can be found [here](./runs/pbft).
+### Consensus Engine (`consensus/engine.py`)
+This module implements a generic PBFT-like consensus engine for distributed agreement among agents. It is framework-agnostic and uses host, transport, and router adapters for I/O and side effects. The engine manages proposals, prepares, and commits, allowing agents to reach agreement on object states (such as job assignments) through quorum-based rounds.
 
-![Overall scheduling latency vs number of agents](./runs/ccgrid/pbft/overall-scheduling-latency.png)
+**How it works:**
+- Agents initiate proposals for objects (e.g., jobs) and broadcast them to peers.
+- Peers respond with prepare and commit messages, tracked by the engine.
+- The engine checks for quorum and triggers selection or commit actions when consensus is reached.
+- The engine is designed to be integrated with custom agent logic via adapter classes.
 
-### Usage
-- Set up the python environment by installing all the dependencies:
-```
-pip install -r requirements.txt
-```
-- Bring up the kafka cluster using `docker-compose up -d`
-- Generates `tasks.json` via `python task_generator.py 100`
-- Start Agents via following command:
-```
-sh pbft-start.sh
-```
-- Launch Log Runs
-```
-nohup sh launch-runs.sh runs/ccgrid/pbft/3/repeated 100 pbft & disown
-```
-- Analyze results and generate plots
-```
-python analyze_results.py --number_of_agents 3 --run_directory pbft/3/repeated/ --algo PBFT
-```
+**How to use:**
+- Instantiate `ConsensusEngine` with your agent's ID and adapter implementations for host, transport, and router.
+- Use the `propose`, `on_proposal`, `on_prepare`, and `on_commit` methods to drive the consensus protocol.
+- See `resource_agent.py` for a concrete example of integration.
 
-## SWARM Consensus (Swarm)
-SWARM algorithm extends PBFT consensus to the swarm topology and implemented in `swarm_agent.py`. In the first version, we have changed the leader election process as described below:
+### Selection Engine (`selection/engine.py`)
+This module provides a generic, cache-enabled engine for assigning candidates (e.g., jobs) to assignees (e.g., agents/resources) based on feasibility and cost functions. It supports cost matrix computation, threshold-based selection, and memoization for performance.
 
-### Swarm Agent Upgrade (Swarm Multi) (Scalability)
+**How it works:**
+- Define feasibility and cost functions for your assignment problem.
+- The engine computes a cost matrix for all candidate-assignee pairs, marking infeasible assignments with infinity.
+- It selects the best assignee for each candidate using greedy or thresholded strategies, with optional tie-breaking and acceptance criteria.
+- Internal LRU caches speed up repeated feasibility and cost checks.
 
-- Neighbor Map via Redis (Source of Truth)
-  - Centralized state of peer agents maintained in Redis 
-  - Each agent periodically updates its metadata (load, availability, etc.)
-  - Any agent whose information is stale by a configured timeout is considered to be lost or out of topology.
+**How to use:**
+- Instantiate `SelectionEngine` with your feasibility and cost functions, plus key and versioning functions for candidates and assignees.
+- Use `compute_cost_matrix` to build the assignment matrix, and `pick_agent_per_candidate` to select assignments.
+- The engine is highly configurable for different selection policies and caching needs.
 
-- Topology Support (Configurable)
-  - Mesh: Every agent connects to every other agent 
-  - Ring:
-    - Agents grouped into rings of 5 
-    - Multiple rings interconnected, forming hierarchical rings
-    - Each agent shares information about its connected peers with others in its ring. 
-    - Despite the segmented structure, consensus is reached by aggregating the state across all agents.
-- Communication Upgrade 
-  - Replaced Kafka with gRPC 
-  - Reduced overhead 
-    - Improved real-time responsiveness 
-    - Simplified protocol semantics
+## Example: Job Selection
 
-New results based on these changes can be found [here](./runs/ccgrid/swarm/topology/)
+The file `swarm/agents/resource_agent.py` provides a comprehensive example of distributed job selection using both the consensus and selection engines:
 
-![Agent](./images/agent-overview.png)
+### Cost Computation Equation
 
-#### Deploy
-[Notebook](./notebooks/SWARM-topo-simple.ipynb) can be used to deploy this on FABRIC. 
+The cost for assigning a job to an agent is computed as a weighted sum of resource utilizations, plus penalties for long jobs and connectivity:
 
-### Leader Election Process
+$$
+	ext{cost} = w_{cpu} \cdot \text{CPU}_{util} + w_{ram} \cdot \text{RAM}_{util} + w_{disk} \cdot \text{Disk}_{util} + w_{gpu} \cdot \text{GPU}_{util} + \text{penalties}
+$$
 
-Each agent utilizes a cost matrix to determine whether it should become the leader for executing a job by performing the following steps:
+Where:
+- $w_{cpu}$, $w_{ram}$, $w_{disk}$, $w_{gpu}$ are the weights for each resource (see `__init__` in `resource_agent.py`).
+- Resource utilization terms are computed as the fraction of required over available capacity.
+- Penalties include:
+	- Long job penalty: applied if job execution time exceeds `long_job_threshold`.
+	- Connectivity penalty: scaled by `connectivity_penalty_factor` for DTN jobs.
 
-1. **Feasibility Check (`feasibility`):** Verify that the requested resources fit within the agent's total available resources.
-2. **Task Cost Calculation (`cost_of_job`):** Determine the requested resources as a percentage of the agent's total resources.
-3. **Agent Load Calculation (`agent_load`):** Calculate the average of in-use resources relative to the agent's total resources.
-4. **Cost of Task Execution on Agent (`cost_of_job_on_agent`):** If the job is feasible, calculate it as `agent_load + feasibility * cost_of_job`; otherwise, it is set to infinite.
-5. **Cost Comparison:** Compare costs across all agents for the given job.
-6. **Leader Election:** If the agent with the minimum cost matches its own ID, it initiates a leader election for the job.
+The final cost is used by the selection engine to compare candidate assignments and select the best agent for each job.
+
+### Job Feasibility
+
+Job feasibility determines whether an agent can execute a given job, based on its current resource capacities and the job's requirements. The logic is implemented in the `is_job_feasible` method of `resource_agent.py`.
+
+**Feasibility criteria include:**
+- The agent must have enough available CPU, RAM, Disk, and GPU resources to meet the job's requirements.
+- The agent must satisfy any additional constraints, such as data dependencies or network connectivity (for DTN jobs).
+- The method checks for resource overcommitment and ensures that jobs are only assigned to agents that can complete them successfully.
+
+This feasibility check is performed before cost computation and candidate selection, ensuring that only valid agent-job pairs are considered in the assignment process.
+
+### Cost Matrix and Candidate Selection
+
+After feasibility is determined, the selection engine computes a cost matrix representing the assignment cost for each agent-job pair. This is handled by the `compute_cost_matrix` method of the `SelectionEngine` (see its instantiation and usage in `resource_agent.py`).
+
+- **Cost Matrix:**
+	- Each row corresponds to an agent, each column to a job.
+	- Entries are the computed costs (see cost equation above), or infinity for infeasible assignments.
+	- The matrix is built using the agent's current capacities, job requirements, and configured weights/penalties.
+
+- **Candidate Selection:**
+	- The selection engine uses the cost matrix to identify the best agent for each job, typically minimizing cost.
+	- Selection can be thresholded using `selection_threshold_pct` to allow more flexible candidate pools.
+	- Tie-breaking and acceptance criteria can be configured for custom selection policies.
+
+This process ensures that jobs are assigned to agents in a way that balances resource usage, cost, and system constraints, as implemented in the selection logic of `resource_agent.py`.
+
+### Distributed Consensus
+
+Once candidate assignments are selected, agents use the consensus engine to coordinate agreement on job selection across the distributed system. This is implemented using a PBFT-like protocol in the `ConsensusEngine` (see its instantiation and usage in `resource_agent.py`).
+
+- **Consensus Protocol:**
+	- Agents broadcast proposals for job assignments to their peers.
+	- Peers respond with prepare and commit messages, tracked by the consensus engine.
+	- The engine checks for quorum (majority agreement) before finalizing job assignments.
+	- Methods such as `__on_proposal`, `__on_prepare`, and `__on_commit` in `resource_agent.py` handle the protocol steps.
+
+- **Fault Tolerance:**
+	- The protocol ensures that job selection is robust to agent failures and network partitions.
+	- Only when a quorum is reached does the system commit to a job assignment, maintaining consistency.
+
+This distributed consensus mechanism allows agents to make autonomous decisions while ensuring global agreement and reliability in job scheduling.
+
+### Job Execution
+- **Execution & State Management:**
+	- After consensus, jobs are scheduled and executed by the selected agents.
+	- Job states and metrics are managed via methods like `schedule_job`, `execute_job`, and the `Metrics` class.
 
 
-### Performance
-#### Greedy Approach with Random seed and single job
-- Greedy approach with random seed used to resolve proposal collisions shows improvement over basic PBFT.
-- Job selection is triggered for only single job at a time
+Additional implementation details:
+- **Job Queue:** The job queue is managed using a Redis database, allowing agents to efficiently share and update job states in a distributed manner.
+- **Message Exchange:** Agents communicate and exchange consensus/selection messages using gRPC, enabling fast and reliable messaging across the network.
+- **Supported Topologies:** The framework supports various network topologies, including Ring, Mesh, and Hierarchical, which can be configured to match different deployment scenarios. Topology logic is handled via the `Topology` and `TopologyType` classes and used in agent initialization and routing decisions.
 
-Performance results for SWARM with single job selection can be found [here](./runs/ccgrid/swarm/single-job).
+For implementation details, see:
+- `resource_agent.py`: Integration of selection and consensus engines, job feasibility/cost logic, and scheduling workflow.
+- `is_job_feasible`, `compute_job_cost`, and `SelectionEngine` usage for assignment logic.
+- The weights and thresholds in the agent's `__init__` for tuning selection behavior.
 
-![Overall scheduling latency vs number of agents](./runs/ccgrid/swarm/single-job/overall-scheduling-latency.png)
+### Testing
 
-#### Greedy Approach with Random seed and multiple job
-- Greedy approach with random seed used to resolve proposal collisions shows improvement over basic PBFT.
-- Job selection is triggered for upto 3 jobs at a time
+You can simulate all agents on a single host for testing and benchmarking. For example, to run 30 agents in a ring topology with 100 jobs and a local Redis database, use:
 
-Performance results for SWARM with mulyiple job selection at a time can be found [here](./runs/ccgrid/swarm/multi-jobs).
-
-![Overall scheduling latency vs number of agents](./runs/ccgrid/swarm/multi-jobs/overall-scheduling-latency.png)
-
-### Usage
-- Set up the python environment by installing all the dependencies:
-```
-pip install -r requirements.txt
-```
-- Bring up the kafka cluster using `docker-compose up -d`
-- Generates `tasks.json` via `python task_generator.py 100`
-- Start Agents via following command:
-  - Multi Jobs
-```
-sh swarm-multi-start.sh
-```
-  - Single Jobs
-```
-sh swarm-single-start.sh
-```
-- Launch Log Runs
-  - Multi Jobs
-```
-  nohup sh launch-runs.sh runs/ccgrid/swarm/multi-jobs/3/repeated 100 swarm-multi & disown
-```
-  - Single Jobs
-```
-nohup sh launch-runs.sh runs/ccgrid/swarm/single-job/3/repeated 100 swarm-single & disown
+```bash
+python run_test.py --agents 30 --topology ring --jobs 100 --db-host localhost --jobs-per-interval 10 --run-dir swarm-multi
 ```
 
-- Analyze results and generate plots
-  - Multi Jobs
-```
-python analyze_results.py --number_of_agents 3 --run_directory swarm/ccgrid/multi-jobs/3/repeated/ --algo SWARM-MULTI
-```
-  - Single Jobs
-```
-python analyze_results.py --number_of_agents 3 --run_directory swarm/ccgrid/single-job/3/repeated/ --algo SWARM-SINGLE
-```
+This will launch the specified number of agents, distribute jobs, and store results in the `swarm-multi` directory. Adjust parameters as needed for your experiments.
 
-## Comparison PBFT vs SWARM Single vs SWARM Multi
-Plots generated using the script:
-```
-python comparison.py --number_of_agents <number of agents>
-```
+### Results
 
-### Results with 3 Agents
-![Idle Time](./runs/ccgrid/histogram_idle_time_with_bootstrap_ci_3.png)
-![CI Plot](./runs/ccgrid/comparison_line_plot_with_ci_3.png)
-### Results with 5 Agents
-![Idle Time](./runs/ccgrid/histogram_idle_time_with_bootstrap_ci_5.png)
-![CI Plot](./runs/ccgrid/comparison_line_plot_with_ci_5.png)
-### Results with 10 Agents
-![Idle Time](./runs/ccgrid/histogram_idle_time_with_bootstrap_ci_10.png)
-![CI Plot](./runs/ccgrid/comparison_line_plot_with_ci_10.png)
+Simulation results for different topologies (Ring, Mesh, Hierarchical, etc.) are stored in the `runs/simulation` directory. Each run contains logs, metrics, and output files summarizing agent performance, job completion rates, consensus rounds, and resource utilization.
 
-## Raft Consensus Algorithm
-RAFT algorithm is explored and implemented in `raft_agent.py`. This agent works as follows:
-### Single Leader Election:
-A single leader is chosen based on the agent's load.
-### Shared Job Queue
-Job queue is maintained in Redis
-### Job Scheduling:
-The leader agent assigns the job to other agents based on their loads.
-The leader agent schedules the job on itself if it can accommodate the job and its load is below a defined threshold.
-### Leader Down:
-If the leader fails, one of the followers assumes leadership and job scheduling continues
-### Agent Termination Handling:
-If an agent abruptly terminates while executing a job, the leader monitors the job's status.
-If a job remains in a particular state beyond a specified threshold time, it is assumed to be terminated. The leader then moves the job to a Pending state for rescheduling.
-
-### Usage
-- Set up the python environment by installing all the dependencies:
-```
-pip install -r requirements.txt
-```
-- Bring up the kafka cluster using `docker-compose up -d`
-- Generates `tasks.json` via `python task_generator.py`
-- Start Agent 0 is started via following command:
-```
-   python3.11 main-raft.py 0 100
-```
-- Rest of the agents can be started via following command:
-```
-    sh raft-start.sh
-```
-NOTE: Remember to clean up the logs and kafka topic between runs via
-```
-rm -rf *.log*
-python3.11 kafka_cleanup.py
-```
-
-### Performance
-Scales well, handling large numbers of agents effectively.
-
-Number of Agents: 10
-
-Plots generated using:
-```
-python comparison.py --number_of_agents 10
-```
+- **How to interpret results:**
+	- Compare job completion times, consensus latency, and resource usage across topologies.
+	- Use the provided plotting scripts (see `plot_latency_jobs.py`) to visualize performance metrics.
+	- Analyze logs for details on agent decisions, consensus events, and system behavior under different configurations.
 
 
-![Scheduling latency comparison - Number of agents](./runs/ccgrid/comparison_line_plot_with_ci_10raft.png)
+### Example Results Visualizations
+
+Below are example images showing results for different topologies:
+
+**Mesh Topology:**
+![Scheduling Latency](runs/simulation/mesh/30/scheduling_latency_histogram.png)
+
+![Jobs Per Agent](runs/simulation/mesh/30/jobs_per_agent.png)
+
+![Agent Load](runs/simulation/mesh/30/agent_loads_summary.png)
+
+**Ring Topology:**
+![Scheduling Latency](runs/simulation/ring/30/scheduling_latency_histogram.png)
+
+![Jobs Per Agent](runs/simulation/ring/30/jobs_per_agent.png)
+
+![Agent Load](runs/simulation/ring/30/agent_loads_summary.png)
+
+**Hierarchical Topology:**
+![Scheduling Latency](runs/simulation/hierarchical/30/scheduling_latency_histogram.png)
+
+![Jobs Per Agent](runs/simulation/hierarchical/30/jobs_per_agent.png)
+
+![Agent Load](runs/simulation/hierarchical/30/agent_loads_summary.png)
+
+For example, after running a simulation with `run_test.py`, inspect the corresponding results directory for summary files and plots. This helps evaluate the scalability, efficiency, and fault tolerance of the framework under various network structures.
+

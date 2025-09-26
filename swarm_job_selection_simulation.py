@@ -9,11 +9,12 @@ from typing import Any
 import numpy as np
 from matplotlib import pyplot as plt
 
-import swarm.utils.queues
+from swarm.utils.queues import SimpleQueue
+from swarm.utils.utils import job_capacities
 from swarm.models.capacities import Capacities
 import random
 
-from swarm.models.job import Job, JobState
+from swarm.models.job import Job, ObjectState
 
 completed_jobs = []  # global or pass into algo
 load_history = defaultdict(list)  # {agent_id: [(timestamp, load), ...]}
@@ -82,12 +83,12 @@ class Agent:
     def __init__(self, agent_id: int, capacities: Capacities):
         self.agent_id = agent_id
         self.capacities = capacities
-        self.select_queue = swarm.utils.queues.SimpleJobQueue()
+        self.select_queue = SimpleQueue()
         self.load = 0
 
     @property
     def capacity_allocations(self):
-        return self.select_queue.capacities(self.select_queue.get_jobs())
+        return job_capacities(self.select_queue.gets())
 
 
 class SelectionAlgo:
@@ -101,7 +102,7 @@ class SelectionAlgo:
             agent = Agent(agent_id=x,
                           capacities=capacity)
             self.agents[x] = agent
-        self.jobs = swarm.utils.queues.SimpleJobQueue()
+        self.jobs = SimpleQueue()
 
     @staticmethod
     def random_capacity(min_val, max_val):
@@ -110,7 +111,7 @@ class SelectionAlgo:
     @staticmethod
     def compute_overall_load(agent: Agent):
         allocated_caps = Capacities()
-        allocated_caps += agent.select_queue.capacities(agent.select_queue.get_jobs())
+        allocated_caps += job_capacities(agent.select_queue.gets())
 
         return SelectionAlgo.resource_usage_score(allocated=allocated_caps, total=agent.capacities)
 
@@ -181,7 +182,7 @@ class SelectionAlgo:
         Select feasible agents and assign jobs to their select queues based on cost.
         This function clears the central job queue once jobs are assigned.
         """
-        jobs = self.jobs.get_jobs(states=[JobState.PENDING], count=100)
+        jobs = self.jobs.gets(states=[ObjectState.PENDING], count=100)
         if not jobs:
             return
 
@@ -192,11 +193,11 @@ class SelectionAlgo:
             job = jobs[j]
             agent = self.agents.get(agent_id)
             if agent:
-                job.set_leader(agent.agent_id)
-                job.change_state(JobState.READY)
+                job.leader_id = agent_id
+                job.state = ObjectState.READY
                 completed_jobs.append(job)
-                agent.select_queue.add_job(job)
-                self.jobs.remove_job(job.get_job_id())
+                agent.select_queue.add(job)
+                self.jobs.remove(job.job_id)
 
     @staticmethod
     def is_job_feasible(job: Job, total: Capacities, projected_load: float,
@@ -258,7 +259,7 @@ def job_producer_thread(algo: SelectionAlgo, job_rate: int = 20):
         job_dict = generator.generate_job(job_index)
         job = Job()
         job.from_dict(job_dict)
-        algo.jobs.add_job(job)
+        algo.jobs.add(job)
         job_index += 1
         time.sleep(sleep_time)
 
@@ -283,13 +284,13 @@ def metrics_printer_thread(algo: SelectionAlgo, interval: float = 5.0):
 
 def agent_executor_thread(agent: Agent):
     while True:
-        jobs = agent.select_queue.get_jobs()
+        jobs = agent.select_queue.gets()
         if not jobs:
             time.sleep(0.5)
             continue
 
         job = jobs[0]
-        agent.select_queue.remove_job(job.get_job_id())
+        agent.select_queue.remove(job.get_job_id())
         agent.load = SelectionAlgo.compute_overall_load(agent=agent)
         exec_time = getattr(job, "execution_time", 1)
         time.sleep(exec_time)
@@ -315,7 +316,7 @@ def agent_selection_thread(agent: Agent, algo: SelectionAlgo):
     quorum_threshold = (n_agents // 2) + 1
 
     while True:
-        pending_jobs = algo.jobs.get_jobs(states=[JobState.PENDING], count=20)
+        pending_jobs = algo.jobs.gets(states=[ObjectState.PENDING], count=20)
         if not pending_jobs:
             time.sleep(0.5)
             continue
@@ -331,8 +332,8 @@ def agent_selection_thread(agent: Agent, algo: SelectionAlgo):
             if selected_agent_id == agent.agent_id:
                 job = pending_jobs[job_idx]
                 with proposal_lock:
-                    if job.get_job_id() not in job_proposals:
-                        job_proposals[job.get_job_id()] = {
+                    if job.job_id not in job_proposals:
+                        job_proposals[job.job_id] = {
                             "leader": agent.agent_id,
                             "prepares": {agent.agent_id},
                             "commits": set()
@@ -342,7 +343,7 @@ def agent_selection_thread(agent: Agent, algo: SelectionAlgo):
         with proposal_lock:
             for job_id, proposal in list(job_proposals.items()):
                 leader_id = proposal["leader"]
-                job = algo.jobs.get_job(job_id)
+                job = algo.jobs.get(job_id)
                 if not job:
                     continue
 
@@ -361,11 +362,11 @@ def agent_selection_thread(agent: Agent, algo: SelectionAlgo):
 
                 # Finalize on commit quorum
                 if leader_id == agent.agent_id and len(proposal["commits"]) >= quorum_threshold:
-                    job.set_leader(leader_id)
-                    job.change_state(JobState.READY)
+                    job.leader_id = leader_id
+                    job.state = ObjectState.READY
                     completed_jobs.append(job)
-                    agent.select_queue.add_job(job)
-                    algo.jobs.remove_job(job.get_job_id())
+                    agent.select_queue.add(job)
+                    algo.jobs.remove(job.job_id)
                     del job_proposals[job_id]
 
         time.sleep(0.5)
@@ -416,7 +417,7 @@ if __name__ == '__main__':
             execution_latency = (job.completed_at - job.scheduled_at) if job.completed_at and job.scheduled_at else None
             total_latency = (job.completed_at - job.created_at) if job.completed_at else None
             writer.writerow([
-                job.get_job_id(), job.get_leader_agent_id(),
+                job.job_id, job.leader_id,
                 job.created_at, job.selected_by_agent_at, job.scheduled_at, job.completed_at,
                 selection_latency, execution_latency, total_latency
             ])
@@ -446,7 +447,7 @@ if __name__ == '__main__':
     # --- Plot Job Distribution ---
     job_counts = defaultdict(int)
     for job in completed_jobs:
-        job_counts[job.get_leader_agent_id()] += 1
+        job_counts[job.leader_id] += 1
     plt.figure(figsize=(10, 6))
     plt.bar([f"Agent-{aid}" for aid in job_counts.keys()], job_counts.values())
     plt.xlabel("Leader Agent ID")

@@ -1,9 +1,6 @@
 redis:
   host: database 
   port: 6379
-etcd:
-  host: database
-  port: 2379
 queue:
   type: simple
   host: 127.0.0.1
@@ -28,7 +25,7 @@ topology:
     - 2
   type: mesh
 grpc:
-  port: 50051
+  port: 20000 
   host: localhost
 dtns:
   - name: dtn1
@@ -46,8 +43,8 @@ runtime:
   projected_queue_threshold: 300.00
   ready_queue_threshold: 100.00
   max_time_load_zero: 300
-  restart_job_selection: 300
-  peer_heartbeat_timeout: 300
+  restart_job_selection: 120
+  peer_expiry_seconds: 300
   results_dir: swarm-multi
   message_service_type: grpc
   shutdown_mode: manual

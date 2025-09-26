@@ -91,7 +91,7 @@ class JobDistributor(threading.Thread):
         with open(file_path, 'r') as f:
             job_data = json.load(f)
             job = Job()
-            job.set_job_id(job_data['id'])
+            job.job_id = job_data['id']
             job.set_capacities(Capacities.from_dict(job_data['capacities']))
             job.execution_time = job_data['execution_time']
             if job_data.get('data_in'):

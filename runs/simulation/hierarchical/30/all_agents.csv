@@ -1,0 +1,533 @@
+[
+  {
+    "agent_id": 23,
+    "host": "localhost",
+    "port": 20023,
+    "capacities": {
+      "cpu": 2,
+      "core": 4,
+      "ram": 16,
+      "disk": 250
+    },
+    "last_updated": 1758857963.7261598
+  },
+  {
+    "agent_id": 30,
+    "host": "localhost",
+    "port": 20030,
+    "capacities": {
+      "cpu": 10,
+      "core": 42,
+      "gpu": 8,
+      "ram": 168,
+      "disk": 2600
+    },
+    "last_updated": 1758857963.795152
+  },
+  {
+    "agent_id": 18,
+    "host": "localhost",
+    "port": 20018,
+    "capacities": {
+      "cpu": 2,
+      "core": 2,
+      "ram": 8,
+      "disk": 100
+    },
+    "last_updated": 1758857963.7340422
+  },
+  {
+    "agent_id": 3,
+    "host": "localhost",
+    "port": 20003,
+    "capacities": {
+      "cpu": 2,
+      "core": 16,
+      "gpu": 4,
+      "ram": 64,
+      "disk": 1000
+    },
+    "last_updated": 1758857963.7261581,
+    "dtns": {
+      "dtn6": {
+        "name": "dtn6",
+        "ip": "192.168.100.6",
+        "user": "dtn_user6",
+        "connectivity_score": 0.87
+      },
+      "dtn10": {
+        "name": "dtn10",
+        "ip": "192.168.100.10",
+        "user": "dtn_user10",
+        "connectivity_score": 0.5
+      },
+      "dtn9": {
+        "name": "dtn9",
+        "ip": "192.168.100.9",
+        "user": "dtn_user9",
+        "connectivity_score": 0.09
+      }
+    }
+  },
+  {
+    "agent_id": 26,
+    "host": "localhost",
+    "port": 20026,
+    "load": 14.35,
+    "capacities": {
+      "cpu": 10,
+      "core": 56,
+      "gpu": 8,
+      "ram": 224,
+      "disk": 2450
+    },
+    "capacity_allocations": {
+      "core": 5.21,
+      "gpu": 2.97,
+      "ram": 20.51,
+      "disk": 602.28
+    },
+    "last_updated": 1758857963.7952828,
+    "dtns": {
+      "dtn6": {
+        "name": "dtn6",
+        "ip": "192.168.100.6",
+        "user": "dtn_user6",
+        "connectivity_score": 0.58
+      },
+      "dtn10": {
+        "name": "dtn10",
+        "ip": "192.168.100.10",
+        "user": "dtn_user10",
+        "connectivity_score": 0.51
+      },
+      "dtn9": {
+        "name": "dtn9",
+        "ip": "192.168.100.9",
+        "user": "dtn_user9",
+        "connectivity_score": 0.09
+      },
+      "dtn2": {
+        "name": "dtn2",
+        "ip": "192.168.100.2",
+        "user": "dtn_user2",
+        "connectivity_score": 0.98
+      },
+      "dtn5": {
+        "name": "dtn5",
+        "ip": "192.168.100.5",
+        "user": "dtn_user5",
+        "connectivity_score": 0.73
+      },
+      "dtn3": {
+        "name": "dtn3",
+        "ip": "192.168.100.3",
+        "user": "dtn_user3",
+        "connectivity_score": 0.91
+      },
+      "dtn4": {
+        "name": "dtn4",
+        "ip": "192.168.100.4",
+        "user": "dtn_user4"
+      },
+      "dtn7": {
+        "name": "dtn7",
+        "ip": "192.168.100.7",
+        "user": "dtn_user7",
+        "connectivity_score": 0.65
+      },
+      "dtn1": {
+        "name": "dtn1",
+        "ip": "192.168.100.1",
+        "user": "dtn_user1",
+        "connectivity_score": 0.62
+      }
+    }
+  },
+  {
+    "agent_id": 12,
+    "host": "localhost",
+    "port": 20012,
+    "capacities": {
+      "cpu": 2,
+      "core": 4,
+      "ram": 16,
+      "disk": 250
+    },
+    "last_updated": 1758857963.73405
+  },
+  {
+    "agent_id": 22,
+    "host": "localhost",
+    "port": 20022,
+    "capacities": {
+      "cpu": 2,
+      "core": 16,
+      "gpu": 4,
+      "ram": 64,
+      "disk": 1000
+    },
+    "last_updated": 1758857963.7341702
+  },
+  {
+    "agent_id": 8,
+    "host": "localhost",
+    "port": 20008,
+    "capacities": {
+      "cpu": 2,
+      "core": 2,
+      "ram": 8,
+      "disk": 100
+    },
+    "last_updated": 1758857963.732331
+  },
+  {
+    "agent_id": 28,
+    "host": "localhost",
+    "port": 20028,
+    "capacities": {
+      "cpu": 10,
+      "core": 62,
+      "gpu": 12,
+      "ram": 248,
+      "disk": 2850
+    },
+    "last_updated": 1758857963.794881
+  },
+  {
+    "agent_id": 4,
+    "host": "localhost",
+    "port": 20004,
+    "capacities": {
+      "cpu": 2,
+      "core": 2,
+      "ram": 8,
+      "disk": 100
+    },
+    "last_updated": 1758857963.73402,
+    "dtns": {
+      "dtn2": {
+        "name": "dtn2",
+        "ip": "192.168.100.2",
+        "user": "dtn_user2",
+        "connectivity_score": 0.98
+      },
+      "dtn5": {
+        "name": "dtn5",
+        "ip": "192.168.100.5",
+        "user": "dtn_user5",
+        "connectivity_score": 0.73
+      },
+      "dtn3": {
+        "name": "dtn3",
+        "ip": "192.168.100.3",
+        "user": "dtn_user3",
+        "connectivity_score": 0.08
+      }
+    }
+  },
+  {
+    "agent_id": 9,
+    "host": "localhost",
+    "port": 20009,
+    "capacities": {
+      "cpu": 2,
+      "core": 2,
+      "ram": 8,
+      "disk": 100
+    },
+    "last_updated": 1758857963.729734
+  },
+  {
+    "agent_id": 10,
+    "host": "localhost",
+    "port": 20010,
+    "capacities": {
+      "cpu": 2,
+      "core": 4,
+      "ram": 16,
+      "disk": 250
+    },
+    "last_updated": 1758857963.7297869
+  },
+  {
+    "agent_id": 1,
+    "host": "localhost",
+    "port": 20001,
+    "load": 30.84,
+    "capacities": {
+      "cpu": 2,
+      "core": 32,
+      "gpu": 4,
+      "ram": 128,
+      "disk": 1000
+    },
+    "capacity_allocations": {
+      "core": 5.21,
+      "gpu": 2.97,
+      "ram": 20.51,
+      "disk": 602.28
+    },
+    "last_updated": 1758857963.734032,
+    "dtns": {
+      "dtn4": {
+        "name": "dtn4",
+        "ip": "192.168.100.4",
+        "user": "dtn_user4",
+        "connectivity_score": 0.77
+      }
+    }
+  },
+  {
+    "agent_id": 2,
+    "host": "localhost",
+    "port": 20002,
+    "capacities": {
+      "cpu": 2,
+      "core": 4,
+      "ram": 16,
+      "disk": 250
+    },
+    "last_updated": 1758857963.7261581,
+    "dtns": {
+      "dtn4": {
+        "name": "dtn4",
+        "ip": "192.168.100.4",
+        "user": "dtn_user4",
+        "connectivity_score": 0.0
+      },
+      "dtn1": {
+        "name": "dtn1",
+        "ip": "192.168.100.1",
+        "user": "dtn_user1",
+        "connectivity_score": 0.62
+      }
+    }
+  },
+  {
+    "agent_id": 19,
+    "host": "localhost",
+    "port": 20019,
+    "capacities": {
+      "cpu": 2,
+      "core": 8,
+      "gpu": 4,
+      "ram": 32,
+      "disk": 500
+    },
+    "last_updated": 1758857963.734098
+  },
+  {
+    "agent_id": 16,
+    "host": "localhost",
+    "port": 20016,
+    "capacities": {
+      "cpu": 2,
+      "core": 8,
+      "gpu": 4,
+      "ram": 32,
+      "disk": 500
+    },
+    "last_updated": 1758857963.734158
+  },
+  {
+    "agent_id": 17,
+    "host": "localhost",
+    "port": 20017,
+    "capacities": {
+      "cpu": 2,
+      "core": 4,
+      "ram": 16,
+      "disk": 250
+    },
+    "last_updated": 1758857963.7278972
+  },
+  {
+    "agent_id": 5,
+    "host": "localhost",
+    "port": 20005,
+    "capacities": {
+      "cpu": 2,
+      "core": 2,
+      "ram": 8,
+      "disk": 100
+    },
+    "last_updated": 1758857963.734166,
+    "dtns": {
+      "dtn7": {
+        "name": "dtn7",
+        "ip": "192.168.100.7",
+        "user": "dtn_user7",
+        "connectivity_score": 0.65
+      },
+      "dtn6": {
+        "name": "dtn6",
+        "ip": "192.168.100.6",
+        "user": "dtn_user6",
+        "connectivity_score": 0.58
+      },
+      "dtn3": {
+        "name": "dtn3",
+        "ip": "192.168.100.3",
+        "user": "dtn_user3",
+        "connectivity_score": 0.91
+      },
+      "dtn10": {
+        "name": "dtn10",
+        "ip": "192.168.100.10",
+        "user": "dtn_user10",
+        "connectivity_score": 0.51
+      }
+    }
+  },
+  {
+    "agent_id": 14,
+    "host": "localhost",
+    "port": 20014,
+    "capacities": {
+      "cpu": 2,
+      "core": 32,
+      "gpu": 4,
+      "ram": 128,
+      "disk": 1000
+    },
+    "last_updated": 1758857963.729739
+  },
+  {
+    "agent_id": 24,
+    "host": "localhost",
+    "port": 20024,
+    "capacities": {
+      "cpu": 2,
+      "core": 2,
+      "ram": 8,
+      "disk": 100
+    },
+    "last_updated": 1758857963.73402
+  },
+  {
+    "agent_id": 15,
+    "host": "localhost",
+    "port": 20015,
+    "capacities": {
+      "cpu": 2,
+      "core": 16,
+      "gpu": 4,
+      "ram": 64,
+      "disk": 1000
+    },
+    "last_updated": 1758857963.73409
+  },
+  {
+    "agent_id": 7,
+    "host": "localhost",
+    "port": 20007,
+    "capacities": {
+      "cpu": 2,
+      "core": 2,
+      "ram": 8,
+      "disk": 100
+    },
+    "last_updated": 1758857963.7340539
+  },
+  {
+    "agent_id": 21,
+    "host": "localhost",
+    "port": 20021,
+    "capacities": {
+      "cpu": 2,
+      "core": 16,
+      "gpu": 4,
+      "ram": 64,
+      "disk": 1000
+    },
+    "last_updated": 1758857963.734024
+  },
+  {
+    "agent_id": 27,
+    "host": "localhost",
+    "port": 20027,
+    "capacities": {
+      "cpu": 10,
+      "core": 14,
+      "ram": 56,
+      "disk": 800
+    },
+    "last_updated": 1758857963.795687
+  },
+  {
+    "agent_id": 11,
+    "host": "localhost",
+    "port": 20011,
+    "capacities": {
+      "cpu": 2,
+      "core": 2,
+      "ram": 8,
+      "disk": 100
+    },
+    "last_updated": 1758857963.732335
+  },
+  {
+    "agent_id": 6,
+    "host": "localhost",
+    "port": 20006,
+    "capacities": {
+      "cpu": 2,
+      "core": 4,
+      "ram": 16,
+      "disk": 250
+    },
+    "last_updated": 1758857963.734039
+  },
+  {
+    "agent_id": 25,
+    "host": "localhost",
+    "port": 20025,
+    "capacities": {
+      "cpu": 2,
+      "core": 4,
+      "ram": 16,
+      "disk": 250
+    },
+    "last_updated": 1758857963.734151
+  },
+  {
+    "agent_id": 13,
+    "host": "localhost",
+    "port": 20013,
+    "capacities": {
+      "cpu": 2,
+      "core": 8,
+      "gpu": 4,
+      "ram": 32,
+      "disk": 500
+    },
+    "last_updated": 1758857963.732345
+  },
+  {
+    "agent_id": 29,
+    "host": "localhost",
+    "port": 20029,
+    "capacities": {
+      "cpu": 10,
+      "core": 38,
+      "gpu": 12,
+      "ram": 152,
+      "disk": 2350
+    },
+    "last_updated": 1758857963.7953122
+  },
+  {
+    "agent_id": 20,
+    "host": "localhost",
+    "port": 20020,
+    "capacities": {
+      "cpu": 2,
+      "core": 16,
+      "gpu": 4,
+      "ram": 64,
+      "disk": 1000
+    },
+    "last_updated": 1758857963.734145
+  }
+]
