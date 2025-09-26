@@ -4,6 +4,15 @@ This repository provides a framework for implementing greedy distributed consens
 
 The core logic enables agents to reach consensus and make selections (such as job assignments) using PBFT-like protocols and cost-based selection strategies. The framework is modular, allowing for flexible integration of custom consensus, selection, and penalty mechanisms.
 
+## Table of Contents
+
+- [Key Features](#key-features)
+- [Core Modules](#core-modules)
+- [Example: Job Selection](#example-job-selection)
+- [Testing](#testing)
+- [Results](#results)
+- [Utilities](#utilities)
+
 ## Key Features
 - Greedy distributed selection and consensus algorithms
 - Modular design for consensus, selection, and penalty logic
@@ -47,18 +56,24 @@ The file `swarm/agents/resource_agent.py` provides a comprehensive example of di
 
 ### Cost Computation Equation
 
-The cost for assigning a job to an agent is computed as a weighted sum of resource utilizations, plus penalties for long jobs and connectivity:
-
+The cost for assigning a job to an agent is computed as a weighted sum of resource utilizations, plus penalties for long jobs and connectivity. Importantly, the weights can be tailored based on the job type, allowing the system to prioritize different resources for different workloads (e.g., compute-heavy, memory-heavy, or data-transfer jobs):
 $$
 	ext{cost} = w_{cpu} \cdot \text{CPU}_{util} + w_{ram} \cdot \text{RAM}_{util} + w_{disk} \cdot \text{Disk}_{util} + w_{gpu} \cdot \text{GPU}_{util} + \text{penalties}
 $$
 
 Where:
-- $w_{cpu}$, $w_{ram}$, $w_{disk}$, $w_{gpu}$ are the weights for each resource (see `__init__` in `resource_agent.py`).
+- $w_{cpu}$, $w_{ram}$, $w_{disk}$, $w_{gpu}$ are the weights for each resource (see `__init__` and `compute_job_cost` in `resource_agent.py`).
 - Resource utilization terms are computed as the fraction of required over available capacity.
 - Penalties include:
 	- Long job penalty: applied if job execution time exceeds `long_job_threshold`.
 	- Connectivity penalty: scaled by `connectivity_penalty_factor` for DTN jobs.
+
+**Job Type-Specific Weights:**
+- The cost computation can dynamically adjust the weights based on the job type (e.g., CPU-intensive, memory-intensive, I/O-bound, or DTN/data-transfer jobs).
+- For example, a data-transfer (DTN) job may use a higher weight for network or disk utilization, while a compute-heavy job may prioritize CPU and GPU weights.
+- This logic is implemented in `compute_job_cost`, where the job's type or attributes are checked and the weights are set accordingly before computing the final cost.
+
+This approach allows the system to flexibly prioritize resources and penalties for different job classes, improving scheduling efficiency and resource utilization.
 
 The final cost is used by the selection engine to compare candidate assignments and select the best agent for each job.
 
@@ -140,7 +155,7 @@ Simulation results for different topologies (Ring, Mesh, Hierarchical, etc.) are
 	- Use the provided plotting scripts (see `plot_latency_jobs.py`) to visualize performance metrics.
 	- Analyze logs for details on agent decisions, consensus events, and system behavior under different configurations.
 
-
+For example, after running a simulation with `run_test.py`, inspect the corresponding results directory for summary files and plots. This helps evaluate the scalability, efficiency, and fault tolerance of the framework under various network structures.
 ### Example Results Visualizations
 
 Below are example images showing results for different topologies:
@@ -166,5 +181,92 @@ Below are example images showing results for different topologies:
 
 ![Agent Load](runs/simulation/hierarchical/30/agent_loads_summary.png)
 
-For example, after running a simulation with `run_test.py`, inspect the corresponding results directory for summary files and plots. This helps evaluate the scalability, efficiency, and fault tolerance of the framework under various network structures.
+## Utilities
 
+The repository includes several utility scripts to support simulation setup and management:
+
+- **job_generator.py**: Generates synthetic job descriptions for simulation runs. You can customize the number, type, and resource requirements of jobs to match your experimental needs.
+```
+python job_generator.py  --help
+usage: job_generator.py [-h] --job-count JOB_COUNT --agent-profile-path AGENT_PROFILE_PATH
+                        [--output-dir OUTPUT_DIR] [--enable-dtns]
+
+Generate jobs matching agent profiles.
+
+options:
+  -h, --help            show this help message and exit
+  --job-count JOB_COUNT
+                        Number of jobs to generate
+  --agent-profile-path AGENT_PROFILE_PATH
+                        Path to agent profiles JSON
+  --output-dir OUTPUT_DIR
+                        Directory to save job files
+  --enable-dtns         Assign DTNs to jobs based on agent profiles
+```
+
+- **generate_configs.py**: Creates agent configuration files for different topologies and agent counts. This helps automate the setup of large-scale experiments with consistent parameters.
+```
+python generate_configs.py  --help
+usage: generate_configs.py [-h] [--dtns] [--flavor-percentages [PERCENT ...]]
+                           [--agent-hosts-file AGENT_HOSTS_FILE] [--agents-per-host AGENTS_PER_HOST]
+                           num_agents jobs_per_proposal base_config_file output_dir topology database
+                           job_cnt
+
+Generate agent configuration files.
+
+positional arguments:
+  num_agents            Number of agents to generate configurations for.
+  jobs_per_proposal     Number of Jobs per proposal.
+  base_config_file      Path to the base configuration YAML file.
+  output_dir            Directory where generated configs should be saved.
+  topology              Topology: mesh | ring | star | hierarchical
+  database              Database host
+  job_cnt               Job Count
+
+options:
+  -h, --help            show this help message and exit
+  --dtns                Enable DTNs
+  --flavor-percentages [PERCENT ...]
+                        Percentages for small, medium, large, xtralarge, xxtralarge (e.g. 0.4 0.25 0.15
+                        0.15 0.05)
+  --agent-hosts-file AGENT_HOSTS_FILE
+                        Path to file with agent hosts (one per line)
+  --agents-per-host AGENTS_PER_HOST
+                        Number of agents per host (for grpc.host assignment)
+```
+- **job_distributor.py**: Distributes jobs to agents or queues in the system, supporting various distribution strategies and load patterns.
+```
+python job_distributor.py --help
+usage: job_distributor.py [-h] --redis-host REDIS_HOST [--redis-port REDIS_PORT] --jobs-dir JOBS_DIR
+                          --jobs-per-interval JOBS_PER_INTERVAL [--interval INTERVAL] [--level LEVEL]
+                          [--group GROUP]
+
+Distribute job JSON files to Redis at a controlled rate.
+
+options:
+  -h, --help            show this help message and exit
+  --redis-host REDIS_HOST
+                        Redis host address
+  --redis-port REDIS_PORT
+                        Redis port (default: 6379)
+  --jobs-dir JOBS_DIR   Directory containing job JSON files
+  --jobs-per-interval JOBS_PER_INTERVAL
+                        Number of jobs to push per interval
+  --interval INTERVAL   Interval duration in seconds (default: 1.0)
+  --level LEVEL         Topology level for which to add Jobs
+  --group GROUP         Topology group at a level for which to add Jobs
+```
+- **dump_db.py**: Exports the contents of the Redis database used by SwarmAgents. This script is useful for debugging, analysis, and archiving the state of jobs, agents, and other system data during or after simulation runs. It can output the database contents in a human-readable or machine-readable format for further inspection.
+```
+usage: dump_db.py [-h] [--host HOST] [--key KEY] [--count] [--type {redis,etcd}]
+
+Display Redis queue or count.
+
+options:
+  -h, --help           show this help message and exit
+  --host HOST          Host (default: localhost)
+  --key KEY            Key prefix to match (default: *)
+  --count              Only display the count of entries
+  --type {redis,etcd}  Type of data store to query (default: etcd)
+```
+These utilities streamline the process of preparing, configuring, and running distributed simulations with SwarmAgents.
