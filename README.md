@@ -9,8 +9,8 @@ The core logic enables agents to reach consensus and make selections (such as jo
 - [Key Features](#key-features)
 - [Core Modules](#core-modules)
 - [Example: Job Selection](#example-job-selection)
-- [Testing](#testing)
-- [Results](#results)
+   - [Testing](#testing)
+   - [Results](#results)
 - [Utilities](#utilities)
 
 ## Key Features
