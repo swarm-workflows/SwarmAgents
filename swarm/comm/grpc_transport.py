@@ -1,7 +1,6 @@
 # MIT License
 #
 # Copyright (c) 2024 swarm-workflows
-import json
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
 # in the Software without restriction, including without limitation the rights
@@ -24,6 +23,7 @@ import json
 import logging
 import time
 from typing import Any
+import json
 
 from swarm.comm import consensus_pb2
 from swarm.comm.consensus_pb2_grpc import add_ConsensusServiceServicer_to_server

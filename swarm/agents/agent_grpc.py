@@ -84,10 +84,6 @@ class Agent(Observer):
         self.last_non_empty_time = time.time()
 
     @property
-    def max_pending_elections(self):
-        return self.runtime_config.get("max_pending_elections", 50)
-
-    @property
     def live_agent_count(self) -> int:
         """Returns the count of all known agents including self."""
         return len(self.neighbor_map)
@@ -245,6 +241,7 @@ class Agent(Observer):
         """
         Returns True if shutdown has been requested.
         """
+        return True
 
     def should_process(self, msg: Message) -> bool:
         path = msg.path if msg.path else []
