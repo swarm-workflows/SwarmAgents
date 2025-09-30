@@ -58,8 +58,9 @@ The file `swarm/agents/resource_agent.py` provides a comprehensive example of di
 
 The cost for assigning a job to an agent is computed as a weighted sum of resource utilizations, plus penalties for long jobs and connectivity. Importantly, the weights can be tailored based on the job type, allowing the system to prioritize different resources for different workloads (e.g., compute-heavy, memory-heavy, or data-transfer jobs):
 $$
-	ext{cost} = w_{cpu} \cdot \text{CPU}_{util} + w_{ram} \cdot \text{RAM}_{util} + w_{disk} \cdot \text{Disk}_{util} + w_{gpu} \cdot \text{GPU}_{util} + \text{penalties}
+	\text{cost} = w_{cpu} \cdot \text{CPU}_{util} + w_{ram} \cdot \text{RAM}_{util} + w_{disk} \cdot \text{Disk}_{util} + w_{gpu} \cdot \text{GPU}_{util} + \text{penalties}
 $$
+
 
 Where:
 - $w_{cpu}$, $w_{ram}$, $w_{disk}$, $w_{gpu}$ are the weights for each resource (see `__init__` and `compute_job_cost` in `resource_agent.py`).
