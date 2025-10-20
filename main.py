@@ -34,9 +34,9 @@ if __name__ == '__main__':
     if len(sys.argv) > 2 and sys.argv[2] == "--debug":
         debug = True
 
-    config_file = f"./configs/config_swarm_multi_{agent_id}.yml"
+    config_file = f"./config_swarm_multi_{agent_id}.yml"
 
-    from swarm.agents.resource_agent import ResourceAgent
-    agent = ResourceAgent(agent_id=agent_id, config_file=config_file, debug=debug)
+    from swarm.agents.colmena_agent import ColmenaAgent
+    agent = ColmenaAgent(agent_id=agent_id, config_file=config_file, debug=debug)
 
     agent.start()

@@ -26,6 +26,8 @@ import time
 import traceback
 from concurrent.futures.thread import ThreadPoolExecutor
 
+from swarm.comm.colmena_consensus import colmena_consensus_pb2_grpc, colmena_consensus_pb2
+from swarm.comm.colmena_consensus.colmena_servicer import SelectionServicer
 from swarm.consensus.engine import ConsensusEngine
 from swarm.consensus.interfaces import ConsensusHost, ConsensusTransport, TopologyRouter
 from swarm.consensus.messages.message import MessageType
@@ -48,6 +50,7 @@ from swarm.models.agent_info import AgentInfo
 from swarm.consensus.messages.proposal_info import ProposalInfo
 from swarm.models.job import Job, ObjectState
 import numpy as np
+import grpc
 
 from swarm.utils.utils import generate_id, job_capacities
 
@@ -55,22 +58,33 @@ from swarm.utils.utils import generate_id, job_capacities
 class _HostAdapter(ConsensusHost):
     def __init__(self, agent: "SwarmAgent"):
         self.agent = agent
+
     def get_object(self, object_id: str): return self.agent.queues.pending_queue.get(object_id)
+
     def is_agreement_achieved(self, object_id: str): return self.agent.is_job_completed(object_id)
+
     def calculate_quorum(self): return self.agent.calculate_quorum()
+
     def on_leader_elected(self, obj: Object, proposal_id: str): self.agent.select_job(obj)
+
     def on_participant_commit(self, obj: Object, leader_id: int, proposal_id: str): obj.state = ObjectState.COMMIT
+
     def now(self): import time; return time.time()
+
     def log_debug(self, m): self.agent.logger.debug(m)
+
     def log_info(self, m): self.agent.logger.info(m)
+
     def log_warn(self, m): self.agent.logger.warning(m)
 
 
 class _TransportAdapter(ConsensusTransport):
     def __init__(self, agent: "SwarmAgent"):
         self.agent = agent
+
     def send(self, dest: int, payload: object) -> None:
         self.agent.send(dest, payload)
+
     def broadcast(self, payload: object) -> None:
         self.agent.broadcast(payload)
 
@@ -85,7 +99,7 @@ class _RouteAdapter(TopologyRouter):
         return False
 
 
-class ResourceAgent(Agent):
+class ColmenaAgent(Agent):
     def __init__(self, agent_id: int, config_file: str, debug: bool = False):
         super().__init__(agent_id, config_file, debug)
         self.engine = ConsensusEngine(agent_id, _HostAdapter(self), _TransportAdapter(self),
@@ -247,7 +261,7 @@ class ResourceAgent(Agent):
 
     def _update_pending_jobs(self, jobs: list[str]):
         for job_id in jobs:
-            #job_id = key.split(":")[-1]
+            # job_id = key.split(":")[-1]
             if job_id not in self.queues.pending_queue:
                 job = self.repository.get(obj_id=job_id, key_prefix=Repository.KEY_JOB, level=self.topology.level,
                                           group=self.topology.group)
@@ -443,7 +457,7 @@ class ResourceAgent(Agent):
         if self.debug:
             self.save_consensus_votes()
         self.save_consensus_votes()
-        #self.save_neighbors()
+        # self.save_neighbors()
 
         self.check_queue()
 
@@ -463,7 +477,7 @@ class ResourceAgent(Agent):
         """
         # Capacity check first (cheapest)
         # Check against allocated resources only if no caching used for feasibility
-        #available = agent.capacities - agent.capacity_allocations
+        # available = agent.capacities - agent.capacity_allocations
         available = agent.capacities
         if not self._has_sufficient_capacity(job, available):
             return False
@@ -516,26 +530,29 @@ class ResourceAgent(Agent):
             round(job.execution_time or 0.0, 3),
             job.job_type or "",
             job._required_dtns_cache,
-            #job.state.value,  # flips when PENDING→READY/COMPLETE, invalidates cache automatically
+            # job.state.value,  # flips when PENDING→READY/COMPLETE, invalidates cache automatically
         )
 
     def _agent_sig(self, agent: AgentInfo) -> tuple:
         caps = agent.capacities or Capacities()
         # Represent DTNs by (name,score) so signature only changes when the set/scores change
         if isinstance(agent.dtns, dict):
-            dtn_pairs = tuple(sorted((k, round(getattr(v, "connectivity_score", 1.0), 3)) for k, v in agent.dtns.items()))
+            dtn_pairs = tuple(
+                sorted((k, round(getattr(v, "connectivity_score", 1.0), 3)) for k, v in agent.dtns.items()))
         else:
             # if already list of dicts or DataNode, normalize
             def _pair(x):
                 name = getattr(x, "name", None) or (x.get("name") if isinstance(x, dict) else None)
-                score = getattr(x, "connectivity_score", None) or (x.get("connectivity_score") if isinstance(x, dict) else 1.0)
+                score = getattr(x, "connectivity_score", None) or (
+                    x.get("connectivity_score") if isinstance(x, dict) else 1.0)
                 return (name, round(float(score), 3))
+
             dtn_pairs = tuple(sorted(_pair(x) for x in (agent.dtns or [])))
 
         return (
             agent.agent_id,
             caps.core, caps.ram, caps.disk, caps.gpu,
-            #round(caps.core, 3), round(caps.ram, 3), round(caps.disk, 3), round(getattr(caps, "gpu", 0.0), 3),
+            # round(caps.core, 3), round(caps.ram, 3), round(caps.disk, 3), round(getattr(caps, "gpu", 0.0), 3),
             dtn_pairs,
         )
 
@@ -664,74 +681,65 @@ class ResourceAgent(Agent):
         cost = (base_score + bottleneck_penalty) * time_penalty * connectivity_penalty * 100
         return round(cost, 2)
 
-
     def selection_main(self):
         self.logger.info(f"Starting agent: {self}")
-        while self.live_agent_count != self.configured_agent_count:
-            time.sleep(0.5)
-            self.logger.info(f"[SEL_WAIT] Waiting for Peer map to be populated: "
-                             f"{self.live_agent_count}/{self.configured_agent_count}!")
+        #while self.live_agent_count != self.configured_agent_count:
+        #    time.sleep(0.5)
+        #    self.logger.info(f"[SEL_WAIT] Waiting for Peer map to be populated: "
+        #                     f"{self.live_agent_count}/{self.configured_agent_count}!")
 
-        while not self.shutdown:
-            try:
-                pending_jobs = self.queues.pending_queue.gets(states=[ObjectState.PENDING],
-                                                              count=self.proposal_job_batch_size)
-                if not pending_jobs:
-                    self.logger.debug(f"No pending jobs available for agent: {self.agent_id}")
-                    time.sleep(0.5)
-                    continue
-                proposals = []
-                jobs = []
+        colmena_servicer = SelectionServicer(trigger_consensus_fn=self.trigger_consensus)
+        self.transport.server.add_service(
+            colmena_consensus_pb2_grpc.add_SelectionServiceServicer_to_server,
+            colmena_servicer
+        )
 
-                # Step 1: Compute cost matrix ONCE for all agents and jobs
-                agents_map = self.neighbor_map
-                agent_ids = list(agents_map.keys())
-                agents = [agents_map.get(aid) for aid in agent_ids if agents_map.get(aid) is not None]
+    def trigger_consensus(self, job: Job):
+        # Step 1: Compute cost matrix ONCE for all agents and jobs (for now one job at a time)
+        job = [job] # Temporal from adapting from jobs to job.
+        agents_map = self.neighbor_map
+        agent_ids = list(agents_map.keys())
+        agents = [agents_map.get(aid) for aid in agent_ids if agents_map.get(aid) is not None]
 
-                # Build once
-                cost_matrix = self.selector.compute_cost_matrix(
-                    assignees=agents,
-                    candidates=pending_jobs,
+        # Build once
+        cost_matrix = self.selector.compute_cost_matrix(
+            assignees=agents,
+            candidates=job,
+        )
+
+        cost_matrix_with_penalities = apply_multiplicative_penalty(cost_matrix=cost_matrix,
+                                                                   assignees=agents,
+                                                                   factor_fn=self._projected_load_factor)
+
+        # Step 2: Use existing helper to get the best agent per job
+        assignments = self.selector.pick_agent_per_candidate(
+            assignees=agents,
+            candidates=job,
+            cost_matrix=cost_matrix_with_penalities,
+            objective="min",
+            threshold_pct=self.selection_threshold_pct,  # e.g., 10 means within +10% of best
+            tie_break_key=lambda ag, s: getattr(ag, "agent_id", "")
+        )
+
+        # Step 3: If this agent is assigned, start proposal
+        proposals = []
+        for job, (selected_agent, cost) in zip(job, assignments):
+            if selected_agent and selected_agent.agent_id == self.agent_id:
+                proposal = ProposalInfo(
+                    p_id=generate_id(),
+                    object_id=job.job_id,
+                    agent_id=self.agent_id,
+                    seed=round((cost + self.agent_id), 2)
                 )
+                proposals.append(proposal)
+                job.state = ObjectState.PRE_PREPARE
 
-                cost_matrix_with_penalities = apply_multiplicative_penalty(cost_matrix=cost_matrix,
-                                                                           assignees=agents,
-                                                                           factor_fn=self._projected_load_factor)
-
-                # Step 2: Use existing helper to get the best agent per job
-                assignments = self.selector.pick_agent_per_candidate(
-                    assignees=agents,
-                    candidates=pending_jobs,
-                    cost_matrix=cost_matrix_with_penalities,
-                    objective="min",
-                    threshold_pct=self.selection_threshold_pct,  # e.g., 10 means within +10% of best
-                    tie_break_key=lambda ag, s: getattr(ag, "agent_id", "")
-                )
-
-                # Step 3: If this agent is assigned, start proposal
-                for job, (selected_agent, cost) in zip(pending_jobs, assignments):
-                    if selected_agent and selected_agent.agent_id == self.agent_id:
-                        proposal = ProposalInfo(
-                            p_id=generate_id(),
-                            object_id=job.job_id,
-                            agent_id=self.agent_id,
-                            seed=round((cost + self.agent_id), 2)
-                        )
-                        proposals.append(proposal)
-                        job.state = ObjectState.PRE_PREPARE
-
-                if len(proposals):
-                    self.logger.debug(f"Identified jobs to propose: {proposals}")
-                    if self.debug:
-                        self.logger.info(f"Identified jobs to select: {jobs}")
-                    self.engine.propose(proposals=proposals)
-                    proposals.clear()
-
-                time.sleep(0.5)
-            except Exception as e:
-                self.logger.error(f"Error occurred while executing e: {e}")
-                self.logger.error(traceback.format_exc())
-        self.logger.info(f"Agent: {self} stopped with restarts: {self.metrics.restarts}!")
+        if len(proposals):
+            self.logger.debug(f"Identified jobs to propose: {proposals}")
+            if self.debug:
+                self.logger.info(f"Identified job to select: {job}")
+            self.engine.propose(proposals=proposals)
+            proposals.clear()
 
     def save_results(self):
         self.logger.info("Saving Results")
@@ -756,10 +764,10 @@ class ResourceAgent(Agent):
                 "timestamp": time.time(),
             }
             self.repository.save(obj=entry,
-                    key=f"peers:{self.agent_id}",
-                    level=self.topology.level,
-                    group=self.topology.group,
-                )
+                                 key=f"peers:{self.agent_id}",
+                                 level=self.topology.level,
+                                 group=self.topology.group,
+                                 )
 
             self.logger.debug(f"Saved neighbors for {self.agent_id}")
 
@@ -788,13 +796,13 @@ class ResourceAgent(Agent):
 
             # Collect all job ids we have any proposals for
             job_ids = set(self.engine.outgoing.objects()) | set(self.engine.incoming.objects())
-            #pending_jobs = len(self.queues.pending_queue.gets(states=[ObjectState.PENDING]))
+            # pending_jobs = len(self.queues.pending_queue.gets(states=[ObjectState.PENDING]))
 
             for job_id in job_ids:
                 # Try to resolve job from in-memory queues first
                 job = (self.queues.pending_queue.get(job_id) or
-                       #self.queues.ready_queue.get(job_id) or
-                       #self.queues.selected_queue.get(job_id) or
+                       # self.queues.ready_queue.get(job_id) or
+                       # self.queues.selected_queue.get(job_id) or
                        None)
 
                 # Gather proposals
@@ -836,7 +844,7 @@ class ResourceAgent(Agent):
                     group=self.topology.group,
                 )
 
-            #self.logger.info(f"Saved consensus votes snapshot for {len(job_ids)} job(s) pending: {pending_jobs}/{self.queues.pending_queue.size()}.")
+            # self.logger.info(f"Saved consensus votes snapshot for {len(job_ids)} job(s) pending: {pending_jobs}/{self.queues.pending_queue.size()}.")
             self.logger.debug(f"Saved consensus votes snapshot for {len(job_ids)} job(s).")
 
         except Exception as e:
@@ -884,6 +892,10 @@ class ResourceAgent(Agent):
         Otherwise, schedule it locally if load permits.
         """
         self.logger.info(f"Starting Job Scheduling Thread: {self}")
+        host = "127.0.0.1"
+        port = 50055  # Hardcoded...
+        channel = grpc.insecure_channel(f"{host}:{port}")
+        self._colmena_client = colmena_consensus_pb2_grpc.SchedulingServiceStub(channel)
 
         while not self.shutdown:
             try:
@@ -927,13 +939,25 @@ class ResourceAgent(Agent):
     def schedule_job(self, job: Job):
         self.end_idle()
         self.logger.info(f"[SCHEDULED]: {job.job_id} on agent: {self.agent_id}")
-        # Add the job to the list of allocated jobs
-        self.queues.ready_queue.add(job)
 
+        # Build TriggerRoleRequest
+        req = colmena_consensus_pb2.TriggerRoleRequest(
+            roleId=job.job_id,  # or some role mapping
+            serviceId=job.service_id,  # if job has service_id
+            startOrStop=True,  # start the role
+        )
+
+        try:
+            # Make the gRPC call
+            self._colmena_client.TriggerRole(req)
+            self.logger.info(f"Triggered role execution via gRPC for job {job.job_id}")
+        except grpc.RpcError as e:
+            self.logger.error(f"Failed to trigger role: {e}")
+
+        # Update internal state (optional)
         self._update_completed_jobs(jobs=[job.job_id])
         job.state = ObjectState.COMPLETE
         self.repository.save(obj=job.to_dict(), level=self.topology.level, group=self.topology.group)
-        self.executor.submit(self.execute_job, job)
 
     def select_job(self, job: Job):
         print(f"[SELECTED]: {job.job_id} on agent: {self.agent_id}")
@@ -961,7 +985,6 @@ class ResourceAgent(Agent):
         except Exception as e:
             self.logger.error(f"[ERROR] Job {job} failed on agent {self.agent_id}: {e}")
             self.logger.error(traceback.format_exc())
-
 
     def on_shutdown(self):
         self.executor.shutdown(wait=True)

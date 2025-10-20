@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package colmena_consensus;
+
+import "google/protobuf/empty.proto";
+
+service SchedulingService {
+  rpc TriggerRole(TriggerRoleRequest) returns (google.protobuf.Empty);
+}
+
+service SelectionService {
+  rpc RequestRoles(RoleRequest) returns (google.protobuf.Empty);
+}
+
+message RoleRequest {
+  Role role = 1;
+  bool startOrStop = 2;
+}
+
+message TriggerRoleRequest {
+  string roleId = 1;
+  string serviceId = 2;
+  bool startOrStop = 3;
+}
+
+message Role {
+  string roleId = 1;
+  string serviceId = 2;
+  repeated Resource resources = 3;
+}
+
+message Resource {
+  string name = 1;
+  float value = 2;
+}
+
+
