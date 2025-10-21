@@ -37,7 +37,6 @@ dtns:
     user: "dtn_user2"
     connectivity_score: 0.87
 runtime:
-  profile: BalancedProfile
   data_transfer: False
   max_pending_elections: 100
   projected_queue_threshold: 300.00
@@ -48,7 +47,6 @@ runtime:
   results_dir: swarm-multi
   message_service_type: grpc
   shutdown_mode: manual
-  heartbeat_mode: redis
   total_agents: 5
   jobs_per_proposal: 20
   executor_workers: 10

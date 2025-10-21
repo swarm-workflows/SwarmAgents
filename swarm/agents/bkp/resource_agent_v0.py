@@ -32,7 +32,7 @@ from swarm.utils.metrics import Metrics
 from swarm.utils.resource_queues import ResourceAgentQueues
 from swarm.utils.thread_safe_dict import ThreadSafeDict
 from swarm.topology.topology import TopologyType
-from swarm.agents.agent_grpc_v0 import Agent
+from swarm.agents.bkp.agent_grpc_v0 import Agent
 from swarm.consensus.messages.commit import Commit
 from swarm.consensus.messages.message_builder import MessageBuilder
 from swarm.consensus.messages.prepare import Prepare
