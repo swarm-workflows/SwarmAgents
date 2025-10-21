@@ -16,7 +16,6 @@ def run_blocking(cmd, log_file=None):
         with open(log_file, "w") as f:
             return subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, text=True)
     else:
-        # Use a real file handle to /dev/null as a context manager
         with open(os.devnull, "w") as devnull:
             return subprocess.run(cmd, stdout=devnull, stderr=subprocess.STDOUT, text=True)
 
@@ -63,19 +62,27 @@ def main():
     ap.add_argument("--grace-seconds", type=int, default=30)
     ap.add_argument("--max-misses", type=int, default=10)
     ap.add_argument("--log-dir", default=None)
-    # Optional pass-throughs to the start script
+
+    # Pass-throughs to the start script
     ap.add_argument("--use-config-dir", action="store_true",
                     help="Pass --use-config-dir to swarm-multi-start.sh")
     ap.add_argument("--debug", action="store_true",
                     help="Pass --debug to swarm-multi-start.sh")
-    # Optional: jobs per proposal (kept default=10 as in your script)
-    ap.add_argument("--jobs-per-proposal", type=int, default=10)
+    ap.add_argument("--jobs-per-proposal", type=int, default=10,
+                    help="Pass jobs_per_proposal positional to swarm-multi-start.sh (default: 10)")
+
+    # NEW: grouping controls → propagated to start script → generate_configs.py
+    ap.add_argument("--groups", type=int, default=None,
+                    help="Number of independent groups for mesh/ring")
+    ap.add_argument("--group-size", type=int, default=None,
+                    help="Size of each group for mesh/ring")
+
     args = ap.parse_args()
 
     if args.log_dir:
         os.makedirs(args.log_dir, exist_ok=True)
 
-    # 1) Run swarm start (blocking) — NOTE: agent_type is first positional arg now
+    # 1) Run swarm start (blocking)
     swarm_cmd = [
         "./swarm-multi-start.sh",
         args.agent_type,
@@ -89,6 +96,11 @@ def main():
         swarm_cmd.append("--use-config-dir")
     if args.debug:
         swarm_cmd.append("--debug")
+    # Propagate grouping flags only if set
+    if args.groups is not None:
+        swarm_cmd += ["--groups", str(args.groups)]
+    if args.group_size is not None:
+        swarm_cmd += ["--group-size", str(args.group_size)]
 
     swarm_log = os.path.join(args.log_dir, "swarm.log") if args.log_dir else None
     log(f"Launching swarm: {' '.join(swarm_cmd)}")

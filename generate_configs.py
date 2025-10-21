@@ -3,7 +3,7 @@ import copy
 import json
 import os
 import random
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
 import yaml
 
@@ -23,29 +23,48 @@ DEFAULT_FLAVOR_PERCENTAGES = [0.4, 0.25, 0.15, 0.15, 0.05]
 class SwarmConfigGenerator:
     """
     Generate per-agent configs given a base YAML, topology, DB host, and options.
-    Supports mapping N agents onto M hosts (M <= N) via round-robin host assignment.
+    Supports:
+      - mesh and ring grouping via --groups / --group-size
+      - legacy defaults when grouping is not specified
+      - mapping N agents onto M hosts via agents_per_host
     """
     AGENT_DTNS = "agent_dtns.json"
 
-    def __init__(self, num_agents, jobs_per_proposal, base_config_path, output_dir, topology,
-                 db_host, enable_dtns, agents_per_host:int = 1):
+    def __init__(
+        self,
+        num_agents: int,
+        jobs_per_proposal: int,
+        base_config_path: str,
+        output_dir: str,
+        topology: str,
+        db_host: str,
+        enable_dtns: bool,
+        agents_per_host: int = 1,
+        groups: Optional[int] = None,
+        group_size: Optional[int] = None,
+    ):
         self.num_agents = num_agents
         self.jobs_per_proposal = jobs_per_proposal
         self.base_config_path = base_config_path
         self.output_dir = output_dir
         self.base_config = self.load_base_config()
-        self.rings = self.create_ring_topology()
         self.topology = topology
         self.db_host = db_host
-        self.agent_dtns_map: Dict[str, List[dict]] = self._load_agent_dtns(path=self.AGENT_DTNS)
         self.enable_dtns = enable_dtns
         self.agents_per_host = agents_per_host
 
+        # grouping controls (only used for mesh/ring)
+        self.req_groups = groups
+        self.req_group_size = group_size
+
+        # legacy ring helper (used when no grouping flags provided for ring)
+        self.rings_default = self._create_default_rings()
+        self.agent_dtns_map: Dict[str, List[dict]] = self._load_agent_dtns(path=self.AGENT_DTNS)
+
+    # -----------------------------
+    # Flavor assignment
+    # -----------------------------
     def assign_flavors(self, percentages):
-        """
-        Assign flavors to agents based on CLI percentages.
-        Ensures total count == num_agents (handles rounding remainders).
-        """
         if len(percentages) != len(INSTANCE_FLAVORS):
             raise ValueError(
                 f"Expected {len(INSTANCE_FLAVORS)} flavor percentages, got {len(percentages)}"
@@ -59,11 +78,10 @@ class SwarmConfigGenerator:
         counts = [int(x) for x in raw_counts]
         assigned = sum(counts)
 
-        # Distribute remainder to the largest fractional parts
         remainder = total_agents - assigned
         if remainder > 0:
             fracs = [(raw_counts[i] - counts[i], i) for i in range(len(counts))]
-            fracs.sort(reverse=True)  # biggest fractional part first
+            fracs.sort(reverse=True)
             for _, idx in fracs[:remainder]:
                 counts[idx] += 1
 
@@ -74,13 +92,19 @@ class SwarmConfigGenerator:
         random.shuffle(agent_flavors)
         return agent_flavors
 
+    # -----------------------------
+    # Base config
+    # -----------------------------
     def load_base_config(self):
         with open(self.base_config_path, "r") as file:
             return yaml.safe_load(file)
 
-    def create_ring_topology(self):
+    # -----------------------------
+    # Defaults for ring (legacy)
+    # -----------------------------
+    def _create_default_rings(self) -> List[List[int]]:
         """
-        Create rings of up to 5 agents; always include agent 1 in the first ring.
+        Legacy default: Create rings of up to 5 agents; always include agent 1 in the first ring.
         Works for num_agents < 5 as well.
         """
         agents = list(range(1, self.num_agents + 1))
@@ -94,79 +118,226 @@ class SwarmConfigGenerator:
         while i < self.num_agents:
             ring = agents[i:i + 5]
             if len(ring) < 5:
-                # Allow a smaller last ring instead of dropping it
                 rings.append(ring)
                 break
             rings.append(ring)
             i += 5
         return rings
 
-    def print_ring_topology(self):
-        print("\nRing Topology:")
-        for i, ring in enumerate(self.rings):
-            ring_display = " ⟶ ".join(map(str, ring)) + f" ⟶ {ring[0]}" if ring else "(empty)"
+    def _print_rings(self, rings: List[List[int]], label: str = "Ring Topology"):
+        print(f"\n{label}:")
+        for i, ring in enumerate(rings):
+            if not ring:
+                ring_display = "(empty)"
+            else:
+                ring_display = " ⟶ ".join(map(str, ring)) + f" ⟶ {ring[0]}"
             print(f"Ring {i + 1}: {ring_display}")
 
+    # -----------------------------
+    # Grouping helpers
+    # -----------------------------
+    def _partition_agents(self, groups: Optional[int], group_size: Optional[int]) -> List[List[int]]:
+        """
+        Partition agents [1..N] into groups according to requested groups or group_size.
+        If both are None: return a single group containing all agents.
+        If both are provided: validate that groups * group_size == num_agents (or last group smaller).
+        We keep the last group smaller if needed, but ensure every agent is placed.
+        """
+        agents = list(range(1, self.num_agents + 1))
+        if not agents:
+            return []
+
+        # No grouping requested => single group with all agents
+        if groups is None and group_size is None:
+            return [agents]
+
+        # If only group_size provided
+        if groups is None and group_size is not None:
+            if group_size <= 0:
+                raise ValueError("--group-size must be > 0")
+            out = []
+            for i in range(0, self.num_agents, group_size):
+                out.append(agents[i:i + group_size])
+            return out
+
+        # If only groups provided
+        if groups is not None and group_size is None:
+            if groups <= 0:
+                raise ValueError("--groups must be > 0")
+            base_size = self.num_agents // groups
+            rem = self.num_agents % groups
+            out = []
+            idx = 0
+            for g in range(groups):
+                sz = base_size + (1 if g < rem else 0)
+                out.append(agents[idx:idx + sz])
+                idx += sz
+            return out
+
+        # Both provided
+        if groups is not None and group_size is not None:
+            if groups <= 0 or group_size <= 0:
+                raise ValueError("--groups and --group-size must be > 0")
+            out = []
+            idx = 0
+            for _ in range(groups):
+                out.append(agents[idx:idx + group_size])
+                idx += group_size
+                if idx >= self.num_agents:
+                    break
+            # If there are stragglers (due to mismatch), put them in a final small group
+            if idx < self.num_agents:
+                out.append(agents[idx:])
+            # sanity: must cover all agents exactly once
+            flat = [a for grp in out for a in grp]
+            if len(set(flat)) != self.num_agents:
+                raise ValueError("Grouping produced duplicate or missing agents; check --groups/--group-size.")
+            return out
+
+        # Should not reach here
+        return [agents]
+
+    # -----------------------------
+    # Topology generators (mesh/ring with grouping)
+    # -----------------------------
+    def _build_mesh_topology(self, groups: List[List[int]]) -> Dict[int, dict]:
+        agent_topo: Dict[int, dict] = {}
+        for gid, group in enumerate(groups):
+            for a in group:
+                peers = [x for x in group if x != a]
+                agent_topo[a] = {
+                    "peers": peers,
+                    "parent": None,
+                    "children": None,
+                    "group": gid,
+                    "level": 0,
+                }
+        return agent_topo
+
+    def _build_ring_topology(self, rings: List[List[int]]) -> Dict[int, dict]:
+        """
+        Build independent rings (no cross-links). Each entry in `rings` is a group.
+        """
+        agent_topo: Dict[int, dict] = {}
+        for gid, ring in enumerate(rings):
+            n = len(ring)
+            if n == 0:
+                continue
+            if n == 1:
+                # single node "ring": no peers
+                agent_topo[ring[0]] = {
+                    "peers": [],
+                    "parent": None,
+                    "children": None,
+                    "group": gid,
+                    "level": 0,
+                }
+                continue
+            for k in range(n):
+                cur = ring[k]
+                nxt = ring[(k + 1) % n]
+                prv = ring[(k - 1) % n]
+                agent_topo[cur] = {
+                    "peers": sorted(set([nxt, prv])),
+                    "parent": None,
+                    "children": None,
+                    "group": gid,
+                    "level": 0,
+                }
+        return agent_topo
+
+    # -----------------------------
+    # DTN helpers
+    # -----------------------------
+    def _load_agent_dtns(self, path: str) -> Dict[str, List[dict]]:
+        if path and os.path.exists(path):
+            with open(path, "r") as f:
+                data = json.load(f)
+                return {str(k): v for k, v in data.items()}
+        return {}
+
+    @staticmethod
+    def random_capacity(min_val, max_val):
+        return random.randint(min_val, max_val)
+
+    def generate_global_dtn_pool(self, total_count=10):
+        pool = []
+        for i in range(1, total_count + 1):
+            pool.append({
+                "name": f"dtn{i}",
+                "ip": f"192.168.100.{i}",
+                "user": f"dtn_user{i}",
+                "base_connectivity_score": round(random.uniform(0.6, 0.95), 2)
+            })
+        return pool
+
+    def adjust_scores(self, dtns: List[dict]):
+        for d in dtns:
+            adjusted_score = min(1.0, max(0.0, d.get("connectivity_score", 0.8) + random.uniform(-0.05, 0.05)))
+            d["connectivity_score"] = round(adjusted_score, 2)
+        return dtns
+
+    def assign_agent_dtns(self, pool, min_dtns=1, max_dtns=4):
+        count = random.randint(min_dtns, max_dtns)
+        selected = random.sample(pool, min(count, len(pool)))
+        agent_dtns = []
+        for d in selected:
+            adjusted_score = min(1.0, max(0.0, d["base_connectivity_score"] + random.uniform(-0.05, 0.05)))
+            agent_dtns.append({
+                "name": d["name"],
+                "ip": d["ip"],
+                "user": d["user"],
+                "connectivity_score": round(adjusted_score, 2)
+            })
+        return agent_dtns
+
+    # -----------------------------
+    # Main generation
+    # -----------------------------
     def get_config_prefix(self):
         filename = os.path.basename(self.base_config_path)
         prefix, _ = os.path.splitext(filename)
         return prefix
 
-    def generate_configs(self, flavor_percentages, agent_hosts, save_agent_profiles_path="agent_profiles.json"):
-        """
-        Generate YAML config per agent.
-        `agent_hosts` is a list of HOSTS ONLY; agents are assigned to hosts round-robin.
-        """
+    def generate_configs(
+        self,
+        flavor_percentages,
+        agent_hosts: Optional[List[str]],
+        save_agent_profiles_path: str = "agent_profiles.json",
+    ):
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
 
-        # Build peer map by topology
-        agent_topo = {}
+        # Build peer map by topology (respect grouping for mesh & ring)
+        agent_topo: Dict[int, dict] = {}
+
         if self.topology == "ring":
-            agent_peers = {i: [] for i in range(1, self.num_agents + 1)}
-            self.print_ring_topology()
+            if self.req_groups is None and self.req_group_size is None:
+                # Legacy default behavior
+                self._print_rings(self.rings_default, "Ring Topology (default groups of up to 5)")
+                agent_topo = self._build_ring_topology(self.rings_default)
+            else:
+                rings = self._partition_agents(self.req_groups, self.req_group_size)
+                self._print_rings(rings, "Ring Topology (grouped)")
+                agent_topo = self._build_ring_topology(rings)
 
-            # Intra-ring neighbors
-            for ring in self.rings:
-                if not ring:
-                    continue
-                for k in range(len(ring)):
-                    cur = ring[k]
-                    nxt = ring[(k + 1) % len(ring)]
-                    prv = ring[(k - 1) % len(ring)]
-                    agent_peers[cur].extend([nxt, prv])
-
-            # Connect first agent of each ring to first agent of previous/next ring
-            for r_idx in range(len(self.rings)):
-                if not self.rings[r_idx]:
-                    continue
-                first_agent = self.rings[r_idx][0]
-                prev_ring_first = self.rings[r_idx - 1][0] if r_idx > 0 else self.rings[-1][0]
-                next_ring_first = self.rings[(r_idx + 1) % len(self.rings)][0]
-                for neighbor in (prev_ring_first, next_ring_first):
-                    if neighbor != first_agent:
-                        agent_peers[first_agent].append(neighbor)
-
-            # Dedup & pack
-            for aid in agent_peers:
-                agent_topo[aid] = {
-                    "peers": sorted(set(agent_peers[aid])),
-                    "parent": None,
-                    "children": None,
-                    "group": 0,
-                    "level": 0
-                }
+        elif self.topology == "mesh":
+            if self.req_groups is None and self.req_group_size is None:
+                # one big mesh
+                groups = [list(range(1, self.num_agents + 1))]
+            else:
+                groups = self._partition_agents(self.req_groups, self.req_group_size)
+            print("\nMesh groups:", groups)
+            agent_topo = self._build_mesh_topology(groups)
 
         elif self.topology == "star":
+            # unchanged from your original
             core_agents = [a for a in range(1, min(6, self.num_agents + 1))]
             agent_peers = {}
-            # Core ring
             for i, cur in enumerate(core_agents):
                 nxt = core_agents[(i + 1) % len(core_agents)] if core_agents else None
                 prv = core_agents[(i - 1) % len(core_agents)] if core_agents else None
                 agent_peers[cur] = [p for p in (prv, nxt) if p and p != cur]
-
-            # Leaves connect to two cores (round-robin)
             for leaf_id in range(len(core_agents) + 1, self.num_agents + 1):
                 primary = core_agents[(leaf_id - 1) % len(core_agents)]
                 secondary = core_agents[(leaf_id) % len(core_agents)]
@@ -174,7 +345,6 @@ class SwarmConfigGenerator:
                 agent_peers[leaf_id].extend([primary, secondary])
                 agent_peers[primary].append(leaf_id)
                 agent_peers[secondary].append(leaf_id)
-
             for aid, peers in agent_peers.items():
                 agent_topo[aid] = {
                     "peers": sorted(set(peers)),
@@ -220,7 +390,8 @@ class SwarmConfigGenerator:
                     "level": 1
                 }
 
-        else:  # mesh / default
+        else:
+            # default to full mesh (backward compatible)
             for i in range(1, self.num_agents + 1):
                 peers = [j for j in range(1, self.num_agents + 1) if j != i]
                 agent_topo[i] = {
@@ -257,7 +428,6 @@ class SwarmConfigGenerator:
         for agent_id in range(1, self.num_agents + 1):
             config = copy.deepcopy(self.base_config)
             if agent_hosts:
-                # integer division: every group of agents_per_host agents goes to the same host
                 host_idx = (agent_id - 1) // self.agents_per_host
                 host = agent_hosts[host_idx]
                 config['grpc']['host'] = host
@@ -268,7 +438,6 @@ class SwarmConfigGenerator:
                     config["dtns"] = self.assign_agent_dtns(dtn_pool, min_dtns=1, max_dtns=4)
                     self.agent_dtns_map[str(agent_id)] = config["dtns"]
                 else:
-                    # adjust existing entries
                     existing = self.agent_dtns_map.get(str(agent_id), [])
                     config["dtns"] = self.adjust_scores(existing)
 
@@ -323,54 +492,11 @@ class SwarmConfigGenerator:
 
         print(f"\nGenerated {self.num_agents} config files in {self.output_dir}")
 
-    def _load_agent_dtns(self, path: str) -> Dict[str, List[dict]]:
-        if path and os.path.exists(path):
-            with open(path, "r") as f:
-                data = json.load(f)
-                # ensure keys are str
-                return {str(k): v for k, v in data.items()}
-        return {}
-
-    @staticmethod
-    def random_capacity(min_val, max_val):
-        return random.randint(min_val, max_val)
-
-    def generate_global_dtn_pool(self, total_count=10):
-        pool = []
-        for i in range(1, total_count + 1):
-            pool.append({
-                "name": f"dtn{i}",
-                "ip": f"192.168.100.{i}",
-                "user": f"dtn_user{i}",
-                "base_connectivity_score": round(random.uniform(0.6, 0.95), 2)
-            })
-        return pool
-
-    def adjust_scores(self, dtns: List[dict]):
-        for d in dtns:
-            adjusted_score = min(1.0, max(0.0, d.get("connectivity_score", 0.8) + random.uniform(-0.05, 0.05)))
-            d["connectivity_score"] = round(adjusted_score, 2)
-        return dtns
-
-    def assign_agent_dtns(self, pool, min_dtns=1, max_dtns=4):
-        count = random.randint(min_dtns, max_dtns)
-        selected = random.sample(pool, count)
-        agent_dtns = []
-        for d in selected:
-            adjusted_score = min(1.0, max(0.0, d["base_connectivity_score"] + random.uniform(-0.05, 0.05)))
-            agent_dtns.append({
-                "name": d["name"],
-                "ip": d["ip"],
-                "user": d["user"],
-                "connectivity_score": round(adjusted_score, 2)
-            })
-        return agent_dtns
-
 
 def load_agent_hosts(path: str) -> List[str]:
     """
     Read HOSTS ONLY (one per line). May be fewer than num_agents.
-    Agents will be mapped to hosts round-robin.
+    Agents will be mapped to hosts round-robin (agents_per_host controls grouping per host).
     """
     with open(path, "r") as f:
         hosts = [line.strip() for line in f if line.strip()]
@@ -396,6 +522,12 @@ if __name__ == "__main__":
     parser.add_argument("--agents-per-host", type=int, default=1,
                         help="Number of agents per host (for grpc.host assignment)")
 
+    # NEW: grouping controls for mesh/ring
+    parser.add_argument("--groups", type=int, default=None,
+                        help="Number of groups for mesh/ring (independent sub-topologies)")
+    parser.add_argument("--group-size", type=int, default=None,
+                        help="Group size for mesh/ring (independent sub-topologies)")
+
     args = parser.parse_args()
 
     if args.agent_hosts_file:
@@ -413,14 +545,16 @@ if __name__ == "__main__":
         flavor_percentages = DEFAULT_FLAVOR_PERCENTAGES
 
     generator = SwarmConfigGenerator(
-        args.num_agents,
-        args.jobs_per_proposal,
-        args.base_config_file,
-        args.output_dir,
-        args.topology,
-        args.database,
-        args.dtns,
-        args.agents_per_host
+        num_agents=args.num_agents,
+        jobs_per_proposal=args.jobs_per_proposal,
+        base_config_path=args.base_config_file,
+        output_dir=args.output_dir,
+        topology=args.topology,
+        db_host=args.database,
+        enable_dtns=args.dtns,
+        agents_per_host=args.agents_per_host,
+        groups=args.groups,
+        group_size=args.group_size,
     )
     generator.generate_configs(flavor_percentages=flavor_percentages, agent_hosts=agent_hosts)
 
