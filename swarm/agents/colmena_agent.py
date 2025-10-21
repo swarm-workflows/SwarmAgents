@@ -681,18 +681,21 @@ class ColmenaAgent(Agent):
         cost = (base_score + bottleneck_penalty) * time_penalty * connectivity_penalty * 100
         return round(cost, 2)
 
-    def selection_main(self):
-        self.logger.info(f"Starting agent: {self}")
-        #while self.live_agent_count != self.configured_agent_count:
-        #    time.sleep(0.5)
-        #    self.logger.info(f"[SEL_WAIT] Waiting for Peer map to be populated: "
-        #                     f"{self.live_agent_count}/{self.configured_agent_count}!")
-
+    def start(self):
+        self.logger.info(f"Starting colmena agent")
         colmena_servicer = SelectionServicer(trigger_consensus_fn=self.trigger_consensus)
         self.transport.server.add_service(
             colmena_consensus_pb2_grpc.add_SelectionServiceServicer_to_server,
             colmena_servicer
         )
+        super().start()
+
+    def selection_main(self):
+        self.logger.info(f"Starting agent: {self}")
+        while self.live_agent_count != self.configured_agent_count:
+            time.sleep(0.5)
+            self.logger.info(f"[SEL_WAIT] Waiting for Peer map to be populated: "
+                             f"{self.live_agent_count}/{self.configured_agent_count}!")
 
     def trigger_consensus(self, job: Job):
         # Step 1: Compute cost matrix ONCE for all agents and jobs (for now one job at a time)
