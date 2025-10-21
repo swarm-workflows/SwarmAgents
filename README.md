@@ -52,10 +52,23 @@ This module provides a generic, cache-enabled engine for assigning candidates (e
 
 ## Example: Job Selection
 
+SwarmAgents implements distributed job selection and consensus through specialized agents that autonomously coordinate and assign jobs to available resources.
+
+Two variants of agents currently implement this functionality:
+
+- **ResourceAgent** — a rule-based agent that computes feasibility and cost metrics deterministically using configured weights and thresholds.
+
+- **LLMAgent** — an LLM-enhanced variant that leverages a language model (OpenAI/Ollama compatible) to evaluate, refine, or explain job-selection decisions dynamically.
+
+Both share the same underlying consensus, selection, and topology logic, differing only in how cost evaluation and decision heuristics are implemented.
+
 The file `swarm/agents/resource_agent.py` provides a comprehensive example of distributed job selection using both the consensus and selection engines:
 
-### Cost Computation Equation
+### Cost Computation and Decision Logic
 
+In both agents, the job assignment decision is derived from a **weighted cost function** based on resource utilization and penalties.
+
+#### Resource Agent
 The cost for assigning a job to an agent is computed as a weighted sum of resource utilizations, plus penalties for long jobs and connectivity. Importantly, the weights can be tailored based on the job type, allowing the system to prioritize different resources for different workloads (e.g., compute-heavy, memory-heavy, or data-transfer jobs):
 
 $$
@@ -79,9 +92,14 @@ This approach allows the system to flexibly prioritize resources and penalties f
 
 The final cost is used by the selection engine to compare candidate assignments and select the best agent for each job.
 
-### Job Feasibility
+#### LLM Agent
+In **LLMAgent**, the final cost is based on LLM-computed “advisory adjustment,” reflecting contextual reasoning about balance, fairness, or uncertainty.
+For example, an LLM might slightly favor an underutilized agent even if raw cost is marginally higher.
 
-Job feasibility determines whether an agent can execute a given job, based on its current resource capacities and the job's requirements. The logic is implemented in the `is_job_feasible` method of `resource_agent.py`.
+### Job Feasibility
+Before computing cost, both agents perform a feasibility check to ensure an agent has enough capacity and connectivity to run the job.
+Job feasibility determines whether an agent can execute a given job, based on its current resource capacities and the job's requirements. 
+The logic is implemented in the `is_job_feasible` method of `resource_agent.py`.
 
 **Feasibility criteria include:**
 - The agent must have enough available CPU, RAM, Disk, and GPU resources to meet the job's requirements.
@@ -90,8 +108,11 @@ Job feasibility determines whether an agent can execute a given job, based on it
 
 This feasibility check is performed before cost computation and candidate selection, ensuring that only valid agent-job pairs are considered in the assignment process.
 
+For LLMAgent, the feasibility stage remains deterministic; only cost ranking and acceptance use LLM input. This can be disabled for LLMAgent if needed.
+
 ### Cost Matrix and Candidate Selection
 
+#### Resource Agent
 After feasibility is determined, the selection engine computes a cost matrix representing the assignment cost for each agent-job pair. This is handled by the `compute_cost_matrix` method of the `SelectionEngine` (see its instantiation and usage in `resource_agent.py`).
 
 - **Cost Matrix:**
@@ -105,6 +126,12 @@ After feasibility is determined, the selection engine computes a cost matrix rep
 	- Tie-breaking and acceptance criteria can be configured for custom selection policies.
 
 This process ensures that jobs are assigned to agents in a way that balances resource usage, cost, and system constraints, as implemented in the selection logic of `resource_agent.py`.
+
+#### LLM Agent
+In the case of **LLMAgent**, cost computation is performed **locally by each agent** rather than centrally across all agent-job pairs.
+Each LLM agent independently evaluates the jobs it receives, using the LLM’s reasoning to determine a single cost value per job.
+As a result, the **cost matrix degenerates to a single-column view** — each agent computes costs only for itself instead of contributing to a full agent-by-job matrix.
+This decentralized approach reduces inter-agent computation and communication overhead, while allowing each LLM agent to incorporate contextual or learned reasoning in its own cost evaluation before participating in consensus.
 
 ### Distributed Consensus
 
@@ -134,12 +161,13 @@ Additional implementation details:
 - **Supported Topologies:** The framework supports various network topologies, including Ring, Mesh, and Hierarchical, which can be configured to match different deployment scenarios. Topology logic is handled via the `Topology` and `TopologyType` classes and used in agent initialization and routing decisions.
 
 For implementation details, see:
-- `resource_agent.py`: Integration of selection and consensus engines, job feasibility/cost logic, and scheduling workflow.
+- `resource_agent.py` & `llm_agent.py`: Integration of selection and consensus engines, job feasibility/cost logic, and scheduling workflow.
 - `is_job_feasible`, `compute_job_cost`, and `SelectionEngine` usage for assignment logic.
 - The weights and thresholds in the agent's `__init__` for tuning selection behavior.
 
 ### Testing
 
+#### Resource Agents
 You can simulate all agents on a single host for testing and benchmarking. For example, to run 30 agents in a ring topology with 100 jobs and a local Redis database, use:
 
 ```bash
@@ -147,6 +175,19 @@ python run_test.py --agents 30 --topology ring --jobs 100 --db-host localhost --
 ```
 
 This will launch the specified number of agents, distribute jobs, and store results in the `swarm-multi` directory. Adjust parameters as needed for your experiments.
+
+##### LLM Agents
+You can launch the LLM Agents via the command below:
+- When using OpenAPI, export API key and launch the agents
+```
+export OPENAI_API_KEY=sk-xxxx
+python run_test.py --agent-type llm --agents 10 --topology mesh --jobs 200 --db-host localhost --jobs-per-interval 20 --run-dir runs/llm-001
+```
+- When using Ollama, export the base url
+```
+export LLM_BASE_URL=http://localhost:11434/v1
+python run_test.py --agent-type llm --agents 5 --topology ring --jobs 100 --db-host localhost --jobs-per-interval 10 --run-dir runs/llm-002
+```
 
 ### Results
 
@@ -160,28 +201,42 @@ Simulation results for different topologies (Ring, Mesh, Hierarchical, etc.) are
 For example, after running a simulation with `run_test.py`, inspect the corresponding results directory for summary files and plots. This helps evaluate the scalability, efficiency, and fault tolerance of the framework under various network structures.
 ### Example Results Visualizations
 
+#### Resource Agents
 Below are example images showing results for different topologies:
 
 **Mesh Topology:**
-![Scheduling Latency](runs/simulation/mesh/30/scheduling_latency_histogram.png)
+![Scheduling Latency](runs/simulation/resource_agent/mesh/30/scheduling_latency_histogram.png)
 
-![Jobs Per Agent](runs/simulation/mesh/30/jobs_per_agent.png)
+![Jobs Per Agent](runs/simulation/resource_agent/mesh/30/jobs_per_agent.png)
 
-![Agent Load](runs/simulation/mesh/30/agent_loads_summary.png)
+![Agent Load](runs/simulation/resource_agent/mesh/30/agent_loads_summary.png)
 
 **Ring Topology:**
-![Scheduling Latency](runs/simulation/ring/30/scheduling_latency_histogram.png)
+![Scheduling Latency](runs/simulation/resource_agent/ring/30/scheduling_latency_histogram.png)
 
-![Jobs Per Agent](runs/simulation/ring/30/jobs_per_agent.png)
+![Jobs Per Agent](runs/simulation/resource_agent/ring/30/jobs_per_agent.png)
 
-![Agent Load](runs/simulation/ring/30/agent_loads_summary.png)
+![Agent Load](runs/simulation/resource_agent/ring/30/agent_loads_summary.png)
 
 **Hierarchical Topology:**
-![Scheduling Latency](runs/simulation/hierarchical/30/scheduling_latency_histogram.png)
+![Scheduling Latency](runs/simulation/resource_agent/hierarchical/30/scheduling_latency_histogram.png)
 
-![Jobs Per Agent](runs/simulation/hierarchical/30/jobs_per_agent.png)
+![Jobs Per Agent](runs/simulation/resource_agent/hierarchical/30/jobs_per_agent.png)
 
-![Agent Load](runs/simulation/hierarchical/30/agent_loads_summary.png)
+![Agent Load](runs/simulation/resource_agent/hierarchical/30/agent_loads_summary.png)
+
+#### LLM Agents
+**Mesh Topology:**
+![Scheduling Latency](runs/simulation/llm_agent/mesh/5/scheduling_latency_histogram.png)
+
+![Reasoning Vs Scheduling](runs/simulation/llm_agent/mesh/5/reasoning_vs_latency_scatter.png)
+
+![Reasoning Time](runs/simulation/llm_agent/mesh/5/mean_reasoning_time_per_agent.png)
+
+![Jobs Per Agent](runs/simulation/llm_agent/mesh/5/jobs_per_agent.png)
+
+![Agent Load](runs/simulation/llm_agent/mesh/5/agent_loads_summary.png)
+
 
 ## Utilities
 

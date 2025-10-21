@@ -122,6 +122,7 @@ class LlmAgent(ResourceAgent):
             payload_job = job.to_dict()
             payload_agent = agent.to_dict() if hasattr(agent, "to_dict") else json.loads(agent.to_json())
             bid = self.bidder.score(job=payload_job, agent_state=payload_agent)
+            job.reasoning_time = bid.reasoning_time
             score = float(bid.score)
             self.logger.debug("LLM bidder score=%s bid=%s", score, bid)
             # audit trail (best-effort)
@@ -132,6 +133,7 @@ class LlmAgent(ResourceAgent):
                     "score": score,
                     "explanation": bid.explanation,
                     "ts": time.time(),
+                    "reasoning_time": bid.reasoning_time,
                 },
                     key=f"llm_score:A-{self.agent_id}:{Repository.KEY_JOB}:{job.job_id}",
                     level=self.topology.level, group=self.topology.group)

@@ -45,7 +45,11 @@ def touch(path: str):
         os.utime(path, None)
 
 def main():
-    ap = argparse.ArgumentParser(description="Run swarm, job distributor (blocking), then shutdown + plot.")
+    ap = argparse.ArgumentParser(
+        description="Run swarm, job distributor (blocking), then shutdown + plot."
+    )
+    ap.add_argument("--agent-type", choices=["resource", "llm"], default="resource",
+                    help="Agent kind to launch via swarm-multi-start.sh (default: resource)")
     ap.add_argument("--agents", type=int, required=True)
     ap.add_argument("--topology", default="mesh")
     ap.add_argument("--jobs", type=int, required=True)
@@ -59,14 +63,35 @@ def main():
     ap.add_argument("--grace-seconds", type=int, default=30)
     ap.add_argument("--max-misses", type=int, default=10)
     ap.add_argument("--log-dir", default=None)
+    # Optional pass-throughs to the start script
+    ap.add_argument("--use-config-dir", action="store_true",
+                    help="Pass --use-config-dir to swarm-multi-start.sh")
+    ap.add_argument("--debug", action="store_true",
+                    help="Pass --debug to swarm-multi-start.sh")
+    # Optional: jobs per proposal (kept default=10 as in your script)
+    ap.add_argument("--jobs-per-proposal", type=int, default=10)
     args = ap.parse_args()
 
-    os.makedirs(args.log_dir, exist_ok=True) if args.log_dir else None
+    if args.log_dir:
+        os.makedirs(args.log_dir, exist_ok=True)
 
-    # 1) Run swarm start (blocking)
-    #swarm_cmd = ["./swarm-multi-start.sh", str(args.agents), args.topology, str(args.jobs), args.db_host, "10"]
-    swarm_cmd = ["./swarm-llm-start.sh", str(args.agents), args.topology, str(args.jobs), args.db_host, "10"]
+    # 1) Run swarm start (blocking) — NOTE: agent_type is first positional arg now
+    swarm_cmd = [
+        "./swarm-multi-start.sh",
+        args.agent_type,
+        str(args.agents),
+        args.topology,
+        str(args.jobs),
+        args.db_host,
+        str(args.jobs_per_proposal),
+    ]
+    if args.use_config_dir:
+        swarm_cmd.append("--use-config-dir")
+    if args.debug:
+        swarm_cmd.append("--debug")
+
     swarm_log = os.path.join(args.log_dir, "swarm.log") if args.log_dir else None
+    log(f"Launching swarm: {' '.join(swarm_cmd)}")
     rc = run_blocking(swarm_cmd, swarm_log)
     if rc.returncode != 0:
         log(f"ERROR: swarm-multi-start.sh exited {rc.returncode}")
@@ -80,6 +105,7 @@ def main():
         "--jobs-per-interval", str(args.jobs_per_interval),
     ]
     job_log = os.path.join(args.log_dir, "job_dist.log") if args.log_dir else None
+    log(f"Starting job distributor: {' '.join(job_dist_cmd)}")
     rc = run_blocking(job_dist_cmd, job_log)
     if rc.returncode != 0:
         log(f"ERROR: job_distributor.py exited {rc.returncode}")

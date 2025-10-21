@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from typing import Dict, Any, Optional
 
 from pydantic import BaseModel, Field
@@ -24,6 +25,7 @@ class Bid(BaseModel):
     """Structured score from the LLM."""
     score: float = Field(ge=0.0, le=100.0)
     explanation: str = ""
+    reasoning_time: float | None = None   # seconds
 
 
 class ScoringDeps(BaseModel):
@@ -90,6 +92,7 @@ class LlmBidder:
                 f"AGENT_STATE:\n{json.dumps(agent_state, ensure_ascii=False, indent=2)}\n"
             )
 
+            start = time.perf_counter()
             res = self.agent.run_sync(
                 prompt,
                 output_type=Bid,
@@ -97,8 +100,9 @@ class LlmBidder:
                     temperature=(self.cfg.temperature if hasattr(self.cfg, "temperature") else 0.0),
                 ),
             )
-            # With Agent[Bid], res.output is already a Bid instance.
-            return res.output
+            bid = res.output
+            bid.reasoning_time = time.perf_counter() - start
+            return bid
         except Exception as e:
             if self.logger:
                 self.logger.exception("LLM scoring failed: %s", e)
