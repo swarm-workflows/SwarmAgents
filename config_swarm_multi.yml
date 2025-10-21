@@ -37,7 +37,6 @@ dtns:
     user: "dtn_user2"
     connectivity_score: 0.87
 runtime:
-  profile: BalancedProfile
   data_transfer: False
   max_pending_elections: 100
   projected_queue_threshold: 300.00
@@ -48,7 +47,6 @@ runtime:
   results_dir: swarm-multi
   message_service_type: grpc
   shutdown_mode: manual
-  heartbeat_mode: redis
   total_agents: 5
   jobs_per_proposal: 20
   executor_workers: 10
@@ -81,3 +79,16 @@ job_selection:
   long_job_threshold: 20.0            # Execution time (in seconds) beyond which jobs incur extra penalty
   connectivity_penalty_factor: 1.0    # Multiplier for DTN connectivity penalty (0=no effect, >1 increases penalty severity)
   selection_threshold_pct: 10.0       # % above min cost allowed in candidate selection (lower = stricter, higher = more agents considered)
+llm:
+  enabled: true
+  provider: openai            # or "none" to disable external calls
+  model: "gpt-4o-mini"       # any text model that returns JSON
+  temperature: 0.1
+  timeout_seconds: 6
+  use_for_selection: true     # use LLM to break ties across candidates
+  prompts:
+    cost: |-
+      You are a scheduler. Given a JSON job and an agent's resource state,
+      output a single JSON object: {"score": <float in [0, 100]>, "explanation": "..."}.
+      Higher score = better fit / lower cost. Consider capacity headroom,
+      estimated runtime, network DTN requirements, and fairness when applicable.

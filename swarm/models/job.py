@@ -50,6 +50,7 @@ class Job(Object):
         self.completed_at = None
         self.no_op_count = 0
         self.job_type = None  # default until classified
+        self._reasoning_time = 0
 
     def get_age(self) -> float:
         """
@@ -74,6 +75,14 @@ class Job(Object):
     def set_completed_time(self):
         with self.lock:
             self.completed_at = time.time()
+
+    @property
+    def reasoning_time(self) -> float:
+        return self._reasoning_time
+
+    @reasoning_time.setter
+    def reasoning_time(self, reasoning_time: float):
+        self._reasoning_time = reasoning_time
 
     @property
     def job_id(self) -> str:
@@ -260,14 +269,14 @@ class Job(Object):
             'completed_at': self.completed_at,
             'leader_id': self.leader_id,
             'time_last_state_change': self.time_last_state_change,
-            'job_type': self.job_type
+            'job_type': self.job_type,
+            'reasoning_time': self.reasoning_time
         }
 
     def from_dict(self, job_data: dict):
         self.job_id = job_data['id']
         self.capacities = Capacities.from_dict(job_data['capacities']) if job_data.get('capacities') else None
-        self.capacity_allocations = Capacities.from_dict(job_data['capacity_allocations']) if job_data.get(
-            'capacity_allocations') else None
+        self.capacity_allocations = Capacities.from_dict(job_data['capacity_allocations']) if job_data.get('capacity_allocations') else None
         self.execution_time = job_data['execution_time']
         self.data_in = [DataNode.from_dict(data_in) for data_in in job_data['data_in']]
         self.data_out = [DataNode.from_dict(data_out) for data_out in job_data['data_out']]
@@ -276,15 +285,13 @@ class Job(Object):
         self.data_in_time = job_data['data_in_time'] if job_data.get('data_in_time') is not None else None
         self.data_out_time = job_data['data_out_time'] if job_data.get('data_out_time') is not None else None
         self.created_at = job_data['created_at'] if job_data.get('created_at') is not None else time.time()
-        self.selection_started_at = job_data['selection_started_at'] if job_data.get(
-            'selection_started_at') is not None else time.time()
-        self.selected_by_agent_at = job_data['selected_by_agent_at'] if job_data.get(
-            'selected_by_agent_at') is not None else None
+        self.selection_started_at = job_data['selection_started_at'] if job_data.get('selection_started_at') is not None else time.time()
+        self.selected_by_agent_at = job_data['selected_by_agent_at'] if job_data.get('selected_by_agent_at') is not None else None
         self.scheduled_at = job_data['scheduled_at'] if job_data.get('scheduled_at') is not None else None
         self.completed_at = job_data['completed_at'] if job_data.get('completed_at') is not None else None
         self.leader_id = job_data['leader_id'] if job_data.get('leader_id') is not None else None
-        self.time_last_state_change = job_data['time_last_state_change'] if job_data.get(
-            'time_last_state_change') is not None else None
+        self.time_last_state_change = job_data['time_last_state_change'] if job_data.get('time_last_state_change') is not None else None
+        self.reasoning_time = job_data['reasoning_time'] if job_data.get('reasoning_time') is not None else 0
         self.classify_job_type()
 
     def classify_job_type(self):
@@ -316,3 +323,5 @@ class Job(Object):
         # ---- Combine ----
         self.job_type = f"{resource_class}_{time_class}_{io_class}"
         return self.job_type
+
+

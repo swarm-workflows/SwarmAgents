@@ -1,15 +1,13 @@
-psutil
-paramiko
 PyYAML
 numpy
 matplotlib
-pyraft
 seaborn
 scipy
 redis
 protobuf
 grpcio
 grpcio-tools
-etcd-sdk-python
 confluent-kafka
 grpcio-health-checking
+pydantic
+pydantic_ai
