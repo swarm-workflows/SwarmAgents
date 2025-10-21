@@ -64,7 +64,8 @@ def main():
     os.makedirs(args.log_dir, exist_ok=True) if args.log_dir else None
 
     # 1) Run swarm start (blocking)
-    swarm_cmd = ["./swarm-multi-start.sh", str(args.agents), args.topology, str(args.jobs), args.db_host, "10"]
+    #swarm_cmd = ["./swarm-multi-start.sh", str(args.agents), args.topology, str(args.jobs), args.db_host, "10"]
+    swarm_cmd = ["./swarm-llm-start.sh", str(args.agents), args.topology, str(args.jobs), args.db_host, "10"]
     swarm_log = os.path.join(args.log_dir, "swarm.log") if args.log_dir else None
     rc = run_blocking(swarm_cmd, swarm_log)
     if rc.returncode != 0:

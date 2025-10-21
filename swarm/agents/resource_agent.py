@@ -830,7 +830,7 @@ class ResourceAgent(Agent):
                 # Example key: job:<job_id>:consensus:<agent_id>
                 self.repository.save(
                     obj=entry,
-                    key=f"consensus::{self.agent_id}:{Repository.KEY_JOB}:{job_id}",
+                    key=f"consensus:{self.agent_id}:{Repository.KEY_JOB}:{job_id}",
                     level=self.topology.level,
                     group=self.topology.group,
                 )

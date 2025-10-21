@@ -61,18 +61,20 @@ analytical cost model implemented by `ResourceAgent.compute_job_cost`.
 from __future__ import annotations
 
 import json
-import threading
 import time
 from typing import Any, Dict, Optional
 
-from swarm.agents.llm_agent.llm_bidder import LlmBidder
-from swarm.agents.llm_agent.llm_config import LlmConfig
+from swarm.agents.llm.llm_bidder import LlmBidder
+from swarm.agents.llm.llm_config import LlmConfig
 from swarm.agents.resource_agent import ResourceAgent
+from swarm.consensus.messages.proposal_info import ProposalInfo
 from swarm.database.repository import Repository
 from swarm.models.job import Job
 from swarm.models.agent_info import AgentInfo
 from swarm.models.object import ObjectState
 from swarm.selection.engine import SelectionEngine
+from swarm.selection.penalties import apply_multiplicative_penalty
+from swarm.utils.utils import generate_id
 
 
 class LlmAgent(ResourceAgent):
@@ -86,14 +88,7 @@ class LlmAgent(ResourceAgent):
         # Load LLM configuration
         self.llm_cfg = LlmConfig.from_dict(self.config.get("llm", {}))
 
-        # Instantiate bidder if enabled; else set to None and rely on analytic cost
-        self.bidder: Optional[LlmBidder] = None
-        if self.llm_cfg.enabled:
-            try:
-                self.bidder = LlmBidder(self.llm_cfg, logger=self.logger)
-            except Exception as e:
-                self.logger.warning("LLM bidder disabled due to init error: %s", e)
-                self.bidder = None
+        self.bidder: Optional[LlmBidder] = LlmBidder(self.llm_cfg, logger=self.logger)
 
         # Re-wire the selection engine to use LLM-driven cost if available
         self.selector = SelectionEngine(
@@ -123,49 +118,28 @@ class LlmAgent(ResourceAgent):
         If LLM bidder is available, get a score in [0,100] and convert to cost: 100 - score.
         On any error, fall back to the analytic model.
         """
-        if self.bidder is not None:
+        try:
+            payload_job = job.to_dict()
+            payload_agent = agent.to_dict() if hasattr(agent, "to_dict") else json.loads(agent.to_json())
+            bid = self.bidder.score(job=payload_job, agent_state=payload_agent)
+            score = float(bid.score)
+            self.logger.debug("LLM bidder score=%s bid=%s", score, bid)
+            # audit trail (best-effort)
             try:
-                payload_job = job.to_dict()
-                payload_agent = agent.to_dict() if hasattr(agent, "to_dict") else json.loads(agent.to_json())
-                bid = self.bidder.score(job=payload_job, agent_state=payload_agent)
-                score = float(bid.score)
-                # audit trail (best-effort)
-                try:
-                    self.repository.save({
-                        "job_id": getattr(job, "job_id", None),
-                        "agent_id": getattr(agent, "agent_id", None),
-                        "score": score,
-                        "explanation": bid.explanation,
-                        "ts": time.time(),
-                    }, key_prefix="llm_score", level=self.topology.level, group=self.topology.group)
-                except Exception:
-                    pass
-                return 100.0 - max(0.0, min(100.0, score))
+                self.repository.save({
+                    "id": getattr(job, "job_id", None),
+                    "agent_id": getattr(agent, "agent_id", None),
+                    "score": score,
+                    "explanation": bid.explanation,
+                    "ts": time.time(),
+                },
+                    key=f"llm_score:A-{self.agent_id}:{Repository.KEY_JOB}:{job.job_id}",
+                    level=self.topology.level, group=self.topology.group)
             except Exception as e:
-                self.logger.debug("LLM scoring failed, using analytic cost: %s", e)
-        return super()._cost_job_on_agent(job=job, agent=agent)
-
-    # If you also want the LLM to rank a *set* of near-equal candidates (tie-break):
-    # The SelectionEngine already returns near-min candidates using the threshold.
-    # We override the parent’s `selection_main` lightly to re-rank if configured.
-    def selection_main(self):
-        """Run selection loop; if multiple near-equal assignees exist, optionally
-        ask the LLM to break the tie by considering qualitative factors.
-        """
-        self.logger.info("LLM Selection thread - Start")
-        super_selection = super().selection_main  # keep parent behavior handy
-
-        if not self.llm_cfg.enabled or not self.llm_cfg.use_for_selection:
-            # Use the default parent loop entirely
-            return super_selection()
-
-        # Otherwise, we wrap the parent loop but intercept the short-list step.
-        # To avoid copying a long loop, we delegate selection scoring entirely to
-        # our cost hook above; SelectionEngine will supply candidates using that cost.
-        # That means the parent loop is sufficient. We just log that we are active.
-        return super_selection()
-
-
+                self.logger.exception("Failed to save LLM bidder: %s", e)
+            return 100.0 - max(0.0, min(100.0, score))
+        except Exception as e:
+            self.logger.exception("LLM scoring failed, using analytic cost: %s", e)
 
     # ------------------------------------------------------------------------------------------
     # Optional: expose a utility to score a job for this agent explicitly
@@ -177,3 +151,75 @@ class LlmAgent(ResourceAgent):
         agent_info = self._generate_agent_info()
         cost = self._llm_or_analytic_cost(job=job, agent=agent_info)
         return {"agent_id": self.agent_id, "cost": cost}
+
+
+    def selection_main(self):
+        self.logger.info(f"Starting agent: {self}")
+        while self.live_agent_count != self.configured_agent_count:
+            time.sleep(0.5)
+            self.logger.info(f"[SEL_WAIT] Waiting for Peer map to be populated: "
+                             f"{self.live_agent_count}/{self.configured_agent_count}!")
+
+        while not self.shutdown:
+            try:
+                pending_jobs = self.queues.pending_queue.gets(states=[ObjectState.PENDING],
+                                                              count=self.proposal_job_batch_size)
+                if not pending_jobs:
+                    self.logger.debug(f"No pending jobs available for agent: {self.agent_id}")
+                    time.sleep(0.5)
+                    continue
+                proposals = []
+                jobs = []
+
+                # Step 1: Compute cost matrix ONCE for all agents and jobs
+                # Scoring the jobs on itself.
+                agents = [self.neighbor_map.get(self.agent_id)]
+                '''
+                agents_map = self.neighbor_map
+                agent_ids = list(agents_map.keys())
+                agents = [agents_map.get(aid) for aid in agent_ids if agents_map.get(aid) is not None]
+                '''
+
+                # Build once
+                cost_matrix = self.selector.compute_cost_matrix(
+                    assignees=agents,
+                    candidates=pending_jobs,
+                )
+
+                cost_matrix_with_penalities = apply_multiplicative_penalty(cost_matrix=cost_matrix,
+                                                                           assignees=agents,
+                                                                           factor_fn=self._projected_load_factor)
+
+                # Step 2: Use existing helper to get the best agent per job
+                assignments = self.selector.pick_agent_per_candidate(
+                    assignees=agents,
+                    candidates=pending_jobs,
+                    cost_matrix=cost_matrix_with_penalities,
+                    objective="min",
+                    threshold_pct=self.selection_threshold_pct,  # e.g., 10 means within +10% of best
+                    tie_break_key=lambda ag, s: getattr(ag, "agent_id", "")
+                )
+
+                # Step 3: If this agent is assigned, start proposal
+                for job, (selected_agent, cost) in zip(pending_jobs, assignments):
+                    if selected_agent and selected_agent.agent_id == self.agent_id:
+                        proposal = ProposalInfo(
+                            p_id=generate_id(),
+                            object_id=job.job_id,
+                            agent_id=self.agent_id,
+                            seed=round((cost + self.agent_id), 2)
+                        )
+                        proposals.append(proposal)
+                        job.state = ObjectState.PRE_PREPARE
+
+                if len(proposals):
+                    self.logger.debug(f"Identified jobs to propose: {proposals}")
+                    if self.debug:
+                        self.logger.info(f"Identified jobs to select: {jobs}")
+                    self.engine.propose(proposals=proposals)
+                    proposals.clear()
+
+                time.sleep(0.5)
+            except Exception as e:
+                self.logger.exception(f"Error occurred while executing e: {e}")
+        self.logger.info(f"Agent: {self} stopped with restarts: {self.metrics.restarts}!")
