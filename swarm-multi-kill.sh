@@ -1,5 +1,5 @@
 #!/bin/bash
 touch shutdown
 sleep 180
-pkill -f "main.py swarm-multi"
+pkill -f "main.py"
 

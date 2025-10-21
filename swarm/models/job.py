@@ -49,6 +49,7 @@ class Job(Object):
         self.completed_at = None
         self.no_op_count = 0
         self.job_type = None  # default until classified
+        self._reasoning_time = 0
 
     def get_age(self) -> float:
         """
@@ -73,6 +74,14 @@ class Job(Object):
     def set_completed_time(self):
         with self.lock:
             self.completed_at = time.time()
+
+    @property
+    def reasoning_time(self) -> float:
+        return self._reasoning_time
+
+    @reasoning_time.setter
+    def reasoning_time(self, reasoning_time: float):
+        self._reasoning_time = reasoning_time
 
     @property
     def job_id(self) -> str:
@@ -259,7 +268,8 @@ class Job(Object):
             'completed_at': self.completed_at,
             'leader_id': self.leader_id,
             'time_last_state_change': self.time_last_state_change,
-            'job_type': self.job_type
+            'job_type': self.job_type,
+            'reasoning_time': self.reasoning_time
         }
 
     def from_dict(self, job_data: dict):
@@ -280,6 +290,7 @@ class Job(Object):
         self.completed_at = job_data['completed_at'] if job_data.get('completed_at') is not None else None
         self.leader_id = job_data['leader_id'] if job_data.get('leader_id') is not None else None
         self.time_last_state_change = job_data['time_last_state_change'] if job_data.get('time_last_state_change') is not None else None
+        self.reasoning_time = job_data['reasoning_time'] if job_data.get('reasoning_time') is not None else 0
         self.classify_job_type()
 
     def classify_job_type(self):

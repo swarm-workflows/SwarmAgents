@@ -116,13 +116,14 @@ def save_agents(agents: list[Any], path: str):
         json.dump(agents, f, indent=2)
 
 def save_jobs(jobs: list[Any], path: str):
-    detailed_latency = []  # For combined output
+    detailed_latency = []
     for job_data in jobs:
         if isinstance(job_data, dict):
             job = Job()
             job.from_dict(job_data)
         else:
             job = job_data
+
         job_id = job.job_id
         leader_id = getattr(job, "leader_id", None)
         if leader_id is None:
@@ -130,7 +131,14 @@ def save_jobs(jobs: list[Any], path: str):
         if job.state not in [ObjectState.READY, ObjectState.RUNNING, ObjectState.COMPLETE]:
             continue
 
-        # Store all in one row
+        # Ensure numeric/float for reasoning_time (0.0 if missing)
+        reasoning_time = getattr(job, "reasoning_time", None)
+        try:
+            reasoning_time = float(reasoning_time) if reasoning_time is not None else 0.0
+        except Exception:
+            reasoning_time = 0.0
+
+        # IMPORTANT: leader_id before reasoning_time to match header
         detailed_latency.append([
             job_id,
             job.created_at if job.created_at is not None else 0,
@@ -139,14 +147,16 @@ def save_jobs(jobs: list[Any], path: str):
             job.scheduled_at if job.scheduled_at is not None else 0,
             job.completed_at if job.completed_at is not None else 0,
             job.exit_status if job.exit_status is not None else 0,
-            leader_id
+            leader_id,
+            reasoning_time,
         ])
 
-    # Save combined CSV with leader_id
     with open(path, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['job_id', 'created_at', 'selection_started_at', 'selected_by_agent_at', 'scheduled_at',
-                            'completed_at', 'exit_status', 'leader_id'])
+        writer.writerow([
+            'job_id', 'created_at', 'selection_started_at', 'selected_by_agent_at',
+            'scheduled_at', 'completed_at', 'exit_status', 'leader_id', 'reasoning_time'
+        ])
         writer.writerows(detailed_latency)
 
 def plot_agent_loads_from_dir(run_dir):
@@ -501,6 +511,54 @@ def plot_scheduling_latency_and_jobs(run_dir: str,
         print(f"  Agent {int(agent_id)}: {int(count)} jobs")
 
 
+def plot_reasoning_time(output_dir: str):
+    csv_file = f"{output_dir}/all_jobs.csv"
+    if not os.path.exists(csv_file):
+        print(f"{csv_file} not found")
+        return
+
+    df = pd.read_csv(csv_file)
+    # Make sure dtypes are right
+    df['leader_id'] = pd.to_numeric(df['leader_id'], errors='coerce').astype('Int64')
+    if 'reasoning_time' in df.columns:
+        df['reasoning_time'] = pd.to_numeric(df['reasoning_time'], errors='coerce').fillna(0.0)
+
+    # Compute scheduling latency if not present
+    if "scheduling_latency" not in df.columns:
+        df["scheduling_latency"] = df["selected_by_agent_at"] - df["created_at"]
+
+    # Compute reasoning_time if stamps present
+    if "reasoning_time" in df.columns:
+        # Save summary CSV
+        df[["job_id","leader_id","scheduling_latency","reasoning_time"]].to_csv(
+            os.path.join(output_dir, "reasoning_vs_latency.csv"), index=False
+        )
+
+        # Scatter: reasoning vs scheduling latency
+        plt.figure(figsize=(10,6))
+        plt.scatter(df["reasoning_time"], df["scheduling_latency"], s=12, alpha=0.7)
+        plt.xlabel("Reasoning Time (s)")
+        plt.ylabel("Scheduling Latency (s)")
+        plt.title("Reasoning Time vs Scheduling Latency (per job)")
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, "reasoning_vs_latency_scatter.png"))
+        plt.close()
+
+        # Bar: mean reasoning time per agent
+        g = df.groupby("leader_id")["reasoning_time"].mean().sort_index()
+        plt.figure(figsize=(10,6))
+        plt.bar(g.index.astype(int), g.values)
+        plt.xlabel("Agent ID")
+        plt.ylabel("Mean Reasoning Time (s)")
+        plt.title("Mean Reasoning Time per Agent")
+        plt.grid(axis="y")
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, "mean_reasoning_time_per_agent.png"))
+        plt.close()
+    else:
+        print("Reasoning timestamps not present in all_jobs.csv; nothing to plot.")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Plot scheduling latency, jobs per agent, conflicts/restarts, and loads")
@@ -530,6 +588,7 @@ if __name__ == "__main__":
 
     # Scheduling latency & jobs (ALL jobs)
     plot_scheduling_latency_and_jobs(args.output_dir, args.agents)
+    plot_reasoning_time(args.output_dir)
 
     # Scheduling latency & jobs (EXCLUDING restarted jobs)
     if restarted_job_ids:

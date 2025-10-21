@@ -47,13 +47,12 @@ from swarm.models.capacities import Capacities
 from swarm.models.agent_info import AgentInfo
 from swarm.consensus.messages.proposal_info import ProposalInfo
 from swarm.models.job import Job, ObjectState
-import numpy as np
 
 from swarm.utils.utils import generate_id, job_capacities
 
 
 class _HostAdapter(ConsensusHost):
-    def __init__(self, agent: "SwarmAgent"):
+    def __init__(self, agent: "ResourceAgent"):
         self.agent = agent
     def get_object(self, object_id: str): return self.agent.queues.pending_queue.get(object_id)
     def is_agreement_achieved(self, object_id: str): return self.agent.is_job_completed(object_id)
@@ -67,7 +66,7 @@ class _HostAdapter(ConsensusHost):
 
 
 class _TransportAdapter(ConsensusTransport):
-    def __init__(self, agent: "SwarmAgent"):
+    def __init__(self, agent: "ResourceAgent"):
         self.agent = agent
     def send(self, dest: int, payload: object) -> None:
         self.agent.send(dest, payload)
@@ -76,7 +75,7 @@ class _TransportAdapter(ConsensusTransport):
 
 
 class _RouteAdapter(TopologyRouter):
-    def __init__(self, agent: "SwarmAgent"):
+    def __init__(self, agent: "ResourceAgent"):
         self.agent = agent
 
     def should_forward(self) -> bool:
@@ -831,7 +830,7 @@ class ResourceAgent(Agent):
                 # Example key: job:<job_id>:consensus:<agent_id>
                 self.repository.save(
                     obj=entry,
-                    key=f"consensus::{self.agent_id}:{Repository.KEY_JOB}:{job_id}",
+                    key=f"consensus:{self.agent_id}:{Repository.KEY_JOB}:{job_id}",
                     level=self.topology.level,
                     group=self.topology.group,
                 )
