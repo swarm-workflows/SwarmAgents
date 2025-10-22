@@ -691,11 +691,12 @@ class ColmenaAgent(Agent):
         super().start()
 
     def selection_main(self):
-        self.logger.info(f"Starting agent: {self}")
-        while self.live_agent_count != self.configured_agent_count:
-            time.sleep(0.5)
-            self.logger.info(f"[SEL_WAIT] Waiting for Peer map to be populated: "
-                             f"{self.live_agent_count}/{self.configured_agent_count}!")
+        pass
+        #self.logger.info(f"Starting agent: {self}")
+        #while self.live_agent_count != self.configured_agent_count:
+        #    time.sleep(0.5)
+        #    self.logger.info(f"[SEL_WAIT] Waiting for Peer map to be populated: "
+        #                     f"{self.live_agent_count}/{self.configured_agent_count}!")
 
     def trigger_consensus(self, job: Job):
         # Step 1: Compute cost matrix ONCE for all agents and jobs (for now one job at a time)
