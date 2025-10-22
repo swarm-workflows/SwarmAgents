@@ -700,6 +700,8 @@ class ColmenaAgent(Agent):
 
     def trigger_consensus(self, job: Job):
         # Step 1: Compute cost matrix ONCE for all agents and jobs (for now one job at a time)
+        if self.debug:
+            self.logger.info("Triggered consensus called!")
         job = [job] # Temporal from adapting from jobs to job.
         agents_map = self.neighbor_map
         agent_ids = list(agents_map.keys())
