@@ -703,7 +703,7 @@ class ColmenaAgent(Agent):
         if self.debug:
             self.logger.info("Triggered consensus called!")
         job = [job] # Temporal from adapting from jobs to job.
-        self.schedule_job(job) # Testing
+        self.schedule_job(job[0]) # Testing
         agents_map = self.neighbor_map
         agent_ids = list(agents_map.keys())
         agents = [agents_map.get(aid) for aid in agent_ids if agents_map.get(aid) is not None]
