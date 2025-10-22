@@ -703,6 +703,7 @@ class ColmenaAgent(Agent):
         if self.debug:
             self.logger.info("Triggered consensus called!")
         job = [job] # Temporal from adapting from jobs to job.
+        self.schedule_job(job) # Testing
         agents_map = self.neighbor_map
         agent_ids = list(agents_map.keys())
         agents = [agents_map.get(aid) for aid in agent_ids if agents_map.get(aid) is not None]
@@ -898,7 +899,7 @@ class ColmenaAgent(Agent):
         Otherwise, schedule it locally if load permits.
         """
         self.logger.info(f"Starting Job Scheduling Thread: {self}")
-        host = "127.0.0.1"
+        host = "172.17.0.1"
         port = 50055  # Hardcoded...
         channel = grpc.insecure_channel(f"{host}:{port}")
         self._colmena_client = colmena_consensus_pb2_grpc.SchedulingServiceStub(channel)
