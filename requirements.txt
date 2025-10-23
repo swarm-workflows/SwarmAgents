@@ -11,3 +11,4 @@ confluent-kafka
 grpcio-health-checking
 pydantic
 pydantic_ai
+psutil

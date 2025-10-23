@@ -35,6 +35,7 @@ class Job(Object):
         super().__init__()
         self.capacities = None
         self.service_id = None
+        self.startOrStop = None
         self.capacity_allocations = None
         self.execution_time = 0
         self.data_in = []

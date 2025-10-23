@@ -102,7 +102,7 @@ class Agent(Observer):
 
     @property
     def grpc_port(self) -> int:
-        return (self.grpc_config.get("port", 50051) + self.agent_id)
+        return self.grpc_config.get("port", 50051)
 
     @property
     def grpc_host(self):
@@ -140,7 +140,7 @@ class Agent(Observer):
             for thread in self.threads.values():
                 thread.join()
         except Exception as e:
-            self.logger.error(f"Exception occurred in startup: {e}")
+            self.logger.info(f"Exception occurred in startup: {e}")
             self.logger.error(traceback.format_exc())
             self.stop()
 

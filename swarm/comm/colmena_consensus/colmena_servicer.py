@@ -21,6 +21,7 @@ class SelectionServicer(colmena_consensus_pb2_grpc.SelectionServiceServicer):
         job = Job()
         job.job_id = request.role.roleId
         job.service_id = request.role.serviceId
+        job.startOrStop = request.startOrStop
 
         #job.set_min_or_max(request.startOrStop)
         resources = {res.name: res.value for res in request.role.resources}

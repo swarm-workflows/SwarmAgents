@@ -50,23 +50,21 @@ import grpc
 
 from swarm.utils.utils import generate_id, job_capacities
 
+import threading
+
 
 class _HostAdapter(ConsensusHost):
     def __init__(self, agent: "ColmenaAgent"):
         self.agent = agent
 
+    def get_object(self, object_id: str): return self.agent.role if getattr(self.agent.role, "job_id", None) == object_id else None
+    def is_agreement_achieved(self, object_id: str): return getattr(self.agent.role, "is_complete", None)
     def calculate_quorum(self): return self.agent.calculate_quorum()
-
     def on_leader_elected(self, obj: Object, proposal_id: str): self.agent.trigger_decision(obj)
-
-    def on_participant_commit(self, obj: Object, leader_id: int, proposal_id: str): obj.state = ObjectState.COMMIT
-
+    def on_participant_commit(self, obj: Object, leader_id: int, proposal_id: str): self.agent.role = None
     def now(self): import time; return time.time()
-
     def log_debug(self, m): self.agent.logger.debug(m)
-
     def log_info(self, m): self.agent.logger.info(m)
-
     def log_warn(self, m): self.agent.logger.warning(m)
 
 
@@ -100,6 +98,8 @@ class ColmenaAgent(Agent):
         self._capacities = Capacities().from_dict(self.config.get("capacities", {}))
         self._load = 0
         self.metrics = Metrics()
+        self._role = None
+        self._role_lock = threading.RLock()
 
         self.selector = SelectionEngine(
             feasible=lambda role, agent: self.is_role_feasible(role, agent),
@@ -115,12 +115,29 @@ class ColmenaAgent(Agent):
         )
 
     @property
+    def role(self):
+        """ Thread-safe role getter"""
+        with self._role_lock:
+            return self._role
+
+    @role.setter
+    def role(self, new_role):
+        """ Thread-safe role setter """
+        with self._role_lock:
+            self._role = new_role
+
+    @property
     def peer_expiry_seconds(self) -> int:
         return self.runtime_config.get("peer_expiry_seconds", 300)
 
     @property
     def capacities(self) -> Capacities:
-        return self._capacities
+        import psutil
+        cpu_percent = 100 - psutil.cpu_percent(interval=1)
+        ram_percent = 100 - psutil.virtual_memory().percent
+        disk_percent = 100 - psutil.disk_usage('/').percent
+        capacities = Capacities.from_dict({'core': cpu_percent, 'ram': ram_percent, 'disk': disk_percent})
+        return capacities
 
     def start_idle(self):
         if self.metrics.idle_start_time is None:
@@ -164,6 +181,10 @@ class ColmenaAgent(Agent):
 
         return round((core + ram + disk) / 3, 2)
 
+    @property
+    def restart_job_selection(self) -> float:
+        return self.runtime_config.get("restart_job_selection", 60.00)
+
     def __on_proposal(self, incoming: Proposal):
         self.engine.on_proposal(incoming)
 
@@ -182,12 +203,15 @@ class ColmenaAgent(Agent):
                 if not self.should_process(msg=incoming):
                     continue
                 if isinstance(incoming, Prepare):
+                    self.logger.info("Received prepare")
                     self.__on_prepare(incoming=incoming)
 
                 elif isinstance(incoming, Commit):
+                    self.logger.info("Received commit")
                     self.__on_commit(incoming=incoming)
 
                 elif isinstance(incoming, Proposal):
+                    self.logger.info("Received proposal")
                     self.__on_proposal(incoming=incoming)
 
                 else:
@@ -301,21 +325,12 @@ class ColmenaAgent(Agent):
             )
         # Non-leaf agent: aggregate info from all children
         else:
-            total_capacities = Capacities()
-            total_allocations = Capacities()
-            # Aggregate DTNs from children, keyed by DTN name to deduplicate
-            dtn_map = {}
+            total_capacities = self.capacities
+            total_allocations = self.capacities
 
             for child in self.children.values():
                 total_capacities += child.capacities
-                if child.dtns:
-                    dtn_map.update(child.dtns)
 
-            dtns = []
-            for dtn in dtn_map.values():
-                dtns.append(dtn.to_dict())
-
-            self._capacities = total_capacities
             self._load = self.resource_usage_score(total_allocations, total_capacities)
             agent_info = AgentInfo(
                 host=self.grpc_host,
@@ -323,13 +338,13 @@ class ColmenaAgent(Agent):
                 agent_id=self.agent_id,
                 capacities=total_capacities,
                 load=self._load,
-                last_updated=current_time,
-                dtns=dtns
+                last_updated=current_time
             )
 
         return agent_info
 
     def on_periodic(self):
+        self._restart_selection()
         current_time = int(time.time())
         self._refresh_children(int(current_time))
         agent_info = self._generate_agent_info()
@@ -337,6 +352,18 @@ class ColmenaAgent(Agent):
                              group=self.topology.group)
 
         self._refresh_neighbors(current_time=current_time)
+
+    def _restart_selection(self):
+        if self.role is not None:
+            diff = int(time.time() - self.role.time_last_state_change)
+            if diff > self.restart_job_selection:
+                self.logger.info(f"RESTART: Job: {self.role} reset to Pending")
+                self.role.state = ObjectState.PENDING
+                self.engine.outgoing.remove_object(object_id=self.role.job_id)
+                self.engine.incoming.remove_object(object_id=self.role.job_id)
+                job_id = self.role.job_id
+                self.metrics.restarts[job_id] = self.metrics.restarts.get(job_id, 0) + 1
+                self.start_consensus(self.role)
 
     def is_role_feasible(self, job: Job, agent: AgentInfo) -> bool:
         """
@@ -445,18 +472,33 @@ class ColmenaAgent(Agent):
 
     def trigger_consensus(self, role: Job):
         # Step 1: Compute cost matrix ONCE for all agents and jobs (for now one job at a time)
+        if self.role is not None:
+            self.logger.info("Consensus in process, try again later.")
+            return
+
+        self.role = role
+        self.start_consensus(role)
+
+    def start_consensus(self, role: Job):
         if self.debug:
-            self.logger.info("Triggered consensus called!")
+            self.logger.info("Start consensus called!")
+            self.logger.info(f"Job capacities: {role.capacities}")
 
         agents_map = self.neighbor_map
         agent_ids = list(agents_map.keys())
         agents = [agents_map.get(aid) for aid in agent_ids if agents_map.get(aid) is not None]
+
+
+        for agent_id, agent in agents_map.items():
+            if agent is not None:
+                self.logger.info(f"Agent: {agent_id}, capacities: {agent.capacities}")
 
         # Build once
         cost_matrix = self.selector.compute_cost_matrix(
             assignees=agents,
             candidates=[role],
         )
+        self.logger.info(f"cost matrix: {cost_matrix}")
 
         # Step 2: Use existing helper to get the best agent per job
         assignments = self.selector.pick_agent_per_candidate(
@@ -464,7 +506,7 @@ class ColmenaAgent(Agent):
             candidates=[role],
             cost_matrix=cost_matrix,
             objective="min",
-            threshold_pct=10.0,  # e.g., 10 means within +10% of best
+            threshold_pct=10.0,  # e.g., 10 means within +10% of best, TODO: Take from config file
             tie_break_key=lambda ag, s: getattr(ag, "agent_id", "")
         )
 
@@ -531,9 +573,9 @@ class ColmenaAgent(Agent):
         req = colmena_consensus_pb2.TriggerRoleRequest(
             roleId=job.job_id,  # or some role mapping
             serviceId=job.service_id,  # if job has service_id
-            startOrStop=True,  # start the role
+            startOrStop=job.startOrStop,  # start the role
         )
-
+        self.role = None
         try:
             # Make the gRPC call
             self.transport._colmena_client.TriggerRole(req)
@@ -547,7 +589,8 @@ class ColmenaAgent(Agent):
         """
         if os.path.exists("./shutdown"):
             return True
-        return (time.time() - self.last_non_empty_time) >= self.empty_timeout_seconds
+        #return (time.time() - self.last_non_empty_time) >= self.empty_timeout_seconds
+        return False
 
     def on_shutdown(self):
         self.save_results()
