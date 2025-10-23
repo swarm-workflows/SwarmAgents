@@ -470,8 +470,11 @@ class ColmenaAgent(Agent):
 
         # Step 3: If this agent is assigned, start proposal
         proposals = []
+        self.logger.info(f"Assignments: {assignments}")
         for selected_agent, cost in assignments:
+            self.logger.info(f"Selected agent: {selected_agent}, cost: {cost}")
             if selected_agent and selected_agent.agent_id == self.agent_id:
+                self.logger.info(f"Selected agent is this - sending proposal")
                 proposal = ProposalInfo(
                     p_id=generate_id(),
                     object_id=role.job_id,
