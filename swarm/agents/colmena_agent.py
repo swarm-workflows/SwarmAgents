@@ -477,6 +477,7 @@ class ColmenaAgent(Agent):
             return
 
         self.role = role
+        self.role.job_id = f"{role.job_id}"
         self.start_consensus(role)
 
     def start_consensus(self, role: Job):
