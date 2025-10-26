@@ -569,6 +569,9 @@ class ColmenaAgent(Agent):
 
     def trigger_decision(self, job: Job):
         print(f"[SELECTED]: {job.job_id} on agent: {self.agent_id}")
+        job.leader_id = self.agent_id
+        self.repository.save(obj=job.to_dict(), key_prefix=Repository.KEY_JOB,
+                             level=self.topology.level, group=self.topology.group)
         # Build TriggerRoleRequest
         req = colmena_consensus_pb2.TriggerRoleRequest(
             roleId=job.job_id,  # or some role mapping
