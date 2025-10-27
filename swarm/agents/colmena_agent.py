@@ -44,11 +44,11 @@ from swarm.database.repository import Repository
 from swarm.models.capacities import Capacities
 from swarm.models.agent_info import AgentInfo
 from swarm.consensus.messages.proposal_info import ProposalInfo
-from swarm.models.job import Job, ObjectState
+from swarm.models.role import Role, ObjectState
 
 import grpc
 
-from swarm.utils.utils import generate_id, job_capacities
+from swarm.utils.utils import generate_id
 
 import threading
 
@@ -57,7 +57,7 @@ class _HostAdapter(ConsensusHost):
     def __init__(self, agent: "ColmenaAgent"):
         self.agent = agent
 
-    def get_object(self, object_id: str): return self.agent.role if getattr(self.agent.role, "job_id", None) == object_id else None
+    def get_object(self, object_id: str): return self.agent.role if getattr(self.agent.role, "role_id", None) == object_id else None
     def is_agreement_achieved(self, object_id: str): return getattr(self.agent.role, "is_complete", None)
     def calculate_quorum(self): return self.agent.calculate_quorum()
     def on_leader_elected(self, obj: Object, proposal_id: str): self.agent.trigger_decision(obj)
@@ -107,7 +107,7 @@ class ColmenaAgent(Agent):
             cost=self._cost_role_on_agent,
             candidate_key=self._role_sig,
             assignee_key=self._agent_sig,
-            candidate_version=lambda job: int(getattr(job, "version", 0) or 0),
+            candidate_version=lambda role: int(getattr(role, "version", 0) or 0),
             assignee_version=lambda ag: int(getattr(ag, "version", 0) or getattr(ag, "updated_at", 0) or 0),
             cache_enabled=True,
             feas_cache_size=131072,
@@ -160,12 +160,12 @@ class ColmenaAgent(Agent):
         return self.runtime_config.get("max_time_load_zero", 3)
 
     @staticmethod
-    def _has_sufficient_capacity(role: Job, available: Capacities) -> bool:
+    def _has_sufficient_capacity(role: Role, available: Capacities) -> bool:
         """
-        Returns True if the job can be accommodated by the available capacity.
+        Returns True if the role can be accommodated by the available capacity.
         Also checks data transfer feasibility if enabled.
         """
-        # Check if job fits into available capacities
+        # Check if role fits into available capacities
         residual = available - role.get_capacities()
         negative_fields = residual.negative_fields()
         if len(negative_fields) > 0:
@@ -358,41 +358,41 @@ class ColmenaAgent(Agent):
         if self.role is not None:
             diff = int(time.time() - self.role.time_last_state_change)
             if diff > self.restart_job_selection:
-                self.logger.info(f"RESTART: Job: {self.role} reset to Pending")
+                self.logger.info(f"RESTART: Role: {self.role} reset to Pending")
                 self.role.state = ObjectState.PENDING
-                self.engine.outgoing.remove_object(object_id=self.role.job_id)
-                self.engine.incoming.remove_object(object_id=self.role.job_id)
-                job_id = self.role.job_id
-                self.metrics.restarts[job_id] = self.metrics.restarts.get(job_id, 0) + 1
+                self.engine.outgoing.remove_object(object_id=self.role.role_id)
+                self.engine.incoming.remove_object(object_id=self.role.role_id)
+                role_id = self.role.role_id
+                self.metrics.restarts[role_id] = self.metrics.restarts.get(role_id, 0) + 1
                 self.start_consensus(self.role)
 
-    def is_role_feasible(self, job: Job, agent: AgentInfo) -> bool:
+    def is_role_feasible(self, role: Role, agent: AgentInfo) -> bool:
         """
-        Check if a job is feasible for a given agent based on:
+        Check if a role is feasible for a given agent based on:
           - Current load threshold
           - Resource availability
           - Connectivity to required DTNs for data_in and data_out
 
-        :param job: The job to check.
-        :type job: Job
+        :param role: The role to check.
+        :type role: Role
         :param agent: The agent to check feasibility for.
         :type agent: AgentInfo
-        :return: True if job is feasible for the agent, False otherwise.
+        :return: True if role is feasible for the agent, False otherwise.
         :rtype: bool
         """
         # Capacity check first (cheapest)
         # Check against allocated resources only if no caching used for feasibility
         # available = agent.capacities - agent.capacity_allocations
-        return self._has_sufficient_capacity(job, agent.capacities)
+        return self._has_sufficient_capacity(role, agent.capacities)
 
     def compute_overall_load(self):
         return self.resource_usage_score(allocated=Capacities(), total=self.capacities)
 
-    def _role_sig(self, job: Job) -> tuple:
+    def _role_sig(self, role: Role) -> tuple:
         # Required DTNs can be expensive to rebuild; compute once and reuse
-        caps = job.capacities
+        caps = role.capacities
         return (
-            job.job_id,
+            role.role_id,
             round(caps.core, 3), round(caps.ram, 3), round(caps.disk, 3), round(getattr(caps, "gpu", 0.0), 3)
         )
 
@@ -406,18 +406,13 @@ class ColmenaAgent(Agent):
 
     def compute_role_cost(
             self,  # now uses self so it can read config defaults
-            role: Job,
+            role: Role,
             total: Capacities,
             dtns: dict[str, DataNode]
     ) -> float:
         """
-        Compute the cost of executing a job on an agent based on weighted resource usage,
+        Compute the cost of executing a role on an agent based on weighted resource usage,
         bottleneck effects, execution time penalties, and DTN connectivity.
-
-        The cost is calculated as a weighted sum of resource usage ratios, penalized for:
-          - High single-resource utilization (bottleneck penalty)
-          - Long execution times beyond a configurable threshold
-          - Poor connectivity to DTNs required by the job
 
         :param role: The role whose cost is to be computed.
         :type role: Role
@@ -425,7 +420,7 @@ class ColmenaAgent(Agent):
         :type total: Capacities
         :param dtns: DTN info for the agent
         :type dtns: dict[str, DataNode]
-        :return: Calculated job cost (higher is more expensive).
+        :return: Calculated role cost (higher is more expensive).
         :rtype: float
         """
 
@@ -434,13 +429,13 @@ class ColmenaAgent(Agent):
 
         # Prevent division by zero for GPUs
         total_gpu = getattr(total, "gpu", 0) or 1
-        job_gpu = getattr(role.capacities, "gpu", 0)
+        role_gpu = getattr(role.capacities, "gpu", 0)
 
         # Resource usage ratios
         core_ratio = role.capacities.core / total.core
         ram_ratio = role.capacities.ram / total.ram
         disk_ratio = role.capacities.disk / total.disk
-        gpu_ratio = job_gpu / total_gpu
+        gpu_ratio = role_gpu / total_gpu
 
         # Weighted base score
         base_score = (
@@ -471,20 +466,20 @@ class ColmenaAgent(Agent):
 
         super().start()
 
-    def trigger_consensus(self, role: Job):
-        # Step 1: Compute cost matrix ONCE for all agents and jobs (for now one job at a time)
+    def trigger_consensus(self, role: Role):
+        # Step 1: Compute cost matrix ONCE for all agents and roles (for now one role at a time)
         if self.role is not None:
             self.logger.info("Consensus in process, try again later.")
             return
 
         self.role = role
-        self.role.job_id = f"{role.job_id}"
+        self.role.role_id = f"{role.role_id}"
         self.start_consensus(role)
 
-    def start_consensus(self, role: Job):
+    def start_consensus(self, role: Role):
         if self.debug:
             self.logger.info("Start consensus called!")
-            self.logger.info(f"Job capacities: {role.capacities}")
+            self.logger.info(f"Role capacities: {role.capacities}")
 
         agents_map = self.neighbor_map
         agent_ids = list(agents_map.keys())
@@ -502,7 +497,7 @@ class ColmenaAgent(Agent):
         )
         self.logger.info(f"cost matrix: {cost_matrix}")
 
-        # Step 2: Use existing helper to get the best agent per job
+        # Step 2: Use existing helper to get the best agent per role
         assignments = self.selector.pick_agent_per_candidate(
             assignees=agents,
             candidates=[role],
@@ -521,7 +516,7 @@ class ColmenaAgent(Agent):
                 self.logger.info(f"Selected agent is this - sending proposal")
                 proposal = ProposalInfo(
                     p_id=generate_id(),
-                    object_id=role.job_id,
+                    object_id=role.role_id,
                     agent_id=self.agent_id,
                     seed=round((cost + self.agent_id), 2)
                 )
@@ -529,13 +524,13 @@ class ColmenaAgent(Agent):
                 role.state = ObjectState.PRE_PREPARE
 
         if len(proposals):
-            self.logger.debug(f"Identified jobs to propose: {proposals}")
+            self.logger.debug(f"Identified roles to propose: {proposals}")
             if self.debug:
-                self.logger.info(f"Identified job to select: {role}")
+                self.logger.info(f"Identified role to select: {role}")
             self.engine.propose(proposals=proposals)
             proposals.clear()
 
-        role_id = role.job_id
+        role_id = role.role_id
         if role_id in self.pending_proposals:
             for proposal in self.pending_proposals.pop(role_id, []):
                 self.engine.on_proposal(proposal)
@@ -575,24 +570,28 @@ class ColmenaAgent(Agent):
             # Never let debugging persist crash the agent loop
             self.logger.error(f"save_neighbors failed: {e}", exc_info=True)
 
-    def trigger_decision(self, job: Job):
-        print(f"[SELECTED]: {job.job_id} on agent: {self.agent_id}")
-        job.leader_id = self.agent_id
-        self.repository.save(obj=job.to_dict(), key_prefix=Repository.KEY_JOB,
-                             level=self.topology.level, group=self.topology.group)
+    def trigger_decision(self, role: Role):
+        print(f"[SELECTED]: {role.role_id} on agent: {self.agent_id}")
+
+        role.leader_id = self.agent_id
+        self.role.state = ObjectState.READY
         # Build TriggerRoleRequest
         req = colmena_consensus_pb2.TriggerRoleRequest(
-            roleId=job.job_id,  # or some role mapping
-            serviceId=job.service_id,  # if job has service_id
-            startOrStop=job.startOrStop,  # start the role
+            roleId=role.role_id,  # or some role mapping
+            serviceId=role.service_id,  # if role has service_id
+            startOrStop=role.startOrStop,  # start the role
         )
-        self.role = None
+
         try:
             # Make the gRPC call
             self.transport._colmena_client.TriggerRole(req)
-            self.logger.info(f"Triggered role execution via gRPC for job {job.job_id}")
+            self.logger.info(f"Triggered role execution via gRPC for role {role.role_id}")
         except grpc.RpcError as e:
             self.logger.error(f"Failed to trigger role: {e}")
+
+        self.repository.save(obj=role.to_dict(), key_prefix=Repository.KEY_ROLE,
+                             level=self.topology.level, group=self.topology.group)
+        self.role = None
 
     def should_shutdown(self):
         """
@@ -606,5 +605,5 @@ class ColmenaAgent(Agent):
     def on_shutdown(self):
         self.save_results()
 
-    def _cost_role_on_agent(self, job: Job, agent: AgentInfo) -> float:
-        return self.compute_role_cost(role=job, total=agent.capacities, dtns=agent.dtns)
+    def _cost_role_on_agent(self, role: Role, agent: AgentInfo) -> float:
+        return self.compute_role_cost(role=role, total=agent.capacities, dtns=agent.dtns)

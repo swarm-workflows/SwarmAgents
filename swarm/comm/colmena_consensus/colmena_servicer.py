@@ -1,5 +1,5 @@
 from swarm.models.capacities import Capacities
-from swarm.models.job import Job
+from swarm.models.role import Role
 from swarm.comm.colmena_consensus import colmena_consensus_pb2_grpc, colmena_consensus_pb2
 from google.protobuf import empty_pb2
 import logging
@@ -18,16 +18,16 @@ class SelectionServicer(colmena_consensus_pb2_grpc.SelectionServiceServicer):
         LOG.info("Received RequestRoles for role=%s, service=%s", request.role.roleId, request.role.serviceId)
 
         # Wrap the request in your internal Job structure if needed
-        job = Job()
-        job.job_id = request.role.roleId
-        job.service_id = request.role.serviceId
-        job.startOrStop = request.startOrStop
+        role = Role()
+        role.role_id = request.role.roleId
+        role.service_id = request.role.serviceId
+        role.startOrStop = request.startOrStop
 
         #job.set_min_or_max(request.startOrStop)
         resources = {res.name: res.value for res in request.role.resources}
-        job.set_capacities(Capacities.from_dict(resources))
+        role.set_capacities(Capacities.from_dict(resources))
 
         # Call your agent's trigger_consensus
-        self.trigger_consensus_fn(job)
+        self.trigger_consensus_fn(role)
 
         return empty_pb2.Empty()
