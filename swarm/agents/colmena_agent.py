@@ -100,6 +100,7 @@ class ColmenaAgent(Agent):
         self.metrics = Metrics()
         self._role = None
         self._role_lock = threading.RLock()
+        self.pending_proposals = {}
 
         self.selector = SelectionEngine(
             feasible=lambda role, agent: self.is_role_feasible(role, agent),
@@ -533,6 +534,12 @@ class ColmenaAgent(Agent):
                 self.logger.info(f"Identified job to select: {role}")
             self.engine.propose(proposals=proposals)
             proposals.clear()
+
+        role_id = role.job_id
+        if role_id in self.pending_proposals:
+            for proposal in self.pending_proposals.pop(role_id, []):
+                self.engine.on_proposal(proposal)
+
 
     def save_results(self):
         self.logger.info("Saving Results")
