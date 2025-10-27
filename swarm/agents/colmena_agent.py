@@ -58,6 +58,7 @@ class _HostAdapter(ConsensusHost):
         self.agent = agent
 
     def get_object(self, object_id: str): return self.agent.role if getattr(self.agent.role, "role_id", None) == object_id else None
+    def set_pending_proposal(self, proposal: Proposal): self.agent.pending_proposals.setdefault(proposal.object_id, []).append(proposal)
     def is_agreement_achieved(self, object_id: str): return getattr(self.agent.role, "is_complete", None)
     def calculate_quorum(self): return self.agent.calculate_quorum()
     def on_leader_elected(self, obj: Object, proposal_id: str): self.agent.trigger_decision(obj)
@@ -531,10 +532,13 @@ class ColmenaAgent(Agent):
             proposals.clear()
 
         role_id = role.role_id
-        if role_id in self.pending_proposals:
+        # Check if there are any pending proposals for this role_id
+        pending_list = self.pending_proposals.get(role_id, [])
+
+        if pending_list:
+            # Pop the list to remove it from the dict and iterate over each proposal
             for proposal in self.pending_proposals.pop(role_id, []):
                 self.engine.on_proposal(proposal)
-
 
     def save_results(self):
         self.logger.info("Saving Results")

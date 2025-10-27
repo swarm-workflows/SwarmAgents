@@ -23,6 +23,8 @@
 #
 # Author: Komal Thareja(kthare10@renci.org)
 from typing import Protocol, Iterable, Optional, Any
+
+from swarm.consensus.messages.proposal import Proposal
 from swarm.models.object import Object
 
 class TopologyRouter(Protocol):
@@ -36,6 +38,7 @@ class ConsensusTransport(Protocol):
 class ConsensusHost(Protocol):
     # domain introspection
     def get_object(self, object_id: str) -> Optional[Object]: ...
+    def set_pending_proposal(self, proposal: Proposal): ...
     def is_agreement_achieved(self, object_id: str) -> bool: ...
     def calculate_quorum(self) -> int: ...
 
