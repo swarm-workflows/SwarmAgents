@@ -58,7 +58,7 @@ class _HostAdapter(ConsensusHost):
         self.agent = agent
 
     def get_object(self, object_id: str): return self.agent.role if getattr(self.agent.role, "role_id", None) == object_id else None
-    def set_pending_proposal(self, proposal: Proposal): self.agent.pending_proposals.setdefault(proposal.object_id, []).append(proposal)
+    def set_pending_proposal(self, proposal: Proposal, object_id: str): self.agent.pending_proposals.setdefault(object_id, []).append(proposal)
     def is_agreement_achieved(self, object_id: str): return getattr(self.agent.role, "is_complete", None)
     def calculate_quorum(self): return self.agent.calculate_quorum()
     def on_leader_elected(self, obj: Object, proposal_id: str): self.agent.trigger_decision(obj)
@@ -356,7 +356,7 @@ class ColmenaAgent(Agent):
         self._refresh_neighbors(current_time=current_time)
 
     def _restart_selection(self):
-        if self.role is not None and self.role.state != ObjectState.PENDING:
+        if (self.role is not None) and (self.role.state != ObjectState.PENDING):
             diff = int(time.time() - self.role.time_last_state_change)
             if diff > self.restart_job_selection:
                 self.logger.info(f"RESTART: Role: {self.role} reset to Pending")

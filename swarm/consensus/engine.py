@@ -66,7 +66,7 @@ class ConsensusEngine:
             if not object or self.host.is_agreement_achieved(object.object_id):
                 if not object:
                     self.host.log_info(f"Skip proposal {proposal.p_id} for {proposal.object_id} (missing)")
-                    self.host.set_pending_proposal(proposal)
+                    self.host.set_pending_proposal(msg, proposal.object_id)
                 else:
                     self.host.log_info(f"Skip proposal {proposal.p_id} for {proposal.object_id} (complete)")
                 self.outgoing.remove_object(object_id=proposal.object_id)
