@@ -356,7 +356,7 @@ class ColmenaAgent(Agent):
         self._refresh_neighbors(current_time=current_time)
 
     def _restart_selection(self):
-        if self.role is not None:
+        if self.role is not None and self.role.state != ObjectState.PENDING:
             diff = int(time.time() - self.role.time_last_state_change)
             if diff > self.restart_job_selection:
                 self.logger.info(f"RESTART: Role: {self.role} reset to Pending")
