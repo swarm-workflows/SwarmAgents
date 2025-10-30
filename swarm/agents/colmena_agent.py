@@ -59,6 +59,8 @@ class _HostAdapter(ConsensusHost):
 
     def get_object(self, object_id: str): return self.agent.role if getattr(self.agent.role, "role_id", None) == object_id else None
     def set_pending_proposal(self, proposal: Proposal, object_id: str): self.agent.pending_proposals.setdefault(object_id, []).append(proposal)
+    def set_pending_prepare(self, prepare: Prepare, object_id: str): self.agent.pending_prepares.setdefault(object_id, []).append(prepare)
+    def set_pending_commit(self, commit: Commit, object_id: str): self.agent.pending_commits.setdefault(object_id, []).append(commit)
     def is_agreement_achieved(self, object_id: str): return getattr(self.agent.role, "is_complete", None)
     def calculate_quorum(self): return self.agent.calculate_quorum()
     def on_leader_elected(self, obj: Object, proposal_id: str): self.agent.trigger_decision(obj)
@@ -102,6 +104,8 @@ class ColmenaAgent(Agent):
         self._role = None
         self._role_lock = threading.RLock()
         self.pending_proposals = {}
+        self.pending_prepares = {}
+        self.pending_commits = {}
 
         self.selector = SelectionEngine(
             feasible=lambda role, agent: self.is_role_feasible(role, agent),
@@ -356,7 +360,7 @@ class ColmenaAgent(Agent):
         self._refresh_neighbors(current_time=current_time)
 
     def _restart_selection(self):
-        if (self.role is not None) and (self.role.state != ObjectState.PENDING):
+        if self.role is not None:
             diff = int(time.time() - self.role.time_last_state_change)
             if diff > self.restart_job_selection:
                 self.logger.info(f"RESTART: Role: {self.role} reset to Pending")
@@ -532,13 +536,19 @@ class ColmenaAgent(Agent):
             proposals.clear()
 
         role_id = role.role_id
-        # Check if there are any pending proposals for this role_id
-        pending_list = self.pending_proposals.get(role_id, [])
 
-        if pending_list:
-            # Pop the list to remove it from the dict and iterate over each proposal
-            for proposal in self.pending_proposals.pop(role_id, []):
-                self.engine.on_proposal(proposal)
+        pending_proposals_list = self.pending_proposals.pop(role_id, [])
+        for proposal in pending_proposals_list:
+            self.engine.on_proposal(proposal)
+
+        pending_prepares_list = self.pending_prepares.pop(role_id, [])
+        for prepare in pending_prepares_list:
+            self.engine.on_prepare(prepare)
+
+        pending_commits_list = self.pending_commits.pop(role_id, [])
+        for commit in pending_commits_list:
+            self.engine.on_commit(commit)
+
 
     def save_results(self):
         self.logger.info("Saving Results")

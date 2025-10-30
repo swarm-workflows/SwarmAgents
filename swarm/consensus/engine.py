@@ -65,12 +65,12 @@ class ConsensusEngine:
             object = self.host.get_object(proposal.object_id)
             if not object or self.host.is_agreement_achieved(object.object_id):
                 if not object:
-                    self.host.log_info(f"Skip proposal {proposal.p_id} for {proposal.object_id} (missing)")
+                    self.host.log_info(f"Enqueued proposal {proposal.p_id} for {proposal.object_id} (missing)")
                     self.host.set_pending_proposal(msg, proposal.object_id)
                 else:
                     self.host.log_info(f"Skip proposal {proposal.p_id} for {proposal.object_id} (complete)")
-                self.outgoing.remove_object(object_id=proposal.object_id)
-                self.incoming.remove_object(object_id=proposal.object_id)
+                    self.outgoing.remove_object(object_id=proposal.object_id)
+                    self.incoming.remove_object(object_id=proposal.object_id)
                 continue
 
             # Basic dominance check using your existing helpers
@@ -118,9 +118,13 @@ class ConsensusEngine:
         for p in msg.proposals:
             object = self.host.get_object(p.object_id)
             if not object or self.host.is_agreement_achieved(object.object_id):
-                self.host.log_debug(f"Skip proposal {p.p_id}/{p.object_id} (missing or complete)")
-                self.outgoing.remove_object(object_id=p.object_id)
-                self.incoming.remove_object(object_id=p.object_id)
+                if not object:
+                    self.host.set_pending_prepare(msg, p.object_id)
+                    self.host.log_info(f"Enqueued prepare {p.p_id}/{p.object_id} (missing)")
+                else:
+                    self.outgoing.remove_object(object_id=p.object_id)
+                    self.incoming.remove_object(object_id=p.object_id)
+                    self.host.log_debug(f"Skip prepare {p.p_id}/{p.object_id} (complete)")
                 continue
 
             # I have sent this proposal
@@ -166,9 +170,13 @@ class ConsensusEngine:
         for p in msg.proposals:
             object = self.host.get_object(p.object_id)
             if not object or self.host.is_agreement_achieved(object.object_id):
-                self.host.log_debug(f"Skip proposal {p.p_id}/{p.object_id} (missing or complete)")
-                self.outgoing.remove_object(object_id=p.object_id)
-                self.incoming.remove_object(object_id=p.object_id)
+                if not object:
+                    self.host.set_pending_commit(msg, p.object_id)
+                    self.host.log_info(f"Enqueued commit {p.p_id}/{p.object_id} (missing)")
+                else:
+                    self.outgoing.remove_object(object_id=p.object_id)
+                    self.incoming.remove_object(object_id=p.object_id)
+                    self.host.log_debug(f"Skipped commit {p.p_id}/{p.object_id} (missing)")
                 continue
 
             # I have sent this proposal
