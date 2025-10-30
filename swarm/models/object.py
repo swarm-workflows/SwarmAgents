@@ -42,7 +42,7 @@ class Object(ABC):
     def __init__(self):
         self._object_id = None
         self._state = ObjectState.PENDING
-        self._time_last_state_change = 0
+        self._time_last_state_change = time.time()
         self._leader_id = None
         self.lock = threading.RLock()  # Lock for synchronization
 
