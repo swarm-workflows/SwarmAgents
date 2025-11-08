@@ -478,7 +478,6 @@ class ColmenaAgent(Agent):
             return
 
         self.role = role
-        self.role.role_id = f"{role.role_id}"
         self.start_consensus(role)
 
     def start_consensus(self, role: Role):
