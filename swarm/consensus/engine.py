@@ -196,7 +196,7 @@ class ConsensusEngine:
                 proposal.commits.append(msg.agents[0].agent_id)
 
             quorum = self.host.calculate_quorum()
-            self.host.log_info("Is quorum?")
+            self.host.log_info(f"Is quorum? /{quorum}")
             if len(proposal.commits) >= quorum:
                 self.host.log_info("Is quorum!!")
                 # leader vs participant path
