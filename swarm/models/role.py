@@ -56,7 +56,7 @@ class Role(Object):
 
     def set_selection_end_time(self):
         with self.lock:
-            self.selected_by_agent_at = time.time()
+            self.selected_by_agent_at = self.time_last_state_change
 
     @property
     def role_id(self) -> str:
