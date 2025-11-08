@@ -91,10 +91,7 @@ class Agent(Observer):
     @property
     def configured_agent_count(self) -> int:
         """Returns the expected total number of agents from the runtime configuration."""
-        if self.topology.type == TopologyType.Ring:
-            return int(self.runtime_config.get("total_agents", 0))
-
-        return 1 + len(self.topology.peers)
+        return self.topology.group_size
 
     @property
     def results_dir(self) -> str:
@@ -102,7 +99,7 @@ class Agent(Observer):
 
     @property
     def grpc_port(self) -> int:
-        return (self.grpc_config.get("port", 50051) + self.agent_id)
+        return self.grpc_config.get("port", 20000)
 
     @property
     def grpc_host(self):

@@ -209,7 +209,7 @@ class LlmAgent(ResourceAgent):
                             p_id=generate_id(),
                             object_id=job.job_id,
                             agent_id=self.agent_id,
-                            seed=round((cost + self.agent_id), 2)
+                            cost=round((cost + self.agent_id), 2)
                         )
                         proposals.append(proposal)
                         job.state = ObjectState.PRE_PREPARE

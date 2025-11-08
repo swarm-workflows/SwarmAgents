@@ -92,8 +92,8 @@ class JobDistributor(threading.Thread):
             job_data = json.load(f)
             job = Job()
             job.job_id = job_data['id']
-            job.set_capacities(Capacities.from_dict(job_data['capacities']))
-            job.execution_time = job_data['execution_time']
+            job.capacities = Capacities.from_dict(job_data['capacities'])
+            job.wall_time = job_data['wall_time']
             if job_data.get('data_in'):
                 for data_in in job_data['data_in']:
                     job.add_incoming_data_dep(DataNode.from_dict(data_in))

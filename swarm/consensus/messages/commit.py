@@ -33,7 +33,7 @@ class Commit(Proposal):
 
 if __name__ == '__main__':
     from swarm.consensus.messages.proposal_info import ProposalInfo
-    p_info = ProposalInfo(p_id="pid_1", job_id='t-1', seed=0.6, agent_id="0", commits=1)
+    p_info = ProposalInfo(p_id="pid_1", job_id='t-1', cost=0.6, agent_id="0", commits=1)
     print(p_info)
     print(p_info.to_dict())
     commit = Commit(proposals=[p_info], forwarded_by="1")

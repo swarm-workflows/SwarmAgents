@@ -238,9 +238,9 @@ class SelectionAlgo:
 
         time_factor = max(1, getattr(job, "execution_time", 1))  # default to 1 if not set
 
-        core_load = (job.capacities.core / total.core) * 100 * time_factor
-        ram_load = (job.capacities.ram / total.ram) * 100 * time_factor
-        disk_load = (job.capacities.disk / total.disk) * 100 * time_factor
+        core_load = (job._capacities.core / total.core) * 100 * time_factor
+        ram_load = (job._capacities.ram / total.ram) * 100 * time_factor
+        disk_load = (job._capacities.disk / total.disk) * 100 * time_factor
 
         cost = round((core_load + ram_load + disk_load) / 3, 2)
 
@@ -277,7 +277,7 @@ def metrics_printer_thread(algo: SelectionAlgo, interval: float = 5.0):
         for agent_id, agent in algo.agents.items():
             queue_size = agent.select_queue.size()
             load_history[agent_id].append((now, agent.load))
-            print(f"  Agent-{agent_id} | Load: {agent.load:.2f} | Queue Size: {queue_size} | Capacities: {agent.capacities}")
+            print(f"  Agent-{agent_id} | Load: {agent.load:.2f} | Queue Size: {queue_size} | Capacities: {agent._capacities}")
         print("-" * 40)
         time.sleep(interval)
 
@@ -413,12 +413,12 @@ if __name__ == '__main__':
             "scheduled_at", "completed_at", "selection_latency", "execution_latency", "total_latency"
         ])
         for job in completed_jobs:
-            selection_latency = (job.selected_by_agent_at - job.created_at) if job.selected_by_agent_at else None
-            execution_latency = (job.completed_at - job.scheduled_at) if job.completed_at and job.scheduled_at else None
-            total_latency = (job.completed_at - job.created_at) if job.completed_at else None
+            selection_latency = (job._selected_at - job._submission_time) if job._selected_at else None
+            execution_latency = (job._completion_time - job._enqueued_at) if job._completion_time and job._enqueued_at else None
+            total_latency = (job._completion_time - job._submission_time) if job._completion_time else None
             writer.writerow([
                 job.job_id, job.leader_id,
-                job.created_at, job.selected_by_agent_at, job.scheduled_at, job.completed_at,
+                job._submission_time, job._selected_at, job._enqueued_at, job._completion_time,
                 selection_latency, execution_latency, total_latency
             ])
 
@@ -433,8 +433,8 @@ if __name__ == '__main__':
 
     # --- Calculate latency stats ---
     latencies = [
-        job.selected_by_agent_at - job.created_at
-        for job in completed_jobs if job.selected_by_agent_at
+        job._selected_at - job._submission_time
+        for job in completed_jobs if job._selected_at
     ]
     if latencies:
         avg_latency = statistics.mean(latencies)

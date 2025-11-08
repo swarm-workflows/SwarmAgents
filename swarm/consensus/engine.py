@@ -79,7 +79,7 @@ class ConsensusEngine:
                 self.conflicts[object.object_id] = self.conflicts.get(object.object_id, 0) + 1
             elif peer_better:
                 # adopt better peer proposal (already handled by containers)
-                self.host.log_debug(f"Already accepted better proposal for Object {object.object_id} from peer {peer_better.agent_id} Cost: {peer_better.seed}")
+                self.host.log_debug(f"Already accepted better proposal for Object {object.object_id} from peer {peer_better.agent_id} Cost: {peer_better.cost}")
                 self.conflicts[object.object_id] = self.conflicts.get(object.object_id, 0) + 1
             else:
                 if my_better:
@@ -188,7 +188,7 @@ class ConsensusEngine:
                     # I am leader, do selection
                     object.leader_id = proposal.agent_id
                     self.host.log_info(f"[CON_LEADER] Object:{proposal.object_id} Leader:{self.agent_id} p:{proposal.p_id}")
-                    #print(f"[CON_LEADER] Object:{proposal.object_id} Leader:{self.agent_id} p:{proposal.p_id} quorum: {len(proposal.commits)}")
+                    print(f"[CON_LEADER] Object:{proposal.object_id} Leader:{self.agent_id} p:{proposal.p_id} quorum: {len(proposal.commits)}")
                     self.host.on_leader_elected(object, proposal.p_id)
                 else:
                     self.host.log_info(f"[CON_PART] Object:{proposal.object_id} Leader:{proposal.agent_id} p:{proposal.p_id}")

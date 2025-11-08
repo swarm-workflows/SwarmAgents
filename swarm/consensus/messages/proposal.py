@@ -55,7 +55,7 @@ class Proposal(Message):
 
 
 if __name__ == '__main__':
-    p_info = ProposalInfo(p_id="pid_1", object_id='t-1', seed=0.6, agent_id="0")
+    p_info = ProposalInfo(p_id="pid_1", object_id='t-1', cost=0.6, agent_id="0")
     print(p_info)
     print(p_info.to_dict())
     proposal = Proposal(proposals=[p_info])

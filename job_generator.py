@@ -75,7 +75,7 @@ class JobGenerator:
         gpu = self.biased_uniform(0.1, agent_profile.get("gpu", 0)) if agent_profile.get("gpu", 0) > 0 else 0
         ram = self.biased_uniform(0.1, agent_profile.get("ram", 8))
         disk = self.biased_uniform(1, agent_profile.get("disk", 100))
-        execution_time = self.biased_uniform(0.1, 30.0)
+        wall_time = self.biased_uniform(0.1, 30.0)
 
         input_files = ['/var/tmp/outgoing/file100M.txt',
                        '/var/tmp/outgoing/file500M.txt',
@@ -103,7 +103,7 @@ class JobGenerator:
 
         return {
             'id': job_id,
-            'execution_time': execution_time,
+            'wall_time': wall_time,
             'capacities': {'core': core, 'ram': ram, 'disk': disk, 'gpu': gpu},
             'data_in': data_in if enable_dtns else None,
             'data_out': data_out if enable_dtns else None,

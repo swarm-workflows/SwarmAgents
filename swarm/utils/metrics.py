@@ -83,11 +83,11 @@ class Metrics:
             # Store all in one row
             detailed_latency.append([
                 job_id,
-                job.created_at if job.created_at is not None else 0,
-                job.selection_started_at if job.selection_started_at is not None else 0,
-                job.selected_by_agent_at if job.selected_by_agent_at is not None else 0,
-                job.scheduled_at if job.scheduled_at is not None else 0,
-                job.completed_at if job.completed_at is not None else 0,
+                job._submission_time if job._submission_time is not None else 0,
+                job._selection_at if job._selection_at is not None else 0,
+                job._selected_at if job._selected_at is not None else 0,
+                job._enqueued_at if job._enqueued_at is not None else 0,
+                job._completion_time if job._completion_time is not None else 0,
                 job.exit_status if job.exit_status is not None else 0,
                 leader_id
             ])

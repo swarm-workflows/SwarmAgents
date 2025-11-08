@@ -120,7 +120,7 @@ if __name__ == "__main__":
 
     job = {
         "id": "1",
-        "execution_time": 1.3,
+        "wall_time": 1.3,
         "capacities": {"core": 1.5, "ram": 5.83, "disk": 8.37, "gpu": 0},
         "data_in": [{"name": "dtn4", "file": "/var/tmp/outgoing/file500M.txt"}],
         "data_out": [{"name": "dtn4", "file": "/var/tmp/outgoing/file100M.txt"}],

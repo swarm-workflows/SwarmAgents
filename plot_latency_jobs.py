@@ -141,10 +141,10 @@ def save_jobs(jobs: list[Any], path: str):
         # IMPORTANT: leader_id before reasoning_time to match header
         detailed_latency.append([
             job_id,
-            job.created_at if job.created_at is not None else 0,
+            job.submitted_at if job.submitted_at is not None else 0,
             job.selection_started_at if job.selection_started_at is not None else 0,
-            job.selected_by_agent_at if job.selected_by_agent_at is not None else 0,
-            job.scheduled_at if job.scheduled_at is not None else 0,
+            job.assigned_at if job.assigned_at is not None else 0,
+            job.started_at if job.started_at is not None else 0,
             job.completed_at if job.completed_at is not None else 0,
             job.exit_status if job.exit_status is not None else 0,
             leader_id,
@@ -154,8 +154,8 @@ def save_jobs(jobs: list[Any], path: str):
     with open(path, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow([
-            'job_id', 'created_at', 'selection_started_at', 'selected_by_agent_at',
-            'scheduled_at', 'completed_at', 'exit_status', 'leader_id', 'reasoning_time'
+            'job_id', 'submitted_at', 'selection_started_at', 'assigned_at',
+            'started_at', 'completed_at', 'exit_status', 'leader_id', 'reasoning_time'
         ])
         writer.writerows(detailed_latency)
 
@@ -448,7 +448,7 @@ def plot_scheduling_latency_and_jobs(run_dir: str,
     df = pd.read_csv(csv_file)
 
     # Compute scheduling latency
-    df["scheduling_latency"] = df["selected_by_agent_at"] - df["created_at"]
+    df["scheduling_latency"] = df["assigned_at"] - df["submitted_at"]
 
     # Optional filter (e.g., exclude restarted jobs)
     if exclude_job_ids:
@@ -525,7 +525,7 @@ def plot_reasoning_time(output_dir: str):
 
     # Compute scheduling latency if not present
     if "scheduling_latency" not in df.columns:
-        df["scheduling_latency"] = df["selected_by_agent_at"] - df["created_at"]
+        df["scheduling_latency"] = df["assigned_at"] - df["submitted_at"]
 
     # Compute reasoning_time if stamps present
     if "reasoning_time" in df.columns:

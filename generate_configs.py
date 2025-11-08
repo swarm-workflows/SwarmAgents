@@ -211,6 +211,8 @@ class SwarmConfigGenerator:
                     "children": None,
                     "group": gid,
                     "level": 0,
+                    "group_size": len(group),
+                    "group_count": len(groups),
                 }
         return agent_topo
 
@@ -231,6 +233,8 @@ class SwarmConfigGenerator:
                     "children": None,
                     "group": gid,
                     "level": 0,
+                    "group_size": len(ring),
+                    "group_count": len(rings),
                 }
                 continue
             for k in range(n):
@@ -243,6 +247,8 @@ class SwarmConfigGenerator:
                     "children": None,
                     "group": gid,
                     "level": 0,
+                    "group_size": len(ring),
+                    "group_count": len(rings),
                 }
         return agent_topo
 
@@ -375,7 +381,10 @@ class SwarmConfigGenerator:
                         "parent": parent_id,
                         "children": None,
                         "group": group,
-                        "level": 0
+                        "level": 0,
+                        "group_size": group_size,
+                        "group_count": num_groups
+
                     }
 
             # Level 1 (parent agents)
@@ -387,7 +396,9 @@ class SwarmConfigGenerator:
                     "parent": None,
                     "children": [group],
                     "group": 0,
-                    "level": 1
+                    "level": 1,
+                    "group_size": group_size,
+                    "group_count": num_groups
                 }
 
         else:
@@ -399,7 +410,9 @@ class SwarmConfigGenerator:
                     "parent": None,
                     "children": None,
                     "group": 0,
-                    "level": 0
+                    "level": 0,
+                    "group_size": self.num_agents,
+                    "group_count": 1
                 }
 
         config_prefix = self.get_config_prefix()
@@ -431,6 +444,8 @@ class SwarmConfigGenerator:
                 host_idx = (agent_id - 1) // self.agents_per_host
                 host = agent_hosts[host_idx]
                 config['grpc']['host'] = host
+            else:
+                config['grpc']['port'] += agent_id
 
             # DTNs
             if self.enable_dtns:
@@ -459,7 +474,9 @@ class SwarmConfigGenerator:
                 "parent": topo["parent"],
                 "children": topo["children"],
                 "level": topo["level"],
-                "group": topo["group"]
+                "group": topo["group"],
+                "group_size": topo["group_size"],
+                "group_count": topo["group_count"]
             }
             config.setdefault("runtime", {})
             config["runtime"]["total_agents"] = self.num_agents

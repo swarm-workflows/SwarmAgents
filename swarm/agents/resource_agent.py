@@ -140,20 +140,8 @@ class ResourceAgent(Agent):
         return self.runtime_config.get("peer_expiry_seconds", 300)
 
     @property
-    def restart_job_selection(self) -> float:
-        return self.runtime_config.get("restart_job_selection", 60.00)
-
-    @property
-    def data_transfer(self) -> bool:
-        return self.runtime_config.get("data_transfer", False)
-
-    @property
-    def projected_queue_threshold(self) -> float:
-        return self.runtime_config.get("projected_queue_threshold", 300.00)
-
-    @property
-    def ready_queue_threshold(self) -> float:
-        return self.runtime_config.get("ready_queue_threshold", 100.00)
+    def reselection_timeout_s(self) -> float:
+        return self.runtime_config.get("reselection_timeout_s", 60.00)
 
     @property
     def capacities(self) -> Capacities:
@@ -180,7 +168,7 @@ class ResourceAgent(Agent):
 
     @property
     def empty_timeout_seconds(self):
-        return self.runtime_config.get("max_time_load_zero", 3)
+        return self.runtime_config.get("empty_timeout_seconds", 3)
 
     @property
     def proposal_job_batch_size(self):
@@ -193,7 +181,7 @@ class ResourceAgent(Agent):
         Also checks data transfer feasibility if enabled.
         """
         # Check if job fits into available capacities
-        residual = available - job.get_capacities()
+        residual = available - job.capacities
         negative_fields = residual.negative_fields()
         if len(negative_fields) > 0:
             return False
@@ -248,7 +236,8 @@ class ResourceAgent(Agent):
         for job_id in jobs:
             #job_id = key.split(":")[-1]
             if job_id not in self.queues.pending_queue:
-                job = self.repository.get(obj_id=job_id, key_prefix=Repository.KEY_JOB, level=self.topology.level,
+                job = self.repository.get(obj_id=job_id, key_prefix=Repository.KEY_JOB,
+                                          level=self.topology.level,
                                           group=self.topology.group)
                 job_obj = Job()
                 job_obj.from_dict(job)
@@ -271,9 +260,10 @@ class ResourceAgent(Agent):
         jobs = self.queues.pending_queue.gets(states=[ObjectState.PREPARE, ObjectState.PRE_PREPARE,
                                                       ObjectState.COMMIT])
         for job in jobs:
-            diff = int(time.time() - job.time_last_state_change)
-            if diff > self.restart_job_selection:
+            diff = int(time.time() - job.last_transition_at)
+            if diff > self.reselection_timeout_s:
                 self.logger.info(f"RESTART: Job: {job} reset to Pending")
+                print(f"RESTART: Job: {job} reset to Pending {self.reselection_timeout_s} seconds")
                 job.state = ObjectState.PENDING
                 self.engine.outgoing.remove_object(object_id=job.job_id)
                 self.engine.incoming.remove_object(object_id=job.job_id)
@@ -393,7 +383,7 @@ class ResourceAgent(Agent):
             dtn_map = {}
 
             for child in self.children.values():
-                total_capacities += child.capacities
+                total_capacities += child._capacities
                 total_allocations += child.capacity_allocations
                 if child.dtns:
                     dtn_map.update(child.dtns)
@@ -424,7 +414,8 @@ class ResourceAgent(Agent):
         current_time = int(time.time())
         self._refresh_children(int(current_time))
         agent_info = self._generate_agent_info()
-        self.repository.save(agent_info.to_dict(), key_prefix=Repository.KEY_AGENT, level=self.topology.level,
+        self.repository.save(agent_info.to_dict(), key_prefix=Repository.KEY_AGENT,
+                             level=self.topology.level,
                              group=self.topology.group)
 
         self._refresh_neighbors(current_time=current_time)
@@ -498,7 +489,7 @@ class ResourceAgent(Agent):
             if j not in self.queues.ready_queue and j not in self.queues.selected_queue:
                 job = self.queues.pending_queue.get(j)
                 if job:
-                    allocations += job.capacities
+                    allocations += job._capacities
 
         return self.resource_usage_score(allocated=allocations, total=self.capacities)
 
@@ -508,11 +499,14 @@ class ResourceAgent(Agent):
             rin = {e.name for e in (job.data_in or [])}
             rout = {e.name for e in (job.data_out or [])}
             job._required_dtns_cache = frozenset(rin | rout)
-        caps = job.capacities
+        caps = job._capacities
         return (
             job.job_id,
-            round(caps.core, 3), round(caps.ram, 3), round(caps.disk, 3), round(getattr(caps, "gpu", 0.0), 3),
-            round(job.execution_time or 0.0, 3),
+            round(caps.core, 3),
+            round(caps.ram, 3),
+            round(caps.disk, 3),
+            round(getattr(caps, "gpu", 0.0), 3),
+            round(job._wall_time or 0.0, 3),
             job.job_type or "",
             job._required_dtns_cache,
             #job.state.value,  # flips when PENDING→READY/COMPLETE, invalidates cache automatically
@@ -575,7 +569,7 @@ class ResourceAgent(Agent):
             return float('inf')
 
         # --- Dynamic tuning based on job_type ---
-        if hasattr(job, "job_type") and job.job_type:
+        if job.job_type:
             jt = job.job_type
 
             # Resource emphasis (scale relative to config)
@@ -641,10 +635,10 @@ class ResourceAgent(Agent):
         bottleneck_penalty = max(core_ratio, ram_ratio, disk_ratio, gpu_ratio) ** 2
 
         # Execution time penalty
-        if job.execution_time > long_job_threshold:
-            time_penalty = 1.5 + (job.execution_time - long_job_threshold) / long_job_threshold
+        if job.wall_time > long_job_threshold:
+            time_penalty = 1.5 + (job.wall_time - long_job_threshold) / long_job_threshold
         else:
-            time_penalty = 1 + (job.execution_time / long_job_threshold) ** 2
+            time_penalty = 1 + (job.wall_time / long_job_threshold) ** 2
 
         # DTN connectivity penalty
         avg_conn = 1.0
@@ -714,7 +708,7 @@ class ResourceAgent(Agent):
                             p_id=generate_id(),
                             object_id=job.job_id,
                             agent_id=self.agent_id,
-                            seed=round((cost + self.agent_id), 2)
+                            cost=round((cost + self.agent_id), 2)
                         )
                         proposals.append(proposal)
                         job.state = ObjectState.PRE_PREPARE
@@ -773,7 +767,7 @@ class ResourceAgent(Agent):
         For every job id seen in either proposals container (incoming/outgoing),
         we record:
           - job state (if we can resolve the Job object)
-          - all outgoing proposals (p_id, agent_id, seed, prepares, commits)
+          - all outgoing proposals (p_id, agent_id, cost, prepares, commits)
           - all incoming proposals (same fields)
           - counts of prepares/commits for quick scanning
 
@@ -809,7 +803,7 @@ class ResourceAgent(Agent):
                     return {
                         "p_id": getattr(p, "p_id", None),
                         "agent_id": getattr(p, "agent_id", None),
-                        "seed": getattr(p, "seed", None),
+                        "cost": getattr(p, "cost", None),
                         "prepares": prepares_list,
                         "prepares_count": len(prepares_list),
                         "commits": commits_list,
@@ -864,18 +858,8 @@ class ResourceAgent(Agent):
         with lock:
             job_set.update(jobs)
 
-    def is_job_in_state(self, job_id: str, job_set: set, redis_key_prefix: str, update_fn, state):
-        return job_id in job_set
-
-    # Unified check methods
     def is_job_completed(self, job_id: str) -> bool:
-        return self.is_job_in_state(
-            job_id,
-            self.completed_jobs_set,
-            Repository.KEY_JOB,
-            self._update_completed_jobs,
-            state=ObjectState.COMPLETE.value
-        )
+        return job_id in self.completed_jobs_set
 
     def scheduling_main(self):
         """
@@ -907,7 +891,8 @@ class ResourceAgent(Agent):
                                 group=child_group
                             )
                             self.logger.info(
-                                f"Delegated job {job_id} to level {self.topology.level - 1}, group {child_group}")
+                                f"Delegated job {job_id} to level {self.topology.level - 1}, "
+                                f"group {child_group}")
 
                     # Leaf agent: schedule job if load allows
                     else:
@@ -952,7 +937,7 @@ class ResourceAgent(Agent):
         try:
             job_id = job.job_id
             self.logger.info(f"[EXECUTE] Starting job {job_id} on agent {self.agent_id}")
-            job.execute(data_transfer=self.data_transfer)
+            job.execute()
             self.queues.ready_queue.remove(job_id)
             self.logger.info(f"[COMPLETE] Job {job_id} completed on agent {self.agent_id}")
             if not self.queues.ready_queue.gets():
@@ -969,7 +954,8 @@ class ResourceAgent(Agent):
     def _cost_job_on_agent(self, job: Job, agent: AgentInfo) -> float:
         return self.compute_job_cost(job=job, total=agent.capacities, dtns=agent.dtns)
 
-    def _projected_load_factor(self, agent: AgentInfo) -> float:
+    @staticmethod
+    def _projected_load_factor(agent: AgentInfo) -> float:
         """
         Compute multiplicative penalty based on projected load for job scheduling.
         Formula: 1 + ((load + proposed_load)/100)^1.5
