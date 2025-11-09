@@ -236,9 +236,10 @@ class ResourceAgent(Agent):
         for job_id in jobs:
             #job_id = key.split(":")[-1]
             if job_id not in self.queues.pending_queue:
+                group = self.topology.level if self.topology.type == TopologyType.Ring else self.topology.group
                 job = self.repository.get(obj_id=job_id, key_prefix=Repository.KEY_JOB,
                                           level=self.topology.level,
-                                          group=self.topology.group)
+                                          group=group)
                 job_obj = Job()
                 job_obj.from_dict(job)
                 self.queues.pending_queue.add(job_obj)
@@ -383,7 +384,7 @@ class ResourceAgent(Agent):
             dtn_map = {}
 
             for child in self.children.values():
-                total_capacities += child._capacities
+                total_capacities += child.capacities
                 total_allocations += child.capacity_allocations
                 if child.dtns:
                     dtn_map.update(child.dtns)
@@ -426,8 +427,9 @@ class ResourceAgent(Agent):
             (Repository.KEY_JOB, self._update_ready_jobs, ObjectState.READY.value),
             (Repository.KEY_JOB, self._update_completed_jobs, ObjectState.COMPLETE.value),
         ]:
+            group = self.topology.level if self.topology.type == TopologyType.Ring else self.topology.group
             jobs = self.repository.get_all_ids(key_prefix=prefix, level=self.topology.level,
-                                               group=self.topology.group, state=state)
+                                               group=group, state=state)
             update_fn(jobs=jobs)
 
         if self.debug:
@@ -489,7 +491,7 @@ class ResourceAgent(Agent):
             if j not in self.queues.ready_queue and j not in self.queues.selected_queue:
                 job = self.queues.pending_queue.get(j)
                 if job:
-                    allocations += job._capacities
+                    allocations += job.capacities
 
         return self.resource_usage_score(allocated=allocations, total=self.capacities)
 
@@ -499,14 +501,14 @@ class ResourceAgent(Agent):
             rin = {e.name for e in (job.data_in or [])}
             rout = {e.name for e in (job.data_out or [])}
             job._required_dtns_cache = frozenset(rin | rout)
-        caps = job._capacities
+        caps = job.capacities
         return (
             job.job_id,
             round(caps.core, 3),
             round(caps.ram, 3),
             round(caps.disk, 3),
             round(getattr(caps, "gpu", 0.0), 3),
-            round(job._wall_time or 0.0, 3),
+            round(job.wall_time or 0.0, 3),
             job.job_type or "",
             job._required_dtns_cache,
             #job.state.value,  # flips when PENDING→READY/COMPLETE, invalidates cache automatically
