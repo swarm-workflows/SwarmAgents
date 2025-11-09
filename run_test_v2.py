@@ -141,6 +141,11 @@ def cleanup_between_runs(args) -> None:
         cmd += ["--redis-host", args.db_host, "--cleanup-redis"]
     log("Cleanup between runs …")
     run_blocking(cmd, check=False)
+    if not args.use_config_dir:
+        cmds = [["rm", "-rf", "agent_hosts.txt"], ["rm", "-rf", "agent_profiles.json"],
+                ["rm", "-rf", "agent_dtns.json"], ["rm", "-rf", "jobs"]]
+        for cmd in cmds:
+            run_blocking(cmd, check=False)
 
 # ------------------------------
 # Agent start (local or remote)
@@ -283,7 +288,7 @@ def wait_runtime(args) -> None:
 def stop_agents(args) -> None:
     log("Stopping agents …")
     # Best-effort stop; if you have a dedicated stop script, call it here.
-    run_blocking(["bash", "stop_agents.sh"], check=False)
+    run_blocking(["bash", "stop_agents_v2.sh"], check=False)
 
 def collect_logs(args) -> None:
     '''
@@ -370,6 +375,7 @@ def main() -> None:
     host_list = read_hosts(args) if args.mode == "remote" else []
 
     # Generate configs + cleanup
+    cleanup_between_runs(args)
     if not args.use_config_dir:
         if args.mode == "remote" and not host_list:
             raise SystemExit("Remote mode with --use-config-dir requires --agent-hosts or --agent-hosts-file")
@@ -379,7 +385,6 @@ def main() -> None:
             needed = math.ceil(args.agents / args.agents_per_host)
             host_list = host_list[:needed]
         generate_configs(args, host_list if args.mode == "remote" else ["localhost"])
-    cleanup_between_runs(args)
 
     # Start agents
     if args.mode == "local":
