@@ -91,7 +91,8 @@ class Agent(Observer):
     @property
     def configured_agent_count(self) -> int:
         """Returns the expected total number of agents from the runtime configuration."""
-        return self.topology.group_size
+        #return self.topology.group_size
+        return self.runtime_config.get("total_agents", 0)
 
     @property
     def results_dir(self) -> str:

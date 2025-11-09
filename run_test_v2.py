@@ -123,7 +123,7 @@ def generate_configs(args, agent_hosts_list: list[str]) -> Path:
         "./config_swarm_multi.yml", str(cfg_dir),
         args.topology, args.db_host, str(args.jobs),
         "--agent-hosts-file", str(hosts_file),
-        "--agents-per-host", str(args.agents_per_host),
+        "--agents-per-host", str(args.agents_per_host) if args.mode == "remote" else str(args.agents),
         "--dtns",
     ]
     if args.groups:

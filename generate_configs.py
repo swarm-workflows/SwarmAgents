@@ -216,40 +216,94 @@ class SwarmConfigGenerator:
                 }
         return agent_topo
 
-    def _build_ring_topology(self, rings: List[List[int]]) -> Dict[int, dict]:
+    from typing import Dict, List, Optional
+
+    def _build_ring_topology(self, rings: List[List[int]], cross_rings: bool = True) -> Dict[int, dict]:
         """
-        Build independent rings (no cross-links). Each entry in `rings` is a group.
+        Build ring topologies.
+
+        - When cross_rings=False (default): build independent rings (no cross-links). Each entry in `rings` is a group.
+        - When cross_rings=True: preserve within-ring links, and also connect *same-index* nodes across
+          adjacent rings (i -> i+1, wrapping). All nodes are assigned group=0, group_size=total_agents, group_count=1.
+
+        Notes on cross-ring linking with uneven ring sizes:
+        - Cross-links are only added for indices that exist in both rings being connected.
         """
         agent_topo: Dict[int, dict] = {}
+
+        # ---- Helper: set metadata for a node ----
+        def _meta(group_id: int, group_size: int, group_count: int) -> Dict[str, Optional[int]]:
+            return {
+                "parent": None,
+                "children": None,
+                "group": group_id,
+                "level": 0,
+                "group_size": group_size,
+                "group_count": group_count,
+            }
+
+        total_agents = sum(len(r) for r in rings)
+        num_groups = 1 if cross_rings else len(rings)
+
+        # 1) Build per-ring links (classic ring)
         for gid, ring in enumerate(rings):
             n = len(ring)
             if n == 0:
                 continue
             if n == 1:
-                # single node "ring": no peers
-                agent_topo[ring[0]] = {
+                node = ring[0]
+                agent_topo[node] = {
                     "peers": [],
-                    "parent": None,
-                    "children": None,
-                    "group": gid,
-                    "level": 0,
-                    "group_size": len(ring),
-                    "group_count": len(rings),
+                    **_meta(0 if cross_rings else gid,
+                            total_agents if cross_rings else len(ring),
+                            num_groups),
                 }
                 continue
+
             for k in range(n):
                 cur = ring[k]
                 nxt = ring[(k + 1) % n]
                 prv = ring[(k - 1) % n]
+                # initialize or update (if already present later due to cross linking)
+                existing = agent_topo.get(cur, {"peers": []})
+                peers = set(existing.get("peers", []))
+                peers.update([nxt, prv])
                 agent_topo[cur] = {
-                    "peers": sorted(set([nxt, prv])),
-                    "parent": None,
-                    "children": None,
-                    "group": gid,
-                    "level": 0,
-                    "group_size": len(ring),
-                    "group_count": len(rings),
+                    "peers": sorted(peers),
+                    **_meta(0 if cross_rings else gid,
+                            total_agents if cross_rings else n,
+                            num_groups),
                 }
+
+        # 2) Optionally add cross-ring links (same-index across adjacent rings with wrap)
+        if cross_rings and len(rings) > 1:
+            m = len(rings)
+            for i in range(m):
+                j = (i + 1) % m  # adjacent ring, wrap around
+                ring_i = rings[i]
+                ring_j = rings[j]
+                max_idx = min(len(ring_i), len(ring_j))
+                for idx in range(max_idx):
+                    a = ring_i[idx]
+                    b = ring_j[idx]
+                    # add bidirectional cross peers
+                    ai = agent_topo.get(a)
+                    bi = agent_topo.get(b)
+                    if ai is not None:
+                        ai_peers = set(ai["peers"])
+                        ai_peers.add(b)
+                        ai["peers"] = sorted(ai_peers)
+                    if bi is not None:
+                        bi_peers = set(bi["peers"])
+                        bi_peers.add(a)
+                        bi["peers"] = sorted(bi_peers)
+
+            # Ensure group metadata is unified for all nodes
+            for node in agent_topo:
+                agent_topo[node]["group"] = 0
+                agent_topo[node]["group_size"] = total_agents
+                agent_topo[node]["group_count"] = 1
+
         return agent_topo
 
     # -----------------------------

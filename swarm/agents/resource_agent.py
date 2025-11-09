@@ -25,6 +25,7 @@ import threading
 import time
 import traceback
 from concurrent.futures.thread import ThreadPoolExecutor
+from tokenize import group
 
 from swarm.consensus.engine import ConsensusEngine
 from swarm.consensus.interfaces import ConsensusHost, ConsensusTransport, TopologyRouter
@@ -236,7 +237,9 @@ class ResourceAgent(Agent):
         for job_id in jobs:
             #job_id = key.split(":")[-1]
             if job_id not in self.queues.pending_queue:
-                group = self.topology.level if self.topology.type == TopologyType.Ring else self.topology.group
+                #group = self.topology.level if self.topology.type == TopologyType.Ring else self.topology.group
+                group = self.topology.group
+                #self.logger.info(f"Adding job {job_id} for: {group}")
                 job = self.repository.get(obj_id=job_id, key_prefix=Repository.KEY_JOB,
                                           level=self.topology.level,
                                           group=group)
@@ -427,9 +430,11 @@ class ResourceAgent(Agent):
             (Repository.KEY_JOB, self._update_ready_jobs, ObjectState.READY.value),
             (Repository.KEY_JOB, self._update_completed_jobs, ObjectState.COMPLETE.value),
         ]:
-            group = self.topology.level if self.topology.type == TopologyType.Ring else self.topology.group
+            #group = self.topology.level if self.topology.type == TopologyType.Ring else self.topology.group
+            group = self.topology.group
             jobs = self.repository.get_all_ids(key_prefix=prefix, level=self.topology.level,
                                                group=group, state=state)
+            #self.logger.info(f"Fetching IDs for jobs in state {state} from group: {group} job count: {len(jobs)}")
             update_fn(jobs=jobs)
 
         if self.debug:
@@ -458,6 +463,7 @@ class ResourceAgent(Agent):
         #available = agent.capacities - agent.capacity_allocations
         available = agent.capacities
         if not self._has_sufficient_capacity(job, available):
+            self.logger.debug(f"Agent: {self.agent_id}  does not have capacity for Job {job.job_id}")
             return False
 
         # DTN connectivity
@@ -475,6 +481,7 @@ class ResourceAgent(Agent):
 
         for d in job._required_dtns_cache:
             if d not in agent_dtn_names:
+                self.logger.debug(f"Agent: {self.agent_id}  does not have dtns for Job {job.job_id}")
                 return False
 
         return True
