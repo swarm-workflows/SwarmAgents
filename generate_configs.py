@@ -521,6 +521,8 @@ class SwarmConfigGenerator:
                 host_idx = (agent_id - 1) // self.agents_per_host
                 host = agent_hosts[host_idx]
                 config['grpc']['host'] = host
+                if self.agents_per_host > 1:
+                    config['grpc']['port'] += agent_id
             else:
                 config['grpc']['port'] += agent_id
 
