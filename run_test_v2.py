@@ -89,13 +89,35 @@ def parse_bucket_set_count(text: str, bucket: int) -> int:
 # Remote helpers
 # ------------------------------
 def ssh(host: str, cmd: str) -> int:
-    return subprocess.call(["ssh", host, cmd])
+    return subprocess.call([
+        "ssh",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "BatchMode=yes",
+        host,
+        cmd
+    ])
 
 def ssh_check(host: str, cmd: str) -> None:
-    run_blocking(["ssh", host, cmd], check=True)
+    run_blocking([
+        "ssh",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "BatchMode=yes",
+        host,
+        cmd
+    ], check=True)
 
 def scp_to(host: str, src: str, dst: str) -> None:
-    run_blocking(["scp", src, f"{host}:{dst}"], check=True)
+    run_blocking([
+        "scp",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "BatchMode=yes",
+        "-q",
+        src,
+        f"{host}:{dst}"
+    ], check=True)
 
 # ------------------------------
 # Config generation / cleanup
