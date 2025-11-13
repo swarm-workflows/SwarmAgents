@@ -92,7 +92,10 @@ class Agent(Observer):
     def configured_agent_count(self) -> int:
         """Returns the expected total number of agents from the runtime configuration."""
         #return self.topology.group_size
-        return self.runtime_config.get("total_agents", 0)
+        if self.topology.type == TopologyType.Ring:
+            return self.runtime_config.get("total_agents", 0)
+        else:
+            return self.topology.group_size
 
     @property
     def results_dir(self) -> str:
@@ -254,17 +257,6 @@ class Agent(Observer):
         """Called by GrpcClient/ChannelPool when a channel moves UP/DOWN."""
         if not up:
             self.logger.info(f"Peer {target} health {up} reason {reason}")
-            '''
-            try:
-                host, port_s = target.rsplit(":", 1)
-                host = normalize_host(host)
-                port = int(port_s)
-                peer_id, transport_state = self._get_peer_state_for_endpoint(host, port)
-                if peer_id is not None:
-                    self.peer_by_endpoint.set((host, port), (peer_id, up))
-            except Exception:
-                self.logger.warning("on_peer_status: bad target %r", target)
-            '''
 
     def _get_peer_state_for_endpoint(self, host: str, port: int):
         """

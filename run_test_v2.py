@@ -172,17 +172,25 @@ def cleanup_between_runs(args) -> None:
 # ------------------------------
 # Agent start (local or remote)
 # ------------------------------
-def start_agents_local(args) -> None:
+def start_agents_local(args, agent_count: int = None, start_offset: int = 0) -> None:
     """
     Delegate to swarm-multi-start.sh locally.
+
+    Args:
+        args: Command-line arguments
+        agent_count: Number of agents to start (defaults to args.agents)
+        start_offset: Starting agent index offset (for dynamic addition)
     """
+    if agent_count is None:
+        agent_count = args.agents
+
     starter = Path(args.starter).absolute()
     if not starter.exists():
         raise FileNotFoundError(f"Starter script not found: {starter}")
 
     start_cmd = [
         "bash", str(starter),
-        args.agent_type, str(args.agents),
+        args.agent_type, str(agent_count),
         args.topology, str(args.jobs),
         args.db_host, str(args.jobs_per_proposal),
     ]
@@ -195,10 +203,14 @@ def start_agents_local(args) -> None:
         start_cmd += ["--group-size", str(args.group_size)]
     if args.debug:
         start_cmd += ["--debug"]
+    if start_offset > 0:
+        start_cmd += ["--start-offset", str(start_offset)]
 
-    log("Starting agents locally …")
+    phase = "initial" if start_offset == 0 else "dynamic"
+    log_file = f"local_agents_{phase}_start.log"
+    log(f"Starting {agent_count} {phase} agents locally …")
     # Run in background via nohup so we can proceed with the rest of the test
-    run_blocking(["nohup"] + start_cmd + [">", "local_agents_start.log", "2>&1", "&"], check=False)
+    run_blocking(["nohup"] + start_cmd + [">", log_file, "2>&1", "&"], check=False)
 
 def shard_ranges(total: int, per_host: int) -> list[tuple[int,int]]:
     """
@@ -210,28 +222,43 @@ def shard_ranges(total: int, per_host: int) -> list[tuple[int,int]]:
         ranges.append((start, end))
     return ranges
 
-def start_agents_remote(args, agent_hosts_list: list[str]) -> None:
+def start_agents_remote(args, agent_hosts_list: list[str], agent_count: int = None, start_offset: int = 0) -> None:
     """
     Copy only the config shards each host needs, then start via swarm-multi-start.sh remotely.
+
+    Args:
+        args: Command-line arguments
+        agent_hosts_list: List of remote hosts
+        agent_count: Number of agents to start (defaults to args.agents)
+        start_offset: Starting agent index offset (for dynamic addition)
     """
+    if agent_count is None:
+        agent_count = args.agents
+
     starter = args.starter  # relative on remote (we cd into repo)
     cfg_dir = Path(args.config_dir).absolute()
     cfg_prefix = "config_swarm_multi_"
-    ranges = shard_ranges(args.agents, args.agents_per_host)
 
-    if len(agent_hosts_list) != len(ranges):
-        # We allow more hosts than needed; extra hosts will be skipped.
-        if len(agent_hosts_list) < len(ranges):
-            raise ValueError(f"Need at least {len(ranges)} hosts for {args.agents} agents with agents_per_host={args.agents_per_host}")
+    # Calculate ranges for the agents we're starting
+    base_idx = start_offset + 1
+    ranges = [(base_idx + i * args.agents_per_host,
+               min(base_idx + (i + 1) * args.agents_per_host - 1, base_idx + agent_count - 1))
+              for i in range(math.ceil(agent_count / args.agents_per_host))]
 
-    for i, (start_idx, end_idx) in enumerate(ranges, start=1):
-        host = agent_hosts_list[i-1]
+    if len(agent_hosts_list) < len(ranges):
+        raise ValueError(f"Need at least {len(ranges)} hosts for {agent_count} agents with agents_per_host={args.agents_per_host}")
+
+    for i, (start_idx, end_idx) in enumerate(ranges):
+        host = agent_hosts_list[i]
         count = end_idx - start_idx + 1
         log(f"[{host}] agents {start_idx}..{end_idx} (count={count})")
 
-        # Prepare remote configs dir
+        # Prepare remote configs dir (don't wipe if this is dynamic addition)
         remote_cfg_dir = f"{args.remote_repo_dir}/configs"
-        ssh_check(host, f"mkdir -p {shlex.quote(remote_cfg_dir)} && rm -rf {shlex.quote(remote_cfg_dir)}/*")
+        if start_offset == 0:
+            ssh_check(host, f"mkdir -p {shlex.quote(remote_cfg_dir)} && rm -rf {shlex.quote(remote_cfg_dir)}/*")
+        else:
+            ssh_check(host, f"mkdir -p {shlex.quote(remote_cfg_dir)}")
 
         # Copy the needed config files
         for idx in range(start_idx, end_idx + 1):
@@ -255,11 +282,60 @@ def start_agents_remote(args, agent_hosts_list: list[str]) -> None:
             f"{shlex.quote(args.agent_type)} {count} {shlex.quote(args.topology)} {args.jobs} "
             f"{shlex.quote(args.db_host)} {args.jobs_per_proposal} "
             f"--use-config-dir " + " ".join(shlex.quote(x) for x in forwarded) +
-            f" > agent_{i}_start.log 2>&1 &"
+            f" > agent_{start_idx}_start.log 2>&1 &"
         )
         ssh_check(host, start_cmd)
 
-    log(f"Launched {args.agents} '{args.agent_type}' agents across {len(ranges)} remote host(s).")
+    phase = "initial" if start_offset == 0 else "dynamic"
+    log(f"Launched {agent_count} {phase} '{args.agent_type}' agents across {len(ranges)} remote host(s).")
+
+# ------------------------------
+# Dynamic agent addition
+# ------------------------------
+def add_dynamic_agents(args, host_list: list[str]) -> None:
+    """
+    Add agents dynamically during the test run.
+    """
+    log(f"Adding {args.dynamic_agents} dynamic agents to topology …")
+
+    if args.mode == "local":
+        start_agents_local(args, agent_count=args.dynamic_agents, start_offset=args.agents)
+    else:
+        # For remote mode, use additional hosts or wrap around existing hosts
+        start_agents_remote(args, host_list, agent_count=args.dynamic_agents, start_offset=args.agents)
+
+    log(f"Dynamic agents added. Total agents now: {args.agents + args.dynamic_agents}")
+
+def wait_for_dynamic_trigger(args) -> None:
+    """
+    Wait for the appropriate trigger before adding dynamic agents.
+    """
+    trigger = args.dynamic_trigger
+
+    if trigger == "time":
+        log(f"Waiting {args.dynamic_delay} seconds before adding dynamic agents …")
+        time.sleep(args.dynamic_delay)
+
+    elif trigger == "bucket":
+        log(f"Waiting for bucket {args.dynamic_trigger_bucket} to reach threshold {args.dynamic_trigger_threshold} …")
+        while True:
+            out = run_once(["python3.11", "dump_db.py", "--host", args.db_host, "--type", "redis", "--key", "state"])
+            size = parse_bucket_set_count(out, args.dynamic_trigger_bucket)
+            if size is not None and size >= args.dynamic_trigger_threshold:
+                log(f"Bucket threshold reached (size={size}). Adding dynamic agents …")
+                break
+            time.sleep(args.check_interval)
+
+    elif trigger == "jobs-completed":
+        log(f"Waiting for {args.dynamic_trigger_jobs} jobs to be completed before adding dynamic agents …")
+        # Monitor completed jobs bucket (typically bucket 3 or 4)
+        while True:
+            out = run_once(["python3.11", "dump_db.py", "--host", args.db_host, "--type", "redis", "--key", "state"])
+            completed = parse_bucket_set_count(out, 3)  # Assuming bucket 3 is completed
+            if completed >= args.dynamic_trigger_jobs:
+                log(f"Job completion threshold reached ({completed} jobs). Adding dynamic agents …")
+                break
+            time.sleep(args.check_interval)
 
 # ------------------------------
 # Test flow: jobs, monitoring, stop, parse, plot
@@ -371,6 +447,20 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--check-interval", type=float, default=5.0)
     ap.add_argument("--max-misses", type=int, default=10)
 
+    # Dynamic agent addition
+    ap.add_argument("--dynamic-agents", type=int, default=0,
+                    help="Number of agents to add dynamically during test (0 = disabled)")
+    ap.add_argument("--dynamic-trigger", choices=["time", "bucket", "jobs-completed"], default="time",
+                    help="Trigger type for adding dynamic agents")
+    ap.add_argument("--dynamic-delay", type=int, default=30,
+                    help="Seconds to wait before adding agents (for 'time' trigger)")
+    ap.add_argument("--dynamic-trigger-bucket", type=int, default=1,
+                    help="Bucket to monitor (for 'bucket' trigger)")
+    ap.add_argument("--dynamic-trigger-threshold", type=int, default=50,
+                    help="Threshold value for bucket/jobs trigger")
+    ap.add_argument("--dynamic-trigger-jobs", type=int, default=50,
+                    help="Number of completed jobs to wait for (for 'jobs-completed' trigger)")
+
     # Output
     ap.add_argument("--run-dir", default="run_out")
     ap.add_argument("--log-dir", default="logs")
@@ -396,19 +486,27 @@ def main() -> None:
     # Build host list up front
     host_list = read_hosts(args) if args.mode == "remote" else []
 
-    # Generate configs + cleanup
+    # Calculate total agents (initial + dynamic)
+    total_agents = args.agents + args.dynamic_agents
+    original_agents = args.agents
+
+    # Generate configs for ALL agents (initial + dynamic) up front
     cleanup_between_runs(args)
     if not args.use_config_dir:
         if args.mode == "remote" and not host_list:
             raise SystemExit("Remote mode with --use-config-dir requires --agent-hosts or --agent-hosts-file")
         # Compute per-host count for writing agent_hosts.txt (if needed)
         if not args.agent_hosts_file and args.mode == "remote":
-            # Match number of shards we will generate
-            needed = math.ceil(args.agents / args.agents_per_host)
+            # Match number of shards we will generate (for ALL agents)
+            needed = math.ceil(total_agents / args.agents_per_host)
             host_list = host_list[:needed]
-        generate_configs(args, host_list if args.mode == "remote" else ["localhost"])
 
-    # Start agents
+        # Temporarily set args.agents to total for config generation
+        args.agents = total_agents
+        generate_configs(args, host_list if args.mode == "remote" else ["localhost"])
+        args.agents = original_agents  # Restore to initial agent count
+
+    # Start initial agents
     if args.mode == "local":
         start_agents_local(args)
     else:
@@ -416,11 +514,27 @@ def main() -> None:
             raise SystemExit("Remote mode requires --agent-hosts or --agent-hosts-file")
         start_agents_remote(args, host_list)
 
-    # Continue with the rest of the test
+    # Start job production
     produce_jobs(args)
+
+    # If dynamic agents are enabled, wait for trigger and add them
+    if args.dynamic_agents > 0:
+        # Start a thread to wait for the trigger and add agents
+        import threading
+        def dynamic_addition():
+            wait_for_dynamic_trigger(args)
+            add_dynamic_agents(args, host_list)
+
+        dynamic_thread = threading.Thread(target=dynamic_addition, daemon=True)
+        dynamic_thread.start()
+
+    # Wait for test completion
     wait_runtime(args)
     stop_agents(args)
     collect_logs(args)
+
+    # Update args.agents to total for reporting
+    args.agents = total_agents
     parse_and_report(args)
     log("Done.")
 

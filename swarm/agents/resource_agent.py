@@ -21,6 +21,7 @@
 #
 # Author: Komal Thareja(kthare10@renci.org)
 import os
+import random
 import threading
 import time
 import traceback
@@ -59,7 +60,13 @@ class _HostAdapter(ConsensusHost):
     def is_agreement_achieved(self, object_id: str): return self.agent.is_job_completed(object_id)
     def calculate_quorum(self): return self.agent.calculate_quorum()
     def on_leader_elected(self, obj: Object, proposal_id: str): self.agent.select_job(obj)
-    def on_participant_commit(self, obj: Object, leader_id: int, proposal_id: str): obj.state = ObjectState.COMMIT
+    def on_participant_commit(self, obj: Object, leader_id: int, proposal_id: str):
+        obj.state = ObjectState.COMMIT
+        # If proposal was committed and leader is a peer (not self)
+        self.agent.job_assignments.set(obj.object_id, int(leader_id))
+        self.agent.logger.debug(
+            f"Tracked peer assignment: Job {obj.object_id} -> Agent {leader_id}"
+        )
     def now(self): import time; return time.time()
     def log_debug(self, m): self.agent.logger.debug(m)
     def log_info(self, m): self.agent.logger.info(m)
@@ -136,9 +143,13 @@ class ResourceAgent(Agent):
             cache_ttl_s=60.0,  # optional, if you want time-based safety
         )
 
+        # Track failed agents and job assignments
+        self.failed_agents = ThreadSafeDict[int, float]()  # agent_id -> failure_timestamp
+        self.job_assignments = ThreadSafeDict[str, int]()  # job_id -> assigned_agent_id
+
     @property
     def peer_expiry_seconds(self) -> int:
-        return self.runtime_config.get("peer_expiry_seconds", 300)
+        return self.runtime_config.get("peer_expiry_seconds", 20)
 
     @property
     def reselection_timeout_s(self) -> float:
@@ -197,6 +208,53 @@ class ResourceAgent(Agent):
         disk = (allocated.disk / total.disk) * 100
 
         return round((core + ram + disk) / 3, 2)
+
+    @property
+    def failure_threshold_seconds(self) -> int:
+        """
+        Time threshold before declaring an agent as failed.
+
+        Balance considerations:
+        - Too low (< 15s): False positives from temporary network issues
+        - Too high (> 60s): Slow failure detection, jobs stuck longer
+        - Recommended: 30s for local, 45-60s for remote deployments
+        """
+        return self.runtime_config.get("failure_threshold_seconds", 30)
+
+    @property
+    def max_failed_agents(self) -> int:
+        """
+        Maximum number of failed agents before triggering critical warnings.
+
+        Returns 0 for unlimited failures allowed.
+        Default is 1/3 of configured agents (33% failure tolerance).
+        """
+        max_config = self.runtime_config.get("max_failed_agents", 0)
+        if max_config == 0 and self.configured_agent_count > 0:
+            return self.configured_agent_count // 3
+        return max_config
+
+    @property
+    def job_reassignment_enabled(self) -> bool:
+        """Enable automatic job reassignment from failed agents."""
+        return self.runtime_config.get("job_reassignment_enabled", True)
+
+    @property
+    def aggressive_failure_detection(self) -> bool:
+        """
+        Enable aggressive failure detection mode.
+
+        When True:
+        - Failures detected immediately via gRPC callbacks
+        - Shorter timeout windows
+        - Immediate job reassignment
+
+        When False:
+        - Rely primarily on periodic checks
+        - Longer grace periods
+        - More tolerant of transient issues
+        """
+        return self.runtime_config.get("aggressive_failure_detection", False)
 
     def __on_proposal(self, incoming: Proposal):
         self.engine.on_proposal(incoming)
@@ -417,6 +475,13 @@ class ResourceAgent(Agent):
         self._restart_selection()
         current_time = int(time.time())
         self._refresh_children(int(current_time))
+
+        # Detect and handle agent failures
+        failed_agents = self._detect_failed_agents(current_time)
+        if failed_agents:
+            self._remove_failed_agents(failed_agents)
+            self._check_failure_threshold()
+
         agent_info = self._generate_agent_info()
         self.repository.save(agent_info.to_dict(), key_prefix=Repository.KEY_AGENT,
                              level=self.topology.level,
@@ -742,7 +807,13 @@ class ResourceAgent(Agent):
             "restarts": self.metrics.restarts,
             "conflicts": self.engine.conflicts,
             "idle_time": self.metrics.idle_time,
-            "load_trace": self.metrics.load
+            "load_trace": self.metrics.load,
+            "agent_failures": getattr(self.metrics, 'agent_failures', {}),
+            "reassignments": getattr(self.metrics, 'reassignments', {}),
+            "quorum_changes": getattr(self.metrics, 'quorum_changes', []),
+            "failed_agents": self.failed_agents,
+            "failed_agents_count": len(self.failed_agents),
+            "final_quorum": self.calculate_quorum(),
         }
         self.repository.save(obj=agent_metrics, key=f"{Repository.KEY_METRICS}:{self.agent_id}")
         self.logger.info("Results saved")
@@ -931,6 +1002,9 @@ class ResourceAgent(Agent):
     def select_job(self, job: Job):
         print(f"[SELECTED]: {job.job_id} on agent: {self.agent_id}")
         self.logger.info(f"[SELECTED]: {job.job_id} on agent: {self.agent_id} to Select Queue")
+
+        self.job_assignments.set(job.job_id, self.agent_id)
+
         job.state = ObjectState.READY
         self.repository.save(obj=job.to_dict(), key_prefix=Repository.KEY_JOB,
                              level=self.topology.level, group=self.topology.group)
@@ -972,3 +1046,246 @@ class ResourceAgent(Agent):
         projected_load = agent.load + agent.proposed_load
         load_penalty = 1 + (projected_load / 100) ** 1.5
         return load_penalty
+
+    def _detect_failed_agents(self, current_time: float) -> list[int]:
+        """
+        Identify agents that have failed based on missing heartbeats.
+
+        Checks Redis update timestamps against failure_threshold_seconds.
+        Adds jitter to prevent thundering herd when multiple agents detect
+        the same failure simultaneously.
+
+        :param current_time: Current timestamp
+        :return: List of agent IDs detected as failed this round
+        """
+        failed_this_round = []
+
+        # Add ±10% jitter to threshold to prevent synchronized failure detection
+        jitter = random.uniform(0.9, 1.1) if len(self.neighbor_map) > 5 else 1.0
+        threshold = self.failure_threshold_seconds * jitter
+
+        for agent_id, agent_info in list(self.neighbor_map.items()):
+            # Skip self
+            if agent_id == self.agent_id:
+                continue
+
+            # Check if agent hasn't updated in Redis beyond threshold
+            time_since_update = current_time - agent_info.last_updated
+
+            if time_since_update > threshold:
+                # Check if already marked as failed
+                if agent_id not in self.failed_agents:
+                    self.logger.warning(
+                        f"Agent {agent_id} detected as FAILED "
+                        f"(no update for {time_since_update:.1f}s, threshold: {threshold:.1f}s)"
+                    )
+                    self.failed_agents.set(agent_id, current_time)
+                    failed_this_round.append(agent_id)
+
+                    # Record failure in metrics
+                    self.metrics.agent_failures[agent_id] = {
+                        'detected_at': current_time,
+                        'last_seen': agent_info.last_updated,
+                        'downtime': time_since_update
+                    }
+
+        return failed_this_round
+
+    def _remove_failed_agents(self, agent_ids: list[int]) -> None:
+        """
+        Remove failed agents from neighbor map and trigger job reassignment.
+
+        :param agent_ids: List of agent IDs to remove
+        """
+        for agent_id in agent_ids:
+            # Remove from neighbor map
+            removed_agent = self.neighbor_map.get(agent_id)
+            if removed_agent:
+                self.neighbor_map.remove(agent_id)
+                self.logger.info(
+                    f"Removed failed agent {agent_id} from neighbor map. "
+                    f"Live agents: {self.live_agent_count}/{self.configured_agent_count}"
+                )
+
+                # Track quorum change
+                new_quorum = self.calculate_quorum()
+                self.metrics.quorum_changes.append({
+                    'timestamp': time.time(),
+                    'live_agents': self.live_agent_count,
+                    'quorum': new_quorum,
+                    'reason': f'removed_agent_{agent_id}'
+                })
+
+                # Trigger job reassignment if enabled
+                if self.job_reassignment_enabled:
+                    self._reassign_jobs_from_failed_agent(agent_id)
+                else:
+                    self.logger.info(f"Job reassignment disabled, not reassigning jobs from agent {agent_id}")
+
+    def _reassign_jobs_from_failed_agent(self, failed_agent_id: int) -> None:
+        """
+        Reassign jobs that were assigned to a failed agent.
+
+        This implements the TODO at resource_agent.py:277.
+
+        Jobs are reset to PENDING state and cleared from consensus containers,
+        allowing them to go through the selection process again with remaining agents.
+
+        :param failed_agent_id: ID of the failed agent
+        """
+        jobs_to_reassign = []
+
+        # Find jobs assigned to the failed agent
+        for job_id, assigned_agent in list(self.job_assignments.items()):
+            if assigned_agent == failed_agent_id:
+                jobs_to_reassign.append(job_id)
+
+        if not jobs_to_reassign:
+            self.logger.debug(f"No jobs to reassign from failed agent {failed_agent_id}")
+            return
+
+        self.logger.info(
+            f"Reassigning {len(jobs_to_reassign)} jobs from failed agent {failed_agent_id}: {jobs_to_reassign}"
+        )
+
+        reassigned_count = 0
+        for job_id in jobs_to_reassign:
+            # Get job from pending queue
+            job = self.queues.pending_queue.get(job_id)
+            if not job:
+                # Job might have completed or moved to another state
+                self.logger.debug(f"Job {job_id} not in pending queue (likely completed)")
+                self.job_assignments.remove(job_id)
+                continue
+
+            # Only reassign if job is not already completed
+            if self.is_job_completed(job_id):
+                self.logger.debug(f"Job {job_id} already completed, skipping reassignment")
+                self.job_assignments.remove(job_id)
+                continue
+
+            # Reset job to PENDING for reselection
+            old_state = job.state
+            job.state = ObjectState.PENDING
+            job.last_transition_at = time.time()
+
+            # Clear from consensus containers
+            self.engine.outgoing.remove_object(object_id=job_id)
+            self.engine.incoming.remove_object(object_id=job_id)
+
+            # Remove from assignment tracking
+            self.job_assignments.remove(job_id)
+
+            # Track reassignment in metrics
+            self.metrics.reassignments[job_id] = {
+                'failed_agent': failed_agent_id,
+                'reassigned_at': time.time(),
+                'reason': 'agent_failure',
+                'old_state': old_state.value if hasattr(old_state, 'value') else str(old_state)
+            }
+
+            reassigned_count += 1
+            self.logger.info(
+                f"Job {job_id} reset to PENDING for reassignment "
+                f"(was {old_state} on failed agent {failed_agent_id})"
+            )
+
+        self.logger.info(f"Successfully reassigned {reassigned_count}/{len(jobs_to_reassign)} jobs")
+
+    def _check_failure_threshold(self) -> None:
+        """
+        Check if too many agents have failed and log critical warnings.
+
+        When more than max_failed_agents have failed, the system may not be
+        able to maintain quorum or process jobs efficiently.
+        """
+        failed_count = len(self.failed_agents)
+        if failed_count == 0:
+            return
+
+        max_allowed = self.max_failed_agents
+        if 0 < max_allowed <= failed_count:
+            self.logger.error(
+                f"CRITICAL: {failed_count} agents failed (max threshold: {max_allowed}). "
+                f"System stability at risk! "
+                f"Live agents: {self.live_agent_count}/{self.configured_agent_count}"
+            )
+
+            # Calculate failure rate
+            failure_rate = failed_count / self.configured_agent_count if self.configured_agent_count > 0 else 0
+            self.logger.error(f"Current failure rate: {failure_rate:.1%}")
+
+    def on_peer_status(self, target: str, up: bool, reason: str):
+        """
+        Enhanced peer status handling with immediate failure detection.
+
+        Called by gRPC transport when a communication channel goes up or down.
+        In aggressive mode, immediately marks agents as failed and triggers reassignment.
+
+        :param target: Target endpoint (host:port)
+        :param up: True if channel is up, False if down
+        :param reason: Reason for status change
+        """
+        if up:
+            self.logger.debug(f"Peer {target} is UP: {reason}")
+            # TODO: Could implement agent recovery here if enable_agent_recovery is True
+            return
+
+        self.logger.warning(f"Peer {target} is DOWN: {reason}")
+
+        # Only take immediate action in aggressive mode
+        if not self.aggressive_failure_detection:
+            return
+
+        # Try to identify which agent this endpoint belongs to
+        try:
+            host, port_s = target.rsplit(":", 1)
+            port = int(port_s)
+            if host == "127.0.0.1":
+                host = "localhost"
+
+            # Find agent by endpoint
+            for agent_id, agent_info in list(self.neighbor_map.items()):
+                if agent_info.host == host and agent_info.port == port:
+                    self.logger.warning(
+                        f"Identified DOWN peer as agent {agent_id} "
+                        f"(aggressive failure detection enabled)"
+                    )
+
+                    # Mark as failed immediately
+                    if agent_id not in self.failed_agents:
+                        self.failed_agents.set(agent_id, time.time())
+                        self._remove_failed_agents([agent_id])
+                    break
+        except Exception as e:
+            self.logger.error(f"Failed to identify down peer {target}: {e}")
+
+    def calculate_quorum(self) -> int:
+        """
+        Calculate quorum with safeguards for failure scenarios.
+
+        In normal PBFT: quorum = (N // 2) + 1
+        With failures: quorum adjusts based on remaining live agents
+
+        Logs warnings when failure rate exceeds 33%.
+
+        :return: Required quorum size for consensus
+        """
+        live_count = self.live_agent_count
+        configured_count = self.configured_agent_count
+
+        # Calculate quorum based on live agents
+        quorum = (live_count // 2) + 1
+
+        # Safety check: if too many agents failed, log warning
+        if configured_count > 0:
+            failure_rate = 1 - (live_count / configured_count)
+            if failure_rate > 0.33:  # More than 33% agents failed
+                self.logger.warning(
+                    f"HIGH FAILURE RATE: {failure_rate:.1%} "
+                    f"({configured_count - live_count}/{configured_count} agents down). "
+                    f"Quorum: {quorum}/{live_count}"
+                )
+
+        # Minimum quorum of 1 to prevent deadlock when few agents remain
+        return max(1, quorum)

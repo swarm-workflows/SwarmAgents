@@ -560,6 +560,373 @@ def plot_reasoning_time(output_dir: str):
         print("Reasoning timestamps not present in all_jobs.csv; nothing to plot.")
 
 
+def detect_agent_failures(output_dir: str, repo: Repository | None = None) -> tuple[list[dict], dict[int, str]]:
+    """
+    Detect agent failures and their timestamps, plus host:port mapping for all agents.
+
+    Returns:
+        - failures: list of failure events [{"agent_id": int, "failure_time": float, "host": str, "port": int}, ...]
+        - agent_mapping: dict mapping agent_id -> "host:port"
+
+    Tries multiple sources:
+    1. Redis agent state transitions (ACTIVE -> FAILED)
+    2. Agent logs (grepping for failure keywords)
+    3. all_agents.csv if state field exists
+    """
+    failures = []
+    agent_mapping = {}
+
+    # Try Redis first - look for agents with FAILED state
+    if repo is not None:
+        try:
+            agents = repo.get_all_objects(key_prefix=Repository.KEY_AGENT, level=None)
+            for agent_data in agents:
+                if isinstance(agent_data, str):
+                    agent_data = json.loads(agent_data)
+                if not isinstance(agent_data, dict):
+                    continue
+
+                agent_id = agent_data.get("id")
+                state = agent_data.get("state", "").upper()
+                last_updated = agent_data.get("last_updated", 0)
+
+                # Extract host and port
+                host = agent_data.get("host", "unknown")
+                port = agent_data.get("port", 0)
+
+                # Build mapping for all agents
+                if agent_id is not None:
+                    agent_mapping[agent_id] = f"{host}:{port}"
+
+                # Check if agent is in FAILED state
+                if state == "FAILED" and last_updated:
+                    failures.append({
+                        "agent_id": agent_id,
+                        "failure_time": float(last_updated),
+                        "host": host,
+                        "port": port
+                    })
+        except Exception as e:
+            print(f"Could not detect failures from Redis: {e}")
+
+    # Fallback: Parse agent logs for failure indicators
+    if not failures and os.path.exists(output_dir):
+        import re
+        failure_pattern = re.compile(r".*detected as FAILED.*agent[_\s]+(\d+).*", re.IGNORECASE)
+
+        for filename in os.listdir(output_dir):
+            if filename.startswith("agent-") and filename.endswith(".log"):
+                try:
+                    agent_id = int(filename.split("-")[1].split(".")[0])
+                except Exception:
+                    continue
+
+                log_path = os.path.join(output_dir, filename)
+                try:
+                    with open(log_path, "r") as f:
+                        for line in f:
+                            # Look for failure indicators
+                            if "FAILED" in line.upper() or "FAILURE" in line.upper():
+                                # Try to extract timestamp (assuming format like: 2025-01-15 10:30:45)
+                                # For now, we'll mark as failed without precise timestamp
+                                failures.append({
+                                    "agent_id": agent_id,
+                                    "failure_time": None,  # Will need timestamp parsing
+                                    "host": "unknown",
+                                    "port": 0
+                                })
+                                break
+                except Exception:
+                    continue
+
+    return failures, agent_mapping
+
+
+def plot_timeline_with_failures(output_dir: str, repo: Repository | None = None,
+                                  window_size: int = 10):
+    """
+    Timeline visualization showing:
+    - Throughput (jobs/sec) over time
+    - Mean latency over time
+    - Active agent count over time
+    - Vertical markers for agent failures
+
+    Args:
+        output_dir: Output directory with all_jobs.csv
+        repo: Redis repository for agent state
+        window_size: Time window in seconds for throughput calculation
+    """
+    csv_file = f"{output_dir}/all_jobs.csv"
+    if not os.path.exists(csv_file):
+        print(f"{csv_file} not found")
+        return
+
+    df = pd.read_csv(csv_file)
+
+    # Filter to completed jobs only
+    df = df[df["completed_at"].notna()].copy()
+    if df.empty:
+        print("No completed jobs to plot")
+        return
+
+    # Compute scheduling latency
+    df["scheduling_latency"] = df["assigned_at"] - df["submitted_at"]
+
+    # Get experiment start/end times
+    start_time = df["submitted_at"].min()
+    end_time = df["completed_at"].max()
+    total_duration = end_time - start_time
+
+    # Create time windows
+    time_bins = list(range(int(start_time), int(end_time) + window_size, window_size))
+
+    # Calculate throughput (jobs completed per window)
+    df["completion_bin"] = pd.cut(df["completed_at"], bins=time_bins, labels=False, include_lowest=True)
+    throughput_series = df.groupby("completion_bin").size()
+    throughput_times = [start_time + (i * window_size) + (window_size / 2) for i in throughput_series.index]
+    throughput_values = throughput_series.values / window_size  # jobs per second
+
+    # Calculate mean latency per window
+    latency_series = df.groupby("completion_bin")["scheduling_latency"].mean()
+    latency_times = [start_time + (i * window_size) + (window_size / 2) for i in latency_series.index]
+    latency_values = latency_series.values
+
+    # Calculate active agents over time (approximate from job assignments)
+    active_agents_series = df.groupby("completion_bin")["leader_id"].nunique()
+    active_times = [start_time + (i * window_size) + (window_size / 2) for i in active_agents_series.index]
+    active_counts = active_agents_series.values
+
+    # Detect failures
+    failures = detect_agent_failures(output_dir, repo)
+
+    # Convert times to relative (seconds from start)
+    throughput_times_rel = [t - start_time for t in throughput_times]
+    latency_times_rel = [t - start_time for t in latency_times]
+    active_times_rel = [t - start_time for t in active_times]
+
+    failure_times_rel = []
+    failure_agents = []
+    for f in failures:
+        if f["failure_time"]:
+            failure_times_rel.append(f["failure_time"] - start_time)
+            failure_agents.append(f["agent_id"])
+
+    # Create figure with 3 subplots
+    fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
+
+    # Plot 1: Throughput over time
+    axes[0].plot(throughput_times_rel, throughput_values, 'b-', linewidth=2, marker='o', markersize=4)
+    axes[0].set_ylabel("Throughput (jobs/sec)", fontsize=11)
+    axes[0].set_title("System Performance Timeline with Failure Events", fontsize=13, fontweight='bold')
+    axes[0].grid(True, alpha=0.3)
+
+    # Mark failures on throughput plot
+    for ft, fa in zip(failure_times_rel, failure_agents):
+        axes[0].axvline(x=ft, color='red', linestyle='--', alpha=0.7, linewidth=2)
+        axes[0].text(ft, axes[0].get_ylim()[1] * 0.95, f'Agent {fa}\nfailed',
+                    rotation=0, ha='center', va='top', fontsize=8,
+                    bbox=dict(boxstyle='round', facecolor='red', alpha=0.3))
+
+    # Plot 2: Mean Latency over time
+    axes[1].plot(latency_times_rel, latency_values, 'g-', linewidth=2, marker='s', markersize=4)
+    axes[1].set_ylabel("Mean Latency (sec)", fontsize=11)
+    axes[1].grid(True, alpha=0.3)
+
+    # Mark failures on latency plot
+    for ft in failure_times_rel:
+        axes[1].axvline(x=ft, color='red', linestyle='--', alpha=0.7, linewidth=2)
+
+    # Plot 3: Active agents over time
+    axes[2].plot(active_times_rel, active_counts, 'purple', linewidth=2, marker='^', markersize=4)
+    axes[2].set_ylabel("Active Agents", fontsize=11)
+    axes[2].set_xlabel("Time (seconds from start)", fontsize=11)
+    axes[2].grid(True, alpha=0.3)
+
+    # Mark failures on active agents plot
+    for ft in failure_times_rel:
+        axes[2].axvline(x=ft, color='red', linestyle='--', alpha=0.7, linewidth=2)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "timeline_with_failures.png"), dpi=300, bbox_inches="tight")
+    plt.close()
+
+    print(f"Saved: {os.path.join(output_dir, 'timeline_with_failures.png')}")
+    if failures:
+        print(f"Detected {len(failures)} agent failure(s)")
+    else:
+        print("No agent failures detected")
+
+
+def analyze_throughput_degradation(output_dir: str, repo: Repository | None = None,
+                                     window_size: int = 10,
+                                     baseline_duration: int = 30):
+    """
+    Analyze throughput degradation due to failures.
+
+    Calculates:
+    - Baseline throughput (first N seconds before any failure)
+    - Throughput during failure period
+    - Throughput degradation percentage
+    - Recovery time (time to return to 95% of baseline)
+
+    Args:
+        output_dir: Output directory with all_jobs.csv
+        repo: Redis repository for agent state
+        window_size: Time window in seconds for throughput calculation
+        baseline_duration: Duration in seconds to establish baseline (pre-failure)
+    """
+    csv_file = f"{output_dir}/all_jobs.csv"
+    if not os.path.exists(csv_file):
+        print(f"{csv_file} not found")
+        return
+
+    df = pd.read_csv(csv_file)
+    df = df[df["completed_at"].notna()].copy()
+
+    if df.empty:
+        print("No completed jobs for degradation analysis")
+        return
+
+    start_time = df["submitted_at"].min()
+    end_time = df["completed_at"].max()
+
+    # Detect failures
+    failures = detect_agent_failures(output_dir, repo)
+
+    if not failures:
+        print("No failures detected - cannot compute degradation metrics")
+        # Still compute overall throughput
+        total_jobs = len(df)
+        duration = end_time - start_time
+        overall_throughput = total_jobs / duration if duration > 0 else 0
+        print(f"Overall throughput: {overall_throughput:.4f} jobs/sec ({total_jobs} jobs in {duration:.2f}s)")
+        return
+
+    # Find first failure time
+    failure_times = [f["failure_time"] for f in failures if f["failure_time"]]
+    if not failure_times:
+        print("Failure times not available")
+        return
+
+    first_failure = min(failure_times)
+
+    # Calculate baseline throughput (before first failure)
+    baseline_end = min(first_failure, start_time + baseline_duration)
+    baseline_df = df[df["completed_at"] <= baseline_end]
+
+    if len(baseline_df) < 5:
+        print(f"Insufficient baseline data ({len(baseline_df)} jobs) - using first {baseline_duration}s regardless of failures")
+        baseline_df = df[df["completed_at"] <= (start_time + baseline_duration)]
+
+    baseline_duration_actual = baseline_end - start_time
+    baseline_throughput = len(baseline_df) / baseline_duration_actual if baseline_duration_actual > 0 else 0
+
+    # Calculate throughput during failure period (failure + 60s)
+    failure_period_end = first_failure + 60  # 60 seconds after first failure
+    failure_df = df[(df["completed_at"] >= first_failure) & (df["completed_at"] <= failure_period_end)]
+    failure_duration = min(failure_period_end - first_failure, end_time - first_failure)
+    failure_throughput = len(failure_df) / failure_duration if failure_duration > 0 else 0
+
+    # Calculate degradation
+    if baseline_throughput > 0:
+        degradation_pct = ((baseline_throughput - failure_throughput) / baseline_throughput) * 100
+    else:
+        degradation_pct = 0
+
+    # Find recovery time (when throughput returns to 95% of baseline)
+    target_throughput = baseline_throughput * 0.95
+    recovery_time = None
+
+    # Create sliding windows after failure
+    time_bins = list(range(int(first_failure), int(end_time) + window_size, window_size))
+    df["completion_bin"] = pd.cut(df["completed_at"], bins=time_bins, labels=False, include_lowest=True)
+
+    for bin_idx in sorted(df["completion_bin"].dropna().unique()):
+        bin_jobs = df[df["completion_bin"] == bin_idx]
+        bin_throughput = len(bin_jobs) / window_size
+
+        if bin_throughput >= target_throughput:
+            bin_start = first_failure + (bin_idx * window_size)
+            recovery_time = bin_start - first_failure
+            break
+
+    # Generate visualization
+    fig, axes = plt.subplots(2, 1, figsize=(12, 8))
+
+    # Subplot 1: Throughput comparison bar chart
+    categories = ['Baseline\n(pre-failure)', 'During Failure\n(+60s)', 'Degradation']
+    values = [baseline_throughput, failure_throughput, degradation_pct]
+    colors = ['green', 'orange', 'red']
+
+    axes[0].bar(categories[:2], values[:2], color=colors[:2], alpha=0.7, edgecolor='black')
+    axes[0].set_ylabel("Throughput (jobs/sec)", fontsize=11)
+    axes[0].set_title("Throughput Degradation Analysis", fontsize=13, fontweight='bold')
+    axes[0].grid(axis='y', alpha=0.3)
+
+    # Add value labels on bars
+    for i, (cat, val) in enumerate(zip(categories[:2], values[:2])):
+        axes[0].text(i, val + 0.02 * max(values[:2]), f'{val:.3f}',
+                    ha='center', va='bottom', fontsize=10, fontweight='bold')
+
+    # Subplot 2: Degradation percentage and recovery
+    metrics = []
+    metric_values = []
+
+    metrics.append(f'Degradation\n({degradation_pct:.1f}%)')
+    metric_values.append(degradation_pct)
+
+    if recovery_time:
+        metrics.append(f'Recovery Time\n({recovery_time:.1f}s)')
+        metric_values.append(recovery_time)
+
+    axes[1].bar(metrics, metric_values, color=['red', 'blue'][:len(metrics)], alpha=0.7, edgecolor='black')
+    axes[1].set_ylabel("Value", fontsize=11)
+    axes[1].grid(axis='y', alpha=0.3)
+
+    # Add value labels
+    for i, (m, v) in enumerate(zip(metrics, metric_values)):
+        axes[1].text(i, v + 0.02 * max(metric_values), f'{v:.2f}',
+                    ha='center', va='bottom', fontsize=10, fontweight='bold')
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "throughput_degradation_analysis.png"), dpi=300, bbox_inches="tight")
+    plt.close()
+
+    # Save metrics to CSV
+    metrics_data = {
+        "baseline_throughput_jobs_per_sec": [baseline_throughput],
+        "failure_throughput_jobs_per_sec": [failure_throughput],
+        "degradation_percentage": [degradation_pct],
+        "recovery_time_seconds": [recovery_time if recovery_time else -1],
+        "baseline_jobs": [len(baseline_df)],
+        "failure_period_jobs": [len(failure_df)],
+        "first_failure_time": [first_failure - start_time],
+        "num_failures": [len(failures)]
+    }
+
+    pd.DataFrame(metrics_data).to_csv(
+        os.path.join(output_dir, "throughput_degradation_metrics.csv"),
+        index=False
+    )
+
+    # Print summary
+    print("\n" + "="*60)
+    print("THROUGHPUT DEGRADATION ANALYSIS")
+    print("="*60)
+    print(f"Baseline throughput (pre-failure): {baseline_throughput:.4f} jobs/sec ({len(baseline_df)} jobs)")
+    print(f"Throughput during failure:         {failure_throughput:.4f} jobs/sec ({len(failure_df)} jobs)")
+    print(f"Throughput degradation:            {degradation_pct:.2f}%")
+    if recovery_time:
+        print(f"Recovery time (to 95% baseline):   {recovery_time:.2f} seconds")
+    else:
+        print(f"Recovery time (to 95% baseline):   Not achieved within test duration")
+    print(f"Number of agent failures:          {len(failures)}")
+    print("="*60)
+    print(f"Saved: {os.path.join(output_dir, 'throughput_degradation_analysis.png')}")
+    print(f"Saved: {os.path.join(output_dir, 'throughput_degradation_metrics.csv')}")
+    print("="*60 + "\n")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Plot scheduling latency, jobs per agent, conflicts/restarts, and loads")
     parser.add_argument("--output_dir", type=str, default=".", help="Directory where plots and CSV files are saved")
@@ -605,4 +972,10 @@ if __name__ == "__main__":
 
     # Agent loads prefer Redis; fallback to files
     plot_agent_loads(args.output_dir, repo)
+
+    # NEW: Timeline with failure events (visualization #1)
+    plot_timeline_with_failures(args.output_dir, repo, window_size=10)
+
+    # NEW: Throughput degradation analysis (visualization #2)
+    analyze_throughput_degradation(args.output_dir, repo, window_size=10, baseline_duration=30)
 

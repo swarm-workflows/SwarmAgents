@@ -37,6 +37,9 @@ class Metrics:
         self.total_idle_time = 0
         self.restarts = {}
         self.conflicts = {}
+        self.agent_failures = {}
+        self.reassignments = {}
+        self.quorum_changes = []
 
     def save_load_metric(self, load: float):
         """

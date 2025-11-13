@@ -102,6 +102,20 @@ def main():
     ap.add_argument("--runtime", type=int, default=30, help="Seconds to keep the test running (v2)")
     ap.add_argument("--job-interval", type=float, default=0.5, help="Seconds between job bursts (v2)")
 
+    # Dynamic agent addition (v2)
+    ap.add_argument("--dynamic-agents", type=int, default=0,
+                    help="Number of agents to add dynamically during test (0 = disabled)")
+    ap.add_argument("--dynamic-trigger", choices=["time", "bucket", "jobs-completed"], default="time",
+                    help="Trigger type for adding dynamic agents")
+    ap.add_argument("--dynamic-delay", type=int, default=30,
+                    help="Seconds to wait before adding agents (for 'time' trigger)")
+    ap.add_argument("--dynamic-trigger-bucket", type=int, default=1,
+                    help="Bucket to monitor (for 'bucket' trigger)")
+    ap.add_argument("--dynamic-trigger-threshold", type=int, default=50,
+                    help="Threshold value for bucket/jobs trigger")
+    ap.add_argument("--dynamic-trigger-jobs", type=int, default=50,
+                    help="Number of completed jobs to wait for (for 'jobs-completed' trigger)")
+
     # Config / starter
     ap.add_argument("--starter", default="./swarm-multi-start.sh",
                     help="Path to swarm-multi-start.sh (v2)")
@@ -194,6 +208,18 @@ def main():
             cmd += ["--remote-repo-dir", args.remote_repo_dir]
         if args.debug:
             cmd.append("--debug")
+
+        # Dynamic agent addition parameters
+        if args.dynamic_agents > 0:
+            cmd += ["--dynamic-agents", str(args.dynamic_agents)]
+            cmd += ["--dynamic-trigger", args.dynamic_trigger]
+            if args.dynamic_trigger == "time":
+                cmd += ["--dynamic-delay", str(args.dynamic_delay)]
+            elif args.dynamic_trigger == "bucket":
+                cmd += ["--dynamic-trigger-bucket", str(args.dynamic_trigger_bucket)]
+                cmd += ["--dynamic-trigger-threshold", str(args.dynamic_trigger_threshold)]
+            elif args.dynamic_trigger == "jobs-completed":
+                cmd += ["--dynamic-trigger-jobs", str(args.dynamic_trigger_jobs)]
 
         log(f"[{run_name}] Starting test…")
         (logs_dir / "batch_runner.log").write_text(
