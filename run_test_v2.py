@@ -350,6 +350,8 @@ def produce_jobs(args) -> None:
         "--jobs-per-interval", str(args.jobs_per_interval),
         "--redis-host", args.db_host,
     ]
+    if args.topology == "hierarchical":
+        jobs_cmd.extend(["--level", "1"])
     if args.debug:
         jobs_cmd.append("--debug")
     log("Producing jobs …")
