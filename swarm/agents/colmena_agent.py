@@ -369,7 +369,7 @@ class ColmenaAgent(Agent):
                 self.engine.incoming.remove_object(object_id=self.role.role_id)
                 role_id = self.role.role_id
                 self.metrics.restarts[role_id] = self.metrics.restarts.get(role_id, 0) + 1
-                self.start_consensus(self.role)
+                self.start_consensus()
 
     def is_role_feasible(self, role: Role, agent: AgentInfo) -> bool:
         """
@@ -478,12 +478,12 @@ class ColmenaAgent(Agent):
             return
 
         self.role = role
-        self.start_consensus(role)
+        self.start_consensus()
 
-    def start_consensus(self, role: Role):
+    def start_consensus(self):
         if self.debug:
             self.logger.info("Start consensus called!")
-            self.logger.info(f"Role capacities: {role.capacities}")
+            self.logger.info(f"Role capacities: {self.role.capacities}")
 
         agents_map = self.neighbor_map
         agent_ids = list(agents_map.keys())
@@ -497,14 +497,14 @@ class ColmenaAgent(Agent):
         # Build once
         cost_matrix = self.selector.compute_cost_matrix(
             assignees=agents,
-            candidates=[role],
+            candidates=[self.role],
         )
         self.logger.info(f"cost matrix: {cost_matrix}")
 
-        # Step 2: Use existing helper to get the best agent per role
+        # Step 2: Use existing helper to get the best agent per self.role
         assignments = self.selector.pick_agent_per_candidate(
             assignees=agents,
-            candidates=[role],
+            candidates=[self.role],
             cost_matrix=cost_matrix,
             objective="min",
             threshold_pct=10.0,  # e.g., 10 means within +10% of best, TODO: Take from config file
@@ -520,21 +520,21 @@ class ColmenaAgent(Agent):
                 self.logger.info(f"Selected agent is this - sending proposal")
                 proposal = ProposalInfo(
                     p_id=generate_id(),
-                    object_id=role.role_id,
+                    object_id=self.role.role_id,
                     agent_id=self.agent_id,
                     seed=round((cost + self.agent_id), 2)
                 )
                 proposals.append(proposal)
-                role.state = ObjectState.PRE_PREPARE
+                self.role.state = ObjectState.PRE_PREPARE
 
         if len(proposals):
             self.logger.debug(f"Identified roles to propose: {proposals}")
             if self.debug:
-                self.logger.info(f"Identified role to select: {role}")
+                self.logger.info(f"Identified role to select: {self.role}")
             self.engine.propose(proposals=proposals)
             proposals.clear()
 
-        role_id = role.role_id
+        role_id = self.role.role_id
 
         pending_proposals_list = self.pending_proposals.pop(role_id, [])
         for proposal in pending_proposals_list:
