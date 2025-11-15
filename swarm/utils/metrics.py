@@ -40,6 +40,7 @@ class Metrics:
         self.agent_failures = {}
         self.reassignments = {}
         self.quorum_changes = []
+        self.delegation_reassignments = {}
 
     def save_load_metric(self, load: float):
         """

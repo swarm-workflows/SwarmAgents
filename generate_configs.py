@@ -42,6 +42,7 @@ class SwarmConfigGenerator:
         agents_per_host: int = 1,
         groups: Optional[int] = None,
         group_size: Optional[int] = None,
+        hierarchical_level1_agent_type: str = "llm",
     ):
         self.num_agents = num_agents
         self.jobs_per_proposal = jobs_per_proposal
@@ -56,6 +57,9 @@ class SwarmConfigGenerator:
         # grouping controls (only used for mesh/ring)
         self.req_groups = groups
         self.req_group_size = group_size
+
+        # hierarchical level 1 agent type (llm or resource)
+        self.hierarchical_level1_agent_type = hierarchical_level1_agent_type
 
         # legacy ring helper (used when no grouping flags provided for ring)
         self.rings_default = self._create_default_rings()
@@ -561,6 +565,13 @@ class SwarmConfigGenerator:
             config["runtime"]["total_agents"] = self.num_agents
             config["runtime"]["jobs_per_proposal"] = self.jobs_per_proposal
 
+            # Set agent type based on topology level (for hierarchical)
+            if self.topology == "hierarchical" and topo["level"] == 1:
+                config["agent_type"] = self.hierarchical_level1_agent_type
+                #print(f"Settting config type: {config['agent_type']}")
+            else:
+                config["agent_type"] = "resource"
+
             # Write file
             config_file_path = os.path.join(self.output_dir, f"{config_prefix}_{agent_id}.yml")
             with open(config_file_path, "w") as f:
@@ -624,6 +635,11 @@ if __name__ == "__main__":
     parser.add_argument("--group-size", type=int, default=None,
                         help="Group size for mesh/ring (independent sub-topologies)")
 
+    # Hierarchical topology control
+    parser.add_argument("--hierarchical-level1-agent-type", type=str,
+                        choices=["llm", "resource"], default="llm",
+                        help="Agent type for level 1 (parent) agents in hierarchical topology (default: llm)")
+
     args = parser.parse_args()
 
     if args.agent_hosts_file:
@@ -651,6 +667,7 @@ if __name__ == "__main__":
         agents_per_host=args.agents_per_host,
         groups=args.groups,
         group_size=args.group_size,
+        hierarchical_level1_agent_type=args.hierarchical_level1_agent_type,
     )
     generator.generate_configs(flavor_percentages=flavor_percentages, agent_hosts=agent_hosts)
 

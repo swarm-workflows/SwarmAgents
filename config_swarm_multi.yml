@@ -41,7 +41,7 @@ dtns:
 runtime:
   max_pending_elections: 100
   empty_timeout_seconds: 300
-  reselection_timeout_s: 120
+  reselection_timeout_s: 60
   peer_expiry_seconds: 20
   results_dir: swarm-multi
   shutdown_mode: manual
@@ -90,7 +90,18 @@ llm:
   use_for_selection: true     # use LLM to break ties across candidates
   prompts:
     cost: |-
-      You are a scheduler. Given a JSON job and an agent's resource state,
-      output a single JSON object: {"score": <float in [0, 100]>, "explanation": "..."}.
-      Higher score = better fit / lower cost. Consider capacity headroom,
-      estimated runtime, network DTN requirements, and fairness when applicable.
+      You are a distributed scheduler in a mesh topology with peer agents.
+      Score this job for THIS agent (higher = better fit, 0-100).
+
+      Key factors to consider:
+      1. Resource headroom: Prefer agents with spare capacity
+      2. Current load: Avoid overloaded agents (check peer context)
+      3. DTN connectivity: Match job's data_in/data_out to agent's DTNs
+      4. Load balancing: Favor underutilized agents in the mesh
+      5. Execution time: Consider wall_time vs agent's current queue depth
+
+      When PEER CONTEXT is provided, use it to make load-aware decisions.
+      Compare this agent's load against peer loads to promote balanced distribution.
+
+      Return JSON: {"score": <0-100>, "explanation": "<concise reason>"}
+      Explanation should be max 1 sentence focusing on the key decision factor.

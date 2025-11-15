@@ -68,6 +68,7 @@ def run_once(cmd: list[str] | str) -> str:
     return (p.stdout or "") + (p.stderr or "")
 
 def parse_bucket_set_count(text: str, bucket: int) -> int:
+    total_count = 0
     for raw_line in text.splitlines():
         line = raw_line.strip()
         m = LINE_RE.match(line)
@@ -78,12 +79,12 @@ def parse_bucket_set_count(text: str, bucket: int) -> int:
             continue
         inside = m.group(2).strip()
         if not inside:
-            return 0
-        # Format: "job_ids: 1,2,3"
+            continue
+        # Format: "job_ids: 1,2,3" or set notation {'job:x', 'job:y', ...}
         parts = [x.strip() for x in inside.split(",") if x.strip()]
-        # Count comma-separated ints
-        return len(parts)
-    return 0
+        # Count comma-separated entries and sum across all agents
+        total_count += len(parts)
+    return total_count
 
 # ------------------------------
 # Remote helpers
@@ -146,12 +147,15 @@ def generate_configs(args, agent_hosts_list: list[str]) -> Path:
         args.topology, args.db_host, str(args.jobs),
         "--agent-hosts-file", str(hosts_file),
         "--agents-per-host", str(args.agents_per_host) if args.mode == "remote" else str(args.agents),
-        "--dtns",
     ]
+    if args.topology != "hierarchical":
+        gen_args.append("--dtns")
     if args.groups:
         gen_args += ["--groups", str(args.groups)]
     if args.group_size:
         gen_args += ["--group-size", str(args.group_size)]
+    if args.topology == "hierarchical":
+        gen_args += ["--hierarchical-level1-agent-type", args.hierarchical_level1_agent_type]
 
     log("Generating configs …")
     run_blocking(gen_args, check=True)
@@ -193,10 +197,8 @@ def start_agents_local(args, agent_count: int = None, start_offset: int = 0) -> 
         args.agent_type, str(agent_count),
         args.topology, str(args.jobs),
         args.db_host, str(args.jobs_per_proposal),
+        "--use-config-dir",  # Always use pre-generated configs
     ]
-    # If configs were generated locally, use them
-    if args.use_config_dir:
-        start_cmd += ["--use-config-dir"]
     if args.groups:
         start_cmd += ["--groups", str(args.groups)]
     if args.group_size:
@@ -372,7 +374,7 @@ def wait_runtime(args) -> None:
                 break
         else:
             cond = size < args.threshold
-            log(f"Bucket {args.watch_bucket} size={size} (thr={args.threshold}) → {'LOW' if cond else 'OK'}")
+            log(f"Bucket state:*:*:{args.watch_bucket} size={size} (thr={args.threshold}) → {'LOW' if cond else 'OK'}")
             if cond:
                 if low_since is None:
                     low_since = time.time()
@@ -407,6 +409,7 @@ def parse_and_report(args) -> None:
         "--output_dir", args.run_dir,
         "--agents", str(args.agents),
         "--db_host", args.db_host,
+        f"--{args.topology}" if args.topology != "hierarchical" else "",
     ]
     log("Plotting …")
     run_blocking(plot_cmd, check=False)
@@ -421,6 +424,9 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--agents", type=int, required=True, help="Total number of agents")
     ap.add_argument("--agents-per-host", type=int, default=1, help="Only for remote mode; shard size")
     ap.add_argument("--topology", required=True, choices=["mesh", "ring", "star", "hierarchical"])
+    ap.add_argument("--hierarchical-level1-agent-type", type=str,
+                    choices=["llm", "resource"], default="llm",
+                    help="Agent type for level 1 (parent) agents in hierarchical topology (default: llm)")
     ap.add_argument("--jobs", type=int, required=True)
     ap.add_argument("--db-host", required=True)
     ap.add_argument("--jobs-per-proposal", type=int, default=10)

@@ -79,17 +79,37 @@ class LlmBidder:
             system_prompt=system_prompt,
         )
 
-    def score(self, *, job: Dict[str, Any], agent_state: Dict[str, Any]) -> Bid:
+    def score(self, *, job: Dict[str, Any], agent_state: Dict[str, Any],
+              peer_context: Optional[Dict[str, Any]] = None) -> Bid:
         """
-        Synchronously obtain a Bid from the LLM.
+        Synchronously obtain a Bid from the LLM with optional peer context.
+
+        :param job: Job information as dict
+        :param agent_state: Agent resource state as dict
+        :param peer_context: Optional peer information for load-aware scoring
+        :return: Bid with score, explanation, and reasoning time
         """
         try:
+            # Prepare peer context summary if provided
+            peer_info = ""
+            if peer_context:
+                peer_agents = ", ".join([f"Agent{k}: {v}" for k, v in peer_context.get('peer_agents', {}).items()])
+                peer_info = (
+                    f"\n\nPEER CONTEXT:\n"
+                    f"- Total agents in mesh: {peer_context.get('total_agents', 'unknown')}\n"
+                    f"- Peer Agents: {peer_agents if peer_agents else 'no peers'}\n"
+                    f"- Recent conflicts: {peer_context.get('conflicts', 0)}\n"
+                    f"- Topology: {peer_context.get('topology', 'mesh')}\n"
+                    f"- Child Agents: {peer_context.get('child_agents', 'mesh')}\n"
+                )
+
             prompt = (
                 "Given the job and agent state below, return ONLY JSON with fields:\n"
-                "  - score: number in [0, 100]\n"
-                "  - explanation: short string\n\n"
+                "  - score: number in [0, 100] (higher = better fit)\n"
+                "  - explanation: SHORT string (max 15 words)\n\n"
                 f"JOB:\n{json.dumps(job, ensure_ascii=False, indent=2)}\n\n"
-                f"AGENT_STATE:\n{json.dumps(agent_state, ensure_ascii=False, indent=2)}\n"
+                f"AGENT_STATE:\n{json.dumps(agent_state, ensure_ascii=False, indent=2)}"
+                f"{peer_info}"
             )
 
             start = time.perf_counter()
@@ -102,6 +122,11 @@ class LlmBidder:
             )
             bid = res.output
             bid.reasoning_time = time.perf_counter() - start
+
+            # Truncate long explanations to save tokens and improve performance
+            if len(bid.explanation) > 100:
+                bid.explanation = bid.explanation[:97] + "..."
+
             return bid
         except Exception as e:
             if self.logger:

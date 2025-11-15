@@ -26,7 +26,6 @@ import threading
 import time
 import traceback
 from concurrent.futures.thread import ThreadPoolExecutor
-from tokenize import group
 
 from swarm.consensus.engine import ConsensusEngine
 from swarm.consensus.interfaces import ConsensusHost, ConsensusTransport, TopologyRouter
@@ -147,6 +146,10 @@ class ResourceAgent(Agent):
         self.failed_agents = ThreadSafeDict[int, float]()  # agent_id -> failure_timestamp
         self.job_assignments = ThreadSafeDict[str, int]()  # job_id -> assigned_agent_id
 
+        # Track jobs delegated to children for hierarchical monitoring
+        # Maps: job_id -> {'delegated_at': timestamp, 'groups': [list of child groups]}
+        self.delegated_jobs = ThreadSafeDict[str, dict]()  # job_id -> delegation_info
+
     @property
     def peer_expiry_seconds(self) -> int:
         return self.runtime_config.get("peer_expiry_seconds", 20)
@@ -154,6 +157,18 @@ class ResourceAgent(Agent):
     @property
     def reselection_timeout_s(self) -> float:
         return self.runtime_config.get("reselection_timeout_s", 60.00)
+
+    @property
+    def delegation_timeout_s(self) -> float:
+        """
+        Time threshold for monitoring delegated jobs at child level.
+        If a job is not selected by children within this time, it will be
+        re-added to the parent's queue.
+
+        Default is 2x reselection_timeout_s to give children enough time
+        to complete their selection process.
+        """
+        return self.runtime_config.get("delegation_timeout_s", self.reselection_timeout_s * 2)
 
     @property
     def capacities(self) -> Capacities:
@@ -334,6 +349,207 @@ class ResourceAgent(Agent):
 
                 # TODO restart selection for jobs which were assigned to neighbor which just went down
 
+    def _monitor_delegated_jobs(self):
+        """
+        Monitor jobs delegated to children and re-add them to parent queue if not selected in time.
+
+        For hierarchical topologies, parent agents delegate jobs to their children.
+        This method checks if those jobs are still pending at the child level after
+        delegation_timeout_s seconds. If so, they are re-added to the parent's queue
+        as they may be infeasible for the children to handle.
+
+        The parent will not propose for these jobs (they remain in a monitored state)
+        to avoid consensus conflicts.
+        """
+        # Only applicable for agents with children
+        if not self.topology.children:
+            return
+
+        current_time = time.time()
+        jobs_to_reassign = []
+        jobs_processed = []
+
+        # Check all delegated jobs
+        for job_id, delegation_info in list(self.delegated_jobs.items()):
+            delegated_at = delegation_info.get('delegated_at', 0)
+            child_groups = delegation_info.get('groups', [])
+
+            time_since_delegation = current_time - delegated_at
+
+            # Check if timeout has been exceeded
+            if time_since_delegation <= self.delegation_timeout_s:
+                continue
+
+            # Check job state in Redis at child level(s)
+            job_still_pending = False
+            job_found = False
+
+            for child_group in child_groups:
+                try:
+                    job_data = self.repository.get(
+                        obj_id=job_id,
+                        key_prefix=Repository.KEY_JOB,
+                        level=self.topology.level - 1,
+                        group=child_group
+                    )
+
+                    if job_data:
+                        job_found = True
+                        job_state = job_data.get('state', ObjectState.PENDING.value)
+
+                        # If job is still PENDING at child level, it wasn't selected
+                        if job_state == ObjectState.PENDING.value:
+                            job_still_pending = True
+                            self.logger.warning(
+                                f"Delegated job {job_id} still PENDING at level {self.topology.level - 1}, "
+                                f"group {child_group} after {time_since_delegation:.1f}s "
+                                f"(timeout: {self.delegation_timeout_s:.1f}s)"
+                            )
+                            break
+                        else:
+                            # Job was processed by children
+                            self.logger.debug(
+                                f"Delegated job {job_id} processed by children (state: {job_state})"
+                            )
+                            jobs_processed.append(job_id)
+
+                except Exception as e:
+                    self.logger.error(
+                        f"Error checking delegated job {job_id} at level {self.topology.level - 1}, "
+                        f"group {child_group}: {e}"
+                    )
+
+            # Re-add to parent queue if still pending or not found (possibly infeasible for children)
+            if not job_found or job_still_pending:
+                jobs_to_reassign.append((job_id, delegation_info, time_since_delegation))
+
+        for job_id in jobs_processed:
+            self.delegated_jobs.remove(job_id)
+
+        # Process reassignments
+        for job_id, delegation_info, time_since_delegation in jobs_to_reassign:
+            self._reassign_delegated_job(job_id, delegation_info, time_since_delegation)
+
+    def _reassign_delegated_job(self, job_id: str, delegation_info: dict, time_since_delegation: float):
+        """
+        Re-add a delegated job back to the parent's pending queue.
+
+        This is called when a job delegated to children hasn't been selected within
+        the timeout period, indicating it may be infeasible at the child level.
+
+        :param job_id: Job ID to reassign
+        :param delegation_info: Delegation metadata (timestamp, groups)
+        :param time_since_delegation: Time elapsed since delegation
+        """
+        child_groups = delegation_info.get('groups', [])
+
+        try:
+            # Try to get the job from child level(s)
+            job_obj = None
+            found_in_group = None
+
+            for child_group in child_groups:
+                job_data = self.repository.get(
+                    obj_id=job_id,
+                    key_prefix=Repository.KEY_JOB,
+                    level=self.topology.level - 1,
+                    group=child_group
+                )
+
+                if job_data:
+                    job_obj = Job()
+                    job_obj.from_dict(job_data)
+                    found_in_group = child_group
+                    break
+
+            # If not found in Redis, check if we have it locally
+            if not job_obj:
+                job_obj = self.queues.pending_queue.get(job_id)
+
+            if not job_obj:
+                self.logger.warning(
+                    f"Cannot reassign delegated job {job_id}: not found in child groups or local queue"
+                )
+                self.delegated_jobs.remove(job_id)
+                return
+
+            # Mark job with a flag to prevent proposing for it
+            # This prevents the parent from competing with children
+            if not hasattr(job_obj, 'delegation_failed'):
+                job_obj.delegation_failed = True
+                job_obj.delegation_failed_count = 1
+                job_obj.add_delegation_failed_agents(self.agent_id)
+            else:
+                job_obj.delegation_failed_count = getattr(job_obj, 'delegation_failed_count', 0) + 1
+                job_obj.add_delegation_failed_agents(self.agent_id)
+
+            # Reset job state to PENDING for parent level
+            job_obj.state = ObjectState.PENDING
+
+            # Add back to parent's pending queue if not already there
+            if job_id not in self.queues.pending_queue:
+                self.queues.pending_queue.add(job_obj)
+                self.logger.info(
+                    f"Re-added delegated job {job_id} to parent queue "
+                    f"(was stuck at child level for {time_since_delegation:.1f}s)"
+                )
+            else:
+                # Update the existing job in the queue
+                existing_job = self.queues.pending_queue.get(job_id)
+                if existing_job:
+                    existing_job.delegation_failed = job_obj.delegation_failed
+                    existing_job.delegation_failed_count = job_obj.delegation_failed_count
+                    existing_job.add_delegation_failed_agents(self.agent_id)
+
+            # Remove from child level(s) in Redis to avoid duplicate processing
+            for child_group in child_groups:
+                try:
+                    # Delete from child level
+                    self.repository.delete(
+                        obj_id=job_id,
+                        key_prefix=Repository.KEY_JOB,
+                        level=self.topology.level - 1,
+                        group=child_group
+                    )
+                    self.logger.debug(
+                        f"Removed job {job_id} from child level {self.topology.level - 1}, group {child_group}"
+                    )
+                except Exception as e:
+                    self.logger.error(
+                        f"Error removing job {job_id} from child group {child_group}: {e}"
+                    )
+            # Add to redis for parent's level to be picked for consensus again
+            try:
+                self.repository.save(obj=job_obj.to_dict(), key_prefix=Repository.KEY_JOB,
+                                     level=self.topology.level, group=self.topology.group)
+            except Exception as e:
+                self.logger.error(
+                    f"Error adding job {job_id} to parent's group {self.topology.group} level: {self.topology.level}: {e}"
+                )
+                traceback.format_exc()
+
+            # Remove from delegated tracking
+            self.delegated_jobs.remove(job_id)
+
+            self.metrics.delegation_reassignments[job_id] = {
+                'reassigned_at': time.time(),
+                'time_at_child_level': time_since_delegation,
+                'child_groups': child_groups,
+                'delegation_failed_count': job_obj.delegation_failed_count,
+                'reason': 'child_selection_timeout'
+            }
+
+            self.logger.warning(
+                f"DELEGATION_REASSIGN: Job {job_id} re-added to parent level {self.topology.level} "
+                f"after {time_since_delegation:.1f}s at child level (attempt #{job_obj.delegation_failed_count})"
+            )
+
+        except Exception as e:
+            self.logger.error(f"Error reassigning delegated job {job_id}: {e}")
+            self.logger.error(traceback.format_exc())
+            # Still remove from tracking to avoid repeated errors
+            self.delegated_jobs.remove(job_id)
+
     def _refresh_neighbors(self, current_time: float):
         """
         Refresh the neighbor agent map by retrieving peer agents at the same level from Redis
@@ -415,6 +631,7 @@ class ResourceAgent(Agent):
         For non-leaf agents (with children), the info aggregates:
           - cumulative capacities and allocations from children
           - cumulative load computed from aggregated values
+          - DTNs with averaged connectivity scores across children
 
         :return: An AgentInfo object with the current agent's state
         :rtype: AgentInfo
@@ -435,24 +652,56 @@ class ResourceAgent(Agent):
                 load=self._load,
                 proposed_load=proposed_load,
                 last_updated=current_time,
-                dtns=self.config.get("dtns")
+                dtns=self.config.get("dtns"),
+                group=self.topology.group,
+                level=self.topology.level
             )
         # Non-leaf agent: aggregate info from all children
         else:
             total_capacities = Capacities()
             total_allocations = Capacities()
-            # Aggregate DTNs from children, keyed by DTN name to deduplicate
-            dtn_map = {}
+            max_child_capacity = None  # Track max capacity across all children
+
+            # Aggregate DTNs with proper connectivity score averaging
+            # Track: {dtn_name: {'scores': [list of scores], 'info': DataNode}}
+            dtn_aggregation = {}
 
             for child in self.children.values():
                 total_capacities += child.capacities
                 total_allocations += child.capacity_allocations
-                if child.dtns:
-                    dtn_map.update(child.dtns)
 
+                '''
+                # Compute element-wise maximum capacity across children
+                if max_child_capacity is None:
+                    max_child_capacity = Capacities(**child.capacities.to_dict())
+                else:
+                    for field in ['cpu', 'core', 'gpu', 'ram', 'disk', 'bw', 'burst_size', 'unit', 'mtu']:
+                        current_max = getattr(max_child_capacity, field)
+                        child_value = getattr(child.capacities, field)
+                        setattr(max_child_capacity, field, max(current_max, child_value))
+                '''
+
+                if child.dtns:
+                    for dtn_name, dtn_obj in child.dtns.items():
+                        if dtn_name not in dtn_aggregation:
+                            dtn_aggregation[dtn_name] = {
+                                'scores': [],
+                                'info': dtn_obj  # Keep one instance for metadata
+                            }
+                        # Collect connectivity score from this child
+                        score = getattr(dtn_obj, 'connectivity_score', 1.0)
+                        dtn_aggregation[dtn_name]['scores'].append(score)
+
+            # Compute averaged DTN connectivity scores
             dtns = []
-            for dtn in dtn_map.values():
-                dtns.append(dtn.to_dict())
+            for dtn_name, agg_data in dtn_aggregation.items():
+                scores = agg_data['scores']
+                avg_score = sum(scores) / len(scores) if scores else 1.0
+
+                # Create new DTN dict with averaged score
+                dtn_dict = agg_data['info'].to_dict() if hasattr(agg_data['info'], 'to_dict') else dict(agg_data['info'])
+                dtn_dict['connectivity_score'] = round(avg_score, 2)
+                dtns.append(dtn_dict)
 
             self._capacities = total_capacities
             self._load = self.resource_usage_score(total_allocations, total_capacities)
@@ -463,16 +712,20 @@ class ResourceAgent(Agent):
                 agent_id=self.agent_id,
                 capacities=total_capacities,
                 capacity_allocations=total_allocations,
+                max_child_capacity=max_child_capacity,  # Set max capacity for hierarchical feasibility
                 load=self._load,
                 last_updated=current_time,
                 dtns=dtns,
-                proposed_load=proposed_load
+                proposed_load=proposed_load,
+                group=self.topology.group,
+                level=self.topology.level
             )
 
         return agent_info
 
     def on_periodic(self):
         self._restart_selection()
+        self._monitor_delegated_jobs()
         current_time = int(time.time())
         self._refresh_children(int(current_time))
 
@@ -516,6 +769,9 @@ class ResourceAgent(Agent):
           - Resource availability
           - Connectivity to required DTNs for data_in and data_out
 
+        For hierarchical agents (level > 0), feasibility is checked against
+        max_child_capacity to ensure at least one child can execute the job.
+
         :param job: The job to check.
         :type job: Job
         :param agent: The agent to check feasibility for.
@@ -523,12 +779,21 @@ class ResourceAgent(Agent):
         :return: True if job is feasible for the agent, False otherwise.
         :rtype: bool
         """
+        if self.topology.children and self.agent_id in job.delegation_failed_agents:
+            return False
+
         # Capacity check first (cheapest)
-        # Check against allocated resources only if no caching used for feasibility
-        #available = agent.capacities - agent.capacity_allocations
-        available = agent.capacities
+        # For parent agents, use max_child_capacity to ensure at least one child can handle the job
+        # For leaf agents, use their own capacities
+        if agent.max_child_capacity is not None:
+            # Parent agent: check against max capacity of any single child
+            available = agent.max_child_capacity
+        else:
+            # Leaf agent: check against own capacities
+            available = agent.capacities
+
         if not self._has_sufficient_capacity(job, available):
-            self.logger.debug(f"Agent: {self.agent_id}  does not have capacity for Job {job.job_id}")
+            self.logger.debug(f"Agent: {self.agent_id} does not have capacity for Job {job.job_id}")
             return False
 
         # DTN connectivity
@@ -778,6 +1043,17 @@ class ResourceAgent(Agent):
                 # Step 3: If this agent is assigned, start proposal
                 for job, (selected_agent, cost) in zip(pending_jobs, assignments):
                     if selected_agent and selected_agent.agent_id == self.agent_id:
+                        '''
+                        # Skip jobs that failed delegation - don't propose for them
+                        # to avoid conflicts with children who may still process them
+                        if hasattr(job, 'delegation_failed') and job.delegation_failed:
+                            self.logger.debug(
+                                f"Skipping proposal for job {job.job_id} - "
+                                f"previously failed delegation (attempt #{getattr(job, 'delegation_failed_count', 0)})"
+                            )
+                            continue
+                        '''
+
                         proposal = ProposalInfo(
                             p_id=generate_id(),
                             object_id=job.job_id,
@@ -808,10 +1084,11 @@ class ResourceAgent(Agent):
             "conflicts": self.engine.conflicts,
             "idle_time": self.metrics.idle_time,
             "load_trace": self.metrics.load,
-            "agent_failures": getattr(self.metrics, 'agent_failures', {}),
-            "reassignments": getattr(self.metrics, 'reassignments', {}),
-            "quorum_changes": getattr(self.metrics, 'quorum_changes', []),
-            "failed_agents": self.failed_agents,
+            "agent_failures": self.metrics.agent_failures,
+            "reassignments": self.metrics.reassignments,
+            "delegation_reassignments": self.metrics.delegation_reassignments,
+            "quorum_changes": self.metrics.quorum_changes,
+            "failed_agents": self.failed_agents.to_dict(),
             "failed_agents_count": len(self.failed_agents),
             "final_quorum": self.calculate_quorum(),
         }
@@ -941,6 +1218,72 @@ class ResourceAgent(Agent):
     def is_job_completed(self, job_id: str) -> bool:
         return job_id in self.completed_jobs_set
 
+    def _get_child_groups_for_job(self, job: Job) -> list[int]:
+        """
+        Identify which child groups can handle a job based on DTN requirements.
+
+        For jobs without DTN requirements, returns all child groups.
+        For jobs with DTN requirements, returns only groups whose children have all required DTNs.
+
+        :param job: The job to check
+        :return: List of child group IDs that can handle the job
+        """
+        if not self.topology.children:
+            return []
+
+        # Extract required DTNs from job
+        required_dtns = set()
+        if hasattr(job, 'data_in') and job.data_in:
+            required_dtns.update(e.name for e in job.data_in)
+        if hasattr(job, 'data_out') and job.data_out:
+            required_dtns.update(e.name for e in job.data_out)
+
+        # If no DTN requirements, all groups can handle it
+        if not required_dtns:
+            return list(self.topology.children)
+
+        # Build map of DTNs available in each child group
+        # group_id -> set of available DTN names
+        group_dtns = {}
+        for child in self.children.values():
+            # Now we can use the group field from AgentInfo
+            child_group = child.group
+            if child_group is None:
+                self.logger.warning(
+                    f"Child agent {child.agent_id} has no group information, "
+                    f"cannot determine DTN availability per group"
+                )
+                # Fallback: treat all children as one group
+                child_group = 0
+
+            if child_group not in group_dtns:
+                group_dtns[child_group] = set()
+
+            if child.dtns:
+                group_dtns[child_group].update(child.dtns.keys())
+
+        # Find groups that have all required DTNs
+        capable_groups = []
+        for group_id in self.topology.children:
+            available_dtns = group_dtns.get(group_id, set())
+            if required_dtns.issubset(available_dtns):
+                capable_groups.append(group_id)
+            else:
+                missing = required_dtns - available_dtns
+                self.logger.debug(
+                    f"Child group {group_id} cannot handle job {job.job_id}: "
+                    f"missing DTNs {missing}"
+                )
+
+        if not capable_groups:
+            self.logger.warning(
+                f"No child groups can handle job {job.job_id} with DTN requirements {required_dtns}. "
+                f"Available group DTNs: {group_dtns}. "
+                f"This should not happen - feasibility check may have passed incorrectly."
+            )
+
+        return capable_groups
+
     def scheduling_main(self):
         """
         Main job scheduling loop. If this agent has children, forward the job to them.
@@ -958,12 +1301,23 @@ class ResourceAgent(Agent):
                 for job in selected_jobs:
                     job_id = job.job_id
 
-                    # Multi-level: delegate job to children
+                    # Multi-level: delegate job to capable children only
                     if self.topology.children:
+                        # Identify which child groups can handle this job
+                        capable_groups = self._get_child_groups_for_job(job)
+
+                        if not capable_groups:
+                            # Fallback: try all groups (backward compatibility)
+                            self.logger.warning(
+                                f"Could not determine capable groups for job {job_id}, "
+                                f"delegating to all groups"
+                            )
+                            capable_groups = self.topology.children
+
                         self.queues.selected_queue.remove(job_id)
                         job.state = ObjectState.PENDING
 
-                        for child_group in self.topology.children:
+                        for child_group in capable_groups:
                             self.repository.save(
                                 obj=job.to_dict(),
                                 key_prefix=Repository.KEY_JOB,
@@ -973,6 +1327,16 @@ class ResourceAgent(Agent):
                             self.logger.info(
                                 f"Delegated job {job_id} to level {self.topology.level - 1}, "
                                 f"group {child_group}")
+
+                        # Track delegated job for monitoring
+                        self.delegated_jobs.set(job_id, {
+                            'delegated_at': time.time(),
+                            'groups': capable_groups
+                        })
+                        self.logger.debug(
+                            f"Tracking delegated job {job_id} for monitoring "
+                            f"(timeout: {self.delegation_timeout_s:.1f}s)"
+                        )
 
                     # Leaf agent: schedule job if load allows
                     else:

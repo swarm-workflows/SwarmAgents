@@ -85,6 +85,9 @@ def main():
                     help="Agent type for v2 runner")
     ap.add_argument("--agents", type=int, required=True, help="Total number of agents")
     ap.add_argument("--topology", required=True, choices=["mesh", "ring", "star", "hierarchical"])
+    ap.add_argument("--hierarchical-level1-agent-type", type=str,
+                    choices=["llm", "resource"], default="llm",
+                    help="Agent type for level 1 (parent) agents in hierarchical topology (default: llm)")
     ap.add_argument("--jobs", type=int, required=True)
     ap.add_argument("--db-host", required=True)
 
@@ -191,6 +194,8 @@ def main():
 
         if args.use_config_dir:
             cmd.append("--use-config-dir")
+        if args.topology == "hierarchical":
+            cmd += ["--hierarchical-level1-agent-type", args.hierarchical_level1_agent_type]
         if args.groups is not None:
             cmd += ["--groups", str(args.groups)]
         if args.group_size is not None:

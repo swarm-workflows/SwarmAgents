@@ -4,8 +4,10 @@ from typing import Any
 
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 import argparse
 import os
+import numpy as np
 
 import redis
 
@@ -13,7 +15,7 @@ from swarm.database.repository import Repository
 from swarm.models.job import Job, ObjectState
 from collections import defaultdict
 
-from typing import Set
+from typing import Set, Dict, List, Tuple
 
 def collect_restarted_job_ids(output_dir: str, repo: Repository | None = None) -> Set[int]:
     """
@@ -149,13 +151,14 @@ def save_jobs(jobs: list[Any], path: str):
             job.exit_status if job.exit_status is not None else 0,
             leader_id,
             reasoning_time,
+            job.assigned_at - job.submitted_at if leader_id and job.submitted_at and job.assigned_at else 0,
         ])
 
     with open(path, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow([
             'job_id', 'submitted_at', 'selection_started_at', 'assigned_at',
-            'started_at', 'completed_at', 'exit_status', 'leader_id', 'reasoning_time'
+            'started_at', 'completed_at', 'exit_status', 'leader_id', 'reasoning_time', 'scheduling_latency',
         ])
         writer.writerows(detailed_latency)
 
@@ -444,7 +447,7 @@ def plot_scheduling_latency_and_jobs(run_dir: str,
 
     label_suffix controls output filenames and plot titles (e.g., '_no_restarts').
     """
-    csv_file = f"{run_dir}/all_jobs.csv"
+    csv_file = f"{run_dir}/level0_jobs.csv"
     df = pd.read_csv(csv_file)
 
     # Compute scheduling latency
@@ -927,11 +930,615 @@ def analyze_throughput_degradation(output_dir: str, repo: Repository | None = No
     print("="*60 + "\n")
 
 
+def identify_agent_types(agents_csv: str) -> Tuple[Dict[int, str], Dict[int, int]]:
+    """
+    Identify agent types (LLM vs Resource) and hierarchy levels from agents CSV.
+
+    Returns:
+        - agent_types: {agent_id: "LLM" or "Resource"}
+        - agent_levels: {agent_id: hierarchy_level}
+    """
+    agent_types = {}
+    agent_levels = {}
+
+    if not os.path.exists(agents_csv):
+        print(f"Warning: {agents_csv} not found")
+        return agent_types, agent_levels
+
+    try:
+        with open(agents_csv, 'r') as f:
+            agents = json.load(f)
+
+        for agent in agents:
+            agent_id = agent.get("agent_id")
+            if agent_id is None:
+                continue
+
+            # Try to determine agent type from various fields
+            # Method 1: Check for 'agent_type' field (if available)
+            agent_type = agent.get("agent_type", None)
+
+            # Method 2: Check topology level (level 0 = top-level LLM, level 1+ = resource agents)
+            # For hierarchical topology, top-level agents are cluster leaders (LLM)
+            level = agent.get("level", 0)
+            agent_levels[agent_id] = level
+
+            if agent_type:
+                agent_types[agent_id] = "LLM" if "llm" in agent_type.lower() else "Resource"
+            else:
+                # Infer from level: level 0 = LLM leaders, level 1 = Resource workers
+                agent_types[agent_id] = "LLM" if level == 0 else "Resource"
+
+    except Exception as e:
+        print(f"Error reading agent types: {e}")
+
+    return agent_types, agent_levels
+
+
+def plot_hierarchical_topology(output_dir: str, repo: Repository | None = None):
+    """
+    Visualize the hierarchical topology structure showing LLM and Resource agents.
+    """
+    agents_csv = f"{output_dir}/all_agents.csv"
+    if not os.path.exists(agents_csv):
+        print(f"{agents_csv} not found - skipping topology visualization")
+        return
+
+    with open(agents_csv, 'r') as f:
+        agents = json.load(f)
+
+    agent_types, agent_levels = identify_agent_types(agents_csv)
+
+    if not agent_types:
+        print("No agent type information available")
+        return
+
+    # Organize agents by level
+    levels = defaultdict(list)
+    for agent_id, level in agent_levels.items():
+        levels[level].append(agent_id)
+
+    # Create visualization
+    fig, ax = plt.subplots(figsize=(14, 8))
+
+    max_level = max(levels.keys()) if levels else 0
+    y_positions = {}
+
+    # Plot agents level by level
+    for level in sorted(levels.keys()):
+        agents_at_level = sorted(levels[level])
+        num_agents = len(agents_at_level)
+
+        # Calculate positions
+        y = max_level - level  # Invert so top level is at top
+        x_spacing = 12.0 / max(num_agents, 1)
+        x_start = (12.0 - x_spacing * num_agents) / 2 + 1
+
+        for i, agent_id in enumerate(agents_at_level):
+            x = x_start + i * x_spacing
+            y_positions[agent_id] = (x, y)
+
+            # Color based on agent type
+            color = '#FF6B6B' if agent_types.get(agent_id) == "LLM" else '#4ECDC4'
+            marker = 's' if agent_types.get(agent_id) == "LLM" else 'o'
+
+            ax.scatter(x, y, s=500, c=color, marker=marker, edgecolors='black', linewidths=2, zorder=3)
+            ax.text(x, y, str(agent_id), ha='center', va='center', fontsize=9, fontweight='bold', zorder=4)
+
+    # Draw connections (parent-child relationships if available)
+    for agent in agents:
+        agent_id = agent.get("agent_id")
+        parent_id = agent.get("parent")
+
+        if agent_id and parent_id and agent_id in y_positions and parent_id in y_positions:
+            x1, y1 = y_positions[parent_id]
+            x2, y2 = y_positions[agent_id]
+            ax.plot([x1, x2], [y1, y2], 'k-', alpha=0.3, linewidth=1.5, zorder=1)
+
+    # Add legend
+    llm_patch = mpatches.Patch(color='#FF6B6B', label='Resource Agents (Workers)')
+    resource_patch = mpatches.Patch(color='#4ECDC4', label='LLM Agents (Top-Level)')
+    ax.legend(handles=[llm_patch, resource_patch], loc='upper right', fontsize=11)
+
+    ax.set_xlabel('Agent Distribution', fontsize=12)
+    ax.set_ylabel('Hierarchy Level', fontsize=12)
+    ax.set_title('Hierarchical Consensus Topology', fontsize=14, fontweight='bold')
+    ax.set_yticks(range(max_level + 1))
+    ax.set_yticklabels([f'Level {max_level - i}' for i in range(max_level + 1)])
+    ax.grid(axis='y', alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "hierarchical_topology.png"), dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"Saved: {os.path.join(output_dir, 'hierarchical_topology.png')}")
+
+
+def plot_latency_comparison_by_agent_type(output_dir: str):
+    """
+    Compare scheduling latency between LLM and Resource agents.
+    """
+    jobs_csv = f"{output_dir}/all_jobs.csv"
+    agents_csv = f"{output_dir}/all_agents.csv"
+
+    if not os.path.exists(jobs_csv) or not os.path.exists(agents_csv):
+        print(f"Missing required files for latency comparison")
+        return
+
+    df_jobs = pd.read_csv(jobs_csv)
+    agent_types, agent_levels = identify_agent_types(agents_csv)
+
+    if not agent_types:
+        print("No agent type information - skipping latency comparison")
+        return
+
+    # Add agent type to jobs dataframe
+    df_jobs['agent_type'] = df_jobs['leader_id'].map(agent_types)
+    df_jobs['agent_level'] = df_jobs['leader_id'].map(agent_levels)
+
+    # Calculate scheduling latency
+    df_jobs['scheduling_latency'] = df_jobs['assigned_at'] - df_jobs['submitted_at']
+
+    # Filter out invalid rows
+    df_jobs = df_jobs[df_jobs['scheduling_latency'].notna()].copy()
+
+    # Group by agent type
+    llm_jobs = df_jobs[df_jobs['agent_type'] == 'LLM']
+    resource_jobs = df_jobs[df_jobs['agent_type'] == 'Resource']
+
+    # Create comparison plots
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    # Plot 1: Box plot comparison
+    data_to_plot = [llm_jobs['scheduling_latency'].dropna(), resource_jobs['scheduling_latency'].dropna()]
+    labels = [f'LLM Agents\n(n={len(llm_jobs)})', f'Resource Agents\n(n={len(resource_jobs)})']
+
+    bp = axes[0, 0].boxplot(data_to_plot, labels=labels, patch_artist=True, showfliers=False)
+    bp['boxes'][0].set_facecolor('#FF6B6B')
+    bp['boxes'][1].set_facecolor('#4ECDC4')
+    axes[0, 0].set_ylabel('Scheduling Latency (s)', fontsize=11)
+    axes[0, 0].set_title('Latency Distribution by Agent Type', fontsize=12, fontweight='bold')
+    axes[0, 0].grid(axis='y', alpha=0.3)
+
+    # Plot 2: Histogram comparison
+    bins = np.linspace(min(df_jobs['scheduling_latency']), max(df_jobs['scheduling_latency']), 30)
+    axes[0, 1].hist(llm_jobs['scheduling_latency'], bins=bins, alpha=0.6, label='LLM Agents', color='#FF6B6B', edgecolor='black')
+    axes[0, 1].hist(resource_jobs['scheduling_latency'], bins=bins, alpha=0.6, label='Resource Agents', color='#4ECDC4', edgecolor='black')
+    axes[0, 1].set_xlabel('Scheduling Latency (s)', fontsize=11)
+    axes[0, 1].set_ylabel('Frequency', fontsize=11)
+    axes[0, 1].set_title('Latency Histogram by Agent Type', fontsize=12, fontweight='bold')
+    axes[0, 1].legend()
+    axes[0, 1].grid(axis='y', alpha=0.3)
+
+    # Plot 3: Mean latency by agent
+    mean_latency_by_agent = df_jobs.groupby(['leader_id', 'agent_type'])['scheduling_latency'].mean().reset_index()
+    llm_agents = mean_latency_by_agent[mean_latency_by_agent['agent_type'] == 'LLM']
+    resource_agents = mean_latency_by_agent[mean_latency_by_agent['agent_type'] == 'Resource']
+
+    if len(llm_agents) > 0:
+        axes[1, 0].bar(llm_agents['leader_id'], llm_agents['scheduling_latency'],
+                      color='#FF6B6B', label='LLM Agents', alpha=0.8, edgecolor='black')
+    if len(resource_agents) > 0:
+        axes[1, 0].bar(resource_agents['leader_id'], resource_agents['scheduling_latency'],
+                      color='#4ECDC4', label='Resource Agents', alpha=0.8, edgecolor='black')
+
+    axes[1, 0].set_xlabel('Agent ID', fontsize=11)
+    axes[1, 0].set_ylabel('Mean Scheduling Latency (s)', fontsize=11)
+    axes[1, 0].set_title('Mean Latency per Agent', fontsize=12, fontweight='bold')
+    axes[1, 0].legend()
+    axes[1, 0].grid(axis='y', alpha=0.3)
+
+    # Plot 4: Statistics table
+    stats_data = []
+
+    if len(llm_jobs) > 0:
+        stats_data.append([
+            'LLM Agents',
+            f"{llm_jobs['scheduling_latency'].mean():.4f}",
+            f"{llm_jobs['scheduling_latency'].median():.4f}",
+            f"{llm_jobs['scheduling_latency'].std():.4f}",
+            f"{llm_jobs['scheduling_latency'].min():.4f}",
+            f"{llm_jobs['scheduling_latency'].max():.4f}"
+        ])
+
+    if len(resource_jobs) > 0:
+        stats_data.append([
+            'Resource Agents',
+            f"{resource_jobs['scheduling_latency'].mean():.4f}",
+            f"{resource_jobs['scheduling_latency'].median():.4f}",
+            f"{resource_jobs['scheduling_latency'].std():.4f}",
+            f"{resource_jobs['scheduling_latency'].min():.4f}",
+            f"{resource_jobs['scheduling_latency'].max():.4f}"
+        ])
+
+    axes[1, 1].axis('tight')
+    axes[1, 1].axis('off')
+    table = axes[1, 1].table(cellText=stats_data,
+                            colLabels=['Agent Type', 'Mean (s)', 'Median (s)', 'Std Dev (s)', 'Min (s)', 'Max (s)'],
+                            cellLoc='center',
+                            loc='center')
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    table.scale(1, 2)
+
+    # Color header
+    for i in range(6):
+        table[(0, i)].set_facecolor('#E0E0E0')
+        table[(0, i)].set_text_props(weight='bold')
+
+    # Color rows
+    if len(stats_data) > 0:
+        for i in range(6):
+            table[(1, i)].set_facecolor('#FFE5E5')
+    if len(stats_data) > 1:
+        for i in range(6):
+            table[(2, i)].set_facecolor('#E5F9F8')
+
+    axes[1, 1].set_title('Latency Statistics', fontsize=12, fontweight='bold')
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "latency_comparison_by_agent_type.png"), dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"Saved: {os.path.join(output_dir, 'latency_comparison_by_agent_type.png')}")
+
+    # Save stats to CSV
+    if stats_data:
+        stats_df = pd.DataFrame(stats_data, columns=['Agent Type', 'Mean (s)', 'Median (s)', 'Std Dev (s)', 'Min (s)', 'Max (s)'])
+        stats_df.to_csv(os.path.join(output_dir, "latency_stats_by_agent_type.csv"), index=False)
+
+
+def plot_reasoning_time_overhead(output_dir: str):
+    """
+    Analyze and visualize LLM reasoning time overhead vs heuristic-based decision making.
+    """
+    jobs_csv = f"{output_dir}/all_jobs.csv"
+    agents_csv = f"{output_dir}/all_agents.csv"
+
+    if not os.path.exists(jobs_csv):
+        print(f"{jobs_csv} not found - skipping reasoning time analysis")
+        return
+
+    df_jobs = pd.read_csv(jobs_csv)
+
+    # Check if reasoning_time column exists
+    if 'reasoning_time' not in df_jobs.columns:
+        print("No reasoning_time data available - skipping analysis")
+        return
+
+    agent_types, _ = identify_agent_types(agents_csv)
+    df_jobs['agent_type'] = df_jobs['leader_id'].map(agent_types)
+    df_jobs['scheduling_latency'] = df_jobs['assigned_at'] - df_jobs['submitted_at']
+
+    # Filter for valid data
+    df_jobs = df_jobs[df_jobs['reasoning_time'].notna() & (df_jobs['reasoning_time'] > 0)].copy()
+
+    if df_jobs.empty:
+        print("No reasoning time data available")
+        return
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    # Plot 1: Reasoning time distribution by agent type
+    llm_jobs = df_jobs[df_jobs['agent_type'] == 'LLM']
+    resource_jobs = df_jobs[df_jobs['agent_type'] == 'Resource']
+
+    if not llm_jobs.empty:
+        axes[0, 0].hist(llm_jobs['reasoning_time'], bins=30, alpha=0.7, color='#FF6B6B',
+                       edgecolor='black', label=f'LLM (n={len(llm_jobs)})')
+    if not resource_jobs.empty:
+        axes[0, 0].hist(resource_jobs['reasoning_time'], bins=30, alpha=0.7, color='#4ECDC4',
+                       edgecolor='black', label=f'Resource (n={len(resource_jobs)})')
+
+    axes[0, 0].set_xlabel('Reasoning Time (s)', fontsize=11)
+    axes[0, 0].set_ylabel('Frequency', fontsize=11)
+    axes[0, 0].set_title('Decision Time Distribution', fontsize=12, fontweight='bold')
+    axes[0, 0].legend()
+    axes[0, 0].grid(axis='y', alpha=0.3)
+
+    # Plot 2: Reasoning time vs scheduling latency scatter
+    if not llm_jobs.empty:
+        axes[0, 1].scatter(llm_jobs['reasoning_time'], llm_jobs['scheduling_latency'],
+                          alpha=0.6, s=20, c='#FF6B6B', label='LLM Agents')
+    if not resource_jobs.empty:
+        axes[0, 1].scatter(resource_jobs['reasoning_time'], resource_jobs['scheduling_latency'],
+                          alpha=0.6, s=20, c='#4ECDC4', label='Resource Agents')
+
+    axes[0, 1].set_xlabel('Reasoning Time (s)', fontsize=11)
+    axes[0, 1].set_ylabel('Scheduling Latency (s)', fontsize=11)
+    axes[0, 1].set_title('Reasoning Time vs Total Latency', fontsize=12, fontweight='bold')
+    axes[0, 1].legend()
+    axes[0, 1].grid(True, alpha=0.3)
+
+    # Plot 3: Mean reasoning time per agent
+    mean_reasoning = df_jobs.groupby(['leader_id', 'agent_type'])['reasoning_time'].mean().reset_index()
+    llm_mean = mean_reasoning[mean_reasoning['agent_type'] == 'LLM']
+    resource_mean = mean_reasoning[mean_reasoning['agent_type'] == 'Resource']
+
+    if not llm_mean.empty:
+        axes[1, 0].bar(llm_mean['leader_id'], llm_mean['reasoning_time'],
+                      color='#FF6B6B', label='LLM Agents', alpha=0.8, edgecolor='black')
+    if not resource_mean.empty:
+        axes[1, 0].bar(resource_mean['leader_id'], resource_mean['reasoning_time'],
+                      color='#4ECDC4', label='Resource Agents', alpha=0.8, edgecolor='black')
+
+    axes[1, 0].set_xlabel('Agent ID', fontsize=11)
+    axes[1, 0].set_ylabel('Mean Reasoning Time (s)', fontsize=11)
+    axes[1, 0].set_title('Mean Decision Time per Agent', fontsize=12, fontweight='bold')
+    axes[1, 0].legend()
+    axes[1, 0].grid(axis='y', alpha=0.3)
+
+    # Plot 4: Overhead percentage
+    df_jobs['overhead_pct'] = (df_jobs['reasoning_time'] / df_jobs['scheduling_latency']) * 100
+    df_jobs['overhead_pct'] = df_jobs['overhead_pct'].clip(0, 100)  # Cap at 100%
+
+    overhead_by_type = df_jobs.groupby('agent_type')['overhead_pct'].agg(['mean', 'median', 'std']).reset_index()
+
+    if not overhead_by_type.empty:
+        x_pos = np.arange(len(overhead_by_type))
+        axes[1, 1].bar(x_pos, overhead_by_type['mean'],
+                      color=['#FF6B6B' if t == 'LLM' else '#4ECDC4' for t in overhead_by_type['agent_type']],
+                      alpha=0.8, edgecolor='black')
+        axes[1, 1].errorbar(x_pos, overhead_by_type['mean'], yerr=overhead_by_type['std'],
+                           fmt='none', ecolor='black', capsize=5)
+        axes[1, 1].set_xticks(x_pos)
+        axes[1, 1].set_xticklabels(overhead_by_type['agent_type'])
+        axes[1, 1].set_ylabel('Reasoning Overhead (%)', fontsize=11)
+        axes[1, 1].set_title('Mean Reasoning Overhead (% of Total Latency)', fontsize=12, fontweight='bold')
+        axes[1, 1].grid(axis='y', alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "reasoning_time_overhead.png"), dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"Saved: {os.path.join(output_dir, 'reasoning_time_overhead.png')}")
+
+
+def plot_job_distribution_by_hierarchy(output_dir: str):
+    """
+    Show job distribution across hierarchy levels.
+    """
+    jobs_csv = f"{output_dir}/all_jobs.csv"
+    agents_csv = f"{output_dir}/all_agents.csv"
+
+    if not os.path.exists(jobs_csv) or not os.path.exists(agents_csv):
+        print(f"Missing required files for job distribution")
+        return
+
+    df_jobs = pd.read_csv(jobs_csv)
+    agent_types, agent_levels = identify_agent_types(agents_csv)
+
+    df_jobs['agent_type'] = df_jobs['leader_id'].map(agent_types)
+    df_jobs['agent_level'] = df_jobs['leader_id'].map(agent_levels)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    # Plot 1: Jobs by agent type
+    jobs_by_type = df_jobs.groupby('agent_type').size()
+    colors = ['#FF6B6B' if t == 'LLM' else '#4ECDC4' for t in jobs_by_type.index]
+
+    axes[0].bar(jobs_by_type.index, jobs_by_type.values, color=colors, alpha=0.8, edgecolor='black')
+    axes[0].set_ylabel('Number of Jobs', fontsize=11)
+    axes[0].set_title('Job Distribution by Agent Type', fontsize=12, fontweight='bold')
+    axes[0].grid(axis='y', alpha=0.3)
+
+    # Add value labels on bars
+    for i, (idx, val) in enumerate(jobs_by_type.items()):
+        axes[0].text(i, val + max(jobs_by_type.values) * 0.02, str(val),
+                    ha='center', va='bottom', fontweight='bold')
+
+    # Plot 2: Jobs by hierarchy level
+    jobs_by_level = df_jobs.groupby('agent_level').size().sort_index()
+
+    axes[1].bar(jobs_by_level.index, jobs_by_level.values,
+               color=['#FF6B6B' if l == 0 else '#4ECDC4' for l in jobs_by_level.index],
+               alpha=0.8, edgecolor='black')
+    axes[1].set_xlabel('Hierarchy Level', fontsize=11)
+    axes[1].set_ylabel('Number of Jobs', fontsize=11)
+    axes[1].set_title('Job Distribution by Hierarchy Level', fontsize=12, fontweight='bold')
+    axes[1].set_xticks(jobs_by_level.index)
+    axes[1].grid(axis='y', alpha=0.3)
+
+    # Add value labels
+    for idx, val in jobs_by_level.items():
+        axes[1].text(idx, val + max(jobs_by_level.values) * 0.02, str(val),
+                    ha='center', va='bottom', fontweight='bold')
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "job_distribution_by_hierarchy.png"), dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"Saved: {os.path.join(output_dir, 'job_distribution_by_hierarchy.png')}")
+
+
+def plot_latency_comparison_by_hierarchy_level(output_dir: str):
+    """
+    Compare scheduling latency between hierarchy level 0 and level 1 jobs.
+    Uses level-specific job entries from Redis (level0_jobs.csv and level1_jobs.csv).
+    """
+    level0_csv = f"{output_dir}/level0_jobs.csv"
+    level1_csv = f"{output_dir}/level1_jobs.csv"
+
+    if not os.path.exists(level0_csv) or not os.path.exists(level1_csv):
+        print(f"Level-specific job files not found - skipping hierarchy level latency comparison")
+        return
+
+    df_level0 = pd.read_csv(level0_csv)
+    df_level1 = pd.read_csv(level1_csv)
+
+    # Calculate scheduling latency for each level
+    #df_level1['scheduling_latency'] = df_level1['assigned_at'] - df_level1['submitted_at']
+    #df_level0['scheduling_latency'] = df_level0['assigned_at'] - df_level0['submitted_at']
+
+    # Filter out invalid rows
+    df_level0 = df_level0[df_level0['scheduling_latency'].notna()].copy()
+    df_level1 = df_level1[df_level1['scheduling_latency'].notna()].copy()
+
+    if df_level0.empty and df_level1.empty:
+        print("No valid latency data for hierarchy level comparison")
+        return
+
+    # Match jobs by job_id and calculate latency difference (level0 - level1)
+    merged = pd.merge(df_level0[['job_id', 'scheduling_latency']],
+                      df_level1[['job_id', 'scheduling_latency']],
+                      on='job_id',
+                      suffixes=('_level0', '_level1'))
+    merged['latency_diff'] = merged['scheduling_latency_level0'] - merged['scheduling_latency_level1']
+
+    # Create comparison plots
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    # Plot 1: Box plot comparison
+    data_to_plot = []
+    labels = []
+    if not df_level0.empty:
+        data_to_plot.append(df_level0['scheduling_latency'].dropna())
+        labels.append(f'Level 0\n(n={len(df_level0)})')
+    if not df_level1.empty:
+        data_to_plot.append(df_level1['scheduling_latency'].dropna())
+        labels.append(f'Level 1\n(n={len(df_level1)})')
+
+    bp = axes[0, 0].boxplot(data_to_plot, labels=labels, patch_artist=True, showfliers=False)
+    colors = ['#FF6B6B', '#4ECDC4']
+    for patch, color in zip(bp['boxes'], colors[:len(bp['boxes'])]):
+        patch.set_facecolor(color)
+    axes[0, 0].set_ylabel('Scheduling Latency (s)', fontsize=11)
+    axes[0, 0].set_title('Latency Distribution by Hierarchy Level', fontsize=12, fontweight='bold')
+    axes[0, 0].grid(axis='y', alpha=0.3)
+
+    # Plot 2: Histogram comparison
+    all_latencies = []
+    if not df_level0.empty:
+        all_latencies.extend(df_level0['scheduling_latency'].tolist())
+    if not df_level1.empty:
+        all_latencies.extend(df_level1['scheduling_latency'].tolist())
+
+    bins = np.linspace(min(all_latencies), max(all_latencies), 30)
+    if not df_level0.empty:
+        axes[0, 1].hist(df_level0['scheduling_latency'], bins=bins, alpha=0.6,
+                       label='Level 0 Jobs', color='#FF6B6B', edgecolor='black')
+    if not df_level1.empty:
+        axes[0, 1].hist(df_level1['scheduling_latency'], bins=bins, alpha=0.6,
+                       label='Level 1 Jobs', color='#4ECDC4', edgecolor='black')
+    axes[0, 1].set_xlabel('Scheduling Latency (s)', fontsize=11)
+    axes[0, 1].set_ylabel('Frequency', fontsize=11)
+    axes[0, 1].set_title('Latency Histogram by Hierarchy Level', fontsize=12, fontweight='bold')
+    axes[0, 1].legend()
+    axes[0, 1].grid(axis='y', alpha=0.3)
+
+    # Plot 3: Latency difference (Level 0 - Level 1)
+    if not merged.empty:
+        # Scatter plot of latency difference
+        axes[1, 0].scatter(merged['job_id'], merged['latency_diff'],
+                          alpha=0.6, s=20, c='#9B59B6', label='Level 0 - Level 1')
+        # Add a horizontal line at y=0 for reference
+        axes[1, 0].axhline(y=0, color='black', linestyle='--', linewidth=1, alpha=0.5)
+        axes[1, 0].set_xlabel('Job ID', fontsize=11)
+        axes[1, 0].set_ylabel('Latency Difference (s)\n(Level 0 - Level 1)', fontsize=11)
+        axes[1, 0].set_title('Scheduling Latency Difference per Job', fontsize=12, fontweight='bold')
+        axes[1, 0].legend()
+        axes[1, 0].grid(True, alpha=0.3)
+
+        # Add mean difference annotation
+        mean_diff = merged['latency_diff'].mean()
+        axes[1, 0].text(0.02, 0.98, f'Mean Diff: {mean_diff:.4f}s',
+                       transform=axes[1, 0].transAxes,
+                       verticalalignment='top',
+                       bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    else:
+        axes[1, 0].text(0.5, 0.5, 'No matching jobs between levels',
+                       ha='center', va='center', transform=axes[1, 0].transAxes)
+        axes[1, 0].set_xlabel('Job ID', fontsize=11)
+        axes[1, 0].set_ylabel('Latency Difference (s)', fontsize=11)
+        axes[1, 0].set_title('Scheduling Latency Difference per Job', fontsize=12, fontweight='bold')
+
+    # Plot 4: Statistics table
+    stats_data = []
+
+    if not df_level0.empty:
+        stats_data.append([
+            'Level 0',
+            f"{df_level0['scheduling_latency'].mean():.4f}",
+            f"{df_level0['scheduling_latency'].median():.4f}",
+            f"{df_level0['scheduling_latency'].std():.4f}",
+            f"{df_level0['scheduling_latency'].min():.4f}",
+            f"{df_level0['scheduling_latency'].max():.4f}",
+            f"{len(df_level0)}"
+        ])
+
+    if not df_level1.empty:
+        stats_data.append([
+            'Level 1',
+            f"{df_level1['scheduling_latency'].mean():.4f}",
+            f"{df_level1['scheduling_latency'].median():.4f}",
+            f"{df_level1['scheduling_latency'].std():.4f}",
+            f"{df_level1['scheduling_latency'].min():.4f}",
+            f"{df_level1['scheduling_latency'].max():.4f}",
+            f"{len(df_level1)}"
+        ])
+
+    # Add latency difference statistics if available
+    if not merged.empty:
+        stats_data.append([
+            'Difference (L0-L1)',
+            f"{merged['latency_diff'].mean():.4f}",
+            f"{merged['latency_diff'].median():.4f}",
+            f"{merged['latency_diff'].std():.4f}",
+            f"{merged['latency_diff'].min():.4f}",
+            f"{merged['latency_diff'].max():.4f}",
+            f"{len(merged)}"
+        ])
+
+    axes[1, 1].axis('tight')
+    axes[1, 1].axis('off')
+    table = axes[1, 1].table(cellText=stats_data,
+                            colLabels=['Level', 'Mean (s)', 'Median (s)', 'Std Dev (s)', 'Min (s)', 'Max (s)', 'Count'],
+                            cellLoc='center',
+                            loc='center')
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    table.scale(1, 2)
+
+    # Color header
+    for i in range(7):
+        table[(0, i)].set_facecolor('#E0E0E0')
+        table[(0, i)].set_text_props(weight='bold')
+
+    # Color rows
+    if len(stats_data) > 0:
+        for i in range(7):
+            table[(1, i)].set_facecolor('#FFE5E5')  # Level 0 - light red
+    if len(stats_data) > 1:
+        for i in range(7):
+            table[(2, i)].set_facecolor('#E5F9F8')  # Level 1 - light cyan
+    if len(stats_data) > 2:
+        for i in range(7):
+            table[(3, i)].set_facecolor('#E8D4F0')  # Difference - light purple
+
+    axes[1, 1].set_title('Latency Statistics by Level', fontsize=12, fontweight='bold')
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "latency_comparison_by_hierarchy_level.png"), dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"Saved: {os.path.join(output_dir, 'latency_comparison_by_hierarchy_level.png')}")
+
+    # Save stats to CSV
+    if stats_data:
+        stats_df = pd.DataFrame(stats_data, columns=['Level', 'Mean (s)', 'Median (s)', 'Std Dev (s)', 'Min (s)', 'Max (s)', 'Count'])
+        stats_df.to_csv(os.path.join(output_dir, "latency_stats_by_hierarchy_level.csv"), index=False)
+        print(f"Saved: {os.path.join(output_dir, 'latency_stats_by_hierarchy_level.csv')}")
+
+    # Save detailed latency difference data to CSV
+    if not merged.empty:
+        merged[['job_id', 'scheduling_latency_level0', 'scheduling_latency_level1', 'latency_diff']].to_csv(
+            os.path.join(output_dir, "latency_difference_per_job.csv"),
+            index=False
+        )
+        print(f"Saved: {os.path.join(output_dir, 'latency_difference_per_job.csv')}")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Plot scheduling latency, jobs per agent, conflicts/restarts, and loads")
     parser.add_argument("--output_dir", type=str, default=".", help="Directory where plots and CSV files are saved")
     parser.add_argument("--agents", type=int, required=True, help="Number of agents")
     parser.add_argument("--db_host", type=str, required=True, help="Database Host")
+    parser.add_argument("--hierarchical", action="store_true", help="Generate hierarchical topology-specific plots")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -943,28 +1550,35 @@ if __name__ == "__main__":
     )
     repo = Repository(redis_client=redis_client)
 
-    jobs_csv_file = f"{args.output_dir}/all_jobs.csv"
     agents_csv_file = f"{args.output_dir}/all_agents.csv"
-    all_jobs = repo.get_all_objects(key_prefix=Repository.KEY_JOB, level=0)
+
+    # For hierarchical topologies, fetch jobs from both level 0 and level 1
+    if args.hierarchical:
+        level0_jobs = repo.get_all_objects(key_prefix=Repository.KEY_JOB, level=0)
+        level1_jobs = repo.get_all_objects(key_prefix=Repository.KEY_JOB, level=1)
+
+        # Tag jobs with their hierarchy level for analysis
+        for job in level0_jobs:
+            job['hierarchy_level'] = 0
+        for job in level1_jobs:
+            job['hierarchy_level'] = 1
+
+        # Combine all jobs
+        all_jobs = level0_jobs + level1_jobs
+
+        # Save level-specific CSVs for detailed analysis
+        save_jobs(jobs=level0_jobs, path=f"{args.output_dir}/level0_jobs.csv")
+        save_jobs(jobs=level1_jobs, path=f"{args.output_dir}/level1_jobs.csv")
+    else:
+        # For non-hierarchical topologies, fetch from level 0 only
+        all_jobs = repo.get_all_objects(key_prefix=Repository.KEY_JOB, level=0)
+        save_jobs(jobs=all_jobs, path=f"{args.output_dir}/level0_jobs.csv")
+
     all_agents = repo.get_all_objects(key_prefix=Repository.KEY_AGENT, level=None)
-    save_jobs(jobs=all_jobs, path=jobs_csv_file)
     save_agents(agents=all_agents, path=agents_csv_file)
 
     # Gather restarted jobs once
     restarted_job_ids = collect_restarted_job_ids(args.output_dir, repo)
-
-    # Scheduling latency & jobs (ALL jobs)
-    plot_scheduling_latency_and_jobs(args.output_dir, args.agents)
-    plot_reasoning_time(args.output_dir)
-
-    # Scheduling latency & jobs (EXCLUDING restarted jobs)
-    if restarted_job_ids:
-        plot_scheduling_latency_and_jobs(
-            args.output_dir,
-            args.agents,
-            exclude_job_ids=restarted_job_ids,
-            label_suffix="_no_restarts"
-        )
 
     # Conflicts/Restarts prefer Redis; fallback to files
     plot_conflicts_and_restarts(args.output_dir, repo)
@@ -978,4 +1592,29 @@ if __name__ == "__main__":
 
     # NEW: Throughput degradation analysis (visualization #2)
     analyze_throughput_degradation(args.output_dir, repo, window_size=10, baseline_duration=30)
+
+    # Hierarchical topology-specific plots
+    if args.hierarchical:
+        print("\n" + "="*60)
+        print("HIERARCHICAL TOPOLOGY ANALYSIS")
+        print("="*60)
+        plot_hierarchical_topology(args.output_dir, repo)
+        plot_latency_comparison_by_hierarchy_level(args.output_dir)  # Compare level 0 vs level 1 latency
+        #plot_latency_comparison_by_agent_type(args.output_dir)
+        #plot_reasoning_time_overhead(args.output_dir)
+        #plot_job_distribution_by_hierarchy(args.output_dir)
+        print("="*60 + "\n")
+    else:
+        # Scheduling latency & jobs (ALL jobs)
+        plot_scheduling_latency_and_jobs(args.output_dir, args.agents)
+        plot_reasoning_time(args.output_dir)
+
+        # Scheduling latency & jobs (EXCLUDING restarted jobs)
+        if restarted_job_ids:
+            plot_scheduling_latency_and_jobs(
+                args.output_dir,
+                args.agents,
+                exclude_job_ids=restarted_job_ids,
+                label_suffix="_no_restarts"
+            )
 

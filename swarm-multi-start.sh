@@ -87,18 +87,27 @@ cfg_glob="configs/${cfg_prefix}*.yml"
 
 # Generate configs unless user asked to use existing
 if [[ "$use_config_dir" == false ]]; then
+    echo "Generating configs"
     rm -rf configs jobs
     mkdir -p configs
 
     # build args for generate_configs.py
-    gen_args=(
-      "$num_agents" "$jobs_per_proposal" "$template_cfg" configs
-      "$topology" "$database" "$job_cnt" --dtns
-    )
+    if [[ "$topology" == "hierarchical" ]]; then
+      gen_args=(
+        "$num_agents" "$jobs_per_proposal" "$template_cfg" configs
+        "$topology" "$database" "$job_cnt"
+      )
+    else
+       gen_args=(
+        "$num_agents" "$jobs_per_proposal" "$template_cfg" configs
+        "$topology" "$database" "$job_cnt" --dtns
+      )
+    fi
     # propagate grouping flags if set
     [[ -n "$groups" ]] && gen_args+=(--groups "$groups")
     [[ -n "$group_size" ]] && gen_args+=(--group-size "$group_size")
 
+    echo "${gen_args[@]}"
     python3.11 generate_configs.py "${gen_args[@]}"
 
     cleanup_cmd=(python3.11 cleanup.py --agents "$num_agents")
@@ -110,8 +119,7 @@ rm -rf swarm-multi
 mkdir -p swarm-multi
 
 # Always define arrays to keep set -u happy
-declare -a agent_flag debug_flag
-agent_flag=(--agent-type "$agent_type")
+declare -a debug_flag
 debug_flag=()
 [[ "$debug" == true ]] && debug_flag=(--debug)
 
@@ -124,9 +132,16 @@ if [[ "$use_config_dir" == true ]]; then
     fi
     for config_file in "${config_files[@]}"; do
         agent_index="$(basename "$config_file" | sed -E "s/${cfg_prefix}([0-9]+)\.yml/\1/")"
-        python3.11 main.py "$agent_index" "${agent_flag[@]}" "${debug_flag[@]+"${debug_flag[@]}"}" &
+
+        # Extract agent_type from config file (default to resource if not specified)
+        agent_type_from_config=$(python3.11 -c "import yaml; c=yaml.safe_load(open('$config_file')); print(c.get('agent_type', 'resource'))" 2>/dev/null || echo "resource")
+
+        python3.11 main.py "$agent_index" --agent-type "$agent_type_from_config" "${debug_flag[@]+"${debug_flag[@]}"}" &
     done
 else
+    # When not using config dir, use the global agent_type parameter
+    declare -a agent_flag
+    agent_flag=(--agent-type "$agent_type")
     for i in $(seq 0 $((num_agents - 1))); do
         agent_index=$((base_index + i + 1))
         python3.11 main.py "$agent_index" "${agent_flag[@]}" "${debug_flag[@]+"${debug_flag[@]}"}" &

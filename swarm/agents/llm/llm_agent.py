@@ -116,15 +116,27 @@ class LlmAgent(ResourceAgent):
         """Return a *lower-is-better* cost for SelectionEngine.
 
         If LLM bidder is available, get a score in [0,100] and convert to cost: 100 - score.
+        Now includes peer context to enable load-aware scoring decisions.
         On any error, fall back to the analytic model.
         """
         try:
             payload_job = job.to_dict()
             payload_agent = agent.to_dict() if hasattr(agent, "to_dict") else json.loads(agent.to_json())
-            bid = self.bidder.score(job=payload_job, agent_state=payload_agent)
+
+            # Gather peer context for load-aware scoring
+            peer_context = self._get_peer_context()
+
+            # Pass peer context to LLM bidder
+            bid = self.bidder.score(
+                job=payload_job,
+                agent_state=payload_agent,
+                peer_context=peer_context
+            )
+
             job.reasoning_time = bid.reasoning_time
             score = float(bid.score)
-            self.logger.debug("LLM bidder score=%s bid=%s", score, bid)
+            self.logger.debug("LLM bidder score=%s bid=%s peer_ctx=%s", score, bid, peer_context)
+
             # audit trail (best-effort)
             try:
                 self.repository.save({
@@ -134,6 +146,7 @@ class LlmAgent(ResourceAgent):
                     "explanation": bid.explanation,
                     "ts": time.time(),
                     "reasoning_time": bid.reasoning_time,
+                    #"peer_context": peer_context,  # Save peer context for analysis
                 },
                     key=f"llm_score:A-{self.agent_id}:{Repository.KEY_JOB}:{job.job_id}",
                     level=self.topology.level, group=self.topology.group)
@@ -142,6 +155,7 @@ class LlmAgent(ResourceAgent):
             return 100.0 - max(0.0, min(100.0, score))
         except Exception as e:
             self.logger.exception("LLM scoring failed, using analytic cost: %s", e)
+            return self._cost_job_on_agent(job, agent)
 
     # ------------------------------------------------------------------------------------------
     # Optional: expose a utility to score a job for this agent explicitly
@@ -154,6 +168,53 @@ class LlmAgent(ResourceAgent):
         cost = self._llm_or_analytic_cost(job=job, agent=agent_info)
         return {"agent_id": self.agent_id, "cost": cost}
 
+    def _get_peer_context(self) -> Dict[str, Any]:
+        """Gather peer information for LLM context to enable load-aware scoring.
+
+        Returns a dictionary with:
+        - total_agents: Number of configured agents in the system
+        - peer_agents: Dictionary mapping peer_id -> peer_agent
+        - conflicts: Number of recent conflicts for this agent
+        - topology: Network topology type (mesh, ring, etc.)
+        """
+        try:
+            peer_agents = {}
+            for peer_id, peer_agent in self.neighbor_map.items():
+                if peer_id != self.agent_id and peer_agent:
+
+                    peer_agents[peer_id] = peer_agent.to_dict()
+
+            # Get recent conflicts for this agent
+            conflicts = 0
+            if hasattr(self, 'metrics') and hasattr(self.metrics, 'conflicts'):
+                conflicts = sum(self.metrics.conflicts.values())
+
+            # Get topology type
+            topology_type = 'unknown'
+            if hasattr(self, 'topology') and self.topology:
+                topology_type = str(self.topology.type.value) if hasattr(self.topology.type, 'value') else str(self.topology.type)
+
+            child_agents = {}
+            for c in self.children:
+                child_agents[c.agent_id] = c.to_dict()
+
+            return {
+                'total_agents': self.configured_agent_count if hasattr(self, 'configured_agent_count') else len(self.neighbor_map),
+                'peer_agents': peer_agents,
+                'conflicts': conflicts,
+                'topology': topology_type,
+                'child_agents': child_agents,
+            }
+        except Exception as e:
+            self.logger.warning(f"Failed to gather peer context: {e}")
+            # Return minimal context on error
+            return {
+                'total_agents': 0,
+                'peer_agents': {},
+                'conflicts': 0,
+                'topology': 'unknown',
+                'child_agents': {},
+            }
 
     def selection_main(self):
         self.logger.info(f"Starting agent: {self}")
@@ -183,10 +244,13 @@ class LlmAgent(ResourceAgent):
                 '''
 
                 # Build once
+                start = time.perf_counter()
                 cost_matrix = self.selector.compute_cost_matrix(
                     assignees=agents,
                     candidates=pending_jobs,
                 )
+                cost_computation = time.perf_counter() - start
+                self.logger.info(f"Time for computing cost matrix: {cost_computation}")
 
                 cost_matrix_with_penalities = apply_multiplicative_penalty(cost_matrix=cost_matrix,
                                                                            assignees=agents,

@@ -68,9 +68,39 @@ class Job(Object):
         self._completed_at: Optional[float] = None
         self._wall_time: Optional[float] = None
         self._reasoning_time: Optional[float] = None
+        self._delegation_failed = False
+        self._delegation_failed_count: int = 0
+        self._delegation_failed_agents: List[int] = []
 
         # Meta
         self.logger = logger if logger else logging.getLogger(self.__class__.__name__)
+
+    @property
+    def delegation_failed(self) -> bool:
+        return self._delegation_failed
+
+    @delegation_failed.setter
+    def delegation_failed(self, value: bool):
+        self._delegation_failed = value
+
+    @property
+    def delegation_failed_count(self) -> int:
+        return self._delegation_failed_count
+
+    @delegation_failed_count.setter
+    def delegation_failed_count(self, value: int):
+        self._delegation_failed_count = value
+
+    @property
+    def delegation_failed_agents(self) -> List[int]:
+        return self._delegation_failed_agents
+
+    @delegation_failed_agents.setter
+    def delegation_failed_agents(self, value: List[int]):
+        self._delegation_failed_agents = value
+
+    def add_delegation_failed_agents(self, value: int):
+        self._delegation_failed_agents.append(value)
 
     # ---------- Convenience/derived ----------
     @property
@@ -285,14 +315,14 @@ class Job(Object):
         fields: Dict[str, Any] = {
             "job_id": self.job_id or "NONE",
             "state": getattr(self.state, "name", str(self.state)),
-            "submitted_at": self._submitted_at,
-            "selection_started_at": self._selection_started_at,
-            "assigned_at": self._assigned_at,
-            "started_at": self._started_at,
-            "completed_at": self._completed_at,
-            "wall_time": self._wall_time,
+            "submitted_at": self.submitted_at,
+            "selection_started_at": self.selection_started_at,
+            "assigned_at": self.assigned_at,
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
+            "wall_time": self.wall_time,
             "exit_status": self.exit_status,
-            "leader_id": self._leader_id,
+            "leader_id": self.leader_id,
             "job_type": self.job_type,
         }
         return f"Job({fields})"
@@ -304,11 +334,11 @@ class Job(Object):
         with self.lock:
             return {
                 "id": self.job_id,
-                "capacities": self._capacities.to_dict() if self._capacities else None,
+                "capacities": self.capacities.to_dict() if self.capacities else None,
                 "capacity_allocations": (
-                    self._capacity_allocations.to_dict() if self._capacity_allocations else None
+                    self.capacity_allocations.to_dict() if self.capacity_allocations else None
                 ),
-                "wall_time": self._wall_time,
+                "wall_time": self.wall_time,
                 "data_in": [dn.to_dict() for dn in self.data_in],
                 "data_out": [dn.to_dict() for dn in self.data_out],
                 "state": self.state.value,
@@ -316,30 +346,33 @@ class Job(Object):
                 "transfer_in_time": self.transfer_in_time,
                 "transfer_out_time": self.transfer_out_time,
                 # canonical keys:
-                "submitted_at": self._submitted_at,
-                "selection_started_at": self._selection_started_at,
-                "assigned_at": self._assigned_at,
-                "started_at": self._started_at,
-                "completed_at": self._completed_at,
-                "leader_id": self._leader_id,
-                "last_transition_at": getattr(self, "last_transition_at", None),
+                "submitted_at": self.submitted_at,
+                "selection_started_at": self.selection_started_at,
+                "assigned_at": self.assigned_at,
+                "started_at": self.started_at,
+                "completed_at": self.completed_at,
+                "leader_id": self.leader_id,
+                "last_transition_at": self.last_transition_at,
                 "job_type": self.job_type,
-                "reasoning_time": self._reasoning_time,
+                "reasoning_time": self.reasoning_time,
+                "delegation_failed_agents": self.delegation_failed_agents,
+                "delegation_failed": self.delegation_failed,
+                "delegation_failed_count": self.delegation_failed_count,
             }
 
     def from_dict(self, job_data: dict):
         with self.lock:
             self.job_id = job_data["id"]
 
-            self._capacities = (
+            self.capacities = (
                 Capacities.from_dict(job_data["capacities"]) if job_data.get("capacities") else None
             )
-            self._capacity_allocations = (
+            self.capacity_allocations = (
                 Capacities.from_dict(job_data["capacity_allocations"])
                 if job_data.get("capacity_allocations")
                 else None
             )
-            self._wall_time = job_data.get("wall_time")
+            self.wall_time = job_data.get("wall_time")
 
             self.data_in = [DataNode.from_dict(d) for d in job_data.get("data_in", [])]
             self.data_out = [DataNode.from_dict(d) for d in job_data.get("data_out", [])]
@@ -350,7 +383,7 @@ class Job(Object):
             self.transfer_out_time = job_data.get("transfer_out_time")
 
             # Back-compat + canonical mapping
-            self._submitted_at = float(
+            self.submitted_at = float(
                 job_data.get("submitted_at", job_data.get("submitted_at", time.time()))
             )
             self._selection_started_at = self._coalesce_time(
@@ -362,11 +395,16 @@ class Job(Object):
             self._started_at = self._coalesce_time(job_data, "started_at", "started_at")
             self._completed_at = job_data.get("completed_at")
 
-            self._leader_id = job_data.get("leader_id")
+            self.leader_id = job_data.get("leader_id")
             self.last_transition_at = job_data.get("last_transition_at")
 
-            self._reasoning_time = job_data.get("reasoning_time")
+            self.reasoning_time = job_data.get("reasoning_time")
             self.classify_job_type()
+
+            self.delegation_failed_agents = job_data.get("delegation_failed_agents")
+            self.delegation_failed = job_data.get("delegation_failed")
+            self.delegation_failed_count = job_data.get("delegation_failed_count")
+
 
     @staticmethod
     def _coalesce_time(d: dict, canonical: str, legacy: str) -> Optional[float]:
