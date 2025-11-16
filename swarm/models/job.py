@@ -24,7 +24,7 @@
 import logging
 import time
 import traceback
-from typing import Tuple, Any, List, Optional, Dict
+from typing import Any, List, Optional, Dict
 
 from swarm.models.object import Object, ObjectState
 from swarm.models.capacities import Capacities
@@ -59,13 +59,15 @@ class Job(Object):
         self.data_out: List[DataNode] = []
         self.transfer_in_time: Optional[float] = None
         self.transfer_out_time: Optional[float] = None
+        self.level = 0
 
-        # Timing (epoch seconds)
-        self._submitted_at: float = time.time()
-        self._selection_started_at: Optional[float] = None
-        self._assigned_at: Optional[float] = None
-        self._started_at: Optional[float] = None
-        self._completed_at: Optional[float] = None
+        # Timing (epoch seconds) - dicts to support multi-level latency tracking
+        # Key: level (int), Value: timestamp (float)
+        self._submitted_at: Dict[int, float] = {}
+        self._selection_started_at: Dict[int, float] = {}
+        self._assigned_at: Dict[int, float] = {}
+        self._started_at: Dict[int, float] = {}
+        self._completed_at: Dict[int, float] = {}
         self._wall_time: Optional[float] = None
         self._reasoning_time: Optional[float] = None
         self._delegation_failed = False
@@ -122,28 +124,35 @@ class Job(Object):
     @property
     def age(self) -> float:
         """Seconds since submission."""
-        return max(0.0, time.time() - (self._submitted_at or time.time()))
+        first_submit = self._submitted_at.get(0, time.time()) if self._submitted_at else time.time()
+        return max(0.0, time.time() - first_submit)
 
     def duration_run(self) -> Optional[float]:
-        """Actual runtime (started -> completed)."""
+        """Actual runtime (started -> completed). Uses last timestamps."""
         with self.lock:
-            if self._started_at is None or self._completed_at is None:
+            if not self._started_at or not self._completed_at:
                 return None
-            return max(0.0, self._completed_at - self._started_at)
+            last_started = max(self._started_at.values())
+            last_completed = max(self._completed_at.values())
+            return max(0.0, last_completed - last_started)
 
     def duration_wait(self) -> Optional[float]:
-        """Queueing delay (submitted -> started)."""
+        """Queueing delay (submitted -> started). Uses first submission and last start."""
         with self.lock:
-            if self._started_at is None:
+            if not self._started_at:
                 return None
-            return max(0.0, self._started_at - self._submitted_at)
+            first_submit = self._submitted_at.get(0, time.time())
+            last_started = max(self._started_at.values())
+            return max(0.0, last_started - first_submit)
 
     def duration_consensus(self) -> Optional[float]:
-        """Planning latency (selection_started -> assigned)."""
+        """Planning latency (selection_started -> assigned). Uses last timestamps."""
         with self.lock:
-            if self._selection_started_at is None or self._assigned_at is None:
+            if not self._selection_started_at or not self._assigned_at:
                 return None
-            return max(0.0, self._assigned_at - self._selection_started_at)
+            last_selection = max(self._selection_started_at.values())
+            last_assigned = max(self._assigned_at.values())
+            return max(0.0, last_assigned - last_selection)
 
     # ---------- IDs ----------
     @property
@@ -192,49 +201,94 @@ class Job(Object):
 
     @property
     def submitted_at(self) -> float:
+        """Return the first submission time (backward compatible)."""
         with self.lock:
-            return self._submitted_at
+            return self._submitted_at.get(0, time.time()) if self._submitted_at else time.time()
+
+    @property
+    def submitted_at_dict(self) -> Dict[int, float]:
+        """Return all submission timestamps for multi-level tracking."""
+        with self.lock:
+            return dict(self._submitted_at)
 
     @submitted_at.setter
     def submitted_at(self, ts: float):
+        """Set submission time (replaces dict with single value at level 0)."""
         with self.lock:
-            self._submitted_at = float(ts)
+            self._submitted_at = {0: float(ts)}
+
+    def mark_submitted(self, ts: Optional[float] = None) -> None:
+        """Add a submission timestamp at the specified level (for multi-level tracking)."""
+        with self.lock:
+            self._submitted_at[self.level] = float(ts or time.time())
 
     @property
     def selection_started_at(self) -> Optional[float]:
+        """Return the last selection start time (backward compatible)."""
         with self.lock:
-            return self._selection_started_at
+            return max(self._selection_started_at.values()) if self._selection_started_at else None
+
+    @property
+    def selection_started_at_dict(self) -> Dict[int, float]:
+        """Return all selection start timestamps for multi-level tracking."""
+        with self.lock:
+            return dict(self._selection_started_at)
 
     def mark_selection_started(self, ts: Optional[float] = None) -> None:
+        """Add a selection start timestamp at the specified level (for multi-level tracking)."""
         with self.lock:
-            self._selection_started_at = float(ts or time.time())
+            self._selection_started_at[self.level] = float(ts or time.time())
 
     @property
     def assigned_at(self) -> Optional[float]:
+        """Return the last assignment time (backward compatible)."""
         with self.lock:
-            return self._assigned_at
+            return max(self._assigned_at.values()) if self._assigned_at else None
+
+    @property
+    def assigned_at_dict(self) -> Dict[int, float]:
+        """Return all assignment timestamps for multi-level tracking."""
+        with self.lock:
+            return dict(self._assigned_at)
 
     def mark_assigned(self, ts: Optional[float] = None) -> None:
+        """Add an assignment timestamp at the specified level (for multi-level tracking)."""
         with self.lock:
-            self._assigned_at = float(ts or time.time())
+            self._assigned_at[self.level] = float(ts or time.time())
 
     @property
     def started_at(self) -> Optional[float]:
+        """Return the last start time (backward compatible)."""
         with self.lock:
-            return self._started_at
+            return max(self._started_at.values()) if self._started_at else None
+
+    @property
+    def started_at_dict(self) -> Dict[int, float]:
+        """Return all start timestamps for multi-level tracking."""
+        with self.lock:
+            return dict(self._started_at)
 
     def mark_started(self, ts: Optional[float] = None) -> None:
+        """Add a start timestamp at the specified level (for multi-level tracking)."""
         with self.lock:
-            self._started_at = float(ts or time.time())
+            self._started_at[self.level] = float(ts or time.time())
 
     @property
     def completed_at(self) -> Optional[float]:
+        """Return the last completion time (backward compatible)."""
         with self.lock:
-            return self._completed_at
+            return max(self._completed_at.values()) if self._completed_at else None
+
+    @property
+    def completed_at_dict(self) -> Dict[int, float]:
+        """Return all completion timestamps for multi-level tracking."""
+        with self.lock:
+            return dict(self._completed_at)
 
     def mark_completed(self, ts: Optional[float] = None) -> None:
+        """Add a completion timestamp at the specified level (for multi-level tracking)."""
         with self.lock:
-            self._completed_at = float(ts or time.time())
+            self._completed_at[self.level] = float(ts or time.time())
 
     @property
     def reasoning_time(self) -> Optional[float]:
@@ -277,7 +331,12 @@ class Job(Object):
     # ---------- State ----------
     def on_state_changed(self, old_state: ObjectState, new_state: ObjectState):
         self.logger.debug("Transitioning job %s from %s to %s", self.job_id, old_state, new_state)
-        if new_state in (ObjectState.PRE_PREPARE, ObjectState.PREPARE):
+        if old_state == new_state:
+            return
+        #if new_state in (ObjectState.PRE_PREPARE, ObjectState.PREPARE):
+        if old_state == ObjectState.PENDING and new_state == ObjectState.PRE_PREPARE:
+            self.mark_selection_started()
+        elif old_state == ObjectState.PENDING and new_state == ObjectState.PREPARE:
             self.mark_selection_started()
         elif new_state is ObjectState.READY:
             self.mark_assigned()
@@ -345,12 +404,12 @@ class Job(Object):
                 "exit_status": self.exit_status,
                 "transfer_in_time": self.transfer_in_time,
                 "transfer_out_time": self.transfer_out_time,
-                # canonical keys:
-                "submitted_at": self.submitted_at,
-                "selection_started_at": self.selection_started_at,
-                "assigned_at": self.assigned_at,
-                "started_at": self.started_at,
-                "completed_at": self.completed_at,
+                # canonical keys (dicts for multi-level latency tracking):
+                "submitted_at": self.submitted_at_dict,
+                "selection_started_at": self.selection_started_at_dict,
+                "assigned_at": self.assigned_at_dict,
+                "started_at": self.started_at_dict,
+                "completed_at": self.completed_at_dict,
                 "leader_id": self.leader_id,
                 "last_transition_at": self.last_transition_at,
                 "job_type": self.job_type,
@@ -358,6 +417,7 @@ class Job(Object):
                 "delegation_failed_agents": self.delegation_failed_agents,
                 "delegation_failed": self.delegation_failed,
                 "delegation_failed_count": self.delegation_failed_count,
+                "level": self.level,
             }
 
     def from_dict(self, job_data: dict):
@@ -382,18 +442,58 @@ class Job(Object):
             self.transfer_in_time = job_data.get("transfer_in_time")
             self.transfer_out_time = job_data.get("transfer_out_time")
 
-            # Back-compat + canonical mapping
-            self.submitted_at = float(
-                job_data.get("submitted_at", job_data.get("submitted_at", time.time()))
-            )
-            self._selection_started_at = self._coalesce_time(
-                job_data, "selection_started_at", "selection_started_at"
-            )
-            self._assigned_at = self._coalesce_time(job_data, "assigned_at", "assigned_at")
+            self.level = job_data.get("level")
 
-            # Previously called "scheduled_at" but used at RUNNING; now "started_at"
-            self._started_at = self._coalesce_time(job_data, "started_at", "started_at")
-            self._completed_at = job_data.get("completed_at")
+            # Back-compat + canonical mapping (supports single values, lists, and dicts)
+            submitted = job_data.get("submitted_at", time.time())
+            if isinstance(submitted, dict):
+                # Convert string keys to int if needed
+                self._submitted_at = {int(k): float(v) for k, v in submitted.items()}
+            elif isinstance(submitted, list):
+                # Convert list to dict with index as level
+                self._submitted_at = {i: float(v) for i, v in enumerate(submitted)}
+            else:
+                self._submitted_at = {self.level: float(submitted)}
+
+            selection_started = job_data.get("selection_started_at")
+            if isinstance(selection_started, dict):
+                self._selection_started_at = {int(k): float(v) for k, v in selection_started.items()}
+            elif isinstance(selection_started, list):
+                self._selection_started_at = {i: float(v) for i, v in enumerate(selection_started)}
+            elif selection_started is not None:
+                self._selection_started_at = {self.level: float(selection_started)}
+            else:
+                self._selection_started_at = {}
+
+            assigned = job_data.get("assigned_at")
+            if isinstance(assigned, dict):
+                self._assigned_at = {int(k): float(v) for k, v in assigned.items()}
+            elif isinstance(assigned, list):
+                self._assigned_at = {i: float(v) for i, v in enumerate(assigned)}
+            elif assigned is not None:
+                self._assigned_at = {self.level: float(assigned)}
+            else:
+                self._assigned_at = {}
+
+            started = job_data.get("started_at")
+            if isinstance(started, dict):
+                self._started_at = {int(k): float(v) for k, v in started.items()}
+            elif isinstance(started, list):
+                self._started_at = {i: float(v) for i, v in enumerate(started)}
+            elif started is not None:
+                self._started_at = {self.level: float(started)}
+            else:
+                self._started_at = {}
+
+            completed = job_data.get("completed_at")
+            if isinstance(completed, dict):
+                self._completed_at = {int(k): float(v) for k, v in completed.items()}
+            elif isinstance(completed, list):
+                self._completed_at = {i: float(v) for i, v in enumerate(completed)}
+            elif completed is not None:
+                self._completed_at = {self.level: float(completed)}
+            else:
+                self._completed_at = {}
 
             self.leader_id = job_data.get("leader_id")
             self.last_transition_at = job_data.get("last_transition_at")
@@ -404,12 +504,6 @@ class Job(Object):
             self.delegation_failed_agents = job_data.get("delegation_failed_agents")
             self.delegation_failed = job_data.get("delegation_failed")
             self.delegation_failed_count = job_data.get("delegation_failed_count")
-
-
-    @staticmethod
-    def _coalesce_time(d: dict, canonical: str, legacy: str) -> Optional[float]:
-        v = d.get(canonical, d.get(legacy))
-        return None if v is None else float(v)
 
     # ---------- Classification ----------
     def classify_job_type(self) -> Optional[str]:

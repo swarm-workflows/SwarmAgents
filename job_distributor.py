@@ -119,6 +119,8 @@ class JobDistributor(threading.Thread):
                 if not batch:
                     break
             for job in batch:
+                job.level = self.level
+                job.mark_submitted()
                 self.job_repo.save(obj=job.to_dict(), key_prefix=Repository.KEY_JOB, level=self.level,
                                    group=self.group)
             time.sleep(self.interval)

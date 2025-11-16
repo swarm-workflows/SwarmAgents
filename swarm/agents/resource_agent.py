@@ -458,6 +458,7 @@ class ResourceAgent(Agent):
 
                 if job_data:
                     job_obj = Job()
+                    job_obj.level = self.topology.level
                     job_obj.from_dict(job_data)
                     found_in_group = child_group
                     break
@@ -1315,7 +1316,10 @@ class ResourceAgent(Agent):
                             capable_groups = self.topology.children
 
                         self.queues.selected_queue.remove(job_id)
+                        job.level = self.topology.level - 1
                         job.state = ObjectState.PENDING
+                        job.mark_submitted()
+                        job.mark_assigned()
 
                         for child_group in capable_groups:
                             self.repository.save(
@@ -1531,7 +1535,6 @@ class ResourceAgent(Agent):
             # Reset job to PENDING for reselection
             old_state = job.state
             job.state = ObjectState.PENDING
-            job.last_transition_at = time.time()
 
             # Clear from consensus containers
             self.engine.outgoing.remove_object(object_id=job_id)
@@ -1590,6 +1593,8 @@ class ResourceAgent(Agent):
         :param up: True if channel is up, False if down
         :param reason: Reason for status change
         """
+        if self.shutdown:
+            return
         if up:
             self.logger.debug(f"Peer {target} is UP: {reason}")
             # TODO: Could implement agent recovery here if enable_agent_recovery is True

@@ -411,8 +411,9 @@ def parse_and_report(args) -> None:
         "--output_dir", args.run_dir,
         "--agents", str(args.agents),
         "--db_host", args.db_host,
-        f"--{args.topology}" if args.topology == "hierarchical" else "",
     ]
+    if args.topology == "hierarchical":
+        plot_cmd.extend(["--hierarchical"])
     log("Plotting …")
     run_blocking(plot_cmd, check=False)
 
