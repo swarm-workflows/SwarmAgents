@@ -389,9 +389,9 @@ class Job(Object):
     __str__ = __repr__
 
     # ---------- (De)serialization ----------
-    def to_dict(self) -> dict:
+    def to_dict(self, compact: bool = False) -> dict:
         with self.lock:
-            return {
+            result = {
                 "id": self.job_id,
                 "capacities": self.capacities.to_dict() if self.capacities else None,
                 "capacity_allocations": (
@@ -419,6 +419,15 @@ class Job(Object):
                 "delegation_failed_count": self.delegation_failed_count,
                 "level": self.level,
             }
+
+            if compact:
+                # Remove None values and empty collections
+                return {
+                    k: v for k, v in result.items()
+                    if v is not None and v != [] and v != {}
+                }
+
+            return result
 
     def from_dict(self, job_data: dict):
         with self.lock:

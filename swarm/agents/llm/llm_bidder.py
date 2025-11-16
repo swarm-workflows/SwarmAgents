@@ -72,6 +72,7 @@ class LlmBidder:
             "return a JSON with fields: score (0..100, higher is better) and "
             "explanation (short string). Respond strictly in JSON."
         )
+        self.logger.info(f"[LLM_BIDDER] System Prompt: {system_prompt}")
 
         # Build the agent with a structured result type.
         self.agent: PydanticAgent[Bid] = PydanticAgent[Bid](
@@ -90,6 +91,18 @@ class LlmBidder:
         :return: Bid with score, explanation, and reasoning time
         """
         try:
+            # Log LLM scoring start
+            job_id = job.get('job_id', job.get('id', 'unknown'))
+            agent_id = agent_state.get('agent_id', 'unknown')
+
+            if self.logger:
+                peer_count = len(peer_context.get('peer_agents', {})) if peer_context else 0
+                self.logger.info(
+                    f"[LLM_SCORE_START] Job={job_id} Agent={agent_id} "
+                    f"Provider={self.cfg.provider} Model={self.cfg.model} "
+                    f"PeerContext={'yes' if peer_context else 'no'} Peers={peer_count}"
+                )
+
             # Prepare peer context summary if provided
             peer_info = ""
             if peer_context:
@@ -100,7 +113,7 @@ class LlmBidder:
                     f"- Peer Agents: {peer_agents if peer_agents else 'no peers'}\n"
                     f"- Recent conflicts: {peer_context.get('conflicts', 0)}\n"
                     f"- Topology: {peer_context.get('topology', 'mesh')}\n"
-                    f"- Child Agents: {peer_context.get('child_agents', 'no children')}\n"
+                    #f"- Child Agents: {peer_context.get('child_agents', 'no children')}\n"
                 )
 
             prompt = (
@@ -111,6 +124,14 @@ class LlmBidder:
                 f"AGENT_STATE:\n{json.dumps(agent_state, ensure_ascii=False, indent=2)}"
                 f"{peer_info}"
             )
+
+            # Log the prompt at DEBUG level for detailed troubleshooting
+            if self.logger:
+                self.logger.debug(
+                    f"[LLM_PROMPT] Job={job_id} Agent={agent_id}\n"
+                    f"Prompt length: {len(prompt)} chars\n"
+                    f"Full prompt:\n{prompt}"
+                )
 
             start = time.perf_counter()
             res = self.agent.run_sync(
@@ -127,10 +148,21 @@ class LlmBidder:
             if len(bid.explanation) > 100:
                 bid.explanation = bid.explanation[:97] + "..."
 
+            # Log successful LLM scoring completion
+            if self.logger:
+                self.logger.info(
+                    f"[LLM_SCORE_COMPLETE] Job={job_id} Agent={agent_id} "
+                    f"Score={bid.score:.2f} ReasoningTime={bid.reasoning_time:.3f}s "
+                    f"Explanation=\"{bid.explanation}\""
+                )
+
             return bid
         except Exception as e:
             if self.logger:
-                self.logger.exception("LLM scoring failed: %s", e)
+                self.logger.exception(
+                    f"[LLM_SCORE_ERROR] Job={job.get('job_id', job.get('id', 'unknown'))} "
+                    f"Agent={agent_state.get('agent_id', 'unknown')} Error: %s", e
+                )
             raise
 
 

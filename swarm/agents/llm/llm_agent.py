@@ -120,11 +120,17 @@ class LlmAgent(ResourceAgent):
         On any error, fall back to the analytic model.
         """
         try:
-            payload_job = job.to_dict()
+            payload_job = job.to_dict(compact=True)
             payload_agent = agent.to_dict() if hasattr(agent, "to_dict") else json.loads(agent.to_json())
 
             # Gather peer context for load-aware scoring
             peer_context = self._get_peer_context()
+
+            # Log LLM cost computation start
+            self.logger.info(
+                f"[LLM_COST_START] Job={job.job_id} Agent={agent.agent_id} "
+                f"GatheringPeerContext=yes Peers={len(peer_context.get('peer_agents', {}))}"
+            )
 
             # Pass peer context to LLM bidder
             bid = self.bidder.score(
@@ -135,6 +141,15 @@ class LlmAgent(ResourceAgent):
 
             job.reasoning_time = bid.reasoning_time
             score = float(bid.score)
+            cost = 100.0 - max(0.0, min(100.0, score))
+
+            # Log successful LLM cost computation
+            self.logger.info(
+                f"[LLM_COST_COMPLETE] Job={job.job_id} Agent={agent.agent_id} "
+                f"Score={score:.2f} Cost={cost:.2f} ReasoningTime={bid.reasoning_time:.3f}s "
+                f"Explanation=\"{bid.explanation}\""
+            )
+
             self.logger.debug("LLM bidder score=%s bid=%s peer_ctx=%s", score, bid, peer_context)
 
             # audit trail (best-effort)
@@ -152,10 +167,17 @@ class LlmAgent(ResourceAgent):
                     level=self.topology.level, group=self.topology.group)
             except Exception as e:
                 self.logger.exception("Failed to save LLM bidder: %s", e)
-            return 100.0 - max(0.0, min(100.0, score))
+            return cost
         except Exception as e:
-            self.logger.exception("LLM scoring failed, using analytic cost: %s", e)
-            return self._cost_job_on_agent(job, agent)
+            self.logger.warning(
+                f"[LLM_COST_FALLBACK] Job={job.job_id} Agent={agent.agent_id} "
+                f"FallingBackToAnalyticCost due to error: %s", e
+            )
+            analytical_cost = self._cost_job_on_agent(job, agent)
+            self.logger.info(
+                f"[ANALYTIC_COST] Job={job.job_id} Agent={agent.agent_id} Cost={analytical_cost:.2f}"
+            )
+            return analytical_cost
 
     # ------------------------------------------------------------------------------------------
     # Optional: expose a utility to score a job for this agent explicitly
@@ -194,19 +216,31 @@ class LlmAgent(ResourceAgent):
             if hasattr(self, 'topology') and self.topology:
                 topology_type = str(self.topology.type.value) if hasattr(self.topology.type, 'value') else str(self.topology.type)
 
+            '''
             child_agents = {}
             for c in self.children.values():
                 child_agents[c.agent_id] = c.to_dict()
+            '''
 
-            return {
+            context = {
                 'total_agents': self.configured_agent_count if hasattr(self, 'configured_agent_count') else len(self.neighbor_map),
                 'peer_agents': peer_agents,
                 'conflicts': conflicts,
                 'topology': topology_type,
-                'child_agents': child_agents,
+                #'child_agents': child_agents,
             }
+
+            # Log peer context summary at DEBUG level
+            self.logger.debug(
+                f"[PEER_CONTEXT] Agent={self.agent_id} "
+                f"TotalAgents={context['total_agents']} Peers={len(peer_agents)} "
+                #f"Children={len(child_agents)} Conflicts={conflicts} Topology={topology_type}"
+                f"Conflicts={conflicts} Topology={topology_type}"
+            )
+
+            return context
         except Exception as e:
-            self.logger.warning(f"Failed to gather peer context: {e}")
+            self.logger.warning(f"[PEER_CONTEXT_ERROR] Agent={self.agent_id} Failed to gather peer context: {e}")
             # Return minimal context on error
             return {
                 'total_agents': 0,
@@ -250,7 +284,18 @@ class LlmAgent(ResourceAgent):
                     candidates=pending_jobs,
                 )
                 cost_computation = time.perf_counter() - start
-                self.logger.info(f"Time for computing cost matrix: {cost_computation}")
+
+                # Calculate LLM scoring statistics
+                num_jobs = len(pending_jobs)
+                num_agents = len(agents)
+                total_evaluations = num_jobs * num_agents
+                avg_time_per_eval = (cost_computation / total_evaluations) if total_evaluations > 0 else 0
+
+                self.logger.info(
+                    f"[COST_MATRIX_COMPLETE] Jobs={num_jobs} Agents={num_agents} "
+                    f"TotalEvaluations={total_evaluations} TotalTime={cost_computation:.3f}s "
+                    f"AvgTimePerEval={avg_time_per_eval:.3f}s"
+                )
 
                 cost_matrix_with_penalities = apply_multiplicative_penalty(cost_matrix=cost_matrix,
                                                                            assignees=agents,
@@ -278,7 +323,19 @@ class LlmAgent(ResourceAgent):
                         proposals.append(proposal)
                         job.state = ObjectState.PRE_PREPARE
 
+                        # Log that this agent won the bid for this job
+                        reasoning_time = getattr(job, 'reasoning_time', None) or 0
+                        self.logger.info(
+                            f"[LLM_BID_WON] Job={job.job_id} Agent={self.agent_id} "
+                            f"Cost={cost:.2f} FinalCost={proposal.cost:.2f} "
+                            f"ReasoningTime={reasoning_time:.3f}s"
+                        )
+
                 if len(proposals):
+                    self.logger.info(
+                        f"[PROPOSALS_CREATED] Agent={self.agent_id} Count={len(proposals)} "
+                        f"ProposalIDs={[p.p_id for p in proposals]}"
+                    )
                     self.logger.debug(f"Identified jobs to propose: {proposals}")
                     if self.debug:
                         self.logger.info(f"Identified jobs to select: {jobs}")

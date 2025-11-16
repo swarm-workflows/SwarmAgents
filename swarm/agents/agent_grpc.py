@@ -121,6 +121,9 @@ class Agent(Observer):
         formatter = logging.Formatter(
             self.log_config.get("log-format",
                                 '%(asctime)s - %(name)s - {%(filename)s:%(lineno)d} - [%(threadName)s]- %(levelname)s - %(message)s'))
+        formatter = logging.Formatter(
+            self.log_config.get("log-format",
+                                '%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
         handler.setFormatter(formatter)
         logger.addHandler(handler)
 
