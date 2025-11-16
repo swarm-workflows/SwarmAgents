@@ -1086,9 +1086,10 @@ def plot_hierarchical_topology(output_dir: str, repo: Repository | None = None):
             ax.plot([x1, x2], [y1, y2], 'k-', alpha=0.3, linewidth=1.5, zorder=1)
 
     # Add legend
-    llm_patch = mpatches.Patch(color='#FF6B6B', label='LLM Agents (Top-Level)')
-    resource_patch = mpatches.Patch(color='#4ECDC4', label='Resource Agents (Workers)')
-    ax.legend(handles=[llm_patch, resource_patch], loc='upper right', fontsize=11)
+    children_patch = mpatches.Patch(color='#FF6B6B', label='Children Agents (Workers)')
+    parent_patch = mpatches.Patch(color='#4ECDC4', label='Parent Agents (Top-Level)')
+    #ax.legend(handles=[parent_patch, children_patch], loc='upper right', fontsize=11)
+    ax.legend(handles=[parent_patch, children_patch], fontsize=11)
 
     ax.set_xlabel('Agent Distribution', fontsize=12)
     ax.set_ylabel('Hierarchy Level', fontsize=12)
