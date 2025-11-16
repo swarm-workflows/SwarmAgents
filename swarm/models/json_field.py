@@ -113,6 +113,8 @@ class JSONField(ABC):
             #if v is None or v == 0:
             if v is None:
                 continue
+            if k not in ["_group", "_level"] and v==0:
+                continue
 
             if isinstance(v, JSONField):
                 new_value = v.to_dict()

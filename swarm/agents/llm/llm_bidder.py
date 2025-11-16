@@ -96,11 +96,11 @@ class LlmBidder:
                 peer_agents = ", ".join([f"Agent{k}: {v}" for k, v in peer_context.get('peer_agents', {}).items()])
                 peer_info = (
                     f"\n\nPEER CONTEXT:\n"
-                    f"- Total agents in mesh: {peer_context.get('total_agents', 'unknown')}\n"
+                    f"- Total agents: {peer_context.get('total_agents', 'unknown')}\n"
                     f"- Peer Agents: {peer_agents if peer_agents else 'no peers'}\n"
                     f"- Recent conflicts: {peer_context.get('conflicts', 0)}\n"
                     f"- Topology: {peer_context.get('topology', 'mesh')}\n"
-                    f"- Child Agents: {peer_context.get('child_agents', 'mesh')}\n"
+                    f"- Child Agents: {peer_context.get('child_agents', 'no children')}\n"
                 )
 
             prompt = (
