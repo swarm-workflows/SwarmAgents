@@ -195,7 +195,7 @@ class LlmAgent(ResourceAgent):
                 topology_type = str(self.topology.type.value) if hasattr(self.topology.type, 'value') else str(self.topology.type)
 
             child_agents = {}
-            for c in self.children:
+            for c in self.children.values():
                 child_agents[c.agent_id] = c.to_dict()
 
             return {
