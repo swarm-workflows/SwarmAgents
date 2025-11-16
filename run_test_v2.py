@@ -280,6 +280,7 @@ def start_agents_remote(args, agent_hosts_list: list[str], agent_count: int = No
             forwarded += ["--debug"]
 
         start_cmd = (
+            f"source ~/.bash_profile && "
             f"cd {shlex.quote(args.remote_repo_dir)} && "
             f"nohup bash {shlex.quote(starter)} "
             f"{shlex.quote(args.agent_type)} {count} {shlex.quote(args.topology)} {args.jobs} "
