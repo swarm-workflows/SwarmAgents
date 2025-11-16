@@ -96,11 +96,13 @@ if [[ "$use_config_dir" == false ]]; then
       gen_args=(
         "$num_agents" "$jobs_per_proposal" "$template_cfg" configs
         "$topology" "$database" "$job_cnt"
+        --agent-type "$agent_type"
       )
     else
        gen_args=(
         "$num_agents" "$jobs_per_proposal" "$template_cfg" configs
         "$topology" "$database" "$job_cnt" --dtns
+        --agent-type "$agent_type"
       )
     fi
     # propagate grouping flags if set

@@ -147,6 +147,7 @@ def generate_configs(args, agent_hosts_list: list[str]) -> Path:
         args.topology, args.db_host, str(args.jobs),
         "--agent-hosts-file", str(hosts_file),
         "--agents-per-host", str(args.agents_per_host) if args.mode == "remote" else str(args.agents),
+        "--agent-type", args.agent_type,
     ]
     if args.topology != "hierarchical":
         gen_args.append("--dtns")

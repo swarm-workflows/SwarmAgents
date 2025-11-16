@@ -43,6 +43,7 @@ class SwarmConfigGenerator:
         groups: Optional[int] = None,
         group_size: Optional[int] = None,
         hierarchical_level1_agent_type: str = "llm",
+        agent_type: str = "resource",
     ):
         self.num_agents = num_agents
         self.jobs_per_proposal = jobs_per_proposal
@@ -60,6 +61,9 @@ class SwarmConfigGenerator:
 
         # hierarchical level 1 agent type (llm or resource)
         self.hierarchical_level1_agent_type = hierarchical_level1_agent_type
+
+        # default agent type for all non-hierarchical level 1 agents
+        self.agent_type = agent_type
 
         # legacy ring helper (used when no grouping flags provided for ring)
         self.rings_default = self._create_default_rings()
@@ -570,7 +574,7 @@ class SwarmConfigGenerator:
                 config["agent_type"] = self.hierarchical_level1_agent_type
                 #print(f"Settting config type: {config['agent_type']}")
             else:
-                config["agent_type"] = "resource"
+                config["agent_type"] = self.agent_type
 
             # Write file
             config_file_path = os.path.join(self.output_dir, f"{config_prefix}_{agent_id}.yml")
@@ -640,6 +644,11 @@ if __name__ == "__main__":
                         choices=["llm", "resource"], default="llm",
                         help="Agent type for level 1 (parent) agents in hierarchical topology (default: llm)")
 
+    # Agent type control (for all non-hierarchical-level-1 agents)
+    parser.add_argument("--agent-type", type=str,
+                        choices=["llm", "resource"], default="resource",
+                        help="Default agent type for all agents (default: resource)")
+
     args = parser.parse_args()
 
     if args.agent_hosts_file:
@@ -668,6 +677,7 @@ if __name__ == "__main__":
         groups=args.groups,
         group_size=args.group_size,
         hierarchical_level1_agent_type=args.hierarchical_level1_agent_type,
+        agent_type=args.agent_type,
     )
     generator.generate_configs(flavor_percentages=flavor_percentages, agent_hosts=agent_hosts)
 

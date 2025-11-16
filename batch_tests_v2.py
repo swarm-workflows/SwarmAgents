@@ -93,7 +93,7 @@ def main():
 
     # v2 knobs that map to old script semantics
     ap.add_argument("--jobs-per-interval", type=int, default=20)
-    ap.add_argument("--watch-bucket", type=int, default=5)
+    ap.add_argument("--watch-bucket", type=int, default=1)
     ap.add_argument("--threshold", type=int, default=5)
     ap.add_argument("--stable-seconds", type=int, default=90)
     ap.add_argument("--check-interval", type=float, default=5.0)

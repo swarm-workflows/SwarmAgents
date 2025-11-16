@@ -36,7 +36,7 @@ num_hosts=$(( num_agents / agents_per_host ))
 for ((i=1; i<=num_hosts; i++)); do
     echo "agent-$i" >> agent_hosts.txt
 done
-python3.11 generate_configs.py "$num_agents" "$jobs_per_proposal" ./config_swarm_multi.yml configs $topology $database $job_cnt --agent-hosts-file agent_hosts.txt --agents-per-host $agents_per_host --dtns
+python3.11 generate_configs.py "$num_agents" "$jobs_per_proposal" ./config_swarm_multi.yml configs $topology $database $job_cnt --agent-hosts-file agent_hosts.txt --agents-per-host $agents_per_host --dtns --agent-type resource
 
 cleanup_cmd="python3.11 cleanup.py --agents $num_agents"
 [[ -n "$database" ]] && cleanup_cmd+=" --redis-host $database --cleanup-redis"
