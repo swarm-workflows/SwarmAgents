@@ -615,10 +615,48 @@ class ResourceAgent(Agent):
             )
             for agent_data in agent_dicts:
                 agent = AgentInfo.from_dict(agent_data)
-                existing = target_dict.get(agent.agent_id)
-                if existing is None or agent.last_updated > existing.last_updated:
-                    target_dict.set(agent.agent_id, agent)
+
+                # Skip agents that have been marked as failed
+                if agent.agent_id in self.failed_agents:
+                    self.logger.debug(
+                        f"Skipping failed agent {agent.agent_id} during neighbor refresh "
+                        f"(failed at {self.failed_agents.get(agent.agent_id)})"
+                    )
+                    continue
+
+                # Track this agent as active (present in Redis)
                 active_ids.add(agent.agent_id)
+
+                existing = target_dict.get(agent.agent_id)
+
+                # For new agents: add them if they're not too stale
+                # For existing agents: only update if Redis has newer data
+                if existing is None:
+                    # New agent - check if it's fresh enough (not too stale)
+                    time_since_update = current_time - agent.last_updated
+                    if time_since_update <= self.peer_expiry_seconds:
+                        target_dict.set(agent.agent_id, agent)
+                        self.logger.debug(
+                            f"Added new agent {agent.agent_id} to map "
+                            f"(last_updated: {time_since_update:.1f}s ago)"
+                        )
+                    else:
+                        self.logger.debug(
+                            f"Skipping stale agent {agent.agent_id} "
+                            f"(last_updated: {time_since_update:.1f}s ago, threshold: {self.peer_expiry_seconds}s)"
+                        )
+                elif agent.last_updated > existing.last_updated:
+                    # Existing agent - update with newer data from Redis
+                    target_dict.set(agent.agent_id, agent)
+
+        # Remove agents from map that are no longer active in Redis
+        # (but keep agents that are still being processed/committed)
+        for agent_id in list(target_dict.keys()):
+            if agent_id != self.agent_id and agent_id not in active_ids:
+                target_dict.remove(agent_id)
+                self.logger.info(
+                    f"Removed agent {agent_id} from map (no longer in Redis)"
+                )
 
     def _generate_agent_info(self) -> AgentInfo:
         """
@@ -1613,6 +1651,7 @@ class ResourceAgent(Agent):
             if host == "127.0.0.1":
                 host = "localhost"
 
+            failed_agent_id = None
             # Find agent by endpoint
             for agent_id, agent_info in list(self.neighbor_map.items()):
                 if agent_info.host == host and agent_info.port == port:
@@ -1620,12 +1659,14 @@ class ResourceAgent(Agent):
                         f"Identified DOWN peer as agent {agent_id} "
                         f"(aggressive failure detection enabled)"
                     )
-
-                    # Mark as failed immediately
-                    if agent_id not in self.failed_agents:
-                        self.failed_agents.set(agent_id, time.time())
-                        self._remove_failed_agents([agent_id])
+                    failed_agent_id = agent_id
                     break
+
+            # Mark as failed immediately
+            if failed_agent_id:
+                if failed_agent_id not in self.failed_agents:
+                    self.failed_agents.set(failed_agent_id, time.time())
+                self._remove_failed_agents([failed_agent_id])
         except Exception as e:
             self.logger.error(f"Failed to identify down peer {target}: {e}")
 

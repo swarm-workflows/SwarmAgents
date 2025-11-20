@@ -566,8 +566,18 @@ def plot_scheduling_latency_and_jobs(run_dir: str,
 
 def plot_reasoning_time(output_dir: str):
     csv_file = f"{output_dir}/all_jobs.csv"
+    agents_csv = f"{output_dir}/all_agents.csv"
+
     if not os.path.exists(csv_file):
         print(f"{csv_file} not found")
+        return
+
+    # Check if there are LLM agents before generating reasoning plots
+    agent_types, _ = identify_agent_types(agents_csv)
+    has_llm_agents = any(agent_type == "llm" for agent_type in agent_types.values())
+
+    if not has_llm_agents:
+        print("No LLM agents detected - skipping reasoning time plots")
         return
 
     df = pd.read_csv(csv_file)
@@ -622,77 +632,282 @@ def detect_agent_failures(output_dir: str, repo: Repository | None = None) -> tu
         - agent_mapping: dict mapping agent_id -> "host:port"
 
     Tries multiple sources:
-    1. Redis agent state transitions (ACTIVE -> FAILED)
-    2. Agent logs (grepping for failure keywords)
-    3. all_agents.csv if state field exists
+    1. Redis metrics (agent_failures field)
+    2. Redis agent state transitions (ACTIVE -> FAILED)
+    3. Agent logs (grepping for failure keywords)
+    4. all_agents.csv if state field exists
     """
     failures = []
     agent_mapping = {}
 
-    # Try Redis first - look for agents with FAILED state
+    # Try Redis metrics first - check for agent_failures in metrics
     if repo is not None:
         try:
-            agents = repo.get_all_objects(key_prefix=Repository.KEY_AGENT, level=None)
-            for agent_data in agents:
-                if isinstance(agent_data, str):
-                    agent_data = json.loads(agent_data)
-                if not isinstance(agent_data, dict):
-                    continue
-
-                agent_id = agent_data.get("id")
-                state = agent_data.get("state", "").upper()
-                last_updated = agent_data.get("last_updated", 0)
-
-                # Extract host and port
-                host = agent_data.get("host", "unknown")
-                port = agent_data.get("port", 0)
-
-                # Build mapping for all agents
-                if agent_id is not None:
-                    agent_mapping[agent_id] = f"{host}:{port}"
-
-                # Check if agent is in FAILED state
-                if state == "FAILED" and last_updated:
+            metrics = load_metrics_from_repo(repo)
+            for agent_id, m in metrics.items():
+                agent_failures_data = m.get("failed_agents", {}) or {}
+                for failed_agent_id, timestamp in agent_failures_data.items():
                     failures.append({
-                        "agent_id": agent_id,
-                        "failure_time": float(last_updated),
-                        "host": host,
-                        "port": port
+                        "agent_id": int(failed_agent_id),
+                        "failure_time": float(timestamp),
                     })
         except Exception as e:
-            print(f"Could not detect failures from Redis: {e}")
+            print(f"Could not detect failures from Redis metrics: {e}")
 
-    # Fallback: Parse agent logs for failure indicators
-    if not failures and os.path.exists(output_dir):
-        import re
-        failure_pattern = re.compile(r".*detected as FAILED.*agent[_\s]+(\d+).*", re.IGNORECASE)
 
-        for filename in os.listdir(output_dir):
-            if filename.startswith("agent-") and filename.endswith(".log"):
-                try:
-                    agent_id = int(filename.split("-")[1].split(".")[0])
-                except Exception:
-                    continue
+    # Deduplicate failures by agent_id (keep first occurrence)
+    seen_agents = set()
+    unique_failures = []
+    for f in failures:
+        if f["agent_id"] not in seen_agents:
+            seen_agents.add(f["agent_id"])
+            unique_failures.append(f)
 
-                log_path = os.path.join(output_dir, filename)
-                try:
-                    with open(log_path, "r") as f:
-                        for line in f:
-                            # Look for failure indicators
-                            if "FAILED" in line.upper() or "FAILURE" in line.upper():
-                                # Try to extract timestamp (assuming format like: 2025-01-15 10:30:45)
-                                # For now, we'll mark as failed without precise timestamp
-                                failures.append({
-                                    "agent_id": agent_id,
-                                    "failure_time": None,  # Will need timestamp parsing
-                                    "host": "unknown",
-                                    "port": 0
-                                })
-                                break
-                except Exception:
-                    continue
+    return unique_failures, agent_mapping
 
-    return failures, agent_mapping
+
+def collect_reassignments(output_dir: str, repo: Repository | None = None, level: int = 0) -> dict[int, dict]:
+    """
+    Collect job reassignment data from Redis metrics.
+
+    Returns:
+        - reassignments: {job_id: {"from_agent": int, "to_agent": int, "timestamp": float, "reason": str}}
+    """
+    reassignments = {}
+
+    # Try Redis metrics first
+    if repo is not None:
+        try:
+            metrics = load_metrics_from_repo(repo)
+            for agent_id, m in metrics.items():
+                # Regular reassignments
+                regular_reassignments = m.get("reassignments", {}) or {}
+                for job_id, reassignment_info in regular_reassignments.items():
+                    if isinstance(reassignment_info, dict):
+                        if int(job_id) not in reassignments:
+                            job_obj = repo.get(job_id)
+                            to_agent = job_obj.get("leader_id", -1)
+                            print(f"KOMAl --- {to_agent}")
+                            reassignments[int(job_id)] = {
+                                "from_agent": reassignment_info.get("failed_agent", -1),
+                                "to_agent": to_agent,
+                                "timestamp": reassignment_info.get("reassigned_at", 0),
+                                "reason": reassignment_info.get("reason", "failure"),
+                                "type": "regular"
+                            }
+
+                # Delegation reassignments
+                delegation_reassignments = m.get("delegation_reassignments", {}) or {}
+                for job_id, reassignment_info in delegation_reassignments.items():
+                    if isinstance(reassignment_info, dict):
+                        # Don't overwrite if already exists
+                        if int(job_id) not in reassignments:
+                            job_obj = repo.get(job_id)
+                            to_agent = job_obj.get("leader_id", -1)
+                            print(f"KOMAl --- {to_agent}")
+                            reassignments[int(job_id)] = {
+                                "from_agent": reassignment_info.get("from_agent", -1),
+                                "to_agent": to_agent,  # Current agent took over
+                                "timestamp": reassignment_info.get("timestamp", 0),
+                                "reason": reassignment_info.get("reason", "delegation"),
+                                "type": "delegation"
+                            }
+        except Exception as e:
+            print(f"Could not collect reassignments from Redis: {e}")
+
+    return reassignments
+
+
+def plot_failure_summary(output_dir: str, repo: Repository | None = None):
+    """
+    Create summary visualization showing:
+    - Total failed agents
+    - Total reassigned jobs (regular + delegation)
+    - Failed agents by ID
+    - Reassigned jobs timeline
+    """
+    failures, _ = detect_agent_failures(output_dir, repo)
+    print("Total failed agents:", len(failures))
+    reassignments = collect_reassignments(output_dir, repo)
+    print("Total reassigned jobs:", len(reassignments))
+
+    if not failures and not reassignments:
+        print("No failure or reassignment data to visualize")
+        return
+
+    # Create figure with 4 subplots
+    fig = plt.figure(figsize=(16, 12))
+    gs = fig.add_gridspec(3, 2, hspace=0.3, wspace=0.3)
+
+    # Plot 1: Summary statistics (top left)
+    ax1 = fig.add_subplot(gs[0, 0])
+    categories = ['Failed\nAgents', 'Reassigned\nJobs']
+    values = [len(failures), len(reassignments)]
+    colors = ['#e74c3c', '#f39c12']
+
+    bars = ax1.bar(categories, values, color=colors, alpha=0.8, edgecolor='black', linewidth=2)
+    ax1.set_ylabel('Count', fontsize=12, fontweight='bold')
+    ax1.set_title('Failure Impact Summary', fontsize=14, fontweight='bold')
+    ax1.grid(axis='y', alpha=0.3)
+
+    # Add value labels on bars
+    for bar, val in zip(bars, values):
+        height = bar.get_height()
+        ax1.text(bar.get_x() + bar.get_width()/2., height,
+                f'{int(val)}',
+                ha='center', va='bottom', fontsize=14, fontweight='bold')
+
+    # Plot 2: Failed agents by ID (top right)
+    ax2 = fig.add_subplot(gs[0, 1])
+    if failures:
+        failed_agent_ids = sorted([f["agent_id"] for f in failures])
+        ax2.bar(range(len(failed_agent_ids)), [1]*len(failed_agent_ids),
+                color='#e74c3c', alpha=0.8, edgecolor='black', linewidth=1.5)
+        ax2.set_xticks(range(len(failed_agent_ids)))
+        ax2.set_xticklabels([f'Agent\n{aid}' for aid in failed_agent_ids], fontsize=9)
+        ax2.set_ylabel('Failed', fontsize=12, fontweight='bold')
+        ax2.set_title(f'Failed Agents (n={len(failed_agent_ids)})', fontsize=14, fontweight='bold')
+        ax2.set_ylim(0, 1.5)
+        ax2.set_yticks([0, 1])
+        ax2.set_yticklabels(['', 'FAILED'])
+        ax2.grid(axis='y', alpha=0.3)
+    else:
+        ax2.text(0.5, 0.5, 'No Agent Failures Detected',
+                ha='center', va='center', fontsize=12, transform=ax2.transAxes)
+        ax2.set_title('Failed Agents', fontsize=14, fontweight='bold')
+
+    # Plot 3: Reassignments by type (middle left)
+    ax3 = fig.add_subplot(gs[1, 0])
+    if reassignments:
+        reassignment_types = defaultdict(int)
+        for job_id, info in reassignments.items():
+            reassignment_types[info.get("type", "unknown")] += 1
+
+        types = list(reassignment_types.keys())
+        counts = list(reassignment_types.values())
+        type_colors = {'regular': '#e67e22', 'delegation': '#3498db', 'unknown': '#95a5a6'}
+        bar_colors = [type_colors.get(t, '#95a5a6') for t in types]
+
+        bars = ax3.bar(types, counts, color=bar_colors, alpha=0.8, edgecolor='black', linewidth=1.5)
+        ax3.set_ylabel('Count', fontsize=12, fontweight='bold')
+        ax3.set_title('Reassignments by Type', fontsize=14, fontweight='bold')
+        ax3.grid(axis='y', alpha=0.3)
+
+        # Add value labels
+        for bar, val in zip(bars, counts):
+            height = bar.get_height()
+            ax3.text(bar.get_x() + bar.get_width()/2., height,
+                    f'{int(val)}',
+                    ha='center', va='bottom', fontsize=12, fontweight='bold')
+    else:
+        ax3.text(0.5, 0.5, 'No Job Reassignments Detected',
+                ha='center', va='center', fontsize=12, transform=ax3.transAxes)
+        ax3.set_title('Reassignments by Type', fontsize=14, fontweight='bold')
+
+    # Plot 4: Reassignment reasons (middle right)
+    ax4 = fig.add_subplot(gs[1, 1])
+    if reassignments:
+        reassignment_reasons = defaultdict(int)
+        for job_id, info in reassignments.items():
+            reassignment_reasons[info.get("reason", "unknown")] += 1
+
+        reasons = list(reassignment_reasons.keys())
+        counts = list(reassignment_reasons.values())
+        reason_colors = {'failure': '#e74c3c', 'delegation': '#3498db', 'timeout': '#f39c12', 'unknown': '#95a5a6'}
+        bar_colors = [reason_colors.get(r, '#95a5a6') for r in reasons]
+
+        bars = ax4.bar(reasons, counts, color=bar_colors, alpha=0.8, edgecolor='black', linewidth=1.5)
+        ax4.set_ylabel('Count', fontsize=12, fontweight='bold')
+        ax4.set_title('Reassignment Reasons', fontsize=14, fontweight='bold')
+        ax4.grid(axis='y', alpha=0.3)
+
+        # Add value labels
+        for bar, val in zip(bars, counts):
+            height = bar.get_height()
+            ax4.text(bar.get_x() + bar.get_width()/2., height,
+                    f'{int(val)}',
+                    ha='center', va='bottom', fontsize=12, fontweight='bold')
+    else:
+        ax4.text(0.5, 0.5, 'No Reassignment Data',
+                ha='center', va='center', fontsize=12, transform=ax4.transAxes)
+        ax4.set_title('Reassignment Reasons', fontsize=14, fontweight='bold')
+
+    # Plot 5: Timeline of failures and reassignments (bottom, spans both columns)
+    ax5 = fig.add_subplot(gs[2, :])
+
+    # Get start time from jobs
+    csv_file = f"{output_dir}/all_jobs.csv"
+    if os.path.exists(csv_file):
+        df = pd.read_csv(csv_file)
+        if not df.empty and "submitted_at" in df.columns:
+            start_time = df["submitted_at"].min()
+
+            # Plot failures
+            failure_times = []
+            failure_agents = []
+            for f in failures:
+                if f.get("failure_time"):
+                    failure_times.append(f["failure_time"] - start_time)
+                    failure_agents.append(f["agent_id"])
+
+            if failure_times:
+                ax5.scatter(failure_times, [1]*len(failure_times),
+                           s=200, c='#e74c3c', marker='X', alpha=0.8,
+                           edgecolors='black', linewidths=2, label='Agent Failures', zorder=3)
+
+                # Add agent ID labels
+                for t, aid in zip(failure_times, failure_agents):
+                    ax5.annotate(f'A{aid}', (t, 1), xytext=(0, 10),
+                               textcoords='offset points', ha='center',
+                               fontsize=9, fontweight='bold')
+
+            # Plot reassignments
+            reassignment_times = []
+            reassignment_jobs = []
+            for job_id, info in reassignments.items():
+                timestamp = info.get("timestamp", 0)
+                if timestamp:
+                    reassignment_times.append(timestamp - start_time)
+                    reassignment_jobs.append(job_id)
+
+            if reassignment_times:
+                ax5.scatter(reassignment_times, [0.5]*len(reassignment_times),
+                           s=100, c='#f39c12', marker='o', alpha=0.7,
+                           edgecolors='black', linewidths=1.5, label='Job Reassignments', zorder=3)
+
+            ax5.set_xlabel('Time (seconds from start)', fontsize=12, fontweight='bold')
+            ax5.set_ylabel('Event Type', fontsize=12, fontweight='bold')
+            ax5.set_yticks([0.5, 1])
+            ax5.set_yticklabels(['Reassignments', 'Failures'])
+            ax5.set_title('Timeline of Failure Events', fontsize=14, fontweight='bold')
+            ax5.legend(loc='upper right', fontsize=11)
+            ax5.grid(True, alpha=0.3)
+            ax5.set_ylim(0, 1.5)
+        else:
+            ax5.text(0.5, 0.5, 'No timeline data available',
+                    ha='center', va='center', fontsize=12, transform=ax5.transAxes)
+    else:
+        ax5.text(0.5, 0.5, 'No job data available for timeline',
+                ha='center', va='center', fontsize=12, transform=ax5.transAxes)
+
+    plt.savefig(os.path.join(output_dir, "failure_summary.png"), dpi=300, bbox_inches="tight")
+    plt.close()
+
+    print(f"Saved: {os.path.join(output_dir, 'failure_summary.png')}")
+    print(f"  - Failed agents: {len(failures)}")
+    print(f"  - Reassigned jobs: {len(reassignments)}")
+
+    # Save detailed data to CSV
+    if failures:
+        failures_df = pd.DataFrame(failures)
+        failures_df.to_csv(os.path.join(output_dir, "failed_agents.csv"), index=False)
+        print(f"Saved: {os.path.join(output_dir, 'failed_agents.csv')}")
+
+    if reassignments:
+        reassignments_list = [{"job_id": jid, **info} for jid, info in reassignments.items()]
+        reassignments_df = pd.DataFrame(reassignments_list)
+        reassignments_df.to_csv(os.path.join(output_dir, "reassigned_jobs.csv"), index=False)
+        print(f"Saved: {os.path.join(output_dir, 'reassigned_jobs.csv')}")
 
 
 def plot_timeline_with_failures(output_dir: str, repo: Repository | None = None,
@@ -750,7 +965,7 @@ def plot_timeline_with_failures(output_dir: str, repo: Repository | None = None,
     active_counts = active_agents_series.values
 
     # Detect failures
-    failures = detect_agent_failures(output_dir, repo)
+    failures, _ = detect_agent_failures(output_dir, repo)
 
     # Convert times to relative (seconds from start)
     throughput_times_rel = [t - start_time for t in throughput_times]
@@ -844,7 +1059,7 @@ def analyze_throughput_degradation(output_dir: str, repo: Repository | None = No
     end_time = df["completed_at"].max()
 
     # Detect failures
-    failures = detect_agent_failures(output_dir, repo)
+    failures, _ = detect_agent_failures(output_dir, repo)
 
     if not failures:
         print("No failures detected - cannot compute degradation metrics")
@@ -903,8 +1118,11 @@ def analyze_throughput_degradation(output_dir: str, repo: Repository | None = No
             recovery_time = bin_start - first_failure
             break
 
+    # Get reassignment data for additional context
+    reassignments = collect_reassignments(output_dir, repo)
+
     # Generate visualization
-    fig, axes = plt.subplots(2, 1, figsize=(12, 8))
+    fig, axes = plt.subplots(3, 1, figsize=(12, 10))
 
     # Subplot 1: Throughput comparison bar chart
     categories = ['Baseline\n(pre-failure)', 'During Failure\n(+60s)', 'Degradation']
@@ -918,7 +1136,7 @@ def analyze_throughput_degradation(output_dir: str, repo: Repository | None = No
 
     # Add value labels on bars
     for i, (cat, val) in enumerate(zip(categories[:2], values[:2])):
-        axes[0].text(i, val + 0.02 * max(values[:2]), f'{val:.3f}',
+        axes[0].text(i, val + 0.02 * max(values[:2]) if max(values[:2]) > 0 else 0.01, f'{val:.3f}',
                     ha='center', va='bottom', fontsize=10, fontweight='bold')
 
     # Subplot 2: Degradation percentage and recovery
@@ -938,7 +1156,24 @@ def analyze_throughput_degradation(output_dir: str, repo: Repository | None = No
 
     # Add value labels
     for i, (m, v) in enumerate(zip(metrics, metric_values)):
-        axes[1].text(i, v + 0.02 * max(metric_values), f'{v:.2f}',
+        axes[1].text(i, v + 0.02 * max(metric_values) if max(metric_values) > 0 else 0.01, f'{v:.2f}',
+                    ha='center', va='bottom', fontsize=10, fontweight='bold')
+
+    # Subplot 3: Failure impact metrics
+    impact_categories = ['Failed\nAgents', 'Reassigned\nJobs']
+    impact_values = [len(failures), len(reassignments)]
+    impact_colors = ['#e74c3c', '#f39c12']
+
+    bars = axes[2].bar(impact_categories, impact_values, color=impact_colors, alpha=0.7, edgecolor='black')
+    axes[2].set_ylabel("Count", fontsize=11)
+    axes[2].set_title("Failure Impact Metrics", fontsize=12, fontweight='bold')
+    axes[2].grid(axis='y', alpha=0.3)
+
+    # Add value labels
+    for bar, val in zip(bars, impact_values):
+        height = bar.get_height()
+        axes[2].text(bar.get_x() + bar.get_width()/2., height + 0.02 * max(impact_values) if max(impact_values) > 0 else 0.5,
+                    f'{int(val)}',
                     ha='center', va='bottom', fontsize=10, fontweight='bold')
 
     plt.tight_layout()
@@ -954,7 +1189,8 @@ def analyze_throughput_degradation(output_dir: str, repo: Repository | None = No
         "baseline_jobs": [len(baseline_df)],
         "failure_period_jobs": [len(failure_df)],
         "first_failure_time": [first_failure - start_time],
-        "num_failures": [len(failures)]
+        "num_failed_agents": [len(failures)],
+        "num_reassigned_jobs": [len(reassignments)]
     }
 
     pd.DataFrame(metrics_data).to_csv(
@@ -973,7 +1209,8 @@ def analyze_throughput_degradation(output_dir: str, repo: Repository | None = No
         print(f"Recovery time (to 95% baseline):   {recovery_time:.2f} seconds")
     else:
         print(f"Recovery time (to 95% baseline):   Not achieved within test duration")
-    print(f"Number of agent failures:          {len(failures)}")
+    print(f"Number of failed agents:           {len(failures)}")
+    print(f"Number of reassigned jobs:         {len(reassignments)}")
     print("="*60)
     print(f"Saved: {os.path.join(output_dir, 'throughput_degradation_analysis.png')}")
     print(f"Saved: {os.path.join(output_dir, 'throughput_degradation_metrics.csv')}")
@@ -1248,6 +1485,14 @@ def plot_reasoning_time_overhead(output_dir: str):
         print(f"{jobs_csv} not found - skipping reasoning time analysis")
         return
 
+    # Check if there are LLM agents before generating reasoning plots
+    agent_types, _ = identify_agent_types(agents_csv)
+    has_llm_agents = any(agent_type == "LLM" for agent_type in agent_types.values())
+
+    if not has_llm_agents:
+        print("No LLM agents detected - skipping reasoning time overhead analysis")
+        return
+
     df_jobs = pd.read_csv(jobs_csv)
 
     # Check if reasoning_time column exists
@@ -1255,7 +1500,6 @@ def plot_reasoning_time_overhead(output_dir: str):
         print("No reasoning_time data available - skipping analysis")
         return
 
-    agent_types, _ = identify_agent_types(agents_csv)
     df_jobs['agent_type'] = df_jobs['leader_id'].map(agent_types)
     df_jobs['scheduling_latency'] = df_jobs['assigned_at'] - df_jobs['submitted_at']
 
@@ -1612,10 +1856,13 @@ if __name__ == "__main__":
     # Agent loads prefer Redis; fallback to files
     plot_agent_loads(args.output_dir, repo)
 
-    # NEW: Timeline with failure events (visualization #1)
+    # NEW: Failure summary with failed agents and reassigned jobs (visualization #1)
+    plot_failure_summary(args.output_dir, repo)
+
+    # NEW: Timeline with failure events (visualization #2)
     plot_timeline_with_failures(args.output_dir, repo, window_size=10)
 
-    # NEW: Throughput degradation analysis (visualization #2)
+    # NEW: Throughput degradation analysis (visualization #3)
     analyze_throughput_degradation(args.output_dir, repo, window_size=10, baseline_duration=30)
 
     # Hierarchical topology-specific plots
@@ -1652,7 +1899,7 @@ if __name__ == "__main__":
         print("="*60 + "\n")
     else:
         # Scheduling latency & jobs (ALL jobs)
-        plot_scheduling_latency_and_jobs(args.output_dir, args.agents, level=None)
+        plot_scheduling_latency_and_jobs(args.output_dir, args.agents, level=0)
         plot_reasoning_time(args.output_dir)
 
         # Scheduling latency & jobs (EXCLUDING restarted jobs)
@@ -1662,6 +1909,6 @@ if __name__ == "__main__":
                 args.agents,
                 exclude_job_ids=restarted_job_ids,
                 label_suffix="_no_restarts",
-                level=None
+                level=0
             )
 
