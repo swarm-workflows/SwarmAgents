@@ -39,7 +39,6 @@ dtns:
     user: "dtn_user2"
     connectivity_score: 0.87
 runtime:
-  max_pending_elections: 100
   empty_timeout_seconds: 300
   reselection_timeout_s: 60
   peer_expiry_seconds: 20
