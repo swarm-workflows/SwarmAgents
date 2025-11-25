@@ -450,15 +450,53 @@ class SwarmConfigGenerator:
                 print("Minimum number of agents for hierarchical topology is 30")
                 return
             agent_topo = {}
-            num_groups = 10 if self.num_agents > 30 else 5
-            group_size = 10 if self.num_agents > 30 else 5
 
-            # Level 0 (leaf agents)
+            # Determine hierarchy structure based on agent count
+            if self.num_agents == 30:
+                # Two-level: 25 Level-0 + 5 Level-1 = 30
+                num_groups = 5
+                group_size = 5
+                num_super_groups = 0  # No Level 2
+                level_1_base = 26
+
+            elif self.num_agents == 100:
+                # Three-level: 80 Level-0 + 16 Level-1 + 4 Level-2 = 100
+                num_super_groups = 4
+                groups_per_super_group = 4
+                num_groups = num_super_groups * groups_per_super_group  # 16 groups
+                group_size = 5
+                level_1_base = 81
+                level_2_base = 97
+
+            elif self.num_agents <= 110:
+                # Two-level: 100 Level-0 + 10 Level-1 = 110
+                num_groups = 10
+                group_size = 10
+                num_super_groups = 0  # No Level 2
+                level_1_base = 101
+
+            elif self.num_agents == 1000:
+                # Three-level: 900 Level-0 + 90 Level-1 + 10 Level-2 = 1000
+                num_super_groups = 10
+                groups_per_super_group = 9
+                num_groups = num_super_groups * groups_per_super_group  # 90 groups
+                group_size = 10
+                level_1_base = 901
+                level_2_base = 991
+
+            else:
+                print(f"Hierarchical topology currently supports 30, 100, 110, or 1000 agents (got {self.num_agents})")
+                return
+
+            # Level 0 (leaf/worker agents)
             for group in range(num_groups):
                 start = group * group_size + 1
-                end = min(start + group_size, self.num_agents + 1)
-                base = 101 if self.num_agents > 30 else 26
-                parent_id = base + group
+                end = start + group_size
+                parent_id = level_1_base + group
+
+                # For 3-level hierarchy, determine super-group
+                super_group = group // groups_per_super_group if num_super_groups > 0 else 0
+
                 for agent_id in range(start, end):
                     peers = [a for a in range(start, end) if a != agent_id]
                     agent_topo[agent_id] = {
@@ -468,23 +506,66 @@ class SwarmConfigGenerator:
                         "group": group,
                         "level": 0,
                         "group_size": group_size,
-                        "group_count": num_groups
-
+                        "group_count": num_groups,
+                        "super_group": super_group
                     }
 
-            # Level 1 (parent agents)
+            # Level 1 (group coordinators)
             for group in range(num_groups):
-                base = 101 if self.num_agents > 30 else 26
-                parent_id = base + group
+                parent_id = level_1_base + group
+
+                if num_super_groups > 0:
+                    # Three-level hierarchy: Level-1 coordinators form groups within super-groups
+                    super_group = group // groups_per_super_group
+                    super_group_start = super_group * groups_per_super_group
+                    super_group_end = super_group_start + groups_per_super_group
+
+                    # Peers are other Level-1 coordinators in same super-group
+                    peers = [level_1_base + i for i in range(super_group_start, super_group_end) if i != group]
+                    level_1_parent = level_2_base + super_group
+                else:
+                    # Two-level hierarchy: Level-1 coordinators form flat mesh
+                    peers = [level_1_base + i for i in range(num_groups) if i != group]
+                    level_1_parent = None
+
+                # Level-1 group metadata should reflect the super-group (not the child group id)
+                l1_group = super_group if num_super_groups > 0 else group
+                l1_group_count = num_super_groups if num_super_groups > 0 else num_groups
+                # Level 1 group_size should be the number of Level 1 coordinators in the peer group
+                l1_group_size = groups_per_super_group if num_super_groups > 0 else num_groups
+
                 agent_topo[parent_id] = {
-                    "peers": [base + i for i in range(num_groups) if i != group],
-                    "parent": None,
+                    "peers": peers,
+                    "parent": level_1_parent,
                     "children": [group],
-                    "group": 0,
+                    "group": l1_group,
                     "level": 1,
-                    "group_size": group_size,
-                    "group_count": num_groups
+                    "group_size": l1_group_size,
+                    "group_count": l1_group_count,
+                    "super_group": super_group if num_super_groups > 0 else 0
                 }
+
+            # Level 2 (super-coordinators) - only for three-level hierarchy
+            if num_super_groups > 0:
+                for super_group in range(num_super_groups):
+                    super_coord_id = level_2_base + super_group
+
+                    # Peers are other Level-2 super-coordinators
+                    peers = [level_2_base + i for i in range(num_super_groups) if i != super_group]
+
+                    # Children is the Level 1 group (super_group) managed by this Level 2 agent
+                    children = [super_group]
+
+                    agent_topo[super_coord_id] = {
+                        "peers": peers,
+                        "parent": None,
+                        "children": children,
+                        "group": 0,
+                        "level": 2,
+                        "group_size": groups_per_super_group,
+                        "group_count": num_super_groups,
+                        "super_group": super_group
+                    }
 
         else:
             # default to full mesh (backward compatible)

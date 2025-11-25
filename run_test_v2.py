@@ -356,7 +356,12 @@ def produce_jobs(args) -> None:
         "--redis-host", args.db_host,
     ]
     if args.topology == "hierarchical":
-        jobs_cmd.extend(["--level", "1"])
+        # For 3-tier hierarchies (100 or 1000 agents), jobs enter at Level 2
+        # For 2-tier hierarchies (30 or 110 agents), jobs enter at Level 1
+        if args.agents in [100, 1000]:
+            jobs_cmd.extend(["--level", "2"])
+        else:
+            jobs_cmd.extend(["--level", "1"])
     if args.debug:
         jobs_cmd.append("--debug")
     log("Producing jobs …")

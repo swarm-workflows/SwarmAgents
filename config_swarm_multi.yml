@@ -40,8 +40,8 @@ dtns:
     connectivity_score: 0.87
 runtime:
   empty_timeout_seconds: 300
-  reselection_timeout_s: 60
-  peer_expiry_seconds: 20
+  reselection_timeout_s: 120
+  peer_expiry_seconds: 45
   results_dir: swarm-multi
   shutdown_mode: manual
   total_agents: 5

@@ -1645,25 +1645,35 @@ def plot_job_distribution_by_hierarchy(output_dir: str):
 def plot_latency_comparison_by_hierarchy_level(output_dir: str):
     """
     Compare scheduling latency between hierarchy levels.
-    Level 1 = Parent (top-level/LLM agents)
-    Level 0 = Children (worker/resource agents)
-    Uses level-specific job entries from Redis (level0_jobs.csv and level1_jobs.csv).
+    Level 2 = Top-level (LLM agents)
+    Level 1 = Mid-level
+    Level 0 = Bottom-level (worker/resource agents)
+    Uses level-specific job entries from Redis (level0_jobs.csv, level1_jobs.csv, level2_jobs.csv).
     """
     level0_csv = f"{output_dir}/level0_jobs.csv"
     level1_csv = f"{output_dir}/level1_jobs.csv"
+    level2_csv = f"{output_dir}/level2_jobs.csv"
 
-    if not os.path.exists(level0_csv) or not os.path.exists(level1_csv):
+    # Check if at least one level file exists
+    has_files = os.path.exists(level0_csv) or os.path.exists(level1_csv) or os.path.exists(level2_csv)
+    if not has_files:
         print(f"Level-specific job files not found - skipping hierarchy level latency comparison")
         return
 
-    df_level0 = pd.read_csv(level0_csv)
-    df_level1 = pd.read_csv(level1_csv)
+    # Load dataframes for each level (if they exist)
+    df_level0 = pd.read_csv(level0_csv) if os.path.exists(level0_csv) else pd.DataFrame()
+    df_level1 = pd.read_csv(level1_csv) if os.path.exists(level1_csv) else pd.DataFrame()
+    df_level2 = pd.read_csv(level2_csv) if os.path.exists(level2_csv) else pd.DataFrame()
 
     # Filter out invalid rows
-    df_level0 = df_level0[df_level0['scheduling_latency'].notna()].copy()
-    df_level1 = df_level1[df_level1['scheduling_latency'].notna()].copy()
+    if not df_level0.empty:
+        df_level0 = df_level0[df_level0['scheduling_latency'].notna()].copy()
+    if not df_level1.empty:
+        df_level1 = df_level1[df_level1['scheduling_latency'].notna()].copy()
+    if not df_level2.empty:
+        df_level2 = df_level2[df_level2['scheduling_latency'].notna()].copy()
 
-    if df_level0.empty and df_level1.empty:
+    if df_level0.empty and df_level1.empty and df_level2.empty:
         print("No valid latency data for hierarchy level comparison")
         return
 
@@ -1673,15 +1683,18 @@ def plot_latency_comparison_by_hierarchy_level(output_dir: str):
     # Plot 1: Box plot comparison
     data_to_plot = []
     labels = []
+    if not df_level2.empty:
+        data_to_plot.append(df_level2['scheduling_latency'].dropna())
+        labels.append(f'Level 2 (Top)\n(n={len(df_level2)})')
     if not df_level1.empty:
         data_to_plot.append(df_level1['scheduling_latency'].dropna())
-        labels.append(f'Level 1 (Parent)\n(n={len(df_level1)})')
+        labels.append(f'Level 1 (Mid)\n(n={len(df_level1)})')
     if not df_level0.empty:
         data_to_plot.append(df_level0['scheduling_latency'].dropna())
-        labels.append(f'Level 0 (Children)\n(n={len(df_level0)})')
+        labels.append(f'Level 0 (Bottom)\n(n={len(df_level0)})')
 
     bp = axes[0, 0].boxplot(data_to_plot, labels=labels, patch_artist=True, showfliers=False)
-    colors = ['#4ECDC4', '#FF6B6B']  # Parent: cyan, Children: red
+    colors = ['#9B59B6', '#4ECDC4', '#FF6B6B']  # Level 2: purple, Level 1: cyan, Level 0: red
     for patch, color in zip(bp['boxes'], colors[:len(bp['boxes'])]):
         patch.set_facecolor(color)
     axes[0, 0].set_ylabel('Scheduling Latency (s)', fontsize=11)
@@ -1694,14 +1707,19 @@ def plot_latency_comparison_by_hierarchy_level(output_dir: str):
         all_latencies.extend(df_level0['scheduling_latency'].tolist())
     if not df_level1.empty:
         all_latencies.extend(df_level1['scheduling_latency'].tolist())
+    if not df_level2.empty:
+        all_latencies.extend(df_level2['scheduling_latency'].tolist())
 
     bins = np.linspace(min(all_latencies), max(all_latencies), 30)
+    if not df_level2.empty:
+        axes[0, 1].hist(df_level2['scheduling_latency'], bins=bins, alpha=0.5,
+                       label='Level 2 (Top)', color='#9B59B6', edgecolor='black')
     if not df_level1.empty:
-        axes[0, 1].hist(df_level1['scheduling_latency'], bins=bins, alpha=0.6,
-                       label='Level 1 (Parent)', color='#4ECDC4', edgecolor='black')
+        axes[0, 1].hist(df_level1['scheduling_latency'], bins=bins, alpha=0.5,
+                       label='Level 1 (Mid)', color='#4ECDC4', edgecolor='black')
     if not df_level0.empty:
-        axes[0, 1].hist(df_level0['scheduling_latency'], bins=bins, alpha=0.6,
-                       label='Level 0 (Children)', color='#FF6B6B', edgecolor='black')
+        axes[0, 1].hist(df_level0['scheduling_latency'], bins=bins, alpha=0.5,
+                       label='Level 0 (Bottom)', color='#FF6B6B', edgecolor='black')
     axes[0, 1].set_xlabel('Scheduling Latency (s)', fontsize=11)
     axes[0, 1].set_ylabel('Frequency', fontsize=11)
     axes[0, 1].set_title('Latency Histogram by Hierarchy Level', fontsize=12, fontweight='bold')
@@ -1713,14 +1731,19 @@ def plot_latency_comparison_by_hierarchy_level(output_dir: str):
     level_labels = []
     bar_colors = []
 
+    if not df_level2.empty:
+        mean_data.append(df_level2['scheduling_latency'].mean())
+        level_labels.append('Level 2\n(Top)')
+        bar_colors.append('#9B59B6')
+
     if not df_level1.empty:
         mean_data.append(df_level1['scheduling_latency'].mean())
-        level_labels.append('Level 1\n(Parent)')
+        level_labels.append('Level 1\n(Mid)')
         bar_colors.append('#4ECDC4')
 
     if not df_level0.empty:
         mean_data.append(df_level0['scheduling_latency'].mean())
-        level_labels.append('Level 0\n(Children)')
+        level_labels.append('Level 0\n(Bottom)')
         bar_colors.append('#FF6B6B')
 
     x_pos = np.arange(len(mean_data))
@@ -1739,9 +1762,20 @@ def plot_latency_comparison_by_hierarchy_level(output_dir: str):
     # Plot 4: Statistics table
     stats_data = []
 
+    if not df_level2.empty:
+        stats_data.append([
+            'Level 2 (Top)',
+            f"{df_level2['scheduling_latency'].mean():.4f}",
+            f"{df_level2['scheduling_latency'].median():.4f}",
+            f"{df_level2['scheduling_latency'].std():.4f}",
+            f"{df_level2['scheduling_latency'].min():.4f}",
+            f"{df_level2['scheduling_latency'].max():.4f}",
+            f"{len(df_level2)}"
+        ])
+
     if not df_level1.empty:
         stats_data.append([
-            'Level 1 (Parent)',
+            'Level 1 (Mid)',
             f"{df_level1['scheduling_latency'].mean():.4f}",
             f"{df_level1['scheduling_latency'].median():.4f}",
             f"{df_level1['scheduling_latency'].std():.4f}",
@@ -1752,7 +1786,7 @@ def plot_latency_comparison_by_hierarchy_level(output_dir: str):
 
     if not df_level0.empty:
         stats_data.append([
-            'Level 0 (Children)',
+            'Level 0 (Bottom)',
             f"{df_level0['scheduling_latency'].mean():.4f}",
             f"{df_level0['scheduling_latency'].median():.4f}",
             f"{df_level0['scheduling_latency'].std():.4f}",
@@ -1776,13 +1810,11 @@ def plot_latency_comparison_by_hierarchy_level(output_dir: str):
         table[(0, i)].set_facecolor('#E0E0E0')
         table[(0, i)].set_text_props(weight='bold')
 
-    # Color rows
-    if len(stats_data) > 0:
-        for i in range(7):
-            table[(1, i)].set_facecolor('#E5F9F8')  # Level 1 (Parent) - light cyan
-    if len(stats_data) > 1:
-        for i in range(7):
-            table[(2, i)].set_facecolor('#FFE5E5')  # Level 0 (Children) - light red
+    # Color rows (in order: Level 2, Level 1, Level 0)
+    row_colors = ['#F0E6FA', '#E5F9F8', '#FFE5E5']  # Level 2: light purple, Level 1: light cyan, Level 0: light red
+    for row_idx in range(len(stats_data)):
+        for col_idx in range(7):
+            table[(row_idx + 1, col_idx)].set_facecolor(row_colors[row_idx])
 
     axes[1, 1].set_title('Latency Statistics by Level', fontsize=12, fontweight='bold')
 
@@ -1817,23 +1849,27 @@ if __name__ == "__main__":
 
     agents_csv_file = f"{args.output_dir}/all_agents.csv"
 
-    # For hierarchical topologies, fetch jobs from both level 0 and level 1
+    # For hierarchical topologies, fetch jobs from all levels (0, 1, 2)
     if args.hierarchical:
         level0_jobs = repo.get_all_objects(key_prefix=Repository.KEY_JOB, level=0)
         level1_jobs = repo.get_all_objects(key_prefix=Repository.KEY_JOB, level=1)
+        level2_jobs = repo.get_all_objects(key_prefix=Repository.KEY_JOB, level=2)
 
         # Tag jobs with their hierarchy level for analysis
         for job in level0_jobs:
             job['hierarchy_level'] = 0
         for job in level1_jobs:
             job['hierarchy_level'] = 1
+        for job in level2_jobs:
+            job['hierarchy_level'] = 2
 
         # Combine all jobs
-        all_jobs = level0_jobs + level1_jobs
+        all_jobs = level0_jobs + level1_jobs + level2_jobs
 
         # Save level-specific CSVs with level-specific timestamps
         save_jobs(jobs=level0_jobs, path=f"{args.output_dir}/level0_jobs.csv", level=0)
         save_jobs(jobs=level1_jobs, path=f"{args.output_dir}/level1_jobs.csv", level=1)
+        save_jobs(jobs=level2_jobs, path=f"{args.output_dir}/level2_jobs.csv", level=2)
 
         # Save combined all_jobs.csv (uses last timestamps for backward compatibility)
         save_jobs(jobs=all_jobs, path=f"{args.output_dir}/all_jobs.csv", level=None)
@@ -1887,6 +1923,14 @@ if __name__ == "__main__":
             args.agents,
             label_suffix="_level1",
             level=1
+        )
+
+        print("Generating Level 2 latency plots...")
+        plot_scheduling_latency_and_jobs(
+            args.output_dir,
+            args.agents,
+            label_suffix="_level2",
+            level=2
         )
 
         # Also generate comparison plots
