@@ -358,7 +358,8 @@ class Job(Object):
             wt = self.wall_time or 0.0
             self.logger.info("Sleeping for %s seconds to simulate job execution", wt)
             if wt > 0:
-                time.sleep(wt)
+                #time.sleep(wt)
+                time.sleep(1)
 
             # TODO: staged-out transfers using self.data_out if data_transfer
 
