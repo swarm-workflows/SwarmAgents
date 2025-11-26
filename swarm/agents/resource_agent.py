@@ -481,6 +481,7 @@ class ResourceAgent(Agent):
                 job_obj.delegation_failed_count = 1
                 job_obj.add_delegation_failed_agents(self.agent_id)
             else:
+                job_obj.delegation_failed = True
                 job_obj.delegation_failed_count = getattr(job_obj, 'delegation_failed_count', 0) + 1
                 job_obj.add_delegation_failed_agents(self.agent_id)
 
@@ -709,7 +710,6 @@ class ResourceAgent(Agent):
                 total_capacities += child.capacities
                 total_allocations += child.capacity_allocations
 
-                '''
                 # Compute element-wise maximum capacity across children
                 if max_child_capacity is None:
                     max_child_capacity = Capacities(**child.capacities.to_dict())
@@ -718,7 +718,6 @@ class ResourceAgent(Agent):
                         current_max = getattr(max_child_capacity, field)
                         child_value = getattr(child.capacities, field)
                         setattr(max_child_capacity, field, max(current_max, child_value))
-                '''
 
                 if child.dtns:
                     for dtn_name, dtn_obj in child.dtns.items():
@@ -818,30 +817,91 @@ class ResourceAgent(Agent):
         :return: True if job is feasible for the agent, False otherwise.
         :rtype: bool
         """
-        if self.topology.children and self.agent_id in job.delegation_failed_agents:
+        # Prevent parent agents from re-proposing jobs that failed delegation to children
+        # This avoids parent-child competition when a job was delegated but timed out at child level
+        if self.topology.children and agent.agent_id in job.delegation_failed_agents:
             return False
 
-        # Capacity check first (cheapest)
-        # For parent agents, use max_child_capacity to ensure at least one child can handle the job
+        # Cache required DTNs for efficiency (computed once, reused multiple times)
+        # Combines data_in and data_out DTN requirements into a single frozenset
+        if not hasattr(job, "_required_dtns_cache"):
+            rin = {e.name for e in (job.data_in or [])}
+            rout = {e.name for e in (job.data_out or [])}
+            job._required_dtns_cache = frozenset(rin | rout)
+
+        # Special handling when checking feasibility for self as a parent agent
+        # Parent agents must verify that at least ONE actual child can execute the job
+        # (not just the synthetic max_child_capacity aggregate used for peer evaluation)
+        if agent.agent_id == self.agent_id and self.topology.children:
+            # Iterate through all child agents to find at least one capable child
+            for child_info in self.children.values():
+                # Check if child has sufficient capacity for this job
+                if not self._has_sufficient_capacity(job, child_info.capacities):
+                    continue  # Skip this child, try next
+
+                # Check child DTN connectivity only if job requires DTNs
+                # Jobs without DTN requirements (empty _required_dtns_cache) skip this check
+                if job._required_dtns_cache:
+                    # Extract child's available DTN names (handle dict vs list formats)
+                    if isinstance(child_info.dtns, dict):
+                        child_dtn_names = child_info.dtns.keys()
+                    else:
+                        child_dtn_names = [getattr(x, "name", None) or (x.get("name") if isinstance(x, dict) else None)
+                                          for x in (child_info.dtns or [])]
+
+                    # Check if child has ALL required DTNs
+                    if not all(d in child_dtn_names for d in job._required_dtns_cache):
+                        continue  # Skip this child, try next
+
+                # Found a feasible child: has sufficient capacity AND all required DTNs (if any)
+                return True
+
+            # No child can handle this job - infeasible for this parent agent
+            self.logger.debug(f"Agent: {self.agent_id} (parent) - Job {job.job_id} not feasible on any child")
+            return False
+
+        # ============================================================================
+        # PEER EVALUATION (Hierarchical Limitation)
+        # ============================================================================
+        # When evaluating peer agents at level 1 or higher, we can only use aggregate
+        # metrics (max_child_capacity, aggregated DTN connectivity) as estimates.
+        #
+        # LIMITATION: This is an optimistic estimate that may not reflect actual
+        # child capabilities within the peer's subtree. For example:
+        #   - max_child_capacity shows the peer has ONE child with sufficient resources
+        #   - Aggregated DTNs show the peer has children with required DTNs
+        #   - BUT: No single child may have BOTH the capacity AND the DTNs
+        #
+        # CONSEQUENCE: Cascading delegation failures at hierarchical levels:
+        #   1. Peer agent appears to be best candidate (lower cost based on aggregates)
+        #   2. Peer wins consensus and is assigned the job
+        #   3. Peer delegates to its children
+        #   4. None of peer's children can actually handle the job (lack capacity OR DTNs)
+        #   5. Delegation times out (delegation_timeout_s) and job is reassigned
+        #   6. Job returns to parent level for re-selection
+        #   7. Process repeats until a parent with capable children is found
+        #
+        # This is a known tradeoff in distributed hierarchical scheduling:
+        #   - Accurate feasibility requires querying all children (expensive, not scalable)
+        #   - Aggregate metrics enable fast distributed decisions (scalable, but optimistic)
+        #   - Delegation monitoring and reassignment recovers from incorrect estimates
+        # ============================================================================
+
+        # Standard feasibility check for leaf agents or when evaluating peers
+        # For parent agents, use max_child_capacity as best estimate (see limitation above)
         # For leaf agents, use their own capacities
         if agent.max_child_capacity is not None:
-            # Parent agent: check against max capacity of any single child
             available = agent.max_child_capacity
         else:
-            # Leaf agent: check against own capacities
             available = agent.capacities
 
         if not self._has_sufficient_capacity(job, available):
             self.logger.debug(f"Agent: {self.agent_id} does not have capacity for Job {job.job_id}")
             return False
 
-        # DTN connectivity
-        if not hasattr(job, "_required_dtns_cache"):
-            rin = {e.name for e in (job.data_in or [])}
-            rout = {e.name for e in (job.data_out or [])}
-            job._required_dtns_cache = frozenset(rin | rout)
-
-        # normalize agent.dtns to a set of names once per agent signature (already in _agent_sig)
+        # DTN connectivity check using aggregated DTN info from peer's children
+        # NOTE: This checks if the peer has ANY children with required DTNs,
+        # not whether a SINGLE child has all required DTNs (see limitation above)
         if isinstance(agent.dtns, dict):
             agent_dtn_names = agent.dtns.keys()
         else:

@@ -460,11 +460,14 @@ class SwarmConfigGenerator:
                 level_1_base = 26
 
             elif self.num_agents == 100:
-                # Three-level: 80 Level-0 + 16 Level-1 + 4 Level-2 = 100
+                # Three-level: Level-0 80 - 16 groups of 5
+                # Level-1: 16 (81-96) - 4 groups of 4
+                # Level-2: 4 (97-100) - 1 group of 4
                 num_super_groups = 4
                 groups_per_super_group = 4
                 num_groups = num_super_groups * groups_per_super_group  # 16 groups
                 group_size = 5
+                super_group_size = 4
                 level_1_base = 81
                 level_2_base = 97
 
@@ -475,17 +478,27 @@ class SwarmConfigGenerator:
                 num_super_groups = 0  # No Level 2
                 level_1_base = 101
 
+            elif self.num_agents == 250:
+                # Two-level: 225 Level-0 + 25 Level-1 = 250
+                num_groups = 25
+                group_size = 9
+                num_super_groups = 0  # No Level 2
+                level_1_base = 226
+
             elif self.num_agents == 1000:
-                # Three-level: 900 Level-0 + 90 Level-1 + 10 Level-2 = 1000
+                # Three-level: Level-0 900 - 90 groups of 10
+                # Level-1: 90 (901-990) - 10 groups of 9
+                # Level-2: 10 (991-1000) - 1 group of 10
                 num_super_groups = 10
                 groups_per_super_group = 9
+                super_group_size = 10
                 num_groups = num_super_groups * groups_per_super_group  # 90 groups
                 group_size = 10
                 level_1_base = 901
                 level_2_base = 991
 
             else:
-                print(f"Hierarchical topology currently supports 30, 100, 110, or 1000 agents (got {self.num_agents})")
+                print(f"Hierarchical topology currently supports 30, 100, 110, 250, or 1000 agents (got {self.num_agents})")
                 return
 
             # Level 0 (leaf/worker agents)
@@ -529,8 +542,9 @@ class SwarmConfigGenerator:
                     level_1_parent = None
 
                 # Level-1 group metadata should reflect the super-group (not the child group id)
-                l1_group = super_group if num_super_groups > 0 else group
-                l1_group_count = num_super_groups if num_super_groups > 0 else num_groups
+                # For 2-level hierarchies, all Level-1 agents are in the same group (0)
+                l1_group = super_group if num_super_groups > 0 else 0
+                l1_group_count = num_super_groups if num_super_groups > 0 else 1
                 # Level 1 group_size should be the number of Level 1 coordinators in the peer group
                 l1_group_size = groups_per_super_group if num_super_groups > 0 else num_groups
 
@@ -562,8 +576,8 @@ class SwarmConfigGenerator:
                         "children": children,
                         "group": 0,
                         "level": 2,
-                        "group_size": groups_per_super_group,
-                        "group_count": num_super_groups,
+                        "group_size": super_group_size,
+                        "group_count": 1,
                         "super_group": super_group
                     }
 
