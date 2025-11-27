@@ -357,9 +357,17 @@ class ProposalContainer:
             for p in bucket.values():
                 if p.p_id == proposal.p_id:
                     continue
+                '''
                 if (p.cost < proposal.cost) or (
                         p.cost == proposal.cost and (p.agent_id or "") < (proposal.agent_id or "")
                 ):
                     best = p
                     break
+                '''
+                # Find the minimum cost proposal
+                if best is None or p.cost < best.cost or (p.cost == best.cost and (p.agent_id or "") < (best.agent_id or
+                                                                                                        "")):
+                    if (p.cost < proposal.cost) or (p.cost == proposal.cost and (p.agent_id or "") < (proposal.agent_id
+                                                                                                      or "")):
+                        best = p
             return best

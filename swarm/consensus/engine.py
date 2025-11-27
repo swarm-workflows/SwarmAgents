@@ -82,12 +82,26 @@ class ConsensusEngine:
                 self.host.log_debug(f"Already accepted better proposal for Object {object.object_id} from peer {peer_better.agent_id} Cost: {peer_better.cost}")
                 self.conflicts[object.object_id] = self.conflicts.get(object.object_id, 0) + 1
             else:
+                '''
                 if my_better:
                     self.host.log_debug(f"Removed my Proposal: {my_better} in favor of incoming proposal {proposal}")
                     self.outgoing.remove_proposal(p_id=my_better.p_id, object_id=object.object_id)
                 if peer_better:
                     self.host.log_debug(f"Removed peer Proposal: {peer_better} in favor of incoming proposal {proposal}")
                     self.incoming.remove_proposal(p_id=peer_better.p_id, object_id=object.object_id)
+                '''
+                # Incoming proposal is better - remove any worse existing proposals
+                existing_outgoing = self.outgoing.get_proposal(object_id=object.object_id)
+                if existing_outgoing:
+                    self.host.log_debug(
+                        f"Removed my proposal {existing_outgoing.p_id} in favor of incoming {proposal.p_id}")
+                    self.outgoing.remove_proposal(p_id=existing_outgoing.p_id, object_id=object.object_id)
+
+                existing_incoming = self.incoming.get_proposal(object_id=object.object_id)
+                if existing_incoming and existing_incoming.p_id != proposal.p_id:
+                    self.host.log_debug(
+                        f"Removed peer proposal {existing_incoming.p_id} in favor of incoming {proposal.p_id}")
+                    self.incoming.remove_proposal(p_id=existing_incoming.p_id, object_id=object.object_id)
 
                 proposals.append(proposal)
                 if msg.agents[0].agent_id not in proposal.prepares:
