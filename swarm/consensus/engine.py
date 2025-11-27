@@ -55,9 +55,14 @@ class ConsensusEngine:
         msg = Proposal(source=self.agent_id,
                        agents=[AgentInfo(agent_id=self.agent_id)],
                        proposals=proposals)
-        self.transport.broadcast(payload=msg)
         for proposal in proposals:
+            # Proposer implicitly prepares its own proposal
+            if self.agent_id not in proposal.prepares:
+                proposal.prepares.append(self.agent_id)
             self.outgoing.add_proposal(proposal)
+        self.transport.broadcast(payload=msg)
+        #for proposal in proposals:
+        #    self.outgoing.add_proposal(proposal)
 
     def on_proposal(self, msg: Proposal) -> None:
         proposals = []
@@ -104,8 +109,8 @@ class ConsensusEngine:
                     self.incoming.remove_proposal(p_id=existing_incoming.p_id, object_id=object.object_id)
 
                 proposals.append(proposal)
-                if msg.agents[0].agent_id not in proposal.prepares:
-                    proposal.prepares.append(msg.agents[0].agent_id)
+                #if msg.agents[0].agent_id not in proposal.prepares:
+                #    proposal.prepares.append(msg.agents[0].agent_id)
                 self.incoming.add_proposal(proposal)
                 object.state = ObjectState.PREPARE
             #if not self.incoming.contains(p_id=proposal.p_id, object_id=object.object_id):
