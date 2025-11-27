@@ -1119,6 +1119,10 @@ class ResourceAgent(Agent):
                 agent_ids = list(agents_map.keys())
                 agents = [agents_map.get(aid) for aid in agent_ids if agents_map.get(aid) is not None]
 
+                # TEMP HACK
+                if self.topology.level == 2:
+                    agents = [agents_map.get(self.agent_id)]
+
                 # Build once
                 cost_matrix = self.selector.compute_cost_matrix(
                     assignees=agents,
