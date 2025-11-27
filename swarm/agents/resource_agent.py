@@ -1120,7 +1120,7 @@ class ResourceAgent(Agent):
                 agents = [agents_map.get(aid) for aid in agent_ids if agents_map.get(aid) is not None]
 
                 # TEMP HACK
-                if self.topology.level == 2:
+                if self.topology.level > 0:
                     agents = [agents_map.get(self.agent_id)]
 
                 # Build once
