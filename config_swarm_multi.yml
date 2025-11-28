@@ -47,7 +47,7 @@ runtime:
   total_agents: 5
   jobs_per_proposal: 20
   executor_workers: 10
-  failure_threshold_seconds: 30        # Time before declaring agent as failed
+  failure_threshold_seconds: 60        # Time before declaring agent as failed
   max_failed_agents: 0                 # Maximum tolerable failures (0 = unlimited)
   job_reassignment_enabled: true       # Enable automatic job reassignment
   aggressive_failure_detection: true  # Use proactive failure detection from gRPC

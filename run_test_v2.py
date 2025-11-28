@@ -358,7 +358,7 @@ def produce_jobs(args) -> None:
     if args.topology == "hierarchical":
         # For 3-tier hierarchies (100 or 1000 agents), jobs enter at Level 2
         # For 2-tier hierarchies (30 or 110 agents), jobs enter at Level 1
-        if args.agents in [100, 1000]:
+        if args.agents in [100, 1000, 990]:
             jobs_cmd.extend(["--level", "2"])
         else:
             jobs_cmd.extend(["--level", "1"])

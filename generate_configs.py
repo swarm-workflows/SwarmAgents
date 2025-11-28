@@ -485,6 +485,18 @@ class SwarmConfigGenerator:
                 num_super_groups = 0  # No Level 2
                 level_1_base = 226
 
+            elif self.num_agents == 990:
+                # Three-level: Level-0 880 - 88 groups of 10
+                # Level-1: 88 (881-968) - 22 super-groups of 4
+                # Level-2: 22 (969-990) - 1 group of 22
+                num_super_groups = 22
+                groups_per_super_group = 4
+                super_group_size = 22
+                num_groups = num_super_groups * groups_per_super_group  # 88 groups
+                group_size = 10
+                level_1_base = 881
+                level_2_base = 969
+
             elif self.num_agents == 1000:
                 # Three-level: Level-0 900 - 90 groups of 10
                 # Level-1: 90 (901-990) - 10 groups of 9
@@ -498,7 +510,7 @@ class SwarmConfigGenerator:
                 level_2_base = 991
 
             else:
-                print(f"Hierarchical topology currently supports 30, 100, 110, 250, or 1000 agents (got {self.num_agents})")
+                print(f"Hierarchical topology currently supports 30, 100, 110, 250, 990, or 1000 agents (got {self.num_agents})")
                 return
 
             # Level 0 (leaf/worker agents)
