@@ -1968,55 +1968,97 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Plot scheduling latency, jobs per agent, conflicts/restarts, and loads")
     parser.add_argument("--output_dir", type=str, default=".", help="Directory where plots and CSV files are saved")
     parser.add_argument("--agents", type=int, required=True, help="Number of agents")
-    parser.add_argument("--db_host", type=str, required=True, help="Database Host")
+    parser.add_argument("--db_host", type=str, required=False, default="localhost", help="Database Host (not required with --from-csv)")
     parser.add_argument("--hierarchical", action="store_true", help="Generate hierarchical topology-specific plots")
     parser.add_argument("--save-csv", action="store_true", help="Export all data to CSV files for later analysis")
     parser.add_argument("--skip-plots", action="store_true", help="Skip plot generation (useful with --save-csv)")
+    parser.add_argument("--from-csv", action="store_true", help="Generate plots from existing CSV files without connecting to Redis")
     args = parser.parse_args()
+
+    # Validate argument combinations
+    if args.from_csv and args.save_csv:
+        print("WARNING: --save-csv is ignored when using --from-csv mode")
+        args.save_csv = False
+
+    if args.from_csv and args.skip_plots:
+        print("ERROR: Cannot use --from-csv with --skip-plots (nothing to do)")
+        exit(1)
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    redis_client = redis.StrictRedis(
-        host=args.db_host,
-        port=6379,
-        decode_responses=True
-    )
-    repo = Repository(redis_client=redis_client)
+    # Create Redis connection only if not using --from-csv mode
+    if args.from_csv:
+        print("Running in CSV-only mode (no Redis connection)")
+        repo = None
+    else:
+        redis_client = redis.StrictRedis(
+            host=args.db_host,
+            port=6379,
+            decode_responses=True
+        )
+        repo = Repository(redis_client=redis_client)
 
     agents_csv_file = f"{args.output_dir}/all_agents.csv"
 
-    # For hierarchical topologies, fetch jobs from all levels (0, 1, 2)
-    if args.hierarchical:
-        level0_jobs = repo.get_all_objects(key_prefix=Repository.KEY_JOB, level=0)
-        level1_jobs = repo.get_all_objects(key_prefix=Repository.KEY_JOB, level=1)
-        level2_jobs = repo.get_all_objects(key_prefix=Repository.KEY_JOB, level=2)
+    # Fetch and save data from Redis (skip if using --from-csv mode)
+    if not args.from_csv:
+        # For hierarchical topologies, fetch jobs from all levels (0, 1, 2)
+        if args.hierarchical:
+            level0_jobs = repo.get_all_objects(key_prefix=Repository.KEY_JOB, level=0)
+            level1_jobs = repo.get_all_objects(key_prefix=Repository.KEY_JOB, level=1)
+            level2_jobs = repo.get_all_objects(key_prefix=Repository.KEY_JOB, level=2)
 
-        # Tag jobs with their hierarchy level for analysis
-        for job in level0_jobs:
-            job['hierarchy_level'] = 0
-        for job in level1_jobs:
-            job['hierarchy_level'] = 1
-        for job in level2_jobs:
-            job['hierarchy_level'] = 2
+            # Tag jobs with their hierarchy level for analysis
+            for job in level0_jobs:
+                job['hierarchy_level'] = 0
+            for job in level1_jobs:
+                job['hierarchy_level'] = 1
+            for job in level2_jobs:
+                job['hierarchy_level'] = 2
 
-        # Combine all jobs
-        all_jobs = level0_jobs + level1_jobs + level2_jobs
+            # Combine all jobs
+            all_jobs = level0_jobs + level1_jobs + level2_jobs
 
-        # Save level-specific CSVs with level-specific timestamps
-        save_jobs(jobs=level0_jobs, path=f"{args.output_dir}/level0_jobs.csv", level=0)
-        save_jobs(jobs=level1_jobs, path=f"{args.output_dir}/level1_jobs.csv", level=1)
-        save_jobs(jobs=level2_jobs, path=f"{args.output_dir}/level2_jobs.csv", level=2)
+            # Save level-specific CSVs with level-specific timestamps
+            save_jobs(jobs=level0_jobs, path=f"{args.output_dir}/level0_jobs.csv", level=0)
+            save_jobs(jobs=level1_jobs, path=f"{args.output_dir}/level1_jobs.csv", level=1)
+            save_jobs(jobs=level2_jobs, path=f"{args.output_dir}/level2_jobs.csv", level=2)
 
-        # Save combined all_jobs.csv (uses last timestamps for backward compatibility)
-        save_jobs(jobs=all_jobs, path=f"{args.output_dir}/all_jobs.csv", level=None)
+            # Save combined all_jobs.csv (uses last timestamps for backward compatibility)
+            save_jobs(jobs=all_jobs, path=f"{args.output_dir}/all_jobs.csv", level=None)
+        else:
+            # For non-hierarchical topologies, fetch from level 0 only
+            all_jobs = repo.get_all_objects(key_prefix=Repository.KEY_JOB, level=0)
+            save_jobs(jobs=all_jobs, path=f"{args.output_dir}/level0_jobs.csv", level=None)
+            save_jobs(jobs=all_jobs, path=f"{args.output_dir}/all_jobs.csv", level=None)
+
+        all_agents = repo.get_all_objects(key_prefix=Repository.KEY_AGENT, level=None)
+        save_agents(agents=all_agents, path=agents_csv_file)
     else:
-        # For non-hierarchical topologies, fetch from level 0 only
-        all_jobs = repo.get_all_objects(key_prefix=Repository.KEY_JOB, level=0)
-        save_jobs(jobs=all_jobs, path=f"{args.output_dir}/level0_jobs.csv", level=None)
-        save_jobs(jobs=all_jobs, path=f"{args.output_dir}/all_jobs.csv", level=None)
+        # Verify required CSV files exist when in --from-csv mode
+        required_files = [agents_csv_file]
+        if args.hierarchical:
+            required_files.extend([
+                f"{args.output_dir}/level0_jobs.csv",
+                f"{args.output_dir}/level1_jobs.csv",
+                f"{args.output_dir}/level2_jobs.csv",
+                f"{args.output_dir}/all_jobs.csv"
+            ])
+        else:
+            required_files.extend([
+                f"{args.output_dir}/level0_jobs.csv",
+                f"{args.output_dir}/all_jobs.csv"
+            ])
 
-    all_agents = repo.get_all_objects(key_prefix=Repository.KEY_AGENT, level=None)
-    save_agents(agents=all_agents, path=agents_csv_file)
+        missing_files = [f for f in required_files if not os.path.exists(f)]
+        if missing_files:
+            print("ERROR: Missing required CSV files for --from-csv mode:")
+            for f in missing_files:
+                print(f"  - {f}")
+            print("\nPlease run without --from-csv first to generate CSV files.")
+            exit(1)
+
+        print(f"Using existing CSV files from {args.output_dir}")
 
     # Gather restarted jobs once
     restarted_job_ids = collect_restarted_job_ids(args.output_dir, repo)
@@ -2029,20 +2071,47 @@ if __name__ == "__main__":
     plot_agent_loads(args.output_dir, repo, save_csv=args.save_csv, skip_plots=args.skip_plots)
 
     # NEW: Failure summary with failed agents and reassigned jobs (visualization #1)
-    plot_failure_summary(args.output_dir, repo)
+    # Note: This function always saves CSVs (failed_agents.csv, reassigned_jobs.csv)
+    if not args.skip_plots:
+        plot_failure_summary(args.output_dir, repo)
 
-    # NEW: Timeline with failure events (visualization #2)
-    plot_timeline_with_failures(args.output_dir, repo, window_size=10)
+        # NEW: Timeline with failure events (visualization #2)
+        plot_timeline_with_failures(args.output_dir, repo, window_size=10)
 
-    # NEW: Throughput degradation analysis (visualization #3)
-    analyze_throughput_degradation(args.output_dir, repo, window_size=10, baseline_duration=30)
+        # NEW: Throughput degradation analysis (visualization #3)
+        analyze_throughput_degradation(args.output_dir, repo, window_size=10, baseline_duration=30)
+    else:
+        # Still run failure detection to export CSVs
+        failures, _ = detect_agent_failures(args.output_dir, repo)
+        reassignments = collect_reassignments(args.output_dir, repo)
+
+        if failures:
+            failures_df = pd.DataFrame(failures)
+            failures_df.to_csv(os.path.join(args.output_dir, "failed_agents.csv"), index=False)
+            print(f"Saved: {os.path.join(args.output_dir, 'failed_agents.csv')}")
+
+        if reassignments:
+            reassignments_list = [
+                {
+                    "job_id": job_id,
+                    "original_agent": info.get("original_agent"),
+                    "new_agent": info.get("new_agent"),
+                    "reassignment_time": info.get("reassignment_time"),
+                    "reason": info.get("reason", "agent_failure")
+                }
+                for job_id, info in reassignments.items()
+            ]
+            reassignments_df = pd.DataFrame(reassignments_list)
+            reassignments_df.to_csv(os.path.join(args.output_dir, "reassigned_jobs.csv"), index=False)
+            print(f"Saved: {os.path.join(args.output_dir, 'reassigned_jobs.csv')}")
 
     # Hierarchical topology-specific plots
     if args.hierarchical:
         print("\n" + "="*60)
         print("HIERARCHICAL TOPOLOGY ANALYSIS")
         print("="*60)
-        plot_hierarchical_topology(args.output_dir, repo)
+        if not args.skip_plots:
+            plot_hierarchical_topology(args.output_dir, repo)
 
         # Plot latency separately for each level
         print("\nGenerating Level 0 latency plots...")
@@ -2076,17 +2145,19 @@ if __name__ == "__main__":
         )
 
         # Also generate comparison plots
-        print("Generating level comparison plots...")
-        plot_latency_comparison_by_hierarchy_level(args.output_dir)
+        if not args.skip_plots:
+            print("Generating level comparison plots...")
+            plot_latency_comparison_by_hierarchy_level(args.output_dir)
 
-        #plot_latency_comparison_by_agent_type(args.output_dir)
-        #plot_reasoning_time_overhead(args.output_dir)
-        #plot_job_distribution_by_hierarchy(args.output_dir)
+            #plot_latency_comparison_by_agent_type(args.output_dir)
+            #plot_reasoning_time_overhead(args.output_dir)
+            #plot_job_distribution_by_hierarchy(args.output_dir)
         print("="*60 + "\n")
     else:
         # Scheduling latency & jobs (ALL jobs)
         plot_scheduling_latency_and_jobs(args.output_dir, args.agents, level=0, save_csv=args.save_csv, skip_plots=args.skip_plots)
-        plot_reasoning_time(args.output_dir)
+        if not args.skip_plots:
+            plot_reasoning_time(args.output_dir)
 
         # Scheduling latency & jobs (EXCLUDING restarted jobs)
         if restarted_job_ids:
