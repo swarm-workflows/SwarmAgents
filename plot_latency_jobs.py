@@ -250,10 +250,16 @@ def plot_agent_loads_from_dir(run_dir):
     plt.savefig(os.path.join(run_dir, "agent_loads_summary.png"))
     print(f"Saved: {os.path.join(run_dir, 'agent_loads_summary.png')}")
 
-def plot_agent_loads(output_dir: str, repo: Repository | None = None):
+def plot_agent_loads(output_dir: str, repo: Repository | None = None, save_csv: bool = False, skip_plots: bool = False):
     """
     Prefer Redis metrics (load_trace per agent).
     Fallback to plot_agent_loads_from_dir(output_dir) if Redis has nothing.
+
+    Args:
+        output_dir: Directory to save outputs
+        repo: Repository instance for fetching metrics from Redis
+        save_csv: If True, export load data to CSV files
+        skip_plots: If True, skip plot generation
     """
     if repo is None:
         return plot_agent_loads_from_dir(output_dir)
@@ -292,6 +298,29 @@ def plot_agent_loads(output_dir: str, repo: Repository | None = None):
     if not agent_data:
         return  # nothing to plot
 
+    # Export CSV if requested
+    if save_csv:
+        # Export individual agent load traces
+        for agent_id, df in agent_data.items():
+            csv_path = os.path.join(output_dir, f"agent_{agent_id}_load_trace.csv")
+            df.to_csv(csv_path, index=False)
+
+        # Export summary statistics
+        summary_data = []
+        for agent_id in sorted(mean_loads.keys()):
+            summary_data.append({
+                "agent_id": agent_id,
+                "mean_load": mean_loads[agent_id],
+                "max_load": max_loads[agent_id]
+            })
+        summary_df = pd.DataFrame(summary_data)
+        summary_csv = os.path.join(output_dir, "agent_loads_summary.csv")
+        summary_df.to_csv(summary_csv, index=False)
+        print(f"Saved: {summary_csv}")
+
+    if skip_plots:
+        return
+
     # Plot load over time
     plt.figure(figsize=(12, 6))
     for agent_id, df in agent_data.items():
@@ -324,13 +353,19 @@ def plot_agent_loads(output_dir: str, repo: Repository | None = None):
     plt.close()
 
 
-def plot_conflicts_and_restarts_by_agent(output_dir: str, repo: Repository | None = None):
+def plot_conflicts_and_restarts_by_agent(output_dir: str, repo: Repository | None = None, save_csv: bool = False, skip_plots: bool = False):
     """
     Prefer Redis metrics; if missing, fall back to misc_<agent_id>.json files under output_dir.
 
     Produces:
       - conflicts_per_agent.png
       - restarts_per_agent.png
+
+    Args:
+        output_dir: Directory to save outputs
+        repo: Repository instance for fetching metrics from Redis
+        save_csv: If True, export conflicts/restarts data to CSV files
+        skip_plots: If True, skip plot generation
 
     Returns: (agent_conflict_counts, agent_restart_counts)
     """
@@ -364,6 +399,29 @@ def plot_conflicts_and_restarts_by_agent(output_dir: str, repo: Repository | Non
                 agent_conflict_counts[agent_id] = int(total_conflicts)
                 agent_restart_counts[agent_id] = int(total_restarts)
 
+    # Export CSV if requested
+    if save_csv:
+        if agent_conflict_counts:
+            df_conflicts = pd.DataFrame(
+                sorted(agent_conflict_counts.items(), key=lambda x: x[0]),
+                columns=["agent_id", "conflicts"]
+            )
+            csv_path = os.path.join(output_dir, "conflicts_per_agent.csv")
+            df_conflicts.to_csv(csv_path, index=False)
+            print(f"Saved: {csv_path}")
+
+        if agent_restart_counts:
+            df_restarts = pd.DataFrame(
+                sorted(agent_restart_counts.items(), key=lambda x: x[0]),
+                columns=["agent_id", "restarts"]
+            )
+            csv_path = os.path.join(output_dir, "restarts_per_agent.csv")
+            df_restarts.to_csv(csv_path, index=False)
+            print(f"Saved: {csv_path}")
+
+    if skip_plots:
+        return agent_conflict_counts, agent_restart_counts
+
     # Plot (only if we have any)
     if agent_conflict_counts:
         df_conflicts = pd.DataFrame(
@@ -396,12 +454,18 @@ def plot_conflicts_and_restarts_by_agent(output_dir: str, repo: Repository | Non
     return agent_conflict_counts, agent_restart_counts
 
 
-def plot_conflicts_and_restarts(output_dir: str, repo: Repository | None = None):
+def plot_conflicts_and_restarts(output_dir: str, repo: Repository | None = None, save_csv: bool = False, skip_plots: bool = False):
     """
     Prefer Redis metrics; fallback to reading misc_*.json files.
     Produces:
       - conflicts_per_job.png
       - restarts_per_job.png
+
+    Args:
+        output_dir: Directory to save outputs
+        repo: Repository instance for fetching metrics from Redis
+        save_csv: If True, export conflicts/restarts data to CSV files
+        skip_plots: If True, skip plot generation
 
     Returns: (df_conflicts, df_restarts) which may be empty DataFrames.
     """
@@ -448,6 +512,21 @@ def plot_conflicts_and_restarts(output_dir: str, repo: Repository | None = None)
     df_restarts = pd.DataFrame(sorted(all_restarts.items(), key=lambda x: x[0]),
                                columns=["job_id", "restarts"])
 
+    # Export CSV if requested
+    if save_csv:
+        if not df_conflicts.empty:
+            csv_path = os.path.join(output_dir, "conflicts_per_job.csv")
+            df_conflicts.to_csv(csv_path, index=False)
+            print(f"Saved: {csv_path}")
+
+        if not df_restarts.empty:
+            csv_path = os.path.join(output_dir, "restarts_per_job.csv")
+            df_restarts.to_csv(csv_path, index=False)
+            print(f"Saved: {csv_path}")
+
+    if skip_plots:
+        return df_conflicts, df_restarts
+
     if not df_conflicts.empty:
         plt.figure(figsize=(12, 6))
         plt.bar(df_conflicts["job_id"], df_conflicts["conflicts"])
@@ -475,7 +554,9 @@ def plot_scheduling_latency_and_jobs(run_dir: str,
                                      agent_count: int,
                                      exclude_job_ids: set[int] | None = None,
                                      label_suffix: str = "",
-                                     level: int | None = None):
+                                     level: int | None = None,
+                                     save_csv: bool = False,
+                                     skip_plots: bool = False):
     """
     Plot latency, jobs/agent, and histogram for a specific hierarchy level.
 
@@ -485,6 +566,8 @@ def plot_scheduling_latency_and_jobs(run_dir: str,
         exclude_job_ids: Set of job IDs to exclude (e.g., restarted jobs)
         label_suffix: Suffix for output filenames (e.g., '_no_restarts')
         level: Hierarchy level to plot (0, 1, etc.). If None, uses level0_jobs.csv
+        save_csv: If True, export scheduling data to CSV files
+        skip_plots: If True, skip plot generation
     """
     # Choose CSV file based on level
     if level is not None:
@@ -512,6 +595,37 @@ def plot_scheduling_latency_and_jobs(run_dir: str,
 
     # Group by leader agent
     grouped = df.groupby("leader_id", dropna=False)
+
+    # Export CSV if requested
+    if save_csv:
+        # Export scheduling latency per job
+        latency_csv = os.path.join(run_dir, f"scheduling_latency_per_job{label_suffix}.csv")
+        df[["job_id", "leader_id", "scheduling_latency"]].to_csv(latency_csv, index=False)
+        print(f"Saved: {latency_csv}")
+
+        # Export jobs per agent summary
+        jobs_per_agent_data = grouped.size().reset_index(name='job_count')
+        jobs_csv = os.path.join(run_dir, f"jobs_per_agent{label_suffix}.csv")
+        jobs_per_agent_data.to_csv(jobs_csv, index=False)
+        print(f"Saved: {jobs_csv}")
+
+        # Export latency statistics
+        stats_data = {
+            "metric": ["mean_latency", "max_latency", "min_latency", "median_latency", "std_latency"],
+            "value": [
+                df['scheduling_latency'].mean(),
+                df['scheduling_latency'].max(),
+                df['scheduling_latency'].min(),
+                df['scheduling_latency'].median(),
+                df['scheduling_latency'].std()
+            ]
+        }
+        stats_csv = os.path.join(run_dir, f"scheduling_latency_stats{label_suffix}.csv")
+        pd.DataFrame(stats_data).to_csv(stats_csv, index=False)
+        print(f"Saved: {stats_csv}")
+
+    if skip_plots:
+        return
 
     # Scatter: scheduling latency per job
     plt.figure(figsize=(12, 6))
@@ -1856,6 +1970,8 @@ if __name__ == "__main__":
     parser.add_argument("--agents", type=int, required=True, help="Number of agents")
     parser.add_argument("--db_host", type=str, required=True, help="Database Host")
     parser.add_argument("--hierarchical", action="store_true", help="Generate hierarchical topology-specific plots")
+    parser.add_argument("--save-csv", action="store_true", help="Export all data to CSV files for later analysis")
+    parser.add_argument("--skip-plots", action="store_true", help="Skip plot generation (useful with --save-csv)")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -1906,11 +2022,11 @@ if __name__ == "__main__":
     restarted_job_ids = collect_restarted_job_ids(args.output_dir, repo)
 
     # Conflicts/Restarts prefer Redis; fallback to files
-    plot_conflicts_and_restarts(args.output_dir, repo)
-    plot_conflicts_and_restarts_by_agent(args.output_dir, repo)
+    plot_conflicts_and_restarts(args.output_dir, repo, save_csv=args.save_csv, skip_plots=args.skip_plots)
+    plot_conflicts_and_restarts_by_agent(args.output_dir, repo, save_csv=args.save_csv, skip_plots=args.skip_plots)
 
     # Agent loads prefer Redis; fallback to files
-    plot_agent_loads(args.output_dir, repo)
+    plot_agent_loads(args.output_dir, repo, save_csv=args.save_csv, skip_plots=args.skip_plots)
 
     # NEW: Failure summary with failed agents and reassigned jobs (visualization #1)
     plot_failure_summary(args.output_dir, repo)
@@ -1934,7 +2050,9 @@ if __name__ == "__main__":
             args.output_dir,
             args.agents,
             label_suffix="_level0",
-            level=0
+            level=0,
+            save_csv=args.save_csv,
+            skip_plots=args.skip_plots
         )
 
         print("Generating Level 1 latency plots...")
@@ -1942,7 +2060,9 @@ if __name__ == "__main__":
             args.output_dir,
             args.agents,
             label_suffix="_level1",
-            level=1
+            level=1,
+            save_csv=args.save_csv,
+            skip_plots=args.skip_plots
         )
 
         print("Generating Level 2 latency plots...")
@@ -1950,7 +2070,9 @@ if __name__ == "__main__":
             args.output_dir,
             args.agents,
             label_suffix="_level2",
-            level=2
+            level=2,
+            save_csv=args.save_csv,
+            skip_plots=args.skip_plots
         )
 
         # Also generate comparison plots
@@ -1963,7 +2085,7 @@ if __name__ == "__main__":
         print("="*60 + "\n")
     else:
         # Scheduling latency & jobs (ALL jobs)
-        plot_scheduling_latency_and_jobs(args.output_dir, args.agents, level=0)
+        plot_scheduling_latency_and_jobs(args.output_dir, args.agents, level=0, save_csv=args.save_csv, skip_plots=args.skip_plots)
         plot_reasoning_time(args.output_dir)
 
         # Scheduling latency & jobs (EXCLUDING restarted jobs)
@@ -1973,6 +2095,8 @@ if __name__ == "__main__":
                 args.agents,
                 exclude_job_ids=restarted_job_ids,
                 label_suffix="_no_restarts",
-                level=0
+                level=0,
+                save_csv=args.save_csv,
+                skip_plots=args.skip_plots
             )
 
