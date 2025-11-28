@@ -945,8 +945,18 @@ def plot_timeline_with_failures(output_dir: str, repo: Repository | None = None,
     end_time = df["completed_at"].max()
     total_duration = end_time - start_time
 
+    # FIX: Check for sufficient duration
+    if total_duration < window_size:
+        print(f"Total duration ({total_duration:.1f}s) is less than window size ({window_size}s) - cannot create time bins")
+        return
+
     # Create time windows
     time_bins = list(range(int(start_time), int(end_time) + window_size, window_size))
+
+    # FIX: Ensure we have at least 2 bins
+    if len(time_bins) < 2:
+        print(f"Insufficient time bins ({len(time_bins)}) - need at least 2 for analysis")
+        return
 
     # Calculate throughput (jobs completed per window)
     df["completion_bin"] = pd.cut(df["completed_at"], bins=time_bins, labels=False, include_lowest=True)
@@ -1106,17 +1116,27 @@ def analyze_throughput_degradation(output_dir: str, repo: Repository | None = No
     recovery_time = None
 
     # Create sliding windows after failure
-    time_bins = list(range(int(first_failure), int(end_time) + window_size, window_size))
-    df["completion_bin"] = pd.cut(df["completed_at"], bins=time_bins, labels=False, include_lowest=True)
+    # FIX: Check if we have enough data after failure for binning
+    time_after_failure = end_time - first_failure
+    if time_after_failure >= window_size:
+        time_bins = list(range(int(first_failure), int(end_time) + window_size, window_size))
 
-    for bin_idx in sorted(df["completion_bin"].dropna().unique()):
-        bin_jobs = df[df["completion_bin"] == bin_idx]
-        bin_throughput = len(bin_jobs) / window_size
+        # Ensure we have at least 2 bins for pd.cut to work
+        if len(time_bins) >= 2:
+            df["completion_bin"] = pd.cut(df["completed_at"], bins=time_bins, labels=False, include_lowest=True)
 
-        if bin_throughput >= target_throughput:
-            bin_start = first_failure + (bin_idx * window_size)
-            recovery_time = bin_start - first_failure
-            break
+            for bin_idx in sorted(df["completion_bin"].dropna().unique()):
+                bin_jobs = df[df["completion_bin"] == bin_idx]
+                bin_throughput = len(bin_jobs) / window_size
+
+                if bin_throughput >= target_throughput:
+                    bin_start = first_failure + (bin_idx * window_size)
+                    recovery_time = bin_start - first_failure
+                    break
+        else:
+            print(f"Insufficient time bins ({len(time_bins)}) for recovery analysis")
+    else:
+        print(f"Insufficient data after failure ({time_after_failure:.1f}s < {window_size}s) for recovery analysis")
 
     # Get reassignment data for additional context
     reassignments = collect_reassignments(output_dir, repo)
