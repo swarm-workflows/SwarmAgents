@@ -119,6 +119,10 @@ def main():
     ap.add_argument("--dynamic-trigger-jobs", type=int, default=50,
                     help="Number of completed jobs to wait for (for 'jobs-completed' trigger)")
 
+    # Test shutdown control (v2)
+    ap.add_argument("--shutdown-after-seconds", type=int, default=0,
+                    help="Shutdown test after N seconds (0 = use default wait_runtime behavior)")
+
     # Config / starter
     ap.add_argument("--starter", default="./swarm-multi-start.sh",
                     help="Path to swarm-multi-start.sh (v2)")
@@ -225,6 +229,10 @@ def main():
                 cmd += ["--dynamic-trigger-threshold", str(args.dynamic_trigger_threshold)]
             elif args.dynamic_trigger == "jobs-completed":
                 cmd += ["--dynamic-trigger-jobs", str(args.dynamic_trigger_jobs)]
+
+        # Shutdown timer parameter
+        if args.shutdown_after_seconds > 0:
+            cmd += ["--shutdown-after-seconds", str(args.shutdown_after_seconds)]
 
         log(f"[{run_name}] Starting test…")
         (logs_dir / "batch_runner.log").write_text(

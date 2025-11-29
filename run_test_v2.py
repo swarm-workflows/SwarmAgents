@@ -29,10 +29,21 @@ Usage (remote):
     --groups 5 --group-size 4 \
     --debug
 
+Usage (with time-based shutdown):
+  ./run_test_v2.py \
+    --mode local \
+    --agent-type resource \
+    --agents 20 \
+    --topology mesh \
+    --jobs 500 \
+    --db-host localhost \
+    --shutdown-after-seconds 300
+
 Notes:
 - For remote mode, you can provide --agent-hosts "agent-1,agent-2,agent-3" OR --agent-hosts-file.
 - This script expects the repo directory on remote hosts at /root/SwarmAgents (adjust with --remote-repo-dir).
 - It assumes passwordless SSH to those hosts.
+- Use --shutdown-after-seconds for time-based test termination (bypasses bucket monitoring).
 """
 from __future__ import annotations
 import argparse, os, re, subprocess, sys, time, math, shlex
@@ -479,6 +490,10 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--dynamic-trigger-jobs", type=int, default=50,
                     help="Number of completed jobs to wait for (for 'jobs-completed' trigger)")
 
+    # Test shutdown control
+    ap.add_argument("--shutdown-after-seconds", type=int, default=0,
+                    help="Shutdown test after N seconds (0 = use default wait_runtime behavior)")
+
     # Output
     ap.add_argument("--run-dir", default="run_out")
     ap.add_argument("--log-dir", default="logs")
@@ -547,7 +562,12 @@ def main() -> None:
         dynamic_thread.start()
 
     # Wait for test completion
-    wait_runtime(args)
+    if args.shutdown_after_seconds > 0:
+        log(f"Using time-based shutdown: will stop after {args.shutdown_after_seconds} seconds")
+        time.sleep(args.shutdown_after_seconds)
+        log("Shutdown timer expired, stopping test")
+    else:
+        wait_runtime(args)
     stop_agents(args)
     collect_logs(args)
 
