@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Comprehensive plotting script for analyzing multiple runs across different configurations.
-Supports comparison of topologies (ring, mesh) and scales (10, 30, 90 agents).
+Supports comparison of topologies (ring, mesh, hierarchical) and scales.
+FIXED VERSION: Handles cases where started_at timestamps are missing/zero.
 """
 
 import os
@@ -13,6 +14,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 import argparse
 from scipy import stats
+import warnings
 
 # Set style for better-looking plots
 sns.set_style("whitegrid")
@@ -93,19 +95,30 @@ class MultiRunAnalyzer:
                 'jobs': df_jobs
             }
 
-            # Add latency data if available
+            # Add latency data if available (either from separate file or from all_jobs.csv)
             if latency_file.exists():
                 df_latency = pd.read_csv(latency_file)
                 run_data['latency'] = df_latency
+            elif 'scheduling_latency' in df_jobs.columns:
+                # Multi-site data has scheduling_latency in all_jobs.csv
+                run_data['latency'] = df_jobs[['job_id', 'leader_id', 'scheduling_latency', 'reasoning_time']].copy()
 
             # Calculate derived metrics
             df_jobs['selection_time'] = df_jobs['assigned_at'] - df_jobs['selection_started_at']
-            df_jobs['wait_time'] = df_jobs['started_at'] - df_jobs['submitted_at']
-            df_jobs['execution_time'] = df_jobs['completed_at'] - df_jobs['started_at']
+
+            # FIX: Handle missing started_at timestamps
+            # Use assigned_at as a proxy for started_at when it's 0
+            df_jobs['effective_started_at'] = np.where(
+                df_jobs['started_at'] == 0,
+                df_jobs['assigned_at'],
+                df_jobs['started_at']
+            )
+
+            df_jobs['wait_time'] = df_jobs['effective_started_at'] - df_jobs['submitted_at']
+            df_jobs['execution_time'] = df_jobs['completed_at'] - df_jobs['effective_started_at']
             df_jobs['total_time'] = df_jobs['completed_at'] - df_jobs['submitted_at']
 
-            # Handle zero timestamps (not started)
-            df_jobs.loc[df_jobs['started_at'] == 0, 'wait_time'] = np.nan
+            # Handle zero completed_at timestamps (not completed)
             df_jobs.loc[df_jobs['completed_at'] == 0, 'execution_time'] = np.nan
             df_jobs.loc[df_jobs['completed_at'] == 0, 'total_time'] = np.nan
 
@@ -127,7 +140,7 @@ class MultiRunAnalyzer:
             for run_data in config_data['runs']:
                 df_jobs = run_data['jobs']
 
-                # Calculate aggregate metrics for this run
+                # Calculate aggregate metrics for this run (with robust handling of NaN)
                 record = {
                     'config': config_name,
                     'topology': topology,
@@ -136,22 +149,22 @@ class MultiRunAnalyzer:
                     'run': run_data['run_dir'],
 
                     # Latency metrics
-                    'mean_selection_time': df_jobs['selection_time'].mean(),
-                    'median_selection_time': df_jobs['selection_time'].median(),
-                    'p95_selection_time': df_jobs['selection_time'].quantile(0.95),
-                    'p99_selection_time': df_jobs['selection_time'].quantile(0.99),
+                    'mean_selection_time': self.safe_mean(df_jobs['selection_time']),
+                    'median_selection_time': self.safe_median(df_jobs['selection_time']),
+                    'p95_selection_time': self.safe_quantile(df_jobs['selection_time'], 0.95),
+                    'p99_selection_time': self.safe_quantile(df_jobs['selection_time'], 0.99),
 
                     # Wait time metrics
-                    'mean_wait_time': df_jobs['wait_time'].mean(),
-                    'median_wait_time': df_jobs['wait_time'].median(),
+                    'mean_wait_time': self.safe_mean(df_jobs['wait_time']),
+                    'median_wait_time': self.safe_median(df_jobs['wait_time']),
 
                     # Execution metrics
-                    'mean_execution_time': df_jobs['execution_time'].mean(),
-                    'total_execution_time': df_jobs['execution_time'].sum(),
+                    'mean_execution_time': self.safe_mean(df_jobs['execution_time']),
+                    'total_execution_time': self.safe_sum(df_jobs['execution_time']),
 
                     # Total time metrics
-                    'mean_total_time': df_jobs['total_time'].mean(),
-                    'median_total_time': df_jobs['total_time'].median(),
+                    'mean_total_time': self.safe_mean(df_jobs['total_time']),
+                    'median_total_time': self.safe_median(df_jobs['total_time']),
 
                     # Job completion
                     'completed_jobs': (df_jobs['exit_status'] == 0).sum(),
@@ -166,13 +179,42 @@ class MultiRunAnalyzer:
                 # Add scheduling latency if available
                 if 'latency' in run_data:
                     df_latency = run_data['latency']
-                    record['mean_scheduling_latency'] = df_latency['scheduling_latency'].mean()
-                    record['median_scheduling_latency'] = df_latency['scheduling_latency'].median()
-                    record['mean_reasoning_time'] = df_latency['reasoning_time'].mean()
+                    record['mean_scheduling_latency'] = self.safe_mean(df_latency['scheduling_latency'])
+                    record['median_scheduling_latency'] = self.safe_median(df_latency['scheduling_latency'])
+                    record['mean_reasoning_time'] = self.safe_mean(df_latency['reasoning_time'])
 
                 records.append(record)
 
         return pd.DataFrame(records)
+
+    # Helper methods for safe statistics calculation
+    def safe_mean(self, series):
+        """Calculate mean, returning 0 if all values are NaN."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            result = series.mean()
+            return result if not pd.isna(result) else 0.0
+
+    def safe_median(self, series):
+        """Calculate median, returning 0 if all values are NaN."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            result = series.median()
+            return result if not pd.isna(result) else 0.0
+
+    def safe_quantile(self, series, q):
+        """Calculate quantile, returning 0 if all values are NaN."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            result = series.quantile(q)
+            return result if not pd.isna(result) else 0.0
+
+    def safe_sum(self, series):
+        """Calculate sum, returning 0 if all values are NaN."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            result = series.sum()
+            return result if not pd.isna(result) else 0.0
 
     def calculate_entropy(self, series):
         """Calculate Shannon entropy for load distribution."""
@@ -191,7 +233,7 @@ class MultiRunAnalyzer:
 
         # Mean Selection Time
         ax = axes[0, 0]
-        sns.boxplot(data=df_plot, x='config_label', y='mean_selection_time', hue='topology', ax=ax)
+        sns.boxplot(data=df_plot, x='config_label', y='mean_selection_time', hue='topology', ax=ax, legend=False)
         ax.set_title('Mean Selection Time')
         ax.set_xlabel('Configuration')
         ax.set_ylabel('Time (seconds)')
@@ -199,7 +241,7 @@ class MultiRunAnalyzer:
 
         # P95 Selection Time
         ax = axes[0, 1]
-        sns.boxplot(data=df_plot, x='config_label', y='p95_selection_time', hue='topology', ax=ax)
+        sns.boxplot(data=df_plot, x='config_label', y='p95_selection_time', hue='topology', ax=ax, legend=False)
         ax.set_title('P95 Selection Time')
         ax.set_xlabel('Configuration')
         ax.set_ylabel('Time (seconds)')
@@ -207,7 +249,7 @@ class MultiRunAnalyzer:
 
         # Mean Total Time
         ax = axes[1, 0]
-        sns.boxplot(data=df_plot, x='config_label', y='mean_total_time', hue='topology', ax=ax)
+        sns.boxplot(data=df_plot, x='config_label', y='mean_total_time', hue='topology', ax=ax, legend=False)
         ax.set_title('Mean Total Job Time (Submission to Completion)')
         ax.set_xlabel('Configuration')
         ax.set_ylabel('Time (seconds)')
@@ -215,14 +257,15 @@ class MultiRunAnalyzer:
 
         # Scheduling Latency (if available)
         ax = axes[1, 1]
-        if 'mean_scheduling_latency' in df_plot.columns:
-            sns.boxplot(data=df_plot, x='config_label', y='mean_scheduling_latency', hue='topology', ax=ax)
+        if 'mean_scheduling_latency' in df_plot.columns and df_plot['mean_scheduling_latency'].sum() > 0:
+            sns.boxplot(data=df_plot, x='config_label', y='mean_scheduling_latency', hue='topology', ax=ax, legend=False)
             ax.set_title('Mean Scheduling Latency')
+            ax.set_ylabel('Time (seconds)')
         else:
             ax.text(0.5, 0.5, 'Scheduling latency data not available',
                    ha='center', va='center', transform=ax.transAxes)
+            ax.set_ylabel('Time (seconds)')
         ax.set_xlabel('Configuration')
-        ax.set_ylabel('Time (seconds)')
         ax.tick_params(axis='x', rotation=45)
 
         plt.tight_layout()
@@ -245,7 +288,7 @@ class MultiRunAnalyzer:
         for idx, (metric, ylabel) in enumerate(metrics):
             ax = axes[idx // 2, idx % 2]
 
-            for topology in df['topology'].unique():
+            for topology in sorted(df['topology'].unique()):
                 df_topo = df[df['topology'] == topology]
 
                 # Group by agent count and calculate mean and std
@@ -253,6 +296,7 @@ class MultiRunAnalyzer:
 
                 # Calculate 95% confidence interval
                 ci = 1.96 * grouped['std'] / np.sqrt(grouped['count'])
+                ci = ci.fillna(0)  # Handle NaN in CI
 
                 ax.errorbar(grouped.index, grouped['mean'], yerr=ci,
                            marker='o', label=topology.capitalize(), capsize=5, capthick=2)
@@ -269,9 +313,9 @@ class MultiRunAnalyzer:
         plt.close()
 
     def plot_topology_comparison(self, df: pd.DataFrame):
-        """Direct comparison between ring and mesh topologies."""
+        """Direct comparison between different topologies."""
         fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-        fig.suptitle('Ring vs Mesh Topology Comparison', fontsize=16, fontweight='bold')
+        fig.suptitle('Topology Comparison', fontsize=16, fontweight='bold')
 
         metrics = [
             ('mean_selection_time', 'Selection Time (s)'),
@@ -289,24 +333,31 @@ class MultiRunAnalyzer:
             for agents in sorted(df['agents'].unique()):
                 df_agents = df[df['agents'] == agents]
 
-                for topology in ['ring', 'mesh']:
+                for topology in sorted(df['topology'].unique()):
                     df_subset = df_agents[df_agents['topology'] == topology]
                     if len(df_subset) > 0:
                         data_to_plot.append(df_subset[metric].values)
                         labels.append(f'{topology.capitalize()}\n{agents} agents')
 
-            bp = ax.boxplot(data_to_plot, labels=labels, patch_artist=True)
+            if data_to_plot:
+                bp = ax.boxplot(data_to_plot, labels=labels, patch_artist=True)
 
-            # Color by topology
-            colors = []
-            for label in labels:
-                if 'Ring' in label:
-                    colors.append('lightblue')
-                else:
-                    colors.append('lightcoral')
+                # Color by topology
+                topology_colors = {
+                    'ring': 'lightblue',
+                    'mesh': 'lightcoral',
+                    'hierarchical': 'lightgreen'
+                }
 
-            for patch, color in zip(bp['boxes'], colors):
-                patch.set_facecolor(color)
+                colors = []
+                for label in labels:
+                    for topo, color in topology_colors.items():
+                        if topo.capitalize() in label:
+                            colors.append(color)
+                            break
+
+                for patch, color in zip(bp['boxes'], colors):
+                    patch.set_facecolor(color)
 
             ax.set_title(ylabel)
             ax.set_ylabel(ylabel.split('\n')[0])
@@ -320,8 +371,15 @@ class MultiRunAnalyzer:
 
     def plot_load_distribution(self):
         """Plot load distribution across agents for each configuration."""
-        fig, axes = plt.subplots(2, 3, figsize=(20, 12))
+        num_configs = len(self.data)
+        num_cols = 3
+        num_rows = (num_configs + num_cols - 1) // num_cols
+
+        fig, axes = plt.subplots(num_rows, num_cols, figsize=(20, 6 * num_rows))
         fig.suptitle('Job Assignment Distribution Across Agents', fontsize=16, fontweight='bold')
+
+        if num_rows == 1:
+            axes = axes.reshape(1, -1)
 
         axes = axes.flatten()
 
@@ -340,21 +398,26 @@ class MultiRunAnalyzer:
             from collections import Counter
             assignment_counts = Counter(all_assignments)
 
-            agents = sorted(assignment_counts.keys())
-            counts = [assignment_counts[a] for a in agents]
+            if assignment_counts:
+                agents = sorted(assignment_counts.keys())
+                counts = [assignment_counts[a] for a in agents]
 
-            ax.bar(agents, counts, color='steelblue', alpha=0.7)
-            ax.set_title(f"{config_data['topology'].capitalize()}: "
-                        f"{config_data['agents']} agents, {config_data['jobs']} jobs")
-            ax.set_xlabel('Agent ID')
-            ax.set_ylabel('Jobs Assigned (Total across runs)')
-            ax.grid(True, alpha=0.3, axis='y')
+                ax.bar(agents, counts, color='steelblue', alpha=0.7)
+                ax.set_title(f"{config_data['topology'].capitalize()}: "
+                            f"{config_data['agents']} agents, {config_data['jobs']} jobs")
+                ax.set_xlabel('Agent ID')
+                ax.set_ylabel('Jobs Assigned (Total across runs)')
+                ax.grid(True, alpha=0.3, axis='y')
 
-            # Add mean line
-            mean_assignments = np.mean(counts)
-            ax.axhline(mean_assignments, color='red', linestyle='--',
-                      label=f'Mean: {mean_assignments:.1f}')
-            ax.legend()
+                # Add mean line
+                mean_assignments = np.mean(counts)
+                ax.axhline(mean_assignments, color='red', linestyle='--',
+                          label=f'Mean: {mean_assignments:.1f}')
+                ax.legend()
+
+        # Hide extra subplots
+        for idx in range(len(self.data), len(axes)):
+            axes[idx].set_visible(False)
 
         plt.tight_layout()
         plt.savefig(self.output_dir / 'load_distribution.png', dpi=300, bbox_inches='tight')
@@ -373,6 +436,7 @@ class MultiRunAnalyzer:
         # Group by configuration
         success_stats = df_plot.groupby('config_label')['success_rate'].agg(['mean', 'std', 'count'])
         success_stats['ci'] = 1.96 * success_stats['std'] / np.sqrt(success_stats['count'])
+        success_stats['ci'] = success_stats['ci'].fillna(0)
 
         x_pos = np.arange(len(success_stats))
 
@@ -438,7 +502,7 @@ class MultiRunAnalyzer:
     def run_analysis(self):
         """Run complete analysis pipeline."""
         print("="*80)
-        print("Multi-Run Analysis Pipeline")
+        print("Multi-Run Analysis Pipeline (FIXED VERSION)")
         print("="*80)
 
         # Load data
@@ -475,13 +539,13 @@ class MultiRunAnalyzer:
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Analyze and plot results from multiple SwarmAgents runs'
+        description='Analyze and plot results from multiple SwarmAgents runs (FIXED VERSION)'
     )
     parser.add_argument(
         '--base-dir',
         type=str,
-        default='single-site',
-        help='Base directory containing run-* subdirectories (default: single-site)'
+        default='runs/single-site',
+        help='Base directory containing run-* subdirectories (default: runs/single-site)'
     )
     parser.add_argument(
         '--output-dir',
