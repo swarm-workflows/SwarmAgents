@@ -112,18 +112,23 @@ class V2DataLoader:
 
             # Calculate metrics
             df_jobs['selection_time'] = df_jobs['assigned_at'] - df_jobs['selection_started_at']
+
+            # Calculate wait time: use started_at if available, otherwise use assigned_at as fallback
             df_jobs['wait_time'] = df_jobs['started_at'] - df_jobs['submitted_at']
+            df_jobs.loc[df_jobs['started_at'] == 0, 'wait_time'] = df_jobs['assigned_at'] - df_jobs['submitted_at']
+
             df_jobs['total_time'] = df_jobs['completed_at'] - df_jobs['submitted_at']
 
-            # Handle zero timestamps
-            df_jobs.loc[df_jobs['started_at'] == 0, 'wait_time'] = np.nan
-
-            # Load latency data if available
-            latency_file = run_dir / "reasoning_vs_latency.csv"
+            # Extract scheduling latency from all_jobs.csv if column exists
             scheduling_latencies = []
-            if latency_file.exists():
-                df_latency = pd.read_csv(latency_file)
-                scheduling_latencies = df_latency['scheduling_latency'].dropna().tolist()
+            if 'scheduling_latency' in df_jobs.columns:
+                scheduling_latencies = df_jobs['scheduling_latency'].dropna().tolist()
+            else:
+                # Fallback: try to load from separate file (for backward compatibility)
+                latency_file = run_dir / "reasoning_vs_latency.csv"
+                if latency_file.exists():
+                    df_latency = pd.read_csv(latency_file)
+                    scheduling_latencies = df_latency['scheduling_latency'].dropna().tolist()
 
             return {
                 'run_name': run_dir.name,
@@ -183,7 +188,7 @@ class ComparisonAnalyzer:
 
         for metric_key, xlabel, title in metrics:
             fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-            fig.suptitle(f'{title}: CCGrid vs V2', fontsize=16, fontweight='bold')
+            fig.suptitle(f'{title}: CCGrid\'25 vs SWARM-Enhanced', fontsize=16, fontweight='bold')
 
             # Collect all data
             ccgrid_data = []
@@ -205,7 +210,7 @@ class ComparisonAnalyzer:
 
             # Box plot
             ax = axes[0, 0]
-            ax.boxplot([ccgrid_data, v2_data], tick_labels=['CCGrid', 'V2'])
+            ax.boxplot([ccgrid_data, v2_data], tick_labels=['CCGrid\'25', 'SWARM-Enhanced'])
             ax.set_ylabel(xlabel)
             ax.set_title('Box Plot Comparison')
             ax.grid(True, alpha=0.3)
@@ -214,7 +219,7 @@ class ComparisonAnalyzer:
             ax = axes[0, 1]
             parts = ax.violinplot([ccgrid_data, v2_data], positions=[1, 2], showmeans=True, showmedians=True)
             ax.set_xticks([1, 2])
-            ax.set_xticklabels(['CCGrid', 'V2'])
+            ax.set_xticklabels(['CCGrid\'25', 'SWARM-Enhanced'])
             ax.set_ylabel(xlabel)
             ax.set_title('Violin Plot Comparison')
             ax.grid(True, alpha=0.3)
@@ -231,14 +236,14 @@ class ComparisonAnalyzer:
                                           np.log10(max(ccgrid_data) + 1e-10), 30)
                 v2_bins = np.logspace(np.log10(min(v2_data) + 1e-10),
                                       np.log10(max(v2_data) + 1e-10), 30)
-                ax.hist(ccgrid_data, bins=ccgrid_bins, alpha=0.5, label='CCGrid', density=True, color='blue')
-                ax.hist(v2_data, bins=v2_bins, alpha=0.5, label='V2', density=True, color='orange')
+                ax.hist(ccgrid_data, bins=ccgrid_bins, alpha=0.5, label='CCGrid\'25', density=True, color='blue')
+                ax.hist(v2_data, bins=v2_bins, alpha=0.5, label='SWARM-Enhanced', density=True, color='orange')
                 ax.set_xscale('log')
                 ax.set_title('Distribution Overlay (Log Scale)')
             else:
                 # Regular linear scale
-                ax.hist(ccgrid_data, bins=30, alpha=0.5, label='CCGrid', density=True, color='blue')
-                ax.hist(v2_data, bins=30, alpha=0.5, label='V2', density=True, color='orange')
+                ax.hist(ccgrid_data, bins=30, alpha=0.5, label='CCGrid\'25', density=True, color='blue')
+                ax.hist(v2_data, bins=30, alpha=0.5, label='SWARM-Enhanced', density=True, color='orange')
                 ax.set_title('Distribution Overlay')
 
             ax.set_xlabel(xlabel)
@@ -253,8 +258,8 @@ class ComparisonAnalyzer:
             ccgrid_cdf = np.arange(1, len(ccgrid_sorted) + 1) / len(ccgrid_sorted)
             v2_cdf = np.arange(1, len(v2_sorted) + 1) / len(v2_sorted)
 
-            ax.plot(ccgrid_sorted, ccgrid_cdf, label='CCGrid', linewidth=2)
-            ax.plot(v2_sorted, v2_cdf, label='V2', linewidth=2)
+            ax.plot(ccgrid_sorted, ccgrid_cdf, label='CCGrid\'25', linewidth=2)
+            ax.plot(v2_sorted, v2_cdf, label='SWARM-Enhanced', linewidth=2)
             ax.set_xlabel(xlabel)
             ax.set_ylabel('Cumulative Probability')
             ax.set_title('Cumulative Distribution Function')
@@ -270,7 +275,7 @@ class ComparisonAnalyzer:
     def plot_run_metrics_comparison(self, df_ccgrid: pd.DataFrame, df_v2: pd.DataFrame):
         """Plot per-run metrics comparison."""
         fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-        fig.suptitle('Per-Run Metrics: CCGrid vs V2', fontsize=16, fontweight='bold')
+        fig.suptitle('Per-Run Metrics: CCGrid\'25 vs SWARM-Enhanced', fontsize=16, fontweight='bold')
 
         metrics = [
             ('mean_selection_time', 'Mean Selection Time (s)'),
@@ -283,14 +288,14 @@ class ComparisonAnalyzer:
             ax = axes[idx // 2, idx % 2]
 
             # Plot both datasets
-            ax.plot(df_ccgrid.index, df_ccgrid[metric], 'o-', label='CCGrid', alpha=0.6, markersize=3)
-            ax.plot(df_v2.index, df_v2[metric], 's-', label='V2', alpha=0.6, markersize=3)
+            ax.plot(df_ccgrid.index, df_ccgrid[metric], 'o-', label='CCGrid\'25', alpha=0.6, markersize=3)
+            ax.plot(df_v2.index, df_v2[metric], 's-', label='SWARM-Enhanced', alpha=0.6, markersize=3)
 
             # Add mean lines
             ccgrid_mean = df_ccgrid[metric].mean()
             v2_mean = df_v2[metric].mean()
-            ax.axhline(ccgrid_mean, color='blue', linestyle='--', alpha=0.5, label=f'CCGrid mean: {ccgrid_mean:.4f}')
-            ax.axhline(v2_mean, color='orange', linestyle='--', alpha=0.5, label=f'V2 mean: {v2_mean:.4f}')
+            ax.axhline(ccgrid_mean, color='blue', linestyle='--', alpha=0.5, label=f'CCGrid\'25 mean: {ccgrid_mean:.4f}')
+            ax.axhline(v2_mean, color='orange', linestyle='--', alpha=0.5, label=f'SWARM-Enhanced mean: {v2_mean:.4f}')
 
             ax.set_xlabel('Run Index')
             ax.set_ylabel(ylabel)
@@ -306,7 +311,7 @@ class ComparisonAnalyzer:
     def statistical_tests(self, df_ccgrid: pd.DataFrame, df_v2: pd.DataFrame):
         """Perform statistical tests to compare the two datasets."""
         print("\n" + "="*80)
-        print("STATISTICAL COMPARISON: CCGrid vs V2")
+        print("STATISTICAL COMPARISON: CCGrid'25 vs SWARM-Enhanced")
         print("="*80)
 
         metrics = [
@@ -340,9 +345,9 @@ class ComparisonAnalyzer:
             pct_change = ((v2_values.mean() - ccgrid_values.mean()) / ccgrid_values.mean()) * 100
 
             print(f"\n{name}:")
-            print(f"  CCGrid:  mean={ccgrid_values.mean():.4f}, std={ccgrid_values.std():.4f}, "
+            print(f"  CCGrid'25:        mean={ccgrid_values.mean():.4f}, std={ccgrid_values.std():.4f}, "
                   f"median={ccgrid_values.median():.4f}")
-            print(f"  V2:      mean={v2_values.mean():.4f}, std={v2_values.std():.4f}, "
+            print(f"  SWARM-Enhanced:   mean={v2_values.mean():.4f}, std={v2_values.std():.4f}, "
                   f"median={v2_values.median():.4f}")
             print(f"  Change:  {pct_change:+.2f}%")
             print(f"  T-test:  t={t_stat:.4f}, p={t_pvalue:.6f} {'***' if t_pvalue < 0.001 else '**' if t_pvalue < 0.01 else '*' if t_pvalue < 0.05 else 'ns'}")
@@ -375,8 +380,8 @@ class ComparisonAnalyzer:
             'Metric': [],
             'CCGrid Mean': [],
             'CCGrid Std': [],
-            'V2 Mean': [],
-            'V2 Std': [],
+            'SWARM-Enhanced Mean': [],
+            'SWARM-Enhanced Std': [],
             'Change (%)': [],
         }
 
@@ -401,8 +406,8 @@ class ComparisonAnalyzer:
             summary['Metric'].append(name)
             summary['CCGrid Mean'].append(f"{ccgrid_values.mean():.4f}")
             summary['CCGrid Std'].append(f"{ccgrid_values.std():.4f}")
-            summary['V2 Mean'].append(f"{v2_values.mean():.4f}")
-            summary['V2 Std'].append(f"{v2_values.std():.4f}")
+            summary['SWARM-Enhanced Mean'].append(f"{v2_values.mean():.4f}")
+            summary['SWARM-Enhanced Std'].append(f"{v2_values.std():.4f}")
             summary['Change (%)'].append(f"{pct_change:+.2f}")
 
         df_summary = pd.DataFrame(summary)
@@ -421,7 +426,7 @@ class ComparisonAnalyzer:
     def run_comparison(self):
         """Run the complete comparison analysis."""
         print("\n" + "="*80)
-        print("CCGrid vs V2 Comparison")
+        print("CCGrid'25 vs SWARM-Enhanced Comparison")
         print("="*80)
 
         # Aggregate metrics

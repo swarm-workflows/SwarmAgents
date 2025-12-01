@@ -203,6 +203,8 @@ def plot_agent_loads_from_dir(run_dir):
 
     # Read all agent_loads_*.csv files
     for filename in sorted(os.listdir(run_dir)):
+        if filename == "agent_loads_summary.csv":
+            continue
         if filename.startswith("agent_loads_") and filename.endswith(".csv"):
             file_path = os.path.join(run_dir, filename)
             df = pd.read_csv(file_path)
@@ -1832,7 +1834,7 @@ def plot_latency_comparison_by_hierarchy_level(output_dir: str):
     for patch, color in zip(bp['boxes'], colors[:len(bp['boxes'])]):
         patch.set_facecolor(color)
     axes[0, 0].set_ylabel('Scheduling Latency (s)', fontsize=11)
-    axes[0, 0].set_title('Latency Distribution by Hierarchy Level', fontsize=12, fontweight='bold')
+    axes[0, 0].set_title('Scheduling Latency Distribution by Hierarchy Level', fontsize=12, fontweight='bold')
     axes[0, 0].grid(axis='y', alpha=0.3)
 
     # Plot 2: Histogram comparison
@@ -1856,7 +1858,7 @@ def plot_latency_comparison_by_hierarchy_level(output_dir: str):
                        label='Level 0 (Bottom)', color='#FF6B6B', edgecolor='black')
     axes[0, 1].set_xlabel('Scheduling Latency (s)', fontsize=11)
     axes[0, 1].set_ylabel('Frequency', fontsize=11)
-    axes[0, 1].set_title('Latency Histogram by Hierarchy Level', fontsize=12, fontweight='bold')
+    axes[0, 1].set_title('Scheduling Latency Histogram by Hierarchy Level', fontsize=12, fontweight='bold')
     axes[0, 1].legend()
     axes[0, 1].grid(axis='y', alpha=0.3)
 
@@ -1885,7 +1887,7 @@ def plot_latency_comparison_by_hierarchy_level(output_dir: str):
     axes[1, 0].set_xticks(x_pos)
     axes[1, 0].set_xticklabels(level_labels)
     axes[1, 0].set_ylabel('Mean Scheduling Latency (s)', fontsize=11)
-    axes[1, 0].set_title('Mean Latency Comparison', fontsize=12, fontweight='bold')
+    axes[1, 0].set_title('Mean Scheduling Latency Comparison', fontsize=12, fontweight='bold')
     axes[1, 0].grid(axis='y', alpha=0.3)
 
     # Add value labels on bars
@@ -1950,7 +1952,7 @@ def plot_latency_comparison_by_hierarchy_level(output_dir: str):
         for col_idx in range(7):
             table[(row_idx + 1, col_idx)].set_facecolor(row_colors[row_idx])
 
-    axes[1, 1].set_title('Latency Statistics by Level', fontsize=12, fontweight='bold')
+    axes[1, 1].set_title('Scheduling Latency Statistics by Level', fontsize=12, fontweight='bold')
 
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "latency_comparison_by_hierarchy_level.png"), dpi=300, bbox_inches="tight")

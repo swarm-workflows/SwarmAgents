@@ -1302,7 +1302,8 @@ class ResourceAgent(Agent):
         """
         if os.path.exists("./shutdown"):
             return True
-        return (time.time() - self.last_non_empty_time) >= self.empty_timeout_seconds
+        return False
+        #return (time.time() - self.last_non_empty_time) >= self.empty_timeout_seconds
 
     def check_queue(self):
         """Call this periodically to monitor the queue."""
@@ -1552,11 +1553,19 @@ class ResourceAgent(Agent):
                     self.failed_agents.set(agent_id, current_time)
                     failed_this_round.append(agent_id)
 
+                    # Increment agent version to invalidate cost cache entries
+                    agent_info.version += 1
+                    self.logger.info(
+                        f"Incremented version for failed agent {agent_id} to {agent_info.version} "
+                        f"(invalidates {agent_info.version - 1} cached cost/feasibility entries)"
+                    )
+
                     # Record failure in metrics
                     self.metrics.agent_failures[agent_id] = {
                         'detected_at': current_time,
                         'last_seen': agent_info.last_updated,
-                        'downtime': time_since_update
+                        'downtime': time_since_update,
+                        'version_at_failure': agent_info.version
                     }
 
         return failed_this_round
@@ -1591,6 +1600,29 @@ class ResourceAgent(Agent):
                     self._reassign_jobs_from_failed_agent(agent_id)
                 else:
                     self.logger.info(f"Job reassignment disabled, not reassigning jobs from agent {agent_id}")
+
+    def invalidate_agent_cache(self, agent_id: int) -> bool:
+        """
+        Manually invalidate cost/feasibility cache for a specific agent.
+
+        This increments the agent's version number, causing all cached entries
+        involving this agent to be treated as stale by the SelectionEngine.
+
+        :param agent_id: ID of agent whose cache entries should be invalidated
+        :return: True if agent was found and version incremented, False otherwise
+        """
+        agent_info = self.neighbor_map.get(agent_id)
+        if agent_info:
+            old_version = agent_info.version
+            agent_info.version += 1
+            self.logger.info(
+                f"Manually invalidated cache for agent {agent_id}: "
+                f"version {old_version} -> {agent_info.version}"
+            )
+            return True
+        else:
+            self.logger.warning(f"Cannot invalidate cache for agent {agent_id}: not found in neighbor_map")
+            return False
 
     def _reassign_jobs_from_failed_agent(self, failed_agent_id: int) -> None:
         """

@@ -471,19 +471,32 @@ class MultiRunAnalyzer:
             print(f"  Mean Total Time: {df_config['mean_total_time'].mean():.4f} ± "
                   f"{df_config['mean_total_time'].std():.4f} s")
             print(f"  P95 Selection Time: {df_config['p95_selection_time'].mean():.4f} s")
+
+            # Print scheduling latency if available
+            if 'mean_scheduling_latency' in df_config.columns and not df_config['mean_scheduling_latency'].isna().all():
+                print(f"  Mean Scheduling Latency: {df_config['mean_scheduling_latency'].mean():.4f} ± "
+                      f"{df_config['mean_scheduling_latency'].std():.4f} s")
+
             print(f"  Success Rate: {df_config['success_rate'].mean():.2%}")
             print(f"  Load Entropy: {df_config['leader_entropy'].mean():.4f}")
 
         # Save detailed statistics to CSV
         summary_file = self.output_dir / 'summary_statistics.csv'
-        summary_stats = df.groupby('config').agg({
+        agg_dict = {
             'mean_selection_time': ['mean', 'std', 'min', 'max'],
             'p95_selection_time': ['mean', 'std'],
             'mean_total_time': ['mean', 'std', 'min', 'max'],
             'success_rate': ['mean', 'std'],
             'leader_entropy': ['mean', 'std'],
             'completed_jobs': ['mean', 'sum'],
-        })
+        }
+
+        # Add scheduling latency if available
+        if 'mean_scheduling_latency' in df.columns:
+            agg_dict['mean_scheduling_latency'] = ['mean', 'std', 'min', 'max']
+            agg_dict['median_scheduling_latency'] = ['mean', 'std']
+
+        summary_stats = df.groupby('config').agg(agg_dict)
         summary_stats.to_csv(summary_file)
         print(f"\nDetailed statistics saved to: {summary_file}")
 

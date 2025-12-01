@@ -42,10 +42,19 @@ class AgentInfo(JSONField):
         self._capacity_allocations = Capacities()
         self._max_child_capacity = None  # For hierarchical agents: max capacity of any single child
         self.last_updated = 0.0
+        self._version = 0  # Incremented when agent state changes (e.g., failure detection) to invalidate caches
         self._dtns = {}
         self._group = None
         self._level = None
         self._set_fields(**kwargs)
+
+    @property
+    def version(self):
+        return self._version
+
+    @version.setter
+    def version(self, value):
+        self._version = value
 
     @property
     def group(self):
