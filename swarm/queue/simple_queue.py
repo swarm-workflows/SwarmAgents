@@ -60,6 +60,22 @@ class SimpleQueue(ObjectQueue):
         with self.lock:
             self.objects[object.object_id] = object
 
+    def move_to_end(self, object: Object):
+        """
+        Move an object to the end of the queue by removing and re-adding it.
+
+        Since self.objects is a dict (Python 3.7+ maintains insertion order),
+        deleting and re-inserting moves the item to the end.
+
+        :param object: Object to move to end of queue
+        """
+        with self.lock:
+            if object.object_id in self.objects:
+                # Remove from current position
+                del self.objects[object.object_id]
+            # Re-add at end (dict insertion order)
+            self.objects[object.object_id] = object
+
     def remove(self, object_id: str):
         with self.lock:
             if object_id in self.objects:

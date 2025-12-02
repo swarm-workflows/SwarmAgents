@@ -46,10 +46,11 @@ Notes:
 - Use --shutdown-after-seconds for time-based test termination (bypasses bucket monitoring).
 """
 from __future__ import annotations
-import argparse, os, re, subprocess, sys, time, math, shlex
+import argparse, os, re, subprocess, sys, time, math, shlex, csv
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import List
 
 LINE_RE = re.compile(r"^state:\d+:\d+:(\d+):\s*\{([^}]*)\}\s*$")
 
@@ -379,6 +380,63 @@ def produce_jobs(args) -> None:
     run_blocking(jobs_cmd, check=False)
 
 
+def check_all_jobs_infeasible(args, bucket: int) -> bool:
+    """
+    Check if all remaining jobs in the specified bucket are infeasible.
+    Returns True if all jobs have 0 feasible agents.
+    """
+    # Get job IDs from Redis bucket
+    out = run_once(["python3.11", "dump_db.py", "--host", args.db_host, "--type", "redis", "--key", "state"])
+    job_ids = set()
+    for line in out.strip().split('\n'):
+        m = LINE_RE.match(line.strip())
+        if m and int(m.group(1)) == bucket:
+            # Extract job IDs from the set content
+            content = m.group(2)
+            for job_id in content.split(','):
+                job_id = job_id.strip().strip("'\"")
+                # Extract just the job ID from 'job:0:0:XX' format
+                if 'job:' in job_id:
+                    job_id = job_id.split(':')[-1]
+                if job_id:
+                    job_ids.add(job_id)
+
+    if not job_ids:
+        return False  # No jobs in bucket
+
+    # Load feasibility CSV
+    csv_path = Path("jobs") / "job_feasibility_mapping.csv"
+    if not csv_path.exists():
+        log(f"WARN: Feasibility CSV not found at {csv_path}, skipping infeasibility check")
+        return False
+
+    agents = find_all_agents(args, "main.py")
+    # Extract agent IDs from the list of dicts
+    available_agents = set(a.get('agent_id') for a in agents if a.get('agent_id'))
+
+    # Check if all remaining jobs are infeasible
+    infeasible_jobs = []
+    with open(csv_path, 'r') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if row['job_id'] in job_ids:
+                feasible_agents_str = row['feasible_agents']
+                if feasible_agents_str:
+                    feasible_agents = set(feasible_agents_str.split(','))
+                    # Check if any of agents 9-30 are in the feasible list
+                    overlap = feasible_agents & available_agents
+
+                    if not overlap:
+                        infeasible_jobs.append(row['job_id'])
+
+    all_infeasible = len(infeasible_jobs) == len(job_ids)
+    #log(f"Infeasible jobs: {infeasible_jobs}")
+    #log(f"Jobs: {job_ids}")
+    if all_infeasible:
+        log(f"All {len(job_ids)} remaining jobs in bucket {bucket} are infeasible!")
+
+    return all_infeasible
+
 def wait_runtime(args) -> None:
     low_since = None
     consecutive_misses = 0
@@ -394,6 +452,12 @@ def wait_runtime(args) -> None:
         else:
             cond = size < args.threshold
             log(f"Bucket state:*:*:{args.watch_bucket} size={size} (thr={args.threshold}) → {'LOW' if cond else 'OK'}")
+
+            # Check if all remaining jobs are infeasible
+            if size > 0 and check_all_jobs_infeasible(args, args.watch_bucket):
+                log("All remaining jobs are infeasible → triggering shutdown.")
+                break
+
             if cond:
                 if low_since is None:
                     low_since = time.time()
@@ -575,6 +639,121 @@ def main() -> None:
     args.agents = total_agents
     parse_and_report(args)
     log("Done.")
+
+def _load_hosts():
+    """Load remote host list from file."""
+    with open("agent_hosts.txt", 'r') as f:
+        hosts = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+    print(f"Loaded {len(hosts)} remote hosts")
+    return hosts
+
+def _find_local_agents(pattern: str = 'main.py') -> List[dict]:
+    """Find agent processes running locally."""
+    try:
+        # Find processes matching the pattern
+        result = subprocess.run(
+            ['ps', 'aux'],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+
+        agents = []
+        for line in result.stdout.split('\n'):
+            if pattern in line and 'grep' not in line and 'kill_agents.py' not in line:
+                parts = line.split()
+                if len(parts) >= 2:
+                    pid = parts[1]
+                    # Try to extract agent ID from command line
+                    agent_id = None
+
+                    # Method 1: --agent-id flag
+                    if '--agent-id' in line:
+                        try:
+                            idx = parts.index('--agent-id')
+                            if idx + 1 < len(parts):
+                                agent_id = parts[idx + 1]
+                        except (ValueError, IndexError):
+                            pass
+
+                    # Method 2: positional arg after main.py (e.g., "python main.py 5")
+                    if agent_id is None and 'main.py' in parts:
+                        try:
+                            main_idx = parts.index('main.py')
+                            if main_idx + 1 < len(parts):
+                                potential_id = parts[main_idx + 1]
+                                if potential_id.isdigit():
+                                    agent_id = potential_id
+                        except (ValueError, IndexError):
+                            pass
+
+                    agents.append({
+                        'pid': pid,
+                        'agent_id': agent_id,
+                        'host': 'localhost',
+                        'cmdline': ' '.join(parts[10:])[:100]  # First 100 chars of command
+                    })
+
+        return agents
+    except subprocess.CalledProcessError as e:
+        print(f"Error finding local agents: {e}")
+        return []
+
+def _find_remote_agents(host: str, pattern: str = 'main.py') -> List[dict]:
+    """Find agent processes running on a remote host."""
+    try:
+        ssh_cmd = ['ssh']
+        target = f"root@{host}"
+        ssh_cmd.extend([target, 'ps aux'])
+
+        result = subprocess.run(
+            ssh_cmd,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10
+        )
+
+        agents = []
+        for line in result.stdout.split('\n'):
+            if pattern in line and 'grep' not in line:
+                parts = line.split()
+                if len(parts) >= 2:
+                    pid = parts[1]
+                    agent_id = None
+                    if '--agent-id' in line:
+                        idx = line.split().index('--agent-id')
+                        if idx + 1 < len(line.split()):
+                            agent_id = line.split()[idx + 1]
+
+                    agents.append({
+                        'pid': pid,
+                        'agent_id': agent_id,
+                        'host': host,
+                        'cmdline': ' '.join(parts[10:])[:100]
+                    })
+
+        return agents
+    except subprocess.CalledProcessError as e:
+        print(f"Error finding agents on {host}: {e}")
+        return []
+    except subprocess.TimeoutExpired:
+        print(f"Timeout connecting to {host}")
+        return []
+
+def find_all_agents(args, pattern: str = 'main.py') -> List[dict]:
+    """Find all agent processes (local or remote)."""
+    all_agents = []
+
+    if args.mode == 'local':
+        all_agents = _find_local_agents(pattern)
+    elif args.mode == 'remote':
+        for host in _load_hosts():
+            print(f"Scanning {host}...")
+            agents = _find_remote_agents(host, pattern)
+            all_agents.extend(agents)
+
+    return all_agents
 
 if __name__ == "__main__":
     main()

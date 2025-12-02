@@ -151,10 +151,10 @@ class Agent(Observer):
     def stop(self):
         try:
             self.shutdown = True
-            self.transport.stop()
             with self.condition:
                 self.condition.notify_all()
             self.on_shutdown()
+            self.transport.stop()
         except Exception as e:
             self.logger.error(f"Exception occurred in shutdown: {e}")
             self.logger.error(traceback.format_exc())

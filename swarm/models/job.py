@@ -384,6 +384,7 @@ class Job(Object):
             "exit_status": self.exit_status,
             "leader_id": self.leader_id,
             "job_type": self.job_type,
+            "last_transition_at": self.last_transition_at
         }
         return f"Job({fields})"
 

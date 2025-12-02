@@ -21,23 +21,28 @@ def collect_restarted_job_ids(output_dir: str, repo: Repository | None = None) -
     """
     Return the set of job_ids that experienced >=1 restart.
 
-    Prefers Redis metrics; falls back to misc_<agent_id>.json files in output_dir.
+    Prefers metrics (Redis or saved file); falls back to misc_<agent_id>.json files in output_dir.
     """
     restarted: set[int] = set()
 
-    # Try Redis first
+    # Try loading metrics (from Redis or file)
+    metrics = None
     if repo is not None:
         metrics = load_metrics_from_repo(repo)
-        if metrics:
-            for _agent_id, m in metrics.items():
-                for job_id, cnt in (m.get("restarts", {}) or {}).items():
-                    try:
-                        if int(cnt) > 0:
-                            restarted.add(int(job_id))
-                    except Exception:
-                        continue
-            if restarted:
-                return restarted
+    else:
+        # Load from saved metrics.json file (--from-csv mode)
+        metrics = load_metrics_from_file(f"{output_dir}/metrics.json")
+
+    if metrics:
+        for _agent_id, m in metrics.items():
+            for job_id, cnt in (m.get("restarts", {}) or {}).items():
+                try:
+                    if int(cnt) > 0:
+                        restarted.add(int(job_id))
+                except Exception:
+                    continue
+        if restarted:
+            return restarted
 
     # Fallback: disk (misc_*.json)
     for fname in os.listdir(output_dir):
@@ -105,6 +110,24 @@ def load_metrics_from_repo(repo: Repository) -> dict[int, dict]:
         metrics_by_agent[int(agent_id)] = entry
 
     return metrics_by_agent
+
+def load_metrics_from_file(path: str) -> dict[int, dict]:
+    """
+    Load metrics from a saved JSON file.
+    Returns: {agent_id: metrics_dict}
+    """
+    if not os.path.exists(path):
+        return {}
+
+    try:
+        with open(path, 'r') as f:
+            metrics = json.load(f)
+
+        # Convert string keys to int keys if needed
+        return {int(k): v for k, v in metrics.items()}
+    except Exception as e:
+        print(f"Error loading metrics from {path}: {e}")
+        return {}
 
 def save_metrics(metrics: dict[int, dict], path: str):
     # Save combined CSV with leader_id
@@ -263,12 +286,16 @@ def plot_agent_loads(output_dir: str, repo: Repository | None = None, save_csv: 
         save_csv: If True, export load data to CSV files
         skip_plots: If True, skip plot generation
     """
+    # Try loading metrics from file first (for --from-csv mode)
+    metrics = None
     if repo is None:
-        return plot_agent_loads_from_dir(output_dir)
-
-    metrics = load_metrics_from_repo(repo)
-    if not metrics:
-        return plot_agent_loads_from_dir(output_dir)
+        metrics = load_metrics_from_file(f"{output_dir}/metrics.json")
+        if not metrics:
+            return plot_agent_loads_from_dir(output_dir)
+    else:
+        metrics = load_metrics_from_repo(repo)
+        if not metrics:
+            return plot_agent_loads_from_dir(output_dir)
 
     save_metrics(path=f"{output_dir}/metrics.json", metrics=metrics)
 
@@ -756,10 +783,19 @@ def detect_agent_failures(output_dir: str, repo: Repository | None = None) -> tu
     failures = []
     agent_mapping = {}
 
-    # Try Redis metrics first - check for agent_failures in metrics
+    # Try metrics first - check for agent_failures in metrics
+    metrics = None
     if repo is not None:
         try:
             metrics = load_metrics_from_repo(repo)
+        except Exception as e:
+            print(f"Could not load metrics from Redis: {e}")
+    else:
+        # Load from saved metrics.json file (--from-csv mode)
+        metrics = load_metrics_from_file(f"{output_dir}/metrics.json")
+
+    if metrics:
+        try:
             for agent_id, m in metrics.items():
                 agent_failures_data = m.get("failed_agents", {}) or {}
                 for failed_agent_id, timestamp in agent_failures_data.items():
@@ -768,7 +804,7 @@ def detect_agent_failures(output_dir: str, repo: Repository | None = None) -> tu
                         "failure_time": float(timestamp),
                     })
         except Exception as e:
-            print(f"Could not detect failures from Redis metrics: {e}")
+            print(f"Could not detect failures from metrics: {e}")
 
 
     # Deduplicate failures by agent_id (keep first occurrence)
@@ -803,7 +839,6 @@ def collect_reassignments(output_dir: str, repo: Repository | None = None, level
                         if int(job_id) not in reassignments:
                             job_obj = repo.get(job_id)
                             to_agent = job_obj.get("leader_id", -1)
-                            print(f"KOMAl --- {to_agent}")
                             reassignments[int(job_id)] = {
                                 "from_agent": reassignment_info.get("failed_agent", -1),
                                 "to_agent": to_agent,
@@ -1975,6 +2010,7 @@ if __name__ == "__main__":
     parser.add_argument("--save-csv", action="store_true", help="Export all data to CSV files for later analysis")
     parser.add_argument("--skip-plots", action="store_true", help="Skip plot generation (useful with --save-csv)")
     parser.add_argument("--from-csv", action="store_true", help="Generate plots from existing CSV files without connecting to Redis")
+    parser.add_argument("--failed-agents", type=str, default=None, help="Comma-separated list of agent IDs that actually failed (e.g., '1,3,5'). Only these will be counted in failure metrics. Useful to exclude intentionally shut down agents.")
     args = parser.parse_args()
 
     # Validate argument combinations

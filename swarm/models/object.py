@@ -38,6 +38,7 @@ class ObjectState(enum.Enum):
     IDLE = enum.auto()
     COMPLETE = enum.auto()
     FAILED = enum.auto()
+    BLOCKED = enum.auto()
 
 
 class Object(ABC):
@@ -68,7 +69,7 @@ class Object(ABC):
         with self.lock:
             old = self._state
             self._state = value
-            self.last_transition_at = time.time()
+            self._last_transition_at = time.time()
         # Call a hook after unlock to avoid lock reentrancy surprises
         self.on_state_changed(old, value)
 

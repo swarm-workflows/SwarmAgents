@@ -10,7 +10,6 @@
 #
 # The above copyright notice and this permission notice shall be included in all
 # copies or substantial portions of the Software.
-
 # THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 # IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 # FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
@@ -26,6 +25,8 @@ import threading
 import time
 import traceback
 from concurrent.futures.thread import ThreadPoolExecutor
+
+from google.genai.types import JobState
 
 from swarm.consensus.engine import ConsensusEngine
 from swarm.consensus.interfaces import ConsensusHost, ConsensusTransport, TopologyRouter
@@ -55,7 +56,33 @@ from swarm.utils.utils import generate_id, job_capacities
 class _HostAdapter(ConsensusHost):
     def __init__(self, agent: "ResourceAgent"):
         self.agent = agent
-    def get_object(self, object_id: str): return self.agent.queues.pending_queue.get(object_id)
+
+    def get_object(self, object_id: str):
+        # Try local queue first
+        job = self.agent.queues.pending_queue.get(object_id)
+        if job:
+            return job
+
+        # Not in local queue - fetch from Redis on-demand
+        # This allows agents to vote on proposals even if they haven't pulled the job locally yet
+        try:
+            job_data = self.agent.repository.get(
+                obj_id=object_id,
+                key_prefix=Repository.KEY_JOB,
+                level=self.agent.topology.level,
+                group=self.agent.topology.group
+            )
+            if job_data:
+                self.agent.logger.debug(f"Fetched job {object_id} from Redis for consensus voting")
+                job = Job()
+                job.from_dict(job_data)
+                if job.state == ObjectState.PENDING:
+                    self.agent.queues.pending_queue.add(job)
+                return job
+        except Exception as e:
+            self.agent.logger.warning(f"Failed to fetch job {object_id} from Redis: {e}")
+            return None
+
     def is_agreement_achieved(self, object_id: str): return self.agent.is_job_completed(object_id)
     def calculate_quorum(self): return self.agent.calculate_quorum()
     def on_leader_elected(self, obj: Object, proposal_id: str): self.agent.select_job(obj)
@@ -211,6 +238,17 @@ class ResourceAgent(Agent):
         residual = available - job.capacities
         negative_fields = residual.negative_fields()
         if len(negative_fields) > 0:
+            # Debug: log capacity mismatch details
+            import logging
+            logger = logging.getLogger('agent')
+            logger.debug(
+                f"[CAPACITY] Job {job.job_id} INSUFFICIENT: "
+                f"needs(cores={job.capacities.core}, ram={job.capacities.ram}, "
+                f"disk={job.capacities.disk}, gpu={getattr(job.capacities, 'gpu', 0)}) "
+                f"vs available(cores={available.core}, ram={available.ram}, "
+                f"disk={available.disk}, gpu={getattr(available, 'gpu', 0)}) "
+                f"negative_fields={negative_fields}"
+            )
             return False
         return True
 
@@ -344,6 +382,8 @@ class ResourceAgent(Agent):
                 job.state = ObjectState.PENDING
                 self.engine.outgoing.remove_object(object_id=job.job_id)
                 self.engine.incoming.remove_object(object_id=job.job_id)
+                if job.job_id in self.completed_jobs_set:
+                    self.completed_jobs_set.remove(job.job_id)
                 job_id = job.job_id
                 self.metrics.restarts[job_id] = self.metrics.restarts.get(job_id, 0) + 1
 
@@ -623,6 +663,20 @@ class ResourceAgent(Agent):
                         f"Skipping failed agent {agent.agent_id} during neighbor refresh "
                         f"(failed at {self.failed_agents.get(agent.agent_id)})"
                     )
+                    continue
+
+                # Skip agents that are shutting down gracefully
+                if getattr(agent, 'shutting_down', False):
+                    self.logger.debug(
+                        f"Skipping agent {agent.agent_id} during neighbor refresh "
+                        f"(shutting down gracefully)"
+                    )
+                    # Remove from map if present
+                    if agent.agent_id in target_dict:
+                        target_dict.remove(agent.agent_id)
+                        self.logger.info(
+                            f"Removed shutting down agent {agent.agent_id} from map"
+                        )
                     continue
 
                 # Track this agent as active (present in Redis)
@@ -910,7 +964,10 @@ class ResourceAgent(Agent):
 
         for d in job._required_dtns_cache:
             if d not in agent_dtn_names:
-                self.logger.debug(f"Agent: {self.agent_id}  does not have dtns for Job {job.job_id}")
+                self.logger.debug(
+                    f"[DTN] Agent {agent.agent_id} missing DTN '{d}' for Job {job.job_id}. "
+                    f"Job requires: {job._required_dtns_cache}, Agent has: {set(agent_dtn_names)}"
+                )
                 return False
 
         return True
@@ -964,7 +1021,7 @@ class ResourceAgent(Agent):
             dtn_pairs = tuple(sorted(_pair(x) for x in (agent.dtns or [])))
 
         return (
-            agent.agent_id,
+            agent.agent_id, agent.version,
             caps.core, caps.ram, caps.disk, caps.gpu,
             #round(caps.core, 3), round(caps.ram, 3), round(caps.disk, 3), round(getattr(caps, "gpu", 0.0), 3),
             dtn_pairs,
@@ -1105,10 +1162,13 @@ class ResourceAgent(Agent):
 
         while not self.shutdown:
             try:
+                infeasible_jobs = []
                 pending_jobs = self.queues.pending_queue.gets(states=[ObjectState.PENDING],
                                                               count=self.proposal_job_batch_size)
                 if not pending_jobs:
-                    self.logger.debug(f"No pending jobs available for agent: {self.agent_id}")
+                    self.logger.warning(f"No pending jobs available for agent Qsize: {self.queues.pending_queue.size()}")
+                    #for job in self.queues.pending_queue.objects.values():
+                    #    self.logger.info(f"Job: {job.job_id} state: {job.state}")
                     time.sleep(0.5)
                     continue
                 proposals = []
@@ -1145,18 +1205,40 @@ class ResourceAgent(Agent):
 
                 # Step 3: If this agent is assigned, start proposal
                 for job, (selected_agent, cost) in zip(pending_jobs, assignments):
-                    if selected_agent and selected_agent.agent_id == self.agent_id:
-                        '''
-                        # Skip jobs that failed delegation - don't propose for them
-                        # to avoid conflicts with children who may still process them
-                        if hasattr(job, 'delegation_failed') and job.delegation_failed:
-                            self.logger.debug(
-                                f"Skipping proposal for job {job.job_id} - "
-                                f"previously failed delegation (attempt #{getattr(job, 'delegation_failed_count', 0)})"
-                            )
-                            continue
-                        '''
+                    # Skip infeasible jobs and defer them
+                    if selected_agent is None and cost == float('inf'):
+                        # Job is completely infeasible - no agent can run it
+                        infeasible_jobs.append(job)
 
+                        # Track retry attempts
+                        if not hasattr(job, 'infeasible_retry_count'):
+                            job.infeasible_retry_count = 0
+                            job.infeasible_first_seen = time.time()
+                        job.infeasible_retry_count += 1
+
+                        self.logger.warning(
+                            f"Job {job.job_id} is INFEASIBLE (no agent can satisfy requirements: "
+                            f"cores={job.capacities.core}, ram={job.capacities.ram}, "
+                            f"disk={job.capacities.disk}, gpu={getattr(job.capacities, 'gpu', 0)}). "
+                            f"Attempt #{job.infeasible_retry_count}. Moving to back of queue."
+                        )
+
+                        # Set to BLOCKED state and move to end of queue
+                        # Will be restored to PENDING after delay (see _restore_infeasible_jobs)
+                        job.state = ObjectState.BLOCKED
+                        self.queues.pending_queue.move_to_end(job)
+                        continue
+
+                    if selected_agent.agent_id != self.agent_id:
+                        self.logger.debug(
+                            f"Job {job.job_id} is BETTER suited for agent {selected_agent.agent_id}: "
+                            f"Moving to back of queue."
+                        )
+
+                        self.queues.pending_queue.move_to_end(job)
+                        continue
+
+                    if selected_agent.agent_id == self.agent_id:
                         proposal = ProposalInfo(
                             p_id=generate_id(),
                             object_id=job.job_id,
@@ -1172,6 +1254,22 @@ class ResourceAgent(Agent):
                         self.logger.info(f"Identified jobs to select: {jobs}")
                     self.engine.propose(proposals=proposals)
                     proposals.clear()
+
+                if len(infeasible_jobs):
+                    self.logger.info(
+                        f"Deferred {len(infeasible_jobs)} infeasible jobs to BLOCKED state: "
+                        f"{[j.job_id for j in infeasible_jobs]}. "
+                        f"Will retry after 5s delay."
+                    )
+                    infeasible_jobs.clear()
+
+                # Periodically restore BLOCKED infeasible jobs back to PENDING
+                # This allows them to be retried after other jobs have been processed
+                self._restore_infeasible_jobs()
+
+                # Periodically check for orphaned jobs (in consensus states but no active proposals)
+                # This handles jobs stuck due to agent failures where consensus was cleared
+                #self._reset_orphaned_jobs()
 
                 time.sleep(0.5)
             except Exception as e:
@@ -1431,7 +1529,7 @@ class ResourceAgent(Agent):
                                 level=self.topology.level - 1,
                                 group=child_group
                             )
-                            self.logger.info(
+                            self.logger.debug(
                                 f"Delegated job {job_id} to level {self.topology.level - 1}, "
                                 f"group {child_group}")
 
@@ -1502,6 +1600,14 @@ class ResourceAgent(Agent):
 
 
     def on_shutdown(self):
+        # Mark as shutting down to prevent other agents from treating this as a failure
+        agent_info = self._generate_agent_info()
+        agent_info.shutting_down = True
+        self.repository.save(agent_info.to_dict(), key_prefix=Repository.KEY_AGENT,
+                             level=self.topology.level,
+                             group=self.topology.group)
+        self.logger.info(f"Agent {self.agent_id} marked as shutting_down in Redis")
+
         self.executor.shutdown(wait=True)
         self.save_results()
 
@@ -1529,6 +1635,9 @@ class ResourceAgent(Agent):
         :param current_time: Current timestamp
         :return: List of agent IDs detected as failed this round
         """
+        if self.shutdown:
+            return []
+
         failed_this_round = []
 
         # Add ±10% jitter to threshold to prevent synchronized failure detection
@@ -1538,6 +1647,13 @@ class ResourceAgent(Agent):
         for agent_id, agent_info in list(self.neighbor_map.items()):
             # Skip self
             if agent_id == self.agent_id:
+                continue
+
+            # Skip agents that are shutting down gracefully
+            if getattr(agent_info, 'shutting_down', False):
+                self.logger.info(
+                    f"Agent {agent_id} is shutting down gracefully, not treating as failure"
+                )
                 continue
 
             # Check if agent hasn't updated in Redis beyond threshold
@@ -1595,11 +1711,193 @@ class ResourceAgent(Agent):
                     'reason': f'removed_agent_{agent_id}'
                 })
 
+                # Clear stuck consensus proposals involving this failed agent
+                self._clear_consensus_for_failed_agent(agent_id)
+
                 # Trigger job reassignment if enabled
                 if self.job_reassignment_enabled:
                     self._reassign_jobs_from_failed_agent(agent_id)
                 else:
                     self.logger.info(f"Job reassignment disabled, not reassigning jobs from agent {agent_id}")
+
+    def _clear_consensus_for_failed_agent(self, failed_agent_id: int) -> None:
+        """
+        Clear consensus state for proposals involving a failed agent.
+
+        When an agent fails mid-consensus, proposals waiting for its prepare/commit
+        votes will be stuck indefinitely. This method identifies and clears such
+        proposals, allowing jobs to restart selection with remaining agents.
+
+        :param failed_agent_id: ID of the failed agent
+        """
+        cleared_proposals = []
+        affected_job_ids = set()
+
+        # Check incoming proposals waiting for failed agent's votes
+        #for job_id, proposals in list(self.engine.incoming.proposals_by_object_id.items()):
+        for job_id in self.engine.incoming.objects():
+            proposals = self.engine.incoming.get_proposals_by_object_id(job_id)
+            for p_id, prop_info in list(proposals.items()):
+                # Check if this proposal involves the failed agent
+                if failed_agent_id == prop_info.agent_id:
+                    # Proposal was FROM the failed agent - remove it
+                    proposals.pop(p_id, None)
+                    cleared_proposals.append((job_id, p_id, 'incoming', 'from_failed'))
+                    affected_job_ids.add(job_id)
+                    self.logger.info(
+                        f"Cleared incoming proposal {p_id} for job {job_id} "
+                        f"(proposal from failed agent {failed_agent_id})"
+                    )
+                elif failed_agent_id in prop_info.prepares:
+                    # Failed agent already voted prepare - proposal stuck waiting for commits
+                    # Remove the proposal since quorum calculation changed
+                    proposals.pop(p_id, None)
+                    cleared_proposals.append((job_id, p_id, 'incoming', 'has_prepare'))
+                    affected_job_ids.add(job_id)
+                    self.logger.info(
+                        f"Cleared incoming proposal {p_id} for job {job_id} "
+                        f"(failed agent {failed_agent_id} in prepare list)"
+                    )
+
+            # Clean up empty job entries
+            if not proposals:
+                self.engine.incoming.remove_object(job_id)
+
+        # Check outgoing proposals this agent sent
+        #for job_id, proposals in list(self.engine.outgoing.proposals_by_object_id.items()):
+        for job_id in self.engine.outgoing.objects():
+            proposals = self.engine.outgoing.get_proposals_by_object_id(job_id)
+            for p_id, prop_info in list(proposals.items()):
+                # Check if waiting for failed agent's prepare/commit
+                if failed_agent_id in prop_info.prepares or prop_info.agent_id == failed_agent_id:
+                    proposals.pop(p_id, None)
+                    cleared_proposals.append((job_id, p_id, 'outgoing', 'waiting_for_failed'))
+                    affected_job_ids.add(job_id)
+                    self.logger.info(
+                        f"Cleared outgoing proposal {p_id} for job {job_id} "
+                        f"(waiting for failed agent {failed_agent_id})"
+                    )
+
+            if not proposals:
+                self.engine.outgoing.remove_object(job_id)
+
+        # Reset affected jobs to PENDING state so they can be reselected
+        if affected_job_ids:
+            for job_id in affected_job_ids:
+                job = self.queues.pending_queue.get(job_id)
+                #if job and job.state == ObjectState.PRE_PREPARE:
+                if job and job.state in [ObjectState.PRE_PREPARE, ObjectState.PREPARE]:
+                    old_state = job.state
+                    job.state = ObjectState.PENDING
+                    self.queues.pending_queue.update(job)
+                    self.logger.info(
+                        f"Reset job {job_id} from {old_state} to PENDING for reselection "
+                        f"(consensus cleared for failed agent {failed_agent_id})"
+                    )
+
+        if cleared_proposals:
+            self.logger.warning(
+                f"Cleared {len(cleared_proposals)} stuck consensus proposals involving failed agent {failed_agent_id}. "
+                f"Reset {len(affected_job_ids)} jobs to PENDING state."
+            )
+            # Record in metrics
+            self.metrics.agent_failures[failed_agent_id]['cleared_proposals'] = len(cleared_proposals)
+            self.metrics.agent_failures[failed_agent_id]['reset_jobs'] = len(affected_job_ids)
+        else:
+            self.logger.debug(f"No stuck consensus proposals found for failed agent {failed_agent_id}")
+
+    def _restore_infeasible_jobs(self, retry_delay: float = 5.0) -> None:
+        """
+        Restore BLOCKED infeasible jobs back to PENDING after a delay.
+
+        This allows infeasible jobs to be retried periodically while not blocking
+        the queue for other feasible jobs. Jobs are restored after retry_delay seconds.
+
+        :param retry_delay: Delay in seconds before retrying infeasible jobs
+        """
+        current_time = time.time()
+        restored_count = 0
+
+        # Check all BLOCKED jobs in the queue
+        blocked_jobs = self.queues.pending_queue.gets(
+            states=[ObjectState.BLOCKED],
+            count=100  # Check up to 100 blocked jobs per iteration
+        )
+
+        self.logger.debug(f"[RESTORE] Found {len(blocked_jobs)} BLOCKED jobs to check for restore")
+
+        for job in blocked_jobs:
+            # Only restore jobs that were blocked due to infeasibility
+            has_timestamp = job.last_transition_at is not None
+            time_blocked = current_time - getattr(job, 'last_transition_at', current_time)
+            self.logger.debug(
+                f"[RESTORE] Checking job {job.job_id}: has_timestamp={has_timestamp}, "
+                f"time_blocked={time_blocked:.1f}s, retry_delay={retry_delay}s"
+            )
+
+            if has_timestamp:
+                if time_blocked >= retry_delay:
+                    # Restore to PENDING state and move to end of queue
+                    job.state = ObjectState.PENDING
+                    self.queues.pending_queue.move_to_end(job)
+                    restored_count += 1
+
+                    self.logger.debug(
+                        f"Restored infeasible job {job.job_id} to PENDING (at back of queue) "
+                        f"(retry #{getattr(job, 'infeasible_retry_count', 0)}, "
+                        f"blocked for {time_blocked:.1f}s)"
+                    )
+
+        if restored_count > 0:
+            self.logger.info(f"Restored {restored_count} infeasible jobs to PENDING for retry")
+
+    def _reset_orphaned_jobs(self) -> None:
+        """
+        Reset orphaned jobs back to PENDING state.
+
+        Orphaned jobs are those stuck in consensus states (PRE_PREPARE, PREPARE, COMMIT)
+        but have no active proposals in engine.incoming or engine.outgoing.
+        This can happen when:
+        - An agent fails mid-consensus and proposals are cleared
+        - Consensus clearing happens but job states aren't reset
+        - Network partitions cause proposal loss
+
+        This method periodically scans for such jobs and resets them to PENDING
+        so they can go through selection again.
+        """
+        orphaned_states = [ObjectState.PRE_PREPARE, ObjectState.PREPARE, ObjectState.COMMIT]
+        reset_count = 0
+
+        # Get all jobs in consensus states
+        for state in orphaned_states:
+            jobs_in_state = self.queues.pending_queue.gets(
+                states=[state],
+                count=100  # Check up to 100 jobs per state per iteration
+            )
+
+            for job in jobs_in_state:
+                job_id = job.job_id
+                if job_id in self.completed_jobs_set:
+                    continue
+
+                # Check if job has active proposals
+                has_incoming = self.engine.incoming.contains(object_id=job_id) and len(self.engine.incoming.get_proposals_by_object_id(job_id)) > 0
+                has_outgoing = self.engine.outgoing.contains(object_id=job_id) and len(self.engine.outgoing.get_proposals_by_object_id(job_id)) > 0
+
+                if not has_incoming and not has_outgoing:
+                    # Job is orphaned - no active proposals
+                    old_state = job.state
+                    job.state = ObjectState.PENDING
+                    self.queues.pending_queue.update(job)
+                    reset_count += 1
+
+                    self.logger.warning(
+                        f"Reset orphaned job {job_id} from {old_state} to PENDING "
+                        f"(no active proposals found in consensus engine)"
+                    )
+
+        if reset_count > 0:
+            self.logger.info(f"Reset {reset_count} orphaned jobs to PENDING state")
 
     def invalidate_agent_cache(self, agent_id: int) -> bool:
         """
@@ -1673,6 +1971,8 @@ class ResourceAgent(Agent):
             # Clear from consensus containers
             self.engine.outgoing.remove_object(object_id=job_id)
             self.engine.incoming.remove_object(object_id=job_id)
+            if job.job_id in self.completed_jobs_set:
+                self.completed_jobs_set.remove(job.job_id)
 
             # Remove from assignment tracking
             self.job_assignments.remove(job_id)

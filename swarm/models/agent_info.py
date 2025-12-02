@@ -46,7 +46,16 @@ class AgentInfo(JSONField):
         self._dtns = {}
         self._group = None
         self._level = None
+        self._shutting_down = False  # Set to True during graceful shutdown to prevent failure detection
         self._set_fields(**kwargs)
+
+    @property
+    def shutting_down(self):
+        return self._shutting_down
+
+    @shutting_down.setter
+    def shutting_down(self, value):
+        self._shutting_down = value
 
     @property
     def version(self):
