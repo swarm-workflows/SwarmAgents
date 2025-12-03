@@ -290,6 +290,8 @@ def start_agents_remote(args, agent_hosts_list: list[str], agent_count: int = No
             forwarded += ["--group-size", str(args.group_size)]
         if args.debug:
             forwarded += ["--debug"]
+        # Add start-offset for this host's agent range (0-based offset from 1-based start_idx)
+        forwarded += ["--start-offset", str(start_idx - 1)]
 
         start_cmd = (
             #f"source ~/.bash_profile && "
