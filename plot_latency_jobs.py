@@ -150,6 +150,7 @@ def save_jobs(jobs: list[Any], path: str, level: int | None = None):
         level: Hierarchy level (0, 1, etc.). If None, uses last timestamp (backward compatible)
     """
     detailed_latency = []
+    pending_jobs = []
     for job_data in jobs:
         if isinstance(job_data, dict):
             job = Job()
@@ -159,10 +160,6 @@ def save_jobs(jobs: list[Any], path: str, level: int | None = None):
 
         job_id = job.job_id
         leader_id = getattr(job, "leader_id", None)
-        if leader_id is None:
-            continue
-        if job.state not in [ObjectState.READY, ObjectState.RUNNING, ObjectState.COMPLETE]:
-            continue
 
         # Ensure numeric/float for reasoning_time (0.0 if missing)
         reasoning_time = getattr(job, "reasoning_time", None)
@@ -198,7 +195,8 @@ def save_jobs(jobs: list[Any], path: str, level: int | None = None):
         scheduling_latency = assigned_at - submitted_at if assigned_at and submitted_at else 0
 
         # IMPORTANT: leader_id before reasoning_time to match header
-        detailed_latency.append([
+        if leader_id is None or job.state not in [ObjectState.READY, ObjectState.RUNNING, ObjectState.COMPLETE]:
+            pending_jobs.append([
             job_id,
             submitted_at,
             selection_started_at,
@@ -209,15 +207,38 @@ def save_jobs(jobs: list[Any], path: str, level: int | None = None):
             leader_id,
             reasoning_time,
             scheduling_latency,
-        ])
+            ])
+        else:
+            detailed_latency.append([
+                job_id,
+                submitted_at,
+                selection_started_at,
+                assigned_at,
+                started_at,
+                completed_at,
+                job.exit_status if job.exit_status is not None else 0,
+                leader_id,
+                reasoning_time,
+                scheduling_latency,
+            ])
 
-    with open(path, 'w', newline='') as f:
+    file_name = f"{path}/all_jobs.csv" if level is None else f"{path}/level{level}_jobs.csv"
+    pending_file_name = f"{path}/pending_jobs.csv" if level is None else f"{path}/pending_level{level}_jobs.csv"
+    with open(file_name, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow([
             'job_id', 'submitted_at', 'selection_started_at', 'assigned_at',
             'started_at', 'completed_at', 'exit_status', 'leader_id', 'reasoning_time', 'scheduling_latency',
         ])
         writer.writerows(detailed_latency)
+
+    with open(pending_file_name, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            'job_id', 'submitted_at', 'selection_started_at', 'assigned_at',
+            'started_at', 'completed_at', 'exit_status', 'leader_id', 'reasoning_time', 'scheduling_latency',
+        ])
+        writer.writerows(pending_jobs)
 
 def plot_agent_loads_from_dir(run_dir):
     agent_data = {}
@@ -766,7 +787,7 @@ def plot_reasoning_time(output_dir: str):
         print("Reasoning timestamps not present in all_jobs.csv; nothing to plot.")
 
 
-def detect_agent_failures(output_dir: str, repo: Repository | None = None) -> tuple[list[dict], dict[int, str]]:
+def detect_agent_failures(output_dir: str, repo: Repository | None = None, failed_agent_list: list  = []) -> tuple[list[dict], dict[int, str]]:
     """
     Detect agent failures and their timestamps, plus host:port mapping for all agents.
 
@@ -799,6 +820,8 @@ def detect_agent_failures(output_dir: str, repo: Repository | None = None) -> tu
             for agent_id, m in metrics.items():
                 agent_failures_data = m.get("failed_agents", {}) or {}
                 for failed_agent_id, timestamp in agent_failures_data.items():
+                    if failed_agent_id not in failed_agent_list:
+                        continue
                     failures.append({
                         "agent_id": int(failed_agent_id),
                         "failure_time": float(timestamp),
@@ -842,7 +865,7 @@ def collect_reassignments(output_dir: str, repo: Repository | None = None, level
                             reassignments[int(job_id)] = {
                                 "from_agent": reassignment_info.get("failed_agent", -1),
                                 "to_agent": to_agent,
-                                "timestamp": reassignment_info.get("reassigned_at", 0),
+                                "timestamp": reassignment_info.get("timestamp", 0),
                                 "reason": reassignment_info.get("reason", "failure"),
                                 "type": "regular"
                             }
@@ -855,7 +878,6 @@ def collect_reassignments(output_dir: str, repo: Repository | None = None, level
                         if int(job_id) not in reassignments:
                             job_obj = repo.get(job_id)
                             to_agent = job_obj.get("leader_id", -1)
-                            print(f"KOMAl --- {to_agent}")
                             reassignments[int(job_id)] = {
                                 "from_agent": reassignment_info.get("from_agent", -1),
                                 "to_agent": to_agent,  # Current agent took over
@@ -869,7 +891,7 @@ def collect_reassignments(output_dir: str, repo: Repository | None = None, level
     return reassignments
 
 
-def plot_failure_summary(output_dir: str, repo: Repository | None = None):
+def plot_failure_summary(output_dir: str, repo: Repository | None = None, failed_agent_list: list  = []):
     """
     Create summary visualization showing:
     - Total failed agents
@@ -877,7 +899,7 @@ def plot_failure_summary(output_dir: str, repo: Repository | None = None):
     - Failed agents by ID
     - Reassigned jobs timeline
     """
-    failures, _ = detect_agent_failures(output_dir, repo)
+    failures, _ = detect_agent_failures(output_dir, repo, failed_agent_list)
     print("Total failed agents:", len(failures))
     reassignments = collect_reassignments(output_dir, repo)
     print("Total reassigned jobs:", len(reassignments))
@@ -1062,7 +1084,7 @@ def plot_failure_summary(output_dir: str, repo: Repository | None = None):
 
 
 def plot_timeline_with_failures(output_dir: str, repo: Repository | None = None,
-                                  window_size: int = 10):
+                                  window_size: int = 10, failed_agent_list: list  = []):
     """
     Timeline visualization showing:
     - Throughput (jobs/sec) over time
@@ -1126,7 +1148,7 @@ def plot_timeline_with_failures(output_dir: str, repo: Repository | None = None,
     active_counts = active_agents_series.values
 
     # Detect failures
-    failures, _ = detect_agent_failures(output_dir, repo)
+    failures, _ = detect_agent_failures(output_dir, repo, failed_agent_list)
 
     # Convert times to relative (seconds from start)
     throughput_times_rel = [t - start_time for t in throughput_times]
@@ -1188,7 +1210,7 @@ def plot_timeline_with_failures(output_dir: str, repo: Repository | None = None,
 
 def analyze_throughput_degradation(output_dir: str, repo: Repository | None = None,
                                      window_size: int = 10,
-                                     baseline_duration: int = 30):
+                                     baseline_duration: int = 30, failed_agent_list: list  = []):
     """
     Analyze throughput degradation due to failures.
 
@@ -1220,7 +1242,7 @@ def analyze_throughput_degradation(output_dir: str, repo: Repository | None = No
     end_time = df["completed_at"].max()
 
     # Detect failures
-    failures, _ = detect_agent_failures(output_dir, repo)
+    failures, _ = detect_agent_failures(output_dir, repo, failed_agent_list)
 
     if not failures:
         print("No failures detected - cannot compute degradation metrics")
@@ -2001,6 +2023,207 @@ def plot_latency_comparison_by_hierarchy_level(output_dir: str):
         print(f"Saved: {os.path.join(output_dir, 'latency_stats_by_hierarchy_level.csv')}")
 
 
+def compute_fault_tolerance_metrics(output_dir: str, repo: Repository | None = None, failed_agent_list: list = []):
+    """
+    Computes fault tolerance evaluation metrics:
+    1. Failure detection latency
+    2. Job reassignment time
+    3. Throughput degradation during recovery
+    4. System availability
+
+    Saves results to:
+    - metric_failure_detection_latency.csv
+    - metric_job_reassignment_time.csv
+    - metric_throughput_degradation.csv
+    - metric_system_availability.csv
+    - fault_tolerance_metrics_summary.csv
+    """
+    print("\n" + "="*80)
+    print("COMPUTING FAULT TOLERANCE METRICS")
+    print("="*80)
+
+    # Load necessary data
+    all_jobs_csv = os.path.join(output_dir, "all_jobs.csv")
+    if not os.path.exists(all_jobs_csv):
+        print(f"Error: {all_jobs_csv} not found. Run data collection first.")
+        return
+
+    all_jobs_df = pd.read_csv(all_jobs_csv)
+    pending_jobs_csv = os.path.join(output_dir, "pending_jobs.csv")
+    if not os.path.exists(pending_jobs_csv):
+        print(f"Error: {pending_jobs_csv} not found. Run data collection first.")
+        return
+    pending_jobs_df = pd.read_csv(pending_jobs_csv)
+
+    # Detect failures and collect reassignments
+    failures, _ = detect_agent_failures(output_dir, repo, failed_agent_list)
+    reassignments = collect_reassignments(output_dir, repo)
+
+    if not failures:
+        print("No failures detected. Skipping fault tolerance metrics.")
+        return
+
+    failures_df = pd.DataFrame(failures)
+
+    metrics = {}
+
+    # =====================================================================
+    # 1. FAILURE DETECTION LATENCY
+    # =====================================================================
+    if reassignments and failures:
+        detection_latencies = []
+        for failure in failures:
+            failed_agent_id = failure['agent_id']
+            failure_time = failure['failure_time']
+
+            # Find jobs reassigned from this agent
+            agent_reassignments = {jid: info for jid, info in reassignments.items()
+                                  if info.get('from_agent') == failed_agent_id}
+
+            if agent_reassignments:
+                # Detection latency = earliest reassignment time - failure time
+                earliest_reassignment = min(info['timestamp'] for info in agent_reassignments.values())
+                detection_latency = earliest_reassignment - failure_time
+                detection_latencies.append({
+                    'failed_agent_id': failed_agent_id,
+                    'failure_time': failure_time,
+                    'detection_time': earliest_reassignment,
+                    'detection_latency_s': detection_latency
+                })
+
+        if detection_latencies:
+            detection_df = pd.DataFrame(detection_latencies)
+            detection_df.to_csv(os.path.join(output_dir, "metric_failure_detection_latency.csv"), index=False)
+            metrics['avg_failure_detection_latency_s'] = detection_df['detection_latency_s'].mean()
+            metrics['max_failure_detection_latency_s'] = detection_df['detection_latency_s'].max()
+            print(f"✓ Failure detection latency: avg={metrics['avg_failure_detection_latency_s']:.2f}s, max={metrics['max_failure_detection_latency_s']:.2f}s")
+
+    # =====================================================================
+    # 2. JOB REASSIGNMENT TIME
+    # =====================================================================
+    if reassignments:
+        reassignment_times = []
+        for job_id, info in reassignments.items():
+            from_agent = info.get('from_agent')
+            to_agent = info.get('to_agent')
+            reassignment_timestamp = info.get('timestamp')
+
+            # Find when the job was originally assigned
+            job_data = all_jobs_df[all_jobs_df['job_id'] == job_id]
+            if not job_data.empty:
+                original_assignment = job_data['scheduled_at'].iloc[0]
+                reassignment_time = reassignment_timestamp - original_assignment
+                reassignment_times.append({
+                    'job_id': job_id,
+                    'from_agent': from_agent,
+                    'to_agent': to_agent,
+                    'original_assignment_time': original_assignment,
+                    'reassignment_time': reassignment_timestamp,
+                    'reassignment_duration_s': reassignment_time
+                })
+
+        if reassignment_times:
+            reassignment_df = pd.DataFrame(reassignment_times)
+            reassignment_df.to_csv(os.path.join(output_dir, "metric_job_reassignment_time.csv"), index=False)
+            metrics['avg_job_reassignment_time_s'] = reassignment_df['reassignment_duration_s'].mean()
+            metrics['max_job_reassignment_time_s'] = reassignment_df['reassignment_duration_s'].max()
+            print(f"✓ Job reassignment time: avg={metrics['avg_job_reassignment_time_s']:.2f}s, max={metrics['max_job_reassignment_time_s']:.2f}s")
+
+    # =====================================================================
+    # 3. THROUGHPUT DEGRADATION DURING RECOVERY
+    # =====================================================================
+    completed_jobs = all_jobs_df[(all_jobs_df['completed_at'] > 0) & (all_jobs_df['assigned_at'] > 0)]
+
+    if not completed_jobs.empty and failures:
+        start_time = completed_jobs['assigned_at'].min()
+        first_failure = min(f['failure_time'] for f in failures)
+
+        # Define time windows
+        baseline_window = (0, first_failure - start_time)
+        failure_window = (first_failure - start_time, first_failure - start_time + 60)
+        recovery_window = (first_failure - start_time + 60, first_failure - start_time + 120)
+
+        completed_jobs['relative_completion'] = completed_jobs['completed_at'] - start_time
+
+        # Calculate throughput for each window
+        def calc_throughput(df, window_start, window_end):
+            window_df = df[(df['relative_completion'] >= window_start) &
+                         (df['relative_completion'] < window_end)]
+            duration = window_end - window_start
+            return len(window_df) / duration if duration > 0 else 0
+
+        baseline_throughput = calc_throughput(completed_jobs, *baseline_window)
+        failure_throughput = calc_throughput(completed_jobs, *failure_window)
+        recovery_throughput = calc_throughput(completed_jobs, *recovery_window)
+
+        degradation_pct = ((baseline_throughput - failure_throughput) / baseline_throughput * 100) if baseline_throughput > 0 else 0
+        recovery_pct = ((recovery_throughput - failure_throughput) / (baseline_throughput - failure_throughput) * 100) if (baseline_throughput - failure_throughput) > 0 else 0
+
+        throughput_metrics = [{
+            'window': 'baseline',
+            'start_time_s': baseline_window[0],
+            'end_time_s': baseline_window[1],
+            'throughput_jobs_per_s': baseline_throughput,
+            'degradation_pct': 0.0
+        }, {
+            'window': 'failure',
+            'start_time_s': failure_window[0],
+            'end_time_s': failure_window[1],
+            'throughput_jobs_per_s': failure_throughput,
+            'degradation_pct': degradation_pct
+        }, {
+            'window': 'recovery',
+            'start_time_s': recovery_window[0],
+            'end_time_s': recovery_window[1],
+            'throughput_jobs_per_s': recovery_throughput,
+            'degradation_pct': ((baseline_throughput - recovery_throughput) / baseline_throughput * 100) if baseline_throughput > 0 else 0
+        }]
+
+        throughput_df = pd.DataFrame(throughput_metrics)
+        throughput_df.to_csv(os.path.join(output_dir, "metric_throughput_degradation.csv"), index=False)
+        metrics['baseline_throughput_jobs_per_s'] = baseline_throughput
+        metrics['failure_throughput_jobs_per_s'] = failure_throughput
+        metrics['recovery_throughput_jobs_per_s'] = recovery_throughput
+        metrics['max_degradation_pct'] = degradation_pct
+        metrics['recovery_pct'] = recovery_pct
+        print(f"✓ Throughput degradation: {degradation_pct:.1f}% (baseline: {baseline_throughput:.3f} jobs/s, failure: {failure_throughput:.3f} jobs/s)")
+
+    # =====================================================================
+    # 4. SYSTEM AVAILABILITY
+    # =====================================================================
+    if not all_jobs_df.empty:
+        total_jobs = len(all_jobs_df) + len(pending_jobs_df)
+        completed_jobs_count = len(all_jobs_df[all_jobs_df['completed_at'] > 0])
+        successful_jobs = len(all_jobs_df[(all_jobs_df['completed_at'] > 0) &
+                                         (all_jobs_df['leader_id'] is not None)])  # State 8 = COMPLETE
+
+        availability_pct = (successful_jobs / total_jobs * 100) if total_jobs > 0 else 0
+        completion_rate_pct = (completed_jobs_count / total_jobs * 100) if total_jobs > 0 else 0
+
+        availability_metrics = [{
+            'total_jobs': total_jobs,
+            'completed_jobs': completed_jobs_count,
+            'successful_jobs': successful_jobs,
+            'failed_jobs': completed_jobs_count - successful_jobs,
+            'pending_jobs': total_jobs - completed_jobs_count,
+            'completion_rate_pct': completion_rate_pct,
+            'availability_pct': availability_pct
+        }]
+
+        availability_df = pd.DataFrame(availability_metrics)
+        availability_df.to_csv(os.path.join(output_dir, "metric_system_availability.csv"), index=False)
+        metrics['system_availability_pct'] = availability_pct
+        metrics['completion_rate_pct'] = completion_rate_pct
+        print(f"✓ System availability: {availability_pct:.1f}% ({successful_jobs}/{total_jobs} jobs successful)")
+
+    # Save summary metrics
+    if metrics:
+        summary_df = pd.DataFrame([metrics])
+        summary_df.to_csv(os.path.join(output_dir, "fault_tolerance_metrics_summary.csv"), index=False)
+        print(f"\n✓ Saved fault_tolerance_metrics_summary.csv")
+        print("="*80 + "\n")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Plot scheduling latency, jobs per agent, conflicts/restarts, and loads")
     parser.add_argument("--output_dir", type=str, default=".", help="Directory where plots and CSV files are saved")
@@ -2012,6 +2235,9 @@ if __name__ == "__main__":
     parser.add_argument("--from-csv", action="store_true", help="Generate plots from existing CSV files without connecting to Redis")
     parser.add_argument("--failed-agents", type=str, default=None, help="Comma-separated list of agent IDs that actually failed (e.g., '1,3,5'). Only these will be counted in failure metrics. Useful to exclude intentionally shut down agents.")
     args = parser.parse_args()
+
+    failed_agent_list = args.failed_agents.split(',') if args.failed_agents else []
+    print ("Failed agents: {}".format(failed_agent_list))
 
     # Validate argument combinations
     if args.from_csv and args.save_csv:
@@ -2058,17 +2284,17 @@ if __name__ == "__main__":
             all_jobs = level0_jobs + level1_jobs + level2_jobs
 
             # Save level-specific CSVs with level-specific timestamps
-            save_jobs(jobs=level0_jobs, path=f"{args.output_dir}/level0_jobs.csv", level=0)
-            save_jobs(jobs=level1_jobs, path=f"{args.output_dir}/level1_jobs.csv", level=1)
-            save_jobs(jobs=level2_jobs, path=f"{args.output_dir}/level2_jobs.csv", level=2)
+            save_jobs(jobs=level0_jobs, path=args.output_dir, level=0)
+            save_jobs(jobs=level1_jobs, path=args.output_dir, level=1)
+            save_jobs(jobs=level2_jobs, path=args.output_dir, level=2)
 
             # Save combined all_jobs.csv (uses last timestamps for backward compatibility)
-            save_jobs(jobs=all_jobs, path=f"{args.output_dir}/all_jobs.csv", level=None)
+            save_jobs(jobs=all_jobs, path=args.output_dir, level=None)
         else:
             # For non-hierarchical topologies, fetch from level 0 only
             all_jobs = repo.get_all_objects(key_prefix=Repository.KEY_JOB, level=0)
-            save_jobs(jobs=all_jobs, path=f"{args.output_dir}/level0_jobs.csv", level=None)
-            save_jobs(jobs=all_jobs, path=f"{args.output_dir}/all_jobs.csv", level=None)
+            save_jobs(jobs=all_jobs, path=args.output_dir, level=0)
+            save_jobs(jobs=all_jobs, path=args.output_dir, level=None)
 
         all_agents = repo.get_all_objects(key_prefix=Repository.KEY_AGENT, level=None)
         save_agents(agents=all_agents, path=agents_csv_file)
@@ -2111,16 +2337,17 @@ if __name__ == "__main__":
     # NEW: Failure summary with failed agents and reassigned jobs (visualization #1)
     # Note: This function always saves CSVs (failed_agents.csv, reassigned_jobs.csv)
     if not args.skip_plots:
-        plot_failure_summary(args.output_dir, repo)
+        plot_failure_summary(args.output_dir, repo, failed_agent_list=failed_agent_list)
 
         # NEW: Timeline with failure events (visualization #2)
-        plot_timeline_with_failures(args.output_dir, repo, window_size=10)
+        plot_timeline_with_failures(args.output_dir, repo, window_size=10, failed_agent_list=failed_agent_list)
 
         # NEW: Throughput degradation analysis (visualization #3)
-        analyze_throughput_degradation(args.output_dir, repo, window_size=10, baseline_duration=30)
+        analyze_throughput_degradation(args.output_dir, repo, window_size=10, baseline_duration=30,
+                                       failed_agent_list=failed_agent_list)
     else:
         # Still run failure detection to export CSVs
-        failures, _ = detect_agent_failures(args.output_dir, repo)
+        failures, _ = detect_agent_failures(args.output_dir, repo, failed_agent_list)
         reassignments = collect_reassignments(args.output_dir, repo)
 
         if failures:
@@ -2132,9 +2359,9 @@ if __name__ == "__main__":
             reassignments_list = [
                 {
                     "job_id": job_id,
-                    "original_agent": info.get("original_agent"),
-                    "new_agent": info.get("new_agent"),
-                    "reassignment_time": info.get("reassignment_time"),
+                    "original_agent": info.get("from_agent"),
+                    "new_agent": info.get("to_agent"),
+                    "reassignment_time": info.get("timestamp"),
                     "reason": info.get("reason", "agent_failure")
                 }
                 for job_id, info in reassignments.items()
@@ -2208,4 +2435,8 @@ if __name__ == "__main__":
                 save_csv=args.save_csv,
                 skip_plots=args.skip_plots
             )
+
+    # Compute fault tolerance metrics
+    if failed_agent_list and not args.from_csv:
+        compute_fault_tolerance_metrics(args.output_dir, repo, failed_agent_list)
 

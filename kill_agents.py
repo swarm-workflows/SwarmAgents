@@ -117,6 +117,17 @@ class AgentKiller:
                             if idx + 1 < len(line.split()):
                                 agent_id = line.split()[idx + 1]
 
+                        # Method 2: positional arg after main.py (e.g., "python main.py 5")
+                        if agent_id is None and 'main.py' in parts:
+                            try:
+                                main_idx = parts.index('main.py')
+                                if main_idx + 1 < len(parts):
+                                    potential_id = parts[main_idx + 1]
+                                    if potential_id.isdigit():
+                                        agent_id = potential_id
+                            except (ValueError, IndexError):
+                                pass
+                            
                         agents.append({
                             'pid': pid,
                             'agent_id': agent_id,
