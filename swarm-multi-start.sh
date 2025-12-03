@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
     cat <<EOF
-Usage: $0 <agent_type> <num_agents> <topology> <job_cnt> [database] [jobs_per_proposal] [--use-config-dir] [--debug] [--groups N] [--group-size M]
+Usage: $0 <agent_type> <num_agents> <topology> <job_cnt> [database] [jobs_per_proposal] [--use-config-dir] [--debug] [--groups N] [--group-size M] [--start-offset N]
   agent_type         Agent kind to start: resource | llm
   num_agents         Number of agents to start
   topology           Topology type (mesh | ring | star | hierarchical)
@@ -13,6 +13,7 @@ Usage: $0 <agent_type> <num_agents> <topology> <job_cnt> [database] [jobs_per_pr
 
   --use-config-dir   (Optional) Use configs in ./configs directory instead of regenerating
   --debug            (Optional) Enable debug metrics/logging
+  --start-offset N   (Optional) Starting agent ID offset (default: 0, for dynamic agents)
 
   # NEW (propagated to generate_configs.py for mesh/ring):
   --groups N         Number of independent groups
@@ -25,6 +26,7 @@ use_config_dir=false
 debug=false
 groups=""
 group_size=""
+start_offset="0"
 
 # Collect flags & positionals
 pos=()
@@ -32,6 +34,11 @@ while (( "$#" )); do
   case "$1" in
     --use-config-dir) use_config_dir=true; shift ;;
     --debug)          debug=true; shift ;;
+    --start-offset)
+        [[ $# -lt 2 ]] && { echo "Error: --start-offset requires a value"; usage; }
+        start_offset="$2"; shift 2 ;;
+    --start-offset=*)
+        start_offset="${1#*=}"; shift ;;
     --groups)
         [[ $# -lt 2 ]] && { echo "Error: --groups requires a value"; usage; }
         groups="$2"; shift 2 ;;
@@ -65,7 +72,7 @@ case "$agent_type" in
   *) echo "Error: agent_type must be 'resource' or 'llm'"; usage ;;
 esac
 
-base_index=0
+base_index="$start_offset"
 
 echo "Starting $num_agents '$agent_type' agents with:"
 echo "  Topology: $topology"
@@ -74,6 +81,7 @@ echo "  Database: $database"
 echo "  Jobs per proposal: $jobs_per_proposal"
 echo "  Use config dir: $use_config_dir"
 echo "  Debug: $debug"
+echo "  Start offset: $start_offset"
 [[ -n "$groups" ]] && echo "  Groups: $groups"
 [[ -n "$group_size" ]] && echo "  Group size: $group_size"
 
@@ -132,8 +140,20 @@ if [[ "$use_config_dir" == true ]]; then
         echo "No config files found matching ${cfg_glob}. Did you generate them?" >&2
         exit 1
     fi
+
+    # Calculate agent ID range to start based on offset
+    start_id=$((base_index + 1))
+    end_id=$((base_index + num_agents))
+
+    echo "Starting agents with IDs: $start_id to $end_id"
+
     for config_file in "${config_files[@]}"; do
         agent_index="$(basename "$config_file" | sed -E "s/${cfg_prefix}([0-9]+)\.yml/\1/")"
+
+        # Skip if agent_index is outside our range (for dynamic agents with offset)
+        if (( agent_index < start_id || agent_index > end_id )); then
+            continue
+        fi
 
         # Extract agent_type from config file (default to resource if not specified)
         agent_type_from_config=$(python3.11 -c "import yaml; c=yaml.safe_load(open('$config_file')); print(c.get('agent_type', 'resource'))" 2>/dev/null || echo "resource")

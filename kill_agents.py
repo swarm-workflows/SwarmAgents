@@ -127,7 +127,7 @@ class AgentKiller:
                                         agent_id = potential_id
                             except (ValueError, IndexError):
                                 pass
-                            
+
                         agents.append({
                             'pid': pid,
                             'agent_id': agent_id,

@@ -2086,12 +2086,14 @@ class ResourceAgent(Agent):
         # Safety check: if too many agents failed, log warning
         if configured_count > 0:
             failure_rate = 1 - (live_count / configured_count)
+            '''
             if failure_rate > 0.33:  # More than 33% agents failed
                 self.logger.warning(
                     f"HIGH FAILURE RATE: {failure_rate:.1%} "
                     f"({configured_count - live_count}/{configured_count} agents down). "
                     f"Quorum: {quorum}/{live_count}"
                 )
+            '''
 
         # Minimum quorum of 1 to prevent deadlock when few agents remain
         return max(1, quorum)
