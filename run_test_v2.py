@@ -390,6 +390,8 @@ def check_all_jobs_infeasible(args, bucket: int) -> bool:
     Check if all remaining jobs in the specified bucket are infeasible.
     Returns True if all jobs have 0 feasible agents.
     """
+    if args.mode != "local":
+       return False
     # Get job IDs from Redis bucket
     out = run_once(["python3.11", "dump_db.py", "--host", args.db_host, "--type", "redis", "--key", "state"])
     job_ids = set()
