@@ -44,6 +44,7 @@ class SwarmConfigGenerator:
         group_size: Optional[int] = None,
         hierarchical_level1_agent_type: str = "llm",
         agent_type: str = "resource",
+        initial_group_size: Optional[int] = None,
     ):
         self.num_agents = num_agents
         self.jobs_per_proposal = jobs_per_proposal
@@ -64,6 +65,9 @@ class SwarmConfigGenerator:
 
         # default agent type for all non-hierarchical level 1 agents
         self.agent_type = agent_type
+
+        # initial group size for dynamic agent addition (if different from num_agents)
+        self.initial_group_size = initial_group_size
 
         # legacy ring helper (used when no grouping flags provided for ring)
         self.rings_default = self._create_default_rings()
@@ -662,6 +666,12 @@ class SwarmConfigGenerator:
             config.setdefault("redis", {})
             config["redis"]["host"] = self.db_host
             topo = agent_topo.get(agent_id, {"peers": [], "parent": None, "children": None, "group": 0, "level": 0})
+
+            # Use initial_group_size for initial agents if specified (for dynamic agent addition)
+            group_size_to_use = topo["group_size"]
+            if self.initial_group_size is not None and agent_id <= self.initial_group_size:
+                group_size_to_use = self.initial_group_size
+
             config["topology"] = {
                 "peer_agents": topo["peers"],
                 "type": self.topology,
@@ -669,7 +679,7 @@ class SwarmConfigGenerator:
                 "children": topo["children"],
                 "level": topo["level"],
                 "group": topo["group"],
-                "group_size": topo["group_size"],
+                "group_size": group_size_to_use,
                 "group_count": topo["group_count"]
             }
             config.setdefault("runtime", {})
@@ -756,6 +766,10 @@ if __name__ == "__main__":
                         choices=["llm", "resource"], default="resource",
                         help="Default agent type for all agents (default: resource)")
 
+    # Dynamic agent addition support
+    parser.add_argument("--initial-group-size", type=int, default=None,
+                        help="Initial group size for dynamic agent addition (if different from total agents)")
+
     args = parser.parse_args()
 
     if args.agent_hosts_file:
@@ -785,6 +799,7 @@ if __name__ == "__main__":
         group_size=args.group_size,
         hierarchical_level1_agent_type=args.hierarchical_level1_agent_type,
         agent_type=args.agent_type,
+        initial_group_size=args.initial_group_size,
     )
     generator.generate_configs(flavor_percentages=flavor_percentages, agent_hosts=agent_hosts)
 

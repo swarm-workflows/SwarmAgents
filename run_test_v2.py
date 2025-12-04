@@ -169,6 +169,9 @@ def generate_configs(args, agent_hosts_list: list[str]) -> Path:
         gen_args += ["--group-size", str(args.group_size)]
     if args.topology == "hierarchical":
         gen_args += ["--hierarchical-level1-agent-type", args.hierarchical_level1_agent_type]
+    # Pass initial group size for dynamic agent addition
+    if hasattr(args, 'initial_group_size') and args.initial_group_size is not None:
+        gen_args += ["--initial-group-size", str(args.initial_group_size)]
 
     log("Generating configs …")
     run_blocking(gen_args, check=True)
@@ -350,7 +353,7 @@ def wait_for_dynamic_trigger(args) -> None:
         # Monitor completed jobs bucket (typically bucket 3 or 4)
         while True:
             out = run_once(["python3.11", "dump_db.py", "--host", args.db_host, "--type", "redis", "--key", "state"])
-            completed = parse_bucket_set_count(out, 3)  # Assuming bucket 3 is completed
+            completed = parse_bucket_set_count(out, 8)  # Assuming bucket 3 is completed
             if completed >= args.dynamic_trigger_jobs:
                 log(f"Job completion threshold reached ({completed} jobs). Adding dynamic agents …")
                 break
@@ -599,6 +602,12 @@ def main() -> None:
             # Match number of shards we will generate (for ALL agents)
             needed = math.ceil(total_agents / args.agents_per_host)
             host_list = host_list[:needed]
+
+        # Set initial_group_size for dynamic agent scenarios
+        if args.dynamic_agents > 0:
+            args.initial_group_size = original_agents
+        else:
+            args.initial_group_size = None
 
         # Temporarily set args.agents to total for config generation
         args.agents = total_agents

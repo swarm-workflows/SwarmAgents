@@ -128,6 +128,50 @@ class MultiRunAnalyzer:
             print(f"    Warning: Could not load {run_dir}: {e}")
             return None
 
+    def get_hierarchy_level(self, agent_id: int, topology: str, total_agents: int) -> int:
+        """Determine hierarchy level for an agent in hierarchical topology.
+
+        Returns:
+            0 for Level 0 (worker) agents
+            1 for Level 1 (coordinator) agents
+            -1 for non-hierarchical topologies
+        """
+        if topology != 'hierarchical':
+            return -1
+
+        # For hierarchical topologies, coordinators are typically the highest numbered agents
+        # This logic needs to match your actual agent ID assignment scheme
+        # Adjust based on your specific hierarchical configuration
+
+        # Common patterns:
+        # - Hier-30: 5 groups of 5 workers (0-24) + 1 group of 5 coordinators (25-29)
+        # - Hier-110: 10 groups of 10 workers (0-99) + 1 group of 10 coordinators (100-109)
+        # - Hier-250: 25 groups of 9 workers (0-224) + 1 group of 25 coordinators (225-249)
+        # - Hier-990: Complex 3-level structure
+
+        if total_agents == 30:
+            # Hier-30: agents 0-24 are Level 0, 25-29 are Level 1
+            return 1 if agent_id >= 25 else 0
+        elif total_agents == 110:
+            # Hier-110: agents 0-99 are Level 0, 100-109 are Level 1
+            return 1 if agent_id >= 100 else 0
+        elif total_agents == 250:
+            # Hier-250: agents 0-224 are Level 0, 225-249 are Level 1
+            return 1 if agent_id >= 225 else 0
+        elif total_agents == 990:
+            # Hier-990: 3-level structure, treat Level 1 and Level 2 coordinators separately
+            # 880 Level 0 workers (88 groups × 10) + 88 Level 1 coordinators + 22 Level 2 coordinators
+            if agent_id < 880:
+                return 0  # Level 0 workers
+            elif agent_id < 968:
+                return 1  # Level 1 coordinators
+            else:
+                return 2  # Level 2 coordinators
+        else:
+            # Default heuristic: top 10% are coordinators
+            coordinator_threshold = int(total_agents * 0.9)
+            return 1 if agent_id >= coordinator_threshold else 0
+
     def aggregate_metrics(self) -> pd.DataFrame:
         """Aggregate metrics across all runs and configurations."""
         records = []
@@ -140,6 +184,12 @@ class MultiRunAnalyzer:
             for run_data in config_data['runs']:
                 df_jobs = run_data['jobs']
 
+                # For hierarchical topologies, add hierarchy level column
+                if topology == 'hierarchical':
+                    df_jobs['hierarchy_level'] = df_jobs['leader_id'].apply(
+                        lambda x: self.get_hierarchy_level(x, topology, agents)
+                    )
+
                 # Calculate aggregate metrics for this run (with robust handling of NaN)
                 record = {
                     'config': config_name,
@@ -148,7 +198,7 @@ class MultiRunAnalyzer:
                     'jobs': jobs,
                     'run': run_data['run_dir'],
 
-                    # Latency metrics
+                    # Latency metrics (all jobs)
                     'mean_selection_time': self.safe_mean(df_jobs['selection_time']),
                     'median_selection_time': self.safe_median(df_jobs['selection_time']),
                     'p95_selection_time': self.safe_quantile(df_jobs['selection_time'], 0.95),
@@ -176,12 +226,33 @@ class MultiRunAnalyzer:
                     'leader_entropy': self.calculate_entropy(df_jobs['leader_id']),
                 }
 
+                # Add per-level metrics for hierarchical topologies
+                if topology == 'hierarchical':
+                    for level in sorted(df_jobs['hierarchy_level'].unique()):
+                        df_level = df_jobs[df_jobs['hierarchy_level'] == level]
+
+                        record[f'level{level}_mean_selection_time'] = self.safe_mean(df_level['selection_time'])
+                        record[f'level{level}_median_selection_time'] = self.safe_median(df_level['selection_time'])
+                        record[f'level{level}_p95_selection_time'] = self.safe_quantile(df_level['selection_time'], 0.95)
+                        record[f'level{level}_job_count'] = len(df_level)
+                        record[f'level{level}_agent_count'] = df_level['leader_id'].nunique()
+
                 # Add scheduling latency if available
                 if 'latency' in run_data:
                     df_latency = run_data['latency']
                     record['mean_scheduling_latency'] = self.safe_mean(df_latency['scheduling_latency'])
                     record['median_scheduling_latency'] = self.safe_median(df_latency['scheduling_latency'])
                     record['mean_reasoning_time'] = self.safe_mean(df_latency['reasoning_time'])
+
+                    # Per-level scheduling latency for hierarchical topologies
+                    if topology == 'hierarchical' and 'leader_id' in df_latency.columns:
+                        df_latency['hierarchy_level'] = df_latency['leader_id'].apply(
+                            lambda x: self.get_hierarchy_level(x, topology, agents)
+                        )
+                        for level in sorted(df_latency['hierarchy_level'].unique()):
+                            df_level_lat = df_latency[df_latency['hierarchy_level'] == level]
+                            record[f'level{level}_mean_scheduling_latency'] = self.safe_mean(df_level_lat['scheduling_latency'])
+                            record[f'level{level}_median_scheduling_latency'] = self.safe_median(df_level_lat['scheduling_latency'])
 
                 records.append(record)
 
@@ -463,6 +534,7 @@ class MultiRunAnalyzer:
 
         for config_name in sorted(df['config'].unique()):
             df_config = df[df['config'] == config_name]
+            topology = df_config['topology'].iloc[0]
 
             print(f"\n{config_name}:")
             print(f"  Runs: {len(df_config)}")
@@ -471,6 +543,38 @@ class MultiRunAnalyzer:
             print(f"  Mean Total Time: {df_config['mean_total_time'].mean():.4f} ± "
                   f"{df_config['mean_total_time'].std():.4f} s")
             print(f"  P95 Selection Time: {df_config['p95_selection_time'].mean():.4f} s")
+
+            # Print per-level metrics for hierarchical topologies
+            if topology == 'hierarchical':
+                # Detect available levels from column names
+                level_cols = [col for col in df_config.columns if col.startswith('level') and 'mean_selection_time' in col]
+                levels = sorted(set(int(col.replace('level', '').replace('_mean_selection_time', '')) for col in level_cols))
+
+                print(f"  Per-Level Metrics:")
+                for level in levels:
+                    mean_col = f'level{level}_mean_selection_time'
+                    median_col = f'level{level}_median_selection_time'
+                    p95_col = f'level{level}_p95_selection_time'
+                    job_count_col = f'level{level}_job_count'
+                    agent_count_col = f'level{level}_agent_count'
+
+                    if mean_col in df_config.columns and not df_config[mean_col].isna().all():
+                        print(f"    Level {level}:")
+                        print(f"      Mean Selection Time: {df_config[mean_col].mean():.4f} ± {df_config[mean_col].std():.4f} s")
+                        if median_col in df_config.columns:
+                            print(f"      Median Selection Time: {df_config[median_col].mean():.4f} s")
+                        if p95_col in df_config.columns:
+                            print(f"      P95 Selection Time: {df_config[p95_col].mean():.4f} s")
+                        if job_count_col in df_config.columns:
+                            print(f"      Jobs Assigned: {df_config[job_count_col].mean():.0f}")
+                        if agent_count_col in df_config.columns:
+                            print(f"      Active Agents: {df_config[agent_count_col].mean():.0f}")
+
+                        # Per-level scheduling latency if available
+                        sched_lat_col = f'level{level}_mean_scheduling_latency'
+                        if sched_lat_col in df_config.columns and not df_config[sched_lat_col].isna().all():
+                            print(f"      Mean Scheduling Latency: {df_config[sched_lat_col].mean():.4f} ± "
+                                  f"{df_config[sched_lat_col].std():.4f} s")
 
             # Print scheduling latency if available
             if 'mean_scheduling_latency' in df_config.columns and not df_config['mean_scheduling_latency'].isna().all():
