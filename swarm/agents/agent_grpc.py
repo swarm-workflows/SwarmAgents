@@ -91,10 +91,11 @@ class Agent(Observer):
     @property
     def configured_agent_count(self) -> int:
         """Returns the expected total number of agents from the runtime configuration."""
+        #return self.topology.group_size
         if self.topology.type == TopologyType.Ring:
-            return int(self.runtime_config.get("total_agents", 0))
-
-        return 1 + len(self.topology.peers)
+            return self.runtime_config.get("total_agents", 0)
+        else:
+            return self.topology.group_size
 
     @property
     def results_dir(self) -> str:
@@ -102,7 +103,7 @@ class Agent(Observer):
 
     @property
     def grpc_port(self) -> int:
-        return (self.grpc_config.get("port", 50051) + self.agent_id)
+        return self.grpc_config.get("port", 20000)
 
     @property
     def grpc_host(self):
@@ -120,6 +121,9 @@ class Agent(Observer):
         formatter = logging.Formatter(
             self.log_config.get("log-format",
                                 '%(asctime)s - %(name)s - {%(filename)s:%(lineno)d} - [%(threadName)s]- %(levelname)s - %(message)s'))
+        formatter = logging.Formatter(
+            self.log_config.get("log-format",
+                                '%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
         handler.setFormatter(formatter)
         logger.addHandler(handler)
 
@@ -147,10 +151,10 @@ class Agent(Observer):
     def stop(self):
         try:
             self.shutdown = True
-            self.transport.stop()
             with self.condition:
                 self.condition.notify_all()
             self.on_shutdown()
+            self.transport.stop()
         except Exception as e:
             self.logger.error(f"Exception occurred in shutdown: {e}")
             self.logger.error(traceback.format_exc())
@@ -256,17 +260,6 @@ class Agent(Observer):
         """Called by GrpcClient/ChannelPool when a channel moves UP/DOWN."""
         if not up:
             self.logger.info(f"Peer {target} health {up} reason {reason}")
-            '''
-            try:
-                host, port_s = target.rsplit(":", 1)
-                host = normalize_host(host)
-                port = int(port_s)
-                peer_id, transport_state = self._get_peer_state_for_endpoint(host, port)
-                if peer_id is not None:
-                    self.peer_by_endpoint.set((host, port), (peer_id, up))
-            except Exception:
-                self.logger.warning("on_peer_status: bad target %r", target)
-            '''
 
     def _get_peer_state_for_endpoint(self, host: str, port: int):
         """

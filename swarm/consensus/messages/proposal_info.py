@@ -84,7 +84,7 @@ class ProposalInfo(JSONField):
       - prepares: list of agent ids (or messages) that prepared
       - commits: list of agent ids (or messages) that committed
       - agent_id: the proposer / owner of this proposal
-      - seed: tie-breaker / priority metric (float)
+      - cost: tie-breaker / priority metric (float)
     """
     def __init__(self, **kwargs):
         self.p_id: Optional[str] = None
@@ -92,7 +92,7 @@ class ProposalInfo(JSONField):
         self.prepares: List = []
         self.commits: List = []
         self.agent_id: Optional[str] = None
-        self.seed: float = 0.0
+        self.cost: float = 0.0
         self._set_fields(**kwargs)
 
     def _set_fields(self, forgiving: bool = False, **kwargs):
@@ -123,7 +123,7 @@ class ProposalInfo(JSONField):
         *,
         list_union: Optional[Dict[str, Callable[[List, List], List]]] = None,
         update_scalars: bool = True,
-        update_seed_policy: str = "latest",
+        update_cost_policy: str = "latest",
     ) -> "ProposalInfo":
         """
         Merge another ProposalInfo into this one.
@@ -133,10 +133,10 @@ class ProposalInfo(JSONField):
         - Scalar fields:
             - If update_scalars=True:
                 - agent_id: take latest non-empty (from 'other') if provided
-                - seed: policy controlled by 'update_seed_policy':
-                    * 'latest': take other.seed if provided
-                    * 'min':    take min(self.seed, other.seed)
-                    * 'max':    take max(self.seed, other.seed)
+                - cost: policy controlled by 'update_cost_policy':
+                    * 'latest': take other.cost if provided
+                    * 'min':    take min(self.cost, other.cost)
+                    * 'max':    take max(self.cost, other.cost)
               If update_scalars=False, keep current values.
 
         Returns self.
@@ -163,15 +163,15 @@ class ProposalInfo(JSONField):
             if other.agent_id:
                 self.agent_id = other.agent_id
 
-            if update_seed_policy == "latest":
+            if update_cost_policy == "latest":
                 # accept latest value if other provided one (0.0 considered provided; change if not desired)
-                self.seed = other.seed
-            elif update_seed_policy == "min":
-                self.seed = min(self.seed, other.seed)
-            elif update_seed_policy == "max":
-                self.seed = max(self.seed, other.seed)
+                self.cost = other.cost
+            elif update_cost_policy == "min":
+                self.cost = min(self.cost, other.cost)
+            elif update_cost_policy == "max":
+                self.cost = max(self.cost, other.cost)
             else:
-                raise ProposalException(f"Unknown update_seed_policy: {update_seed_policy}")
+                raise ProposalException(f"Unknown update_cost_policy: {update_cost_policy}")
 
         return self
 
@@ -197,7 +197,7 @@ class ProposalContainer:
 
         # Merge behavior defaults (can be made configurable if needed)
         self._update_scalars_default = True
-        self._update_seed_policy_default = "latest"  # choose: 'latest' | 'min' | 'max'
+        self._update_cost_policy_default = "latest"  # choose: 'latest' | 'min' | 'max'
         self._list_union_default: Dict[str, Callable[[List, List], List]] = {
             "prepares": lambda a, b: _dedupe_preserve_order([*a, *b]),
             "commits":  lambda a, b: _dedupe_preserve_order([*a, *b]),
@@ -226,7 +226,7 @@ class ProposalContainer:
         proposal: ProposalInfo,
         *,
         update_scalars: Optional[bool] = None,
-        update_seed_policy: Optional[str] = None,
+        update_cost_policy: Optional[str] = None,
         list_union: Optional[Dict[str, Callable[[List, List], List]]] = None,
     ):
         """
@@ -236,7 +236,7 @@ class ProposalContainer:
 
         Args:
           update_scalars: override default scalar update behavior for this call
-          update_seed_policy: 'latest' (default), 'min', or 'max'
+          update_cost_policy: 'latest' (default), 'min', or 'max'
           list_union: per-list merge strategy overrides
         """
         if not proposal or not proposal.object_id or not proposal.p_id:
@@ -263,7 +263,7 @@ class ProposalContainer:
                     update_scalars=(
                         self._update_scalars_default if update_scalars is None else update_scalars
                     ),
-                    update_seed_policy=(update_seed_policy or self._update_seed_policy_default),
+                    update_cost_policy=(update_cost_policy or self._update_cost_policy_default),
                 )
 
                 # Maps already point to 'existing'
@@ -345,8 +345,8 @@ class ProposalContainer:
     def has_better_proposal(self, proposal: ProposalInfo) -> Optional[ProposalInfo]:
         """
         Return a better proposal for the same object_id (if any), based on:
-          - Lower seed wins
-          - If equal seed, lexicographically smaller agent_id wins
+          - Lower cost wins
+          - If equal cost, lexicographically smaller agent_id wins
         """
         if not proposal or not proposal.object_id:
             return None
@@ -357,9 +357,17 @@ class ProposalContainer:
             for p in bucket.values():
                 if p.p_id == proposal.p_id:
                     continue
-                if (p.seed < proposal.seed) or (
-                    p.seed == proposal.seed and (p.agent_id or "") < (proposal.agent_id or "")
+                '''
+                if (p.cost < proposal.cost) or (
+                        p.cost == proposal.cost and (p.agent_id or "") < (proposal.agent_id or "")
                 ):
                     best = p
                     break
+                '''
+                # Find the minimum cost proposal
+                if best is None or p.cost < best.cost or (p.cost == best.cost and (p.agent_id or "") < (best.agent_id or
+                                                                                                        "")):
+                    if (p.cost < proposal.cost) or (p.cost == proposal.cost and (p.agent_id or "") < (proposal.agent_id
+                                                                                                      or "")):
+                        best = p
             return best

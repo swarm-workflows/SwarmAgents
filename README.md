@@ -9,6 +9,7 @@ The core logic enables agents to reach consensus and make selections (such as jo
 - [Key Features](#key-features)
 - [Core Modules](#core-modules)
 - [Example: Job Selection](#example-job-selection)
+   - [Network Topologies](#network-topologies)
    - [Testing](#testing)
    - [Results](#results)
 - [Utilities](#utilities)
@@ -158,12 +159,161 @@ This distributed consensus mechanism allows agents to make autonomous decisions 
 Additional implementation details:
 - **Job Queue:** The job queue is managed using a Redis database, allowing agents to efficiently share and update job states in a distributed manner.
 - **Message Exchange:** Agents communicate and exchange consensus/selection messages using gRPC, enabling fast and reliable messaging across the network.
-- **Supported Topologies:** The framework supports various network topologies, including Ring, Mesh, and Hierarchical, which can be configured to match different deployment scenarios. Topology logic is handled via the `Topology` and `TopologyType` classes and used in agent initialization and routing decisions.
+- **Supported Topologies:** The framework supports various network topologies, including Ring, Mesh, Star, and Hierarchical, which can be configured to match different deployment scenarios. Topology logic is handled via the `Topology` and `TopologyType` classes and used in agent initialization and routing decisions.
 
 For implementation details, see:
 - `resource_agent.py` & `llm_agent.py`: Integration of selection and consensus engines, job feasibility/cost logic, and scheduling workflow.
 - `is_job_feasible`, `compute_job_cost`, and `SelectionEngine` usage for assignment logic.
 - The weights and thresholds in the agent's `__init__` for tuning selection behavior.
+
+### Network Topologies
+
+The framework supports multiple network topologies that define how agents communicate and coordinate during consensus. Each topology offers different trade-offs in terms of communication overhead, fault tolerance, and scalability.
+
+#### Ring Topology
+Agents are arranged in a circular structure where each agent communicates with its immediate neighbors (predecessor and successor). This topology minimizes communication overhead but may have higher latency for reaching consensus across distant agents.
+
+**Best for:**
+- Small to medium deployments (10-50 agents)
+- Scenarios where communication bandwidth is limited
+- Testing basic consensus behavior
+
+#### Mesh Topology
+All agents communicate directly with all other agents in a fully connected network. This provides the fastest consensus but has the highest communication overhead.
+
+**Best for:**
+- Small deployments (5-30 agents)
+- Scenarios requiring fast consensus
+- Benchmarking and comparison studies
+
+#### Star Topology
+A central coordinator agent communicates with all other agents, which do not communicate directly with each other. This simplifies coordination but creates a single point of failure.
+
+**Best for:**
+- Centralized control scenarios
+- Small deployments with a clear leader
+- Testing coordinator-based algorithms
+
+#### Hierarchical Topology
+
+Agents are organized in a multi-level tree structure with parent-child relationships. This topology enables scalable coordination by delegating decisions across hierarchy levels.
+
+**Architecture:**
+- **Level 0 (Leaf agents)**: Worker agents organized into groups (typically 5-10 agents per group)
+- **Level 1 (Coordinators)**: Parent agents that coordinate their respective groups
+- **Higher levels**: Additional coordination layers for very large deployments
+
+Each agent has:
+- `level`: Its position in the hierarchy (0 = leaf, 1+ = coordinator)
+- `group`: Group membership identifier
+- `parent`: Parent agent ID (for non-root agents)
+- `children`: List of child agent IDs (for coordinator agents)
+- `peer_agents`: Other agents at the same level
+- `group_size`: Number of agents per group
+- `group_count`: Total number of groups at each level
+
+**Mixed Agent Types:**
+
+Hierarchical topology supports mixing LLM and Resource agents within the same deployment:
+
+- **Level 1 agents** (coordinators) can automatically use **LLM agents** for intelligent, context-aware scheduling decisions
+- **Level 0 agents** (workers) typically use **Resource agents** for fast, heuristic-based execution
+
+This hybrid approach balances decision quality (LLM reasoning) with execution speed (heuristic-based resource agents).
+
+**Example Configuration:**
+
+For 30 agents in hierarchical mode:
+```
+Level 1 (Coordinators): 5 LLM agents    [agents 26-30]
+Level 0 (Workers):      25 Resource agents in 5 groups of 5 [agents 1-25]
+```
+
+Each Level 1 LLM agent manages a cluster of 5 Level 0 Resource agents, providing strategic scheduling while workers execute jobs efficiently.
+
+**Running Hierarchical Topology:**
+
+```bash
+# Basic hierarchical deployment
+python run_test.py \
+    --agent-type resource \
+    --agents 30 \
+    --topology hierarchical \
+    --jobs 500 \
+    --db-host localhost \
+    --jobs-per-interval 20 \
+    --run-dir runs/hierarchical-demo
+
+# With automatic LLM coordinators at Level 1
+python run_test_v2.py \
+    --mode local \
+    --agent-type resource \
+    --agents 30 \
+    --topology hierarchical \
+    --jobs 500 \
+    --db-host localhost \
+    --jobs-per-proposal 10 \
+    --run-dir runs/hierarchical-llm
+
+# Distributed across multiple hosts
+python run_test_v2.py \
+    --mode remote \
+    --agent-type resource \
+    --agents 110 \
+    --agents-per-host 10 \
+    --topology hierarchical \
+    --jobs 1000 \
+    --db-host 10.0.0.5 \
+    --agent-hosts-file hosts.txt \
+    --run-dir runs/remote-hierarchical
+```
+
+**Hierarchical-Specific Visualizations:**
+
+When using `plot_latency_jobs.py` with the `--hierarchical` flag, additional plots are generated:
+
+```bash
+python plot_latency_jobs.py \
+    --output_dir runs/hierarchical-demo \
+    --agents 30 \
+    --db_host localhost \
+    --hierarchical
+```
+
+Generated visualizations include:
+- `hierarchical_topology.png`: Visual representation of the hierarchy structure
+- `latency_comparison_by_agent_type.png`: Performance comparison between LLM and Resource agents
+- `reasoning_time_overhead.png`: LLM overhead analysis
+- `job_distribution_by_hierarchy.png`: Load distribution across hierarchy levels
+
+**Performance Characteristics:**
+
+- **LLM Agents (Level 1):**
+  - Mean scheduling latency: TBD seconds
+  - Reasoning time: TBD seconds (60-80% of total latency)
+  - Fewer consensus conflicts due to better initial decisions
+  - Higher decision quality through context-aware reasoning
+
+- **Resource Agents (Level 0):**
+  - Mean scheduling latency: TBD seconds
+  - Reasoning time: TBD seconds (<10% of total latency)
+  - Faster execution through deterministic heuristics
+  - More conflicts due to greedy local decisions
+
+**Best for:**
+- Large-scale deployments (50-1000+ agents)
+- Scenarios requiring both intelligent scheduling and fast execution
+- Multi-site or multi-cluster deployments
+- Minimizing communication overhead while maintaining coordination
+- Mixing LLM and Resource agents for optimal cost-performance balance
+
+**Scaling Considerations:**
+- Add additional hierarchy levels for very large deployments (Level 0 → Level 1 → Level 2)
+- Maintain fan-out of ~5-10 agents per coordinator for optimal performance
+- Job distribution can target specific levels using `--level` flag in `job_distributor.py`
+
+**Additional Resources:**
+- See `HIERARCHICAL_LLM_AGENTS.md` for details on LLM/Resource agent mixing
 
 ### Testing
 

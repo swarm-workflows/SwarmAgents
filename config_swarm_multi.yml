@@ -19,6 +19,8 @@ topology:
   children: null
   level: 0
   group: 0
+  group_size: 0
+  group_count: 0
   parent: null
   peer_agents:
     - 1
@@ -37,19 +39,18 @@ dtns:
     user: "dtn_user2"
     connectivity_score: 0.87
 runtime:
-  data_transfer: False
-  max_pending_elections: 100
-  projected_queue_threshold: 300.00
-  ready_queue_threshold: 100.00
-  max_time_load_zero: 300
-  restart_job_selection: 120
-  peer_expiry_seconds: 300
+  empty_timeout_seconds: 300
+  reselection_timeout_s: 60
+  peer_expiry_seconds: 45
   results_dir: swarm-multi
-  message_service_type: grpc
   shutdown_mode: manual
   total_agents: 5
   jobs_per_proposal: 20
   executor_workers: 10
+  failure_threshold_seconds: 60        # Time before declaring agent as failed
+  max_failed_agents: 0                 # Maximum tolerable failures (0 = unlimited)
+  job_reassignment_enabled: true       # Enable automatic job reassignment
+  aggressive_failure_detection: true  # Use proactive failure detection from gRPC
 logging:
   ## The directory in which actor should create log files.
   ## This directory will be automatically created if it does not exist.
@@ -88,7 +89,18 @@ llm:
   use_for_selection: true     # use LLM to break ties across candidates
   prompts:
     cost: |-
-      You are a scheduler. Given a JSON job and an agent's resource state,
-      output a single JSON object: {"score": <float in [0, 100]>, "explanation": "..."}.
-      Higher score = better fit / lower cost. Consider capacity headroom,
-      estimated runtime, network DTN requirements, and fairness when applicable.
+      You are a distributed scheduler in a mesh topology with peer agents.
+      Score this job for THIS agent (higher = better fit, 0-100).
+
+      Key factors to consider:
+      1. Resource headroom: Prefer agents with spare capacity
+      2. Current load: Avoid overloaded agents (check peer context)
+      3. DTN connectivity: Match job's data_in/data_out to agent's DTNs
+      4. Load balancing: Favor underutilized agents in the mesh
+      5. Execution time: Consider wall_time vs agent's current queue depth
+
+      When PEER CONTEXT is provided, use it to make load-aware decisions.
+      Compare this agent's load against peer loads to promote balanced distribution.
+
+      Return JSON: {"score": <0-100>, "explanation": "<concise reason>"}
+      Explanation should be max 1 sentence focusing on the key decision factor.

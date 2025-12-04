@@ -265,7 +265,7 @@ class ResourceAgent(Agent):
         jobs = self.queues.pending_queue.gets(states=[ObjectState.PREPARE, ObjectState.PRE_PREPARE,
                                                       ObjectState.COMMIT])
         for job in jobs:
-            diff = int(time.time() - job.time_last_state_change)
+            diff = int(time.time() - job.last_transition_at)
             if diff > self.restart_job_selection:
                 self.logger.info(f"RESTART: Job: {job} reset to Pending")
                 job.state = ObjectState.PENDING
@@ -467,7 +467,7 @@ class ResourceAgent(Agent):
             dtn_map = {}
 
             for child in self.children.values():
-                total_capacities += child.capacities
+                total_capacities += child._capacities
                 total_allocations += child.capacity_allocations
                 if child.dtns:
                     dtn_map.update(child.dtns)
@@ -571,7 +571,7 @@ class ResourceAgent(Agent):
             if j not in self.queues.ready_queue and j not in self.queues.selected_queue:
                 job = self.queues.pending_queue.get(j)
                 if job:
-                    allocations += job.capacities
+                    allocations += job._capacities
 
         return self.resource_usage_score(allocated=allocations, total=self.capacities)
 
@@ -581,11 +581,11 @@ class ResourceAgent(Agent):
             rin = {e.name for e in (job.data_in or [])}
             rout = {e.name for e in (job.data_out or [])}
             job._required_dtns_cache = frozenset(rin | rout)
-        caps = job.capacities
+        caps = job._capacities
         return (
             job.job_id,
             round(caps.core, 3), round(caps.ram, 3), round(caps.disk, 3), round(getattr(caps, "gpu", 0.0), 3),
-            round(job.execution_time or 0.0, 3),
+            round(job._wall_time or 0.0, 3),
             job.job_type or "",
             job._required_dtns_cache,
             #job.state.value,  # flips when PENDING→READY/COMPLETE, invalidates cache automatically
@@ -708,12 +708,12 @@ class ResourceAgent(Agent):
 
         # Prevent division by zero for GPUs
         total_gpu = getattr(total, "gpu", 0) or 1
-        job_gpu = getattr(job.capacities, "gpu", 0)
+        job_gpu = getattr(job._capacities, "gpu", 0)
 
         # Resource usage ratios
-        core_ratio = job.capacities.core / total.core
-        ram_ratio = job.capacities.ram / total.ram
-        disk_ratio = job.capacities.disk / total.disk
+        core_ratio = job._capacities.core / total.core
+        ram_ratio = job._capacities.ram / total.ram
+        disk_ratio = job._capacities.disk / total.disk
         gpu_ratio = job_gpu / total_gpu
 
         # Weighted base score
@@ -728,10 +728,10 @@ class ResourceAgent(Agent):
         bottleneck_penalty = max(core_ratio, ram_ratio, disk_ratio, gpu_ratio) ** 2
 
         # Execution time penalty
-        if job.execution_time > long_job_threshold:
-            time_penalty = 1.5 + (job.execution_time - long_job_threshold) / long_job_threshold
+        if job._wall_time > long_job_threshold:
+            time_penalty = 1.5 + (job._wall_time - long_job_threshold) / long_job_threshold
         else:
-            time_penalty = 1 + (job.execution_time / long_job_threshold) ** 2
+            time_penalty = 1 + (job._wall_time / long_job_threshold) ** 2
 
         # DTN connectivity penalty
         avg_conn = 1.0
@@ -798,7 +798,7 @@ class ResourceAgent(Agent):
                 ckey = ("C", agent_sig, job_sigs[ji])
                 base_cost = self._base_cost_cache.get(ckey)
                 if base_cost is None:
-                    base_cost = self.compute_job_cost(job, total=agent.capacities, dtns=agent.dtns)
+                    base_cost = self.compute_job_cost(job, total=agent._capacities, dtns=agent.dtns)
                     self._base_cost_cache[ckey] = base_cost
 
                 cost_matrix[ai, ji] = round(base_cost * load_penalty, 2)
@@ -868,7 +868,7 @@ class ResourceAgent(Agent):
                         # Send proposal to all neighbors
                         job = pending_jobs[job_idx]
                         proposal = ProposalInfo(p_id=generate_id(), object_id=job.job_id,
-                                                agent_id=self.agent_id, seed=round((cost + self.agent_id), 2))
+                                                agent_id=self.agent_id, cost=round((cost + self.agent_id), 2))
                         proposals.append(proposal)
                         # Begin election for Job leader for this job
                         job.state = ObjectState.PRE_PREPARE
@@ -939,7 +939,7 @@ class ResourceAgent(Agent):
         For every job id seen in either proposals container (incoming/outgoing),
         we record:
           - job state (if we can resolve the Job object)
-          - all outgoing proposals (p_id, agent_id, seed, prepares, commits)
+          - all outgoing proposals (p_id, agent_id, cost, prepares, commits)
           - all incoming proposals (same fields)
           - counts of prepares/commits for quick scanning
 
@@ -975,7 +975,7 @@ class ResourceAgent(Agent):
                     return {
                         "p_id": getattr(p, "p_id", None),
                         "agent_id": getattr(p, "agent_id", None),
-                        "seed": getattr(p, "seed", None),
+                        "cost": getattr(p, "cost", None),
                         "prepares": prepares_list,
                         "prepares_count": len(prepares_list),
                         "commits": commits_list,

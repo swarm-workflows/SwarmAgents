@@ -25,6 +25,7 @@
 
 import os
 import json
+import csv
 import random
 from typing import Dict, Any, List, Optional
 
@@ -75,7 +76,7 @@ class JobGenerator:
         gpu = self.biased_uniform(0.1, agent_profile.get("gpu", 0)) if agent_profile.get("gpu", 0) > 0 else 0
         ram = self.biased_uniform(0.1, agent_profile.get("ram", 8))
         disk = self.biased_uniform(1, agent_profile.get("disk", 100))
-        execution_time = self.biased_uniform(0.1, 30.0)
+        wall_time = self.biased_uniform(0.1, 30.0)
 
         input_files = ['/var/tmp/outgoing/file100M.txt',
                        '/var/tmp/outgoing/file500M.txt',
@@ -88,7 +89,9 @@ class JobGenerator:
         data_in, data_out = None, None
         if enable_dtns and "dtns" in agent_profile and agent_profile["dtns"]:
             candidate_dtns = agent_profile["dtns"]
-            dtn_count = min(random.randint(1, len(candidate_dtns)), len(candidate_dtns))
+            # Limit to max 2 DTNs to ensure jobs can be satisfied by multiple agents
+            max_dtns = min(2, len(candidate_dtns))
+            dtn_count = random.randint(1, max_dtns)
             dtns = random.sample(candidate_dtns, dtn_count)
             data_in = [
                 {'name': dtn.get("name") if isinstance(dtn, dict) else dtn,
@@ -103,23 +106,137 @@ class JobGenerator:
 
         return {
             'id': job_id,
-            'execution_time': execution_time,
+            'wall_time': wall_time,
             'capacities': {'core': core, 'ram': ram, 'disk': disk, 'gpu': gpu},
             'data_in': data_in if enable_dtns else None,
             'data_out': data_out if enable_dtns else None,
             'exit_status': exit_status
         }
 
+    def is_job_feasible(self, job: Dict[str, Any], agent_profile: Dict[str, Any]) -> bool:
+        """
+        Check if a job is feasible for a given agent profile.
+
+        :param job: Job dictionary with capacities requirements and optional DTN requirements
+        :param agent_profile: Agent profile with available capacities and DTNs
+        :return: True if agent can run the job, False otherwise
+        """
+        job_caps = job.get('capacities', {})
+        agent_caps = agent_profile
+
+        # Check each resource dimension
+        if job_caps.get('core', 0) > agent_caps.get('core', 0):
+            return False
+        if job_caps.get('ram', 0) > agent_caps.get('ram', 0):
+            return False
+        if job_caps.get('disk', 0) > agent_caps.get('disk', 0):
+            return False
+        if job_caps.get('gpu', 0) > agent_caps.get('gpu', 0):
+            return False
+
+        # Check DTN requirements
+        job_data_in = job.get('data_in', []) or []
+        job_data_out = job.get('data_out', []) or []
+
+        # Collect all required DTN names from data_in and data_out
+        required_dtns = set()
+        for data_node in job_data_in:
+            if isinstance(data_node, dict):
+                required_dtns.add(data_node.get('name'))
+        for data_node in job_data_out:
+            if isinstance(data_node, dict):
+                required_dtns.add(data_node.get('name'))
+
+        # If job requires DTNs, check if agent has them
+        if required_dtns:
+            agent_dtns = agent_profile.get('dtns', [])
+            # Extract DTN names from agent profile
+            agent_dtn_names = set()
+            for dtn in agent_dtns:
+                if isinstance(dtn, dict):
+                    agent_dtn_names.add(dtn.get('name'))
+                elif isinstance(dtn, str):
+                    agent_dtn_names.add(dtn)
+
+            # Check if agent has ALL required DTNs
+            if not required_dtns.issubset(agent_dtn_names):
+                return False
+
+        return True
+
+    def generate_feasibility_csv(self, jobs: List[Dict[str, Any]], output_path: str) -> None:
+        """
+        Generate a CSV file showing job-to-agent feasibility mapping.
+
+        CSV format:
+        job_id, core, ram, disk, gpu, feasible_agents, infeasible_agents, total_feasible, total_agents
+
+        :param jobs: List of generated job dictionaries
+        :param output_path: Path to save the CSV file
+        """
+        with open(output_path, 'w', newline='') as csvfile:
+            fieldnames = [
+                'job_id', 'core', 'ram', 'disk', 'gpu', 'wall_time',
+                'feasible_agents', 'infeasible_agents',
+                'total_feasible', 'total_agents', 'feasibility_pct'
+            ]
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+
+            for job in jobs:
+                job_id = job['id']
+                caps = job['capacities']
+
+                # Check feasibility against all agents
+                feasible_agents = []
+                infeasible_agents = []
+
+                for agent_id, agent_profile in self.agent_profiles.items():
+                    if self.is_job_feasible(job, agent_profile):
+                        feasible_agents.append(agent_id)
+                    else:
+                        infeasible_agents.append(agent_id)
+
+                total_agents = len(self.agent_profiles)
+                total_feasible = len(feasible_agents)
+                feasibility_pct = (total_feasible / total_agents * 100) if total_agents > 0 else 0
+
+                writer.writerow({
+                    'job_id': job_id,
+                    'core': caps.get('core', 0),
+                    'ram': caps.get('ram', 0),
+                    'disk': caps.get('disk', 0),
+                    'gpu': caps.get('gpu', 0),
+                    'wall_time': job.get('wall_time', 0),
+                    'feasible_agents': ','.join(map(str, feasible_agents)),
+                    'infeasible_agents': ','.join(map(str, infeasible_agents)),
+                    'total_feasible': total_feasible,
+                    'total_agents': total_agents,
+                    'feasibility_pct': round(feasibility_pct, 2)
+                })
+
     def generate_job_files(self, output_dir: str = "jobs", enable_dtns: bool = False) -> None:
         """
-        Generate job files in the specified output directory.
+        Generate job files in the specified output directory and a feasibility CSV.
         """
         os.makedirs(output_dir, exist_ok=True)
+
+        # Generate jobs and store them for feasibility analysis
+        jobs = []
         for i in range(1, self.job_count + 1):
             job = self.generate_job(i, enable_dtns)
+            jobs.append(job)
+
+            # Save individual job JSON file
             job_path = os.path.join(output_dir, f"job_{i}.json")
             with open(job_path, "w") as f:
                 json.dump(job, f, indent=2)
+
+        # Generate feasibility CSV
+        csv_path = os.path.join(output_dir, "job_feasibility_mapping.csv")
+        self.generate_feasibility_csv(jobs, csv_path)
+        print(f"Generated {len(jobs)} jobs in {output_dir}")
+        print(f"Feasibility mapping saved to: {csv_path}")
 
 if __name__ == "__main__":
     import argparse

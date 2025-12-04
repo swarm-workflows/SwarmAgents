@@ -53,7 +53,7 @@ def timed(logger, section: str, **fields):
 def job_capacities(jobs: list[Job]):
     allocated_caps = Capacities()
     for t in jobs:
-        allocated_caps += t.get_capacities()
+        allocated_caps += t.capacities
     return allocated_caps
 
 
