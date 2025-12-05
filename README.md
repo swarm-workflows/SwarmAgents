@@ -12,6 +12,9 @@ The core logic enables agents to reach consensus and make selections (such as jo
    - [Network Topologies](#network-topologies)
    - [Testing](#testing)
    - [Results](#results)
+- [Agent Failure Handling and Resilience](#agent-failure-handling-and-resilience)
+- [Dynamic Agent Addition](#dynamic-agent-addition)
+- [Enhanced Visualizations](#enhanced-visualizations)
 - [Utilities](#utilities)
 
 ## Key Features
@@ -312,6 +315,27 @@ Generated visualizations include:
 - Maintain fan-out of ~5-10 agents per coordinator for optimal performance
 - Job distribution can target specific levels using `--level` flag in `job_distributor.py`
 
+**Job Routing in Hierarchical Topologies:**
+
+Jobs enter at different levels depending on the tier structure:
+
+| Agents | Tiers | Job Entry Level | Flow |
+|--------|-------|-----------------|------|
+| 30, 110 | 2-tier | Level 1 | L1 → L0 |
+| 100, 1000 | 3-tier | Level 2 | L2 → L1 → L0 |
+
+For 3-tier hierarchies (100 or 1000 agents), jobs enter at Level 2 and flow down through coordinators to workers. The `run_test_v2.py` script automatically detects this and sets the correct entry level. For manual job distribution, specify the level explicitly:
+
+```bash
+# 100-agent 3-tier hierarchy
+python job_distributor.py \
+  --redis-host localhost \
+  --jobs-dir jobs/ \
+  --jobs-per-interval 20 \
+  --level 2 \
+  --group 0
+```
+
 **Additional Resources:**
 - See `HIERARCHICAL_LLM_AGENTS.md` for details on LLM/Resource agent mixing
 
@@ -340,6 +364,7 @@ python run_test.py --agent-type llm --agents 5 --topology ring --jobs 100 --db-h
 ```
 
 ### Results
+**Evaluation Data** for **SWARM(CCGrid'25)** and **SWARM+(CCGrid'26)** can be found [here](https://github.com/swarm-workflows/swarm-evaluation-data).
 
 Simulation results for different topologies (Ring, Mesh, Hierarchical, etc.) are stored in the `runs/simulation` directory. Each run contains logs, metrics, and output files summarizing agent performance, job completion rates, consensus rounds, and resource utilization.
 
@@ -387,6 +412,208 @@ Below are example images showing results for different topologies:
 
 ![Agent Load](runs/simulation/llm_agent/mesh/5/agent_loads_summary.png)
 
+
+## Agent Failure Handling and Resilience
+
+SwarmAgents includes comprehensive failure detection and recovery mechanisms to maintain system reliability under agent failures.
+
+### Failure Detection Mechanisms
+
+1. **Peer Expiry Detection**: Agents periodically refresh neighbor maps from Redis. Agents not updating status within `peer_expiry_seconds` (default: 300s) are marked as stale.
+
+2. **gRPC Health Checking**: Communication layer detects when channels go down and triggers peer status callbacks.
+
+3. **Job Reselection Timeout**: Jobs stuck in consensus states (PREPARE, COMMIT) for longer than `reselection_timeout_s` (default: 60s) are automatically reset to PENDING for reassignment.
+
+4. **Dynamic Quorum Calculation**: Quorum adjusts automatically based on live agent count: `quorum = (live_agents // 2) + 1`, allowing continued operation as agents fail.
+
+### Configuration Parameters
+
+Add these to your `config_swarm_multi.yml`:
+
+```yaml
+runtime:
+  peer_expiry_seconds: 300           # Time before marking agent as stale
+  reselection_timeout_s: 60          # Job timeout before reselection
+  failure_threshold_seconds: 30      # Time before declaring agent as failed
+  max_failed_agents: 10              # Maximum tolerable failures
+  job_reassignment_enabled: true     # Enable automatic job reassignment
+  aggressive_failure_detection: true # Use proactive failure detection
+```
+
+### Testing Failure Scenarios
+
+Use `kill_agents.py` to simulate agent failures:
+
+**Single agent failure:**
+```bash
+python kill_agents.py --mode local --count 1 --random
+```
+
+**Gradual cascading failure (10 agents over 5 minutes):**
+```bash
+python kill_agents.py --mode local --count 10 --interval 30 --random
+```
+
+**Catastrophic failure (25% of agents instantly):**
+```bash
+# For 30 agents, kill 7-8 agents
+python kill_agents.py --mode local --count 7 --random
+```
+
+**Remote agent failure (across multiple hosts):**
+```bash
+python kill_agents.py --mode remote \
+    --hosts-file hosts.txt \
+    --ssh-user ubuntu \
+    --count 5 \
+    --interval 60 \
+    --random
+```
+
+### Monitoring Recovery
+
+Check agent logs for failure detection and recovery:
+```bash
+grep "RESTART: Job" <run-dir>/agent-*.log
+grep "Reassigning.*jobs from failed agent" <run-dir>/agent-*.log
+grep "Agent.*detected as FAILED" <run-dir>/agent-*.log
+```
+
+### Topology-Specific Considerations
+
+**Mesh Topology:**
+- Fast failure detection (direct connections to all agents)
+- Straightforward job reassignment
+- Immediate quorum failure detection
+
+**Ring Topology:**
+- Slower failure propagation (messages traverse ring)
+- Failed agent breaks ring; requires message forwarding
+- May need higher timeouts for propagation delay
+
+**Hierarchical Topology:**
+- Parent failures affect entire subtrees
+- Different handling for leaf vs. parent failures
+- Consider cascading reassignment to sibling subtrees
+
+## Dynamic Agent Addition
+
+SwarmAgents supports adding agents dynamically during execution to test scalability, elasticity, and load balancing.
+
+### Trigger Types
+
+1. **Time-based**: Add agents after N seconds
+2. **Bucket-based**: Add agents when Redis bucket reaches threshold
+3. **Job-completion-based**: Add agents after N jobs complete
+
+### Usage Examples
+
+**Time-based (add 5 agents after 30 seconds):**
+```bash
+python run_test_v2.py \
+    --mode local \
+    --agents 20 \
+    --dynamic-agents 5 \
+    --dynamic-trigger time \
+    --dynamic-delay 30 \
+    --topology mesh \
+    --jobs 500 \
+    --db-host localhost \
+    --run-dir runs/dynamic-time
+```
+
+**Bucket-based (add 10 agents when bucket has 50+ jobs):**
+```bash
+python run_test_v2.py \
+    --mode local \
+    --agents 20 \
+    --dynamic-agents 10 \
+    --dynamic-trigger bucket \
+    --dynamic-trigger-bucket 1 \
+    --dynamic-trigger-threshold 50 \
+    --topology ring \
+    --jobs 500 \
+    --db-host localhost \
+    --run-dir runs/dynamic-bucket
+```
+
+**Job-completion-based (add 5 agents after 100 jobs complete):**
+```bash
+python run_test_v2.py \
+    --mode local \
+    --agents 15 \
+    --dynamic-agents 5 \
+    --dynamic-trigger jobs-completed \
+    --dynamic-trigger-jobs 100 \
+    --topology hierarchical \
+    --jobs 300 \
+    --db-host localhost \
+    --run-dir runs/dynamic-jobs
+```
+
+### How It Works
+
+1. All agent configs (initial + dynamic) are pre-generated before test starts
+2. Initial agents start and begin processing jobs
+3. Background thread monitors for trigger condition
+4. When triggered, dynamic agents start and join existing topology
+5. New agents discover peers via Redis and participate in consensus
+
+### Monitoring Dynamic Addition
+
+```bash
+# Monitor initial agents
+tail -f local_agents_initial_start.log
+
+# Monitor dynamic agents (appears after trigger)
+tail -f local_agents_dynamic_start.log
+
+# Check agent count
+ps aux | grep "python.*main.py" | wc -l
+```
+
+## Enhanced Visualizations
+
+The `plot_latency_jobs.py` script includes comprehensive failure analysis and hierarchical topology visualizations.
+
+### Failure Analysis
+
+After running experiments with agent failures:
+
+```bash
+python plot_latency_jobs.py \
+    --output_dir runs/failure-test \
+    --agents 30 \
+    --db_host localhost
+```
+
+**Generated failure visualizations:**
+- `failure_summary.png`: Comprehensive failure overview with 5 subplots
+  - Failed agents count and IDs
+  - Job reassignments by type and reason
+  - Timeline of failures and reassignments
+- `failed_agents.csv`: Detailed failure data
+- `reassigned_jobs.csv`: Job reassignment details
+- `throughput_degradation_analysis.png`: Throughput impact analysis
+
+### Hierarchical Topology Analysis
+
+For hierarchical deployments, use the `--hierarchical` flag:
+
+```bash
+python plot_latency_jobs.py \
+    --output_dir runs/hierarchical-demo \
+    --agents 30 \
+    --db_host localhost \
+    --hierarchical
+```
+
+**Additional hierarchical visualizations:**
+- `hierarchical_topology.png`: Visual hierarchy structure (LLM coordinators + Resource workers)
+- `latency_comparison_by_agent_type.png`: Performance comparison between agent types
+- `reasoning_time_overhead.png`: LLM overhead analysis
+- `job_distribution_by_hierarchy.png`: Load distribution across levels
 
 ## Utilities
 
@@ -476,4 +703,18 @@ options:
   --count              Only display the count of entries
   --type {redis,etcd}  Type of data store to query (default: etcd)
 ```
+
+- **kill_agents.py**: Simulates agent failures for resilience testing. Supports local and remote killing with various patterns (gradual, instant, random selection).
+```bash
+# Local mode examples
+python kill_agents.py --mode local --all                        # Kill all agents
+python kill_agents.py --mode local --count 5 --random          # Kill 5 random agents
+python kill_agents.py --mode local --all --interval 30         # Kill agents gradually
+python kill_agents.py --mode local --agent-ids 5 9 12          # Kill specific agents
+
+# Remote mode examples
+python kill_agents.py --mode remote --hosts-file hosts.txt --ssh-user ubuntu --all
+python kill_agents.py --mode remote --hosts-file hosts.txt --count 3 --interval 60 --random
+```
+
 These utilities streamline the process of preparing, configuring, and running distributed simulations with SwarmAgents.
