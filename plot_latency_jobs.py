@@ -1834,7 +1834,7 @@ def plot_job_distribution_by_hierarchy(output_dir: str):
     plt.close()
     print(f"Saved: {os.path.join(output_dir, 'job_distribution_by_hierarchy.png')}")
 
-
+'''
 def plot_latency_comparison_by_hierarchy_level(output_dir: str):
     """
     Compare scheduling latency between hierarchy levels.
@@ -2021,7 +2021,221 @@ def plot_latency_comparison_by_hierarchy_level(output_dir: str):
         stats_df = pd.DataFrame(stats_data, columns=['Level', 'Mean (s)', 'Median (s)', 'Std Dev (s)', 'Min (s)', 'Max (s)', 'Count'])
         stats_df.to_csv(os.path.join(output_dir, "latency_stats_by_hierarchy_level.csv"), index=False)
         print(f"Saved: {os.path.join(output_dir, 'latency_stats_by_hierarchy_level.csv')}")
+'''
 
+def plot_latency_comparison_by_hierarchy_level(output_dir: str):
+    """
+    Compare scheduling latency between hierarchy levels.
+    Level 2 = Top-level (LLM agents)
+    Level 1 = Mid-level
+    Level 0 = Bottom-level (worker/resource agents)
+    Uses level-specific job entries from Redis (level0_jobs.csv, level1_jobs.csv, level2_jobs.csv).
+    """
+    level0_csv = f"{output_dir}/level0_jobs.csv"
+    level1_csv = f"{output_dir}/level1_jobs.csv"
+    level2_csv = f"{output_dir}/level2_jobs.csv"
+
+    # Check if at least one level file exists
+    has_files = os.path.exists(level0_csv) or os.path.exists(level1_csv) or os.path.exists(level2_csv)
+    if not has_files:
+        print("Level-specific job files not found - skipping hierarchy level latency comparison")
+        return
+
+    # Load dataframes for each level (if they exist)
+    df_level0 = pd.read_csv(level0_csv) if os.path.exists(level0_csv) else pd.DataFrame()
+    df_level1 = pd.read_csv(level1_csv) if os.path.exists(level1_csv) else pd.DataFrame()
+    df_level2 = pd.read_csv(level2_csv) if os.path.exists(level2_csv) else pd.DataFrame()
+
+    # Compute selection_latency as assigned_at - selection_started_at
+    if not df_level0.empty:
+        df_level0 = df_level0[df_level0['assigned_at'].notna() & df_level0['selection_started_at'].notna()].copy()
+        df_level0['selection_latency'] = df_level0['assigned_at'] - df_level0['selection_started_at']
+    if not df_level1.empty:
+        df_level1 = df_level1[df_level1['assigned_at'].notna() & df_level1['selection_started_at'].notna()].copy()
+        df_level1['selection_latency'] = df_level1['assigned_at'] - df_level1['selection_started_at']
+    if not df_level2.empty:
+        df_level2 = df_level2[df_level2['assigned_at'].notna() & df_level2['selection_started_at'].notna()].copy()
+        df_level2['selection_latency'] = df_level2['assigned_at'] - df_level2['selection_started_at']
+
+    if df_level0.empty and df_level1.empty and df_level2.empty:
+        print("No valid latency data for hierarchy level comparison")
+        return
+
+    # Figure size tuned for paper/slide PDFs - compact for column layout
+    fig, axes = plt.subplots(1, 2, figsize=(8, 3.5))  # compact height for paper
+
+    # ---------- Plot 1: Box plot ----------
+    data_to_plot = []
+    labels = []
+    if not df_level2.empty:
+        data_to_plot.append(df_level2['selection_latency'].dropna())
+        labels.append(f'Level 2 (Top)\n(n={len(df_level2)})')
+    if not df_level1.empty:
+        data_to_plot.append(df_level1['selection_latency'].dropna())
+        labels.append(f'Level 1 (Top)\n(n={len(df_level1)})') if df_level2.empty else labels.append(f'Level 1 (Mid)\n(n={len(df_level1)})')
+    if not df_level0.empty:
+        data_to_plot.append(df_level0['selection_latency'].dropna())
+        labels.append(f'Level 0 (Bottom)\n(n={len(df_level0)})')
+
+    ax_box = axes[0]
+    bp = ax_box.boxplot(data_to_plot, labels=labels, patch_artist=True, showfliers=False)
+    colors = ['#9B59B6', '#4ECDC4', '#FF6B6B']  # Level 2, Level 1, Level 0
+    for patch, color in zip(bp['boxes'], colors[:len(bp['boxes'])]):
+        patch.set_facecolor(color)
+    ax_box.set_ylabel('Selection Time (s)', fontsize=12)
+    ax_box.set_title('Selection Time by Hierarchy Level', fontsize=13, fontweight='bold')
+    ax_box.grid(axis='y', alpha=0.3)
+
+    # ---------- Plot 2: Histogram ----------
+    ax_hist = axes[1]
+    all_latencies = []
+    if not df_level0.empty:
+        all_latencies.extend(df_level0['selection_latency'].tolist())
+    if not df_level1.empty:
+        all_latencies.extend(df_level1['selection_latency'].tolist())
+    if not df_level2.empty:
+        all_latencies.extend(df_level2['selection_latency'].tolist())
+
+    bins = np.linspace(min(all_latencies), max(all_latencies), 30)
+    if not df_level2.empty:
+        ax_hist.hist(df_level2['selection_latency'], bins=bins, alpha=0.5,
+                     label='Level 2 (Top)', color='#9B59B6', edgecolor='black')
+    if not df_level1.empty:
+        label = 'Level 1 (Top)' if df_level2.empty else f'Level 1 (Mid)'
+        ax_hist.hist(df_level1['selection_latency'], bins=bins, alpha=0.5,
+                     label=label, color='#4ECDC4', edgecolor='black')
+    if not df_level0.empty:
+        ax_hist.hist(df_level0['selection_latency'], bins=bins, alpha=0.5,
+                     label='Level 0 (Bottom)', color='#FF6B6B', edgecolor='black')
+    ax_hist.set_xlabel('Selection Time (s)', fontsize=12)
+    ax_hist.set_ylabel('Frequency', fontsize=12)
+    ax_hist.set_title('Histogram by Hierarchy Level', fontsize=13, fontweight='bold')
+    ax_hist.legend()
+    ax_hist.grid(axis='y', alpha=0.3)
+
+    # ---------- Plot 3: Mean latency bar chart ----------
+    #ax_bar = axes[1, 0]
+    mean_data = []
+    level_labels = []
+    bar_colors = []
+
+    if not df_level2.empty:
+        mean_data.append(df_level2['selection_latency'].mean())
+        level_labels.append('Level 2\n(Top)')
+        bar_colors.append('#9B59B6')
+    if not df_level1.empty:
+        mean_data.append(df_level1['selection_latency'].mean())
+        level_labels.append('Level 1\n(Top)') if df_level2.empty else level_labels.append('Level 1\n(Mid)')
+        bar_colors.append('#4ECDC4')
+    if not df_level0.empty:
+        mean_data.append(df_level0['selection_latency'].mean())
+        level_labels.append('Level 0\n(Bottom)')
+        bar_colors.append('#FF6B6B')
+
+    x_pos = np.arange(len(mean_data))
+    '''
+    ax_bar.bar(x_pos, mean_data, color=bar_colors, alpha=0.8, edgecolor='black')
+    ax_bar.set_xticks(x_pos)
+    ax_bar.set_xticklabels(level_labels)
+    ax_bar.set_ylabel('Mean Selection Latency (s)', fontsize=12)
+    ax_bar.set_title('Mean Selection Latency', fontsize=13, fontweight='bold')
+    ax_bar.grid(axis='y', alpha=0.3)
+    '''
+
+    # Value labels on bars
+    if mean_data:
+        max_mean = max(mean_data)
+        #for i, val in enumerate(mean_data):
+        #    ax_bar.text(i, val + max_mean * 0.02, f'{val:.4f}s',
+        #                ha='center', va='bottom', fontweight='bold', fontsize=10)
+
+    # ---------- Plot 4: Statistics table ----------
+    #ax_table = axes[1, 1]
+    stats_data = []
+
+    if not df_level2.empty:
+        stats_data.append([
+            '2 (Top)',
+            f"{df_level2['selection_latency'].mean():.4f}",
+            f"{df_level2['selection_latency'].median():.4f}",
+            f"{df_level2['selection_latency'].std():.4f}",
+            f"{df_level2['selection_latency'].min():.4f}",
+            f"{df_level2['selection_latency'].max():.4f}",
+            f"{len(df_level2)}"
+        ])
+    if not df_level1.empty:
+        stats_data.append([
+            '1 (Top)' if df_level2.empty else '1 (Mid)',
+            f"{df_level1['selection_latency'].mean():.4f}",
+            f"{df_level1['selection_latency'].median():.4f}",
+            f"{df_level1['selection_latency'].std():.4f}",
+            f"{df_level1['selection_latency'].min():.4f}",
+            f"{df_level1['selection_latency'].max():.4f}",
+            f"{len(df_level1)}"
+        ])
+    if not df_level0.empty:
+        stats_data.append([
+            '0 (Bottom)',
+            f"{df_level0['selection_latency'].mean():.4f}",
+            f"{df_level0['selection_latency'].median():.4f}",
+            f"{df_level0['selection_latency'].std():.4f}",
+            f"{df_level0['selection_latency'].min():.4f}",
+            f"{df_level0['selection_latency'].max():.4f}",
+            f"{len(df_level0)}"
+        ])
+
+    '''
+    ax_table.axis('tight')
+    ax_table.axis('off')
+    table = ax_table.table(
+        cellText=stats_data,
+        colLabels=['Level', 'Mean (s)', 'Median (s)', 'Std Dev (s)', 'Min (s)', 'Max (s)', 'Count'],
+        cellLoc='center',
+        loc='center'
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)   # bump up for readability in PDF
+    table.scale(1.5, 1.5)   # (col_scale, row_scale)
+
+    # Header styling
+    for i in range(7):
+        table[(0, i)].set_facecolor('#E0E0E0')
+        table[(0, i)].set_text_props(weight='bold')
+
+    # Row coloring
+    row_colors = ['#F0E6FA', '#E5F9F8', '#FFE5E5']  # L2, L1, L0
+    for row_idx in range(len(stats_data)):
+        for col_idx in range(7):
+            table[(row_idx + 1, col_idx)].set_facecolor(row_colors[row_idx])
+
+    ax_table.set_title('Selection Latency Statistics', fontsize=13, fontweight='bold')
+    '''
+
+    plt.tight_layout()
+
+    # -------- Save as high-quality PDF (and optionally PNG) --------
+    pdf_path = os.path.join(output_dir, "latency_comparison_by_hierarchy_level.pdf")
+    plt.savefig(pdf_path, bbox_inches="tight")  # PDF is vector; dpi not needed
+    print(f"Saved: {pdf_path}")
+
+    # Optional: also save PNG for quick viewing / slides
+    png_path = os.path.join(output_dir, "latency_comparison_by_hierarchy_level.png")
+    plt.savefig(png_path, dpi=300, bbox_inches="tight")
+    print(f"Saved: {png_path}")
+
+    plt.close()
+
+    # Save stats to CSV
+    if stats_data:
+        stats_df = pd.DataFrame(
+            stats_data,
+            columns=['Level', 'Mean (s)', 'Median (s)', 'Std Dev (s)', 'Min (s)', 'Max (s)', 'Count']
+        )
+        stats_df.to_csv(
+            os.path.join(output_dir, "latency_stats_by_hierarchy_level.csv"),
+            index=False
+        )
+        print(f"Saved: {os.path.join(output_dir, 'latency_stats_by_hierarchy_level.csv')}")
 
 def compute_fault_tolerance_metrics(output_dir: str, repo: Repository | None = None, failed_agent_list: list = []):
     """
