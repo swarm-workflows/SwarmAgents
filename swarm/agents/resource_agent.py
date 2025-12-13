@@ -1269,7 +1269,7 @@ class ResourceAgent(Agent):
 
                 # Periodically check for orphaned jobs (in consensus states but no active proposals)
                 # This handles jobs stuck due to agent failures where consensus was cleared
-                #self._reset_orphaned_jobs()
+                self._reset_orphaned_jobs()
 
                 time.sleep(0.5)
             except Exception as e:
