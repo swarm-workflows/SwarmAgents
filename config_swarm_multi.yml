@@ -50,7 +50,7 @@ runtime:
   failure_threshold_seconds: 60        # Time before declaring agent as failed
   max_failed_agents: 0                 # Maximum tolerable failures (0 = unlimited)
   job_reassignment_enabled: true       # Enable automatic job reassignment
-  aggressive_failure_detection: true  # Use proactive failure detection from gRPC
+  aggressive_failure_detection: true # Use proactive failure detection from gRPC
 logging:
   ## The directory in which actor should create log files.
   ## This directory will be automatically created if it does not exist.

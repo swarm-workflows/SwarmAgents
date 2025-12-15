@@ -792,16 +792,21 @@ def detect_agent_failures(output_dir: str, repo: Repository | None = None, faile
     Detect agent failures and their timestamps, plus host:port mapping for all agents.
 
     Returns:
-        - failures: list of failure events [{"agent_id": int, "failure_time": float, "host": str, "port": int}, ...]
+        - failures: list of failure events with detailed detection info
         - agent_mapping: dict mapping agent_id -> "host:port"
 
+    Now captures:
+    - First detection time and mechanism (redis/gRPC)
+    - Detection statistics (avg latency, # detections by each mechanism)
+    - All detector agents
+
     Tries multiple sources:
-    1. Redis metrics (agent_failures field)
-    2. Redis agent state transitions (ACTIVE -> FAILED)
-    3. Agent logs (grepping for failure keywords)
-    4. all_agents.csv if state field exists
+    1. Redis metrics (agent_failures field - NEW format with detected_by)
+    2. Redis metrics (failed_agents field - OLD format, timestamps only)
+    3. Redis agent state transitions (ACTIVE -> FAILED)
+    4. Agent logs (grepping for failure keywords)
     """
-    failures = []
+    failures_by_agent = {}  # failed_agent_id -> list of detection events
     agent_mapping = {}
 
     # Try metrics first - check for agent_failures in metrics
@@ -818,27 +823,117 @@ def detect_agent_failures(output_dir: str, repo: Repository | None = None, faile
     if metrics:
         try:
             for agent_id, m in metrics.items():
-                agent_failures_data = m.get("failed_agents", {}) or {}
-                for failed_agent_id, timestamp in agent_failures_data.items():
-                    if failed_agent_id not in failed_agent_list:
-                        continue
-                    failures.append({
-                        "agent_id": int(failed_agent_id),
-                        "failure_time": float(timestamp),
-                    })
+                # NEW FORMAT: agent_failures with detection details
+                agent_failures_new = m.get("agent_failures", {})
+                if agent_failures_new:
+                    for failed_agent_id, failure_info in agent_failures_new.items():
+                        if failed_agent_list and failed_agent_id not in failed_agent_list:
+                            continue
+
+                        if isinstance(failure_info, dict):
+                            detection_event = {
+                                "detector_agent_id": int(agent_id),
+                                "detected_at": failure_info.get("detected_at", 0),
+                                "detected_by": failure_info.get("detected_by", "unknown"),
+                                "last_seen": failure_info.get("last_seen", 0),
+                                "downtime": failure_info.get("downtime", 0),
+                            }
+
+                            failed_id = int(failed_agent_id)
+                            if failed_id not in failures_by_agent:
+                                failures_by_agent[failed_id] = []
+                            failures_by_agent[failed_id].append(detection_event)
+
+                # OLD FORMAT: failed_agents with just timestamps (fallback)
+                elif "failed_agents" in m:
+                    agent_failures_old = m.get("failed_agents", {}) or {}
+                    for failed_agent_id, timestamp in agent_failures_old.items():
+                        if failed_agent_list and failed_agent_id not in failed_agent_list:
+                            continue
+
+                        if isinstance(timestamp, (int, float)):
+                            detection_event = {
+                                "detector_agent_id": int(agent_id),
+                                "detected_at": float(timestamp),
+                                "detected_by": "unknown",
+                                "last_seen": 0,
+                                "downtime": 0,
+                            }
+
+                            failed_id = int(failed_agent_id)
+                            if failed_id not in failures_by_agent:
+                                failures_by_agent[failed_id] = []
+                            failures_by_agent[failed_id].append(detection_event)
         except Exception as e:
             print(f"Could not detect failures from metrics: {e}")
 
+    # Load killed_agents.csv if available for accurate kill timestamps
+    killed_agents = {}
+    killed_agents_file = f"{output_dir}/killed_agents.csv"
+    if os.path.exists(killed_agents_file):
+        try:
+            import pandas as pd
+            killed_df = pd.read_csv(killed_agents_file)
+            for _, row in killed_df.iterrows():
+                agent_id = int(row['agent_id'])
+                killed_agents[agent_id] = {
+                    'kill_timestamp': row['kill_timestamp'],
+                    'signal': row.get('signal', 'unknown')
+                }
+            print(f"Loaded kill timestamps for {len(killed_agents)} agents from killed_agents.csv")
+        except Exception as e:
+            print(f"Could not load killed_agents.csv: {e}")
 
-    # Deduplicate failures by agent_id (keep first occurrence)
-    seen_agents = set()
-    unique_failures = []
-    for f in failures:
-        if f["agent_id"] not in seen_agents:
-            seen_agents.add(f["agent_id"])
-            unique_failures.append(f)
+    # Aggregate detection data per failed agent
+    failures = []
+    for failed_agent_id, detections in failures_by_agent.items():
+        if not detections:
+            continue
 
-    return unique_failures, agent_mapping
+        # Find first detection
+        first_detection = min(detections, key=lambda d: d["detected_at"])
+
+        # Count detections by mechanism
+        redis_detections = [d for d in detections if d["detected_by"] == "redis"]
+        grpc_detections = [d for d in detections if d["detected_by"] == "gRPC"]
+        unknown_detections = [d for d in detections if d["detected_by"] == "unknown"]
+
+        # Calculate average detection latency (using downtime from metrics)
+        latencies = [d["downtime"] for d in detections if d["downtime"] > 0]
+        avg_latency = sum(latencies) / len(latencies) if latencies else 0
+
+        # Calculate TRUE detection latency if kill timestamp is available
+        actual_kill_time = None
+        true_detection_latency = None
+        if failed_agent_id in killed_agents:
+            actual_kill_time = killed_agents[failed_agent_id]['kill_timestamp']
+            true_detection_latency = first_detection["detected_at"] - actual_kill_time
+
+        failure_summary = {
+            "agent_id": failed_agent_id,
+            "failure_time": first_detection["detected_at"],
+            "first_detected_by": first_detection["detected_by"],
+            "first_detector_agent": first_detection["detector_agent_id"],
+            "total_detections": len(detections),
+            "redis_detections": len(redis_detections),
+            "grpc_detections": len(grpc_detections),
+            "unknown_detections": len(unknown_detections),
+            "avg_detection_latency": avg_latency,
+            "min_detection_latency": min(latencies) if latencies else 0,
+            "max_detection_latency": max(latencies) if latencies else 0,
+        }
+
+        # Add true kill time and latency if available
+        if actual_kill_time is not None:
+            failure_summary["actual_kill_time"] = actual_kill_time
+            failure_summary["true_detection_latency"] = true_detection_latency
+
+        failures.append(failure_summary)
+
+    # Sort by failure time
+    failures.sort(key=lambda f: f["failure_time"])
+
+    return failures, agent_mapping
 
 
 def collect_reassignments(output_dir: str, repo: Repository | None = None, level: int = 0) -> dict[int, dict]:

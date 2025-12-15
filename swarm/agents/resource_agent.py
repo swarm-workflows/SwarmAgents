@@ -1269,7 +1269,7 @@ class ResourceAgent(Agent):
 
                 # Periodically check for orphaned jobs (in consensus states but no active proposals)
                 # This handles jobs stuck due to agent failures where consensus was cleared
-                self._reset_orphaned_jobs()
+                #self._reset_orphaned_jobs()
 
                 time.sleep(0.5)
             except Exception as e:
@@ -1679,6 +1679,7 @@ class ResourceAgent(Agent):
                     # Record failure in metrics
                     self.metrics.agent_failures[agent_id] = {
                         'detected_at': current_time,
+                        'detected_by': "redis",
                         'last_seen': agent_info.last_updated,
                         'downtime': time_since_update,
                         'version_at_failure': agent_info.version
@@ -2048,6 +2049,7 @@ class ResourceAgent(Agent):
                 host = "localhost"
 
             failed_agent_id = None
+            failed_agent_info = None
             # Find agent by endpoint
             for agent_id, agent_info in list(self.neighbor_map.items()):
                 if agent_info.host == host and agent_info.port == port:
@@ -2056,12 +2058,23 @@ class ResourceAgent(Agent):
                         f"(aggressive failure detection enabled)"
                     )
                     failed_agent_id = agent_id
+                    failed_agent_info = agent_info
                     break
 
             # Mark as failed immediately
             if failed_agent_id:
                 if failed_agent_id not in self.failed_agents:
-                    self.failed_agents.set(failed_agent_id, time.time())
+                    current_time = time.time()
+                    self.failed_agents.set(failed_agent_id, current_time)
+                    # Record failure in metrics
+                    time_since_update = current_time - failed_agent_info.last_updated
+                    self.metrics.agent_failures[failed_agent_id] = {
+                        'detected_at': current_time,
+                        'detected_by': "gRPC",
+                        'last_seen': failed_agent_info.last_updated,
+                        'downtime': time_since_update,
+                        'version_at_failure': failed_agent_info.version
+                    }
                 self._remove_failed_agents([failed_agent_id])
         except Exception as e:
             self.logger.error(f"Failed to identify down peer {target}: {e}")
