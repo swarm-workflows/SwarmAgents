@@ -792,16 +792,21 @@ def detect_agent_failures(output_dir: str, repo: Repository | None = None, faile
     Detect agent failures and their timestamps, plus host:port mapping for all agents.
 
     Returns:
-        - failures: list of failure events [{"agent_id": int, "failure_time": float, "host": str, "port": int}, ...]
+        - failures: list of failure events with detailed detection info
         - agent_mapping: dict mapping agent_id -> "host:port"
 
+    Now captures:
+    - First detection time and mechanism (redis/gRPC)
+    - Detection statistics (avg latency, # detections by each mechanism)
+    - All detector agents
+
     Tries multiple sources:
-    1. Redis metrics (agent_failures field)
-    2. Redis agent state transitions (ACTIVE -> FAILED)
-    3. Agent logs (grepping for failure keywords)
-    4. all_agents.csv if state field exists
+    1. Redis metrics (agent_failures field - NEW format with detected_by)
+    2. Redis metrics (failed_agents field - OLD format, timestamps only)
+    3. Redis agent state transitions (ACTIVE -> FAILED)
+    4. Agent logs (grepping for failure keywords)
     """
-    failures = []
+    failures_by_agent = {}  # failed_agent_id -> list of detection events
     agent_mapping = {}
 
     # Try metrics first - check for agent_failures in metrics
@@ -818,27 +823,117 @@ def detect_agent_failures(output_dir: str, repo: Repository | None = None, faile
     if metrics:
         try:
             for agent_id, m in metrics.items():
-                agent_failures_data = m.get("failed_agents", {}) or {}
-                for failed_agent_id, timestamp in agent_failures_data.items():
-                    if failed_agent_id not in failed_agent_list:
-                        continue
-                    failures.append({
-                        "agent_id": int(failed_agent_id),
-                        "failure_time": float(timestamp),
-                    })
+                # NEW FORMAT: agent_failures with detection details
+                agent_failures_new = m.get("agent_failures", {})
+                if agent_failures_new:
+                    for failed_agent_id, failure_info in agent_failures_new.items():
+                        if failed_agent_list and failed_agent_id not in failed_agent_list:
+                            continue
+
+                        if isinstance(failure_info, dict):
+                            detection_event = {
+                                "detector_agent_id": int(agent_id),
+                                "detected_at": failure_info.get("detected_at", 0),
+                                "detected_by": failure_info.get("detected_by", "unknown"),
+                                "last_seen": failure_info.get("last_seen", 0),
+                                "downtime": failure_info.get("downtime", 0),
+                            }
+
+                            failed_id = int(failed_agent_id)
+                            if failed_id not in failures_by_agent:
+                                failures_by_agent[failed_id] = []
+                            failures_by_agent[failed_id].append(detection_event)
+
+                # OLD FORMAT: failed_agents with just timestamps (fallback)
+                elif "failed_agents" in m:
+                    agent_failures_old = m.get("failed_agents", {}) or {}
+                    for failed_agent_id, timestamp in agent_failures_old.items():
+                        if failed_agent_list and failed_agent_id not in failed_agent_list:
+                            continue
+
+                        if isinstance(timestamp, (int, float)):
+                            detection_event = {
+                                "detector_agent_id": int(agent_id),
+                                "detected_at": float(timestamp),
+                                "detected_by": "unknown",
+                                "last_seen": 0,
+                                "downtime": 0,
+                            }
+
+                            failed_id = int(failed_agent_id)
+                            if failed_id not in failures_by_agent:
+                                failures_by_agent[failed_id] = []
+                            failures_by_agent[failed_id].append(detection_event)
         except Exception as e:
             print(f"Could not detect failures from metrics: {e}")
 
+    # Load killed_agents.csv if available for accurate kill timestamps
+    killed_agents = {}
+    killed_agents_file = f"{output_dir}/killed_agents.csv"
+    if os.path.exists(killed_agents_file):
+        try:
+            import pandas as pd
+            killed_df = pd.read_csv(killed_agents_file)
+            for _, row in killed_df.iterrows():
+                agent_id = int(row['agent_id'])
+                killed_agents[agent_id] = {
+                    'kill_timestamp': row['kill_timestamp'],
+                    'signal': row.get('signal', 'unknown')
+                }
+            print(f"Loaded kill timestamps for {len(killed_agents)} agents from killed_agents.csv")
+        except Exception as e:
+            print(f"Could not load killed_agents.csv: {e}")
 
-    # Deduplicate failures by agent_id (keep first occurrence)
-    seen_agents = set()
-    unique_failures = []
-    for f in failures:
-        if f["agent_id"] not in seen_agents:
-            seen_agents.add(f["agent_id"])
-            unique_failures.append(f)
+    # Aggregate detection data per failed agent
+    failures = []
+    for failed_agent_id, detections in failures_by_agent.items():
+        if not detections:
+            continue
 
-    return unique_failures, agent_mapping
+        # Find first detection
+        first_detection = min(detections, key=lambda d: d["detected_at"])
+
+        # Count detections by mechanism
+        redis_detections = [d for d in detections if d["detected_by"] == "redis"]
+        grpc_detections = [d for d in detections if d["detected_by"] == "gRPC"]
+        unknown_detections = [d for d in detections if d["detected_by"] == "unknown"]
+
+        # Calculate average detection latency (using downtime from metrics)
+        latencies = [d["downtime"] for d in detections if d["downtime"] > 0]
+        avg_latency = sum(latencies) / len(latencies) if latencies else 0
+
+        # Calculate TRUE detection latency if kill timestamp is available
+        actual_kill_time = None
+        true_detection_latency = None
+        if failed_agent_id in killed_agents:
+            actual_kill_time = killed_agents[failed_agent_id]['kill_timestamp']
+            true_detection_latency = first_detection["detected_at"] - actual_kill_time
+
+        failure_summary = {
+            "agent_id": failed_agent_id,
+            "failure_time": first_detection["detected_at"],
+            "first_detected_by": first_detection["detected_by"],
+            "first_detector_agent": first_detection["detector_agent_id"],
+            "total_detections": len(detections),
+            "redis_detections": len(redis_detections),
+            "grpc_detections": len(grpc_detections),
+            "unknown_detections": len(unknown_detections),
+            "avg_detection_latency": avg_latency,
+            "min_detection_latency": min(latencies) if latencies else 0,
+            "max_detection_latency": max(latencies) if latencies else 0,
+        }
+
+        # Add true kill time and latency if available
+        if actual_kill_time is not None:
+            failure_summary["actual_kill_time"] = actual_kill_time
+            failure_summary["true_detection_latency"] = true_detection_latency
+
+        failures.append(failure_summary)
+
+    # Sort by failure time
+    failures.sort(key=lambda f: f["failure_time"])
+
+    return failures, agent_mapping
 
 
 def collect_reassignments(output_dir: str, repo: Repository | None = None, level: int = 0) -> dict[int, dict]:
@@ -1834,7 +1929,7 @@ def plot_job_distribution_by_hierarchy(output_dir: str):
     plt.close()
     print(f"Saved: {os.path.join(output_dir, 'job_distribution_by_hierarchy.png')}")
 
-
+'''
 def plot_latency_comparison_by_hierarchy_level(output_dir: str):
     """
     Compare scheduling latency between hierarchy levels.
@@ -2021,7 +2116,221 @@ def plot_latency_comparison_by_hierarchy_level(output_dir: str):
         stats_df = pd.DataFrame(stats_data, columns=['Level', 'Mean (s)', 'Median (s)', 'Std Dev (s)', 'Min (s)', 'Max (s)', 'Count'])
         stats_df.to_csv(os.path.join(output_dir, "latency_stats_by_hierarchy_level.csv"), index=False)
         print(f"Saved: {os.path.join(output_dir, 'latency_stats_by_hierarchy_level.csv')}")
+'''
 
+def plot_latency_comparison_by_hierarchy_level(output_dir: str):
+    """
+    Compare scheduling latency between hierarchy levels.
+    Level 2 = Top-level (LLM agents)
+    Level 1 = Mid-level
+    Level 0 = Bottom-level (worker/resource agents)
+    Uses level-specific job entries from Redis (level0_jobs.csv, level1_jobs.csv, level2_jobs.csv).
+    """
+    level0_csv = f"{output_dir}/level0_jobs.csv"
+    level1_csv = f"{output_dir}/level1_jobs.csv"
+    level2_csv = f"{output_dir}/level2_jobs.csv"
+
+    # Check if at least one level file exists
+    has_files = os.path.exists(level0_csv) or os.path.exists(level1_csv) or os.path.exists(level2_csv)
+    if not has_files:
+        print("Level-specific job files not found - skipping hierarchy level latency comparison")
+        return
+
+    # Load dataframes for each level (if they exist)
+    df_level0 = pd.read_csv(level0_csv) if os.path.exists(level0_csv) else pd.DataFrame()
+    df_level1 = pd.read_csv(level1_csv) if os.path.exists(level1_csv) else pd.DataFrame()
+    df_level2 = pd.read_csv(level2_csv) if os.path.exists(level2_csv) else pd.DataFrame()
+
+    # Compute selection_latency as assigned_at - selection_started_at
+    if not df_level0.empty:
+        df_level0 = df_level0[df_level0['assigned_at'].notna() & df_level0['selection_started_at'].notna()].copy()
+        df_level0['selection_latency'] = df_level0['assigned_at'] - df_level0['selection_started_at']
+    if not df_level1.empty:
+        df_level1 = df_level1[df_level1['assigned_at'].notna() & df_level1['selection_started_at'].notna()].copy()
+        df_level1['selection_latency'] = df_level1['assigned_at'] - df_level1['selection_started_at']
+    if not df_level2.empty:
+        df_level2 = df_level2[df_level2['assigned_at'].notna() & df_level2['selection_started_at'].notna()].copy()
+        df_level2['selection_latency'] = df_level2['assigned_at'] - df_level2['selection_started_at']
+
+    if df_level0.empty and df_level1.empty and df_level2.empty:
+        print("No valid latency data for hierarchy level comparison")
+        return
+
+    # Figure size tuned for paper/slide PDFs - compact for column layout
+    fig, axes = plt.subplots(1, 2, figsize=(8, 3.5))  # compact height for paper
+
+    # ---------- Plot 1: Box plot ----------
+    data_to_plot = []
+    labels = []
+    if not df_level2.empty:
+        data_to_plot.append(df_level2['selection_latency'].dropna())
+        labels.append(f'Level 2 (Top)\n(n={len(df_level2)})')
+    if not df_level1.empty:
+        data_to_plot.append(df_level1['selection_latency'].dropna())
+        labels.append(f'Level 1 (Top)\n(n={len(df_level1)})') if df_level2.empty else labels.append(f'Level 1 (Mid)\n(n={len(df_level1)})')
+    if not df_level0.empty:
+        data_to_plot.append(df_level0['selection_latency'].dropna())
+        labels.append(f'Level 0 (Bottom)\n(n={len(df_level0)})')
+
+    ax_box = axes[0]
+    bp = ax_box.boxplot(data_to_plot, labels=labels, patch_artist=True, showfliers=False)
+    colors = ['#9B59B6', '#4ECDC4', '#FF6B6B']  # Level 2, Level 1, Level 0
+    for patch, color in zip(bp['boxes'], colors[:len(bp['boxes'])]):
+        patch.set_facecolor(color)
+    ax_box.set_ylabel('Selection Time (s)', fontsize=12)
+    ax_box.set_title('Selection Time by Hierarchy Level', fontsize=13, fontweight='bold')
+    ax_box.grid(axis='y', alpha=0.3)
+
+    # ---------- Plot 2: Histogram ----------
+    ax_hist = axes[1]
+    all_latencies = []
+    if not df_level0.empty:
+        all_latencies.extend(df_level0['selection_latency'].tolist())
+    if not df_level1.empty:
+        all_latencies.extend(df_level1['selection_latency'].tolist())
+    if not df_level2.empty:
+        all_latencies.extend(df_level2['selection_latency'].tolist())
+
+    bins = np.linspace(min(all_latencies), max(all_latencies), 30)
+    if not df_level2.empty:
+        ax_hist.hist(df_level2['selection_latency'], bins=bins, alpha=0.5,
+                     label='Level 2 (Top)', color='#9B59B6', edgecolor='black')
+    if not df_level1.empty:
+        label = 'Level 1 (Top)' if df_level2.empty else f'Level 1 (Mid)'
+        ax_hist.hist(df_level1['selection_latency'], bins=bins, alpha=0.5,
+                     label=label, color='#4ECDC4', edgecolor='black')
+    if not df_level0.empty:
+        ax_hist.hist(df_level0['selection_latency'], bins=bins, alpha=0.5,
+                     label='Level 0 (Bottom)', color='#FF6B6B', edgecolor='black')
+    ax_hist.set_xlabel('Selection Time (s)', fontsize=12)
+    ax_hist.set_ylabel('Frequency', fontsize=12)
+    ax_hist.set_title('Histogram by Hierarchy Level', fontsize=13, fontweight='bold')
+    ax_hist.legend()
+    ax_hist.grid(axis='y', alpha=0.3)
+
+    # ---------- Plot 3: Mean latency bar chart ----------
+    #ax_bar = axes[1, 0]
+    mean_data = []
+    level_labels = []
+    bar_colors = []
+
+    if not df_level2.empty:
+        mean_data.append(df_level2['selection_latency'].mean())
+        level_labels.append('Level 2\n(Top)')
+        bar_colors.append('#9B59B6')
+    if not df_level1.empty:
+        mean_data.append(df_level1['selection_latency'].mean())
+        level_labels.append('Level 1\n(Top)') if df_level2.empty else level_labels.append('Level 1\n(Mid)')
+        bar_colors.append('#4ECDC4')
+    if not df_level0.empty:
+        mean_data.append(df_level0['selection_latency'].mean())
+        level_labels.append('Level 0\n(Bottom)')
+        bar_colors.append('#FF6B6B')
+
+    x_pos = np.arange(len(mean_data))
+    '''
+    ax_bar.bar(x_pos, mean_data, color=bar_colors, alpha=0.8, edgecolor='black')
+    ax_bar.set_xticks(x_pos)
+    ax_bar.set_xticklabels(level_labels)
+    ax_bar.set_ylabel('Mean Selection Latency (s)', fontsize=12)
+    ax_bar.set_title('Mean Selection Latency', fontsize=13, fontweight='bold')
+    ax_bar.grid(axis='y', alpha=0.3)
+    '''
+
+    # Value labels on bars
+    if mean_data:
+        max_mean = max(mean_data)
+        #for i, val in enumerate(mean_data):
+        #    ax_bar.text(i, val + max_mean * 0.02, f'{val:.4f}s',
+        #                ha='center', va='bottom', fontweight='bold', fontsize=10)
+
+    # ---------- Plot 4: Statistics table ----------
+    #ax_table = axes[1, 1]
+    stats_data = []
+
+    if not df_level2.empty:
+        stats_data.append([
+            '2 (Top)',
+            f"{df_level2['selection_latency'].mean():.4f}",
+            f"{df_level2['selection_latency'].median():.4f}",
+            f"{df_level2['selection_latency'].std():.4f}",
+            f"{df_level2['selection_latency'].min():.4f}",
+            f"{df_level2['selection_latency'].max():.4f}",
+            f"{len(df_level2)}"
+        ])
+    if not df_level1.empty:
+        stats_data.append([
+            '1 (Top)' if df_level2.empty else '1 (Mid)',
+            f"{df_level1['selection_latency'].mean():.4f}",
+            f"{df_level1['selection_latency'].median():.4f}",
+            f"{df_level1['selection_latency'].std():.4f}",
+            f"{df_level1['selection_latency'].min():.4f}",
+            f"{df_level1['selection_latency'].max():.4f}",
+            f"{len(df_level1)}"
+        ])
+    if not df_level0.empty:
+        stats_data.append([
+            '0 (Bottom)',
+            f"{df_level0['selection_latency'].mean():.4f}",
+            f"{df_level0['selection_latency'].median():.4f}",
+            f"{df_level0['selection_latency'].std():.4f}",
+            f"{df_level0['selection_latency'].min():.4f}",
+            f"{df_level0['selection_latency'].max():.4f}",
+            f"{len(df_level0)}"
+        ])
+
+    '''
+    ax_table.axis('tight')
+    ax_table.axis('off')
+    table = ax_table.table(
+        cellText=stats_data,
+        colLabels=['Level', 'Mean (s)', 'Median (s)', 'Std Dev (s)', 'Min (s)', 'Max (s)', 'Count'],
+        cellLoc='center',
+        loc='center'
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)   # bump up for readability in PDF
+    table.scale(1.5, 1.5)   # (col_scale, row_scale)
+
+    # Header styling
+    for i in range(7):
+        table[(0, i)].set_facecolor('#E0E0E0')
+        table[(0, i)].set_text_props(weight='bold')
+
+    # Row coloring
+    row_colors = ['#F0E6FA', '#E5F9F8', '#FFE5E5']  # L2, L1, L0
+    for row_idx in range(len(stats_data)):
+        for col_idx in range(7):
+            table[(row_idx + 1, col_idx)].set_facecolor(row_colors[row_idx])
+
+    ax_table.set_title('Selection Latency Statistics', fontsize=13, fontweight='bold')
+    '''
+
+    plt.tight_layout()
+
+    # -------- Save as high-quality PDF (and optionally PNG) --------
+    pdf_path = os.path.join(output_dir, "latency_comparison_by_hierarchy_level.pdf")
+    plt.savefig(pdf_path, bbox_inches="tight")  # PDF is vector; dpi not needed
+    print(f"Saved: {pdf_path}")
+
+    # Optional: also save PNG for quick viewing / slides
+    png_path = os.path.join(output_dir, "latency_comparison_by_hierarchy_level.png")
+    plt.savefig(png_path, dpi=300, bbox_inches="tight")
+    print(f"Saved: {png_path}")
+
+    plt.close()
+
+    # Save stats to CSV
+    if stats_data:
+        stats_df = pd.DataFrame(
+            stats_data,
+            columns=['Level', 'Mean (s)', 'Median (s)', 'Std Dev (s)', 'Min (s)', 'Max (s)', 'Count']
+        )
+        stats_df.to_csv(
+            os.path.join(output_dir, "latency_stats_by_hierarchy_level.csv"),
+            index=False
+        )
+        print(f"Saved: {os.path.join(output_dir, 'latency_stats_by_hierarchy_level.csv')}")
 
 def compute_fault_tolerance_metrics(output_dir: str, repo: Repository | None = None, failed_agent_list: list = []):
     """

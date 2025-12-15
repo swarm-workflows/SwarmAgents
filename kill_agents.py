@@ -10,11 +10,12 @@ Supports:
 """
 
 import argparse
+import csv
 import subprocess
 import time
 import random
 import sys
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 
 class AgentKiller:
@@ -157,8 +158,12 @@ class AgentKiller:
 
         return all_agents
 
-    def kill_agent(self, agent: dict, signal: str = 'SIGTERM') -> bool:
-        """Kill a single agent."""
+    def kill_agent(self, agent: dict, signal: str = 'SIGTERM') -> Tuple[bool, float]:
+        """
+        Kill a single agent.
+
+        :return: Tuple of (success, timestamp) where timestamp is when kill was executed
+        """
         host = agent['host']
         pid = agent['pid']
         agent_id = agent.get('agent_id', 'unknown')
@@ -166,6 +171,7 @@ class AgentKiller:
         try:
             if host == 'localhost':
                 # Local kill
+                kill_timestamp = time.time()
                 result = subprocess.run(
                     ['kill', f'-{signal}', pid],
                     capture_output=True,
@@ -182,6 +188,7 @@ class AgentKiller:
                 target = f"{self.ssh_user}@{host}" if self.ssh_user else host
                 ssh_cmd.extend([target, f'kill -{signal} {pid}'])
 
+                kill_timestamp = time.time()
                 result = subprocess.run(
                     ssh_cmd,
                     capture_output=True,
@@ -191,27 +198,31 @@ class AgentKiller:
                 success = result.returncode == 0
 
             if success:
-                print(f"✓ Killed agent {agent_id} (PID {pid}) on {host}")
+                print(f"✓ Killed agent {agent_id} (PID {pid}) on {host} at {kill_timestamp:.6f}")
             else:
                 print(f"✗ Failed to kill agent {agent_id} (PID {pid}) on {host}: {result.stderr}")
+                kill_timestamp = 0
 
-            return success
+            return success, kill_timestamp
         except subprocess.TimeoutExpired:
             print(f"✗ Timeout killing agent {agent_id} (PID {pid}) on {host}")
-            return False
+            return False, 0
         except Exception as e:
             print(f"✗ Error killing agent {agent_id} (PID {pid}) on {host}: {e}")
-            return False
+            return False, 0
 
     def kill_agents(self, agents: List[dict], interval: float = 0,
-                    signal: str = 'SIGTERM', random_order: bool = False):
+                    signal: str = 'SIGTERM', random_order: bool = False,
+                    output_file: Optional[str] = None) -> List[dict]:
         """
-        Kill multiple agents.
+        Kill multiple agents and track timestamps.
 
         :param agents: List of agent dicts to kill
         :param interval: Seconds to wait between kills (0 = all at once)
         :param signal: Signal to send (SIGTERM, SIGKILL, SIGINT)
         :param random_order: Randomize kill order
+        :param output_file: Optional CSV file to save kill timestamps
+        :return: List of kill events with timestamps
         """
         if random_order:
             agents = agents.copy()
@@ -219,6 +230,7 @@ class AgentKiller:
 
         total = len(agents)
         killed = 0
+        kill_log = []
 
         print(f"\n{'='*60}")
         print(f"Killing {total} agents with signal {signal}")
@@ -230,8 +242,19 @@ class AgentKiller:
 
         for i, agent in enumerate(agents, 1):
             print(f"[{i}/{total}] ", end='')
-            if self.kill_agent(agent, signal):
+            success, kill_timestamp = self.kill_agent(agent, signal)
+
+            if success:
                 killed += 1
+                # Record kill event
+                kill_event = {
+                    'agent_id': agent.get('agent_id', 'unknown'),
+                    'pid': agent['pid'],
+                    'host': agent['host'],
+                    'kill_timestamp': kill_timestamp,
+                    'signal': signal
+                }
+                kill_log.append(kill_event)
 
             # Wait between kills (except for last one)
             if interval > 0 and i < total:
@@ -241,6 +264,29 @@ class AgentKiller:
         print(f"\n{'='*60}")
         print(f"Summary: Killed {killed}/{total} agents")
         print(f"{'='*60}\n")
+
+        # Save kill log to file if specified
+        if output_file and kill_log:
+            self.save_kill_log(kill_log, output_file)
+
+        return kill_log
+
+    def save_kill_log(self, kill_log: List[dict], output_file: str):
+        """
+        Save kill timestamps to CSV file.
+
+        :param kill_log: List of kill event dictionaries
+        :param output_file: Path to output CSV file
+        """
+        try:
+            with open(output_file, 'w', newline='') as f:
+                if kill_log:
+                    writer = csv.DictWriter(f, fieldnames=kill_log[0].keys())
+                    writer.writeheader()
+                    writer.writerows(kill_log)
+            print(f"✓ Saved kill log to: {output_file}")
+        except Exception as e:
+            print(f"✗ Error saving kill log: {e}")
 
 
 def main():
@@ -252,20 +298,20 @@ Examples:
   # Kill all local agents at once
   python kill_agents.py --mode local --all
 
-  # Kill agents one every 30 seconds
-  python kill_agents.py --mode local --all --interval 30
+  # Kill agents one every 30 seconds and save timestamps
+  python kill_agents.py --mode local --all --interval 30 --output-file killed_agents.csv
 
-  # Kill 5 random agents
-  python kill_agents.py --mode local --count 5 --random
+  # Kill 5 random agents and log timestamps
+  python kill_agents.py --mode local --count 5 --random --output-file test_run/killed_agents.csv
 
-  # Kill specific agent IDs
-  python kill_agents.py --mode local --agent-ids 5 9 12
+  # Kill specific agent IDs with timestamp logging
+  python kill_agents.py --mode local --agent-ids 5 9 12 --output-file failures.csv
 
   # Kill remote agents
   python kill_agents.py --mode remote --hosts-file hosts.txt --all --ssh-user ubuntu
 
   # Use SIGKILL instead of SIGTERM
-  python kill_agents.py --mode local --all --signal SIGKILL
+  python kill_agents.py --mode local --all --signal SIGKILL --output-file killed.csv
         """
     )
 
@@ -301,9 +347,11 @@ Examples:
     parser.add_argument('--ssh-key', type=str,
                         help='SSH private key path')
 
-    # Dry run
+    # Dry run and output
     parser.add_argument('--dry-run', action='store_true',
                         help='Show what would be killed without actually killing')
+    parser.add_argument('--output-file', type=str,
+                        help='CSV file to save kill timestamps (e.g., killed_agents.csv)')
 
     args = parser.parse_args()
 
@@ -373,6 +421,8 @@ Examples:
         print(f"\nSignal: {args.signal}")
         print(f"Interval: {args.interval}s")
         print(f"Random order: {args.random}")
+        if args.output_file:
+            print(f"Output file: {args.output_file}")
         sys.exit(0)
 
     # Confirm before killing
@@ -390,12 +440,19 @@ Examples:
         sys.exit(0)
 
     # Kill agents
-    killer.kill_agents(
+    kill_log = killer.kill_agents(
         agents_to_kill,
         interval=args.interval,
         signal=args.signal,
-        random_order=args.random
+        random_order=args.random,
+        output_file=args.output_file
     )
+
+    # Print summary of killed agents
+    if kill_log:
+        print(f"\nKilled {len(kill_log)} agents:")
+        for event in kill_log:
+            print(f"  - Agent {event['agent_id']} at timestamp {event['kill_timestamp']:.6f}")
 
 
 if __name__ == '__main__':
