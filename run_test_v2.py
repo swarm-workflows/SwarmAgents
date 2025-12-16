@@ -624,19 +624,22 @@ def main() -> None:
             raise SystemExit("Remote mode requires --agent-hosts or --agent-hosts-file")
         start_agents_remote(args, host_list)
 
-    # Start job production
-    produce_jobs(args)
+    # Start job production in background thread to avoid blocking dynamic trigger detection
+    import threading
+    job_thread = threading.Thread(target=lambda: produce_jobs(args), daemon=True, name="JobDistributor")
+    job_thread.start()
+    log("Job distribution started in background thread")
 
     # If dynamic agents are enabled, wait for trigger and add them
     if args.dynamic_agents > 0:
         # Start a thread to wait for the trigger and add agents
-        import threading
         def dynamic_addition():
             wait_for_dynamic_trigger(args)
             add_dynamic_agents(args, host_list)
 
-        dynamic_thread = threading.Thread(target=dynamic_addition, daemon=True)
+        dynamic_thread = threading.Thread(target=dynamic_addition, daemon=True, name="DynamicAgentAdder")
         dynamic_thread.start()
+        log("Dynamic agent trigger monitoring started")
 
     # Wait for test completion
     if args.shutdown_after_seconds > 0:
