@@ -33,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     # Agent selection
     parser.add_argument(
         "--agent-type",
-        choices=["resource", "llm"],
+        choices=["resource", "llm", "colmena"],
         default="resource",
         help="Type of agent to start (default: resource)"
     )
@@ -74,6 +74,9 @@ if __name__ == '__main__':
     elif agent_type == "llm":
         from swarm.agents.llm.llm_agent import LlmAgent
         agent = LlmAgent(agent_id=agent_id, config_file=config_file)
+    elif agent_type == "colmena":
+        from swarm.agents.colmena_agent import ColmenaAgent
+        agent = ColmenaAgent(agent_id=agent_id, config_file=config_file, debug=debug)
     else:
         raise ValueError(f"Unknown agent type: {agent_type}")
 

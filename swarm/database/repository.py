@@ -36,6 +36,7 @@ class Repository:
 
     KEY_STATE = "state"
     KEY_JOB = "job"
+    KEY_ROLE = "role"
     KEY_AGENT = "agent"
     KEY_PRE_PREPARE = "pre_prepare"
     KEY_PREPARE = "prepare"

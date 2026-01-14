@@ -29,6 +29,7 @@ import threading
 import time
 import traceback
 from abc import abstractmethod
+from typing import Tuple
 from logging.handlers import RotatingFileHandler
 
 import redis
@@ -52,7 +53,11 @@ class Agent(Observer):
         self.neighbor_map = ThreadSafeDict[int, AgentInfo]()
         self.children = ThreadSafeDict[int, AgentInfo]()
         self.parents = ThreadSafeDict[int, AgentInfo]()
-        self.peer_by_endpoint = ThreadSafeDict[(str, int), (int, bool)]()
+        self.peer_by_endpoint = ThreadSafeDict[
+            Tuple[str, int],
+            Tuple[int, bool]
+        ]()
+
 
         with open(config_file, 'r') as f:
             self.config = yaml.safe_load(f)
@@ -103,7 +108,7 @@ class Agent(Observer):
 
     @property
     def grpc_port(self) -> int:
-        return self.grpc_config.get("port", 20000)
+        return self.grpc_config.get("port", 50051)
 
     @property
     def grpc_host(self):
@@ -144,7 +149,7 @@ class Agent(Observer):
             for thread in self.threads.values():
                 thread.join()
         except Exception as e:
-            self.logger.error(f"Exception occurred in startup: {e}")
+            self.logger.info(f"Exception occurred in startup: {e}")
             self.logger.error(traceback.format_exc())
             self.stop()
 

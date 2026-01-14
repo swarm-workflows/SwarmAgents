@@ -46,6 +46,8 @@ class Job(Object):
 
     def __init__(self, logger: Optional[logging.Logger] = None):
         super().__init__()
+        self.service_id = None
+        self.startOrStop = None
         # Resource intents and allocations
         self._capacities: Optional[Capacities] = None
         self._capacity_allocations: Optional[Capacities] = None

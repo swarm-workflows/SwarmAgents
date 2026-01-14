@@ -37,7 +37,8 @@ from swarm.utils.thread_safe_dict import ThreadSafeDict
 class GrpcTransport(Observer):
     def __init__(self, host: str, port: int, logger: logging.Logger = logging.getLogger(),
                  on_peer_status = None):
-        self.server = GrpcServer(on_message=self.on_message, bind_host=host, bind_port=port)
+        #self.server = GrpcServer(on_message=self.on_message, bind_host=host, bind_port=port)
+        self.server = GrpcServer(on_message=self.on_message, bind_host="0.0.0.0", bind_port=port) # Start in all interfaces
         self.client = GrpcClient(on_peer_status=on_peer_status)
         self.observers = []
         self.logger = logger
@@ -95,5 +96,6 @@ class GrpcTransport(Observer):
             if not peer_info:
                 continue
 
+            self.logger.info(f"Sending proposal to peer: {peer_id}")
             self.send(host=peer_info.host, port=peer_info.port, payload=payload,
                       dest=peer_info.agent_id, src=sender)

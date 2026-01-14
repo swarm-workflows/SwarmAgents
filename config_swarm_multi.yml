@@ -28,7 +28,7 @@ topology:
   type: mesh
 grpc:
   port: 20000 
-  host: localhost
+  host: "0.0.0.0"
 dtns:
   - name: dtn1
     ip: "192.168.1.10"
@@ -39,6 +39,11 @@ dtns:
     user: "dtn_user2"
     connectivity_score: 0.87
 runtime:
+  projected_queue_threshold: 300.00
+  ready_queue_threshold: 100.00
+  max_time_load_zero: 300
+  restart_job_selection: 30
+  peer_expiry_seconds: 300
   empty_timeout_seconds: 300
   reselection_timeout_s: 60
   peer_expiry_seconds: 45

@@ -23,6 +23,11 @@
 #
 # Author: Komal Thareja(kthare10@renci.org)
 from typing import Protocol, Iterable, Optional, Any
+
+from swarm.consensus.messages.proposal import Proposal
+from swarm.consensus.messages.prepare import Prepare
+from swarm.consensus.messages.commit import Commit
+
 from swarm.models.object import Object
 
 class TopologyRouter(Protocol):
@@ -36,6 +41,9 @@ class ConsensusTransport(Protocol):
 class ConsensusHost(Protocol):
     # domain introspection
     def get_object(self, object_id: str) -> Optional[Object]: ...
+    def set_pending_proposal(self, proposal: Proposal, object_id: str): ...
+    def set_pending_prepare(self, prepare: Prepare, object_id: str): ...
+    def set_pending_commit(self, commit: Commit, object_id: str): ...
     def is_agreement_achieved(self, object_id: str) -> bool: ...
     def calculate_quorum(self) -> int: ...
 
