@@ -100,10 +100,10 @@ class ConsensusEngine:
             object = self.host.get_object(proposal.object_id)
             if not object or self.host.is_agreement_achieved(object.object_id):
                 if not object:
-                    self.host.log_info(f"Enqueued proposal {proposal.p_id} for {proposal.object_id} (missing)")
+                    self.host.log_debug(f"Enqueued proposal {proposal.p_id} for {proposal.object_id} (missing)")
                     self.host.set_pending_proposal(msg, proposal.object_id)
                 else:
-                    self.host.log_info(f"Skip proposal {proposal.p_id} for {proposal.object_id} (complete)")
+                    self.host.log_debug(f"Skip proposal {proposal.p_id} for {proposal.object_id} (complete)")
                     self.outgoing.remove_object(object_id=proposal.object_id)
                     self.incoming.remove_object(object_id=proposal.object_id)
                 continue
@@ -114,8 +114,8 @@ class ConsensusEngine:
 
             if my_better:
                 # I think my own proposal for this object is better; ignore/forward if topology requires
-                self.host.log_info(f"Retaining my better proposal for Object {proposal.object_id}")
-                self.conflicts[proposal.object_id] = self.conflicts.get(proposal.object_id, 0) + 1
+                self.host.log_debug(f"Retaining my better proposal for Object {object.object_id}")
+                self.conflicts[object.object_id] = self.conflicts.get(object.object_id, 0) + 1
             elif peer_better:
                 # adopt better peer proposal (already handled by containers)
                 self.host.log_debug(f"Already accepted better proposal for Object {object.object_id} from peer {peer_better.agent_id} Cost: {peer_better.cost}")
@@ -135,7 +135,7 @@ class ConsensusEngine:
             prepare = Prepare(source=self.agent_id,
                               agents=[AgentInfo(agent_id=self.agent_id)],
                               proposals=proposals)
-            self.host.log_info("Sending prepares")
+            self.host.log_debug("Sending prepares")
             self.transport.broadcast(prepare)
 
         if self.router.should_forward():
@@ -148,7 +148,7 @@ class ConsensusEngine:
             if not object or self.host.is_agreement_achieved(object.object_id):
                 if not object:
                     self.host.set_pending_prepare(msg, p.object_id)
-                    self.host.log_info(f"Enqueued prepare {p.p_id}/{p.object_id} (missing)")
+                    self.host.log_debug(f"Enqueued prepare {p.p_id}/{p.object_id} (missing)")
                 else:
                     self.outgoing.remove_object(object_id=p.object_id)
                     self.incoming.remove_object(object_id=p.object_id)
@@ -235,7 +235,7 @@ class ConsensusEngine:
             if not object or self.host.is_agreement_achieved(object.object_id):
                 if not object:
                     self.host.set_pending_commit(msg, p.object_id)
-                    self.host.log_info(f"Enqueued commit {p.p_id}/{p.object_id} (missing)")
+                    self.host.log_debug(f"Enqueued commit {p.p_id}/{p.object_id} (missing)")
                 else:
                     self.outgoing.remove_object(object_id=p.object_id)
                     self.incoming.remove_object(object_id=p.object_id)
@@ -276,9 +276,9 @@ class ConsensusEngine:
                 proposal.commits.append(msg.agents[0].agent_id)
 
             quorum = self.host.calculate_quorum()
-            self.host.log_info(f"Is quorum? /{quorum}")
+            self.host.log_debug(f"Is quorum? /{quorum}")
             if len(proposal.commits) >= quorum:
-                self.host.log_info("Is quorum!!")
+                self.host.log_debug("Is quorum!!")
                 # leader vs participant path
                 if proposal.agent_id == self.agent_id and self.outgoing.contains(object_id=proposal.object_id, p_id=proposal.p_id):
                     # I am leader, do selection
