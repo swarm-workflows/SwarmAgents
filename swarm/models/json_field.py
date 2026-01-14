@@ -110,7 +110,10 @@ class JSONField(ABC):
             # Remove the underscore from the beginning of the key
             new_key = k.lstrip('_')
 
-            if v is None or v == 0:
+            #if v is None or v == 0:
+            if v is None:
+                continue
+            if k not in ["_group", "_level"] and v==0:
                 continue
 
             if isinstance(v, JSONField):

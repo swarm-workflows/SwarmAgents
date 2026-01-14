@@ -66,7 +66,7 @@ class ConsensusServiceServicer(consensus_pb2_grpc.ConsensusServiceServicer):
 class GrpcServer:
     def __init__(self, on_message: Any, bind_host: str, bind_port: int, max_workers: int = 32, options=None):
         self.on_message = on_message
-        self.bind_host = bind_host or "127.0.0.1"     # normalize to IPv4 loopback
+        self.bind_host = bind_host
         self.bind_port = int(bind_port)
         self._server = grpc.server(futures.ThreadPoolExecutor(max_workers=max_workers),
                                    options=options or _DEFAULT_OPTS)

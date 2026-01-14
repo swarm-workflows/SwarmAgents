@@ -97,3 +97,8 @@ class ThreadSafeDict(Generic[K, V]):
     def __iter__(self) -> Iterator[K]:
         with self._lock:
             return iter(self._store.copy())
+
+    def to_dict(self) -> dict[K, V]:
+        """Return a regular dictionary copy of the internal store."""
+        with self._lock:
+            return self._store.copy()

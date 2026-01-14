@@ -25,6 +25,8 @@ import enum
 import threading
 import time
 from abc import ABC
+from typing import Optional
+
 
 class ObjectState(enum.Enum):
     PENDING = enum.auto()
@@ -36,25 +38,26 @@ class ObjectState(enum.Enum):
     IDLE = enum.auto()
     COMPLETE = enum.auto()
     FAILED = enum.auto()
+    BLOCKED = enum.auto()
 
 
 class Object(ABC):
     def __init__(self):
-        self._object_id = None
-        self._state = ObjectState.PENDING
-        self._time_last_state_change = time.time()
-        self._leader_id = None
+        self._object_id: Optional[int] = None
+        self._state: ObjectState = ObjectState.PENDING
+        self._last_transition_at = time.time()
+        self._leader_id: Optional[int] = None
         self.lock = threading.RLock()  # Lock for synchronization
 
     @property
-    def time_last_state_change(self):
+    def last_transition_at(self):
         with self.lock:
-            return self._time_last_state_change
+            return self._last_transition_at
 
-    @time_last_state_change.setter
-    def time_last_state_change(self, time_last_state_change):
+    @last_transition_at.setter
+    def last_transition_at(self, value: float):
         with self.lock:
-            self._time_last_state_change = time_last_state_change
+            self._last_transition_at = value
 
     @property
     def state(self):
@@ -66,7 +69,7 @@ class Object(ABC):
         with self.lock:
             old = self._state
             self._state = value
-            self.time_last_state_change = time.time()
+            self._last_transition_at = time.time()
         # Call a hook after unlock to avoid lock reentrancy surprises
         self.on_state_changed(old, value)
 

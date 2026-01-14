@@ -42,6 +42,9 @@ class SwarmConfigGenerator:
         agents_per_host: int = 1,
         groups: Optional[int] = None,
         group_size: Optional[int] = None,
+        hierarchical_level1_agent_type: str = "llm",
+        agent_type: str = "resource",
+        initial_group_size: Optional[int] = None,
     ):
         self.num_agents = num_agents
         self.jobs_per_proposal = jobs_per_proposal
@@ -56,6 +59,15 @@ class SwarmConfigGenerator:
         # grouping controls (only used for mesh/ring)
         self.req_groups = groups
         self.req_group_size = group_size
+
+        # hierarchical level 1 agent type (llm or resource)
+        self.hierarchical_level1_agent_type = hierarchical_level1_agent_type
+
+        # default agent type for all non-hierarchical level 1 agents
+        self.agent_type = agent_type
+
+        # initial group size for dynamic agent addition (if different from num_agents)
+        self.initial_group_size = initial_group_size
 
         # legacy ring helper (used when no grouping flags provided for ring)
         self.rings_default = self._create_default_rings()
@@ -211,39 +223,122 @@ class SwarmConfigGenerator:
                     "children": None,
                     "group": gid,
                     "level": 0,
+                    "group_size": len(group),
+                    "group_count": len(groups),
                 }
         return agent_topo
 
-    def _build_ring_topology(self, rings: List[List[int]]) -> Dict[int, dict]:
+    from typing import Dict, List, Optional
+
+    def _build_ring_topology(
+            self,
+            rings: List[List[int]],
+            cross_rings: bool = True,
+            cross_ring_indices: Optional[List[int]] = [0],
+    ) -> Dict[int, dict]:
         """
-        Build independent rings (no cross-links). Each entry in `rings` is a group.
+        Build ring topologies.
+
+        Args:
+            rings: List of rings, each ring is a list of agent ids in order.
+            cross_rings: If True, connect chosen same-index nodes across adjacent rings (with wrap).
+            cross_ring_indices: Which within-ring indices to cross-link. If None and cross_rings=True,
+                                link *all* valid indices across rings. Example: [0] links only 1-6-11-1
+                                in your 3-ring, 5-per-ring case.
+
+        Behavior:
+          - Always builds intra-ring neighbors (prev/next).
+          - If cross_rings=True, adds cross-ring peers at the specified indices.
+          - When cross_rings=True, sets group=0 for all nodes, group_size=total agents, group_count=1.
+            Otherwise, each ring has its own group id and size; group_count=len(rings).
         """
         agent_topo: Dict[int, dict] = {}
+
+        def _meta(group_id: int, group_size: int, group_count: int) -> dict:
+            return {
+                "parent": None,
+                "children": None,
+                "group": group_id,
+                "level": 0,
+                "group_size": group_size,
+                "group_count": group_count,
+            }
+
+        total_agents = sum(len(r) for r in rings)
+        num_groups = 1 if cross_rings else len(rings)
+
+        # 1) Intra-ring links
         for gid, ring in enumerate(rings):
             n = len(ring)
             if n == 0:
                 continue
             if n == 1:
-                # single node "ring": no peers
-                agent_topo[ring[0]] = {
+                node = ring[0]
+                agent_topo[node] = {
                     "peers": [],
-                    "parent": None,
-                    "children": None,
-                    "group": gid,
-                    "level": 0,
+                    **_meta(0 if cross_rings else gid,
+                            total_agents if cross_rings else 1,
+                            num_groups),
                 }
                 continue
+
             for k in range(n):
                 cur = ring[k]
                 nxt = ring[(k + 1) % n]
                 prv = ring[(k - 1) % n]
+                existing = agent_topo.get(cur, {"peers": []})
+                peers = set(existing.get("peers", []))
+                peers.update((nxt, prv))
                 agent_topo[cur] = {
-                    "peers": sorted(set([nxt, prv])),
-                    "parent": None,
-                    "children": None,
-                    "group": gid,
-                    "level": 0,
+                    "peers": sorted(peers),
+                    **_meta(0 if cross_rings else gid,
+                            total_agents if cross_rings else n,
+                            num_groups),
                 }
+
+        # 2) Cross-ring links (same-index across adjacent rings, with wrap)
+        if cross_rings and len(rings) > 1:
+            m = len(rings)
+
+            # Determine which indices we will cross-link
+            if cross_ring_indices is None:
+                # Link all indices that are valid across each adjacent ring pair
+                # We'll compute per-pair max and intersect on the fly
+                per_pair_indices = [None] * m  # None means "0..min_len-1"
+            else:
+                # Use the given indices for every adjacent pair (will skip if index out of range)
+                per_pair_indices = [set(cross_ring_indices)] * m
+
+            for i in range(m):
+                j = (i + 1) % m  # adjacent ring (wrap)
+                ring_i, ring_j = rings[i], rings[j]
+                if per_pair_indices[i] is None:
+                    max_idx = min(len(ring_i), len(ring_j))
+                    indices = range(max_idx)
+                else:
+                    indices = (idx for idx in per_pair_indices[i])
+
+                for idx in indices:
+                    if idx < len(ring_i) and idx < len(ring_j):
+                        a, b = ring_i[idx], ring_j[idx]
+                        # add bidirectional cross peers
+                        ai = agent_topo.get(a)
+                        bi = agent_topo.get(b)
+                        if ai is not None:
+                            ai_peers = set(ai["peers"])
+                            ai_peers.add(b)
+                            ai["peers"] = sorted(ai_peers)
+                        if bi is not None:
+                            bi_peers = set(bi["peers"])
+                            bi_peers.add(a)
+                            bi["peers"] = sorted(bi_peers)
+
+            # Normalize group metadata to a single group when cross-ring is enabled
+            for node in agent_topo:
+                agent_topo[node]["group"] = 0
+                agent_topo[node]["group_size"] = total_agents
+                agent_topo[node]["group_count"] = 1
+
         return agent_topo
 
     # -----------------------------
@@ -359,15 +454,78 @@ class SwarmConfigGenerator:
                 print("Minimum number of agents for hierarchical topology is 30")
                 return
             agent_topo = {}
-            num_groups = 10 if self.num_agents > 30 else 5
-            group_size = 10 if self.num_agents > 30 else 5
 
-            # Level 0 (leaf agents)
+            # Determine hierarchy structure based on agent count
+            if self.num_agents == 30:
+                # Two-level: 25 Level-0 + 5 Level-1 = 30
+                num_groups = 5
+                group_size = 5
+                num_super_groups = 0  # No Level 2
+                level_1_base = 26
+
+            elif self.num_agents == 100:
+                # Three-level: Level-0 80 - 16 groups of 5
+                # Level-1: 16 (81-96) - 4 groups of 4
+                # Level-2: 4 (97-100) - 1 group of 4
+                num_super_groups = 4
+                groups_per_super_group = 4
+                num_groups = num_super_groups * groups_per_super_group  # 16 groups
+                group_size = 5
+                super_group_size = 4
+                level_1_base = 81
+                level_2_base = 97
+
+            elif self.num_agents <= 110:
+                # Two-level: 100 Level-0 + 10 Level-1 = 110
+                num_groups = 10
+                group_size = 10
+                num_super_groups = 0  # No Level 2
+                level_1_base = 101
+
+            elif self.num_agents == 250:
+                # Two-level: 225 Level-0 + 25 Level-1 = 250
+                num_groups = 25
+                group_size = 9
+                num_super_groups = 0  # No Level 2
+                level_1_base = 226
+
+            elif self.num_agents == 990:
+                # Three-level: Level-0 880 - 88 groups of 10
+                # Level-1: 88 (881-968) - 22 super-groups of 4
+                # Level-2: 22 (969-990) - 1 group of 22
+                num_super_groups = 22
+                groups_per_super_group = 4
+                super_group_size = 22
+                num_groups = num_super_groups * groups_per_super_group  # 88 groups
+                group_size = 10
+                level_1_base = 881
+                level_2_base = 969
+
+            elif self.num_agents == 1000:
+                # Three-level: Level-0 900 - 90 groups of 10
+                # Level-1: 90 (901-990) - 10 groups of 9
+                # Level-2: 10 (991-1000) - 1 group of 10
+                num_super_groups = 10
+                groups_per_super_group = 9
+                super_group_size = 10
+                num_groups = num_super_groups * groups_per_super_group  # 90 groups
+                group_size = 10
+                level_1_base = 901
+                level_2_base = 991
+
+            else:
+                print(f"Hierarchical topology currently supports 30, 100, 110, 250, 990, or 1000 agents (got {self.num_agents})")
+                return
+
+            # Level 0 (leaf/worker agents)
             for group in range(num_groups):
                 start = group * group_size + 1
-                end = min(start + group_size, self.num_agents + 1)
-                base = 101 if self.num_agents > 30 else 26
-                parent_id = base + group
+                end = start + group_size
+                parent_id = level_1_base + group
+
+                # For 3-level hierarchy, determine super-group
+                super_group = group // groups_per_super_group if num_super_groups > 0 else 0
+
                 for agent_id in range(start, end):
                     peers = [a for a in range(start, end) if a != agent_id]
                     agent_topo[agent_id] = {
@@ -375,20 +533,69 @@ class SwarmConfigGenerator:
                         "parent": parent_id,
                         "children": None,
                         "group": group,
-                        "level": 0
+                        "level": 0,
+                        "group_size": group_size,
+                        "group_count": num_groups,
+                        "super_group": super_group
                     }
 
-            # Level 1 (parent agents)
+            # Level 1 (group coordinators)
             for group in range(num_groups):
-                base = 101 if self.num_agents > 30 else 26
-                parent_id = base + group
+                parent_id = level_1_base + group
+
+                if num_super_groups > 0:
+                    # Three-level hierarchy: Level-1 coordinators form groups within super-groups
+                    super_group = group // groups_per_super_group
+                    super_group_start = super_group * groups_per_super_group
+                    super_group_end = super_group_start + groups_per_super_group
+
+                    # Peers are other Level-1 coordinators in same super-group
+                    peers = [level_1_base + i for i in range(super_group_start, super_group_end) if i != group]
+                    level_1_parent = level_2_base + super_group
+                else:
+                    # Two-level hierarchy: Level-1 coordinators form flat mesh
+                    peers = [level_1_base + i for i in range(num_groups) if i != group]
+                    level_1_parent = None
+
+                # Level-1 group metadata should reflect the super-group (not the child group id)
+                # For 2-level hierarchies, all Level-1 agents are in the same group (0)
+                l1_group = super_group if num_super_groups > 0 else 0
+                l1_group_count = num_super_groups if num_super_groups > 0 else 1
+                # Level 1 group_size should be the number of Level 1 coordinators in the peer group
+                l1_group_size = groups_per_super_group if num_super_groups > 0 else num_groups
+
                 agent_topo[parent_id] = {
-                    "peers": [base + i for i in range(num_groups) if i != group],
-                    "parent": None,
+                    "peers": peers,
+                    "parent": level_1_parent,
                     "children": [group],
-                    "group": 0,
-                    "level": 1
+                    "group": l1_group,
+                    "level": 1,
+                    "group_size": l1_group_size,
+                    "group_count": l1_group_count,
+                    "super_group": super_group if num_super_groups > 0 else 0
                 }
+
+            # Level 2 (super-coordinators) - only for three-level hierarchy
+            if num_super_groups > 0:
+                for super_group in range(num_super_groups):
+                    super_coord_id = level_2_base + super_group
+
+                    # Peers are other Level-2 super-coordinators
+                    peers = [level_2_base + i for i in range(num_super_groups) if i != super_group]
+
+                    # Children is the Level 1 group (super_group) managed by this Level 2 agent
+                    children = [super_group]
+
+                    agent_topo[super_coord_id] = {
+                        "peers": peers,
+                        "parent": None,
+                        "children": children,
+                        "group": 0,
+                        "level": 2,
+                        "group_size": super_group_size,
+                        "group_count": 1,
+                        "super_group": super_group
+                    }
 
         else:
             # default to full mesh (backward compatible)
@@ -399,7 +606,9 @@ class SwarmConfigGenerator:
                     "parent": None,
                     "children": None,
                     "group": 0,
-                    "level": 0
+                    "level": 0,
+                    "group_size": self.num_agents,
+                    "group_count": 1
                 }
 
         config_prefix = self.get_config_prefix()
@@ -431,6 +640,10 @@ class SwarmConfigGenerator:
                 host_idx = (agent_id - 1) // self.agents_per_host
                 host = agent_hosts[host_idx]
                 config['grpc']['host'] = host
+                if self.agents_per_host > 1:
+                    config['grpc']['port'] += agent_id
+            else:
+                config['grpc']['port'] += agent_id
 
             # DTNs
             if self.enable_dtns:
@@ -453,17 +666,32 @@ class SwarmConfigGenerator:
             config.setdefault("redis", {})
             config["redis"]["host"] = self.db_host
             topo = agent_topo.get(agent_id, {"peers": [], "parent": None, "children": None, "group": 0, "level": 0})
+
+            # Use initial_group_size for initial agents if specified (for dynamic agent addition)
+            group_size_to_use = topo["group_size"]
+            if self.initial_group_size is not None and agent_id <= self.initial_group_size:
+                group_size_to_use = self.initial_group_size
+
             config["topology"] = {
                 "peer_agents": topo["peers"],
                 "type": self.topology,
                 "parent": topo["parent"],
                 "children": topo["children"],
                 "level": topo["level"],
-                "group": topo["group"]
+                "group": topo["group"],
+                "group_size": group_size_to_use,
+                "group_count": topo["group_count"]
             }
             config.setdefault("runtime", {})
             config["runtime"]["total_agents"] = self.num_agents
             config["runtime"]["jobs_per_proposal"] = self.jobs_per_proposal
+
+            # Set agent type based on topology level (for hierarchical)
+            if self.topology == "hierarchical" and topo["level"] == 1:
+                config["agent_type"] = self.hierarchical_level1_agent_type
+                #print(f"Settting config type: {config['agent_type']}")
+            else:
+                config["agent_type"] = self.agent_type
 
             # Write file
             config_file_path = os.path.join(self.output_dir, f"{config_prefix}_{agent_id}.yml")
@@ -528,6 +756,20 @@ if __name__ == "__main__":
     parser.add_argument("--group-size", type=int, default=None,
                         help="Group size for mesh/ring (independent sub-topologies)")
 
+    # Hierarchical topology control
+    parser.add_argument("--hierarchical-level1-agent-type", type=str,
+                        choices=["llm", "resource"], default="llm",
+                        help="Agent type for level 1 (parent) agents in hierarchical topology (default: llm)")
+
+    # Agent type control (for all non-hierarchical-level-1 agents)
+    parser.add_argument("--agent-type", type=str,
+                        choices=["llm", "resource"], default="resource",
+                        help="Default agent type for all agents (default: resource)")
+
+    # Dynamic agent addition support
+    parser.add_argument("--initial-group-size", type=int, default=None,
+                        help="Initial group size for dynamic agent addition (if different from total agents)")
+
     args = parser.parse_args()
 
     if args.agent_hosts_file:
@@ -555,6 +797,9 @@ if __name__ == "__main__":
         agents_per_host=args.agents_per_host,
         groups=args.groups,
         group_size=args.group_size,
+        hierarchical_level1_agent_type=args.hierarchical_level1_agent_type,
+        agent_type=args.agent_type,
+        initial_group_size=args.initial_group_size,
     )
     generator.generate_configs(flavor_percentages=flavor_percentages, agent_hosts=agent_hosts)
 

@@ -47,6 +47,8 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 if __name__ == '__main__':
+    import yaml
+
     args = parse_args()
     agent_id = args.agent_id
     debug = args.debug
@@ -55,6 +57,16 @@ if __name__ == '__main__':
     config_file = args.config
     if not config_file:
         config_file = f"./configs/config_swarm_multi_{agent_id}.yml"
+
+    # If agent_type not explicitly provided via CLI, try reading from config file
+    if not agent_type or agent_type == "resource":
+        try:
+            with open(config_file, 'r') as f:
+                config = yaml.safe_load(f)
+                agent_type = config.get('agent_type', agent_type or 'resource')
+        except Exception:
+            # If config read fails, use default or CLI-provided value
+            agent_type = agent_type or 'resource'
 
     if agent_type == "resource":
         from swarm.agents.resource_agent import ResourceAgent

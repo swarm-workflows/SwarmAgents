@@ -56,4 +56,6 @@ class Topology:
         self.children = topo.get("children", None)
         self.level = topo.get("level", 0)
         self.group = topo.get("group", 0)
+        self.group_size = topo.get("group_size", 0)
+        self.group_count = topo.get("group_count", 0)
         self.peers = topo.get("peer_agents", [])
