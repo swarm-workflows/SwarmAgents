@@ -41,6 +41,8 @@ class Metrics:
         self.reassignments = {}
         self.quorum_changes = []
         self.delegation_reassignments = {}
+        self.mab_rewards = {}      # group_id -> list of (timestamp, reward)
+        self.mab_selections = {}   # group_id -> selection count
 
     def save_load_metric(self, load: float):
         """

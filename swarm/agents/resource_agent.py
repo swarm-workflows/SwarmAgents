@@ -49,6 +49,7 @@ from swarm.models.capacities import Capacities
 from swarm.models.agent_info import AgentInfo
 from swarm.consensus.messages.proposal_info import ProposalInfo
 from swarm.models.job import Job, ObjectState
+from swarm.rl.mab_manager import MABManager
 
 from swarm.utils.utils import generate_id, job_capacities
 
@@ -177,6 +178,23 @@ class ResourceAgent(Agent):
         # Maps: job_id -> {'delegated_at': timestamp, 'groups': [list of child groups]}
         self.delegated_jobs = ThreadSafeDict[str, dict]()  # job_id -> delegation_info
 
+        # MAB (Multi-Armed Bandit) configuration for hierarchical delegation
+        mab_cfg = self.config.get("mab", {})
+        self.mab_enabled = mab_cfg.get("enabled", False)
+        self.mab_config = mab_cfg
+        self.mab_top_k = mab_cfg.get("top_k", 1)
+        self.mab_manager = None  # Lazily initialised in _init_mab() once children are known
+
+        # Failure simulation for MAB testing
+        fail_sim_cfg = mab_cfg.get("failure_simulation", {})
+        self.failure_sim_enabled = fail_sim_cfg.get("enabled", False)
+        self.failure_sim_base_prob = fail_sim_cfg.get("failure_probability", 0.1)
+        self.failure_sim_per_agent = fail_sim_cfg.get("per_agent_failure_rates", {})
+        self.failure_sim_per_job_type = fail_sim_cfg.get("per_job_type_failure_rates", {})
+
+        # Track which group each delegated job was sent to for MAB reward attribution
+        self.job_delegation_map = ThreadSafeDict[str, int]()  # job_id -> group_id
+
     @property
     def peer_expiry_seconds(self) -> int:
         return self.runtime_config.get("peer_expiry_seconds", 20)
@@ -219,6 +237,28 @@ class ResourceAgent(Agent):
     def get_total_idle_time(self):
         self.end_idle()
         return self.metrics.total_idle_time
+
+    def _init_mab(self):
+        """Lazily initialise the MABManager once child groups are known."""
+        if not self.mab_enabled:
+            return
+        if self.mab_manager is not None:
+            return
+        if not self.topology.children:
+            return
+
+        child_groups = list(self.topology.children)
+        self.mab_manager = MABManager(
+            agent_id=self.agent_id,
+            child_groups=child_groups,
+            config=self.mab_config,
+            repository=self.repository,
+            logger=self.logger,
+        )
+        self.mab_manager.load_state()
+        self.logger.info(
+            f"MAB initialised for agent {self.agent_id} with child groups {child_groups}"
+        )
 
     @property
     def empty_timeout_seconds(self):
@@ -398,6 +438,9 @@ class ResourceAgent(Agent):
         delegation_timeout_s seconds. If so, they are re-added to the parent's queue
         as they may be infeasible for the children to handle.
 
+        When MAB is enabled, this method also checks for early completion (before
+        timeout) so the bandit receives timely success/failure signals.
+
         The parent will not propose for these jobs (they remain in a monitored state)
         to avoid consensus conflicts.
         """
@@ -408,6 +451,7 @@ class ResourceAgent(Agent):
         current_time = time.time()
         jobs_to_reassign = []
         jobs_processed = []
+        mab_active = self.mab_enabled and self.mab_manager is not None
 
         # Check all delegated jobs
         for job_id, delegation_info in list(self.delegated_jobs.items()):
@@ -415,14 +459,17 @@ class ResourceAgent(Agent):
             child_groups = delegation_info.get('groups', [])
 
             time_since_delegation = current_time - delegated_at
+            timed_out = time_since_delegation > self.delegation_timeout_s
 
-            # Check if timeout has been exceeded
-            if time_since_delegation <= self.delegation_timeout_s:
+            # When MAB is disabled and timeout hasn't elapsed, skip checking
+            if not mab_active and not timed_out:
                 continue
 
             # Check job state in Redis at child level(s)
             job_still_pending = False
             job_found = False
+            job_complete = False
+            job_exit_status = 0
 
             for child_group in child_groups:
                 try:
@@ -437,21 +484,32 @@ class ResourceAgent(Agent):
                         job_found = True
                         job_state = job_data.get('state', ObjectState.PENDING.value)
 
-                        # If job is still PENDING at child level, it wasn't selected
-                        if job_state == ObjectState.PENDING.value:
-                            job_still_pending = True
-                            self.logger.warning(
-                                f"Delegated job {job_id} still PENDING at level {self.topology.level - 1}, "
-                                f"group {child_group} after {time_since_delegation:.1f}s "
-                                f"(timeout: {self.delegation_timeout_s:.1f}s)"
-                            )
-                            break
-                        else:
-                            # Job was processed by children
+                        if job_state == ObjectState.COMPLETE.value:
+                            job_complete = True
+                            job_exit_status = int(job_data.get('exit_status', 0))
                             self.logger.debug(
-                                f"Delegated job {job_id} processed by children (state: {job_state})"
+                                f"Delegated job {job_id} COMPLETE at child group {child_group}, "
+                                f"exit_status={job_exit_status}"
                             )
                             jobs_processed.append(job_id)
+                            break
+                        elif job_state == ObjectState.PENDING.value:
+                            if timed_out:
+                                job_still_pending = True
+                                self.logger.warning(
+                                    f"Delegated job {job_id} still PENDING at level {self.topology.level - 1}, "
+                                    f"group {child_group} after {time_since_delegation:.1f}s "
+                                    f"(timeout: {self.delegation_timeout_s:.1f}s)"
+                                )
+                                break
+                        else:
+                            # Job in progress (READY, RUNNING, etc.) — not yet done
+                            if timed_out:
+                                # Job was picked up but hasn't finished — processed
+                                self.logger.debug(
+                                    f"Delegated job {job_id} processed by children (state: {job_state})"
+                                )
+                                jobs_processed.append(job_id)
 
                 except Exception as e:
                     self.logger.error(
@@ -459,15 +517,40 @@ class ResourceAgent(Agent):
                         f"group {child_group}: {e}"
                     )
 
-            # Re-add to parent queue if still pending or not found (possibly infeasible for children)
-            if not job_found or job_still_pending:
+            # Feed MAB reward for completed jobs
+            if mab_active and job_complete:
+                delegated_group = self.job_delegation_map.get(job_id)
+                if delegated_group is not None:
+                    success = (job_exit_status == 0)
+                    self.mab_manager.report_outcome(delegated_group, job_id, success)
+                    # Track in metrics
+                    reward = 1.0 if success else -1.0
+                    self.metrics.mab_rewards.setdefault(delegated_group, []).append(
+                        (current_time, reward)
+                    )
+                    self.job_delegation_map.remove(job_id)
+
+            # Re-add to parent queue if timed out and still pending or not found
+            if timed_out and (not job_found or job_still_pending):
                 jobs_to_reassign.append((job_id, delegation_info, time_since_delegation))
 
         for job_id in jobs_processed:
             self.delegated_jobs.remove(job_id)
+            # Clean up delegation map entry if not already handled by MAB
+            if job_id in self.job_delegation_map:
+                self.job_delegation_map.remove(job_id)
 
         # Process reassignments
         for job_id, delegation_info, time_since_delegation in jobs_to_reassign:
+            # Report failure to MAB when delegation times out
+            if mab_active:
+                delegated_group = self.job_delegation_map.get(job_id)
+                if delegated_group is not None:
+                    self.mab_manager.report_outcome(delegated_group, job_id, success=False)
+                    self.metrics.mab_rewards.setdefault(delegated_group, []).append(
+                        (current_time, -1.0)
+                    )
+                    self.job_delegation_map.remove(job_id)
             self._reassign_delegated_job(job_id, delegation_info, time_since_delegation)
 
     def _reassign_delegated_job(self, job_id: str, delegation_info: dict, time_since_delegation: float):
@@ -820,6 +903,7 @@ class ResourceAgent(Agent):
         self._monitor_delegated_jobs()
         current_time = int(time.time())
         self._refresh_children(int(current_time))
+        self._init_mab()
 
         # Detect and handle agent failures
         failed_agents = self._detect_failed_agents(current_time)
@@ -1293,6 +1377,13 @@ class ResourceAgent(Agent):
             "failed_agents_count": len(self.failed_agents),
             "final_quorum": self.calculate_quorum(),
         }
+        if self.mab_enabled and self.mab_manager:
+            agent_metrics["mab_stats"] = self.mab_manager.get_stats()
+            agent_metrics["mab_selections"] = self.metrics.mab_selections
+            agent_metrics["mab_rewards"] = {
+                str(k): v for k, v in self.metrics.mab_rewards.items()
+            }
+            self.mab_manager.save_state()
         self.repository.save(obj=agent_metrics, key=f"{Repository.KEY_METRICS}:{self.agent_id}")
         self.logger.info("Results saved")
 
@@ -1516,13 +1607,24 @@ class ResourceAgent(Agent):
                             )
                             capable_groups = self.topology.children
 
+                        # MAB-guided selection: pick top_k groups instead of all
+                        if self.mab_enabled and self.mab_manager:
+                            selected_groups = self.mab_manager.select_groups(
+                                capable_groups, job, top_k=self.mab_top_k
+                            )
+                            for g in selected_groups:
+                                self.metrics.mab_selections[g] = \
+                                    self.metrics.mab_selections.get(g, 0) + 1
+                        else:
+                            selected_groups = capable_groups
+
                         self.queues.selected_queue.remove(job_id)
                         job.level = self.topology.level - 1
                         job.state = ObjectState.PENDING
                         job.mark_submitted()
                         job.mark_assigned()
 
-                        for child_group in capable_groups:
+                        for child_group in selected_groups:
                             self.repository.save(
                                 obj=job.to_dict(),
                                 key_prefix=Repository.KEY_JOB,
@@ -1536,8 +1638,13 @@ class ResourceAgent(Agent):
                         # Track delegated job for monitoring
                         self.delegated_jobs.set(job_id, {
                             'delegated_at': time.time(),
-                            'groups': capable_groups
+                            'groups': selected_groups
                         })
+
+                        # Track which group this job was delegated to for MAB reward attribution
+                        if self.mab_enabled and self.mab_manager and len(selected_groups) == 1:
+                            self.job_delegation_map.set(job_id, selected_groups[0])
+
                         self.logger.debug(
                             f"Tracking delegated job {job_id} for monitoring "
                             f"(timeout: {self.delegation_timeout_s:.1f}s)"
@@ -1590,6 +1697,24 @@ class ResourceAgent(Agent):
             job_id = job.job_id
             self.logger.info(f"[EXECUTE] Starting job {job_id} on agent {self.agent_id}")
             job.execute()
+
+            # Simulated failure injection for MAB testing
+            if self.failure_sim_enabled:
+                fail_rate = self._get_failure_rate(job)
+                if random.random() < fail_rate:
+                    job.exit_status = 1
+                    self.logger.info(
+                        f"[FAILURE_SIM] Injected failure for job {job_id} on agent {self.agent_id} "
+                        f"(rate={fail_rate:.2f})"
+                    )
+                    # Persist updated exit_status so parent coordinator reads it
+                    self.repository.save(
+                        obj=job.to_dict(),
+                        key_prefix=Repository.KEY_JOB,
+                        level=self.topology.level,
+                        group=self.topology.group,
+                    )
+
             self.queues.ready_queue.remove(job_id)
             self.logger.info(f"[COMPLETE] Job {job_id} completed on agent {self.agent_id}")
             if not self.queues.ready_queue.gets():
@@ -1597,6 +1722,16 @@ class ResourceAgent(Agent):
         except Exception as e:
             self.logger.error(f"[ERROR] Job {job} failed on agent {self.agent_id}: {e}")
             self.logger.error(traceback.format_exc())
+
+    def _get_failure_rate(self, job: Job) -> float:
+        """Determine failure probability for a job: per-agent > per-job-type > base."""
+        agent_key = str(self.agent_id)
+        if agent_key in self.failure_sim_per_agent:
+            return float(self.failure_sim_per_agent[agent_key])
+        job_type = getattr(job, 'job_type', None)
+        if job_type and job_type in self.failure_sim_per_job_type:
+            return float(self.failure_sim_per_job_type[job_type])
+        return self.failure_sim_base_prob
 
 
     def on_shutdown(self):
