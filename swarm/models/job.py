@@ -55,6 +55,7 @@ class Job(Object):
         # Classification + status
         self._job_type: Optional[str] = None
         self._exit_status: int = 0
+        self._should_fail: bool = False  # Pre-determined failure flag from job generator
 
         # Data deps
         self.data_in: List[DataNode] = []
@@ -366,11 +367,22 @@ class Job(Object):
             # TODO: staged-out transfers using self.data_out if data_transfer
 
             self.state = ObjectState.COMPLETE
+
+            # Check pre-determined failure flag (from job generator)
+            if self._should_fail:
+                self._exit_status = 1
+                self.logger.info("Job %s marked as FAILED (pre-determined)", self.job_id)
+            else:
+                self._exit_status = 0
+
             self.mark_completed()
-            self.logger.info("Completed execution for job: %s", self.job_id)
+            self.logger.info("Completed execution for job: %s (exit_status=%d)", self.job_id, self._exit_status)
         except Exception as e:
             self.logger.error("Error executing job %s: %s", self.job_id, e)
             self.logger.error(traceback.format_exc())
+            self.state = ObjectState.COMPLETE
+            self._exit_status = 1  # Real failure
+            self.mark_completed()
 
     # ---------- Introspection helpers ----------
     def __repr__(self):
@@ -406,6 +418,7 @@ class Job(Object):
                 "data_out": [dn.to_dict() for dn in self.data_out],
                 "state": self.state.value,
                 "exit_status": self.exit_status,
+                "should_fail": self._should_fail,
                 "transfer_in_time": self.transfer_in_time,
                 "transfer_out_time": self.transfer_out_time,
                 # canonical keys (dicts for multi-level latency tracking):
@@ -452,6 +465,7 @@ class Job(Object):
 
             self.state = ObjectState(job_data["state"]) if job_data.get("state") else ObjectState.PENDING
             self.exit_status = int(job_data.get("exit_status", 0))
+            self._should_fail = bool(job_data.get("should_fail", False))
             self.transfer_in_time = job_data.get("transfer_in_time")
             self.transfer_out_time = job_data.get("transfer_out_time")
 

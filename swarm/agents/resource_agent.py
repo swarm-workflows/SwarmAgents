@@ -1698,7 +1698,7 @@ class ResourceAgent(Agent):
             self.logger.info(f"[EXECUTE] Starting job {job_id} on agent {self.agent_id}")
             job.execute()
 
-            # Simulated failure injection for MAB testing
+            # Simulated failure injection for MAB testing (overrides real exit_status)
             if self.failure_sim_enabled:
                 fail_rate = self._get_failure_rate(job)
                 if random.random() < fail_rate:
@@ -1707,21 +1707,35 @@ class ResourceAgent(Agent):
                         f"[FAILURE_SIM] Injected failure for job {job_id} on agent {self.agent_id} "
                         f"(rate={fail_rate:.2f})"
                     )
-                    # Persist updated exit_status so parent coordinator reads it
-                    self.repository.save(
-                        obj=job.to_dict(),
-                        key_prefix=Repository.KEY_JOB,
-                        level=self.topology.level,
-                        group=self.topology.group,
-                    )
+
+            # Always persist job with exit_status so parent coordinator can read outcome
+            self.repository.save(
+                obj=job.to_dict(),
+                key_prefix=Repository.KEY_JOB,
+                level=self.topology.level,
+                group=self.topology.group,
+            )
 
             self.queues.ready_queue.remove(job_id)
-            self.logger.info(f"[COMPLETE] Job {job_id} completed on agent {self.agent_id}")
+            exit_status_str = "SUCCESS" if job.exit_status == 0 else f"FAILED (exit={job.exit_status})"
+            self.logger.info(f"[COMPLETE] Job {job_id} {exit_status_str} on agent {self.agent_id}")
             if not self.queues.ready_queue.gets():
                 self.start_idle()
         except Exception as e:
             self.logger.error(f"[ERROR] Job {job} failed on agent {self.agent_id}: {e}")
             self.logger.error(traceback.format_exc())
+            # Persist failure status even on exception
+            try:
+                job.exit_status = 1
+                job.state = ObjectState.COMPLETE
+                self.repository.save(
+                    obj=job.to_dict(),
+                    key_prefix=Repository.KEY_JOB,
+                    level=self.topology.level,
+                    group=self.topology.group,
+                )
+            except Exception:
+                pass
 
     def _get_failure_rate(self, job: Job) -> float:
         """Determine failure probability for a job: per-agent > per-job-type > base."""

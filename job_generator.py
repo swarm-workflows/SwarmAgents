@@ -34,15 +34,20 @@ class JobGenerator:
     Generates random jobs and stores them as JSON files.
     """
 
-    def __init__(self, job_count: int = 0, agent_profile_path: str = None) -> None:
+    def __init__(self, job_count: int = 0, agent_profile_path: str = None,
+                 failure_rate: float = 0.0, failure_agents: Dict[str, float] = None) -> None:
         """
         Initialize the JobGenerator.
 
         :param job_count: Number of jobs to generate
         :param agent_profile_path: Path to JSON file mapping agent_id -> profile dict (capacities, dtns)
+        :param failure_rate: Base probability (0.0-1.0) that a job should fail
+        :param failure_agents: Dict mapping agent_id -> failure_rate for targeted failures
         """
         self.job_count = job_count
         self.agent_profiles = self._load_agent_profiles(agent_profile_path)
+        self.failure_rate = failure_rate
+        self.failure_agents = failure_agents or {}
 
     def _load_agent_profiles(self, path: Optional[str]) -> Dict[str, Dict[str, Any]]:
         """
@@ -65,10 +70,19 @@ class JobGenerator:
         ensuring requirements fit within a randomly selected agent's profile.
         """
         job_id = str(x)
-        exit_status = random.choice([0, -1])
 
         # Choose a random agent profile
         agent_id = random.choice(list(self.agent_profiles.keys()))
+
+        # Determine if job should fail based on failure_rate or per-agent rate
+        if agent_id in self.failure_agents:
+            fail_prob = self.failure_agents[agent_id]
+        else:
+            fail_prob = self.failure_rate
+
+        # should_fail is stored in job; actual exit_status is set during execution
+        should_fail = random.random() < fail_prob
+        exit_status = 1 if should_fail else 0
         agent_profile = self.agent_profiles[agent_id]
 
         # Ensure job requirements do not exceed agent's capacities
@@ -110,7 +124,9 @@ class JobGenerator:
             'capacities': {'core': core, 'ram': ram, 'disk': disk, 'gpu': gpu},
             'data_in': data_in if enable_dtns else None,
             'data_out': data_out if enable_dtns else None,
-            'exit_status': exit_status
+            'exit_status': exit_status,
+            'should_fail': should_fail,
+            'target_agent': agent_id,  # Agent this job was designed for (useful for targeted failures)
         }
 
     def is_job_feasible(self, job: Dict[str, Any], agent_profile: Dict[str, Any]) -> bool:
@@ -245,7 +261,32 @@ if __name__ == "__main__":
     parser.add_argument("--agent-profile-path", type=str, required=True, help="Path to agent profiles JSON")
     parser.add_argument("--output-dir", type=str, default="jobs", help="Directory to save job files")
     parser.add_argument("--enable-dtns", action="store_true", help="Assign DTNs to jobs based on agent profiles")
+    parser.add_argument("--failure-rate", type=float, default=0.0,
+                        help="Base failure probability (0.0-1.0) for generated jobs")
+    parser.add_argument("--failure-agents", type=str, default=None,
+                        help="JSON string of agent_id:failure_rate, e.g. '{\"3\":0.5,\"4\":0.3}'")
     args = parser.parse_args()
 
-    generator = JobGenerator(job_count=args.job_count, agent_profile_path=args.agent_profile_path)
+    # Parse failure_agents if provided
+    failure_agents = {}
+    if args.failure_agents:
+        try:
+            failure_agents = json.loads(args.failure_agents)
+        except json.JSONDecodeError as e:
+            print(f"Error parsing --failure-agents: {e}")
+            exit(1)
+
+    generator = JobGenerator(
+        job_count=args.job_count,
+        agent_profile_path=args.agent_profile_path,
+        failure_rate=args.failure_rate,
+        failure_agents=failure_agents,
+    )
     generator.generate_job_files(output_dir=args.output_dir, enable_dtns=args.enable_dtns)
+
+    # Print failure summary
+    if args.failure_rate > 0 or failure_agents:
+        print(f"\nFailure configuration:")
+        print(f"  Base failure rate: {args.failure_rate*100:.1f}%")
+        if failure_agents:
+            print(f"  Per-agent overrides: {failure_agents}")
