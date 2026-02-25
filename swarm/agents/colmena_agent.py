@@ -363,7 +363,7 @@ class ColmenaAgent(Agent):
     def _restart_selection(self):
         if self.role is not None:
             try:
-                diff = int(time.time() - self.role.time_last_state_change)
+                diff = int(time.time() - self.role.last_transition_at)
                 if diff > self.restart_job_selection:
                     self.logger.info(f"RESTART: Role: {self.role} reset to Pending")
                     self.role.state = ObjectState.PENDING
