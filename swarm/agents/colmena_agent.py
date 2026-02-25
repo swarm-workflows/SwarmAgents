@@ -525,8 +525,7 @@ class ColmenaAgent(Agent):
                 proposal = ProposalInfo(
                     p_id=generate_id(),
                     object_id=self.role.role_id,
-                    agent_id=self.agent_id,
-                    seed=round((cost + self.agent_id), 2)
+                    agent_id=self.agent_id
                 )
                 proposals.append(proposal)
                 self.role.state = ObjectState.PRE_PREPARE
