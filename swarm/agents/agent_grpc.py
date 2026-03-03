@@ -174,7 +174,7 @@ class Agent(Observer):
 
                 time.sleep(0.5)
                 if self.should_shutdown():
-                    print("[SHUTDOWN] Queue has been empty for too long. Triggering shutdown.")
+                    self.logger.info("[SHUTDOWN] Queue has been empty for too long. Triggering shutdown.")
                     break
             except Exception as e:
                 self.logger.error(f"Periodic update error: {e}\n{traceback.format_exc()}")
