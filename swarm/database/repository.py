@@ -155,6 +155,30 @@ class Repository:
             all_keys = self.redis.scan_iter(f'{key_prefix}:{level}:{group}:*')
         return [key.split(":", 3)[-1] for key in all_keys]
 
+    def get_all_ids_multi(self, key_prefix: str = KEY_JOB, level: int = 0,
+                          group: int = 0, states: list = None) -> Dict[int, List[str]]:
+        """
+        Get IDs for multiple states in a single Redis pipeline round-trip.
+
+        Args:
+            key_prefix (str): Prefix to search.
+            level (int): Agent level in hierarchy.
+            group (int): Agent group in hierarchy at a level.
+            states (list): List of state values to query.
+
+        Returns:
+            Dict[int, List[str]]: Mapping of state -> list of object IDs.
+        """
+        if not states:
+            return {}
+        pipe = self.redis.pipeline()
+        for state in states:
+            state_key = f"state:{level}:{group}:{state}"
+            pipe.smembers(state_key)
+        results = pipe.execute()
+        return {state: [k.split(":", 3)[-1] for k in keys]
+                for state, keys in zip(states, results)}
+
     def get_all_objects(self, key_prefix: str = KEY_JOB, level: int = 0, group: int = None, state: int = None) -> List[dict]:
         """
         Retrieve all objects under given key prefix.
@@ -182,12 +206,11 @@ class Repository:
                     keys = self.redis.scan_iter(f'{key_prefix}:{level}:{group}:*')
                 else:
                     keys = self.redis.scan_iter(f'{key_prefix}:{level}:*')
-        results = []
-        for key in keys:
-            val = self.redis.get(key)
-            if val:
-                results.append(json.loads(val))
-        return results
+        keys = list(keys)
+        if not keys:
+            return []
+        values = self.redis.mget(keys)
+        return [json.loads(v) for v in values if v]
 
     def delete_all(self, key_prefix: str = KEY_JOB):
         """
@@ -198,6 +221,6 @@ class Repository:
             group (int): Agent group in hierarchy at a level.
             level (int): Agent level in hierarchy.
         """
-        keys = self.redis.scan_iter(f'{key_prefix}:*')
-        for key in keys:
-            self.redis.delete(key)
+        keys = list(self.redis.scan_iter(f'{key_prefix}:*'))
+        if keys:
+            self.redis.delete(*keys)

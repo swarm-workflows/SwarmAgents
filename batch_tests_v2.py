@@ -119,6 +119,15 @@ def main():
     ap.add_argument("--dynamic-trigger-jobs", type=int, default=50,
                     help="Number of completed jobs to wait for (for 'jobs-completed' trigger)")
 
+    # Co-parent support for hierarchical topology
+    ap.add_argument("--co-parents", type=int, default=1,
+                    help="Number of co-parents per child group in hierarchical topology (default: 1)")
+
+    # Job generation (v2)
+    ap.add_argument("--fit-all", action="store_true",
+                    help="Size every job to fit ALL agents (min capacities). "
+                         "Enables any agent to take over jobs from failed agents.")
+
     # Test shutdown control (v2)
     ap.add_argument("--shutdown-after-seconds", type=int, default=0,
                     help="Shutdown test after N seconds (0 = use default wait_runtime behavior)")
@@ -200,6 +209,8 @@ def main():
             cmd.append("--use-config-dir")
         if args.topology == "hierarchical":
             cmd += ["--hierarchical-level1-agent-type", args.hierarchical_level1_agent_type]
+            if hasattr(args, 'co_parents') and args.co_parents > 1:
+                cmd += ["--co-parents", str(args.co_parents)]
         if args.groups is not None:
             cmd += ["--groups", str(args.groups)]
         if args.group_size is not None:
@@ -233,6 +244,10 @@ def main():
         # Shutdown timer parameter
         if args.shutdown_after_seconds > 0:
             cmd += ["--shutdown-after-seconds", str(args.shutdown_after_seconds)]
+
+        # Job generation: fit-all mode
+        if args.fit_all:
+            cmd.append("--fit-all")
 
         log(f"[{run_name}] Starting test…")
         (logs_dir / "batch_runner.log").write_text(

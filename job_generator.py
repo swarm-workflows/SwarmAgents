@@ -64,32 +64,73 @@ class JobGenerator:
         """Generate values skewed toward the lower range."""
         return round(min_val + (max_val - min_val) * (random.random() ** bias_factor), 2)
 
-    def generate_job(self, x: int, enable_dtns: bool) -> Dict[str, Any]:
+    def _compute_min_profile(self) -> Dict[str, Any]:
+        """
+        Compute the minimum capacities across all agent profiles.
+        Jobs sized to this profile are feasible for every agent.
+        """
+        profiles = list(self.agent_profiles.values())
+        min_profile = {
+            "core": min(p.get("core", 0) for p in profiles),
+            "ram": min(p.get("ram", 0) for p in profiles),
+            "disk": min(p.get("disk", 0) for p in profiles),
+            "gpu": min(p.get("gpu", 0) for p in profiles),
+        }
+
+        # For DTNs, keep only DTNs common to ALL agents
+        all_dtn_sets = []
+        for p in profiles:
+            dtns = p.get("dtns", [])
+            dtn_names = set()
+            for dtn in dtns:
+                if isinstance(dtn, dict):
+                    dtn_names.add(dtn.get("name"))
+                elif isinstance(dtn, str):
+                    dtn_names.add(dtn)
+            all_dtn_sets.append(dtn_names)
+
+        if all_dtn_sets:
+            common_dtns = all_dtn_sets[0]
+            for s in all_dtn_sets[1:]:
+                common_dtns = common_dtns & s
+            min_profile["dtns"] = [{"name": name} for name in sorted(common_dtns)]
+        else:
+            min_profile["dtns"] = []
+
+        return min_profile
+
+    def generate_job(self, x: int, enable_dtns: bool, fit_all: bool = False) -> Dict[str, Any]:
         """
         Generate a single job dictionary with randomized fields,
-        ensuring requirements fit within a randomly selected agent's profile.
+        ensuring requirements fit within a randomly selected agent's profile,
+        or within ALL agents' profiles when fit_all=True.
+
+        :param x: Job number/index
+        :param enable_dtns: Whether to assign DTN requirements
+        :param fit_all: If True, size jobs to fit every agent (for failure resilience)
         """
         job_id = str(x)
 
-        # Choose a random agent profile
-        agent_id = random.choice(list(self.agent_profiles.keys()))
-
-        # Determine if job should fail based on failure_rate or per-agent rate
-        if agent_id in self.failure_agents:
-            fail_prob = self.failure_agents[agent_id]
-        else:
+        if fit_all:
+            # Use minimum profile so every agent can run this job
+            agent_id = None
+            profile = self._compute_min_profile()
             fail_prob = self.failure_rate
+        else:
+            # Choose a random agent profile
+            agent_id = random.choice(list(self.agent_profiles.keys()))
+            profile = self.agent_profiles[agent_id]
+            fail_prob = self.failure_agents.get(agent_id, self.failure_rate)
 
         # should_fail is stored in job; actual exit_status is set during execution
         should_fail = random.random() < fail_prob
         exit_status = 1 if should_fail else 0
-        agent_profile = self.agent_profiles[agent_id]
 
-        # Ensure job requirements do not exceed agent's capacities
-        core = self.biased_uniform(0.1, agent_profile.get("core", 2))
-        gpu = self.biased_uniform(0.1, agent_profile.get("gpu", 0)) if agent_profile.get("gpu", 0) > 0 else 0
-        ram = self.biased_uniform(0.1, agent_profile.get("ram", 8))
-        disk = self.biased_uniform(1, agent_profile.get("disk", 100))
+        # Ensure job requirements do not exceed profile capacities
+        core = self.biased_uniform(0.1, profile.get("core", 2))
+        gpu = self.biased_uniform(0.1, profile.get("gpu", 0)) if profile.get("gpu", 0) > 0 else 0
+        ram = self.biased_uniform(0.1, profile.get("ram", 8))
+        disk = self.biased_uniform(1, profile.get("disk", 100))
         wall_time = self.biased_uniform(0.1, 30.0)
 
         input_files = ['/var/tmp/outgoing/file100M.txt',
@@ -101,8 +142,8 @@ class JobGenerator:
                         '/var/tmp/outgoing/file1G.txt']
 
         data_in, data_out = None, None
-        if enable_dtns and "dtns" in agent_profile and agent_profile["dtns"]:
-            candidate_dtns = agent_profile["dtns"]
+        if enable_dtns and "dtns" in profile and profile["dtns"]:
+            candidate_dtns = profile["dtns"]
             # Limit to max 2 DTNs to ensure jobs can be satisfied by multiple agents
             max_dtns = min(2, len(candidate_dtns))
             dtn_count = random.randint(1, max_dtns)
@@ -126,7 +167,7 @@ class JobGenerator:
             'data_out': data_out if enable_dtns else None,
             'exit_status': exit_status,
             'should_fail': should_fail,
-            'target_agent': agent_id,  # Agent this job was designed for (useful for targeted failures)
+            'target_agent': agent_id,  # Agent this job was designed for (None when fit_all=True)
         }
 
     def is_job_feasible(self, job: Dict[str, Any], agent_profile: Dict[str, Any]) -> bool:
@@ -231,16 +272,28 @@ class JobGenerator:
                     'feasibility_pct': round(feasibility_pct, 2)
                 })
 
-    def generate_job_files(self, output_dir: str = "jobs", enable_dtns: bool = False) -> None:
+    def generate_job_files(self, output_dir: str = "jobs", enable_dtns: bool = False,
+                           fit_all: bool = False) -> None:
         """
         Generate job files in the specified output directory and a feasibility CSV.
+
+        :param output_dir: Directory to save job files
+        :param enable_dtns: Assign DTNs to jobs based on agent profiles
+        :param fit_all: If True, size every job to fit all agents (for failure resilience)
         """
         os.makedirs(output_dir, exist_ok=True)
+
+        if fit_all:
+            min_profile = self._compute_min_profile()
+            print(f"fit-all mode: jobs sized to min profile across {len(self.agent_profiles)} agents:")
+            print(f"  core={min_profile['core']}, ram={min_profile['ram']}, "
+                  f"disk={min_profile['disk']}, gpu={min_profile['gpu']}, "
+                  f"common_dtns={[d['name'] for d in min_profile.get('dtns', [])]}")
 
         # Generate jobs and store them for feasibility analysis
         jobs = []
         for i in range(1, self.job_count + 1):
-            job = self.generate_job(i, enable_dtns)
+            job = self.generate_job(i, enable_dtns, fit_all=fit_all)
             jobs.append(job)
 
             # Save individual job JSON file
@@ -261,6 +314,9 @@ if __name__ == "__main__":
     parser.add_argument("--agent-profile-path", type=str, required=True, help="Path to agent profiles JSON")
     parser.add_argument("--output-dir", type=str, default="jobs", help="Directory to save job files")
     parser.add_argument("--enable-dtns", action="store_true", help="Assign DTNs to jobs based on agent profiles")
+    parser.add_argument("--fit-all", action="store_true",
+                        help="Size every job to fit ALL agents (min capacities). "
+                             "Enables any agent to take over jobs from failed agents.")
     parser.add_argument("--failure-rate", type=float, default=0.0,
                         help="Base failure probability (0.0-1.0) for generated jobs")
     parser.add_argument("--failure-agents", type=str, default=None,
@@ -282,7 +338,8 @@ if __name__ == "__main__":
         failure_rate=args.failure_rate,
         failure_agents=failure_agents,
     )
-    generator.generate_job_files(output_dir=args.output_dir, enable_dtns=args.enable_dtns)
+    generator.generate_job_files(output_dir=args.output_dir, enable_dtns=args.enable_dtns,
+                                 fit_all=args.fit_all)
 
     # Print failure summary
     if args.failure_rate > 0 or failure_agents:

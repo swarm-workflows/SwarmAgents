@@ -59,3 +59,6 @@ class Topology:
         self.group_size = topo.get("group_size", 0)
         self.group_count = topo.get("group_count", 0)
         self.peers = topo.get("peer_agents", [])
+        self.co_parents = topo.get("co_parents", None)
+        self.co_parent_groups = topo.get("co_parent_groups", None)
+        self.primary_group = topo.get("primary_group", None)

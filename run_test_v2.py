@@ -169,9 +169,13 @@ def generate_configs(args, agent_hosts_list: list[str]) -> Path:
         gen_args += ["--group-size", str(args.group_size)]
     if args.topology == "hierarchical":
         gen_args += ["--hierarchical-level1-agent-type", args.hierarchical_level1_agent_type]
+        if hasattr(args, 'co_parents') and args.co_parents > 1:
+            gen_args += ["--co-parents", str(args.co_parents)]
     # Pass initial group size for dynamic agent addition
     if hasattr(args, 'initial_group_size') and args.initial_group_size is not None:
         gen_args += ["--initial-group-size", str(args.initial_group_size)]
+    if hasattr(args, 'fit_all') and args.fit_all:
+        gen_args += ["--fit-all"]
 
     log("Generating configs …")
     run_blocking(gen_args, check=True)
@@ -499,8 +503,10 @@ def parse_and_report(args) -> None:
         "--output_dir", args.run_dir,
         "--agents", str(args.agents),
         "--db_host", args.db_host,
-        "--save-csv", "--skip-plots"
+        "--save-csv",
     ]
+    if not getattr(args, 'generate_plots', False):
+        plot_cmd.append("--skip-plots")
     if args.topology == "hierarchical":
         plot_cmd.extend(["--hierarchical"])
     log("Plotting …")
@@ -560,6 +566,19 @@ def parse_args() -> argparse.Namespace:
                     help="Threshold value for bucket/jobs trigger")
     ap.add_argument("--dynamic-trigger-jobs", type=int, default=50,
                     help="Number of completed jobs to wait for (for 'jobs-completed' trigger)")
+
+    # Co-parent support for hierarchical topology
+    ap.add_argument("--co-parents", type=int, default=1,
+                    help="Number of co-parents per child group in hierarchical topology (default: 1)")
+
+    # Job generation
+    ap.add_argument("--fit-all", action="store_true",
+                    help="Size every job to fit ALL agents (min capacities). "
+                         "Enables any agent to take over jobs from failed agents.")
+
+    # Plot generation
+    ap.add_argument("--generate-plots", action="store_true",
+                    help="Generate full plots after test (default: CSV-only with --skip-plots)")
 
     # Test shutdown control
     ap.add_argument("--shutdown-after-seconds", type=int, default=0,

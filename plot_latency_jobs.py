@@ -240,6 +240,83 @@ def save_jobs(jobs: list[Any], path: str, level: int | None = None):
         ])
         writer.writerows(pending_jobs)
 
+def save_infeasible_jobs(repo: Repository, output_dir: str, hierarchical: bool = False):
+    """
+    Query Redis for infeasible/non-complete jobs and write infeasible_jobs.csv.
+    Returns (retired_count, still_pending_count) for summary printing.
+    """
+    infeasible_rows = []
+    levels = [0, 1, 2] if hierarchical else [0]
+
+    for level in levels:
+        for state_val, state_name in [(9, "FAILED"), (10, "BLOCKED"), (1, "PENDING")]:
+            try:
+                jobs = repo.get_all_objects(
+                    key_prefix=Repository.KEY_JOB,
+                    level=level,
+                    state=state_val
+                )
+            except Exception:
+                jobs = []
+            for job_data in jobs:
+                job = Job()
+                job.from_dict(job_data)
+                infeasible_rows.append([
+                    job.job_id,
+                    level,
+                    getattr(job_data, 'group', job_data.get('group', 0)),
+                    state_name,
+                    getattr(job.capacities, 'core', 0),
+                    getattr(job.capacities, 'ram', 0),
+                    getattr(job.capacities, 'disk', 0),
+                    getattr(job.capacities, 'gpu', 0),
+                ])
+
+    csv_path = os.path.join(output_dir, "infeasible_jobs.csv")
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['job_id', 'level', 'group', 'state', 'core', 'ram', 'disk', 'gpu'])
+        writer.writerows(infeasible_rows)
+
+    retired = sum(1 for r in infeasible_rows if r[3] == "FAILED")
+    still_pending = sum(1 for r in infeasible_rows if r[3] in ("PENDING", "BLOCKED"))
+    print(f"Infeasible/Failed jobs: {retired} retired, {still_pending} still pending/blocked")
+    print(f"Saved: {csv_path}")
+    return retired, still_pending
+
+
+def save_co_parent_summary(repo: Repository, output_dir: str):
+    """
+    Read Level-1 agent metrics from Redis and write co_parent_summary.csv.
+    """
+    metrics = load_metrics_from_repo(repo)
+    if not metrics:
+        print("No agent metrics found in Redis for co-parent summary.")
+        return
+
+    rows = []
+    for agent_id, m in sorted(metrics.items()):
+        infeasible_retired = m.get('infeasible_retired', [])
+        mab_selections = m.get('mab_selections', {})
+        total_delegated = sum(mab_selections.values()) if mab_selections else 0
+        active_groups = list(mab_selections.keys()) if mab_selections else []
+
+        rows.append([
+            agent_id,
+            len(active_groups),
+            ','.join(str(g) for g in active_groups),
+            total_delegated,
+            len(infeasible_retired),
+        ])
+
+    csv_path = os.path.join(output_dir, "co_parent_summary.csv")
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['agent_id', 'active_groups_count', 'active_groups', 'total_delegated', 'infeasible_retired_count'])
+        writer.writerows(rows)
+    print(f"Saved: {csv_path}")
+
+
 def plot_agent_loads_from_dir(run_dir):
     agent_data = {}
     mean_loads = {}
@@ -2748,4 +2825,12 @@ if __name__ == "__main__":
     # Compute fault tolerance metrics
     if failed_agent_list and not args.from_csv:
         compute_fault_tolerance_metrics(args.output_dir, repo, failed_agent_list)
+
+    # Save infeasible/non-complete jobs report
+    if not args.from_csv and repo is not None:
+        save_infeasible_jobs(repo, args.output_dir, hierarchical=args.hierarchical)
+
+        # Save co-parent summary for hierarchical topologies
+        if args.hierarchical:
+            save_co_parent_summary(repo, args.output_dir)
 

@@ -45,6 +45,7 @@ class SwarmConfigGenerator:
         hierarchical_level1_agent_type: str = "llm",
         agent_type: str = "resource",
         initial_group_size: Optional[int] = None,
+        co_parent_count: int = 1,
     ):
         self.num_agents = num_agents
         self.jobs_per_proposal = jobs_per_proposal
@@ -68,6 +69,9 @@ class SwarmConfigGenerator:
 
         # initial group size for dynamic agent addition (if different from num_agents)
         self.initial_group_size = initial_group_size
+
+        # co-parent count for hierarchical topology shared parenting
+        self.co_parent_count = co_parent_count
 
         # legacy ring helper (used when no grouping flags provided for ring)
         self.rings_default = self._create_default_rings()
@@ -517,18 +521,47 @@ class SwarmConfigGenerator:
                 print(f"Hierarchical topology currently supports 30, 100, 110, 250, 990, or 1000 agents (got {self.num_agents})")
                 return
 
+            # Build co-parent assignment map (circular round-robin)
+            K = self.co_parent_count
+            level_1_agents = [level_1_base + g for g in range(num_groups)]
+
+            if num_super_groups > 0:
+                # Three-level: apply circular assignment within each super-group
+                co_parent_map = {}
+                for sg in range(num_super_groups):
+                    sg_start = sg * groups_per_super_group
+                    sg_end = sg_start + groups_per_super_group
+                    sg_agents = level_1_agents[sg_start:sg_end]
+                    for i, group in enumerate(range(sg_start, sg_end)):
+                        parents = []
+                        for k in range(K):
+                            parent_idx = (i + k) % len(sg_agents)
+                            parents.append(sg_agents[parent_idx])
+                        co_parent_map[group] = sorted(parents)
+            else:
+                # Two-level: circular assignment across all Level-1 agents
+                co_parent_map = {}
+                for group in range(num_groups):
+                    parents = []
+                    for k in range(K):
+                        parent_idx = (group + k) % len(level_1_agents)
+                        parents.append(level_1_agents[parent_idx])
+                    co_parent_map[group] = sorted(parents)
+
             # Level 0 (leaf/worker agents)
             for group in range(num_groups):
                 start = group * group_size + 1
                 end = start + group_size
-                parent_id = level_1_base + group
+
+                # Primary parent is lowest-ID co-parent (backward compat)
+                parent_id = co_parent_map[group][0]
 
                 # For 3-level hierarchy, determine super-group
                 super_group = group // groups_per_super_group if num_super_groups > 0 else 0
 
                 for agent_id in range(start, end):
                     peers = [a for a in range(start, end) if a != agent_id]
-                    agent_topo[agent_id] = {
+                    topo_entry = {
                         "peers": peers,
                         "parent": parent_id,
                         "children": None,
@@ -538,6 +571,9 @@ class SwarmConfigGenerator:
                         "group_count": num_groups,
                         "super_group": super_group
                     }
+                    if K > 1:
+                        topo_entry["co_parents"] = co_parent_map[group]
+                    agent_topo[agent_id] = topo_entry
 
             # Level 1 (group coordinators)
             for group in range(num_groups):
@@ -564,16 +600,23 @@ class SwarmConfigGenerator:
                 # Level 1 group_size should be the number of Level 1 coordinators in the peer group
                 l1_group_size = groups_per_super_group if num_super_groups > 0 else num_groups
 
-                agent_topo[parent_id] = {
+                # Determine which groups this agent co-parents
+                my_groups = {g: co_parent_map[g] for g in range(num_groups) if parent_id in co_parent_map[g]}
+
+                topo_entry = {
                     "peers": peers,
                     "parent": level_1_parent,
-                    "children": [group],
+                    "children": sorted(my_groups.keys()),
                     "group": l1_group,
                     "level": 1,
                     "group_size": l1_group_size,
                     "group_count": l1_group_count,
-                    "super_group": super_group if num_super_groups > 0 else 0
+                    "super_group": super_group if num_super_groups > 0 else 0,
+                    "primary_group": group,
                 }
+                if K > 1:
+                    topo_entry["co_parent_groups"] = {g: my_groups[g] for g in sorted(my_groups.keys())}
+                agent_topo[parent_id] = topo_entry
 
             # Level 2 (super-coordinators) - only for three-level hierarchy
             if num_super_groups > 0:
@@ -680,7 +723,10 @@ class SwarmConfigGenerator:
                 "level": topo["level"],
                 "group": topo["group"],
                 "group_size": group_size_to_use,
-                "group_count": topo["group_count"]
+                "group_count": topo["group_count"],
+                "co_parents": topo.get("co_parents", None),
+                "co_parent_groups": topo.get("co_parent_groups", None),
+                "primary_group": topo.get("primary_group", None),
             }
             config.setdefault("runtime", {})
             config["runtime"]["total_agents"] = self.num_agents
@@ -770,6 +816,13 @@ if __name__ == "__main__":
     parser.add_argument("--initial-group-size", type=int, default=None,
                         help="Initial group size for dynamic agent addition (if different from total agents)")
 
+    parser.add_argument("--co-parents", type=int, default=1,
+                        help="Number of co-parents per child group in hierarchical topology (default: 1)")
+
+    parser.add_argument("--fit-all", action="store_true",
+                        help="Size every job to fit ALL agents (min capacities). "
+                             "Enables any agent to take over jobs from failed agents.")
+
     args = parser.parse_args()
 
     if args.agent_hosts_file:
@@ -800,10 +853,11 @@ if __name__ == "__main__":
         hierarchical_level1_agent_type=args.hierarchical_level1_agent_type,
         agent_type=args.agent_type,
         initial_group_size=args.initial_group_size,
+        co_parent_count=args.co_parents,
     )
     generator.generate_configs(flavor_percentages=flavor_percentages, agent_hosts=agent_hosts)
 
     # Create jobs if not present
     if not os.path.exists("jobs"):
         jg = JobGenerator(job_count=args.job_cnt, agent_profile_path='agent_profiles.json')
-        jg.generate_job_files(output_dir="jobs", enable_dtns=args.dtns)
+        jg.generate_job_files(output_dir="jobs", enable_dtns=args.dtns, fit_all=args.fit_all)

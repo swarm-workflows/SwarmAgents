@@ -43,6 +43,7 @@ class Metrics:
         self.delegation_reassignments = {}
         self.mab_rewards = {}      # group_id -> list of (timestamp, reward)
         self.mab_selections = {}   # group_id -> selection count
+        self.infeasible_retired = []  # job_ids retired after max infeasible retries
 
     def save_load_metric(self, load: float):
         """

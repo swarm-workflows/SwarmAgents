@@ -105,23 +105,13 @@ class LlmBidder:
 
             # Prepare peer context summary if provided
             peer_info = ""
-            if peer_context:
-                peer_agents = ", ".join([f"Agent{k}: {v}" for k, v in peer_context.get('peer_agents', {}).items()])
-                peer_info = (
-                    f"\n\nPEER CONTEXT:\n"
-                    f"- Total agents: {peer_context.get('total_agents', 'unknown')}\n"
-                    f"- Peer Agents: {peer_agents if peer_agents else 'no peers'}\n"
-                    f"- Recent conflicts: {peer_context.get('conflicts', 0)}\n"
-                    f"- Topology: {peer_context.get('topology', 'mesh')}\n"
-                    #f"- Child Agents: {peer_context.get('child_agents', 'no children')}\n"
-                )
+            if peer_context and peer_context.get('peer_agents'):
+                loads = ",".join(f"{k}:{v.get('load',0)}" for k, v in peer_context['peer_agents'].items())
+                peer_info = f"\nPEERS({peer_context.get('total_agents','?')}agents):[{loads}]"
 
             prompt = (
-                "Given the job and agent state below, return ONLY JSON with fields:\n"
-                "  - score: number in [0, 100] (higher = better fit)\n"
-                "  - explanation: SHORT string (max 15 words)\n\n"
-                f"JOB:\n{json.dumps(job, ensure_ascii=False, indent=2)}\n\n"
-                f"AGENT_STATE:\n{json.dumps(agent_state, ensure_ascii=False, indent=2)}"
+                f"JOB:{json.dumps(job, ensure_ascii=False, separators=(',', ':'))}\n"
+                f"AGENT:{json.dumps(agent_state, ensure_ascii=False, separators=(',', ':'))}"
                 f"{peer_info}"
             )
 

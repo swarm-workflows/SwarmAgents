@@ -65,18 +65,23 @@ class GrpcTransport(Observer):
     def send(self, host: str, port: int, src: int, dest: int, payload: object) -> None:
         if not isinstance(payload, Message):
             raise TypeError("Payload must be of Message type")
-        message_dict = {
-            "sender_id": str(src),
-            "receiver_id": str(dest),
-            "message_type": str(payload.message_type),
-            "payload": payload.to_dict()
-        }
         req = consensus_pb2.ConsensusMessage(
-            sender_id=message_dict["sender_id"],
-            receiver_id=message_dict["receiver_id"],
-            message_type=message_dict["message_type"],
-            payload=json.dumps(message_dict["payload"]),
-            timestamp=message_dict.get("timestamp", int(time.time()))
+            sender_id=str(src),
+            receiver_id=str(dest),
+            message_type=str(payload.message_type),
+            payload=json.dumps(payload.to_dict()),
+            timestamp=int(time.time())
+        )
+        self.client.call_unary(host, port, "SendMessage", req, timeout=2.0, retries=4)
+
+    def _send_raw(self, host: str, port: int, src: int, dest: int,
+                  payload_json: str, msg_type: str) -> None:
+        req = consensus_pb2.ConsensusMessage(
+            sender_id=str(src),
+            receiver_id=str(dest),
+            message_type=msg_type,
+            payload=payload_json,
+            timestamp=int(time.time())
         )
         self.client.call_unary(host, port, "SendMessage", req, timeout=2.0, retries=4)
 
@@ -88,6 +93,8 @@ class GrpcTransport(Observer):
             raise TypeError("Neighbor map must be ThreadSafeDict")
 
         payload.path.append(sender)
+        payload_json = json.dumps(payload.to_dict())
+        msg_type = str(payload.message_type)
         for peer_id in peers:
             if peer_id in payload.path:
                 continue
@@ -97,5 +104,6 @@ class GrpcTransport(Observer):
                 continue
 
             self.logger.info(f"Sending proposal to peer: {peer_id}")
-            self.send(host=peer_info.host, port=peer_info.port, payload=payload,
-                      dest=peer_info.agent_id, src=sender)
+            self._send_raw(host=peer_info.host, port=peer_info.port,
+                           payload_json=payload_json, msg_type=msg_type,
+                           dest=peer_info.agent_id, src=sender)

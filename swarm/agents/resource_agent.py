@@ -195,6 +195,9 @@ class ResourceAgent(Agent):
         # Track which group each delegated job was sent to for MAB reward attribution
         self.job_delegation_map = ThreadSafeDict[str, int]()  # job_id -> group_id
 
+        # Max retries before retiring an infeasible job (0 = infinite retries)
+        self.max_infeasible_retries = self.runtime_config.get("max_infeasible_retries", 10)
+
     @property
     def peer_expiry_seconds(self) -> int:
         return self.runtime_config.get("peer_expiry_seconds", 20)
@@ -429,6 +432,37 @@ class ResourceAgent(Agent):
 
                 # TODO restart selection for jobs which were assigned to neighbor which just went down
 
+    def _is_leader_for_group(self, group_id) -> bool:
+        """
+        Determine if this agent is the active leader for a given child group.
+
+        Uses deterministic leader election among co-parents: the lowest-ID
+        co-parent with a fresh heartbeat in neighbor_map wins. Each co-parent
+        evaluates this independently using locally-refreshed neighbor data.
+
+        When co_parent_groups is not configured (K=1), falls back to checking
+        whether group_id is in self.topology.children.
+        """
+        if not self.topology.co_parent_groups:
+            return group_id in (self.topology.children or [])
+        co_parents = self.topology.co_parent_groups.get(group_id) or self.topology.co_parent_groups.get(str(group_id), [])
+        for candidate_id in sorted(co_parents):
+            if candidate_id == self.agent_id:
+                return True
+            if self.neighbor_map.get(candidate_id) is not None:
+                return False  # lower-ID co-parent is alive
+        return True  # all lower-ID co-parents are dead
+
+    def _get_active_child_groups(self) -> list:
+        """
+        Return the list of child groups for which this agent is currently the active leader.
+
+        For agents without children, returns an empty list.
+        """
+        if not self.topology.children:
+            return []
+        return [g for g in self.topology.children if self._is_leader_for_group(g)]
+
     def _monitor_delegated_jobs(self):
         """
         Monitor jobs delegated to children and re-add them to parent queue if not selected in time.
@@ -452,11 +486,17 @@ class ResourceAgent(Agent):
         jobs_to_reassign = []
         jobs_processed = []
         mab_active = self.mab_enabled and self.mab_manager is not None
+        active_groups = set(self._get_active_child_groups())
 
         # Check all delegated jobs
         for job_id, delegation_info in list(self.delegated_jobs.items()):
             delegated_at = delegation_info.get('delegated_at', 0)
             child_groups = delegation_info.get('groups', [])
+
+            # Lost leadership for all groups this job was delegated to — stop tracking
+            if not any(g in active_groups for g in child_groups):
+                self.delegated_jobs.remove(job_id)
+                continue
 
             time_since_delegation = current_time - delegated_at
             timed_out = time_since_delegation > self.delegation_timeout_s
@@ -833,7 +873,7 @@ class ResourceAgent(Agent):
                 group=self.topology.group,
                 level=self.topology.level
             )
-        # Non-leaf agent: aggregate info from all children
+        # Non-leaf agent: aggregate info from children in actively-led groups only
         else:
             total_capacities = Capacities()
             total_allocations = Capacities()
@@ -843,7 +883,11 @@ class ResourceAgent(Agent):
             # Track: {dtn_name: {'scores': [list of scores], 'info': DataNode}}
             dtn_aggregation = {}
 
+            active_groups = set(self._get_active_child_groups())
+
             for child in self.children.values():
+                if active_groups and child.group not in active_groups:
+                    continue
                 total_capacities += child.capacities
                 total_allocations += child.capacity_allocations
 
@@ -918,22 +962,18 @@ class ResourceAgent(Agent):
 
         self._refresh_neighbors(current_time=current_time)
 
-        # Batch update job sets
-        for prefix, update_fn, state in [
-            (Repository.KEY_JOB, self._update_pending_jobs, ObjectState.PENDING.value),
-            (Repository.KEY_JOB, self._update_ready_jobs, ObjectState.READY.value),
-            (Repository.KEY_JOB, self._update_completed_jobs, ObjectState.COMPLETE.value),
-        ]:
-            #group = self.topology.level if self.topology.type == TopologyType.Ring else self.topology.group
-            group = self.topology.group
-            jobs = self.repository.get_all_ids(key_prefix=prefix, level=self.topology.level,
-                                               group=group, state=state)
-            #self.logger.info(f"Fetching IDs for jobs in state {state} from group: {group} job count: {len(jobs)}")
-            update_fn(jobs=jobs)
+        # Batch update job sets (single Redis pipeline round-trip)
+        group = self.topology.group
+        state_map = self.repository.get_all_ids_multi(
+            key_prefix=Repository.KEY_JOB, level=self.topology.level,
+            group=group, states=[ObjectState.PENDING.value, ObjectState.READY.value,
+                                 ObjectState.COMPLETE.value])
+        self._update_pending_jobs(jobs=state_map.get(ObjectState.PENDING.value, []))
+        self._update_ready_jobs(jobs=state_map.get(ObjectState.READY.value, []))
+        self._update_completed_jobs(jobs=state_map.get(ObjectState.COMPLETE.value, []))
 
         if self.debug:
             self.save_consensus_votes()
-        self.save_consensus_votes()
         #self.save_neighbors()
 
         self.check_queue()
@@ -971,8 +1011,15 @@ class ResourceAgent(Agent):
         # Parent agents must verify that at least ONE actual child can execute the job
         # (not just the synthetic max_child_capacity aggregate used for peer evaluation)
         if agent.agent_id == self.agent_id and self.topology.children:
-            # Iterate through all child agents to find at least one capable child
+            active_groups = set(self._get_active_child_groups())
+            if not active_groups:
+                return False
+
+            # Iterate through child agents in active groups to find at least one capable child
             for child_info in self.children.values():
+                if child_info.group not in active_groups:
+                    continue
+
                 # Check if child has sufficient capacity for this job
                 if not self._has_sufficient_capacity(job, child_info.capacities):
                     continue  # Skip this child, try next
@@ -994,8 +1041,8 @@ class ResourceAgent(Agent):
                 # Found a feasible child: has sufficient capacity AND all required DTNs (if any)
                 return True
 
-            # No child can handle this job - infeasible for this parent agent
-            self.logger.debug(f"Agent: {self.agent_id} (parent) - Job {job.job_id} not feasible on any child")
+            # No child in active groups can handle this job
+            self.logger.debug(f"Agent: {self.agent_id} (parent) - Job {job.job_id} not feasible on any active child")
             return False
 
         # ============================================================================
@@ -1376,6 +1423,7 @@ class ResourceAgent(Agent):
             "failed_agents": self.failed_agents.to_dict(),
             "failed_agents_count": len(self.failed_agents),
             "final_quorum": self.calculate_quorum(),
+            "infeasible_retired": getattr(self.metrics, 'infeasible_retired', []),
         }
         if self.mab_enabled and self.mab_manager:
             agent_metrics["mab_stats"] = self.mab_manager.get_stats()
@@ -1531,9 +1579,9 @@ class ResourceAgent(Agent):
         if hasattr(job, 'data_out') and job.data_out:
             required_dtns.update(e.name for e in job.data_out)
 
-        # If no DTN requirements, all groups can handle it
+        # If no DTN requirements, all active groups can handle it
         if not required_dtns:
-            return list(self.topology.children)
+            return list(self._get_active_child_groups())
 
         # Build map of DTNs available in each child group
         # group_id -> set of available DTN names
@@ -1555,9 +1603,9 @@ class ResourceAgent(Agent):
             if child.dtns:
                 group_dtns[child_group].update(child.dtns.keys())
 
-        # Find groups that have all required DTNs
+        # Find groups that have all required DTNs (only among active groups)
         capable_groups = []
-        for group_id in self.topology.children:
+        for group_id in self._get_active_child_groups():
             available_dtns = group_dtns.get(group_id, set())
             if required_dtns.issubset(available_dtns):
                 capable_groups.append(group_id)
@@ -1595,17 +1643,20 @@ class ResourceAgent(Agent):
                     job_id = job.job_id
 
                     # Multi-level: delegate job to capable children only
-                    if self.topology.children:
+                    active_groups = self._get_active_child_groups()
+                    if active_groups:
                         # Identify which child groups can handle this job
                         capable_groups = self._get_child_groups_for_job(job)
+                        # Filter to only groups we actively lead
+                        capable_groups = [g for g in capable_groups if g in active_groups]
 
                         if not capable_groups:
-                            # Fallback: try all groups (backward compatibility)
+                            # Fallback: try all active groups (backward compatibility)
                             self.logger.warning(
                                 f"Could not determine capable groups for job {job_id}, "
-                                f"delegating to all groups"
+                                f"delegating to all active groups"
                             )
-                            capable_groups = self.topology.children
+                            capable_groups = active_groups
 
                         # MAB-guided selection: pick top_k groups instead of all
                         if self.mab_enabled and self.mab_manager:
@@ -1987,6 +2038,27 @@ class ResourceAgent(Agent):
 
             if has_timestamp:
                 if time_blocked >= retry_delay:
+                    # Check if job has exceeded max infeasible retries
+                    retry_count = getattr(job, 'infeasible_retry_count', 0)
+                    if self.max_infeasible_retries > 0 and retry_count >= self.max_infeasible_retries:
+                        job.state = ObjectState.FAILED
+                        self.queues.pending_queue.remove(job.job_id)
+                        # Update Redis so the job shows as FAILED
+                        job_dict = job.to_dict()
+                        self.repository.save(
+                            obj=job_dict,
+                            key_prefix=Repository.KEY_JOB,
+                            level=self.topology.level,
+                            group=self.topology.group
+                        )
+                        self.metrics.infeasible_retired.append(job.job_id)
+                        self.logger.warning(
+                            f"RETIRED infeasible job {job.job_id} after {retry_count} attempts. "
+                            f"Requirements: cores={job.capacities.core}, ram={job.capacities.ram}, "
+                            f"disk={job.capacities.disk}, gpu={getattr(job.capacities, 'gpu', 0)}"
+                        )
+                        continue
+
                     # Restore to PENDING state and move to end of queue
                     job.state = ObjectState.PENDING
                     self.queues.pending_queue.move_to_end(job)
@@ -1994,7 +2066,7 @@ class ResourceAgent(Agent):
 
                     self.logger.debug(
                         f"Restored infeasible job {job.job_id} to PENDING (at back of queue) "
-                        f"(retry #{getattr(job, 'infeasible_retry_count', 0)}, "
+                        f"(retry #{retry_count}, "
                         f"blocked for {time_blocked:.1f}s)"
                     )
 

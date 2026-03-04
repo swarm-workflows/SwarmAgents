@@ -1,720 +1,282 @@
 # SwarmAgents
 
-This repository provides a framework for implementing greedy distributed consensus and selection algorithms. It is designed to support scalable, resilient, and efficient decision-making across multiple agents in a distributed system.
-
-The core logic enables agents to reach consensus and make selections (such as job assignments) using PBFT-like protocols and cost-based selection strategies. The framework is modular, allowing for flexible integration of custom consensus, selection, and penalty mechanisms.
+A framework for greedy distributed consensus and selection algorithms, designed for scalable, resilient decision-making across multiple agents. Agents reach consensus on job assignments using a PBFT-like protocol with cost-based selection strategies.
 
 ## Table of Contents
 
 - [Key Features](#key-features)
 - [Core Modules](#core-modules)
-- [Example: Job Selection](#example-job-selection)
-   - [Network Topologies](#network-topologies)
-   - [Testing](#testing)
-   - [Results](#results)
-- [Agent Failure Handling and Resilience](#agent-failure-handling-and-resilience)
+- [Job Selection](#job-selection)
+- [Network Topologies](#network-topologies)
+- [Testing](#testing)
+- [Results](#results)
+- [Agent Failure Handling](#agent-failure-handling)
 - [Dynamic Agent Addition](#dynamic-agent-addition)
-- [Enhanced Visualizations](#enhanced-visualizations)
 - [Utilities](#utilities)
+- [Additional Documentation](#additional-documentation)
 
 ## Key Features
-- Greedy distributed selection and consensus algorithms
-- Modular design for consensus, selection, and penalty logic
-- Example application for job selection
-- Extensible for other distributed resource allocation problems
 
+- Greedy distributed selection and consensus algorithms
+- PBFT-like consensus with cost-based self-selection and dominance filtering
+- Multiple network topologies: Ring, Mesh, Star, Hierarchical
+- LLM-enhanced agents (OpenAI/Ollama) alongside rule-based resource agents
+- Multi-Armed Bandit (MAB) reinforcement learning for hierarchical delegation
+- Agent failure detection, job reassignment, and dynamic agent addition
+- Extensible for other distributed resource allocation problems
 
 ## Core Modules
 
-### Consensus Engine (`consensus/engine.py`)
-This module implements a generic PBFT-like consensus engine for distributed agreement among agents. It is framework-agnostic and uses host, transport, and router adapters for I/O and side effects. The engine manages proposals, prepares, and commits, allowing agents to reach agreement on object states (such as job assignments) through quorum-based rounds.
+### Consensus Engine (`swarm/consensus/engine.py`)
 
-**How it works:**
-- Agents initiate proposals for objects (e.g., jobs) and broadcast them to peers.
-- Peers respond with prepare and commit messages, tracked by the engine.
-- The engine checks for quorum and triggers selection or commit actions when consensus is reached.
-- The engine is designed to be integrated with custom agent logic via adapter classes.
+A generic PBFT-like consensus engine for distributed agreement. Framework-agnostic — uses host, transport, and router adapters for I/O and side effects.
 
-**How to use:**
-- Instantiate `ConsensusEngine` with your agent's ID and adapter implementations for host, transport, and router.
-- Use the `propose`, `on_proposal`, `on_prepare`, and `on_commit` methods to drive the consensus protocol.
-- See `resource_agent.py` for a concrete example of integration.
+- Agents broadcast proposals for objects (e.g., jobs) to peers
+- Peers respond with prepare and commit messages, tracked by the engine
+- Quorum-based rounds trigger selection or commit actions
+- See `resource_agent.py` for integration via adapter classes
 
-### Selection Engine (`selection/engine.py`)
-This module provides a generic, cache-enabled engine for assigning candidates (e.g., jobs) to assignees (e.g., agents/resources) based on feasibility and cost functions. It supports cost matrix computation, threshold-based selection, and memoization for performance.
+### Selection Engine (`swarm/selection/engine.py`)
 
-**How it works:**
-- Define feasibility and cost functions for your assignment problem.
-- The engine computes a cost matrix for all candidate-assignee pairs, marking infeasible assignments with infinity.
-- It selects the best assignee for each candidate using greedy or thresholded strategies, with optional tie-breaking and acceptance criteria.
-- Internal LRU caches speed up repeated feasibility and cost checks.
+A cache-enabled engine for assigning candidates to assignees based on feasibility and cost functions.
 
-**How to use:**
-- Instantiate `SelectionEngine` with your feasibility and cost functions, plus key and versioning functions for candidates and assignees.
-- Use `compute_cost_matrix` to build the assignment matrix, and `pick_agent_per_candidate` to select assignments.
-- The engine is highly configurable for different selection policies and caching needs.
+- Computes cost matrices for all candidate-assignee pairs (infeasible = infinity)
+- Greedy or thresholded selection with tie-breaking and acceptance criteria
+- Internal LRU caches for repeated feasibility and cost checks
 
-## Example: Job Selection
+## Job Selection
 
-SwarmAgents implements distributed job selection and consensus through specialized agents that autonomously coordinate and assign jobs to available resources.
+SwarmAgents implements distributed job selection through two agent variants:
 
-Two variants of agents currently implement this functionality:
+- **ResourceAgent** — rule-based, computes feasibility and cost deterministically using configured weights and thresholds
+- **LLMAgent** — LLM-enhanced, leverages a language model to evaluate and explain job-selection decisions
 
-- **ResourceAgent** — a rule-based agent that computes feasibility and cost metrics deterministically using configured weights and thresholds.
+Both share the same consensus, selection, and topology logic.
 
-- **LLMAgent** — an LLM-enhanced variant that leverages a language model (OpenAI/Ollama compatible) to evaluate, refine, or explain job-selection decisions dynamically.
-
-Both share the same underlying consensus, selection, and topology logic, differing only in how cost evaluation and decision heuristics are implemented.
-
-The file `swarm/agents/resource_agent.py` provides a comprehensive example of distributed job selection using both the consensus and selection engines:
-
-### Cost Computation and Decision Logic
-
-In both agents, the job assignment decision is derived from a **weighted cost function** based on resource utilization and penalties.
+### Cost Computation
 
 #### Resource Agent
-The cost for assigning a job to an agent is computed as a weighted sum of resource utilizations, plus penalties for long jobs and connectivity. Importantly, the weights can be tailored based on the job type, allowing the system to prioritize different resources for different workloads (e.g., compute-heavy, memory-heavy, or data-transfer jobs):
 
 $$
 \text{cost} = w_{cpu} \cdot \text{CPU}_{util} + w_{ram} \cdot \text{RAM}_{util} + w_{disk} \cdot \text{Disk}_{util} + w_{gpu} \cdot \text{GPU}_{util} + \text{penalties}
 $$
 
-
-Where:
-- $w_{cpu}$, $w_{ram}$, $w_{disk}$, $w_{gpu}$ are the weights for each resource (see `__init__` and `compute_job_cost` in `resource_agent.py`).
-- Resource utilization terms are computed as the fraction of required over available capacity.
-- Penalties include:
-	- Long job penalty: applied if job execution time exceeds `long_job_threshold`.
-	- Connectivity penalty: scaled by `connectivity_penalty_factor` for DTN jobs.
-
-**Job Type-Specific Weights:**
-- The cost computation can dynamically adjust the weights based on the job type (e.g., CPU-intensive, memory-intensive, I/O-bound, or DTN/data-transfer jobs).
-- For example, a data-transfer (DTN) job may use a higher weight for network or disk utilization, while a compute-heavy job may prioritize CPU and GPU weights.
-- This logic is implemented in `compute_job_cost`, where the job's type or attributes are checked and the weights are set accordingly before computing the final cost.
-
-This approach allows the system to flexibly prioritize resources and penalties for different job classes, improving scheduling efficiency and resource utilization.
-
-The final cost is used by the selection engine to compare candidate assignments and select the best agent for each job.
+- Weights dynamically adjust per job type (CPU-intensive, memory-heavy, DTN/data-transfer, etc.)
+- Penalties: long job penalty (`long_job_threshold`), connectivity penalty (`connectivity_penalty_factor`)
+- See `compute_job_cost` in `resource_agent.py`
 
 #### LLM Agent
-In **LLMAgent**, the final cost is based on LLM-computed “advisory adjustment,” reflecting contextual reasoning about balance, fairness, or uncertainty.
-For example, an LLM might slightly favor an underutilized agent even if raw cost is marginally higher.
+
+Each LLM agent independently evaluates jobs using LLM reasoning, producing a single-column cost view per agent. This decentralized approach reduces inter-agent overhead while incorporating contextual reasoning.
 
 ### Job Feasibility
-Before computing cost, both agents perform a feasibility check to ensure an agent has enough capacity and connectivity to run the job.
-Job feasibility determines whether an agent can execute a given job, based on its current resource capacities and the job's requirements. 
-The logic is implemented in the `is_job_feasible` method of `resource_agent.py`.
 
-**Feasibility criteria include:**
-- The agent must have enough available CPU, RAM, Disk, and GPU resources to meet the job's requirements.
-- The agent must satisfy any additional constraints, such as data dependencies or network connectivity (for DTN jobs).
-- The method checks for resource overcommitment and ensures that jobs are only assigned to agents that can complete them successfully.
+Both agents perform a feasibility check before cost computation:
+- Sufficient CPU, RAM, Disk, GPU capacity
+- DTN connectivity for data-dependent jobs
+- Resource overcommitment prevention
 
-This feasibility check is performed before cost computation and candidate selection, ensuring that only valid agent-job pairs are considered in the assignment process.
+For LLMAgent, feasibility remains deterministic; only cost ranking uses LLM input.
 
-For LLMAgent, the feasibility stage remains deterministic; only cost ranking and acceptance use LLM input. This can be disabled for LLMAgent if needed.
+### Cost Matrix and Selection
 
-### Cost Matrix and Candidate Selection
+The selection engine builds a cost matrix (agents x jobs), then selects the minimum-cost agent per job. Selection is thresholded via `selection_threshold_pct` to control the candidate pool.
 
-#### Resource Agent
-After feasibility is determined, the selection engine computes a cost matrix representing the assignment cost for each agent-job pair. This is handled by the `compute_cost_matrix` method of the `SelectionEngine` (see its instantiation and usage in `resource_agent.py`).
+### Consensus Protocol
 
-- **Cost Matrix:**
-	- Each row corresponds to an agent, each column to a job.
-	- Entries are the computed costs (see cost equation above), or infinity for infeasible assignments.
-	- The matrix is built using the agent's current capacities, job requirements, and configured weights/penalties.
+1. Agents broadcast proposals for job assignments
+2. Peers respond with prepare and commit messages
+3. Quorum reached (`ceil((n+1)/2)`) finalizes assignment
+4. Dynamic quorum adjusts based on live agent count
 
-- **Candidate Selection:**
-	- The selection engine uses the cost matrix to identify the best agent for each job, typically minimizing cost.
-	- Selection can be thresholded using `selection_threshold_pct` to allow more flexible candidate pools.
-	- Tie-breaking and acceptance criteria can be configured for custom selection policies.
-
-This process ensures that jobs are assigned to agents in a way that balances resource usage, cost, and system constraints, as implemented in the selection logic of `resource_agent.py`.
-
-#### LLM Agent
-In the case of **LLMAgent**, cost computation is performed **locally by each agent** rather than centrally across all agent-job pairs.
-Each LLM agent independently evaluates the jobs it receives, using the LLM’s reasoning to determine a single cost value per job.
-As a result, the **cost matrix degenerates to a single-column view** — each agent computes costs only for itself instead of contributing to a full agent-by-job matrix.
-This decentralized approach reduces inter-agent computation and communication overhead, while allowing each LLM agent to incorporate contextual or learned reasoning in its own cost evaluation before participating in consensus.
-
-### Distributed Consensus
-
-Once candidate assignments are selected, agents use the consensus engine to coordinate agreement on job selection across the distributed system. This is implemented using a PBFT-like protocol in the `ConsensusEngine` (see its instantiation and usage in `resource_agent.py`).
-
-- **Consensus Protocol:**
-	- Agents broadcast proposals for job assignments to their peers.
-	- Peers respond with prepare and commit messages, tracked by the consensus engine.
-	- The engine checks for quorum (majority agreement) before finalizing job assignments.
-	- Methods such as `__on_proposal`, `__on_prepare`, and `__on_commit` in `resource_agent.py` handle the protocol steps.
-
-- **Fault Tolerance:**
-	- The protocol ensures that job selection is robust to agent failures and network partitions.
-	- Only when a quorum is reached does the system commit to a job assignment, maintaining consistency.
-
-This distributed consensus mechanism allows agents to make autonomous decisions while ensuring global agreement and reliability in job scheduling.
+See [message_complexity.md](message_complexity.md) for detailed message complexity analysis.
 
 ### Job Execution
-- **Execution & State Management:**
-	- After consensus, jobs are scheduled and executed by the selected agents.
-	- Job states and metrics are managed via methods like `schedule_job`, `execute_job`, and the `Metrics` class.
 
+After consensus, jobs are scheduled and executed by selected agents. States and metrics are managed via Redis and the `Metrics` class. Communication uses gRPC for inter-agent messaging.
 
-Additional implementation details:
-- **Job Queue:** The job queue is managed using a Redis database, allowing agents to efficiently share and update job states in a distributed manner.
-- **Message Exchange:** Agents communicate and exchange consensus/selection messages using gRPC, enabling fast and reliable messaging across the network.
-- **Supported Topologies:** The framework supports various network topologies, including Ring, Mesh, Star, and Hierarchical, which can be configured to match different deployment scenarios. Topology logic is handled via the `Topology` and `TopologyType` classes and used in agent initialization and routing decisions.
+## Network Topologies
 
-For implementation details, see:
-- `resource_agent.py` & `llm_agent.py`: Integration of selection and consensus engines, job feasibility/cost logic, and scheduling workflow.
-- `is_job_feasible`, `compute_job_cost`, and `SelectionEngine` usage for assignment logic.
-- The weights and thresholds in the agent's `__init__` for tuning selection behavior.
+### Ring
+Circular structure where agents communicate with immediate neighbors. Minimizes communication overhead; higher latency for distant consensus. Best for 10-50 agents.
 
-### Network Topologies
+### Mesh
+Fully connected network. Fastest consensus but highest communication overhead. Best for 5-30 agents and benchmarking.
 
-The framework supports multiple network topologies that define how agents communicate and coordinate during consensus. Each topology offers different trade-offs in terms of communication overhead, fault tolerance, and scalability.
+### Star
+Central coordinator communicates with all agents. Simple coordination but single point of failure. Best for small deployments with a clear leader.
 
-#### Ring Topology
-Agents are arranged in a circular structure where each agent communicates with its immediate neighbors (predecessor and successor). This topology minimizes communication overhead but may have higher latency for reaching consensus across distant agents.
+### Hierarchical
 
-**Best for:**
-- Small to medium deployments (10-50 agents)
-- Scenarios where communication bandwidth is limited
-- Testing basic consensus behavior
+Multi-level tree with parent-child relationships for scalable coordination:
+- **Level 0 (Leaf agents)**: Workers organized into groups (5-10 per group)
+- **Level 1+ (Coordinators)**: Parent agents that coordinate groups
 
-#### Mesh Topology
-All agents communicate directly with all other agents in a fully connected network. This provides the fastest consensus but has the highest communication overhead.
-
-**Best for:**
-- Small deployments (5-30 agents)
-- Scenarios requiring fast consensus
-- Benchmarking and comparison studies
-
-#### Star Topology
-A central coordinator agent communicates with all other agents, which do not communicate directly with each other. This simplifies coordination but creates a single point of failure.
-
-**Best for:**
-- Centralized control scenarios
-- Small deployments with a clear leader
-- Testing coordinator-based algorithms
-
-#### Hierarchical Topology
-
-Agents are organized in a multi-level tree structure with parent-child relationships. This topology enables scalable coordination by delegating decisions across hierarchy levels.
-
-**Architecture:**
-- **Level 0 (Leaf agents)**: Worker agents organized into groups (typically 5-10 agents per group)
-- **Level 1 (Coordinators)**: Parent agents that coordinate their respective groups
-- **Higher levels**: Additional coordination layers for very large deployments
-
-Each agent has:
-- `level`: Its position in the hierarchy (0 = leaf, 1+ = coordinator)
-- `group`: Group membership identifier
-- `parent`: Parent agent ID (for non-root agents)
-- `children`: List of child agent IDs (for coordinator agents)
-- `peer_agents`: Other agents at the same level
-- `group_size`: Number of agents per group
-- `group_count`: Total number of groups at each level
-
-**Mixed Agent Types:**
-
-Hierarchical topology supports mixing LLM and Resource agents within the same deployment:
-
-- **Level 1 agents** (coordinators) can automatically use **LLM agents** for intelligent, context-aware scheduling decisions
-- **Level 0 agents** (workers) typically use **Resource agents** for fast, heuristic-based execution
-
-This hybrid approach balances decision quality (LLM reasoning) with execution speed (heuristic-based resource agents).
-
-**Example Configuration:**
-
-For 30 agents in hierarchical mode:
-```
-Level 1 (Coordinators): 5 LLM agents    [agents 26-30]
-Level 0 (Workers):      25 Resource agents in 5 groups of 5 [agents 1-25]
-```
-
-Each Level 1 LLM agent manages a cluster of 5 Level 0 Resource agents, providing strategic scheduling while workers execute jobs efficiently.
-
-**Running Hierarchical Topology:**
-
-```bash
-# Basic hierarchical deployment
-python run_test.py \
-    --agent-type resource \
-    --agents 30 \
-    --topology hierarchical \
-    --jobs 500 \
-    --db-host localhost \
-    --jobs-per-interval 20 \
-    --run-dir runs/hierarchical-demo
-
-# With automatic LLM coordinators at Level 1
-python run_test_v2.py \
-    --mode local \
-    --agent-type resource \
-    --agents 30 \
-    --topology hierarchical \
-    --jobs 500 \
-    --db-host localhost \
-    --jobs-per-proposal 10 \
-    --run-dir runs/hierarchical-llm
-
-# Distributed across multiple hosts
-python run_test_v2.py \
-    --mode remote \
-    --agent-type resource \
-    --agents 110 \
-    --agents-per-host 10 \
-    --topology hierarchical \
-    --jobs 1000 \
-    --db-host 10.0.0.5 \
-    --agent-hosts-file hosts.txt \
-    --run-dir runs/remote-hierarchical
-```
-
-**Hierarchical-Specific Visualizations:**
-
-When using `plot_latency_jobs.py` with the `--hierarchical` flag, additional plots are generated:
-
-```bash
-python plot_latency_jobs.py \
-    --output_dir runs/hierarchical-demo \
-    --agents 30 \
-    --db_host localhost \
-    --hierarchical
-```
-
-Generated visualizations include:
-- `hierarchical_topology.png`: Visual representation of the hierarchy structure
-- `latency_comparison_by_agent_type.png`: Performance comparison between LLM and Resource agents
-- `reasoning_time_overhead.png`: LLM overhead analysis
-- `job_distribution_by_hierarchy.png`: Load distribution across hierarchy levels
-
-**Performance Characteristics:**
-
-- **LLM Agents (Level 1):**
-  - Mean scheduling latency: TBD seconds
-  - Reasoning time: TBD seconds (60-80% of total latency)
-  - Fewer consensus conflicts due to better initial decisions
-  - Higher decision quality through context-aware reasoning
-
-- **Resource Agents (Level 0):**
-  - Mean scheduling latency: TBD seconds
-  - Reasoning time: TBD seconds (<10% of total latency)
-  - Faster execution through deterministic heuristics
-  - More conflicts due to greedy local decisions
-
-**Best for:**
-- Large-scale deployments (50-1000+ agents)
-- Scenarios requiring both intelligent scheduling and fast execution
-- Multi-site or multi-cluster deployments
-- Minimizing communication overhead while maintaining coordination
-- Mixing LLM and Resource agents for optimal cost-performance balance
-
-**Scaling Considerations:**
-- Add additional hierarchy levels for very large deployments (Level 0 → Level 1 → Level 2)
-- Maintain fan-out of ~5-10 agents per coordinator for optimal performance
-- Job distribution can target specific levels using `--level` flag in `job_distributor.py`
-
-**Job Routing in Hierarchical Topologies:**
-
-Jobs enter at different levels depending on the tier structure:
+Supports mixed agent types (LLM coordinators + Resource workers), co-parent failover, and MAB-based delegation.
 
 | Agents | Tiers | Job Entry Level | Flow |
 |--------|-------|-----------------|------|
-| 30, 110 | 2-tier | Level 1 | L1 → L0 |
-| 100, 1000 | 3-tier | Level 2 | L2 → L1 → L0 |
+| 30, 110 | 2-tier | Level 1 | L1 -> L0 |
+| 100, 1000 | 3-tier | Level 2 | L2 -> L1 -> L0 |
 
-For 3-tier hierarchies (100 or 1000 agents), jobs enter at Level 2 and flow down through coordinators to workers. The `run_test_v2.py` script automatically detects this and sets the correct entry level. For manual job distribution, specify the level explicitly:
+See detailed guides:
+- [HIERARCHICAL_LLM_AGENTS.md](HIERARCHICAL_LLM_AGENTS.md) — LLM/Resource agent mixing
+- [CO_PARENT_USAGE.md](CO_PARENT_USAGE.md) — Multi-parent shared parenting and failover
+- [MAB_README.md](MAB_README.md) — Multi-Armed Bandit delegation for hierarchical topologies
 
-```bash
-# 100-agent 3-tier hierarchy
-python job_distributor.py \
-  --redis-host localhost \
-  --jobs-dir jobs/ \
-  --jobs-per-interval 20 \
-  --level 2 \
-  --group 0
-```
+## Testing
 
-**Additional Resources:**
-- See `HIERARCHICAL_LLM_AGENTS.md` for details on LLM/Resource agent mixing
-
-### Testing
-
-#### Resource Agents
-You can simulate all agents on a single host for testing and benchmarking. For example, to run 30 agents in a ring topology with 100 jobs and a local Redis database, use:
+### Prerequisites
 
 ```bash
-python run_test.py --agents 30 --topology ring --jobs 100 --db-host localhost --jobs-per-interval 10 --run-dir swarm-multi
+pip install -r requirements.txt
+docker run -d -p 6379:6379 redis
 ```
 
-This will launch the specified number of agents, distribute jobs, and store results in the `swarm-multi` directory. Adjust parameters as needed for your experiments.
+### Resource Agents
 
-##### LLM Agents
-You can launch the LLM Agents via the command below:
-- When using OpenAPI, export API key and launch the agents
+```bash
+# Single-host test (30 agents, ring, 100 jobs)
+python run_test.py --agents 30 --topology ring --jobs 100 --db-host localhost --jobs-per-interval 10 --run-dir runs/test-001
+
+# Advanced test runner (local mode)
+python run_test_v2.py --mode local --agent-type resource --agents 20 --topology mesh --jobs 500 --db-host localhost --run-dir runs/v2-test
+
+# Remote mode (multiple hosts, requires passwordless SSH)
+python run_test_v2.py --mode remote --agent-type resource --agents 30 --agents-per-host 5 --topology ring --jobs 1000 --db-host 10.0.0.5 --agent-hosts-file hosts.txt --run-dir runs/remote-test
 ```
+
+### LLM Agents
+
+```bash
+# OpenAI
 export OPENAI_API_KEY=sk-xxxx
 python run_test.py --agent-type llm --agents 10 --topology mesh --jobs 200 --db-host localhost --jobs-per-interval 20 --run-dir runs/llm-001
-```
-- When using Ollama, export the base url
-```
+
+# Ollama
 export LLM_BASE_URL=http://localhost:11434/v1
 python run_test.py --agent-type llm --agents 5 --topology ring --jobs 100 --db-host localhost --jobs-per-interval 10 --run-dir runs/llm-002
 ```
 
-### Results
+### Batch Testing
+
+```bash
+python batch_tests_v2.py --runs 10 --base-out runs/batch --mode local --agent-type resource --agents 20 --topology mesh --jobs 500 --db-host localhost
+```
+
+### Visualizations
+
+```bash
+python plot_latency_jobs.py --output_dir runs/test-001 --agents 30 --db_host localhost [--hierarchical]
+```
+
+Generated plots include scheduling latency histograms, jobs per agent, agent load summaries, and (with `--hierarchical`) topology visualizations, agent type comparisons, and LLM overhead analysis.
+
+## Results
+
 **Evaluation Data** for **SWARM(CCGrid'25)** and **SWARM+(CCGrid'26)** can be found [here](https://github.com/swarm-workflows/swarm-evaluation-data).
 
-Simulation results for different topologies (Ring, Mesh, Hierarchical, etc.) are stored in the `runs/simulation` directory. Each run contains logs, metrics, and output files summarizing agent performance, job completion rates, consensus rounds, and resource utilization.
+### Example Visualizations
 
-- **How to interpret results:**
-	- Compare job completion times, consensus latency, and resource usage across topologies.
-	- Use the provided plotting scripts (see `plot_latency_jobs.py`) to visualize performance metrics.
-	- Analyze logs for details on agent decisions, consensus events, and system behavior under different configurations.
-
-For example, after running a simulation with `run_test.py`, inspect the corresponding results directory for summary files and plots. This helps evaluate the scalability, efficiency, and fault tolerance of the framework under various network structures.
-### Example Results Visualizations
-
-#### Resource Agents
-Below are example images showing results for different topologies:
-
-**Mesh Topology:**
+#### Resource Agents — Mesh Topology
 ![Scheduling Latency](runs/simulation/resource_agent/mesh/30/scheduling_latency_histogram.png)
-
 ![Jobs Per Agent](runs/simulation/resource_agent/mesh/30/jobs_per_agent.png)
-
 ![Agent Load](runs/simulation/resource_agent/mesh/30/agent_loads_summary.png)
 
-**Ring Topology:**
+#### Resource Agents — Ring Topology
 ![Scheduling Latency](runs/simulation/resource_agent/ring/30/scheduling_latency_histogram.png)
-
 ![Jobs Per Agent](runs/simulation/resource_agent/ring/30/jobs_per_agent.png)
-
 ![Agent Load](runs/simulation/resource_agent/ring/30/agent_loads_summary.png)
 
-**Hierarchical Topology:**
+#### Resource Agents — Hierarchical Topology
 ![Scheduling Latency](runs/simulation/resource_agent/hierarchical/30/scheduling_latency_histogram.png)
-
 ![Jobs Per Agent](runs/simulation/resource_agent/hierarchical/30/jobs_per_agent.png)
-
 ![Agent Load](runs/simulation/resource_agent/hierarchical/30/agent_loads_summary.png)
 
-#### LLM Agents
-**Mesh Topology:**
+#### LLM Agents — Mesh Topology
 ![Scheduling Latency](runs/simulation/llm_agent/mesh/5/scheduling_latency_histogram.png)
-
 ![Reasoning Vs Scheduling](runs/simulation/llm_agent/mesh/5/reasoning_vs_latency_scatter.png)
-
 ![Reasoning Time](runs/simulation/llm_agent/mesh/5/mean_reasoning_time_per_agent.png)
-
 ![Jobs Per Agent](runs/simulation/llm_agent/mesh/5/jobs_per_agent.png)
-
 ![Agent Load](runs/simulation/llm_agent/mesh/5/agent_loads_summary.png)
 
+## Agent Failure Handling
 
-## Agent Failure Handling and Resilience
+### Detection Mechanisms
 
-SwarmAgents includes comprehensive failure detection and recovery mechanisms to maintain system reliability under agent failures.
+1. **Peer Expiry** — Agents not updating within `peer_expiry_seconds` (default: 300s) are marked stale
+2. **gRPC Health Checking** — Channel-down events trigger peer status callbacks
+3. **Job Reselection Timeout** — Jobs stuck in PREPARE/COMMIT beyond `reselection_timeout_s` (default: 60s) reset to PENDING
+4. **Dynamic Quorum** — `quorum = (live_agents // 2) + 1`, adjusts as agents fail
 
-### Failure Detection Mechanisms
-
-1. **Peer Expiry Detection**: Agents periodically refresh neighbor maps from Redis. Agents not updating status within `peer_expiry_seconds` (default: 300s) are marked as stale.
-
-2. **gRPC Health Checking**: Communication layer detects when channels go down and triggers peer status callbacks.
-
-3. **Job Reselection Timeout**: Jobs stuck in consensus states (PREPARE, COMMIT) for longer than `reselection_timeout_s` (default: 60s) are automatically reset to PENDING for reassignment.
-
-4. **Dynamic Quorum Calculation**: Quorum adjusts automatically based on live agent count: `quorum = (live_agents // 2) + 1`, allowing continued operation as agents fail.
-
-### Configuration Parameters
-
-Add these to your `config_swarm_multi.yml`:
+### Configuration
 
 ```yaml
 runtime:
-  peer_expiry_seconds: 300           # Time before marking agent as stale
-  reselection_timeout_s: 60          # Job timeout before reselection
-  failure_threshold_seconds: 30      # Time before declaring agent as failed
-  max_failed_agents: 10              # Maximum tolerable failures
-  job_reassignment_enabled: true     # Enable automatic job reassignment
-  aggressive_failure_detection: true # Use proactive failure detection
+  peer_expiry_seconds: 300
+  reselection_timeout_s: 60
+  failure_threshold_seconds: 30
+  max_failed_agents: 10
+  job_reassignment_enabled: true
 ```
 
-### Testing Failure Scenarios
+### Simulating Failures
 
-Use `kill_agents.py` to simulate agent failures:
-
-**Single agent failure:**
 ```bash
-python kill_agents.py --mode local --count 1 --random
+python kill_agents.py --mode local --count 1 --random           # Single failure
+python kill_agents.py --mode local --count 10 --interval 30 --random  # Cascading
+python kill_agents.py --mode local --count 7 --random           # Catastrophic (25%)
 ```
 
-**Gradual cascading failure (10 agents over 5 minutes):**
-```bash
-python kill_agents.py --mode local --count 10 --interval 30 --random
-```
+### Monitoring
 
-**Catastrophic failure (25% of agents instantly):**
-```bash
-# For 30 agents, kill 7-8 agents
-python kill_agents.py --mode local --count 7 --random
-```
-
-**Remote agent failure (across multiple hosts):**
-```bash
-python kill_agents.py --mode remote \
-    --hosts-file hosts.txt \
-    --ssh-user ubuntu \
-    --count 5 \
-    --interval 60 \
-    --random
-```
-
-### Monitoring Recovery
-
-Check agent logs for failure detection and recovery:
 ```bash
 grep "RESTART: Job" <run-dir>/agent-*.log
-grep "Reassigning.*jobs from failed agent" <run-dir>/agent-*.log
 grep "Agent.*detected as FAILED" <run-dir>/agent-*.log
 ```
 
-### Topology-Specific Considerations
-
-**Mesh Topology:**
-- Fast failure detection (direct connections to all agents)
-- Straightforward job reassignment
-- Immediate quorum failure detection
-
-**Ring Topology:**
-- Slower failure propagation (messages traverse ring)
-- Failed agent breaks ring; requires message forwarding
-- May need higher timeouts for propagation delay
-
-**Hierarchical Topology:**
-- Parent failures affect entire subtrees
-- Different handling for leaf vs. parent failures
-- Consider cascading reassignment to sibling subtrees
-
 ## Dynamic Agent Addition
 
-SwarmAgents supports adding agents dynamically during execution to test scalability, elasticity, and load balancing.
-
-### Trigger Types
-
-1. **Time-based**: Add agents after N seconds
-2. **Bucket-based**: Add agents when Redis bucket reaches threshold
-3. **Job-completion-based**: Add agents after N jobs complete
-
-### Usage Examples
-
-**Time-based (add 5 agents after 30 seconds):**
-```bash
-python run_test_v2.py \
-    --mode local \
-    --agents 20 \
-    --dynamic-agents 5 \
-    --dynamic-trigger time \
-    --dynamic-delay 30 \
-    --topology mesh \
-    --jobs 500 \
-    --db-host localhost \
-    --run-dir runs/dynamic-time
-```
-
-**Bucket-based (add 10 agents when bucket has 50+ jobs):**
-```bash
-python run_test_v2.py \
-    --mode local \
-    --agents 20 \
-    --dynamic-agents 10 \
-    --dynamic-trigger bucket \
-    --dynamic-trigger-bucket 1 \
-    --dynamic-trigger-threshold 50 \
-    --topology ring \
-    --jobs 500 \
-    --db-host localhost \
-    --run-dir runs/dynamic-bucket
-```
-
-**Job-completion-based (add 5 agents after 100 jobs complete):**
-```bash
-python run_test_v2.py \
-    --mode local \
-    --agents 15 \
-    --dynamic-agents 5 \
-    --dynamic-trigger jobs-completed \
-    --dynamic-trigger-jobs 100 \
-    --topology hierarchical \
-    --jobs 300 \
-    --db-host localhost \
-    --run-dir runs/dynamic-jobs
-```
-
-### How It Works
-
-1. All agent configs (initial + dynamic) are pre-generated before test starts
-2. Initial agents start and begin processing jobs
-3. Background thread monitors for trigger condition
-4. When triggered, dynamic agents start and join existing topology
-5. New agents discover peers via Redis and participate in consensus
-
-### Monitoring Dynamic Addition
+Add agents during execution via three trigger types:
 
 ```bash
-# Monitor initial agents
-tail -f local_agents_initial_start.log
+# Time-based: add 5 agents after 30 seconds
+python run_test_v2.py --mode local --agents 20 --dynamic-agents 5 \
+    --dynamic-trigger time --dynamic-delay 30 \
+    --topology mesh --jobs 500 --db-host localhost --run-dir runs/dynamic-time
 
-# Monitor dynamic agents (appears after trigger)
-tail -f local_agents_dynamic_start.log
+# Bucket-based: add agents when Redis bucket reaches threshold
+python run_test_v2.py --mode local --agents 20 --dynamic-agents 10 \
+    --dynamic-trigger bucket --dynamic-trigger-bucket 1 --dynamic-trigger-threshold 50 \
+    --topology ring --jobs 500 --db-host localhost --run-dir runs/dynamic-bucket
 
-# Check agent count
-ps aux | grep "python.*main.py" | wc -l
+# Job-completion-based: add agents after N jobs complete
+python run_test_v2.py --mode local --agents 15 --dynamic-agents 5 \
+    --dynamic-trigger jobs-completed --dynamic-trigger-jobs 100 \
+    --topology hierarchical --jobs 300 --db-host localhost --run-dir runs/dynamic-jobs
 ```
 
-## Enhanced Visualizations
-
-The `plot_latency_jobs.py` script includes comprehensive failure analysis and hierarchical topology visualizations.
-
-### Failure Analysis
-
-After running experiments with agent failures:
-
-```bash
-python plot_latency_jobs.py \
-    --output_dir runs/failure-test \
-    --agents 30 \
-    --db_host localhost
-```
-
-**Generated failure visualizations:**
-- `failure_summary.png`: Comprehensive failure overview with 5 subplots
-  - Failed agents count and IDs
-  - Job reassignments by type and reason
-  - Timeline of failures and reassignments
-- `failed_agents.csv`: Detailed failure data
-- `reassigned_jobs.csv`: Job reassignment details
-- `throughput_degradation_analysis.png`: Throughput impact analysis
-
-### Hierarchical Topology Analysis
-
-For hierarchical deployments, use the `--hierarchical` flag:
-
-```bash
-python plot_latency_jobs.py \
-    --output_dir runs/hierarchical-demo \
-    --agents 30 \
-    --db_host localhost \
-    --hierarchical
-```
-
-**Additional hierarchical visualizations:**
-- `hierarchical_topology.png`: Visual hierarchy structure (LLM coordinators + Resource workers)
-- `latency_comparison_by_agent_type.png`: Performance comparison between agent types
-- `reasoning_time_overhead.png`: LLM overhead analysis
-- `job_distribution_by_hierarchy.png`: Load distribution across levels
+Dynamic agents are pre-configured, started when the trigger fires, and join the topology via Redis peer discovery.
 
 ## Utilities
 
-The repository includes several utility scripts to support simulation setup and management:
+| Script | Purpose |
+|--------|---------|
+| `job_generator.py` | Generate synthetic job descriptions matching agent profiles |
+| `generate_configs.py` | Create agent configs for different topologies and agent counts |
+| `job_distributor.py` | Distribute jobs to Redis at a controlled rate |
+| `dump_db.py` | Inspect Redis database state for debugging |
+| `kill_agents.py` | Simulate agent failures (local/remote, gradual/instant) |
+| `plot_latency_jobs.py` | Visualize scheduling latency, load, and failure metrics |
+| `plot_mab_results.py` | Visualize MAB learning curves and delegation patterns |
+| `plot_comparison.py` | Compare results across multiple runs |
+| `analyze_run.py` | Post-run analysis of metrics and agent behavior |
 
-- **job_generator.py**: Generates synthetic job descriptions for simulation runs. You can customize the number, type, and resource requirements of jobs to match your experimental needs.
-```
-python job_generator.py  --help
-usage: job_generator.py [-h] --job-count JOB_COUNT --agent-profile-path AGENT_PROFILE_PATH
-                        [--output-dir OUTPUT_DIR] [--enable-dtns]
+Run any script with `--help` for full usage details.
 
-Generate jobs matching agent profiles.
+## Additional Documentation
 
-options:
-  -h, --help            show this help message and exit
-  --job-count JOB_COUNT
-                        Number of jobs to generate
-  --agent-profile-path AGENT_PROFILE_PATH
-                        Path to agent profiles JSON
-  --output-dir OUTPUT_DIR
-                        Directory to save job files
-  --enable-dtns         Assign DTNs to jobs based on agent profiles
-```
-
-- **generate_configs.py**: Creates agent configuration files for different topologies and agent counts. This helps automate the setup of large-scale experiments with consistent parameters.
-```
-python generate_configs.py  --help
-usage: generate_configs.py [-h] [--dtns] [--flavor-percentages [PERCENT ...]]
-                           [--agent-hosts-file AGENT_HOSTS_FILE] [--agents-per-host AGENTS_PER_HOST]
-                           num_agents jobs_per_proposal base_config_file output_dir topology database
-                           job_cnt
-
-Generate agent configuration files.
-
-positional arguments:
-  num_agents            Number of agents to generate configurations for.
-  jobs_per_proposal     Number of Jobs per proposal.
-  base_config_file      Path to the base configuration YAML file.
-  output_dir            Directory where generated configs should be saved.
-  topology              Topology: mesh | ring | star | hierarchical
-  database              Database host
-  job_cnt               Job Count
-
-options:
-  -h, --help            show this help message and exit
-  --dtns                Enable DTNs
-  --flavor-percentages [PERCENT ...]
-                        Percentages for small, medium, large, xtralarge, xxtralarge (e.g. 0.4 0.25 0.15
-                        0.15 0.05)
-  --agent-hosts-file AGENT_HOSTS_FILE
-                        Path to file with agent hosts (one per line)
-  --agents-per-host AGENTS_PER_HOST
-                        Number of agents per host (for grpc.host assignment)
-```
-- **job_distributor.py**: Distributes jobs to agents or queues in the system, supporting various distribution strategies and load patterns.
-```
-python job_distributor.py --help
-usage: job_distributor.py [-h] --redis-host REDIS_HOST [--redis-port REDIS_PORT] --jobs-dir JOBS_DIR
-                          --jobs-per-interval JOBS_PER_INTERVAL [--interval INTERVAL] [--level LEVEL]
-                          [--group GROUP]
-
-Distribute job JSON files to Redis at a controlled rate.
-
-options:
-  -h, --help            show this help message and exit
-  --redis-host REDIS_HOST
-                        Redis host address
-  --redis-port REDIS_PORT
-                        Redis port (default: 6379)
-  --jobs-dir JOBS_DIR   Directory containing job JSON files
-  --jobs-per-interval JOBS_PER_INTERVAL
-                        Number of jobs to push per interval
-  --interval INTERVAL   Interval duration in seconds (default: 1.0)
-  --level LEVEL         Topology level for which to add Jobs
-  --group GROUP         Topology group at a level for which to add Jobs
-```
-- **dump_db.py**: Exports the contents of the Redis database used by SwarmAgents. This script is useful for debugging, analysis, and archiving the state of jobs, agents, and other system data during or after simulation runs. It can output the database contents in a human-readable or machine-readable format for further inspection.
-```
-usage: dump_db.py [-h] [--host HOST] [--key KEY] [--count] [--type {redis,etcd}]
-
-Display Redis queue or count.
-
-options:
-  -h, --help           show this help message and exit
-  --host HOST          Host (default: localhost)
-  --key KEY            Key prefix to match (default: *)
-  --count              Only display the count of entries
-  --type {redis,etcd}  Type of data store to query (default: etcd)
-```
-
-- **kill_agents.py**: Simulates agent failures for resilience testing. Supports local and remote killing with various patterns (gradual, instant, random selection).
-```bash
-# Local mode examples
-python kill_agents.py --mode local --all                        # Kill all agents
-python kill_agents.py --mode local --count 5 --random          # Kill 5 random agents
-python kill_agents.py --mode local --all --interval 30         # Kill agents gradually
-python kill_agents.py --mode local --agent-ids 5 9 12          # Kill specific agents
-
-# Remote mode examples
-python kill_agents.py --mode remote --hosts-file hosts.txt --ssh-user ubuntu --all
-python kill_agents.py --mode remote --hosts-file hosts.txt --count 3 --interval 60 --random
-```
-
-These utilities streamline the process of preparing, configuring, and running distributed simulations with SwarmAgents.
+- [HIERARCHICAL_LLM_AGENTS.md](HIERARCHICAL_LLM_AGENTS.md) — LLM agents as Level 1 coordinators in hierarchical topology
+- [CO_PARENT_USAGE.md](CO_PARENT_USAGE.md) — Multi-parent shared parenting for hierarchical failover
+- [MAB_README.md](MAB_README.md) — Multi-Armed Bandit configuration and tuning for delegation
+- [message_complexity.md](message_complexity.md) — PBFT message complexity analysis
