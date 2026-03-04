@@ -56,7 +56,7 @@ class Role(Object):
 
     def set_selection_end_time(self):
         with self.lock:
-            self.selected_by_agent_at = self.time_last_state_change
+            self.selected_by_agent_at = self.last_transition_at
 
     @property
     def role_id(self) -> str:
@@ -174,7 +174,7 @@ class Role(Object):
             'selection_started_at': self.selection_started_at,
             'selected_by_agent_at': self.selected_by_agent_at,
             'leader_id': self.leader_id,
-            'time_last_state_change': self.time_last_state_change,
+            'time_last_state_change': self.last_transition_at,
         }
 
     def from_dict(self, role_data: dict):
@@ -185,5 +185,5 @@ class Role(Object):
         self.selection_started_at = role_data['selection_started_at'] if role_data.get('selection_started_at') is not None else time.time()
         self.selected_by_agent_at = role_data['selected_by_agent_at'] if role_data.get('selected_by_agent_at') is not None else None
         self.leader_id = role_data['leader_id'] if role_data.get('leader_id') is not None else None
-        self.time_last_state_change = role_data['time_last_state_change'] if role_data.get('time_last_state_change') is not None else None
+        self.last_transition_at = role_data['time_last_state_change'] if role_data.get('time_last_state_change') is not None else None
 

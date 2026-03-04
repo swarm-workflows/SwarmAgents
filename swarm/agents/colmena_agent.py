@@ -21,6 +21,7 @@
 #
 # Author: Komal Thareja(kthare10@renci.org)
 import os
+import sys
 import time
 import traceback
 
@@ -361,15 +362,18 @@ class ColmenaAgent(Agent):
 
     def _restart_selection(self):
         if self.role is not None:
-            diff = int(time.time() - self.role.time_last_state_change)
-            if diff > self.restart_job_selection:
-                self.logger.info(f"RESTART: Role: {self.role} reset to Pending")
-                self.role.state = ObjectState.PENDING
-                self.engine.outgoing.remove_object(object_id=self.role.role_id)
-                self.engine.incoming.remove_object(object_id=self.role.role_id)
-                role_id = self.role.role_id
-                self.metrics.restarts[role_id] = self.metrics.restarts.get(role_id, 0) + 1
-                self.start_consensus()
+            try:
+                diff = int(time.time() - self.role.last_transition_at)
+                if diff > self.restart_job_selection:
+                    self.logger.info(f"RESTART: Role: {self.role} reset to Pending")
+                    self.role.state = ObjectState.PENDING
+                    self.engine.outgoing.remove_object(object_id=self.role.role_id)
+                    self.engine.incoming.remove_object(object_id=self.role.role_id)
+                    role_id = self.role.role_id
+                    self.metrics.restarts[role_id] = self.metrics.restarts.get(role_id, 0) + 1
+                    self.start_consensus()
+            except AttributeError:
+                return
 
     def is_role_feasible(self, role: Role, agent: AgentInfo) -> bool:
         """
@@ -521,8 +525,7 @@ class ColmenaAgent(Agent):
                 proposal = ProposalInfo(
                     p_id=generate_id(),
                     object_id=self.role.role_id,
-                    agent_id=self.agent_id,
-                    seed=round((cost + self.agent_id), 2)
+                    agent_id=self.agent_id
                 )
                 proposals.append(proposal)
                 self.role.state = ObjectState.PRE_PREPARE
@@ -584,7 +587,7 @@ class ColmenaAgent(Agent):
             self.logger.error(f"save_neighbors failed: {e}", exc_info=True)
 
     def trigger_decision(self, role: Role):
-        print(f"[SELECTED]: {role.role_id} on agent: {self.agent_id}")
+        self.logger.info(f"[SELECTED]: {role.role_id} on agent: {self.agent_id}")
 
         role.leader_id = self.agent_id
         self.role.state = ObjectState.READY
