@@ -137,13 +137,15 @@ docker run -d -p 6379:6379 redis
 
 ```bash
 # Single-host test (30 agents, ring, 100 jobs)
-python run_test.py --agents 30 --topology ring --jobs 100 --db-host localhost --jobs-per-interval 10 --run-dir runs/test-001
+python run_test.py --mode local --agent-type resource --agents 30 --topology ring --jobs 100 --db-host localhost --jobs-per-interval 10 --run-dir runs/test-001
 
 # Advanced test runner (local mode)
-python run_test_v2.py --mode local --agent-type resource --agents 20 --topology mesh --jobs 500 --db-host localhost --run-dir runs/v2-test
+python run_test.py --mode local --agent-type resource --agents 30 --topology mesh --jobs 500 --db-host localhost --run-dir runs/v2-test
+
+python run_test.py --mode local --agent-type resource --agents 30 --topology hierarchical --hierarchical-level1-agent-type resource --jobs 500 --db-host localhost --run-dir runs/v2-test
 
 # Remote mode (multiple hosts, requires passwordless SSH)
-python run_test_v2.py --mode remote --agent-type resource --agents 30 --agents-per-host 5 --topology ring --jobs 1000 --db-host 10.0.0.5 --agent-hosts-file hosts.txt --run-dir runs/remote-test
+python run_test.py --mode remote --agent-type resource --agents 30 --agents-per-host 5 --topology ring --jobs 1000 --db-host 10.0.0.5 --agent-hosts-file hosts.txt --run-dir runs/remote-test
 ```
 
 ### LLM Agents
@@ -166,8 +168,20 @@ python batch_tests_v2.py --runs 10 --base-out runs/batch --mode local --agent-ty
 
 ### Visualizations
 
+All plotting functionality lives in the `plotting/` package. Top-level scripts are thin CLI wrappers for backward compatibility.
+
 ```bash
+# Single-run analysis (latency, conflicts, failures, loads, hierarchical)
 python plot_latency_jobs.py --output_dir runs/test-001 --agents 30 --db_host localhost [--hierarchical]
+
+# Multi-run statistical comparison across topologies/scales
+python plot_multi_run_results.py --base-dir runs/single-site --output-dir runs/single-site/plots
+
+# Scheduler comparison (SWARM vs baselines)
+python plot_comparison.py --swarm-dir runs/swarm --greedy-dir runs/greedy --output-dir runs/comparison
+
+# MAB/hierarchical delegation analysis
+python plot_mab_results.py --db-host localhost --output-dir runs/mab-test
 ```
 
 Generated plots include scheduling latency histograms, jobs per agent, agent load summaries, and (with `--hierarchical`) topology visualizations, agent type comparisons, and LLM overhead analysis.
@@ -267,15 +281,24 @@ Dynamic agents are pre-configured, started when the trigger fires, and join the 
 | `job_distributor.py` | Distribute jobs to Redis at a controlled rate |
 | `dump_db.py` | Inspect Redis database state for debugging |
 | `kill_agents.py` | Simulate agent failures (local/remote, gradual/instant) |
-| `plot_latency_jobs.py` | Visualize scheduling latency, load, and failure metrics |
-| `plot_mab_results.py` | Visualize MAB learning curves and delegation patterns |
-| `plot_comparison.py` | Compare results across multiple runs |
-| `analyze_run.py` | Post-run analysis of metrics and agent behavior |
 
-Run any script with `--help` for full usage details.
+### Plotting (`plotting/` package)
+
+| Module | CLI Wrapper | Purpose |
+|--------|-------------|---------|
+| `plotting/single_run.py` | `plot_latency_jobs.py` | Single-run analysis: latency, conflicts, failures, hierarchical |
+| `plotting/multi_run.py` | `plot_multi_run_results.py` | Multi-run statistical comparison across topologies and scales |
+| `plotting/comparison.py` | `plot_comparison.py` | Scheduler comparison (SWARM vs baselines) |
+| `plotting/mab.py` | `plot_mab_results.py` | MAB learning curves and delegation patterns |
+| `plotting/data.py` | — | Shared data loading/saving (Redis, CSV, JSON) |
+| `plotting/stats.py` | — | Shared statistics helpers (Jain's fairness, safe aggregations) |
+
+Run any CLI wrapper with `--help` for full usage details.
 
 ## Additional Documentation
 
+- [docs/Architecture.md](docs/Architecture.md) — Detailed system architecture and design patterns
+- [docs/ROADMAP.md](docs/ROADMAP.md) — Identified improvements and feature roadmap
 - [HIERARCHICAL_LLM_AGENTS.md](HIERARCHICAL_LLM_AGENTS.md) — LLM agents as Level 1 coordinators in hierarchical topology
 - [CO_PARENT_USAGE.md](CO_PARENT_USAGE.md) — Multi-parent shared parenting for hierarchical failover
 - [MAB_README.md](MAB_README.md) — Multi-Armed Bandit configuration and tuning for delegation
