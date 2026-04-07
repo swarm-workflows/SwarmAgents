@@ -148,6 +148,12 @@ def main():
     ap.add_argument("--agent-hosts-file", default=None, help="File with one hostname per line")
     ap.add_argument("--remote-repo-dir", default="/root/SwarmAgents", help="Remote repo root")
 
+    # Pegasus job integration (passthrough to run_test_v2.py)
+    ap.add_argument("--pegasus-profiles", default=None,
+                    help="Path to Pegasus profiles file (text/export) or Redis host")
+    ap.add_argument("--pegasus-input-type", choices=["text", "redis", "export"], default="text",
+                    help="Format of the Pegasus profiles source (default: text)")
+
     # Logging/output structure per run
     ap.add_argument("--log-subdir-name", default="logs", help="Subdir name for logs inside each run dir")
     ap.add_argument("--debug", action="store_true")
@@ -248,6 +254,11 @@ def main():
         # Job generation: fit-all mode
         if args.fit_all:
             cmd.append("--fit-all")
+
+        # Pegasus job integration
+        if args.pegasus_profiles:
+            cmd += ["--pegasus-profiles", args.pegasus_profiles]
+            cmd += ["--pegasus-input-type", args.pegasus_input_type]
 
         log(f"[{run_name}] Starting test…")
         (logs_dir / "batch_runner.log").write_text(
