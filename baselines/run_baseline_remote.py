@@ -234,6 +234,7 @@ def generate_configs_and_jobs(
     topology: str,
     enable_dtns: bool,
     agent_hosts_file: str | None = None,
+    agents_per_host: int = 1,
 ) -> tuple[str, str]:
     """Generate agent configs and job files. Returns (profiles_path, jobs_dir)."""
     config_dir_path = Path(config_dir)
@@ -248,7 +249,7 @@ def generate_configs_and_jobs(
     ]
 
     if agent_hosts_file:
-        gen_args += ["--agent-hosts-file", agent_hosts_file, "--agents-per-host", "1"]
+        gen_args += ["--agent-hosts-file", agent_hosts_file, "--agents-per-host", str(agents_per_host)]
 
     if enable_dtns:
         gen_args.append("--dtns")
@@ -281,6 +282,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--db-host", type=str, required=True, help="Redis host (must be reachable from all VMs)")
     p.add_argument("--db-port", type=int, default=6379)
     p.add_argument("--agent-hosts-file", type=str, required=True, help="File with one remote hostname per line")
+    p.add_argument("--agents-per-host", type=int, default=1, help="Number of agents per remote host (default: 1)")
     p.add_argument("--run-dir", type=str, required=True)
     p.add_argument("--remote-repo-dir", default="/root/SwarmAgents", help="Repo path on remote hosts")
 
@@ -351,6 +353,7 @@ def main():
             topology=args.topology,
             enable_dtns=not args.no_dtns,
             agent_hosts_file=args.agent_hosts_file,
+            agents_per_host=args.agents_per_host,
         )
 
     # 5. Instantiate scheduler in remote mode

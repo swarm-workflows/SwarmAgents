@@ -24,7 +24,10 @@
 #   --no-dtns             Disable DTN generation
 #   --timeout       SECS  Max run time per test in seconds (default: 600)
 #   --debug               Enable debug logging
+#   --agents-per-host N   Agents per remote host (default: 1)
 #   --agent-hosts-file F  Hosts file for remote mode (one hostname per line)
+#                         If omitted, auto-generated as agent-1..agent-N based on
+#                         --agents and --agents-per-host
 #   --remote-repo-dir DIR Repo path on remote hosts (default: /root/SwarmAgents)
 #   --skip-preflight      Skip SSH preflight checks (remote mode)
 #   --worker-timeout SECS Seconds to wait for workers to register (default: 30)
@@ -39,10 +42,18 @@
 #   # Local: only greedy, 5 runs
 #   sudo ./run_centralized_baselines.sh --schedulers greedy --runs 5
 #
-#   # Remote: distribute execution across 30 VMs
+#   # Remote: provide an explicit hosts file
 #   sudo ./run_centralized_baselines.sh --mode remote \
 #     --agent-hosts-file agent_hosts.txt --db-host 10.0.0.1 \
 #     --agents 30 --jobs 500 --runs 10
+#
+#   # Remote: auto-generate hosts (30 agents, 1 per host → agent-1..agent-30)
+#   sudo ./run_centralized_baselines.sh --mode remote \
+#     --db-host database --agents 30 --jobs 500 --runs 10
+#
+#   # Remote: 30 agents across 10 hosts (3 per host → agent-1..agent-10)
+#   sudo ./run_centralized_baselines.sh --mode remote \
+#     --db-host database --agents 30 --agents-per-host 3 --runs 10
 #
 #   # Remote: reuse existing jobs and profiles
 #   sudo ./run_centralized_baselines.sh --mode remote \
@@ -66,6 +77,7 @@ NO_DTNS=""
 TIMEOUT=600
 DEBUG=""
 PYTHON=python3.11
+AGENTS_PER_HOST=1
 AGENT_HOSTS_FILE=""
 REMOTE_REPO_DIR="/root/SwarmAgents"
 SKIP_PREFLIGHT=""
@@ -88,6 +100,7 @@ while [[ $# -gt 0 ]]; do
     --timeout)          TIMEOUT="$2";           shift 2 ;;
     --debug)            DEBUG="--debug";        shift ;;
     --python)           PYTHON="$2";            shift 2 ;;
+    --agents-per-host)  AGENTS_PER_HOST="$2";   shift 2 ;;
     --agent-hosts-file) AGENT_HOSTS_FILE="$2";  shift 2 ;;
     --remote-repo-dir)  REMOTE_REPO_DIR="$2";   shift 2 ;;
     --skip-preflight)   SKIP_PREFLIGHT="--skip-preflight"; shift ;;
@@ -105,12 +118,19 @@ if [[ "$MODE" != "local" && "$MODE" != "remote" ]]; then
   echo "ERROR: --mode must be 'local' or 'remote' (got '$MODE')" >&2; exit 1
 fi
 
-if [[ "$MODE" == "remote" && -z "$AGENT_HOSTS_FILE" ]]; then
-  echo "ERROR: --agent-hosts-file is required for remote mode" >&2; exit 1
-fi
-
 if [[ "$MODE" == "remote" && -n "$AGENT_HOSTS_FILE" && ! -f "$AGENT_HOSTS_FILE" ]]; then
   echo "ERROR: agent hosts file '$AGENT_HOSTS_FILE' not found" >&2; exit 1
+fi
+
+# ─── Auto-generate agent_hosts.txt if not provided (remote mode) ──
+if [[ "$MODE" == "remote" && -z "$AGENT_HOSTS_FILE" ]]; then
+  NUM_HOSTS=$(( (AGENTS + AGENTS_PER_HOST - 1) / AGENTS_PER_HOST ))
+  AGENT_HOSTS_FILE="agent_hosts.txt"
+  log "Auto-generating $AGENT_HOSTS_FILE: $NUM_HOSTS hosts ($AGENTS agents, $AGENTS_PER_HOST per host)"
+  > "$AGENT_HOSTS_FILE"
+  for i in $(seq 1 "$NUM_HOSTS"); do
+    echo "agent-$i" >> "$AGENT_HOSTS_FILE"
+  done
 fi
 
 # ─── Resolve paths ─────────────────────────────────────────────────
@@ -167,6 +187,7 @@ log "  Output base:       $BASE_DIR"
 log "  Reuse jobs:        $REUSE_JOBS"
 if [[ "$MODE" == "remote" ]]; then
 log "  Hosts file:        $AGENT_HOSTS_FILE"
+log "  Agents/host:       $AGENTS_PER_HOST"
 log "  Remote repo dir:   $REMOTE_REPO_DIR"
 log "  Worker timeout:    ${WORKER_TIMEOUT}s"
 fi
@@ -198,7 +219,7 @@ for SCHEDULER in "${SCHED_LIST[@]}"; do
     log "[$COMPLETED/$TOTAL_TESTS] $SCHEDULER run $RUN_NUM → $RUN_DIR ($MODE)"
 
     if [[ "$MODE" == "remote" ]]; then
-      REMOTE_FLAGS="--agent-hosts-file $AGENT_HOSTS_FILE --remote-repo-dir $REMOTE_REPO_DIR --worker-timeout $WORKER_TIMEOUT"
+      REMOTE_FLAGS="--agent-hosts-file $AGENT_HOSTS_FILE --agents-per-host $AGENTS_PER_HOST --remote-repo-dir $REMOTE_REPO_DIR --worker-timeout $WORKER_TIMEOUT"
       [[ -n "$SKIP_PREFLIGHT" ]] && REMOTE_FLAGS="$REMOTE_FLAGS $SKIP_PREFLIGHT"
       RUN_SCRIPT="baselines/run_baseline_remote.py"
     else
