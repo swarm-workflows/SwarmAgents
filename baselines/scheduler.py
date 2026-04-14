@@ -50,6 +50,7 @@ class BaselineScheduler(ABC):
         long_job_threshold: float = 20.0,
         connectivity_penalty_factor: float = 1.0,
         timeout: float = 600.0,
+        remote: bool = False,
     ):
         self.db_host = db_host
         self.db_port = db_port
@@ -63,6 +64,7 @@ class BaselineScheduler(ABC):
         self.level = level
         self.group = group
         self.timeout = timeout
+        self.remote = remote
 
         # Cost function parameters (match ResourceAgent defaults)
         cw = cost_weights or {}
@@ -81,6 +83,7 @@ class BaselineScheduler(ABC):
         self.assigned_count = 0
         self.start_time: float = 0.0
         self._futures: list[Future] = []
+        self._remote_released: set[str] = set()  # job IDs whose capacity has been released (remote mode)
 
         os.makedirs(self.run_dir, exist_ok=True)
 
@@ -241,19 +244,20 @@ class BaselineScheduler(ABC):
         finally:
             agent.release(job.capacities)
 
-        # Save completed job to Redis
+        # Save completed job to Redis (no explicit key — let save() derive it)
         self.repo.save(
             obj=job.to_dict(),
             key_prefix="job",
-            key=str(job.job_id),
             level=self.level,
             group=self.group,
         )
-        self.completed_count += 1
-        if self.completed_count % 50 == 0:
+        with self._completed_lock:
+            self.completed_count += 1
+            count = self.completed_count
+        if count % 50 == 0:
             logger.info(
                 "Progress: %d/%d jobs completed (%.1fs elapsed)",
-                self.completed_count,
+                count,
                 self.total_jobs,
                 time.time() - self.start_time,
             )
@@ -270,13 +274,39 @@ class BaselineScheduler(ABC):
 
     # ── Main Run Loop ──────────────────────────────────────────────
 
+    def _poll_completed_count(self) -> int:
+        """Count COMPLETE jobs in Redis and release capacity for newly completed ones (remote mode)."""
+        completed_dicts = self.repo.get_all_objects(
+            key_prefix="job",
+            level=self.level,
+            group=self.group,
+            state=ObjectState.COMPLETE.value,
+        )
+
+        # Release capacity for newly completed jobs
+        agent_map = {a.agent_id: a for a in self.agents}
+        for jd in completed_dicts:
+            if isinstance(jd, str):
+                jd = json.loads(jd)
+            jid = jd.get("id")
+            if jid and jid not in self._remote_released:
+                self._remote_released.add(jid)
+                leader = jd.get("leader_id")
+                cap_dict = jd.get("capacities")
+                if leader is not None and cap_dict:
+                    agent = agent_map.get(int(leader))
+                    if agent:
+                        agent.release(Capacities.from_dict(cap_dict))
+
+        return len(completed_dicts)
+
     def run(self):
         """Main scheduling loop.
 
         1. Start JobDistributor thread for rate-controlled submission
         2. Poll Redis for PENDING jobs
         3. Call assign_jobs() — strategy-specific
-        4. Submit assigned jobs to ThreadPoolExecutor
+        4. Submit assigned jobs to ThreadPoolExecutor (local) or let workers handle (remote)
         5. Re-queue unassigned jobs (waiting queue)
         6. Exit when all jobs COMPLETE or timeout
         """
@@ -303,13 +333,19 @@ class BaselineScheduler(ABC):
         self.start_time = time.time()
         self.completed_count = 0
         self.assigned_count = 0
+        self._completed_lock = threading.Lock()
         waiting_queue: list[Job] = []
+        seen_ids: set[str] = set()  # track jobs already assigned/in-flight
 
-        executor = ThreadPoolExecutor(max_workers=self.executor_workers)
+        executor = None
+        if not self.remote:
+            executor = ThreadPoolExecutor(max_workers=self.executor_workers)
 
+        mode_str = "REMOTE" if self.remote else "LOCAL"
         logger.info(
-            "Starting %s with %d agents, %d jobs (timeout=%.0fs)",
+            "Starting %s [%s] with %d agents, %d jobs (timeout=%.0fs)",
             self.__class__.__name__,
+            mode_str,
             len(self.agents),
             self.total_jobs,
             self.timeout,
@@ -321,6 +357,12 @@ class BaselineScheduler(ABC):
                 if elapsed > self.timeout:
                     logger.warning("Timeout reached (%.0fs). Stopping.", elapsed)
                     break
+
+                # In remote mode, refresh completed count from Redis
+                if self.remote:
+                    self.completed_count = self._poll_completed_count()
+                    if self.completed_count >= self.total_jobs:
+                        break
 
                 # Poll Redis for PENDING jobs
                 pending_dicts = self.repo.get_all_objects(
@@ -337,10 +379,17 @@ class BaselineScheduler(ABC):
                     job = Job()
                     job.from_dict(jd)
                     job.level = self.level
+                    # Skip jobs already assigned or in-flight
+                    if job.job_id in seen_ids:
+                        continue
                     new_jobs.append(job)
 
-                # Combine with waiting queue
-                batch = waiting_queue + new_jobs
+                # Combine with waiting queue, dedup by job_id
+                waiting_ids = {j.job_id for j in waiting_queue}
+                for nj in new_jobs:
+                    if nj.job_id not in waiting_ids:
+                        waiting_queue.append(nj)
+                batch = waiting_queue
                 waiting_queue = []
 
                 if not batch:
@@ -362,8 +411,9 @@ class BaselineScheduler(ABC):
                     if job.job_id not in assigned_ids:
                         waiting_queue.append(job)
 
-                # Execute assigned jobs
+                # Process assigned jobs
                 for job, agent in assignments:
+                    seen_ids.add(job.job_id)
                     job.mark_assigned()
                     job.leader_id = agent.agent_id
                     job.state = ObjectState.READY
@@ -372,21 +422,36 @@ class BaselineScheduler(ABC):
                     self.repo.save(
                         obj=job.to_dict(),
                         key_prefix="job",
-                        key=str(job.job_id),
                         level=self.level,
                         group=self.group,
                     )
 
-                    # Allocate capacity and submit to thread pool
                     agent.allocate(job.capacities)
                     self.assigned_count += 1
-                    executor.submit(self._execute_on_agent, job, agent)
+
+                    if not self.remote:
+                        # Local mode: execute in thread pool
+                        executor.submit(self._execute_on_agent, job, agent)
+
+                if self.remote and self.assigned_count % 50 < len(assignments):
+                    logger.info(
+                        "Progress: %d assigned, %d/%d completed (%.1fs elapsed)",
+                        self.assigned_count,
+                        self.completed_count,
+                        self.total_jobs,
+                        time.time() - self.start_time,
+                    )
 
                 time.sleep(0.5)
 
         finally:
             distributor.shutdown_flag.set()
-            executor.shutdown(wait=True)
+            if executor is not None:
+                executor.shutdown(wait=True)
+
+        # Final completed count in remote mode
+        if self.remote:
+            self.completed_count = self._poll_completed_count()
 
         elapsed = time.time() - self.start_time
         logger.info(

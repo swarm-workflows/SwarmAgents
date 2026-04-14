@@ -14,11 +14,13 @@ from swarm.models.data_node import DataNode
 class SimulatedAgent:
     """Thread-safe simulated agent that tracks resource allocation."""
 
-    def __init__(self, agent_id: int, capacities: Capacities, dtns: dict[str, DataNode]):
+    def __init__(self, agent_id: int, capacities: Capacities, dtns: dict[str, DataNode],
+                 host: str = "localhost"):
         self.agent_id = agent_id
         self.capacities = capacities          # total capacity
         self.current_alloc = Capacities()     # currently consumed by running jobs
         self.dtns = dtns                      # {dtn_name: DataNode}
+        self.host = host                      # remote hostname for distributed mode
         self.lock = threading.Lock()
         self.jobs_completed = 0
 
@@ -65,4 +67,12 @@ class SimulatedAgent:
             dn = DataNode.from_dict(dtn_data)
             dtns[dn.name] = dn
 
-        return cls(agent_id=agent_id, capacities=cap, dtns=dtns)
+        # Host field: check grpc.host (from generate_configs), then top-level host
+        host = "localhost"
+        grpc_cfg = profile.get("grpc", {})
+        if isinstance(grpc_cfg, dict) and grpc_cfg.get("host"):
+            host = grpc_cfg["host"]
+        elif profile.get("host"):
+            host = profile["host"]
+
+        return cls(agent_id=agent_id, capacities=cap, dtns=dtns, host=host)
