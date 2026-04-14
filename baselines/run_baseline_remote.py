@@ -385,6 +385,16 @@ def main():
     )
     scheduler.load_agents()
 
+    # 5b. Patch agent hosts from hosts file if profiles lack host info
+    #     (handles agent_profiles.json generated before grpc.host was included)
+    agents_missing_host = [a for a in scheduler.agents if a.host == "localhost"]
+    if agents_missing_host and host_list:
+        log(f"Patching {len(agents_missing_host)} agents with hosts from {args.agent_hosts_file}")
+        for agent in scheduler.agents:
+            host_idx = (agent.agent_id - 1) // args.agents_per_host
+            if host_idx < len(host_list):
+                agent.host = host_list[host_idx]
+
     # 6. Start workers on remote hosts
     host_agents = start_workers(
         agents=scheduler.agents,

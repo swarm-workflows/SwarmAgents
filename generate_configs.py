@@ -751,7 +751,11 @@ class SwarmConfigGenerator:
                 "ram": caps['ram'],
                 "disk": caps['disk'],
                 "gpu": caps['gpu'],
-                "dtns": dtns
+                "dtns": dtns,
+                "grpc": {
+                    "host": config.get('grpc', {}).get('host', 'localhost'),
+                    "port": config.get('grpc', {}).get('port', 50051),
+                },
             }
 
         # Persist DTN assignments (if any)
