@@ -64,6 +64,7 @@ def ssh(host: str, cmd: str) -> int:
         "-o", "StrictHostKeyChecking=no",
         "-o", "UserKnownHostsFile=/dev/null",
         "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=10",
         host,
         cmd,
     ])
@@ -75,6 +76,7 @@ def ssh_check(host: str, cmd: str) -> None:
         "-o", "StrictHostKeyChecking=no",
         "-o", "UserKnownHostsFile=/dev/null",
         "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=10",
         host,
         cmd,
     ], text=True, check=True)
@@ -86,6 +88,7 @@ def ssh_output(host: str, cmd: str) -> str:
         "-o", "StrictHostKeyChecking=no",
         "-o", "UserKnownHostsFile=/dev/null",
         "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=10",
         host,
         cmd,
     ], text=True, capture_output=True, check=True)

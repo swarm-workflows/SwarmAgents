@@ -122,6 +122,12 @@ if [[ "$MODE" == "remote" && -n "$AGENT_HOSTS_FILE" && ! -f "$AGENT_HOSTS_FILE" 
   echo "ERROR: agent hosts file '$AGENT_HOSTS_FILE' not found" >&2; exit 1
 fi
 
+# ─── Resolve paths ─────────────────────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
+
+log() { printf '[%(%Y-%m-%d %H:%M:%S)T] %s\n' -1 "$*"; }
+
 # ─── Auto-generate agent_hosts.txt if not provided (remote mode) ──
 if [[ "$MODE" == "remote" && -z "$AGENT_HOSTS_FILE" ]]; then
   NUM_HOSTS=$(( (AGENTS + AGENTS_PER_HOST - 1) / AGENTS_PER_HOST ))
@@ -132,12 +138,6 @@ if [[ "$MODE" == "remote" && -z "$AGENT_HOSTS_FILE" ]]; then
     echo "agent-$i" >> "$AGENT_HOSTS_FILE"
   done
 fi
-
-# ─── Resolve paths ─────────────────────────────────────────────────
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-cd "$SCRIPT_DIR"
-
-log() { printf '[%(%Y-%m-%d %H:%M:%S)T] %s\n' -1 "$*"; }
 
 # ─── Verify prerequisites ──────────────────────────────────────────
 log "Checking prerequisites..."
