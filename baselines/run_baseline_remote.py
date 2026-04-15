@@ -167,7 +167,8 @@ def start_workers(
                 f"nohup python3.11 baselines/baseline_worker.py "
                 f"--agent-id {aid} --db-host {db_host} --db-port {db_port} "
                 f"--level {level} --group {group} "
-                f"> baseline-worker-{aid}.log 2>&1 & echo $!"
+                f"</dev/null > baseline-worker-{aid}.log 2>&1 & "
+                f"echo $!"
             )
             try:
                 pid = ssh_output(host, cmd)
