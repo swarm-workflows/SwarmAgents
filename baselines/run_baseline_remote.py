@@ -164,11 +164,7 @@ def start_workers(
         for aid in agent_ids:
             cmd = (
                 f"cd {shlex.quote(remote_repo_dir)} && "
-                f"nohup python3.11 baselines/baseline_worker.py "
-                f"--agent-id {aid} --db-host {db_host} --db-port {db_port} "
-                f"--level {level} --group {group} "
-                f"</dev/null > baseline-worker-{aid}.log 2>&1 & "
-                f"echo $!"
+                f"bash baseline-worker-start.sh {aid} {db_host} {db_port}"
             )
             try:
                 pid = ssh_output(host, cmd)

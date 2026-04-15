@@ -17,6 +17,7 @@ nohup python3.11 baselines/baseline_worker.py \
     --agent-id "$AGENT_ID" \
     --db-host "$DB_HOST" \
     --db-port "$DB_PORT" \
-    > "baseline-worker-${AGENT_ID}.log" 2>&1 &
+    </dev/null >"baseline-worker-${AGENT_ID}.log" 2>&1 &
+disown
 
 echo $!
