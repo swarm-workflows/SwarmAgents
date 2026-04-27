@@ -75,8 +75,8 @@ def main():
     ap.add_argument("--tar-after", action="store_true", help="Tar.gz each run directory after completion")
 
     # Path to the v2 runner
-    ap.add_argument("--runner", default="run_test_v2.py",
-                    help="Path to run_test_v2.py (default: run_test_v2.py)")
+    ap.add_argument("--runner", default="run_test.py",
+                    help="Path to run_test.py (default: run_test.py)")
 
     # ---- Passthrough to run_test_v2.py (required / common) ----
     ap.add_argument("--mode", choices=["local", "remote"], default="local",
