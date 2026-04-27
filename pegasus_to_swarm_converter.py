@@ -10,6 +10,7 @@ YAML configs so that agents have the right DTNs and enough capacity to run the
 converted jobs.
 
 Input sources:
+  - json:   all_runs_jobs_profile.json (JSON array of profile dicts)
   - text:   all_profiles.txt (alternating Key/JSON lines)
   - redis:  Redis keys matching pegasus:profile:*
   - export: pegasus_export.json (lines of SET <key> '<json>')
@@ -80,10 +81,22 @@ def parse_export_file(path: str) -> Iterator[Tuple[str, dict]]:
                 yield key, profile
 
 
+def parse_json_file(path: str) -> Iterator[Tuple[str, dict]]:
+    """Parse all_runs_jobs_profile.json: a JSON array of profile dicts."""
+    with open(path, "r") as fh:
+        profiles = json.load(fh)
+    for profile in profiles:
+        run_name = profile.get("run_name", "unknown")
+        job_name = profile.get("job_name", f"job_{profile.get('job_id_db', 0)}")
+        key = f"pegasus:profile:{run_name}:{job_name}"
+        yield key, profile
+
+
 PARSERS = {
     "text": parse_text_file,
     "redis": parse_redis,
     "export": parse_export_file,
+    "json": parse_json_file,
 }
 
 
@@ -522,6 +535,8 @@ def convert_pegasus_profiles(
         profiles = list(parse_redis(input_path, redis_port))
     elif input_type == "export":
         profiles = list(parse_export_file(input_path))
+    elif input_type == "json":
+        profiles = list(parse_json_file(input_path))
     else:
         profiles = list(parse_text_file(input_path))
 
@@ -619,6 +634,8 @@ def convert(args: argparse.Namespace):
         profiles = list(parse_redis(args.input, args.redis_port))
     elif args.input_type == "export":
         profiles = list(parse_export_file(args.input))
+    elif args.input_type == "json":
+        profiles = list(parse_json_file(args.input))
     else:
         profiles = list(parse_text_file(args.input))
 
@@ -744,8 +761,8 @@ def parse_args() -> argparse.Namespace:
         help="Path to all_profiles.txt / pegasus_export.json, or Redis host."
     )
     parser.add_argument(
-        "--input-type", required=True, choices=["text", "redis", "export"],
-        help="Input format: text (all_profiles.txt), redis, or export."
+        "--input-type", required=True, choices=["text", "redis", "export", "json"],
+        help="Input format: json (all_runs_jobs_profile.json), text, redis, or export."
     )
     parser.add_argument(
         "--output-dir", required=True,

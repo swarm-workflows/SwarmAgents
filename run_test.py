@@ -664,7 +664,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--pegasus-profiles", default=None,
                     help="Path to Pegasus profiles file (text/export) or Redis host. "
                          "When set, jobs are converted from Pegasus profiles instead of generated synthetically.")
-    ap.add_argument("--pegasus-input-type", choices=["text", "redis", "export"], default="text",
+    ap.add_argument("--pegasus-input-type", choices=["text", "redis", "export", "json"], default="text",
                     help="Format of the Pegasus profiles source (default: text)")
 
     # Output

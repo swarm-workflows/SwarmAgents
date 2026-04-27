@@ -88,6 +88,76 @@ Stop workers on all hosts:
 # Reads agent_hosts.txt, SSH into each, kill baseline_worker.py
 ```
 
+### 5. `run_centralized_baselines.sh`
+Batch runner that executes all three centralized baseline schedulers (Greedy, Round-Robin, Random) with multiple iterations for statistical significance. Supports both local and remote modes.
+
+```
+Usage: sudo ./run_centralized_baselines.sh [OPTIONS]
+```
+
+**Options:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--mode MODE` | `local` | Execution mode: `local` or `remote` |
+| `--agents N` | `30` | Number of agents |
+| `--jobs N` | `500` | Total number of jobs |
+| `--runs N` | `10` | Iterations per scheduler |
+| `--db-host HOST` | `localhost` | Redis host |
+| `--db-port PORT` | `6379` | Redis port |
+| `--jobs-per-interval N` | `10` | Jobs submitted per interval |
+| `--base-dir DIR` | `runs/baselines` | Base output directory |
+| `--schedulers LIST` | `greedy,round-robin,random` | Comma-separated schedulers to run |
+| `--reuse-jobs` | — | Reuse existing `jobs/` and `agent_profiles.json` |
+| `--no-dtns` | — | Disable DTN generation |
+| `--timeout SECS` | `600` | Max run time per test in seconds |
+| `--debug` | — | Enable debug logging |
+| `--agents-per-host N` | `1` | Agents per remote host (remote mode) |
+| `--agent-hosts-file F` | — | Hosts file for remote mode; auto-generates `agent-1..agent-N` if omitted |
+| `--remote-repo-dir DIR` | `/root/SwarmAgents` | Repo path on remote hosts |
+| `--skip-preflight` | — | Skip SSH preflight checks (remote mode) |
+| `--worker-timeout SECS` | `30` | Seconds to wait for workers to register (remote mode) |
+
+**Examples:**
+
+```bash
+# Local: all 3 schedulers, 10 runs each (default)
+sudo ./run_centralized_baselines.sh
+
+# Local: quick test, 1 run, reuse existing jobs
+sudo ./run_centralized_baselines.sh --runs 1 --reuse-jobs
+
+# Local: only greedy, 5 runs
+sudo ./run_centralized_baselines.sh --schedulers greedy --runs 5
+
+# Remote: explicit hosts file
+sudo ./run_centralized_baselines.sh --mode remote \
+    --agent-hosts-file agent_hosts.txt --db-host 10.0.0.1 \
+    --agents 30 --jobs 500 --runs 10
+
+# Remote: auto-generate hosts (30 agents, 1 per host → agent-1..agent-30)
+sudo ./run_centralized_baselines.sh --mode remote \
+    --db-host database --agents 30 --jobs 500 --runs 10
+
+# Remote: 30 agents across 10 hosts (3 per host)
+sudo ./run_centralized_baselines.sh --mode remote \
+    --db-host database --agents 30 --agents-per-host 3 --runs 10
+```
+
+**Output structure:**
+```
+runs/baselines/
+├── greedy/
+│   ├── run-1/all_jobs.csv
+│   ├── run-2/all_jobs.csv
+│   └── ...
+├── round-robin/
+│   └── ...
+├── random/
+│   └── ...
+└── failures.log
+```
+
 ## Files Modified
 
 ### 5. `baselines/scheduler.py` — Refactored for reuse
