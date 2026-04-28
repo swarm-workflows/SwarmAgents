@@ -467,6 +467,13 @@ class SwarmConfigGenerator:
                 num_super_groups = 0  # No Level 2
                 level_1_base = 26
 
+            elif self.num_agents == 60:
+                # Two-level: 50 Level-0 (10 groups of 5) + 10 Level-1 = 60
+                num_groups = 10
+                group_size = 5
+                num_super_groups = 0  # No Level 2
+                level_1_base = 51
+
             elif self.num_agents == 100:
                 # Three-level: Level-0 80 - 16 groups of 5
                 # Level-1: 16 (81-96) - 4 groups of 4
@@ -518,7 +525,7 @@ class SwarmConfigGenerator:
                 level_2_base = 991
 
             else:
-                print(f"Hierarchical topology currently supports 30, 100, 110, 250, 990, or 1000 agents (got {self.num_agents})")
+                print(f"Hierarchical topology currently supports 30, 60, 100, 110, 250, 990, or 1000 agents (got {self.num_agents})")
                 return
 
             # Build co-parent assignment map (circular round-robin)
