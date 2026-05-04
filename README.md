@@ -89,7 +89,7 @@ The selection engine builds a cost matrix (agents x jobs), then selects the mini
 3. Quorum reached (`ceil((n+1)/2)`) finalizes assignment
 4. Dynamic quorum adjusts based on live agent count
 
-See [message_complexity.md](message_complexity.md) for detailed message complexity analysis.
+See [COMPLEXITY.md](docs/COMPLEXITY.md) for detailed message complexity analysis.
 
 ### Job Execution
 
@@ -120,9 +120,9 @@ Supports mixed agent types (LLM coordinators + Resource workers), co-parent fail
 | 100, 1000 | 3-tier | Level 2 | L2 -> L1 -> L0 |
 
 See detailed guides:
-- [HIERARCHICAL_LLM_AGENTS.md](HIERARCHICAL_LLM_AGENTS.md) — LLM/Resource agent mixing
-- [CO_PARENT_USAGE.md](CO_PARENT_USAGE.md) — Multi-parent shared parenting and failover
-- [MAB_README.md](MAB_README.md) — Multi-Armed Bandit delegation for hierarchical topologies
+- [docs/HIERARCHICAL_LLM_AGENTS.md](docs/HIERARCHICAL_LLM_AGENTS.md) — LLM/Resource agent mixing
+- [docs/CO_PARENT_USAGE.md](docs/CO_PARENT_USAGE.md) — Multi-parent shared parenting and failover
+- [docs/MAB_README.md](docs/MAB_README.md) — Multi-Armed Bandit delegation for hierarchical topologies
 
 ## Testing
 
@@ -295,11 +295,22 @@ Dynamic agents are pre-configured, started when the trigger fires, and join the 
 
 Run any CLI wrapper with `--help` for full usage details.
 
-## Additional Documentation
+## Documentation
 
-- [docs/Architecture.md](docs/Architecture.md) — Detailed system architecture and design patterns
-- [docs/ROADMAP.md](docs/ROADMAP.md) — Identified improvements and feature roadmap
-- [HIERARCHICAL_LLM_AGENTS.md](HIERARCHICAL_LLM_AGENTS.md) — LLM agents as Level 1 coordinators in hierarchical topology
-- [CO_PARENT_USAGE.md](CO_PARENT_USAGE.md) — Multi-parent shared parenting for hierarchical failover
-- [MAB_README.md](MAB_README.md) — Multi-Armed Bandit configuration and tuning for delegation
-- [message_complexity.md](message_complexity.md) — PBFT message complexity analysis
+All documentation lives in the [`docs/`](docs/) directory.
+
+### Architecture & Design
+- [ARCHITECTURE.md](docs/ARCHITECTURE.md) — System architecture, five-layer design, and adapter patterns
+- [COMPLEXITY.md](docs/COMPLEXITY.md) — PBFT message complexity analysis for mesh and hierarchical topologies
+- [GOSSIP_CONSENSUS_DESIGN.md](docs/GOSSIP_CONSENSUS_DESIGN.md) — Design document for gossip-based consensus (future work)
+
+### Hierarchical Topology
+- [HIERARCHICAL_LLM_AGENTS.md](docs/HIERARCHICAL_LLM_AGENTS.md) — LLM agents as Level-1 coordinators in hierarchical topology
+- [CO_PARENT_USAGE.md](docs/CO_PARENT_USAGE.md) — Multi-parent shared parenting and coordinator failover
+- [MAB_README.md](docs/MAB_README.md) — Multi-Armed Bandit configuration and tuning for delegation
+
+### Baselines & Evaluation
+- [DISTRIBUTED_BASELINE_DESIGN.md](docs/DISTRIBUTED_BASELINE_DESIGN.md) — Design for distributed baseline schedulers with remote execution
+
+### Project Planning
+- [ROADMAP.md](docs/ROADMAP.md) — Identified improvements and feature roadmap

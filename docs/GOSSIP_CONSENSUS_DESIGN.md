@@ -2,7 +2,7 @@
 
 > **Status:** Proposal (pre-implementation design document)
 > **Author:** SWARM+ Team
-> **Related:** [ROADMAP.md](ROADMAP.md) (line 147-149), [message_complexity.md](../message_complexity.md)
+> **Related:** [ROADMAP.md](ROADMAP.md) (line 147-149), [COMPLEXITY.md](COMPLEXITY.md)
 
 ---
 
@@ -729,5 +729,5 @@ The migration is designed as four incremental phases, each independently useful 
 1. **SWIM Protocol:** Das, A., Gupta, I., & Motivala, A. (2002). "SWIM: Scalable Weakly-consistent Infection-style Process Group Membership Protocol." DSN 2002.
 2. **Avalanche Consensus:** Team Rocket (2018). "Scalable and Probabilistic Leaderless BFT Consensus through Metastability." arXiv:1906.08936.
 3. **Epidemic Algorithms:** Demers, A., et al. (1987). "Epidemic Algorithms for Replicated Database Maintenance." PODC 1987.
-4. **Current SWARM+ Complexity:** [message_complexity.md](../message_complexity.md) — O(n²/m²) with mesh grouping.
+4. **Current SWARM+ Complexity:** [COMPLEXITY.md](COMPLEXITY.md) — O(n²/m²) with mesh grouping.
 5. **SWARM+ Roadmap:** [ROADMAP.md](ROADMAP.md) — Gossip-based protocol identified for 1000+ agent deployments.

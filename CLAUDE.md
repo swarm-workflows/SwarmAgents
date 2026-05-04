@@ -139,9 +139,13 @@ Consensus and selection engines are **decoupled** from agents via adapter classe
 
 ## Additional Documentation
 
-- `docs/Architecture.md` — Detailed system architecture and design patterns
+- `docs/ARCHITECTURE.md` — System architecture, five-layer design, and adapter patterns
 - `docs/ROADMAP.md` — Identified improvements and feature roadmap
-- `CO_PARENT_USAGE.md` — Multi-parent shared parenting for hierarchical topology
-- `HIERARCHICAL_LLM_AGENTS.md` — LLM agents as Level 1 coordinators
-- `MAB_README.md` — Multi-Armed Bandit configuration for delegation
-- `message_complexity.md` — PBFT message complexity analysis
+- `docs/CO_PARENT_USAGE.md` — Multi-parent shared parenting for hierarchical topology
+- `docs/HIERARCHICAL_LLM_AGENTS.md` — LLM agents as Level 1 coordinators
+- `docs/MAB_README.md` — Multi-Armed Bandit configuration for delegation
+- `docs/COMPLEXITY.md` — PBFT message complexity analysis (mesh and hierarchical)
+- `docs/GOSSIP_CONSENSUS_DESIGN.md` — Gossip-based consensus design (future work)
+- `docs/DISTRIBUTED_BASELINE_DESIGN.md` — Distributed baseline scheduler design
+- `docs/ARCHITECTURE.md` — System architecture, five-layer design, and adapter patterns
+- `docs/ROADMAP.md` — Feature roadmap and identified improvements
