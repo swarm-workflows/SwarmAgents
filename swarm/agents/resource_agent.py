@@ -1962,16 +1962,18 @@ class ResourceAgent(Agent):
         affected_job_ids = set()
 
         # Check incoming proposals waiting for failed agent's votes
-        #for job_id, proposals in list(self.engine.incoming.proposals_by_object_id.items()):
         for job_id in self.engine.incoming.objects():
-            proposals = self.engine.incoming.get_proposals_by_object_id(job_id)
-            for p_id, prop_info in list(proposals.items()):
+            proposal_list = self.engine.incoming.get_proposals_by_object_id(job_id)
+            cleared_any = False
+            for prop_info in proposal_list:
+                p_id = prop_info.p_id
                 # Check if this proposal involves the failed agent
                 if failed_agent_id == prop_info.agent_id:
                     # Proposal was FROM the failed agent - remove it
-                    proposals.pop(p_id, None)
+                    self.engine.incoming.remove_proposal(p_id, object_id=job_id)
                     cleared_proposals.append((job_id, p_id, 'incoming', 'from_failed'))
                     affected_job_ids.add(job_id)
+                    cleared_any = True
                     self.logger.info(
                         f"Cleared incoming proposal {p_id} for job {job_id} "
                         f"(proposal from failed agent {failed_agent_id})"
@@ -1979,34 +1981,37 @@ class ResourceAgent(Agent):
                 elif failed_agent_id in prop_info.prepares:
                     # Failed agent already voted prepare - proposal stuck waiting for commits
                     # Remove the proposal since quorum calculation changed
-                    proposals.pop(p_id, None)
+                    self.engine.incoming.remove_proposal(p_id, object_id=job_id)
                     cleared_proposals.append((job_id, p_id, 'incoming', 'has_prepare'))
                     affected_job_ids.add(job_id)
+                    cleared_any = True
                     self.logger.info(
                         f"Cleared incoming proposal {p_id} for job {job_id} "
                         f"(failed agent {failed_agent_id} in prepare list)"
                     )
 
             # Clean up empty job entries
-            if not proposals:
+            if cleared_any and not self.engine.incoming.get_proposals_by_object_id(job_id):
                 self.engine.incoming.remove_object(job_id)
 
         # Check outgoing proposals this agent sent
-        #for job_id, proposals in list(self.engine.outgoing.proposals_by_object_id.items()):
         for job_id in self.engine.outgoing.objects():
-            proposals = self.engine.outgoing.get_proposals_by_object_id(job_id)
-            for p_id, prop_info in list(proposals.items()):
+            proposal_list = self.engine.outgoing.get_proposals_by_object_id(job_id)
+            cleared_any = False
+            for prop_info in proposal_list:
+                p_id = prop_info.p_id
                 # Check if waiting for failed agent's prepare/commit
                 if failed_agent_id in prop_info.prepares or prop_info.agent_id == failed_agent_id:
-                    proposals.pop(p_id, None)
+                    self.engine.outgoing.remove_proposal(p_id, object_id=job_id)
                     cleared_proposals.append((job_id, p_id, 'outgoing', 'waiting_for_failed'))
                     affected_job_ids.add(job_id)
+                    cleared_any = True
                     self.logger.info(
                         f"Cleared outgoing proposal {p_id} for job {job_id} "
                         f"(waiting for failed agent {failed_agent_id})"
                     )
 
-            if not proposals:
+            if cleared_any and not self.engine.outgoing.get_proposals_by_object_id(job_id):
                 self.engine.outgoing.remove_object(job_id)
 
         # Reset affected jobs to PENDING state so they can be reselected
