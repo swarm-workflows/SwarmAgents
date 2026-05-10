@@ -586,6 +586,31 @@ class ResourceAgent(Agent):
             # Clean up delegation map entry if not already handled by MAB
             if job_id in self.job_delegation_map:
                 self.job_delegation_map.remove(job_id)
+            # Propagate completion to L1: mark the parent-level job as COMPLETE
+            try:
+                parent_job_data = self.repository.get(
+                    obj_id=job_id,
+                    key_prefix=Repository.KEY_JOB,
+                    level=self.topology.level,
+                    group=self.topology.group,
+                )
+                if parent_job_data:
+                    parent_job_data['state'] = ObjectState.COMPLETE.value
+                    self.repository.save(
+                        obj=parent_job_data,
+                        key_prefix=Repository.KEY_JOB,
+                        level=self.topology.level,
+                        group=self.topology.group,
+                    )
+                    self.logger.info(
+                        f"Delegated job {job_id} completed at child level — "
+                        f"marked COMPLETE at level {self.topology.level}"
+                    )
+            except Exception as e:
+                self.logger.error(
+                    f"Failed to propagate completion for job {job_id} "
+                    f"to level {self.topology.level}: {e}"
+                )
 
         # Process reassignments
         for job_id, delegation_info, time_since_delegation in jobs_to_reassign:
@@ -654,6 +679,36 @@ class ResourceAgent(Agent):
                 job_obj.delegation_failed = True
                 job_obj.delegation_failed_count = getattr(job_obj, 'delegation_failed_count', 0) + 1
                 job_obj.add_delegation_failed_agents(self.agent_id)
+
+            # Check if job has exceeded max delegation attempts (likely infeasible)
+            max_delegation_attempts = self.runtime_config.get("max_delegation_attempts", 3)
+            fail_count = getattr(job_obj, 'delegation_failed_count', 0)
+            if fail_count >= max_delegation_attempts:
+                self.logger.warning(
+                    f"Job {job_id} failed delegation {fail_count} times "
+                    f"(max={max_delegation_attempts}) — marking as infeasible"
+                )
+                job_obj.state = ObjectState.COMPLETE
+                job_obj.exit_status = 1
+                self.repository.save(
+                    obj=job_obj.to_dict(),
+                    key_prefix=Repository.KEY_JOB,
+                    level=self.topology.level,
+                    group=self.topology.group,
+                )
+                self.delegated_jobs.remove(job_id)
+                # Remove from child level(s)
+                for child_group in child_groups:
+                    try:
+                        self.repository.delete(
+                            obj_id=job_id,
+                            key_prefix=Repository.KEY_JOB,
+                            level=self.topology.level - 1,
+                            group=child_group
+                        )
+                    except Exception:
+                        pass
+                return
 
             # Reset job state to PENDING for parent level
             job_obj.state = ObjectState.PENDING

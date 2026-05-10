@@ -58,6 +58,7 @@ runtime:
   aggressive_failure_detection: true # Use proactive failure detection from gRPC
   enable_agent_recovery: true        # Allow recovered agents to rejoin the pool
   max_infeasible_retries: 10         # Retire infeasible jobs after N attempts (0 = infinite)
+  max_delegation_attempts: 3         # Mark job infeasible after N failed delegation timeouts
 logging:
   ## The directory in which actor should create log files.
   ## This directory will be automatically created if it does not exist.
