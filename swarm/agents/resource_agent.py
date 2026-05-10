@@ -1064,10 +1064,11 @@ class ResourceAgent(Agent):
 
         # Cache required DTNs for efficiency (computed once, reused multiple times)
         # Combines data_in and data_out DTN requirements into a single frozenset
+        # "local" DTN is excluded — it means local filesystem, not a remote data transfer node
         if not hasattr(job, "_required_dtns_cache"):
             rin = {e.name for e in (job.data_in or [])}
             rout = {e.name for e in (job.data_out or [])}
-            job._required_dtns_cache = frozenset(rin | rout)
+            job._required_dtns_cache = frozenset((rin | rout) - {"local"})
 
         # Special handling when checking feasibility for self as a parent agent
         # Parent agents must verify that at least ONE actual child can execute the job
@@ -1104,7 +1105,25 @@ class ResourceAgent(Agent):
                 return True
 
             # No child in active groups can handle this job
-            self.logger.debug(f"Agent: {self.agent_id} (parent) - Job {job.job_id} not feasible on any active child")
+            children_count = len(list(self.children.values()))
+            children_in_group = [c.agent_id for c in self.children.values() if c.group in active_groups]
+            self.logger.warning(
+                f"Agent: {self.agent_id} (parent) - Job {job.job_id} not feasible on any active child. "
+                f"active_groups={active_groups}, total_children={children_count}, "
+                f"children_in_group={children_in_group}, "
+                f"job_needs=(cores={job.capacities.core}, ram={job.capacities.ram}, "
+                f"disk={job.capacities.disk}, gpu={getattr(job.capacities, 'gpu', 0)})"
+            )
+            if children_in_group:
+                # Log first child's capacity for debugging
+                first_child_id = children_in_group[0]
+                first_child = self.children.get(first_child_id)
+                if first_child:
+                    self.logger.warning(
+                        f"  First child {first_child_id} capacity: "
+                        f"cores={first_child.capacities.core}, ram={first_child.capacities.ram}, "
+                        f"disk={first_child.capacities.disk}, gpu={getattr(first_child.capacities, 'gpu', 0)}"
+                    )
             return False
 
         # ============================================================================

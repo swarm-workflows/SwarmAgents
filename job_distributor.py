@@ -90,6 +90,8 @@ class JobDistributor(threading.Thread):
         """
         with open(file_path, 'r') as f:
             job_data = json.load(f)
+            if 'id' not in job_data:
+                return None  # Skip non-job files (e.g., conversion_summary.json)
             job = Job()
             job.job_id = job_data['id']
             job.capacities = Capacities.from_dict(job_data['capacities'])
@@ -114,7 +116,8 @@ class JobDistributor(threading.Thread):
                 for _ in range(self.jobs_per_interval):
                     file_path = next(self.file_iter)
                     job = self._load_job_from_file(file_path)
-                    batch.append(job)
+                    if job is not None:
+                        batch.append(job)
             except StopIteration:
                 if not batch:
                     break
