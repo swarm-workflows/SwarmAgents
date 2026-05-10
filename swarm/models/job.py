@@ -406,131 +406,175 @@ class Job(Object):
 
     # ---------- (De)serialization ----------
     def to_dict(self, compact: bool = False) -> dict:
+        # Snapshot all fields under lock (fast — just reference copies)
         with self.lock:
-            result = {
-                "id": self.job_id,
-                "capacities": self.capacities.to_dict() if self.capacities else None,
-                "capacity_allocations": (
-                    self.capacity_allocations.to_dict() if self.capacity_allocations else None
-                ),
-                "wall_time": self.wall_time,
-                "data_in": [dn.to_dict() for dn in self.data_in],
-                "data_out": [dn.to_dict() for dn in self.data_out],
-                "state": self.state.value,
-                "exit_status": self.exit_status,
-                "should_fail": self._should_fail,
-                "transfer_in_time": self.transfer_in_time,
-                "transfer_out_time": self.transfer_out_time,
-                # canonical keys (dicts for multi-level latency tracking):
-                "submitted_at": self.submitted_at_dict,
-                "selection_started_at": self.selection_started_at_dict,
-                "assigned_at": self.assigned_at_dict,
-                "started_at": self.started_at_dict,
-                "completed_at": self.completed_at_dict,
-                "leader_id": self.leader_id,
-                "last_transition_at": self.last_transition_at,
-                "job_type": self.job_type,
-                "reasoning_time": self.reasoning_time,
-                "delegation_failed_agents": self.delegation_failed_agents,
-                "delegation_failed": self.delegation_failed,
-                "delegation_failed_count": self.delegation_failed_count,
-                "level": self.level,
+            snap_id = self._object_id
+            snap_capacities = self._capacities
+            snap_cap_alloc = self._capacity_allocations
+            snap_wall_time = self._wall_time
+            snap_data_in = list(self.data_in)
+            snap_data_out = list(self.data_out)
+            snap_state = self._state
+            snap_exit_status = self._exit_status
+            snap_should_fail = self._should_fail
+            snap_transfer_in = self.transfer_in_time
+            snap_transfer_out = self.transfer_out_time
+            snap_submitted = dict(self._submitted_at)
+            snap_selection_started = dict(self._selection_started_at)
+            snap_assigned = dict(self._assigned_at)
+            snap_started = dict(self._started_at)
+            snap_completed = dict(self._completed_at)
+            snap_leader_id = self._leader_id
+            snap_last_transition = self._last_transition_at
+            snap_job_type = self._job_type
+            snap_reasoning_time = self._reasoning_time
+            snap_deleg_agents = list(self._delegation_failed_agents)
+            snap_deleg_failed = self._delegation_failed
+            snap_deleg_count = self._delegation_failed_count
+            snap_level = self.level
+
+        # Serialize outside lock (slow — dict building, DataNode conversion)
+        result = {
+            "id": snap_id,
+            "capacities": snap_capacities.to_dict() if snap_capacities else None,
+            "capacity_allocations": (
+                snap_cap_alloc.to_dict() if snap_cap_alloc else None
+            ),
+            "wall_time": snap_wall_time,
+            "data_in": [dn.to_dict() for dn in snap_data_in],
+            "data_out": [dn.to_dict() for dn in snap_data_out],
+            "state": snap_state.value,
+            "exit_status": snap_exit_status,
+            "should_fail": snap_should_fail,
+            "transfer_in_time": snap_transfer_in,
+            "transfer_out_time": snap_transfer_out,
+            "submitted_at": snap_submitted,
+            "selection_started_at": snap_selection_started,
+            "assigned_at": snap_assigned,
+            "started_at": snap_started,
+            "completed_at": snap_completed,
+            "leader_id": snap_leader_id,
+            "last_transition_at": snap_last_transition,
+            "job_type": snap_job_type,
+            "reasoning_time": snap_reasoning_time,
+            "delegation_failed_agents": snap_deleg_agents,
+            "delegation_failed": snap_deleg_failed,
+            "delegation_failed_count": snap_deleg_count,
+            "level": snap_level,
+        }
+
+        if compact:
+            return {
+                k: v for k, v in result.items()
+                if v is not None and v != [] and v != {}
             }
 
-            if compact:
-                # Remove None values and empty collections
-                return {
-                    k: v for k, v in result.items()
-                    if v is not None and v != [] and v != {}
-                }
-
-            return result
+        return result
 
     def from_dict(self, job_data: dict):
+        # Parse all values outside the lock (slow — Capacities, DataNode construction)
+        parsed_id = job_data["id"]
+        parsed_capacities = (
+            Capacities.from_dict(job_data["capacities"]) if job_data.get("capacities") else None
+        )
+        parsed_cap_alloc = (
+            Capacities.from_dict(job_data["capacity_allocations"])
+            if job_data.get("capacity_allocations")
+            else None
+        )
+        parsed_wall_time = job_data.get("wall_time")
+        parsed_data_in = [DataNode.from_dict(d) for d in job_data.get("data_in", [])]
+        parsed_data_out = [DataNode.from_dict(d) for d in job_data.get("data_out", [])]
+        parsed_state = ObjectState(job_data["state"]) if job_data.get("state") else ObjectState.PENDING
+        parsed_exit_status = int(job_data.get("exit_status", 0))
+        parsed_should_fail = bool(job_data.get("should_fail", False))
+        parsed_transfer_in = job_data.get("transfer_in_time")
+        parsed_transfer_out = job_data.get("transfer_out_time")
+        parsed_level = job_data.get("level")
+
+        # Back-compat + canonical mapping (supports single values, lists, and dicts)
+        submitted = job_data.get("submitted_at", time.time())
+        if isinstance(submitted, dict):
+            parsed_submitted = {int(k): float(v) for k, v in submitted.items()}
+        elif isinstance(submitted, list):
+            parsed_submitted = {i: float(v) for i, v in enumerate(submitted)}
+        else:
+            parsed_submitted = {(parsed_level or 0): float(submitted)}
+
+        selection_started = job_data.get("selection_started_at")
+        if isinstance(selection_started, dict):
+            parsed_selection_started = {int(k): float(v) for k, v in selection_started.items()}
+        elif isinstance(selection_started, list):
+            parsed_selection_started = {i: float(v) for i, v in enumerate(selection_started)}
+        elif selection_started is not None:
+            parsed_selection_started = {(parsed_level or 0): float(selection_started)}
+        else:
+            parsed_selection_started = {}
+
+        assigned = job_data.get("assigned_at")
+        if isinstance(assigned, dict):
+            parsed_assigned = {int(k): float(v) for k, v in assigned.items()}
+        elif isinstance(assigned, list):
+            parsed_assigned = {i: float(v) for i, v in enumerate(assigned)}
+        elif assigned is not None:
+            parsed_assigned = {(parsed_level or 0): float(assigned)}
+        else:
+            parsed_assigned = {}
+
+        started = job_data.get("started_at")
+        if isinstance(started, dict):
+            parsed_started = {int(k): float(v) for k, v in started.items()}
+        elif isinstance(started, list):
+            parsed_started = {i: float(v) for i, v in enumerate(started)}
+        elif started is not None:
+            parsed_started = {(parsed_level or 0): float(started)}
+        else:
+            parsed_started = {}
+
+        completed = job_data.get("completed_at")
+        if isinstance(completed, dict):
+            parsed_completed = {int(k): float(v) for k, v in completed.items()}
+        elif isinstance(completed, list):
+            parsed_completed = {i: float(v) for i, v in enumerate(completed)}
+        elif completed is not None:
+            parsed_completed = {(parsed_level or 0): float(completed)}
+        else:
+            parsed_completed = {}
+
+        parsed_leader_id = job_data.get("leader_id")
+        parsed_last_transition = job_data.get("last_transition_at")
+        parsed_reasoning_time = job_data.get("reasoning_time")
+        parsed_deleg_agents = job_data.get("delegation_failed_agents")
+        parsed_deleg_failed = job_data.get("delegation_failed")
+        parsed_deleg_count = job_data.get("delegation_failed_count")
+
+        # Assign all parsed values under lock (fast — just reference assignments)
         with self.lock:
-            self.job_id = job_data["id"]
+            self._object_id = parsed_id
+            self._capacities = parsed_capacities
+            self._capacity_allocations = parsed_cap_alloc
+            self._wall_time = float(parsed_wall_time) if parsed_wall_time is not None else None
+            self.data_in = parsed_data_in
+            self.data_out = parsed_data_out
+            self._state = parsed_state
+            self._exit_status = parsed_exit_status
+            self._should_fail = parsed_should_fail
+            self.transfer_in_time = parsed_transfer_in
+            self.transfer_out_time = parsed_transfer_out
+            self.level = parsed_level
+            self._submitted_at = parsed_submitted
+            self._selection_started_at = parsed_selection_started
+            self._assigned_at = parsed_assigned
+            self._started_at = parsed_started
+            self._completed_at = parsed_completed
+            self._leader_id = int(parsed_leader_id) if parsed_leader_id is not None else None
+            self._last_transition_at = parsed_last_transition
+            self._reasoning_time = float(parsed_reasoning_time) if parsed_reasoning_time is not None else None
+            self._delegation_failed_agents = parsed_deleg_agents if parsed_deleg_agents is not None else []
+            self._delegation_failed = parsed_deleg_failed if parsed_deleg_failed is not None else False
+            self._delegation_failed_count = parsed_deleg_count if parsed_deleg_count is not None else 0
 
-            self.capacities = (
-                Capacities.from_dict(job_data["capacities"]) if job_data.get("capacities") else None
-            )
-            self.capacity_allocations = (
-                Capacities.from_dict(job_data["capacity_allocations"])
-                if job_data.get("capacity_allocations")
-                else None
-            )
-            self.wall_time = job_data.get("wall_time")
-
-            self.data_in = [DataNode.from_dict(d) for d in job_data.get("data_in", [])]
-            self.data_out = [DataNode.from_dict(d) for d in job_data.get("data_out", [])]
-
-            self.state = ObjectState(job_data["state"]) if job_data.get("state") else ObjectState.PENDING
-            self.exit_status = int(job_data.get("exit_status", 0))
-            self._should_fail = bool(job_data.get("should_fail", False))
-            self.transfer_in_time = job_data.get("transfer_in_time")
-            self.transfer_out_time = job_data.get("transfer_out_time")
-
-            self.level = job_data.get("level")
-
-            # Back-compat + canonical mapping (supports single values, lists, and dicts)
-            submitted = job_data.get("submitted_at", time.time())
-            if isinstance(submitted, dict):
-                # Convert string keys to int if needed
-                self._submitted_at = {int(k): float(v) for k, v in submitted.items()}
-            elif isinstance(submitted, list):
-                # Convert list to dict with index as level
-                self._submitted_at = {i: float(v) for i, v in enumerate(submitted)}
-            else:
-                self._submitted_at = {self.level: float(submitted)}
-
-            selection_started = job_data.get("selection_started_at")
-            if isinstance(selection_started, dict):
-                self._selection_started_at = {int(k): float(v) for k, v in selection_started.items()}
-            elif isinstance(selection_started, list):
-                self._selection_started_at = {i: float(v) for i, v in enumerate(selection_started)}
-            elif selection_started is not None:
-                self._selection_started_at = {self.level: float(selection_started)}
-            else:
-                self._selection_started_at = {}
-
-            assigned = job_data.get("assigned_at")
-            if isinstance(assigned, dict):
-                self._assigned_at = {int(k): float(v) for k, v in assigned.items()}
-            elif isinstance(assigned, list):
-                self._assigned_at = {i: float(v) for i, v in enumerate(assigned)}
-            elif assigned is not None:
-                self._assigned_at = {self.level: float(assigned)}
-            else:
-                self._assigned_at = {}
-
-            started = job_data.get("started_at")
-            if isinstance(started, dict):
-                self._started_at = {int(k): float(v) for k, v in started.items()}
-            elif isinstance(started, list):
-                self._started_at = {i: float(v) for i, v in enumerate(started)}
-            elif started is not None:
-                self._started_at = {self.level: float(started)}
-            else:
-                self._started_at = {}
-
-            completed = job_data.get("completed_at")
-            if isinstance(completed, dict):
-                self._completed_at = {int(k): float(v) for k, v in completed.items()}
-            elif isinstance(completed, list):
-                self._completed_at = {i: float(v) for i, v in enumerate(completed)}
-            elif completed is not None:
-                self._completed_at = {self.level: float(completed)}
-            else:
-                self._completed_at = {}
-
-            self.leader_id = job_data.get("leader_id")
-            self.last_transition_at = job_data.get("last_transition_at")
-
-            self.reasoning_time = job_data.get("reasoning_time")
-            self.classify_job_type()
-
-            self.delegation_failed_agents = job_data.get("delegation_failed_agents")
-            self.delegation_failed = job_data.get("delegation_failed")
-            self.delegation_failed_count = job_data.get("delegation_failed_count")
+        self.classify_job_type()
 
     # ---------- Classification ----------
     def classify_job_type(self) -> Optional[str]:

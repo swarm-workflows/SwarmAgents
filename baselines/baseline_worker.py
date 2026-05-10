@@ -97,7 +97,8 @@ def poll_and_execute(
             logger.info("Executing job %s (wall_time=%.1fs)", job.job_id, job.wall_time or 0.0)
             try:
                 job.execute()
-            except Exception:
+            except Exception as e:
+                logger.warning("Job %s execution failed: %s", job.job_id, e)
                 job._exit_status = 1
                 job.state = ObjectState.COMPLETE
                 job.mark_completed()

@@ -23,6 +23,7 @@
 # Author: Komal Thareja(kthare10@renci.org)
 from dataclasses import dataclass, field
 import queue
+import threading
 
 from swarm.queue.object_queue import ObjectQueue
 from swarm.queue.simple_queue import SimpleQueue
@@ -34,3 +35,6 @@ class AgentQueues:
         self.message_queue = queue.Queue()
         self.pending_queue = SimpleQueue()
         self.selected_queue = SimpleQueue()
+        self.message_event = threading.Event()   # wakes _do_inbound
+        self.pending_event = threading.Event()   # wakes selection_main
+        self.selected_event = threading.Event()  # wakes scheduling_main

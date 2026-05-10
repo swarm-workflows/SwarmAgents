@@ -79,6 +79,7 @@ class _HostAdapter(ConsensusHost):
                 job.from_dict(job_data)
                 if job.state == ObjectState.PENDING:
                     self.agent.queues.pending_queue.add(job)
+                    self.agent.queues.pending_event.set()
                 return job
         except Exception as e:
             self.agent.logger.warning(f"Failed to fetch job {object_id} from Redis: {e}")
@@ -352,6 +353,11 @@ class ResourceAgent(Agent):
         """
         return self.runtime_config.get("aggressive_failure_detection", False)
 
+    @property
+    def enable_agent_recovery(self) -> bool:
+        """Allow recovered agents to rejoin the pool when their gRPC channel comes back UP."""
+        return self.runtime_config.get("enable_agent_recovery", True)
+
     def __on_proposal(self, incoming: Proposal):
         self.engine.on_proposal(incoming)
 
@@ -400,6 +406,7 @@ class ResourceAgent(Agent):
                 job_obj = Job()
                 job_obj.from_dict(job)
                 self.queues.pending_queue.add(job_obj)
+        self.queues.pending_event.set()
 
     def _update_ready_jobs(self, jobs: list[str]):
         for j in jobs:
@@ -1300,7 +1307,8 @@ class ResourceAgent(Agent):
                     self.logger.warning(f"No pending jobs available for agent Qsize: {self.queues.pending_queue.size()}")
                     #for job in self.queues.pending_queue.objects.values():
                     #    self.logger.info(f"Job: {job.job_id} state: {job.state}")
-                    time.sleep(0.5)
+                    self.queues.pending_event.wait(timeout=0.5)
+                    self.queues.pending_event.clear()
                     continue
                 proposals = []
                 jobs = []
@@ -1402,7 +1410,8 @@ class ResourceAgent(Agent):
                 # This handles jobs stuck due to agent failures where consensus was cleared
                 #self._reset_orphaned_jobs()
 
-                time.sleep(0.5)
+                self.queues.pending_event.wait(timeout=0.5)
+                self.queues.pending_event.clear()
             except Exception as e:
                 self.logger.error(f"Error occurred while executing e: {e}")
                 self.logger.error(traceback.format_exc())
@@ -1636,7 +1645,8 @@ class ResourceAgent(Agent):
             try:
                 selected_jobs = self.queues.selected_queue.gets()
                 if not selected_jobs:
-                    time.sleep(0.5)
+                    self.queues.selected_event.wait(timeout=0.5)
+                    self.queues.selected_event.clear()
                     continue
 
                 for job in selected_jobs:
@@ -1737,6 +1747,7 @@ class ResourceAgent(Agent):
                              level=self.topology.level, group=self.topology.group)
         # Add the job to the list of allocated jobs
         self.queues.selected_queue.add(job)
+        self.queues.selected_event.set()
 
     def can_schedule_job(self, job: Job) -> bool:
         ready_caps = job_capacities(self.queues.ready_queue.gets())
@@ -1785,8 +1796,8 @@ class ResourceAgent(Agent):
                     level=self.topology.level,
                     group=self.topology.group,
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                self.logger.error(f"Failed to persist failure status for job {job}: {e}")
 
     def _get_failure_rate(self, job: Job) -> float:
         """Determine failure probability for a job: per-agent > per-job-type > base."""
@@ -1823,6 +1834,22 @@ class ResourceAgent(Agent):
         projected_load = agent.load + agent.proposed_load
         load_penalty = 1 + (projected_load / 100) ** 1.5
         return load_penalty
+
+    def _find_agent_by_endpoint(self, host: str, port: int) -> int | None:
+        """Look up agent_id by host:port from Redis agent records."""
+        try:
+            agent_dicts = self.repository.get_all_objects(
+                key_prefix=Repository.KEY_AGENT,
+                level=self.topology.level,
+                group=self.topology.group
+            )
+            for agent_data in agent_dicts:
+                agent = AgentInfo.from_dict(agent_data)
+                if agent.host == host and agent.port == port:
+                    return agent.agent_id
+        except Exception as e:
+            self.logger.debug(f"Failed to look up agent by endpoint {host}:{port}: {e}")
+        return None
 
     def _detect_failed_agents(self, current_time: float) -> list[int]:
         """
@@ -2253,7 +2280,37 @@ class ResourceAgent(Agent):
             return
         if up:
             self.logger.debug(f"Peer {target} is UP: {reason}")
-            # TODO: Could implement agent recovery here if enable_agent_recovery is True
+            if not self.enable_agent_recovery:
+                return
+            # Attempt to recover a previously failed agent
+            try:
+                host, port_s = target.rsplit(":", 1)
+                port = int(port_s)
+                if host == "127.0.0.1":
+                    host = "localhost"
+
+                agent_id = None
+                # Check neighbor_map first
+                for aid, agent_info in list(self.neighbor_map.items()):
+                    if agent_info.host == host and agent_info.port == port:
+                        agent_id = aid
+                        break
+                # If not in neighbor_map (removed on failure), look up from Redis
+                if agent_id is None:
+                    agent_id = self._find_agent_by_endpoint(host, port)
+
+                if agent_id and agent_id in self.failed_agents:
+                    self.logger.info(
+                        f"Agent {agent_id} ({target}) recovered — removing from failed set. "
+                        f"Will rejoin on next neighbor refresh."
+                    )
+                    self.failed_agents.remove(agent_id)
+                    self.metrics.agent_recoveries.append({
+                        'agent_id': agent_id,
+                        'recovered_at': time.time(),
+                    })
+            except Exception as e:
+                self.logger.error(f"Failed to process peer recovery for {target}: {e}")
             return
 
         self.logger.warning(f"Peer {target} is DOWN: {reason}")

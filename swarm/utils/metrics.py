@@ -44,6 +44,7 @@ class Metrics:
         self.mab_rewards = {}      # group_id -> list of (timestamp, reward)
         self.mab_selections = {}   # group_id -> selection count
         self.infeasible_retired = []  # job_ids retired after max infeasible retries
+        self.agent_recoveries = []   # dicts with agent_id, recovered_at
 
     def save_load_metric(self, load: float):
         """

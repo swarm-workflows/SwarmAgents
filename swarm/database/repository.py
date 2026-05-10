@@ -23,9 +23,14 @@
 # Author: Komal Thareja (kthare10@renci.org)
 
 import json
+import logging
+import random
 import threading
+import time
 import redis
 from typing import Optional, Dict, Tuple, List, Union
+
+LOG = logging.getLogger(__name__)
 
 
 class Repository:
@@ -56,9 +61,13 @@ class Repository:
     # GENERIC JOB OPERATIONS #
     ##########################
 
-    def save(self, obj: dict, key_prefix: str = KEY_JOB, key: Optional[str] = None, level: int = 0, group: int = 0):
+    def save(self, obj: dict, key_prefix: str = KEY_JOB, key: Optional[str] = None,
+             level: int = 0, group: int = 0, max_retries: int = 10):
         """
         Save a generic object into Redis under the given key.
+
+        Uses optimistic locking (WATCH/MULTI/EXEC) with exponential backoff
+        and jitter on contention. Raises RuntimeError after max_retries.
 
         Args:
             obj (dict): Object to save.
@@ -66,6 +75,7 @@ class Repository:
             key (Optional[str]): Specific Redis key. If None, will derive key from object ID.
             level (int): Agent level in hierarchy.
             group (int): Agent group in hierarchy at a level.
+            max_retries (int): Maximum retry attempts on WatchError (default: 10).
         """
         if not key:
             obj_id = obj.get("id") or obj.get(f"{key_prefix}_id")
@@ -74,7 +84,7 @@ class Repository:
             key = f"{key_prefix}:{level}:{group}:{obj_id}"
 
         pipeline = self.redis.pipeline()
-        while True:
+        for attempt in range(1, max_retries + 1):
             try:
                 pipeline.watch(key)
                 old_data = pipeline.get(key)
@@ -94,9 +104,16 @@ class Repository:
                             old_state_key = f"{self.KEY_STATE}:{level}:{group}:{old_state}"
                             pipeline.srem(old_state_key, key)
                 pipeline.execute()
-                break
+                return  # success
             except redis.WatchError:
-                continue
+                if attempt == max_retries:
+                    raise RuntimeError(
+                        f"Redis optimistic lock failed after {max_retries} attempts for key={key}"
+                    )
+                backoff = min(0.01 * (2 ** attempt), 0.5) + random.uniform(0, 0.01)
+                LOG.debug("WatchError on key=%s (attempt %d/%d), retrying in %.3fs",
+                          key, attempt, max_retries, backoff)
+                time.sleep(backoff)
 
     def get(self, obj_id: str, key_prefix: str = KEY_JOB, level: int = 0, group: int = 0) -> dict:
         """

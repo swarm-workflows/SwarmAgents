@@ -94,8 +94,8 @@ class GrpcServer:
         if self._serving:
             try:
                 self._health.set('', health_pb2.HealthCheckResponse.NOT_SERVING)
-            except Exception:
-                pass
+            except Exception as e:
+                LOG.warning("Failed to update health status during shutdown: %s", e)
         self._server.stop(grace)
         self._serving = False
         LOG.info("gRPC server stopped (%s)", f"{self.bind_host}:{self.bind_port}")

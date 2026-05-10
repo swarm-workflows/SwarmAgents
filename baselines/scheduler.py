@@ -237,7 +237,8 @@ class BaselineScheduler(ABC):
         """Execute a job on a simulated agent (runs in thread pool)."""
         try:
             job.execute()
-        except Exception:
+        except Exception as e:
+            logger.warning("Job %s execution failed: %s", job.job_id, e)
             job._exit_status = 1
             job.state = ObjectState.COMPLETE
             job.mark_completed()
