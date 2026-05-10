@@ -21,6 +21,9 @@
 #
 # Author: Komal Thareja(kthare10@renci.org)
 import argparse
+import faulthandler
+import signal
+import sys
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -48,6 +51,12 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == '__main__':
     import yaml
+
+    # Enable faulthandler to get tracebacks on segfaults and other fatal signals
+    faulthandler.enable()
+    # Also dump all thread tracebacks on SIGUSR1 (kill -USR1 <pid>)
+    if hasattr(signal, 'SIGUSR1'):
+        faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
 
     args = parse_args()
     agent_id = args.agent_id
