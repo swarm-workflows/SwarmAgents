@@ -57,6 +57,9 @@ if __name__ == '__main__':
     # Also dump all thread tracebacks on SIGUSR1 (kill -USR1 <pid>)
     if hasattr(signal, 'SIGUSR1'):
         faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
+    # Ignore SIGHUP so agents survive SSH session disconnects
+    if hasattr(signal, 'SIGHUP'):
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
 
     args = parse_args()
     agent_id = args.agent_id

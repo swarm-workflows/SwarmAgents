@@ -89,6 +89,9 @@ echo "  Start offset: $start_offset"
 pkill -f "python3\.11 .*main\.py" || true
 rm -f shutdown
 
+# Raise file descriptor limit — 1024 is too low for multiple gRPC agents
+ulimit -n 65536 2>/dev/null || ulimit -n 8192 2>/dev/null || true
+
 template_cfg="./config_swarm_multi.yml"
 cfg_prefix="config_swarm_multi_"
 cfg_glob="configs/${cfg_prefix}*.yml"
