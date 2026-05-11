@@ -1226,10 +1226,11 @@ class ResourceAgent(Agent):
 
     def _job_sig(self, job: Job) -> tuple:
         # Required DTNs can be expensive to rebuild; compute once and reuse
+        # "local" DTN is excluded — it means local filesystem, not a remote data transfer node
         if not hasattr(job, "_required_dtns_cache"):
             rin = {e.name for e in (job.data_in or [])}
             rout = {e.name for e in (job.data_out or [])}
-            job._required_dtns_cache = frozenset(rin | rout)
+            job._required_dtns_cache = frozenset((rin | rout) - {"local"})
         caps = job.capacities
         return (
             job.job_id,
