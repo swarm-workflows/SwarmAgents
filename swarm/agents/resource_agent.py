@@ -1068,13 +1068,7 @@ class ResourceAgent(Agent):
         if not hasattr(job, "_required_dtns_cache"):
             rin = {e.name for e in (job.data_in or [])}
             rout = {e.name for e in (job.data_out or [])}
-            raw = rin | rout
-            job._required_dtns_cache = frozenset(raw - {"local"})
-            if raw and self.topology.level > 0:
-                self.logger.info(
-                    f"[DTN_CACHE] Job {job.job_id}: raw_dtns={raw}, "
-                    f"filtered_cache={job._required_dtns_cache}"
-                )
+            job._required_dtns_cache = frozenset((rin | rout) - {"local"})
 
         # Special handling when checking feasibility for self as a parent agent
         # Parent agents must verify that at least ONE actual child can execute the job
@@ -1085,21 +1079,12 @@ class ResourceAgent(Agent):
                 return False
 
             # Iterate through child agents in active groups to find at least one capable child
-            checked_any = False
             for child_info in self.children.values():
                 if child_info.group not in active_groups:
                     continue
-                checked_any = True
 
                 # Check if child has sufficient capacity for this job
                 if not self._has_sufficient_capacity(job, child_info.capacities):
-                    self.logger.warning(
-                        f"  Child {child_info.agent_id} FAILS capacity for {job.job_id}: "
-                        f"child(cores={child_info.capacities.core}, ram={child_info.capacities.ram}, "
-                        f"disk={child_info.capacities.disk}, gpu={getattr(child_info.capacities, 'gpu', 0)}) "
-                        f"vs job(cores={job.capacities.core}, ram={job.capacities.ram}, "
-                        f"disk={job.capacities.disk}, gpu={getattr(job.capacities, 'gpu', 0)})"
-                    )
                     continue  # Skip this child, try next
 
                 # Check child DTN connectivity only if job requires DTNs
@@ -1114,40 +1099,16 @@ class ResourceAgent(Agent):
 
                     # Check if child has ALL required DTNs
                     if not all(d in child_dtn_names for d in job._required_dtns_cache):
-                        self.logger.warning(
-                            f"  Child {child_info.agent_id} FAILS DTN for {job.job_id}: "
-                            f"needs={job._required_dtns_cache}, has={set(child_dtn_names)}"
-                        )
                         continue  # Skip this child, try next
 
                 # Found a feasible child: has sufficient capacity AND all required DTNs (if any)
                 return True
 
-            if not checked_any:
-                self.logger.warning(
-                    f"Agent: {self.agent_id} - No children in active groups {active_groups} to check"
-                )
-
             # No child in active groups can handle this job
-            children_count = len(list(self.children.values()))
-            children_in_group = [c.agent_id for c in self.children.values() if c.group in active_groups]
-            self.logger.warning(
-                f"Agent: {self.agent_id} (parent) - Job {job.job_id} not feasible on any active child. "
-                f"active_groups={active_groups}, total_children={children_count}, "
-                f"children_in_group={children_in_group}, "
-                f"job_needs=(cores={job.capacities.core}, ram={job.capacities.ram}, "
-                f"disk={job.capacities.disk}, gpu={getattr(job.capacities, 'gpu', 0)})"
+            self.logger.debug(
+                f"Agent: {self.agent_id} (parent) - Job {job.job_id} not feasible on any active child "
+                f"(active_groups={active_groups}, children={len(list(self.children.values()))})"
             )
-            if children_in_group:
-                # Log first child's capacity for debugging
-                first_child_id = children_in_group[0]
-                first_child = self.children.get(first_child_id)
-                if first_child:
-                    self.logger.warning(
-                        f"  First child {first_child_id} capacity: "
-                        f"cores={first_child.capacities.core}, ram={first_child.capacities.ram}, "
-                        f"disk={first_child.capacities.disk}, gpu={getattr(first_child.capacities, 'gpu', 0)}"
-                    )
             return False
 
         # ============================================================================
