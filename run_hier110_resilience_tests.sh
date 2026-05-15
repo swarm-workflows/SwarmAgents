@@ -93,7 +93,9 @@ stop_agents() {
     echo "  Stopping all agents..."
     ./stop_agents_v2.sh --mode remote --agent-hosts-file "${AGENT_HOSTS_FILE}" \
         --remote-repo-dir "${BASE_DIR}" > /dev/null 2>&1 || true
-    # Belt and suspenders: kill on all hosts
+    # Allow 5s for graceful shutdown (SIGTERM → save_results → Redis)
+    sleep 5
+    # Belt and suspenders: force-kill any remaining agents
     for host in $(cat "${AGENT_HOSTS_FILE}"); do
         ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "${host}" \
             "pkill -9 -f 'main.py' 2>/dev/null" &

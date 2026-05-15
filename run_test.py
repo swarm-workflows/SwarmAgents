@@ -185,16 +185,18 @@ def collect_remote_logs(args, host_list: list[str]) -> None:
     for host in host_list:
         dest_dir = os.path.join(args.run_dir, host.replace("/", "_"))
         os.makedirs(dest_dir, exist_ok=True)
-        # scp agent logs — best-effort, don't fail the run
-        scp_cmd = (
-            f"scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
-            f"-o BatchMode=yes -o ConnectTimeout=10 -q "
-            f"{host}:{shlex.quote(args.remote_repo_dir)}/agent-*.log "
-            f"{shlex.quote(dest_dir)}/ 2>/dev/null"
-        )
-        rc = subprocess.call(scp_cmd, shell=True)
-        if rc == 0:
-            log(f"  Collected logs from {host}")
+        # Try log directory from config (e.g. swarm-multi/), then fall back to repo root
+        for log_subdir in ("swarm-multi/", ""):
+            scp_cmd = (
+                f"scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
+                f"-o BatchMode=yes -o ConnectTimeout=10 -q "
+                f"{host}:{shlex.quote(args.remote_repo_dir)}/{log_subdir}agent-*.log "
+                f"{shlex.quote(dest_dir)}/ 2>/dev/null"
+            )
+            rc = subprocess.call(scp_cmd, shell=True)
+            if rc == 0:
+                log(f"  Collected logs from {host}")
+                break
         else:
             log(f"  WARN: No logs from {host} (rc={rc})")
 
@@ -550,6 +552,78 @@ def wait_runtime(args) -> None:
     log(f"Sleeping for grace_seconds: {args.grace_seconds}s …")
     time.sleep(args.grace_seconds)
 
+def wait_with_early_exit(args) -> None:
+    """
+    Wait up to shutdown_after_seconds, but exit early if all jobs reach a
+    terminal state (COMPLETE, FAILED, or BLOCKED).  Polls Redis every 30s
+    after an initial settling period of 120s.
+    """
+    import redis as _redis
+    deadline = time.time() + args.shutdown_after_seconds
+    settle_until = time.time() + 120          # let jobs start flowing
+    poll_interval = 30
+    total_jobs = args.jobs
+    # Terminal states: COMPLETE=8, FAILED=9, BLOCKED=10
+    terminal_states = {8, 9, 10}
+    stable_count = 0                          # consecutive polls at 100%
+
+    try:
+        r = _redis.StrictRedis(host=args.db_host, port=6379, decode_responses=True)
+    except Exception as e:
+        log(f"Cannot connect to Redis for early-exit polling: {e}")
+        time.sleep(args.shutdown_after_seconds)
+        log("Shutdown timer expired, stopping test")
+        return
+
+    while time.time() < deadline:
+        remaining = int(deadline - time.time())
+        sleep_for = min(poll_interval, remaining)
+        if sleep_for <= 0:
+            break
+        time.sleep(sleep_for)
+
+        if time.time() < settle_until:
+            continue
+
+        # Count jobs in terminal states across all levels
+        try:
+            import json as _json
+            terminal = 0
+            # Check L1 jobs (hierarchical) or L0 jobs (flat)
+            for k in r.scan_iter(match='job:1:0:*', count=1000):
+                raw = r.get(k)
+                if raw:
+                    d = _json.loads(raw)
+                    if d.get('state') in terminal_states:
+                        terminal += 1
+
+            # If no L1 jobs found, check L0
+            if terminal == 0:
+                for k in r.scan_iter(match='job:0:*:*', count=1000):
+                    raw = r.get(k)
+                    if raw:
+                        d = _json.loads(raw)
+                        if d.get('state') in terminal_states:
+                            terminal += 1
+
+            pct = 100 * terminal / total_jobs if total_jobs > 0 else 0
+            log(f"Early-exit check: {terminal}/{total_jobs} jobs terminal ({pct:.1f}%), "
+                f"{remaining}s remaining")
+
+            if terminal >= total_jobs:
+                stable_count += 1
+                if stable_count >= 2:
+                    log(f"All {total_jobs} jobs reached terminal state — exiting early "
+                        f"(saved {remaining}s)")
+                    return
+            else:
+                stable_count = 0
+        except Exception as e:
+            log(f"Early-exit poll error: {e}")
+
+    log("Shutdown timer expired, stopping test")
+
+
 def stop_agents(args) -> None:
     log("Stopping agents …")
     stop_cmd = ["bash", "stop_agents_v2.sh", "--mode", args.mode]
@@ -557,7 +631,16 @@ def stop_agents(args) -> None:
         # Determine hosts file path
         hosts_file = getattr(args, 'agent_hosts_file', None)
         if not hosts_file:
-            hosts_file = "agent_hosts.txt"
+            # Write a temporary hosts file from --agent-hosts if provided
+            if getattr(args, 'agent_hosts', None):
+                hosts_file = os.path.join(args.run_dir, '_agent_hosts.txt')
+                with open(hosts_file, 'w') as hf:
+                    for h in args.agent_hosts.split(','):
+                        h = h.strip()
+                        if h:
+                            hf.write(h + '\n')
+            else:
+                hosts_file = "agent_hosts.txt"
         stop_cmd += ["--agent-hosts-file", hosts_file,
                       "--remote-repo-dir", args.remote_repo_dir]
     run_blocking(stop_cmd, check=False)
@@ -754,8 +837,7 @@ def main() -> None:
     # Wait for test completion
     if args.shutdown_after_seconds > 0:
         log(f"Using time-based shutdown: will stop after {args.shutdown_after_seconds} seconds")
-        time.sleep(args.shutdown_after_seconds)
-        log("Shutdown timer expired, stopping test")
+        wait_with_early_exit(args)
     else:
         wait_runtime(args)
     stop_agents(args)
@@ -767,6 +849,7 @@ def main() -> None:
     args.agents = total_agents
     parse_and_report(args)
     log("Done.")
+    sys.exit(0)
 
 def _load_hosts():
     """Load remote host list from file."""

@@ -92,4 +92,11 @@ if __name__ == '__main__':
     else:
         raise ValueError(f"Unknown agent type: {agent_type}")
 
+    # Handle SIGTERM gracefully: save metrics to Redis before exiting
+    def _sigterm_handler(signum, frame):
+        agent.stop()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+
     agent.start()
