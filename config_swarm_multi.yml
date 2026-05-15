@@ -45,7 +45,7 @@ runtime:
   restart_job_selection: 30
   peer_expiry_seconds: 300
   empty_timeout_seconds: 300
-  reselection_timeout_s: 60
+  reselection_timeout_s: 300
   peer_expiry_seconds: 45
   results_dir: swarm-multi
   shutdown_mode: manual

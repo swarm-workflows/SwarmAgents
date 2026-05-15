@@ -38,7 +38,7 @@ JOBS_PER_INTERVAL=20
 JOBS_PER_PROPOSAL=10
 CO_PARENTS=2
 KILL_DELAY=90           # Wait 90s for system to be fully loaded before killing
-SHUTDOWN_SECONDS=2700   # 45 min timeout per run
+SHUTDOWN_SECONDS=10800   # 3 hour timeout per run
 OUT_DIR="${BASE_DIR}/runs/hier110-resilience"
 
 mkdir -p "${OUT_DIR}"
@@ -106,7 +106,7 @@ stop_agents() {
 
 flush_redis() {
     echo "  Flushing Redis..."
-    docker exec redis redis-cli flushall > /dev/null 2>&1
+    python3.11 -c "import redis; redis.StrictRedis(host='database', port=6379).flushall()"
 }
 
 kill_agents_by_id() {
