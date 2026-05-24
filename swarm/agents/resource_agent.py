@@ -49,6 +49,7 @@ from swarm.models.capacities import Capacities
 from swarm.models.agent_info import AgentInfo
 from swarm.consensus.messages.proposal_info import ProposalInfo
 from swarm.models.job import Job, ObjectState
+from swarm.rl.mab_manager import MABManager
 
 from swarm.utils.utils import generate_id, job_capacities
 
@@ -78,6 +79,7 @@ class _HostAdapter(ConsensusHost):
                 job.from_dict(job_data)
                 if job.state == ObjectState.PENDING:
                     self.agent.queues.pending_queue.add(job)
+                    self.agent.queues.pending_event.set()
                 return job
         except Exception as e:
             self.agent.logger.warning(f"Failed to fetch job {object_id} from Redis: {e}")
@@ -177,6 +179,26 @@ class ResourceAgent(Agent):
         # Maps: job_id -> {'delegated_at': timestamp, 'groups': [list of child groups]}
         self.delegated_jobs = ThreadSafeDict[str, dict]()  # job_id -> delegation_info
 
+        # MAB (Multi-Armed Bandit) configuration for hierarchical delegation
+        mab_cfg = self.config.get("mab", {})
+        self.mab_enabled = mab_cfg.get("enabled", False)
+        self.mab_config = mab_cfg
+        self.mab_top_k = mab_cfg.get("top_k", 1)
+        self.mab_manager = None  # Lazily initialised in _init_mab() once children are known
+
+        # Failure simulation for MAB testing
+        fail_sim_cfg = mab_cfg.get("failure_simulation", {})
+        self.failure_sim_enabled = fail_sim_cfg.get("enabled", False)
+        self.failure_sim_base_prob = fail_sim_cfg.get("failure_probability", 0.1)
+        self.failure_sim_per_agent = fail_sim_cfg.get("per_agent_failure_rates", {})
+        self.failure_sim_per_job_type = fail_sim_cfg.get("per_job_type_failure_rates", {})
+
+        # Track which group each delegated job was sent to for MAB reward attribution
+        self.job_delegation_map = ThreadSafeDict[str, int]()  # job_id -> group_id
+
+        # Max retries before retiring an infeasible job (0 = infinite retries)
+        self.max_infeasible_retries = self.runtime_config.get("max_infeasible_retries", 10)
+
     @property
     def peer_expiry_seconds(self) -> int:
         return self.runtime_config.get("peer_expiry_seconds", 20)
@@ -219,6 +241,28 @@ class ResourceAgent(Agent):
     def get_total_idle_time(self):
         self.end_idle()
         return self.metrics.total_idle_time
+
+    def _init_mab(self):
+        """Lazily initialise the MABManager once child groups are known."""
+        if not self.mab_enabled:
+            return
+        if self.mab_manager is not None:
+            return
+        if not self.topology.children:
+            return
+
+        child_groups = list(self.topology.children)
+        self.mab_manager = MABManager(
+            agent_id=self.agent_id,
+            child_groups=child_groups,
+            config=self.mab_config,
+            repository=self.repository,
+            logger=self.logger,
+        )
+        self.mab_manager.load_state()
+        self.logger.info(
+            f"MAB initialised for agent {self.agent_id} with child groups {child_groups}"
+        )
 
     @property
     def empty_timeout_seconds(self):
@@ -309,6 +353,11 @@ class ResourceAgent(Agent):
         """
         return self.runtime_config.get("aggressive_failure_detection", False)
 
+    @property
+    def enable_agent_recovery(self) -> bool:
+        """Allow recovered agents to rejoin the pool when their gRPC channel comes back UP."""
+        return self.runtime_config.get("enable_agent_recovery", True)
+
     def __on_proposal(self, incoming: Proposal):
         self.engine.on_proposal(incoming)
 
@@ -357,6 +406,7 @@ class ResourceAgent(Agent):
                 job_obj = Job()
                 job_obj.from_dict(job)
                 self.queues.pending_queue.add(job_obj)
+        self.queues.pending_event.set()
 
     def _update_ready_jobs(self, jobs: list[str]):
         for j in jobs:
@@ -389,6 +439,37 @@ class ResourceAgent(Agent):
 
                 # TODO restart selection for jobs which were assigned to neighbor which just went down
 
+    def _is_leader_for_group(self, group_id) -> bool:
+        """
+        Determine if this agent is the active leader for a given child group.
+
+        Uses deterministic leader election among co-parents: the lowest-ID
+        co-parent with a fresh heartbeat in neighbor_map wins. Each co-parent
+        evaluates this independently using locally-refreshed neighbor data.
+
+        When co_parent_groups is not configured (K=1), falls back to checking
+        whether group_id is in self.topology.children.
+        """
+        if not self.topology.co_parent_groups:
+            return group_id in (self.topology.children or [])
+        co_parents = self.topology.co_parent_groups.get(group_id) or self.topology.co_parent_groups.get(str(group_id), [])
+        for candidate_id in sorted(co_parents):
+            if candidate_id == self.agent_id:
+                return True
+            if self.neighbor_map.get(candidate_id) is not None:
+                return False  # lower-ID co-parent is alive
+        return True  # all lower-ID co-parents are dead
+
+    def _get_active_child_groups(self) -> list:
+        """
+        Return the list of child groups for which this agent is currently the active leader.
+
+        For agents without children, returns an empty list.
+        """
+        if not self.topology.children:
+            return []
+        return [g for g in self.topology.children if self._is_leader_for_group(g)]
+
     def _monitor_delegated_jobs(self):
         """
         Monitor jobs delegated to children and re-add them to parent queue if not selected in time.
@@ -397,6 +478,9 @@ class ResourceAgent(Agent):
         This method checks if those jobs are still pending at the child level after
         delegation_timeout_s seconds. If so, they are re-added to the parent's queue
         as they may be infeasible for the children to handle.
+
+        When MAB is enabled, this method also checks for early completion (before
+        timeout) so the bandit receives timely success/failure signals.
 
         The parent will not propose for these jobs (they remain in a monitored state)
         to avoid consensus conflicts.
@@ -408,21 +492,31 @@ class ResourceAgent(Agent):
         current_time = time.time()
         jobs_to_reassign = []
         jobs_processed = []
+        mab_active = self.mab_enabled and self.mab_manager is not None
+        active_groups = set(self._get_active_child_groups())
 
         # Check all delegated jobs
         for job_id, delegation_info in list(self.delegated_jobs.items()):
             delegated_at = delegation_info.get('delegated_at', 0)
             child_groups = delegation_info.get('groups', [])
 
-            time_since_delegation = current_time - delegated_at
+            # Lost leadership for all groups this job was delegated to — stop tracking
+            if not any(g in active_groups for g in child_groups):
+                self.delegated_jobs.remove(job_id)
+                continue
 
-            # Check if timeout has been exceeded
-            if time_since_delegation <= self.delegation_timeout_s:
+            time_since_delegation = current_time - delegated_at
+            timed_out = time_since_delegation > self.delegation_timeout_s
+
+            # When MAB is disabled and timeout hasn't elapsed, skip checking
+            if not mab_active and not timed_out:
                 continue
 
             # Check job state in Redis at child level(s)
             job_still_pending = False
             job_found = False
+            job_complete = False
+            job_exit_status = 0
 
             for child_group in child_groups:
                 try:
@@ -437,21 +531,32 @@ class ResourceAgent(Agent):
                         job_found = True
                         job_state = job_data.get('state', ObjectState.PENDING.value)
 
-                        # If job is still PENDING at child level, it wasn't selected
-                        if job_state == ObjectState.PENDING.value:
-                            job_still_pending = True
-                            self.logger.warning(
-                                f"Delegated job {job_id} still PENDING at level {self.topology.level - 1}, "
-                                f"group {child_group} after {time_since_delegation:.1f}s "
-                                f"(timeout: {self.delegation_timeout_s:.1f}s)"
-                            )
-                            break
-                        else:
-                            # Job was processed by children
+                        if job_state == ObjectState.COMPLETE.value:
+                            job_complete = True
+                            job_exit_status = int(job_data.get('exit_status', 0))
                             self.logger.debug(
-                                f"Delegated job {job_id} processed by children (state: {job_state})"
+                                f"Delegated job {job_id} COMPLETE at child group {child_group}, "
+                                f"exit_status={job_exit_status}"
                             )
                             jobs_processed.append(job_id)
+                            break
+                        elif job_state == ObjectState.PENDING.value:
+                            if timed_out:
+                                job_still_pending = True
+                                self.logger.warning(
+                                    f"Delegated job {job_id} still PENDING at level {self.topology.level - 1}, "
+                                    f"group {child_group} after {time_since_delegation:.1f}s "
+                                    f"(timeout: {self.delegation_timeout_s:.1f}s)"
+                                )
+                                break
+                        else:
+                            # Job in progress (READY, RUNNING, etc.) — not yet done
+                            if timed_out:
+                                # Job was picked up but hasn't finished — processed
+                                self.logger.debug(
+                                    f"Delegated job {job_id} processed by children (state: {job_state})"
+                                )
+                                jobs_processed.append(job_id)
 
                 except Exception as e:
                     self.logger.error(
@@ -459,15 +564,65 @@ class ResourceAgent(Agent):
                         f"group {child_group}: {e}"
                     )
 
-            # Re-add to parent queue if still pending or not found (possibly infeasible for children)
-            if not job_found or job_still_pending:
+            # Feed MAB reward for completed jobs
+            if mab_active and job_complete:
+                delegated_group = self.job_delegation_map.get(job_id)
+                if delegated_group is not None:
+                    success = (job_exit_status == 0)
+                    self.mab_manager.report_outcome(delegated_group, job_id, success)
+                    # Track in metrics
+                    reward = 1.0 if success else -1.0
+                    self.metrics.mab_rewards.setdefault(delegated_group, []).append(
+                        (current_time, reward)
+                    )
+                    self.job_delegation_map.remove(job_id)
+
+            # Re-add to parent queue if timed out and still pending or not found
+            if timed_out and (not job_found or job_still_pending):
                 jobs_to_reassign.append((job_id, delegation_info, time_since_delegation))
 
         for job_id in jobs_processed:
             self.delegated_jobs.remove(job_id)
+            # Clean up delegation map entry if not already handled by MAB
+            if job_id in self.job_delegation_map:
+                self.job_delegation_map.remove(job_id)
+            # Propagate completion to L1: mark the parent-level job as COMPLETE
+            try:
+                parent_job_data = self.repository.get(
+                    obj_id=job_id,
+                    key_prefix=Repository.KEY_JOB,
+                    level=self.topology.level,
+                    group=self.topology.group,
+                )
+                if parent_job_data:
+                    parent_job_data['state'] = ObjectState.COMPLETE.value
+                    self.repository.save(
+                        obj=parent_job_data,
+                        key_prefix=Repository.KEY_JOB,
+                        level=self.topology.level,
+                        group=self.topology.group,
+                    )
+                    self.logger.info(
+                        f"Delegated job {job_id} completed at child level — "
+                        f"marked COMPLETE at level {self.topology.level}"
+                    )
+            except Exception as e:
+                self.logger.error(
+                    f"Failed to propagate completion for job {job_id} "
+                    f"to level {self.topology.level}: {e}"
+                )
 
         # Process reassignments
         for job_id, delegation_info, time_since_delegation in jobs_to_reassign:
+            # Report failure to MAB when delegation times out
+            if mab_active:
+                delegated_group = self.job_delegation_map.get(job_id)
+                if delegated_group is not None:
+                    self.mab_manager.report_outcome(delegated_group, job_id, success=False)
+                    self.metrics.mab_rewards.setdefault(delegated_group, []).append(
+                        (current_time, -1.0)
+                    )
+                    self.job_delegation_map.remove(job_id)
             self._reassign_delegated_job(job_id, delegation_info, time_since_delegation)
 
     def _reassign_delegated_job(self, job_id: str, delegation_info: dict, time_since_delegation: float):
@@ -524,6 +679,36 @@ class ResourceAgent(Agent):
                 job_obj.delegation_failed = True
                 job_obj.delegation_failed_count = getattr(job_obj, 'delegation_failed_count', 0) + 1
                 job_obj.add_delegation_failed_agents(self.agent_id)
+
+            # Check if job has exceeded max delegation attempts (likely infeasible)
+            max_delegation_attempts = self.runtime_config.get("max_delegation_attempts", 3)
+            fail_count = getattr(job_obj, 'delegation_failed_count', 0)
+            if fail_count >= max_delegation_attempts:
+                self.logger.warning(
+                    f"Job {job_id} failed delegation {fail_count} times "
+                    f"(max={max_delegation_attempts}) — marking as infeasible"
+                )
+                job_obj.state = ObjectState.COMPLETE
+                job_obj.exit_status = 1
+                self.repository.save(
+                    obj=job_obj.to_dict(),
+                    key_prefix=Repository.KEY_JOB,
+                    level=self.topology.level,
+                    group=self.topology.group,
+                )
+                self.delegated_jobs.remove(job_id)
+                # Remove from child level(s)
+                for child_group in child_groups:
+                    try:
+                        self.repository.delete(
+                            obj_id=job_id,
+                            key_prefix=Repository.KEY_JOB,
+                            level=self.topology.level - 1,
+                            group=child_group
+                        )
+                    except Exception:
+                        pass
+                return
 
             # Reset job state to PENDING for parent level
             job_obj.state = ObjectState.PENDING
@@ -750,7 +935,7 @@ class ResourceAgent(Agent):
                 group=self.topology.group,
                 level=self.topology.level
             )
-        # Non-leaf agent: aggregate info from all children
+        # Non-leaf agent: aggregate info from children in actively-led groups only
         else:
             total_capacities = Capacities()
             total_allocations = Capacities()
@@ -760,7 +945,11 @@ class ResourceAgent(Agent):
             # Track: {dtn_name: {'scores': [list of scores], 'info': DataNode}}
             dtn_aggregation = {}
 
+            active_groups = set(self._get_active_child_groups())
+
             for child in self.children.values():
+                if active_groups and child.group not in active_groups:
+                    continue
                 total_capacities += child.capacities
                 total_allocations += child.capacity_allocations
 
@@ -820,6 +1009,7 @@ class ResourceAgent(Agent):
         self._monitor_delegated_jobs()
         current_time = int(time.time())
         self._refresh_children(int(current_time))
+        self._init_mab()
 
         # Detect and handle agent failures
         failed_agents = self._detect_failed_agents(current_time)
@@ -834,22 +1024,18 @@ class ResourceAgent(Agent):
 
         self._refresh_neighbors(current_time=current_time)
 
-        # Batch update job sets
-        for prefix, update_fn, state in [
-            (Repository.KEY_JOB, self._update_pending_jobs, ObjectState.PENDING.value),
-            (Repository.KEY_JOB, self._update_ready_jobs, ObjectState.READY.value),
-            (Repository.KEY_JOB, self._update_completed_jobs, ObjectState.COMPLETE.value),
-        ]:
-            #group = self.topology.level if self.topology.type == TopologyType.Ring else self.topology.group
-            group = self.topology.group
-            jobs = self.repository.get_all_ids(key_prefix=prefix, level=self.topology.level,
-                                               group=group, state=state)
-            #self.logger.info(f"Fetching IDs for jobs in state {state} from group: {group} job count: {len(jobs)}")
-            update_fn(jobs=jobs)
+        # Batch update job sets (single Redis pipeline round-trip)
+        group = self.topology.group
+        state_map = self.repository.get_all_ids_multi(
+            key_prefix=Repository.KEY_JOB, level=self.topology.level,
+            group=group, states=[ObjectState.PENDING.value, ObjectState.READY.value,
+                                 ObjectState.COMPLETE.value])
+        self._update_pending_jobs(jobs=state_map.get(ObjectState.PENDING.value, []))
+        self._update_ready_jobs(jobs=state_map.get(ObjectState.READY.value, []))
+        self._update_completed_jobs(jobs=state_map.get(ObjectState.COMPLETE.value, []))
 
         if self.debug:
             self.save_consensus_votes()
-        self.save_consensus_votes()
         #self.save_neighbors()
 
         self.check_queue()
@@ -878,17 +1064,25 @@ class ResourceAgent(Agent):
 
         # Cache required DTNs for efficiency (computed once, reused multiple times)
         # Combines data_in and data_out DTN requirements into a single frozenset
+        # "local" DTN is excluded — it means local filesystem, not a remote data transfer node
         if not hasattr(job, "_required_dtns_cache"):
             rin = {e.name for e in (job.data_in or [])}
             rout = {e.name for e in (job.data_out or [])}
-            job._required_dtns_cache = frozenset(rin | rout)
+            job._required_dtns_cache = frozenset((rin | rout) - {"local"})
 
         # Special handling when checking feasibility for self as a parent agent
         # Parent agents must verify that at least ONE actual child can execute the job
         # (not just the synthetic max_child_capacity aggregate used for peer evaluation)
         if agent.agent_id == self.agent_id and self.topology.children:
-            # Iterate through all child agents to find at least one capable child
+            active_groups = set(self._get_active_child_groups())
+            if not active_groups:
+                return False
+
+            # Iterate through child agents in active groups to find at least one capable child
             for child_info in self.children.values():
+                if child_info.group not in active_groups:
+                    continue
+
                 # Check if child has sufficient capacity for this job
                 if not self._has_sufficient_capacity(job, child_info.capacities):
                     continue  # Skip this child, try next
@@ -910,8 +1104,11 @@ class ResourceAgent(Agent):
                 # Found a feasible child: has sufficient capacity AND all required DTNs (if any)
                 return True
 
-            # No child can handle this job - infeasible for this parent agent
-            self.logger.debug(f"Agent: {self.agent_id} (parent) - Job {job.job_id} not feasible on any child")
+            # No child in active groups can handle this job
+            self.logger.debug(
+                f"Agent: {self.agent_id} (parent) - Job {job.job_id} not feasible on any active child "
+                f"(active_groups={active_groups}, children={len(list(self.children.values()))})"
+            )
             return False
 
         # ============================================================================
@@ -990,10 +1187,11 @@ class ResourceAgent(Agent):
 
     def _job_sig(self, job: Job) -> tuple:
         # Required DTNs can be expensive to rebuild; compute once and reuse
+        # "local" DTN is excluded — it means local filesystem, not a remote data transfer node
         if not hasattr(job, "_required_dtns_cache"):
             rin = {e.name for e in (job.data_in or [])}
             rout = {e.name for e in (job.data_out or [])}
-            job._required_dtns_cache = frozenset(rin | rout)
+            job._required_dtns_cache = frozenset((rin | rout) - {"local"})
         caps = job.capacities
         return (
             job.job_id,
@@ -1169,7 +1367,8 @@ class ResourceAgent(Agent):
                     self.logger.warning(f"No pending jobs available for agent Qsize: {self.queues.pending_queue.size()}")
                     #for job in self.queues.pending_queue.objects.values():
                     #    self.logger.info(f"Job: {job.job_id} state: {job.state}")
-                    time.sleep(0.5)
+                    self.queues.pending_event.wait(timeout=0.5)
+                    self.queues.pending_event.clear()
                     continue
                 proposals = []
                 jobs = []
@@ -1271,7 +1470,8 @@ class ResourceAgent(Agent):
                 # This handles jobs stuck due to agent failures where consensus was cleared
                 #self._reset_orphaned_jobs()
 
-                time.sleep(0.5)
+                self.queues.pending_event.wait(timeout=0.5)
+                self.queues.pending_event.clear()
             except Exception as e:
                 self.logger.error(f"Error occurred while executing e: {e}")
                 self.logger.error(traceback.format_exc())
@@ -1292,7 +1492,15 @@ class ResourceAgent(Agent):
             "failed_agents": self.failed_agents.to_dict(),
             "failed_agents_count": len(self.failed_agents),
             "final_quorum": self.calculate_quorum(),
+            "infeasible_retired": getattr(self.metrics, 'infeasible_retired', []),
         }
+        if self.mab_enabled and self.mab_manager:
+            agent_metrics["mab_stats"] = self.mab_manager.get_stats()
+            agent_metrics["mab_selections"] = self.metrics.mab_selections
+            agent_metrics["mab_rewards"] = {
+                str(k): v for k, v in self.metrics.mab_rewards.items()
+            }
+            self.mab_manager.save_state()
         self.repository.save(obj=agent_metrics, key=f"{Repository.KEY_METRICS}:{self.agent_id}")
         self.logger.info("Results saved")
 
@@ -1440,9 +1648,9 @@ class ResourceAgent(Agent):
         if hasattr(job, 'data_out') and job.data_out:
             required_dtns.update(e.name for e in job.data_out)
 
-        # If no DTN requirements, all groups can handle it
+        # If no DTN requirements, all active groups can handle it
         if not required_dtns:
-            return list(self.topology.children)
+            return list(self._get_active_child_groups())
 
         # Build map of DTNs available in each child group
         # group_id -> set of available DTN names
@@ -1464,9 +1672,9 @@ class ResourceAgent(Agent):
             if child.dtns:
                 group_dtns[child_group].update(child.dtns.keys())
 
-        # Find groups that have all required DTNs
+        # Find groups that have all required DTNs (only among active groups)
         capable_groups = []
-        for group_id in self.topology.children:
+        for group_id in self._get_active_child_groups():
             available_dtns = group_dtns.get(group_id, set())
             if required_dtns.issubset(available_dtns):
                 capable_groups.append(group_id)
@@ -1497,24 +1705,39 @@ class ResourceAgent(Agent):
             try:
                 selected_jobs = self.queues.selected_queue.gets()
                 if not selected_jobs:
-                    time.sleep(0.5)
+                    self.queues.selected_event.wait(timeout=0.5)
+                    self.queues.selected_event.clear()
                     continue
 
                 for job in selected_jobs:
                     job_id = job.job_id
 
                     # Multi-level: delegate job to capable children only
-                    if self.topology.children:
+                    active_groups = self._get_active_child_groups()
+                    if active_groups:
                         # Identify which child groups can handle this job
                         capable_groups = self._get_child_groups_for_job(job)
+                        # Filter to only groups we actively lead
+                        capable_groups = [g for g in capable_groups if g in active_groups]
 
                         if not capable_groups:
-                            # Fallback: try all groups (backward compatibility)
+                            # Fallback: try all active groups (backward compatibility)
                             self.logger.warning(
                                 f"Could not determine capable groups for job {job_id}, "
-                                f"delegating to all groups"
+                                f"delegating to all active groups"
                             )
-                            capable_groups = self.topology.children
+                            capable_groups = active_groups
+
+                        # MAB-guided selection: pick top_k groups instead of all
+                        if self.mab_enabled and self.mab_manager:
+                            selected_groups = self.mab_manager.select_groups(
+                                capable_groups, job, top_k=self.mab_top_k
+                            )
+                            for g in selected_groups:
+                                self.metrics.mab_selections[g] = \
+                                    self.metrics.mab_selections.get(g, 0) + 1
+                        else:
+                            selected_groups = capable_groups
 
                         self.queues.selected_queue.remove(job_id)
                         job.level = self.topology.level - 1
@@ -1522,7 +1745,7 @@ class ResourceAgent(Agent):
                         job.mark_submitted()
                         job.mark_assigned()
 
-                        for child_group in capable_groups:
+                        for child_group in selected_groups:
                             self.repository.save(
                                 obj=job.to_dict(),
                                 key_prefix=Repository.KEY_JOB,
@@ -1536,8 +1759,13 @@ class ResourceAgent(Agent):
                         # Track delegated job for monitoring
                         self.delegated_jobs.set(job_id, {
                             'delegated_at': time.time(),
-                            'groups': capable_groups
+                            'groups': selected_groups
                         })
+
+                        # Track which group this job was delegated to for MAB reward attribution
+                        if self.mab_enabled and self.mab_manager and len(selected_groups) == 1:
+                            self.job_delegation_map.set(job_id, selected_groups[0])
+
                         self.logger.debug(
                             f"Tracking delegated job {job_id} for monitoring "
                             f"(timeout: {self.delegation_timeout_s:.1f}s)"
@@ -1579,6 +1807,7 @@ class ResourceAgent(Agent):
                              level=self.topology.level, group=self.topology.group)
         # Add the job to the list of allocated jobs
         self.queues.selected_queue.add(job)
+        self.queues.selected_event.set()
 
     def can_schedule_job(self, job: Job) -> bool:
         ready_caps = job_capacities(self.queues.ready_queue.gets())
@@ -1590,13 +1819,55 @@ class ResourceAgent(Agent):
             job_id = job.job_id
             self.logger.info(f"[EXECUTE] Starting job {job_id} on agent {self.agent_id}")
             job.execute()
+
+            # Simulated failure injection for MAB testing (overrides real exit_status)
+            if self.failure_sim_enabled:
+                fail_rate = self._get_failure_rate(job)
+                if random.random() < fail_rate:
+                    job.exit_status = 1
+                    self.logger.info(
+                        f"[FAILURE_SIM] Injected failure for job {job_id} on agent {self.agent_id} "
+                        f"(rate={fail_rate:.2f})"
+                    )
+
+            # Always persist job with exit_status so parent coordinator can read outcome
+            self.repository.save(
+                obj=job.to_dict(),
+                key_prefix=Repository.KEY_JOB,
+                level=self.topology.level,
+                group=self.topology.group,
+            )
+
             self.queues.ready_queue.remove(job_id)
-            self.logger.info(f"[COMPLETE] Job {job_id} completed on agent {self.agent_id}")
+            exit_status_str = "SUCCESS" if job.exit_status == 0 else f"FAILED (exit={job.exit_status})"
+            self.logger.info(f"[COMPLETE] Job {job_id} {exit_status_str} on agent {self.agent_id}")
             if not self.queues.ready_queue.gets():
                 self.start_idle()
         except Exception as e:
             self.logger.error(f"[ERROR] Job {job} failed on agent {self.agent_id}: {e}")
             self.logger.error(traceback.format_exc())
+            # Persist failure status even on exception
+            try:
+                job.exit_status = 1
+                job.state = ObjectState.COMPLETE
+                self.repository.save(
+                    obj=job.to_dict(),
+                    key_prefix=Repository.KEY_JOB,
+                    level=self.topology.level,
+                    group=self.topology.group,
+                )
+            except Exception as e:
+                self.logger.error(f"Failed to persist failure status for job {job}: {e}")
+
+    def _get_failure_rate(self, job: Job) -> float:
+        """Determine failure probability for a job: per-agent > per-job-type > base."""
+        agent_key = str(self.agent_id)
+        if agent_key in self.failure_sim_per_agent:
+            return float(self.failure_sim_per_agent[agent_key])
+        job_type = getattr(job, 'job_type', None)
+        if job_type and job_type in self.failure_sim_per_job_type:
+            return float(self.failure_sim_per_job_type[job_type])
+        return self.failure_sim_base_prob
 
 
     def on_shutdown(self):
@@ -1623,6 +1894,22 @@ class ResourceAgent(Agent):
         projected_load = agent.load + agent.proposed_load
         load_penalty = 1 + (projected_load / 100) ** 1.5
         return load_penalty
+
+    def _find_agent_by_endpoint(self, host: str, port: int) -> int | None:
+        """Look up agent_id by host:port from Redis agent records."""
+        try:
+            agent_dicts = self.repository.get_all_objects(
+                key_prefix=Repository.KEY_AGENT,
+                level=self.topology.level,
+                group=self.topology.group
+            )
+            for agent_data in agent_dicts:
+                agent = AgentInfo.from_dict(agent_data)
+                if agent.host == host and agent.port == port:
+                    return agent.agent_id
+        except Exception as e:
+            self.logger.debug(f"Failed to look up agent by endpoint {host}:{port}: {e}")
+        return None
 
     def _detect_failed_agents(self, current_time: float) -> list[int]:
         """
@@ -1735,16 +2022,18 @@ class ResourceAgent(Agent):
         affected_job_ids = set()
 
         # Check incoming proposals waiting for failed agent's votes
-        #for job_id, proposals in list(self.engine.incoming.proposals_by_object_id.items()):
         for job_id in self.engine.incoming.objects():
-            proposals = self.engine.incoming.get_proposals_by_object_id(job_id)
-            for p_id, prop_info in list(proposals.items()):
+            proposal_list = self.engine.incoming.get_proposals_by_object_id(job_id)
+            cleared_any = False
+            for prop_info in proposal_list:
+                p_id = prop_info.p_id
                 # Check if this proposal involves the failed agent
                 if failed_agent_id == prop_info.agent_id:
                     # Proposal was FROM the failed agent - remove it
-                    proposals.pop(p_id, None)
+                    self.engine.incoming.remove_proposal(p_id, object_id=job_id)
                     cleared_proposals.append((job_id, p_id, 'incoming', 'from_failed'))
                     affected_job_ids.add(job_id)
+                    cleared_any = True
                     self.logger.info(
                         f"Cleared incoming proposal {p_id} for job {job_id} "
                         f"(proposal from failed agent {failed_agent_id})"
@@ -1752,34 +2041,37 @@ class ResourceAgent(Agent):
                 elif failed_agent_id in prop_info.prepares:
                     # Failed agent already voted prepare - proposal stuck waiting for commits
                     # Remove the proposal since quorum calculation changed
-                    proposals.pop(p_id, None)
+                    self.engine.incoming.remove_proposal(p_id, object_id=job_id)
                     cleared_proposals.append((job_id, p_id, 'incoming', 'has_prepare'))
                     affected_job_ids.add(job_id)
+                    cleared_any = True
                     self.logger.info(
                         f"Cleared incoming proposal {p_id} for job {job_id} "
                         f"(failed agent {failed_agent_id} in prepare list)"
                     )
 
             # Clean up empty job entries
-            if not proposals:
+            if cleared_any and not self.engine.incoming.get_proposals_by_object_id(job_id):
                 self.engine.incoming.remove_object(job_id)
 
         # Check outgoing proposals this agent sent
-        #for job_id, proposals in list(self.engine.outgoing.proposals_by_object_id.items()):
         for job_id in self.engine.outgoing.objects():
-            proposals = self.engine.outgoing.get_proposals_by_object_id(job_id)
-            for p_id, prop_info in list(proposals.items()):
+            proposal_list = self.engine.outgoing.get_proposals_by_object_id(job_id)
+            cleared_any = False
+            for prop_info in proposal_list:
+                p_id = prop_info.p_id
                 # Check if waiting for failed agent's prepare/commit
                 if failed_agent_id in prop_info.prepares or prop_info.agent_id == failed_agent_id:
-                    proposals.pop(p_id, None)
+                    self.engine.outgoing.remove_proposal(p_id, object_id=job_id)
                     cleared_proposals.append((job_id, p_id, 'outgoing', 'waiting_for_failed'))
                     affected_job_ids.add(job_id)
+                    cleared_any = True
                     self.logger.info(
                         f"Cleared outgoing proposal {p_id} for job {job_id} "
                         f"(waiting for failed agent {failed_agent_id})"
                     )
 
-            if not proposals:
+            if cleared_any and not self.engine.outgoing.get_proposals_by_object_id(job_id):
                 self.engine.outgoing.remove_object(job_id)
 
         # Reset affected jobs to PENDING state so they can be reselected
@@ -1838,6 +2130,27 @@ class ResourceAgent(Agent):
 
             if has_timestamp:
                 if time_blocked >= retry_delay:
+                    # Check if job has exceeded max infeasible retries
+                    retry_count = getattr(job, 'infeasible_retry_count', 0)
+                    if self.max_infeasible_retries > 0 and retry_count >= self.max_infeasible_retries:
+                        job.state = ObjectState.FAILED
+                        self.queues.pending_queue.remove(job.job_id)
+                        # Update Redis so the job shows as FAILED
+                        job_dict = job.to_dict()
+                        self.repository.save(
+                            obj=job_dict,
+                            key_prefix=Repository.KEY_JOB,
+                            level=self.topology.level,
+                            group=self.topology.group
+                        )
+                        self.metrics.infeasible_retired.append(job.job_id)
+                        self.logger.warning(
+                            f"RETIRED infeasible job {job.job_id} after {retry_count} attempts. "
+                            f"Requirements: cores={job.capacities.core}, ram={job.capacities.ram}, "
+                            f"disk={job.capacities.disk}, gpu={getattr(job.capacities, 'gpu', 0)}"
+                        )
+                        continue
+
                     # Restore to PENDING state and move to end of queue
                     job.state = ObjectState.PENDING
                     self.queues.pending_queue.move_to_end(job)
@@ -1845,7 +2158,7 @@ class ResourceAgent(Agent):
 
                     self.logger.debug(
                         f"Restored infeasible job {job.job_id} to PENDING (at back of queue) "
-                        f"(retry #{getattr(job, 'infeasible_retry_count', 0)}, "
+                        f"(retry #{retry_count}, "
                         f"blocked for {time_blocked:.1f}s)"
                     )
 
@@ -2032,7 +2345,37 @@ class ResourceAgent(Agent):
             return
         if up:
             self.logger.debug(f"Peer {target} is UP: {reason}")
-            # TODO: Could implement agent recovery here if enable_agent_recovery is True
+            if not self.enable_agent_recovery:
+                return
+            # Attempt to recover a previously failed agent
+            try:
+                host, port_s = target.rsplit(":", 1)
+                port = int(port_s)
+                if host == "127.0.0.1":
+                    host = "localhost"
+
+                agent_id = None
+                # Check neighbor_map first
+                for aid, agent_info in list(self.neighbor_map.items()):
+                    if agent_info.host == host and agent_info.port == port:
+                        agent_id = aid
+                        break
+                # If not in neighbor_map (removed on failure), look up from Redis
+                if agent_id is None:
+                    agent_id = self._find_agent_by_endpoint(host, port)
+
+                if agent_id and agent_id in self.failed_agents:
+                    self.logger.info(
+                        f"Agent {agent_id} ({target}) recovered — removing from failed set. "
+                        f"Will rejoin on next neighbor refresh."
+                    )
+                    self.failed_agents.remove(agent_id)
+                    self.metrics.agent_recoveries.append({
+                        'agent_id': agent_id,
+                        'recovered_at': time.time(),
+                    })
+            except Exception as e:
+                self.logger.error(f"Failed to process peer recovery for {target}: {e}")
             return
 
         self.logger.warning(f"Peer {target} is DOWN: {reason}")

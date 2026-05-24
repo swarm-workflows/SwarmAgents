@@ -204,7 +204,11 @@ class LlmAgent(ResourceAgent):
             for peer_id, peer_agent in self.neighbor_map.items():
                 if peer_id != self.agent_id and peer_agent:
 
-                    peer_agents[peer_id] = peer_agent.to_dict()
+                    peer_agents[peer_id] = {
+                        'id': peer_agent.agent_id,
+                        'load': round(peer_agent.load, 2) if peer_agent.load else 0,
+                        'proposed_load': round(peer_agent.proposed_load, 2) if peer_agent.proposed_load else 0,
+                    }
 
             # Get recent conflicts for this agent
             conflicts = 0

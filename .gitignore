@@ -163,6 +163,9 @@ agent_pids.txt
 redis-data/
 *.log*
 tasks.json
+nohup.out
+agent_hosts.txt
+runs/
 # Swarm config files
 config_swarm_multi*.yml
 swarm-multi/**

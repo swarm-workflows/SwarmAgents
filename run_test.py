@@ -1,9 +1,9 @@
 #!/usr/bin/env python3.11
 """
-run_test_v2.py — unified local/remote test runner for SwarmAgents
+run_test.py — unified local/remote test runner for SwarmAgents
 
 Usage (local):
-  ./run_test_v2.py \
+  ./run_test.py \
     --mode local \
     --agent-type resource \
     --agents 12 \
@@ -15,7 +15,7 @@ Usage (local):
     --debug
 
 Usage (remote):
-  ./run_test_v2.py \
+  ./run_test.py \
     --mode remote \
     --agent-type llm \
     --agents 20 \
@@ -30,7 +30,7 @@ Usage (remote):
     --debug
 
 Usage (with time-based shutdown):
-  ./run_test_v2.py \
+  ./run_test.py \
     --mode local \
     --agent-type resource \
     --agents 20 \
@@ -133,6 +133,74 @@ def scp_to(host: str, src: str, dst: str) -> None:
     ], check=True)
 
 # ------------------------------
+# Pegasus job conversion
+# ------------------------------
+def convert_pegasus_jobs(args) -> dict:
+    """Convert Pegasus profiles into SwarmAgents job files in jobs/."""
+    from pegasus_to_swarm_converter import convert_pegasus_profiles
+
+    log(f"Converting Pegasus profiles: {args.pegasus_profiles} ({args.pegasus_input_type}) …")
+    result = convert_pegasus_profiles(
+        input_path=args.pegasus_profiles,
+        input_type=args.pegasus_input_type,
+        output_dir="jobs",
+    )
+    log(f"Pegasus conversion: {result['jobs_written']} jobs written, "
+        f"{result['warnings_count']} warnings")
+    return result
+
+# ------------------------------
+# Preflight checks (remote mode)
+# ------------------------------
+def preflight_check(args, host_list: list[str]) -> None:
+    """Verify SSH connectivity, repo dir, and python3.11 on each remote host."""
+    log("Running preflight checks on remote hosts …")
+    failures = []
+    for host in host_list:
+        # Check SSH + repo dir + python3.11 in a single command
+        check_cmd = (
+            f"test -d {shlex.quote(args.remote_repo_dir)} && "
+            f"which python3.11 >/dev/null 2>&1"
+        )
+        rc = ssh(host, check_cmd)
+        if rc != 0:
+            failures.append(host)
+            log(f"  FAIL: {host}")
+        else:
+            log(f"  OK:   {host}")
+
+    if failures:
+        raise SystemExit(
+            f"Preflight failed for {len(failures)} host(s): {', '.join(failures)}. "
+            f"Check SSH access, that {args.remote_repo_dir} exists, and python3.11 is installed."
+        )
+    log("Preflight checks passed.")
+
+# ------------------------------
+# Remote log collection
+# ------------------------------
+def collect_remote_logs(args, host_list: list[str]) -> None:
+    """SCP agent logs from remote hosts into run_dir/hostname/ (best-effort)."""
+    log("Collecting logs from remote hosts …")
+    for host in host_list:
+        dest_dir = os.path.join(args.run_dir, host.replace("/", "_"))
+        os.makedirs(dest_dir, exist_ok=True)
+        # Try log directory from config (e.g. swarm-multi/), then fall back to repo root
+        for log_subdir in ("swarm-multi/", ""):
+            scp_cmd = (
+                f"scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
+                f"-o BatchMode=yes -o ConnectTimeout=10 -q "
+                f"{host}:{shlex.quote(args.remote_repo_dir)}/{log_subdir}agent-*.log "
+                f"{shlex.quote(dest_dir)}/ 2>/dev/null"
+            )
+            rc = subprocess.call(scp_cmd, shell=True)
+            if rc == 0:
+                log(f"  Collected logs from {host}")
+                break
+        else:
+            log(f"  WARN: No logs from {host} (rc={rc})")
+
+# ------------------------------
 # Config generation / cleanup
 # ------------------------------
 def generate_configs(args, agent_hosts_list: list[str]) -> Path:
@@ -169,9 +237,13 @@ def generate_configs(args, agent_hosts_list: list[str]) -> Path:
         gen_args += ["--group-size", str(args.group_size)]
     if args.topology == "hierarchical":
         gen_args += ["--hierarchical-level1-agent-type", args.hierarchical_level1_agent_type]
+        if hasattr(args, 'co_parents') and args.co_parents > 1:
+            gen_args += ["--co-parents", str(args.co_parents)]
     # Pass initial group size for dynamic agent addition
     if hasattr(args, 'initial_group_size') and args.initial_group_size is not None:
         gen_args += ["--initial-group-size", str(args.initial_group_size)]
+    if hasattr(args, 'fit_all') and args.fit_all:
+        gen_args += ["--fit-all"]
 
     log("Generating configs …")
     run_blocking(gen_args, check=True)
@@ -185,7 +257,10 @@ def cleanup_between_runs(args) -> None:
     run_blocking(cmd, check=False)
     if not args.use_config_dir:
         cmds = [["rm", "-rf", "agent_hosts.txt"], ["rm", "-rf", "agent_profiles.json"],
-                ["rm", "-rf", "agent_dtns.json"], ["rm", "-rf", "jobs"]]
+                ["rm", "-rf", "agent_dtns.json"]]
+        # Only delete jobs/ when NOT using Pegasus profiles (Pegasus will overwrite it)
+        if not getattr(args, 'pegasus_profiles', None):
+            cmds.append(["rm", "-rf", "jobs"])
         for cmd in cmds:
             run_blocking(cmd, check=False)
 
@@ -477,10 +552,98 @@ def wait_runtime(args) -> None:
     log(f"Sleeping for grace_seconds: {args.grace_seconds}s …")
     time.sleep(args.grace_seconds)
 
+def wait_with_early_exit(args) -> None:
+    """
+    Wait up to shutdown_after_seconds, but exit early if all jobs reach a
+    terminal state (COMPLETE, FAILED, or BLOCKED).  Polls Redis every 30s
+    after an initial settling period of 120s.
+    """
+    import redis as _redis
+    deadline = time.time() + args.shutdown_after_seconds
+    settle_until = time.time() + 120          # let jobs start flowing
+    poll_interval = 30
+    total_jobs = args.jobs
+    # Terminal states: COMPLETE=8, FAILED=9, BLOCKED=10
+    terminal_states = {8, 9, 10}
+    stable_count = 0                          # consecutive polls at 100%
+
+    try:
+        r = _redis.StrictRedis(host=args.db_host, port=6379, decode_responses=True)
+    except Exception as e:
+        log(f"Cannot connect to Redis for early-exit polling: {e}")
+        time.sleep(args.shutdown_after_seconds)
+        log("Shutdown timer expired, stopping test")
+        return
+
+    while time.time() < deadline:
+        remaining = int(deadline - time.time())
+        sleep_for = min(poll_interval, remaining)
+        if sleep_for <= 0:
+            break
+        time.sleep(sleep_for)
+
+        if time.time() < settle_until:
+            continue
+
+        # Count jobs in terminal states across all levels
+        try:
+            import json as _json
+            terminal = 0
+            # Check L1 jobs (hierarchical) or L0 jobs (flat)
+            for k in r.scan_iter(match='job:1:0:*', count=1000):
+                raw = r.get(k)
+                if raw:
+                    d = _json.loads(raw)
+                    if d.get('state') in terminal_states:
+                        terminal += 1
+
+            # If no L1 jobs found, check L0
+            if terminal == 0:
+                for k in r.scan_iter(match='job:0:*:*', count=1000):
+                    raw = r.get(k)
+                    if raw:
+                        d = _json.loads(raw)
+                        if d.get('state') in terminal_states:
+                            terminal += 1
+
+            pct = 100 * terminal / total_jobs if total_jobs > 0 else 0
+            log(f"Early-exit check: {terminal}/{total_jobs} jobs terminal ({pct:.1f}%), "
+                f"{remaining}s remaining")
+
+            if terminal >= total_jobs:
+                stable_count += 1
+                if stable_count >= 2:
+                    log(f"All {total_jobs} jobs reached terminal state — exiting early "
+                        f"(saved {remaining}s)")
+                    return
+            else:
+                stable_count = 0
+        except Exception as e:
+            log(f"Early-exit poll error: {e}")
+
+    log("Shutdown timer expired, stopping test")
+
+
 def stop_agents(args) -> None:
     log("Stopping agents …")
-    # Best-effort stop; if you have a dedicated stop script, call it here.
-    run_blocking(["bash", "stop_agents_v2.sh"], check=False)
+    stop_cmd = ["bash", "stop_agents_v2.sh", "--mode", args.mode]
+    if args.mode == "remote":
+        # Determine hosts file path
+        hosts_file = getattr(args, 'agent_hosts_file', None)
+        if not hosts_file:
+            # Write a temporary hosts file from --agent-hosts if provided
+            if getattr(args, 'agent_hosts', None):
+                hosts_file = os.path.join(args.run_dir, '_agent_hosts.txt')
+                with open(hosts_file, 'w') as hf:
+                    for h in args.agent_hosts.split(','):
+                        h = h.strip()
+                        if h:
+                            hf.write(h + '\n')
+            else:
+                hosts_file = "agent_hosts.txt"
+        stop_cmd += ["--agent-hosts-file", hosts_file,
+                      "--remote-repo-dir", args.remote_repo_dir]
+    run_blocking(stop_cmd, check=False)
 
 def collect_logs(args) -> None:
     '''
@@ -499,8 +662,10 @@ def parse_and_report(args) -> None:
         "--output_dir", args.run_dir,
         "--agents", str(args.agents),
         "--db_host", args.db_host,
-        "--save-csv", "--skip-plots"
+        #"--save-csv",
     ]
+    #if not getattr(args, 'generate_plots', False):
+    #    plot_cmd.append("--skip-plots")
     if args.topology == "hierarchical":
         plot_cmd.extend(["--hierarchical"])
     log("Plotting …")
@@ -561,9 +726,29 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--dynamic-trigger-jobs", type=int, default=50,
                     help="Number of completed jobs to wait for (for 'jobs-completed' trigger)")
 
+    # Co-parent support for hierarchical topology
+    ap.add_argument("--co-parents", type=int, default=1,
+                    help="Number of co-parents per child group in hierarchical topology (default: 1)")
+
+    # Job generation
+    ap.add_argument("--fit-all", action="store_true",
+                    help="Size every job to fit ALL agents (min capacities). "
+                         "Enables any agent to take over jobs from failed agents.")
+
+    # Plot generation
+    ap.add_argument("--generate-plots", action="store_true",
+                    help="Generate full plots after test (default: CSV-only with --skip-plots)")
+
     # Test shutdown control
     ap.add_argument("--shutdown-after-seconds", type=int, default=0,
                     help="Shutdown test after N seconds (0 = use default wait_runtime behavior)")
+
+    # Pegasus job integration
+    ap.add_argument("--pegasus-profiles", default=None,
+                    help="Path to Pegasus profiles file (text/export) or Redis host. "
+                         "When set, jobs are converted from Pegasus profiles instead of generated synthetically.")
+    ap.add_argument("--pegasus-input-type", choices=["text", "redis", "export", "json"], default="text",
+                    help="Format of the Pegasus profiles source (default: text)")
 
     # Output
     ap.add_argument("--run-dir", default="run_out")
@@ -590,6 +775,10 @@ def main() -> None:
     # Build host list up front
     host_list = read_hosts(args) if args.mode == "remote" else []
 
+    # Preflight checks for remote mode
+    if args.mode == "remote" and host_list:
+        preflight_check(args, host_list)
+
     # Calculate total agents (initial + dynamic)
     total_agents = args.agents + args.dynamic_agents
     original_agents = args.agents
@@ -597,8 +786,12 @@ def main() -> None:
     # Generate configs for ALL agents (initial + dynamic) up front
     cleanup_between_runs(args)
     if not args.use_config_dir:
+        # Convert Pegasus profiles if requested (writes to jobs/)
+        if args.pegasus_profiles:
+            convert_pegasus_jobs(args)
+
         if args.mode == "remote" and not host_list:
-            raise SystemExit("Remote mode with --use-config-dir requires --agent-hosts or --agent-hosts-file")
+            raise SystemExit("Remote mode requires --agent-hosts or --agent-hosts-file")
         # Compute per-host count for writing agent_hosts.txt (if needed)
         if not args.agent_hosts_file and args.mode == "remote":
             # Match number of shards we will generate (for ALL agents)
@@ -644,17 +837,19 @@ def main() -> None:
     # Wait for test completion
     if args.shutdown_after_seconds > 0:
         log(f"Using time-based shutdown: will stop after {args.shutdown_after_seconds} seconds")
-        time.sleep(args.shutdown_after_seconds)
-        log("Shutdown timer expired, stopping test")
+        wait_with_early_exit(args)
     else:
         wait_runtime(args)
     stop_agents(args)
+    if args.mode == "remote" and host_list:
+        collect_remote_logs(args, host_list)
     collect_logs(args)
 
     # Update args.agents to total for reporting
     args.agents = total_agents
     parse_and_report(args)
     log("Done.")
+    sys.exit(0)
 
 def _load_hosts():
     """Load remote host list from file."""

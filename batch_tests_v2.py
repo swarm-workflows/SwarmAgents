@@ -75,8 +75,8 @@ def main():
     ap.add_argument("--tar-after", action="store_true", help="Tar.gz each run directory after completion")
 
     # Path to the v2 runner
-    ap.add_argument("--runner", default="run_test_v2.py",
-                    help="Path to run_test_v2.py (default: run_test_v2.py)")
+    ap.add_argument("--runner", default="run_test.py",
+                    help="Path to run_test.py (default: run_test.py)")
 
     # ---- Passthrough to run_test_v2.py (required / common) ----
     ap.add_argument("--mode", choices=["local", "remote"], default="local",
@@ -119,6 +119,15 @@ def main():
     ap.add_argument("--dynamic-trigger-jobs", type=int, default=50,
                     help="Number of completed jobs to wait for (for 'jobs-completed' trigger)")
 
+    # Co-parent support for hierarchical topology
+    ap.add_argument("--co-parents", type=int, default=1,
+                    help="Number of co-parents per child group in hierarchical topology (default: 1)")
+
+    # Job generation (v2)
+    ap.add_argument("--fit-all", action="store_true",
+                    help="Size every job to fit ALL agents (min capacities). "
+                         "Enables any agent to take over jobs from failed agents.")
+
     # Test shutdown control (v2)
     ap.add_argument("--shutdown-after-seconds", type=int, default=0,
                     help="Shutdown test after N seconds (0 = use default wait_runtime behavior)")
@@ -138,6 +147,12 @@ def main():
     ap.add_argument("--agent-hosts", default=None, help="Comma-separated hostnames")
     ap.add_argument("--agent-hosts-file", default=None, help="File with one hostname per line")
     ap.add_argument("--remote-repo-dir", default="/root/SwarmAgents", help="Remote repo root")
+
+    # Pegasus job integration (passthrough to run_test_v2.py)
+    ap.add_argument("--pegasus-profiles", default=None,
+                    help="Path to Pegasus profiles file (text/export) or Redis host")
+    ap.add_argument("--pegasus-input-type", choices=["text", "redis", "export"], default="text",
+                    help="Format of the Pegasus profiles source (default: text)")
 
     # Logging/output structure per run
     ap.add_argument("--log-subdir-name", default="logs", help="Subdir name for logs inside each run dir")
@@ -200,6 +215,8 @@ def main():
             cmd.append("--use-config-dir")
         if args.topology == "hierarchical":
             cmd += ["--hierarchical-level1-agent-type", args.hierarchical_level1_agent_type]
+            if hasattr(args, 'co_parents') and args.co_parents > 1:
+                cmd += ["--co-parents", str(args.co_parents)]
         if args.groups is not None:
             cmd += ["--groups", str(args.groups)]
         if args.group_size is not None:
@@ -233,6 +250,15 @@ def main():
         # Shutdown timer parameter
         if args.shutdown_after_seconds > 0:
             cmd += ["--shutdown-after-seconds", str(args.shutdown_after_seconds)]
+
+        # Job generation: fit-all mode
+        if args.fit_all:
+            cmd.append("--fit-all")
+
+        # Pegasus job integration
+        if args.pegasus_profiles:
+            cmd += ["--pegasus-profiles", args.pegasus_profiles]
+            cmd += ["--pegasus-input-type", args.pegasus_input_type]
 
         log(f"[{run_name}] Starting test…")
         (logs_dir / "batch_runner.log").write_text(

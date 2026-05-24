@@ -45,7 +45,7 @@ runtime:
   restart_job_selection: 30
   peer_expiry_seconds: 300
   empty_timeout_seconds: 300
-  reselection_timeout_s: 60
+  reselection_timeout_s: 300
   peer_expiry_seconds: 45
   results_dir: swarm-multi
   shutdown_mode: manual
@@ -56,6 +56,9 @@ runtime:
   max_failed_agents: 0                 # Maximum tolerable failures (0 = unlimited)
   job_reassignment_enabled: true       # Enable automatic job reassignment
   aggressive_failure_detection: true # Use proactive failure detection from gRPC
+  enable_agent_recovery: true        # Allow recovered agents to rejoin the pool
+  max_infeasible_retries: 10         # Retire infeasible jobs after N attempts (0 = infinite)
+  max_delegation_attempts: 3         # Mark job infeasible after N failed delegation timeouts
 logging:
   ## The directory in which actor should create log files.
   ## This directory will be automatically created if it does not exist.
@@ -85,6 +88,21 @@ job_selection:
   long_job_threshold: 20.0            # Execution time (in seconds) beyond which jobs incur extra penalty
   connectivity_penalty_factor: 1.0    # Multiplier for DTN connectivity penalty (0=no effect, >1 increases penalty severity)
   selection_threshold_pct: 10.0       # % above min cost allowed in candidate selection (lower = stricter, higher = more agents considered)
+mab:
+  enabled: true                    # Enable Multi-Armed Bandit for hierarchical delegation
+  algorithm: "epsilon_greedy"      # "epsilon_greedy" or "ucb1"
+  epsilon: 0.1                     # Initial exploration rate (epsilon_greedy only)
+  epsilon_decay: 0.995             # Epsilon decay per update (epsilon_greedy only)
+  epsilon_min: 0.01                # Minimum epsilon floor (epsilon_greedy only)
+  exploration_weight: 1.41         # UCB1 exploration weight (ucb1 only)
+  top_k: 1                         # Number of child groups to delegate to per job
+  persist_to_redis: false          # Persist bandit state to Redis
+  persist_interval_s: 30.0         # Seconds between Redis persistence writes
+  failure_simulation:
+    enabled: true                  # Enable simulated job failures for testing
+    failure_probability: 0.5       # Base failure probability (0.0–1.0)
+    per_agent_failure_rates: {}    # Per-agent overrides, e.g. {3: 0.5}
+    per_job_type_failure_rates: {} # Per-job-type overrides, e.g. {"compute": 0.2}
 llm:
   enabled: true
   provider: openai            # or "none" to disable external calls

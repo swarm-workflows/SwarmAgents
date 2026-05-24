@@ -156,6 +156,9 @@ class Agent(Observer):
     def stop(self):
         try:
             self.shutdown = True
+            self.queues.message_event.set()
+            self.queues.pending_event.set()
+            self.queues.selected_event.set()
             with self.condition:
                 self.condition.notify_all()
             self.on_shutdown()
@@ -188,10 +191,11 @@ class Agent(Observer):
         self.logger.info("Inbound Message Handler - Start")
         while not self.shutdown:
             try:
+                self.queues.message_event.wait(timeout=0.5)
+                self.queues.message_event.clear()
                 messages = list(IterableQueue(self.queues.message_queue))
                 if messages:
                     self._process(messages=messages)
-                time.sleep(0.5)
             except Exception as e:
                 self.logger.error(f"Inbound processing error: {e}\n{traceback.format_exc()}")
         self.logger.info("Inbound Message Handler - Stopped")
@@ -222,6 +226,7 @@ class Agent(Observer):
 
             # Queue message
             self.queues.message_queue.put_nowait(payload)
+            self.queues.message_event.set()
 
             with self.condition:
                 self.condition.notify_all()

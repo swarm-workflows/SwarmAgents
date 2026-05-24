@@ -21,6 +21,9 @@
 #
 # Author: Komal Thareja(kthare10@renci.org)
 import argparse
+import faulthandler
+import signal
+import sys
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -48,6 +51,15 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == '__main__':
     import yaml
+
+    # Enable faulthandler to get tracebacks on segfaults and other fatal signals
+    faulthandler.enable()
+    # Also dump all thread tracebacks on SIGUSR1 (kill -USR1 <pid>)
+    if hasattr(signal, 'SIGUSR1'):
+        faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
+    # Ignore SIGHUP so agents survive SSH session disconnects
+    if hasattr(signal, 'SIGHUP'):
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
 
     args = parse_args()
     agent_id = args.agent_id
@@ -79,5 +91,12 @@ if __name__ == '__main__':
         agent = ColmenaAgent(agent_id=agent_id, config_file=config_file, debug=debug)
     else:
         raise ValueError(f"Unknown agent type: {agent_type}")
+
+    # Handle SIGTERM gracefully: save metrics to Redis before exiting
+    def _sigterm_handler(signum, frame):
+        agent.stop()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _sigterm_handler)
 
     agent.start()
