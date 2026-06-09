@@ -29,8 +29,17 @@ from concurrent.futures.thread import ThreadPoolExecutor
 from google.genai.types import JobState
 
 from swarm.consensus.engine import ConsensusEngine
+from swarm.consensus.gossip_engine import GossipConsensusEngine
 from swarm.consensus.interfaces import ConsensusHost, ConsensusTransport, TopologyRouter
 from swarm.consensus.messages.message import MessageType
+from swarm.consensus.messages.gossip_state import GossipState
+from swarm.consensus.messages.snow_query import SnowQuery
+from swarm.consensus.messages.snow_response import SnowResponse
+from swarm.consensus.messages.swim_ack import SwimAck
+from swarm.consensus.messages.swim_ping import SwimPing
+from swarm.consensus.messages.swim_ping_req import SwimPingReq
+from swarm.gossip.disseminator import GossipStateDisseminator
+from swarm.membership.swim import SwimMembership
 from swarm.models.data_node import DataNode
 from swarm.models.object import Object
 from swarm.selection.engine import SelectionEngine
@@ -100,6 +109,36 @@ class _HostAdapter(ConsensusHost):
     def log_info(self, m): self.agent.logger.info(m)
     def log_warn(self, m): self.agent.logger.warning(m)
 
+    # --- Snow-engine extensions (no-ops for PBFT, used by GossipConsensusEngine).
+    def live_peer_ids(self):
+        if self.agent.swim is not None:
+            return [a for a in self.agent.swim.live_agents() if a != self.agent.agent_id]
+        return [k for k in self.agent.neighbor_map.keys() if k != self.agent.agent_id]
+
+    def my_cost_for_job(self, object_id: str):
+        obj = self.get_object(object_id)
+        if obj is None:
+            return None
+        try:
+            return float(self.agent._cost_job_on_agent(
+                obj, self.agent._generate_agent_info()
+            ))
+        except Exception as exc:
+            self.agent.logger.debug(f"my_cost_for_job({object_id}) failed: {exc}")
+            return None
+
+    def try_claim_assignment(self, object_id: str, agent_id: int) -> int:
+        return self.agent.repository.try_claim_assignment(
+            job_id=object_id, agent_id=int(agent_id),
+            level=self.agent.topology.level, group=self.agent.topology.group,
+        )
+
+    def get_assignment(self, object_id: str):
+        return self.agent.repository.get_assignment(
+            job_id=object_id,
+            level=self.agent.topology.level, group=self.agent.topology.group,
+        )
+
 
 class _TransportAdapter(ConsensusTransport):
     def __init__(self, agent: "ResourceAgent"):
@@ -120,11 +159,96 @@ class _RouteAdapter(TopologyRouter):
         return False
 
 
+class _SwimAdapter:
+    """Adapter that lets SwimMembership drive itself off ResourceAgent's
+    transport, peer list, logger, and failure-handling callbacks."""
+
+    def __init__(self, agent: "ResourceAgent"):
+        self.agent = agent
+        self.agent_id = agent.agent_id
+
+    def send(self, dest: int, payload: object) -> None:
+        self.agent.send(dest, payload)
+
+    def known_peers(self):
+        # neighbor_map is the canonical peer set; SWIM seeds from it.
+        return list(self.agent.neighbor_map.keys())
+
+    def log_debug(self, msg: str) -> None:
+        self.agent.logger.debug(msg)
+
+    def log_info(self, msg: str) -> None:
+        self.agent.logger.info(msg)
+
+    def log_warn(self, msg: str) -> None:
+        self.agent.logger.warning(msg)
+
+    def on_agent_alive(self, agent_id: int) -> None:
+        pass  # advisory in Phase 1
+
+    def on_agent_joined(self, agent_id: int) -> None:
+        self.agent.logger.info(f"[SWIM] joined: {agent_id}")
+
+    def on_agent_suspected(self, agent_id: int) -> None:
+        self.agent.logger.info(f"[SWIM] suspected: {agent_id}")
+
+    def on_agent_failed(self, agent_id: int) -> None:
+        # Phase 1 is advisory; heartbeat-driven failure detection still owns
+        # reassignment. Surface the event so operators can correlate.
+        self.agent.logger.warning(f"[SWIM] failed: {agent_id}")
+
+
+class _GossipAdapter:
+    """Adapter that lets GossipStateDisseminator drive itself off the agent's
+    transport, peer list, and logger."""
+
+    def __init__(self, agent: "ResourceAgent"):
+        self.agent = agent
+        self.agent_id = agent.agent_id
+
+    def send(self, dest: int, payload: object) -> None:
+        self.agent.send(dest, payload)
+
+    def live_peers(self):
+        # Prefer SWIM's live set when available so gossip doesn't push to
+        # peers we already know are failed.
+        if self.agent.swim is not None:
+            return self.agent.swim.live_agents()
+        return list(self.agent.neighbor_map.keys())
+
+    def log_debug(self, msg: str) -> None:
+        self.agent.logger.debug(msg)
+
+    def log_warn(self, msg: str) -> None:
+        self.agent.logger.warning(msg)
+
+
 class ResourceAgent(Agent):
     def __init__(self, agent_id: int, config_file: str, debug: bool = False):
         super().__init__(agent_id, config_file, debug)
-        self.engine = ConsensusEngine(agent_id, _HostAdapter(self), _TransportAdapter(self),
-                                      router=_RouteAdapter(self))
+        consensus_cfg = self.config.get("consensus", {})
+        protocol = (consensus_cfg.get("protocol") or "pbft").lower()
+        host = _HostAdapter(self)
+        transport = _TransportAdapter(self)
+        router = _RouteAdapter(self)
+        if protocol == "snow":
+            snow_cfg = consensus_cfg.get("snow", {})
+            self.engine = GossipConsensusEngine(
+                agent_id=agent_id,
+                host=host,
+                transport=transport,
+                router=router,
+                k=int(snow_cfg.get("k", 20)),
+                alpha=float(snow_cfg.get("alpha", 0.7)),
+                beta=int(snow_cfg.get("beta", 20)),
+                max_rounds=int(snow_cfg.get("max_rounds", 100)),
+                round_timeout_s=float(snow_cfg.get("round_timeout_ms", 500)) / 1000.0,
+                tick_interval_s=float(snow_cfg.get("tick_interval_ms", 50)) / 1000.0,
+            )
+            self.consensus_protocol = "snow"
+        else:
+            self.engine = ConsensusEngine(agent_id, host, transport, router=router)
+            self.consensus_protocol = "pbft"
 
         self._capacities = Capacities().from_dict(self.config.get("capacities", {}))
         self._load = 0
@@ -198,6 +322,36 @@ class ResourceAgent(Agent):
 
         # Max retries before retiring an infeasible job (0 = infinite retries)
         self.max_infeasible_retries = self.runtime_config.get("max_infeasible_retries", 10)
+
+        # SWIM membership (Phase 1 of gossip-consensus migration). Enabled when
+        # `failure_detection.protocol` is "swim"; otherwise the legacy heartbeat
+        # path remains authoritative and SWIM stays inert.
+        fd_cfg = self.config.get("failure_detection", {})
+        self.swim_enabled = fd_cfg.get("protocol", "heartbeat") == "swim"
+        self.swim = None
+        if self.swim_enabled:
+            swim_cfg = fd_cfg.get("swim", {})
+            self.swim = SwimMembership(
+                host=_SwimAdapter(self),
+                period_s=float(swim_cfg.get("period_ms", 1000)) / 1000.0,
+                probe_timeout_s=float(swim_cfg.get("probe_timeout_ms", 300)) / 1000.0,
+                k_req=int(swim_cfg.get("k_req", 3)),
+                suspect_timeout_s=float(swim_cfg.get("suspect_timeout_s", 8.0)),
+            )
+
+        # Gossip state dissemination (Phase 2). Off by default; turn on with
+        # `gossip.enabled: true`. The disseminator is independent of SWIM and
+        # safe to run with either failure-detection protocol.
+        gossip_cfg = self.config.get("gossip", {})
+        self.gossip_enabled = bool(gossip_cfg.get("enabled", False))
+        self.gossip = None
+        if self.gossip_enabled:
+            self.gossip = GossipStateDisseminator(
+                host=_GossipAdapter(self),
+                period_s=float(gossip_cfg.get("period_ms", 1000)) / 1000.0,
+                fanout=int(gossip_cfg.get("fanout", 3)),
+                state_ttl_s=float(gossip_cfg.get("state_ttl_s", 30.0)),
+            )
 
     @property
     def peer_expiry_seconds(self) -> int:
@@ -383,6 +537,30 @@ class ResourceAgent(Agent):
 
                 elif isinstance(incoming, Proposal):
                     self.__on_proposal(incoming=incoming)
+
+                elif isinstance(incoming, SwimPing):
+                    if self.swim is not None:
+                        self.swim.on_ping(incoming)
+
+                elif isinstance(incoming, SwimAck):
+                    if self.swim is not None:
+                        self.swim.on_ack(incoming)
+
+                elif isinstance(incoming, SwimPingReq):
+                    if self.swim is not None:
+                        self.swim.on_ping_req(incoming)
+
+                elif isinstance(incoming, GossipState):
+                    if self.gossip is not None:
+                        self.gossip.on_gossip(incoming)
+
+                elif isinstance(incoming, SnowQuery):
+                    if isinstance(self.engine, GossipConsensusEngine):
+                        self.engine.on_snow_query(incoming)
+
+                elif isinstance(incoming, SnowResponse):
+                    if isinstance(self.engine, GossipConsensusEngine):
+                        self.engine.on_snow_response(incoming)
 
                 else:
                     self.logger.info(f"Ignoring unsupported message: {message}")
@@ -1005,6 +1183,36 @@ class ResourceAgent(Agent):
         return agent_info
 
     def on_periodic(self):
+        # Start SWIM lazily on first tick (transport and neighbor_map are ready by now).
+        if self.swim is not None and getattr(self.swim, "_thread", None) is None:
+            self.swim.start()
+            self.logger.info("[SWIM] membership protocol started")
+
+        # Same for gossip dissemination.
+        if self.gossip is not None and getattr(self.gossip, "_thread", None) is None:
+            self.gossip.start()
+            self.logger.info("[gossip] state disseminator started")
+
+        # Snow engine driver thread.
+        if isinstance(self.engine, GossipConsensusEngine) \
+                and getattr(self.engine, "_thread", None) is None:
+            self.engine.start()
+            self.logger.info("[snow] consensus engine started")
+
+        # Refresh our own gossip entry every tick so peers' TTLs don't expire us.
+        if self.gossip is not None:
+            try:
+                cap = self._capacities
+                alloc = self.capacity_allocations
+                self.gossip.publish_local(
+                    cpu_util=(alloc.core / cap.core * 100.0) if cap.core else 0.0,
+                    ram_util=(alloc.ram / cap.ram * 100.0) if cap.ram else 0.0,
+                    disk_util=(alloc.disk / cap.disk * 100.0) if cap.disk else 0.0,
+                    load=float(self._load),
+                )
+            except Exception as exc:
+                self.logger.debug(f"[gossip] publish_local failed: {exc}")
+
         self._restart_selection()
         self._monitor_delegated_jobs()
         current_time = int(time.time())
@@ -1878,6 +2086,24 @@ class ResourceAgent(Agent):
                              level=self.topology.level,
                              group=self.topology.group)
         self.logger.info(f"Agent {self.agent_id} marked as shutting_down in Redis")
+
+        if self.swim is not None:
+            try:
+                self.swim.stop()
+            except Exception as exc:
+                self.logger.debug(f"SWIM stop raised: {exc}")
+
+        if self.gossip is not None:
+            try:
+                self.gossip.stop()
+            except Exception as exc:
+                self.logger.debug(f"gossip stop raised: {exc}")
+
+        if isinstance(self.engine, GossipConsensusEngine):
+            try:
+                self.engine.stop()
+            except Exception as exc:
+                self.logger.debug(f"snow engine stop raised: {exc}")
 
         self.executor.shutdown(wait=True)
         self.save_results()

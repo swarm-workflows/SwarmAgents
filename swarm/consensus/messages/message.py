@@ -34,6 +34,15 @@ class MessageType(enum.Enum):
     Proposal = enum.auto()    #3
     Prepare = enum.auto()     #4
     Commit = enum.auto()      #5
+    # SWIM membership (Phase 1)
+    SwimPing = enum.auto()    #6
+    SwimAck = enum.auto()     #7
+    SwimPingReq = enum.auto() #8
+    # Gossip state dissemination (Phase 2)
+    GossipState = enum.auto() #9
+    # Snow/Avalanche consensus (Phase 3)
+    SnowQuery = enum.auto()   #10
+    SnowResponse = enum.auto()#11
 
     def __repr__(self):
         return self.name

@@ -47,6 +47,7 @@ class Repository:
     KEY_PREPARE = "prepare"
     KEY_COMMIT = "commit"
     KEY_METRICS = "metrics"
+    KEY_ASSIGNEE = "assignee"
 
     def __init__(self, redis_client: redis.Redis):
         """
@@ -228,6 +229,29 @@ class Repository:
             return []
         values = self.redis.mget(keys)
         return [json.loads(v) for v in values if v]
+
+    def try_claim_assignment(self, job_id: str, agent_id: int,
+                             level: int = 0, group: int = 0) -> int:
+        """
+        Atomically claim ``job_id`` for ``agent_id`` using Redis SET NX.
+
+        Returns the winning agent_id — ``agent_id`` if this caller won the
+        claim, otherwise the agent_id of whoever got there first. Used by the
+        Snow/Avalanche engine to finalize a probabilistic decision into an
+        exactly-once assignment.
+        """
+        key = f"{self.KEY_ASSIGNEE}:{level}:{group}:{job_id}"
+        # `nx=True` returns True iff we set the key; otherwise read the existing value.
+        if self.redis.set(key, str(int(agent_id)), nx=True):
+            return int(agent_id)
+        existing = self.redis.get(key)
+        return int(existing) if existing is not None else int(agent_id)
+
+    def get_assignment(self, job_id: str, level: int = 0, group: int = 0):
+        """Return the committed assignee for ``job_id``, or None if unclaimed."""
+        key = f"{self.KEY_ASSIGNEE}:{level}:{group}:{job_id}"
+        v = self.redis.get(key)
+        return int(v) if v is not None else None
 
     def delete_all(self, key_prefix: str = KEY_JOB):
         """

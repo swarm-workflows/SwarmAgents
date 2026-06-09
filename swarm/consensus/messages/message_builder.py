@@ -29,11 +29,19 @@ from swarm.consensus.messages.message import MessageType, MessageException
 from swarm.consensus.messages.prepare import Prepare
 from swarm.consensus.messages.proposal import Proposal
 from swarm.consensus.messages.job_status import JobStatus
+from swarm.consensus.messages.swim_ping import SwimPing
+from swarm.consensus.messages.swim_ack import SwimAck
+from swarm.consensus.messages.swim_ping_req import SwimPingReq
+from swarm.consensus.messages.gossip_state import GossipState
+from swarm.consensus.messages.snow_query import SnowQuery
+from swarm.consensus.messages.snow_response import SnowResponse
 
 
 class MessageBuilder:
     @staticmethod
-    def from_dict(message: dict) -> Union[HeartBeat, Proposal, Prepare, Commit, JobStatus]:
+    def from_dict(message: dict) -> Union[HeartBeat, Proposal, Prepare, Commit, JobStatus,
+                                          SwimPing, SwimAck, SwimPingReq, GossipState,
+                                          SnowQuery, SnowResponse]:
         message_type = MessageType(message.get('message_type'))
 
         if message_type == MessageType.HeartBeat:
@@ -50,6 +58,24 @@ class MessageBuilder:
 
         elif message_type == MessageType.JobStatus:
             return JobStatus.from_dict(message)
+
+        elif message_type == MessageType.SwimPing:
+            return SwimPing.from_dict(message)
+
+        elif message_type == MessageType.SwimAck:
+            return SwimAck.from_dict(message)
+
+        elif message_type == MessageType.SwimPingReq:
+            return SwimPingReq.from_dict(message)
+
+        elif message_type == MessageType.GossipState:
+            return GossipState.from_dict(message)
+
+        elif message_type == MessageType.SnowQuery:
+            return SnowQuery.from_dict(message)
+
+        elif message_type == MessageType.SnowResponse:
+            return SnowResponse.from_dict(message)
 
         else:
             raise MessageException(f"Unsupported Message: {message}")

@@ -59,6 +59,43 @@ runtime:
   enable_agent_recovery: true        # Allow recovered agents to rejoin the pool
   max_infeasible_retries: 10         # Retire infeasible jobs after N attempts (0 = infinite)
   max_delegation_attempts: 3         # Mark job infeasible after N failed delegation timeouts
+
+# Consensus protocol — Phase 3 of the gossip-consensus migration. With
+# `protocol: snow`, ResourceAgent runs the Snow/Avalanche-style engine with
+# Redis SET-NX finalization in place of PBFT. Snow benefits significantly from
+# enabling gossip (below) and SWIM so peer cost estimates are informed by
+# fresh state.
+consensus:
+  protocol: pbft            # pbft (default) | snow
+  snow:
+    k: 20                    # Peers sampled per query round
+    alpha: 0.7               # Supermajority threshold within the sample
+    beta: 20                 # Consecutive winning rounds required to commit
+    max_rounds: 100          # Abandon Snow attempt after this many rounds
+    round_timeout_ms: 500    # Per-round response timeout
+    tick_interval_ms: 50     # Driver-thread polling interval
+
+# Failure detection — Phase 1 of the gossip-consensus migration (see
+# docs/GOSSIP_CONSENSUS_DESIGN.md). With `protocol: swim`, the SWIM membership
+# layer runs alongside the heartbeat mechanism; heartbeats remain authoritative
+# for job reassignment in this phase.
+failure_detection:
+  protocol: heartbeat       # heartbeat (default) | swim
+  swim:
+    period_ms: 1000          # Protocol round period
+    probe_timeout_ms: 300    # Direct ping timeout before falling back to ping-req
+    k_req: 3                 # Indirect probe fanout
+    suspect_timeout_s: 8     # Suspect -> failed transition
+
+# Gossip state dissemination (Phase 2). When enabled, agents push their
+# versioned utilization/load state to `fanout` random peers every round.
+# Independent of SWIM.
+gossip:
+  enabled: false
+  fanout: 3
+  period_ms: 1000
+  state_ttl_s: 30
+
 logging:
   ## The directory in which actor should create log files.
   ## This directory will be automatically created if it does not exist.
