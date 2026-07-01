@@ -44,11 +44,11 @@ export LLM_BASE_URL=http://localhost:11434/v1
 
 ### 2. Run with automatic LLM configuration
 
-**Using run_test_v2.py (recommended):**
+**Using run_test.py (recommended):**
 ```bash
 cd SwarmAgents
 
-python run_test_v2.py \
+python run_test.py \
     --mode local \
     --agent-type resource \
     --agents 30 \
@@ -173,7 +173,7 @@ llm:
 The same approach works for remote distributed deployments:
 
 ```bash
-python run_test_v2.py \
+python run_test.py \
     --mode remote \
     --agent-type resource \
     --agents 110 \

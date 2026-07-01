@@ -489,7 +489,7 @@ def generate_agent_configs(jobs: List[dict], num_agents: int,
 
 
 # ---------------------------------------------------------------------------
-# Importable entry point (for run_test_v2.py integration)
+# Importable entry point (for run_test.py integration)
 # ---------------------------------------------------------------------------
 
 def convert_pegasus_profiles(
@@ -504,7 +504,7 @@ def convert_pegasus_profiles(
 ) -> dict:
     """Convert Pegasus profiles to SwarmAgents job JSON files.
 
-    This is the programmatic entry point used by run_test_v2.py.  It writes
+    This is the programmatic entry point used by run_test.py.  It writes
     job_*.json, pegasus_baseline.json, and conversion_summary.json into
     *output_dir* and returns a result dict.  It does NOT generate agent
     configs — that is handled by generate_configs.py.

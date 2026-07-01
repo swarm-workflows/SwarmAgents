@@ -26,7 +26,7 @@ With shared parenting (K>1), each child group is assigned K co-parents from the 
 ```bash
 cd SwarmAgents
 
-python run_test_v2.py \
+python run_test.py \
     --mode local \
     --agent-type resource \
     --agents 30 \

@@ -255,17 +255,17 @@ Add agents during execution via three trigger types:
 
 ```bash
 # Time-based: add 5 agents after 30 seconds
-python run_test_v2.py --mode local --agents 20 --dynamic-agents 5 \
+python run_test.py --mode local --agents 20 --dynamic-agents 5 \
     --dynamic-trigger time --dynamic-delay 30 \
     --topology mesh --jobs 500 --db-host localhost --run-dir runs/dynamic-time
 
 # Bucket-based: add agents when Redis bucket reaches threshold
-python run_test_v2.py --mode local --agents 20 --dynamic-agents 10 \
+python run_test.py --mode local --agents 20 --dynamic-agents 10 \
     --dynamic-trigger bucket --dynamic-trigger-bucket 1 --dynamic-trigger-threshold 50 \
     --topology ring --jobs 500 --db-host localhost --run-dir runs/dynamic-bucket
 
 # Job-completion-based: add agents after N jobs complete
-python run_test_v2.py --mode local --agents 15 --dynamic-agents 5 \
+python run_test.py --mode local --agents 15 --dynamic-agents 5 \
     --dynamic-trigger jobs-completed --dynamic-trigger-jobs 100 \
     --topology hierarchical --jobs 300 --db-host localhost --run-dir runs/dynamic-jobs
 ```
@@ -302,7 +302,7 @@ All documentation lives in the [`docs/`](docs/) directory.
 ### Architecture & Design
 - [ARCHITECTURE.md](docs/ARCHITECTURE.md) — System architecture, five-layer design, and adapter patterns
 - [COMPLEXITY.md](docs/COMPLEXITY.md) — PBFT message complexity analysis for mesh and hierarchical topologies
-- [GOSSIP_CONSENSUS_DESIGN.md](docs/GOSSIP_CONSENSUS_DESIGN.md) — Design document for gossip-based consensus (future work)
+- [GOSSIP_CONSENSUS_DESIGN.md](docs/GOSSIP_CONSENSUS_DESIGN.md) — Gossip-based consensus stack (SWIM + gossip + Snow); Phases 1-3 implemented, wired, and unit-tested, Phase 4 (hybrid hierarchical) and at-scale evaluation pending
 
 ### Hierarchical Topology
 - [HIERARCHICAL_LLM_AGENTS.md](docs/HIERARCHICAL_LLM_AGENTS.md) — LLM agents as Level-1 coordinators in hierarchical topology

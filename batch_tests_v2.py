@@ -66,7 +66,7 @@ def run_blocking(cmd: list[str] | str, log_file: str | None = None, check: bool 
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Batch wrapper for run_test_v2.py with per-run isolation and archives."
+        description="Batch wrapper for run_test.py with per-run isolation and archives."
     )
     # Batch controls
     ap.add_argument("--runs", type=int, default=50, help="Number of runs (default: 50)")
@@ -78,7 +78,7 @@ def main():
     ap.add_argument("--runner", default="run_test.py",
                     help="Path to run_test.py (default: run_test.py)")
 
-    # ---- Passthrough to run_test_v2.py (required / common) ----
+    # ---- Passthrough to run_test.py (required / common) ----
     ap.add_argument("--mode", choices=["local", "remote"], default="local",
                     help="Where to start agents (v2 required)")
     ap.add_argument("--agent-type", choices=["resource", "llm"], default="resource",
@@ -148,7 +148,7 @@ def main():
     ap.add_argument("--agent-hosts-file", default=None, help="File with one hostname per line")
     ap.add_argument("--remote-repo-dir", default="/root/SwarmAgents", help="Remote repo root")
 
-    # Pegasus job integration (passthrough to run_test_v2.py)
+    # Pegasus job integration (passthrough to run_test.py)
     ap.add_argument("--pegasus-profiles", default=None,
                     help="Path to Pegasus profiles file (text/export) or Redis host")
     ap.add_argument("--pegasus-input-type", choices=["text", "redis", "export"], default="text",
@@ -186,7 +186,7 @@ def main():
         if args.sleep_between > 0 and i > 1:
             time.sleep(args.sleep_between)
 
-        # Build run_test_v2.py command
+        # Build run_test.py command
         cmd = [
             "python3.11", args.runner,
             "--mode", args.mode,

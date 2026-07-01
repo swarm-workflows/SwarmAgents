@@ -110,7 +110,7 @@ pip install -r requirements.txt
 #   mab.enabled: true
 #   mab.failure_simulation.enabled: true
 
-python run_test_v2.py \
+python run_test.py \
   --mode local \
   --agent-type resource \
   --agents 30 \
@@ -145,7 +145,7 @@ python job_generator.py \
 Then run the test (MAB will learn from the pre-determined failures):
 
 ```bash
-python run_test_v2.py \
+python run_test.py \
   --mode local \
   --agent-type resource \
   --agents 30 \
@@ -175,7 +175,7 @@ mab:
 Run and observe MAB learning to avoid the high-failure group:
 
 ```bash
-python run_test_v2.py \
+python run_test.py \
   --mode local \
   --agent-type resource \
   --agents 30 \

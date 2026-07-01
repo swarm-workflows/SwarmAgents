@@ -1,8 +1,15 @@
 # Gossip-Based Consensus Design for SWARM+
 
-> **Status:** Proposal (pre-implementation design document)
+> **Status:** Partially implemented — Phases 1–3 built, wired, and unit-tested; Phase 4 (hybrid hierarchical) not yet implemented; at-scale empirical evaluation pending.
 > **Author:** SWARM+ Team
 > **Related:** [ROADMAP.md](ROADMAP.md) (line 147-149), [COMPLEXITY.md](COMPLEXITY.md)
+>
+> **Implementation summary (2026-06):**
+> - **Phase 1 — SWIM membership:** implemented in `swarm/membership/swim.py`, wired via `_SwimAdapter`, started lazily in `ResourceAgent.on_periodic`. Runs alongside heartbeat; heartbeat remains authoritative for job reassignment in this phase.
+> - **Phase 2 — Gossip state dissemination:** implemented in `swarm/gossip/disseminator.py`, wired via `_GossipAdapter`, unit-tested (`tests/test_gossip.py`).
+> - **Phase 3 — Snow consensus engine:** implemented in `swarm/consensus/gossip_engine.py`, drop-in with `ConsensusEngine`, exactly-once finalization via Redis `SET NX` (`repository.try_claim_assignment`), unit-tested (`tests/test_snow.py`). Selected by `consensus.protocol: snow`.
+> - **Phase 4 — Hybrid hierarchical:** not implemented. `ResourceAgent` selects a single engine globally; there is no per-topology-level engine instantiation yet.
+> - **Evaluation:** unit tests use in-memory transports/fake CAS. The at-scale correctness and performance study (100–1000+ agents) is still outstanding.
 
 ---
 
@@ -593,63 +600,58 @@ Snow achieves roughly constant per-job message cost regardless of total agent co
 
 The migration is designed as four incremental phases, each independently useful and testable.
 
-### Phase 1: SWIM Membership Layer
+### Phase 1: SWIM Membership Layer — ✅ Implemented
 
 **Scope:** Add SWIM failure detection alongside the existing heartbeat mechanism.
 
-**Changes:**
+**As built:**
 - New module: `swarm/membership/swim.py`
-- New proto messages: `SwimPing`, `SwimAck`, `SwimPingReq`, `MembershipUpdate`
-- Integrate with `ResourceAgent` via `_SwimCallback`
+- New messages: `SwimPing`, `SwimAck`, `SwimPingReq` (in `swarm/consensus/messages/`)
+- Integrated with `ResourceAgent` via the `_SwimAdapter` class; started lazily in `on_periodic`
 - Config toggle: `failure_detection.protocol: "heartbeat" | "swim"`
-- Both mechanisms can run in parallel during transition — SWIM augments heartbeat, does not replace it yet
+- SWIM runs in parallel with heartbeat; **heartbeat remains authoritative for job reassignment in this phase** — SWIM's faster detection primarily informs peer liveness for cost/query sampling
 
-**Validation:**
-- Compare false positive rates between heartbeat (300s) and SWIM (8s suspect timeout)
-- Measure detection latency under simulated failures (`kill_agents.py`)
-- Verify no impact on existing PBFT consensus
+**Validation status:** Unit-level behavior covered indirectly; the false-positive-rate and detection-latency comparison under `kill_agents.py` at scale is still pending.
 
 **Risk:** Low — purely additive, no changes to consensus path.
 
-### Phase 2: Gossip State Dissemination
+### Phase 2: Gossip State Dissemination — ✅ Implemented
 
 **Scope:** Replace broadcast-based state sharing with epidemic gossip for agent load/capacity.
 
-**Changes:**
-- New module: `swarm/gossip/disseminator.py`
-- New proto message: `GossipState`, `AgentStateEntry`
-- Agents periodically push local state to `fanout` random peers instead of (or in addition to) Redis writes
-- `SelectionEngine` reads from local gossip state instead of querying Redis for peer capacities
+**As built:**
+- New module: `swarm/gossip/disseminator.py` (`GossipStateDisseminator`)
+- New messages: `GossipState`, `AgentStateEntry` (in `swarm/consensus/messages/`)
+- Integrated with `ResourceAgent` via the `_GossipAdapter` class; enabled by `gossip.enabled: true` and started lazily in `on_periodic`. Agents push versioned local state to `fanout` random peers each round; entries expire after `state_ttl_s`. When SWIM is active, gossip pushes to SWIM's live set.
+- Merge semantics (higher version wins, self-record protected, TTL eviction) covered by `tests/test_gossip.py`
 
-**Validation:**
-- Measure state convergence time across 100, 500, 1000 agents
-- Compare cost matrix accuracy (gossip state vs Redis ground truth)
-- Benchmark reduction in Redis read load
+**Validation status:** Merge/push/expiry unit-tested with an in-memory bus. Convergence-time and cost-matrix-accuracy studies at scale are still pending.
 
-**Risk:** Low-medium — gossip state may be slightly stale compared to Redis. Staleness is bounded by `state_ttl`.
+**Risk:** Low-medium — gossip state may be slightly stale compared to Redis. Staleness is bounded by `state_ttl_s`.
 
-### Phase 3: Snow Consensus Engine
+### Phase 3: Snow Consensus Engine — ✅ Implemented
 
 **Scope:** Implement `GossipConsensusEngine` as an alternative to `ConsensusEngine`, selectable via config.
 
-**Changes:**
-- New module: `swarm/consensus/gossip_engine.py`
-- New proto messages: `SnowQuery`, `SnowResponse`
-- New adapter: `_GossipTransportAdapter`
-- Redis CAS Lua script for exactly-once finalization
-- Config toggle: `consensus.protocol: "pbft" | "snow"`
-- Fallback: if Snow fails to converge in MAX_ROUNDS, delegate to PBFT within local group
+**As built:**
+- New module: `swarm/consensus/gossip_engine.py` (`GossipConsensusEngine`)
+- New messages: `SnowQuery`, `SnowResponse` (in `swarm/consensus/messages/`)
+- Reuses the existing `_TransportAdapter`; the `_HostAdapter` was extended with Snow-specific accessors (`live_peer_ids`, `my_cost_for_job`, `try_claim_assignment`, `get_assignment`)
+- Drop-in parity with `ConsensusEngine`: same `propose()` signature, `outgoing`/`incoming`/`conflicts` containers, and `on_leader_elected`/`on_participant_commit` callbacks. PBFT message handlers (`on_proposal`/`on_prepare`/`on_commit`) are kept as no-op shims for safe protocol rollout.
+- **Exactly-once finalization uses Redis `SET key value NX`** (`repository.try_claim_assignment`), not a Lua script — a single atomic set-if-absent claims the assignment; losers read back the committed winner.
+- Concurrency model: a single daemon driver thread pumps k-peer query rounds; inbound `on_snow_query`/`on_snow_response` mutate shared state under a lock.
+- Config toggle: `consensus.protocol: "pbft" | "snow"` (with `consensus.snow.{k,alpha,beta,max_rounds,round_timeout_ms,tick_interval_ms}`)
+- **No PBFT fallback on non-convergence** (differs from the original plan): after `max_rounds` the Snow attempt is abandoned and the job is left for reselection.
 
-**Validation:**
-- Correctness: verify no double-assignments under concurrent Snow queries (stress test with 100+ jobs, 100+ agents)
-- Performance: compare job assignment throughput and latency vs PBFT at various scales
-- Convergence: measure actual rounds-to-converge distribution
+**Validation status:** Unit tests (`tests/test_snow.py`) cover propose→round→commit, the peer dominance/yield rule, the already-decided fast path, and exactly-once CAS with a fake Redis. The 100+ job / 100+ agent no-double-assignment stress test and the throughput/latency-vs-PBFT study are still pending.
 
-**Risk:** Medium — probabilistic safety requires thorough testing. Redis CAS provides a deterministic safety net.
+**Risk:** Medium — probabilistic safety requires thorough testing. Redis `SET NX` provides a deterministic safety net.
 
-### Phase 4: Hybrid Hierarchical Mode
+### Phase 4: Hybrid Hierarchical Mode — ❌ Not implemented
 
 **Scope:** Use PBFT within groups and Snow across groups in hierarchical topologies.
+
+> **Current limitation:** `ResourceAgent.__init__` selects a single engine globally from `consensus.protocol`. A hierarchical run therefore uses either all-PBFT or all-Snow; per-topology-level engine instantiation does not exist yet.
 
 **Changes:**
 - Modify `ResourceAgent` to instantiate different engines at different topology levels
