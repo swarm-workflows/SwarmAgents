@@ -402,6 +402,7 @@ class SwarmConfigGenerator:
         self,
         flavor_percentages,
         agent_hosts: Optional[List[str]],
+        agent_sites: Optional[List[str]] = None,
         save_agent_profiles_path: str = "agent_profiles.json",
     ):
         if not os.path.exists(self.output_dir):
@@ -697,6 +698,10 @@ class SwarmConfigGenerator:
                 host_idx = (agent_id - 1) // self.agents_per_host
                 host = agent_hosts[host_idx]
                 config['grpc']['host'] = host
+                # Site label parallels the hosts file (one site per host line), so all
+                # agents on the same host share a site. Enables topology-aware Snow sampling.
+                if agent_sites and host_idx < len(agent_sites):
+                    config['site'] = agent_sites[host_idx]
                 if self.agents_per_host > 1:
                     config['grpc']['port'] += agent_id
             else:
@@ -797,6 +802,18 @@ def load_agent_hosts(path: str) -> List[str]:
     return hosts
 
 
+def load_agent_sites(path: str) -> List[str]:
+    """
+    Read SITE labels (one per line), parallel to the agent hosts file: line i is the
+    site of host i. Used for topology-aware (locality-weighted) Snow sampling.
+    """
+    with open(path, "r") as f:
+        sites = [line.strip() for line in f if line.strip()]
+    if not sites:
+        raise ValueError("No sites found in agent sites file")
+    return sites
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate agent configuration files.")
     parser.add_argument("num_agents", type=int, help="Number of agents to generate configurations for.")
@@ -811,6 +828,9 @@ if __name__ == "__main__":
     parser.add_argument("--flavor-percentages", nargs='*', type=float, metavar='PERCENT',
                         help="Percentages for small, medium, large, xtralarge, xxtralarge (e.g. 0.4 0.25 0.15 0.15 0.05)")
     parser.add_argument("--agent-hosts-file", type=str, help="Path to file with agent hosts (one per line)")
+    parser.add_argument("--agent-sites-file", type=str,
+                        help="Path to file with site labels (one per line), parallel to the hosts file. "
+                             "Enables topology-aware Snow sampling (each host's agents get that site).")
     parser.add_argument("--agents-per-host", type=int, default=1,
                         help="Number of agents per host (for grpc.host assignment)")
 
@@ -848,6 +868,11 @@ if __name__ == "__main__":
     else:
         agent_hosts = None
 
+    if args.agent_sites_file:
+        agent_sites = load_agent_sites(args.agent_sites_file)
+    else:
+        agent_sites = None
+
     # Normalize flavor percentages: fill missing with defaults
     if args.flavor_percentages:
         fp = list(args.flavor_percentages)
@@ -873,7 +898,8 @@ if __name__ == "__main__":
         initial_group_size=args.initial_group_size,
         co_parent_count=args.co_parents,
     )
-    generator.generate_configs(flavor_percentages=flavor_percentages, agent_hosts=agent_hosts)
+    generator.generate_configs(flavor_percentages=flavor_percentages, agent_hosts=agent_hosts,
+                               agent_sites=agent_sites)
 
     # Create jobs if not present
     if not os.path.exists("jobs"):

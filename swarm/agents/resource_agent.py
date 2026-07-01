@@ -139,6 +139,13 @@ class _HostAdapter(ConsensusHost):
             level=self.agent.topology.level, group=self.agent.topology.group,
         )
 
+    def my_site(self):
+        return getattr(self.agent, "site", None)
+
+    def peer_site(self, peer_id: int):
+        info = self.agent.neighbor_map.get(int(peer_id))
+        return getattr(info, "site", None) if info is not None else None
+
 
 class _TransportAdapter(ConsensusTransport):
     def __init__(self, agent: "ResourceAgent"):
@@ -231,24 +238,49 @@ class ResourceAgent(Agent):
         host = _HostAdapter(self)
         transport = _TransportAdapter(self)
         router = _RouteAdapter(self)
-        if protocol == "snow":
-            snow_cfg = consensus_cfg.get("snow", {})
-            self.engine = GossipConsensusEngine(
-                agent_id=agent_id,
-                host=host,
-                transport=transport,
-                router=router,
-                k=int(snow_cfg.get("k", 20)),
-                alpha=float(snow_cfg.get("alpha", 0.7)),
-                beta=int(snow_cfg.get("beta", 20)),
-                max_rounds=int(snow_cfg.get("max_rounds", 100)),
-                round_timeout_s=float(snow_cfg.get("round_timeout_ms", 500)) / 1000.0,
-                tick_interval_s=float(snow_cfg.get("tick_interval_ms", 50)) / 1000.0,
-            )
-            self.consensus_protocol = "snow"
+
+        def _make_engine(engine_name: str):
+            """Build a consensus engine by name ('pbft' | 'snow')."""
+            if engine_name == "snow":
+                snow_cfg = consensus_cfg.get("snow", {})
+                return GossipConsensusEngine(
+                    agent_id=agent_id,
+                    host=host,
+                    transport=transport,
+                    router=router,
+                    k=int(snow_cfg.get("k", 20)),
+                    alpha=float(snow_cfg.get("alpha", 0.7)),
+                    beta=int(snow_cfg.get("beta", 20)),
+                    max_rounds=int(snow_cfg.get("max_rounds", 100)),
+                    round_timeout_s=float(snow_cfg.get("round_timeout_ms", 500)) / 1000.0,
+                    tick_interval_s=float(snow_cfg.get("tick_interval_ms", 50)) / 1000.0,
+                    local_sample_frac=float(snow_cfg.get("local_sample_frac", 1.0)),
+                )
+            return ConsensusEngine(agent_id, host, transport, router=router)
+
+        # Phase 4 hybrid: PBFT within small level-0 worker groups; Snow across the
+        # (potentially large) coordinator tiers where flat PBFT hits O(g^2). Engine is
+        # chosen from the agent's immutable topology level; consensus only ever flows
+        # among same-level peers, so a level exchanges messages of a single engine type.
+        if protocol == "hybrid":
+            hybrid_cfg = consensus_cfg.get("hybrid", {})
+            level0_engine = (hybrid_cfg.get("level0") or "pbft").lower()
+            coord_engine = (hybrid_cfg.get("coordinator") or "snow").lower()
+            resolved = level0_engine if int(self.topology.level) == 0 else coord_engine
+        elif protocol == "snow":
+            resolved = "snow"
         else:
-            self.engine = ConsensusEngine(agent_id, host, transport, router=router)
-            self.consensus_protocol = "pbft"
+            resolved = "pbft"
+
+        self.engine = _make_engine(resolved)
+        self.consensus_protocol = resolved
+        self.logger.info(
+            f"[consensus] protocol={protocol} level={self.topology.level} -> engine={resolved}"
+        )
+
+        # Site/locality label (e.g. FABRIC site) for topology-aware Snow sampling.
+        # None when not configured -> sampling falls back to uniform.
+        self.site = self.config.get("site")
 
         self._capacities = Capacities().from_dict(self.config.get("capacities", {}))
         self._load = 0
@@ -1111,7 +1143,8 @@ class ResourceAgent(Agent):
                 last_updated=current_time,
                 dtns=self.config.get("dtns"),
                 group=self.topology.group,
-                level=self.topology.level
+                level=self.topology.level,
+                site=self.site
             )
         # Non-leaf agent: aggregate info from children in actively-led groups only
         else:
@@ -1177,7 +1210,8 @@ class ResourceAgent(Agent):
                 dtns=dtns,
                 proposed_load=proposed_load,
                 group=self.topology.group,
-                level=self.topology.level
+                level=self.topology.level,
+                site=self.site
             )
 
         return agent_info

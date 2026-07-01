@@ -46,6 +46,7 @@ class AgentInfo(JSONField):
         self._dtns = {}
         self._group = None
         self._level = None
+        self.site = None  # Locality/site label for topology-aware Snow sampling (may be None)
         self._shutting_down = False  # Set to True during graceful shutdown to prevent failure detection
         self._set_fields(**kwargs)
 

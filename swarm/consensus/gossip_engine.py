@@ -66,6 +66,10 @@ class SnowHost(ConsensusHost, Protocol):
     def my_cost_for_job(self, object_id: str) -> Optional[float]: ...
     def try_claim_assignment(self, object_id: str, agent_id: int) -> int: ...
     def get_assignment(self, object_id: str) -> Optional[int]: ...
+    # Optional locality accessors for topology-aware sampling. Implementations that
+    # don't provide site info can omit these (the engine falls back to uniform sampling).
+    def my_site(self) -> Optional[str]: ...
+    def peer_site(self, peer_id: int) -> Optional[str]: ...
 
 
 @dataclass
@@ -80,6 +84,8 @@ class _SnowState:
     round_deadline: float = 0.0
     finalized: bool = False
     last_round_at: float = 0.0
+    queried: int = 0          # peers actually queried in the current round
+    started_at: float = 0.0   # when this proposal entered Snow (for latency instrumentation)
 
 
 class GossipConsensusEngine:
@@ -109,6 +115,7 @@ class GossipConsensusEngine:
         max_rounds: int = 100,
         round_timeout_s: float = 0.5,
         tick_interval_s: float = 0.05,
+        local_sample_frac: float = 1.0,
         time_fn: Callable[[], float] = time.time,
     ):
         self.agent_id = int(agent_id)
@@ -116,11 +123,14 @@ class GossipConsensusEngine:
         self.transport = transport
         self.router = router
         self.k = int(k)
+        self.alpha = float(alpha)
         self.alpha_k = max(1, int(round(alpha * k)))
         self.beta = int(beta)
         self.max_rounds = int(max_rounds)
         self.round_timeout_s = float(round_timeout_s)
         self.tick_interval_s = float(tick_interval_s)
+        # Fraction of each k-sample drawn from same-site peers (1.0 = uniform).
+        self.local_sample_frac = min(1.0, max(0.0, float(local_sample_frac)))
         self._time = time_fn
 
         # ProposalContainer parity with PBFT engine — agent code reads/clears these.
@@ -132,6 +142,14 @@ class GossipConsensusEngine:
         self._states: Dict[str, _SnowState] = {}
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+
+    def _alpha_threshold(self, sample_size: int) -> int:
+        """Supermajority vote count required, relative to the peers actually sampled
+        this round. Basing this on the live sample (not the static k) lets small
+        groups — where fewer than k peers exist — still reach a supermajority and
+        commit, instead of never clearing a k-based threshold."""
+        eff = min(int(self.k), int(sample_size)) if sample_size else int(self.k)
+        return max(1, int(round(self.alpha * eff)))
 
     # ---- Lifecycle ------------------------------------------------------- #
 
@@ -169,6 +187,7 @@ class GossipConsensusEngine:
                     preferred=self.agent_id,
                     preferred_cost=float(p.cost or 0.0),
                     round_deadline=now,  # send first query on next tick
+                    started_at=now,
                 )
 
     # PBFT-message handlers — Snow doesn't use them but keep no-op shims so
@@ -264,11 +283,15 @@ class GossipConsensusEngine:
             if state.pending_query_id is None:
                 self._send_round(state, now)
                 continue
-            # Round complete by quorum, or deadline reached.
+            # A round ends as soon as every peer we actually queried has responded
+            # (capped at k), or the deadline is hit. Using min(k, queried) instead of
+            # a static k means small groups (fewer than k live peers) no longer wait
+            # the full round_timeout on every round — the dominant latency source.
             with self._lock:
                 got = len(state.pending_responses)
+                needed = min(self.k, state.queried) if state.queried else self.k
                 deadline_hit = state.round_deadline <= now
-            if got >= self.k or deadline_hit:
+            if got >= needed or deadline_hit:
                 self._evaluate_round(state, now)
 
         # Drop finalized state entries.
@@ -289,6 +312,7 @@ class GossipConsensusEngine:
             state.round_deadline = now + self.round_timeout_s
             state.last_round_at = now
             state.round_no += 1
+            state.queried = len(peers)
         msg = SnowQuery(
             source=self.agent_id,
             query_id=query_id,
@@ -320,9 +344,12 @@ class GossipConsensusEngine:
             self._maybe_abort_or_continue(state, now)
             return
         top_choice, top_count = counts.most_common(1)[0]
+        # Supermajority relative to the peers actually queried this round, so small
+        # groups (fewer than k peers) can still clear the threshold and commit.
+        alpha_threshold = self._alpha_threshold(state.queried or len(responses))
 
         with self._lock:
-            if top_count >= self.alpha_k:
+            if top_count >= alpha_threshold:
                 if top_choice == state.preferred:
                     state.confidence += 1
                 else:
@@ -371,6 +398,14 @@ class GossipConsensusEngine:
             self.outgoing.remove_object(object_id=state.proposal.object_id)
             self.incoming.remove_object(object_id=state.proposal.object_id)
 
+        # Per-decision latency instrumentation: separates Snow round time from any
+        # downstream queue/serialization tax so the ~9s selection cost can be diagnosed.
+        elapsed = self._time() - state.started_at if state.started_at else -1.0
+        self.host.log_info(
+            f"[SNOW_TIMING] Object:{state.proposal.object_id} rounds={state.round_no} "
+            f"queried={state.queried} elapsed={elapsed:.3f}s reason={reason}"
+        )
+
         obj = self.host.get_object(state.proposal.object_id)
         if obj is None:
             return
@@ -399,7 +434,34 @@ class GossipConsensusEngine:
             return []
         if len(pool) <= self.k:
             return pool
-        return random.sample(pool, self.k)
+        # Uniform sampling unless topology-aware sampling is enabled AND site info exists.
+        if self.local_sample_frac >= 1.0:
+            return random.sample(pool, self.k)
+        my_site = self._safe_site(None)
+        if my_site is None:
+            return random.sample(pool, self.k)
+        # Partition by locality and draw most of the sample from same-site peers so
+        # rounds resolve at LAN latency; keep a cross-site remainder for global convergence.
+        local = [p for p in pool if self._safe_site(p) == my_site]
+        remote = [p for p in pool if self._safe_site(p) != my_site]
+        n_local = min(len(local), int(round(self.local_sample_frac * self.k)))
+        picks = random.sample(local, n_local) if n_local else []
+        n_remote = min(len(remote), self.k - len(picks))
+        if n_remote > 0:
+            picks += random.sample(remote, n_remote)
+        if len(picks) < self.k:  # backfill from leftovers if a partition was too small
+            leftover = list(set(pool) - set(picks))
+            need = min(self.k - len(picks), len(leftover))
+            if need > 0:
+                picks += random.sample(leftover, need)
+        return picks
+
+    def _safe_site(self, peer_id: Optional[int]) -> Optional[str]:
+        """Site of a peer (or this agent when peer_id is None); None if unavailable."""
+        try:
+            return self.host.my_site() if peer_id is None else self.host.peer_site(int(peer_id))
+        except Exception:
+            return None
 
     def _safe_send(self, dest: int, payload: object) -> None:
         try:

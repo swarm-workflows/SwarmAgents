@@ -244,6 +244,8 @@ def generate_configs(args, agent_hosts_list: list[str]) -> Path:
         gen_args += ["--initial-group-size", str(args.initial_group_size)]
     if hasattr(args, 'fit_all') and args.fit_all:
         gen_args += ["--fit-all"]
+    if getattr(args, "agent_sites_file", None):
+        gen_args += ["--agent-sites-file", str(args.agent_sites_file)]
 
     log("Generating configs …")
     run_blocking(gen_args, check=True)
@@ -699,6 +701,9 @@ def parse_args() -> argparse.Namespace:
     # Remote host options
     ap.add_argument("--agent-hosts", default=None, help="Comma-separated hostnames")
     ap.add_argument("--agent-hosts-file", default=None, help="File with one hostname per line")
+    ap.add_argument("--agent-sites-file", default=None,
+                    help="File with one site label per line, parallel to the hosts file "
+                         "(enables topology-aware Snow sampling)")
     ap.add_argument("--remote-repo-dir", default="/root/SwarmAgents", help="Remote repo root")
 
     # Test control

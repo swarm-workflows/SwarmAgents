@@ -255,5 +255,37 @@ class SnowFastFinalizeTests(unittest.TestCase):
         self.assertEqual(host.participant_events, [("job-y", 99)])
 
 
+class SnowFewPeersTests(unittest.TestCase):
+    """Small groups (fewer live peers than k) must commit without waiting the full
+    per-round timeout, and must be able to clear the supermajority threshold.
+
+    Regression guard for the latency fix: a round completes when all *queried* peers
+    respond (min(k, queried)) rather than requiring k responses, and the alpha
+    threshold is relative to the peers actually sampled — so a 2-peer group under
+    k=8 still commits at t=0 instead of burning round_timeout on every round."""
+
+    def test_commits_without_waiting_when_peers_below_k(self):
+        eng, host, transport, cas = _make_engine(
+            agent_id=1, peers=[2, 3], k=8, alpha=0.7, beta=2)
+        p = ProposalInfo(p_id="p", object_id="job-s", cost=1.0, agent_id="1")
+        eng.propose([p])
+
+        # Two rounds, both evaluated at t=0.0 — well before the 0.5s round deadline.
+        for _ in range(2):
+            eng._tick(now=0.0)  # send a round
+            q = max((m[1] for m in transport.outbox if isinstance(m[1], SnowQuery)),
+                    key=lambda x: x.round)
+            self.assertEqual(len([m for m in transport.outbox
+                                  if isinstance(m[1], SnowQuery) and m[1].query_id == q.query_id]), 2)
+            for peer in (2, 3):
+                eng.on_snow_response(SnowResponse(
+                    source=peer, query_id=q.query_id, job_id="job-s",
+                    preferred_agent=1, cost=1.0, already_decided=False))
+            eng._tick(now=0.0)  # evaluate the round at t=0.0 (no deadline wait)
+
+        self.assertEqual(cas.get("job-s"), 1)
+        self.assertEqual(host.leader_events, ["job-s"])
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
