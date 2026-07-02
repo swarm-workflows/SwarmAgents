@@ -154,6 +154,10 @@ class _TransportAdapter(ConsensusTransport):
         self.agent.send(dest, payload)
     def broadcast(self, payload: object) -> None:
         self.agent.broadcast(payload)
+    def send_besteffort(self, dest: int, payload: object, timeout_s: float = 0.3) -> None:
+        # Low-latency, no-retry send for best-effort Snow queries/responses so a slow or
+        # unreachable peer can't stall the Snow driver.
+        self.agent.send(dest, payload, timeout=timeout_s, retries=0)
 
 
 class _RouteAdapter(TopologyRouter):
@@ -255,6 +259,8 @@ class ResourceAgent(Agent):
                     round_timeout_s=float(snow_cfg.get("round_timeout_ms", 500)) / 1000.0,
                     tick_interval_s=float(snow_cfg.get("tick_interval_ms", 50)) / 1000.0,
                     local_sample_frac=float(snow_cfg.get("local_sample_frac", 1.0)),
+                    send_workers=int(snow_cfg.get("send_workers", 12)),
+                    send_timeout_s=float(snow_cfg.get("send_timeout_ms", 300)) / 1000.0,
                 )
             return ConsensusEngine(agent_id, host, transport, router=router)
 

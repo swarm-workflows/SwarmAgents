@@ -240,10 +240,13 @@ class Agent(Observer):
                                  neighbor_map=self.neighbor_map,
                                  sender=self.agent_id)
 
-    def send(self, dest: int, payload: object) -> None:
+    def send(self, dest: int, payload: object, timeout: float = 2.0, retries: int = 4) -> None:
         peer_info = self.neighbor_map.get(dest)
+        if peer_info is None:
+            return
         self.transport.send(host=peer_info.host, port=peer_info.port, payload=payload,
-                      dest=peer_info.agent_id, src=self.agent_id)
+                      dest=peer_info.agent_id, src=self.agent_id,
+                      timeout=timeout, retries=retries)
 
     def calculate_quorum(self) -> int:
         # Simple majority quorum calculation

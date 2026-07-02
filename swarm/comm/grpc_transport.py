@@ -62,7 +62,8 @@ class GrpcTransport(Observer):
     def stop(self):
         self.server.stop()
 
-    def send(self, host: str, port: int, src: int, dest: int, payload: object) -> None:
+    def send(self, host: str, port: int, src: int, dest: int, payload: object,
+             timeout: float = 2.0, retries: int = 4) -> None:
         if not isinstance(payload, Message):
             raise TypeError("Payload must be of Message type")
         req = consensus_pb2.ConsensusMessage(
@@ -72,7 +73,7 @@ class GrpcTransport(Observer):
             payload=json.dumps(payload.to_dict()),
             timestamp=int(time.time())
         )
-        self.client.call_unary(host, port, "SendMessage", req, timeout=2.0, retries=4)
+        self.client.call_unary(host, port, "SendMessage", req, timeout=timeout, retries=retries)
 
     def _send_raw(self, host: str, port: int, src: int, dest: int,
                   payload_json: str, msg_type: str) -> None:

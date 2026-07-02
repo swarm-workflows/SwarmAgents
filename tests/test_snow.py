@@ -287,5 +287,60 @@ class SnowFewPeersTests(unittest.TestCase):
         self.assertEqual(host.leader_events, ["job-s"])
 
 
+def _deliver_round(eng, transport, job_id, votes):
+    """Send the next round for job_id and deliver (peer, choice) votes, then evaluate."""
+    eng._tick(now=0.0)  # sends a round (pending_query_id was None)
+    q = max((m[1] for m in transport.outbox
+             if isinstance(m[1], SnowQuery) and m[1].job_id == job_id),
+            key=lambda x: x.round)
+    for peer, choice in votes:
+        eng.on_snow_response(SnowResponse(
+            source=peer, query_id=q.query_id, job_id=job_id,
+            preferred_agent=choice, cost=1.0, already_decided=False))
+    eng._tick(now=0.0)  # evaluates the round
+
+
+class SnowballStickyTests(unittest.TestCase):
+    """Snowball keeps `preferred` as the argmax of cumulative support, so a transient
+    minority flip does not thrash the preference (Snowflake used to switch every flip,
+    broadcasting unstable preferences that blocked network convergence)."""
+
+    def test_preferred_sticky_under_minority_flip(self):
+        eng, host, transport, cas = _make_engine(
+            agent_id=1, peers=[2, 3, 4], k=3, alpha=0.7, beta=10)
+        eng.propose([ProposalInfo(p_id="p", object_id="j", cost=1.0, agent_id="1")])
+        st = eng._states["j"]
+        _deliver_round(eng, transport, "j", [(2, 7), (3, 7), (4, 7)])   # supermajority for 7
+        self.assertEqual(st.preferred, 7)
+        self.assertEqual(st.d[7], 1)
+        _deliver_round(eng, transport, "j", [(2, 7), (3, 7), (4, 9)])   # one flip to 9
+        self.assertEqual(st.preferred, 7)   # sticky
+        self.assertEqual(st.d[7], 2)
+
+
+class SnowNonBlockingSendTests(unittest.TestCase):
+    """With the send pool running, a slow transport must not block the caller/driver."""
+
+    def test_slow_send_does_not_block(self):
+        import time as _t
+
+        class SlowTransport:
+            def send(self, dest, payload): _t.sleep(0.5)
+            def broadcast(self, payload): pass
+
+        eng, host, transport, cas = _make_engine()
+        eng.transport = SlowTransport()
+        eng.start()  # spins the (idle) driver + the send pool
+        try:
+            q = SnowQuery(source=1, query_id="q", job_id="j",
+                          preferred_agent=1, preferred_cost=1.0, round=1)
+            t0 = _t.time()
+            for d in (2, 3, 4, 5, 6):
+                eng._safe_send(d, q)      # submitted to pool, must return immediately
+            self.assertLess(_t.time() - t0, 0.2)  # did not wait on the 0.5s sends
+        finally:
+            eng.stop()
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

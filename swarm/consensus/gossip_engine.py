@@ -41,6 +41,7 @@ import threading
 import time
 import uuid
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Protocol
 
@@ -55,6 +56,9 @@ class SnowTransport(Protocol):
 
     def send(self, dest: int, payload: object) -> None: ...
     def broadcast(self, payload: object) -> None: ...
+    # Optional low-latency, no-retry send for best-effort Snow queries/responses. If a
+    # transport doesn't provide it, the engine falls back to send().
+    def send_besteffort(self, dest: int, payload: object, timeout_s: float) -> None: ...
 
 
 class SnowHost(ConsensusHost, Protocol):
@@ -75,9 +79,9 @@ class SnowHost(ConsensusHost, Protocol):
 @dataclass
 class _SnowState:
     proposal: ProposalInfo
-    preferred: int            # agent_id currently believed to win
+    preferred: int            # agent_id currently believed to win (Snowball: argmax of `d`)
     preferred_cost: float
-    confidence: int = 0
+    confidence: int = 0       # consecutive successful rounds for `last_choice`
     round_no: int = 0
     pending_query_id: Optional[str] = None
     pending_responses: List[SnowResponse] = field(default_factory=list)
@@ -86,6 +90,9 @@ class _SnowState:
     last_round_at: float = 0.0
     queried: int = 0          # peers actually queried in the current round
     started_at: float = 0.0   # when this proposal entered Snow (for latency instrumentation)
+    d: Counter = field(default_factory=Counter)  # Snowball cumulative per-choice support
+    last_choice: Optional[int] = None            # top choice of the previous successful round
+    cost_of: Dict[int, float] = field(default_factory=dict)  # best-known cost per candidate
 
 
 class GossipConsensusEngine:
@@ -116,6 +123,8 @@ class GossipConsensusEngine:
         round_timeout_s: float = 0.5,
         tick_interval_s: float = 0.05,
         local_sample_frac: float = 1.0,
+        send_workers: int = 12,
+        send_timeout_s: float = 0.3,
         time_fn: Callable[[], float] = time.time,
     ):
         self.agent_id = int(agent_id)
@@ -132,6 +141,14 @@ class GossipConsensusEngine:
         # Fraction of each k-sample drawn from same-site peers (1.0 = uniform).
         self.local_sample_frac = min(1.0, max(0.0, float(local_sample_frac)))
         self._time = time_fn
+
+        # Non-blocking send pool: queries are best-effort and one-way (responses arrive
+        # asynchronously), so the driver tick must never block on a slow gRPC send.
+        self.send_workers = max(1, int(send_workers))
+        self.send_timeout_s = float(send_timeout_s)
+        self._send_pool: Optional[ThreadPoolExecutor] = None
+        self._send_sem: Optional[threading.BoundedSemaphore] = None
+        self.sends_dropped = 0
 
         # ProposalContainer parity with PBFT engine — agent code reads/clears these.
         self.outgoing = ProposalContainer()
@@ -157,6 +174,13 @@ class GossipConsensusEngine:
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
+        if self._send_pool is None:
+            self._send_pool = ThreadPoolExecutor(
+                max_workers=self.send_workers, thread_name_prefix=f"snow-send-{self.agent_id}"
+            )
+            # Bound outstanding sends so a burst can't grow memory without limit; excess
+            # sends are dropped (best-effort — a missed query just means that peer abstains).
+            self._send_sem = threading.BoundedSemaphore(self.send_workers * 4)
         self._thread = threading.Thread(
             target=self._run, name=f"snow-{self.agent_id}", daemon=True
         )
@@ -167,6 +191,10 @@ class GossipConsensusEngine:
         if self._thread:
             self._thread.join(timeout=max(0.2, self.tick_interval_s * 4))
             self._thread = None
+        if self._send_pool is not None:
+            self._send_pool.shutdown(wait=False)
+            self._send_pool = None
+            self._send_sem = None
 
     # ---- PBFT-engine-compatible API ------------------------------------- #
 
@@ -182,13 +210,15 @@ class GossipConsensusEngine:
                 if p.object_id in self._states:
                     continue  # already in flight
                 self.outgoing.add_proposal(p)
-                self._states[p.object_id] = _SnowState(
+                st = _SnowState(
                     proposal=p,
                     preferred=self.agent_id,
                     preferred_cost=float(p.cost or 0.0),
                     round_deadline=now,  # send first query on next tick
                     started_at=now,
                 )
+                st.cost_of[self.agent_id] = float(p.cost or 0.0)
+                self._states[p.object_id] = st
 
     # PBFT-message handlers — Snow doesn't use them but keep no-op shims so
     # ResourceAgent's existing dispatch path doesn't crash if a stray PBFT
@@ -350,20 +380,27 @@ class GossipConsensusEngine:
 
         with self._lock:
             if top_count >= alpha_threshold:
-                if top_choice == state.preferred:
-                    state.confidence += 1
-                else:
+                # Track best-known cost for the winning choice.
+                cost = min(
+                    (r.cost for r in responses
+                     if r.preferred_agent is not None
+                     and int(r.preferred_agent) == top_choice
+                     and r.cost is not None),
+                    default=state.cost_of.get(top_choice, state.preferred_cost),
+                )
+                state.cost_of[top_choice] = float(cost)
+                # Snowball: accumulate cumulative support per choice and keep `preferred`
+                # as the argmax of that tally. This makes the preference STICKY across
+                # transient round-to-round flips (the Snowflake version switched preferred
+                # on every flip, broadcasting thrashing preferences that prevented the
+                # network from converging). Confidence counts consecutive rounds won by
+                # the same top choice; a flip resets it to 1, not 0.
+                state.d[top_choice] += 1
+                if state.d[top_choice] > state.d[state.preferred]:
                     state.preferred = top_choice
-                    # Adopt the new candidate's cost from the responses if known.
-                    new_cost = min(
-                        (r.cost for r in responses
-                         if r.preferred_agent is not None
-                         and int(r.preferred_agent) == top_choice
-                         and r.cost is not None),
-                        default=state.preferred_cost,
-                    )
-                    state.preferred_cost = float(new_cost)
-                    state.confidence = 1
+                    state.preferred_cost = state.cost_of.get(top_choice, state.preferred_cost)
+                state.confidence = state.confidence + 1 if top_choice == state.last_choice else 1
+                state.last_choice = top_choice
             else:
                 state.confidence = 0
                 self.conflicts[state.proposal.object_id] = (
@@ -464,7 +501,36 @@ class GossipConsensusEngine:
             return None
 
     def _safe_send(self, dest: int, payload: object) -> None:
+        """Dispatch a Snow message without blocking the driver thread. Sends run on a
+        bounded pool as best-effort (short timeout, no retries); if the pool is saturated
+        the send is dropped (that peer simply abstains this round). When no pool is
+        running (e.g. unit tests calling _tick directly), fall back to a synchronous send."""
+        pool, sem = self._send_pool, self._send_sem
+        if pool is None or sem is None:
+            self._do_send(dest, payload)
+            return
+        if not sem.acquire(blocking=False):
+            self.sends_dropped += 1
+            return
         try:
-            self.transport.send(dest, payload)
+            pool.submit(self._do_send_release, dest, payload)
+        except RuntimeError:  # pool shutting down
+            sem.release()
+            self.sends_dropped += 1
+
+    def _do_send_release(self, dest: int, payload: object) -> None:
+        try:
+            self._do_send(dest, payload)
+        finally:
+            if self._send_sem is not None:
+                self._send_sem.release()
+
+    def _do_send(self, dest: int, payload: object) -> None:
+        try:
+            besteffort = getattr(self.transport, "send_besteffort", None)
+            if besteffort is not None:
+                besteffort(dest, payload, self.send_timeout_s)
+            else:
+                self.transport.send(dest, payload)
         except Exception as exc:
             self.host.log_debug(f"[snow] send -> {dest} failed: {exc}")

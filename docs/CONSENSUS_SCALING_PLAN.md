@@ -67,7 +67,37 @@ A first (self-contained, biggest win) → B (engine-local, unit-testable) → C 
 behind the new `site` field so it's a no-op until sites are provided). All preserve the exactly-once
 safety net (Redis `SET NX` in `repository.try_claim_assignment`).
 
-## Verification
+## Verification RESULTS (2026-07-02, 4-site FABRIC testbed)
+
+Code merged (`dc3e708e`, `0a57ef50`) and deployed to all 40 agents + DB node. Raw data:
+`swarmplus-evaluation-data/runs/pegasus-workloads/snow-gossip/demo-{hier60-hybrid,mesh120-snowloc}`.
+
+**Part A hybrid — WORKS (engine selection), but no latency win yet.** Hier-60 hybrid, 3 runs:
+- Engine selection validated on testbed: level-0 agents log `protocol=hybrid level=0 -> engine=pbft`,
+  coordinators `level=1 -> engine=snow`.
+- Snow coordinator tier (level-1): **7.68 ± 0.67 s** (≈ pure-Snow 6.49s — the round fix didn't help
+  because coordinators finalize `single-node`, `elapsed≈44s`: **single-threaded driver starvation**).
+- PBFT worker tier (level-0): **20.21 ± 13.99 s** (vs ~1.0s pure-PBFT baseline — the slow coordinator
+  tier backs up delegation and congests the whole pipeline).
+- Completion 100%.
+
+**Parts B+C — did NOT help at flat scale; got worse.** Mesh-120 Snow+locality (`local_sample_frac=0.7`), 2 runs:
+- level-0 selection: **86.75 ± 12.40 s** vs **56.93 s** uniform baseline — worse.
+- Locality IS active (`queried≈12–17`, same-site biased), but rounds **don't converge**: 38–97 rounds
+  per decision, finalizing via `peer-decided` (CAS race), never reaching β=20. The round-completion fix
+  makes rounds faster → more non-converging churn → higher elapsed. Completion 100%.
+
+**Diagnosis (from the Part B `[SNOW_TIMING]` instrumentation — its real payoff):** Snow's latency is
+**not** the round-timeout or WAN locality we targeted. It is (1) **single-threaded driver starvation**
+(one daemon pumping all in-flight job states + network sends per tick) and (2) **β-non-convergence under
+high contention** (2188 jobs / 120 agents → preference flips → confidence resets → CAS-race fallback).
+Correctness held everywhere (100% completion via Redis `SET NX`).
+
+**Redirected next steps:** (a) re-architect the Snow driver — parallel/sharded workers, batched/async
+sends; (b) convergence — stabilize per-round preference (sticky sampling, hysteresis) and/or adaptive β;
+(c) only then will the round fix + locality sampling pay off. Hybrid engine selection is a keeper.
+
+## Verification (original plan)
 
 1. Unit: `python -m pytest tests/test_snow.py -v` (+ Part B few-peers test).
 2. Local smoke: small hierarchical config with `protocol: hybrid`; confirm level-0 log `protocol=pbft`,
