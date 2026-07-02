@@ -97,6 +97,26 @@ Correctness held everywhere (100% completion via Redis `SET NX`).
 sends; (b) convergence — stabilize per-round preference (sticky sampling, hysteresis) and/or adaptive β;
 (c) only then will the round fix + locality sampling pay off. Hybrid engine selection is a keeper.
 
+### Post-fix results (2026-07-02, commit `7208ee90`) — driver + Snowball fixes shipped
+
+Implemented both: non-blocking best-effort sends (bounded pool + `send_besteffort`, short timeout/no
+retries) and Snowball sticky preference (`_evaluate_round`, cumulative `d`, `preferred = argmax(d)`).
+Deployed to all 40 agents; re-ran on the testbed. See `SNOW_DRIVER_REARCH.md` and data dirs
+`snow-gossip/demo-{hier60-hybrid-fixed,mesh120-snowloc-fixed}`.
+
+| Config / metric | Pre-fix | Post-fix |
+|---|---|---|
+| Hier-60 PBFT worker tier selection | 20.21 s | **0.92 s** |
+| Hier-60 `single-node` finalizes (starvation marker) | 3772 | **28** |
+| Hier-60 Snow coordinator tier | 7.68 s | 7.14 s |
+| **Mesh-120 Snow+locality selection** | 86.75 s | **22.06 ± 1.35 s** (~3.9×) |
+| Completion (all) | 100% | 100% |
+
+Driver starvation is eliminated (PBFT tier restored to ~1s; single-node all but gone) and flat-mesh
+selection is ~3.9× faster with the convergence + locality changes now that the driver isn't the
+bottleneck. Remaining: the Hier-60 Snow *coordinator* tier (~7s) is a delegation-shape issue
+(coordinators mostly own their group → `peer-decided` CAS rather than β-convergence), tracked separately.
+
 ## Verification (original plan)
 
 1. Unit: `python -m pytest tests/test_snow.py -v` (+ Part B few-peers test).

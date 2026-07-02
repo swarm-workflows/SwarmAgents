@@ -64,3 +64,37 @@
 
 Medium; localized to the engine + transport. Risk: fire-and-forget failures are silent — mitigate with
 a debug log + a dropped-send metric. No change to finalization safety (Redis CAS remains authoritative).
+
+## RESULTS (implemented `7208ee90`, testbed 2026-07-02)
+
+Both fixes shipped: (1) non-blocking best-effort sends (bounded pool + `send_besteffort`), and
+(2) Snowball sticky preference (`_evaluate_round` cumulative `d`, `preferred = argmax(d)`). Deployed to
+all 40 agents. Hier-60 hybrid re-run vs the pre-fix run:
+
+| Metric | Pre-fix | Post-fix | |
+|---|---|---|---|
+| PBFT worker tier (level-0) selection | 20.21 s | **0.92 ± 0.50 s** | ✅ back to baseline |
+| `single-node` finalizes (coordinator, starvation marker) | 3772 | **28** | ✅ starvation eliminated |
+| Snow coordinator tier (level-1) selection | 7.68 s | 7.14 s | ~unchanged (see note) |
+| Completion | 100% | 100% | |
+
+Flat **Mesh-120 Snow+locality** (2 runs, where agents have ~119 real peers, so this best exercises the
+Snowball convergence fix):
+
+| Metric | Pre-fix | Post-fix | |
+|---|---|---|---|
+| level-0 selection | 86.75 s | **22.06 ± 1.35 s** | ✅ ~3.9× faster |
+| Completion | 100% | 100% | |
+
+**Interpretation:** the driver fix worked as designed — eliminating send-blocking removed the
+starvation that had congested delegation and dragged the PBFT worker tier to 20s; it's now ~1s again,
+and coordinators reach peers (single-node 3772 → 28). On flat Mesh-120 the combined driver +
+Snowball-convergence + locality changes cut selection ~3.9× (86.75s → 22s) at 100% completion — the
+regime where agents have enough peers for the convergence fix to bite. The Snow *coordinator* tier in
+Hier-60 is still ~7s because each coordinator largely owns its group and finalizes via `peer-decided`
+(CAS) rather than β-convergence; the remaining latency there is a hierarchy/delegation-shape question,
+not the driver.
+
+**Next:** convergence work item (per-round sticky/hysteretic sampling, adaptive β) now that the driver
+is no longer the bottleneck; the round-completion + locality changes should also matter more once
+convergence holds.
