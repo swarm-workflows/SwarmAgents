@@ -123,7 +123,7 @@ class GossipConsensusEngine:
         round_timeout_s: float = 0.5,
         tick_interval_s: float = 0.05,
         local_sample_frac: float = 1.0,
-        send_workers: int = 12,
+        send_workers: int = 32,
         send_timeout_s: float = 0.3,
         time_fn: Callable[[], float] = time.time,
     ):
@@ -180,7 +180,9 @@ class GossipConsensusEngine:
             )
             # Bound outstanding sends so a burst can't grow memory without limit; excess
             # sends are dropped (best-effort — a missed query just means that peer abstains).
-            self._send_sem = threading.BoundedSemaphore(self.send_workers * 4)
+            # 8x workers: query fan-out is bursty (k sends per job per round) and each is
+            # tiny, so a deeper backlog beats dropping (drops cost a full round_timeout).
+            self._send_sem = threading.BoundedSemaphore(self.send_workers * 8)
         self._thread = threading.Thread(
             target=self._run, name=f"snow-{self.agent_id}", daemon=True
         )
@@ -342,7 +344,7 @@ class GossipConsensusEngine:
             state.round_deadline = now + self.round_timeout_s
             state.last_round_at = now
             state.round_no += 1
-            state.queried = len(peers)
+            # state.queried is set after the send loop, to the count actually dispatched.
         msg = SnowQuery(
             source=self.agent_id,
             query_id=query_id,
@@ -351,8 +353,19 @@ class GossipConsensusEngine:
             preferred_cost=state.preferred_cost,
             round=state.round_no,
         )
+        dispatched = 0
         for dest in peers:
-            self._safe_send(dest, msg)
+            if self._safe_send(dest, msg):
+                dispatched += 1
+        with self._lock:
+            # Count only queries actually dispatched: a pool-dropped send will never be
+            # answered, and waiting on it burns the full round_timeout every round
+            # (measured as snow_sends_dropped=5742 with rounds resolving by deadline).
+            state.queried = dispatched
+            if dispatched == 0:
+                # Send pool fully saturated — abandon this round attempt and retry on a
+                # later tick rather than idling out the deadline with zero peers queried.
+                state.pending_query_id = None
 
     def _evaluate_round(self, state: _SnowState, now: float) -> None:
         with self._lock:
@@ -500,23 +513,29 @@ class GossipConsensusEngine:
         except Exception:
             return None
 
-    def _safe_send(self, dest: int, payload: object) -> None:
+    def _safe_send(self, dest: int, payload: object) -> bool:
         """Dispatch a Snow message without blocking the driver thread. Sends run on a
         bounded pool as best-effort (short timeout, no retries); if the pool is saturated
-        the send is dropped (that peer simply abstains this round). When no pool is
-        running (e.g. unit tests calling _tick directly), fall back to a synchronous send."""
+        the send is dropped (that peer simply abstains this round). Returns True when the
+        send was dispatched (or sent synchronously), False when it was dropped — callers
+        must count only dispatched sends toward the round's expected responses, otherwise
+        a round waits the full timeout for peers that never received the query. When no
+        pool is running (e.g. unit tests calling _tick directly), falls back to a
+        synchronous send."""
         pool, sem = self._send_pool, self._send_sem
         if pool is None or sem is None:
             self._do_send(dest, payload)
-            return
+            return True
         if not sem.acquire(blocking=False):
             self.sends_dropped += 1
-            return
+            return False
         try:
             pool.submit(self._do_send_release, dest, payload)
+            return True
         except RuntimeError:  # pool shutting down
             sem.release()
             self.sends_dropped += 1
+            return False
 
     def _do_send_release(self, dest: int, payload: object) -> None:
         try:

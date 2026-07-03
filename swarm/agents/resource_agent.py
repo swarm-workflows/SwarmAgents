@@ -285,7 +285,7 @@ class ResourceAgent(Agent):
                     round_timeout_s=float(snow_cfg.get("round_timeout_ms", 500)) / 1000.0,
                     tick_interval_s=float(snow_cfg.get("tick_interval_ms", 50)) / 1000.0,
                     local_sample_frac=float(snow_cfg.get("local_sample_frac", 1.0)),
-                    send_workers=int(snow_cfg.get("send_workers", 12)),
+                    send_workers=int(snow_cfg.get("send_workers", 32)),
                     send_timeout_s=float(snow_cfg.get("send_timeout_ms", 300)) / 1000.0,
                 )
             return ConsensusEngine(agent_id, host, transport, router=router)

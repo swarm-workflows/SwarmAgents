@@ -318,6 +318,63 @@ class SnowballStickyTests(unittest.TestCase):
         self.assertEqual(st.d[7], 2)
 
 
+class SnowDroppedSendAccountingTests(unittest.TestCase):
+    """state.queried must count only DISPATCHED sends. A pool-dropped query is never
+    answered; counting it made rounds wait the full round_timeout (measured on the
+    testbed as snow_sends_dropped=5742 with rounds resolving by deadline)."""
+
+    class _DroppyEngine(GossipConsensusEngine):
+        """Simulate pool saturation: drop sends to a configured set of peers."""
+        drop_to: set = set()
+
+        def _safe_send(self, dest, payload):
+            if dest in self.drop_to:
+                self.sends_dropped += 1
+                return False
+            return super()._safe_send(dest, payload)
+
+    def _make(self, peers, drop_to, k=8, beta=2):
+        cas = _FakeCAS()
+        host = _Host(1, list(peers), 1.0, cas)
+        transport = _Transport()
+        eng = self._DroppyEngine(
+            agent_id=1, host=host, transport=transport, router=_Router(),
+            k=k, alpha=0.7, beta=beta, max_rounds=20,
+            round_timeout_s=0.5, tick_interval_s=0.01)
+        eng.drop_to = set(drop_to)
+        return eng, host, transport, cas
+
+    def test_round_completes_with_only_dispatched_peers(self):
+        # Peers 2,3 reachable; sends to 4,5 dropped. Round must complete at t=0
+        # once 2 and 3 answer — not wait the deadline for 4 and 5.
+        eng, host, transport, cas = self._make(peers=[2, 3, 4, 5], drop_to={4, 5})
+        eng.propose([ProposalInfo(p_id="p", object_id="j-d", cost=1.0, agent_id="1")])
+        for _ in range(2):  # beta=2 rounds
+            eng._tick(now=0.0)
+            st = eng._states.get("j-d")
+            if st is None:  # finalized during previous evaluate
+                break
+            self.assertEqual(st.queried, 2)  # only dispatched sends counted
+            q = max((m[1] for m in transport.outbox if isinstance(m[1], SnowQuery)),
+                    key=lambda x: x.round)
+            for peer in (2, 3):
+                eng.on_snow_response(SnowResponse(
+                    source=peer, query_id=q.query_id, job_id="j-d",
+                    preferred_agent=1, cost=1.0, already_decided=False))
+            eng._tick(now=0.0)  # evaluates at t=0.0 — no deadline wait
+        self.assertEqual(cas.get("j-d"), 1)
+        self.assertEqual(eng.sends_dropped, 4)  # 2 dropped peers x 2 rounds
+
+    def test_fully_dropped_round_retries_instead_of_idling(self):
+        eng, host, transport, cas = self._make(peers=[2, 3], drop_to={2, 3})
+        eng.propose([ProposalInfo(p_id="p", object_id="j-z", cost=1.0, agent_id="1")])
+        eng._tick(now=0.0)  # all sends dropped
+        st = eng._states["j-z"]
+        # Round abandoned for retry: no pending query id, nothing waiting on a deadline.
+        self.assertIsNone(st.pending_query_id)
+        self.assertGreaterEqual(eng.sends_dropped, 2)
+
+
 class SnowNonBlockingSendTests(unittest.TestCase):
     """With the send pool running, a slow transport must not block the caller/driver."""
 

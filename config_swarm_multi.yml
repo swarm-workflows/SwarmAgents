@@ -83,7 +83,7 @@ consensus:
     tick_interval_ms: 50     # Driver-thread polling interval
     local_sample_frac: 1.0   # Fraction of each k-sample drawn from same-site peers (1.0 = uniform;
                              # <1.0 enables topology-aware sampling when agents have a `site`)
-    send_workers: 12         # Thread-pool size for non-blocking best-effort query sends
+    send_workers: 32         # Thread-pool size for non-blocking best-effort query sends
     send_timeout_ms: 300     # Per-send timeout for Snow queries/responses (no retries; a dropped
                              # query just means that peer abstains this round)
 
