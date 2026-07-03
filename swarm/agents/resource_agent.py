@@ -673,15 +673,15 @@ class ResourceAgent(Agent):
                 self.logger.error(traceback.format_exc())
 
     def _update_pending_jobs(self, jobs: list[str]):
+        # One MGET for every job we don't have locally — the per-id get() loop paid a
+        # WAN round-trip per pending job on every periodic tick.
+        missing = [j for j in jobs if j not in self.queues.pending_queue]
+        fetched = self.repository.get_many(
+            missing, key_prefix=Repository.KEY_JOB,
+            level=self.topology.level, group=self.topology.group) if missing else {}
         for job_id in jobs:
-            #job_id = key.split(":")[-1]
-            if job_id not in self.queues.pending_queue:
-                #group = self.topology.level if self.topology.type == TopologyType.Ring else self.topology.group
-                group = self.topology.group
-                #self.logger.info(f"Adding job {job_id} for: {group}")
-                job = self.repository.get(obj_id=job_id, key_prefix=Repository.KEY_JOB,
-                                          level=self.topology.level,
-                                          group=group)
+            job = fetched.get(job_id)
+            if job:
                 job_obj = Job()
                 job_obj.from_dict(job)
                 self.queues.pending_queue.add(job_obj)
@@ -794,6 +794,19 @@ class ResourceAgent(Agent):
         mab_active = self.mab_enabled and self.mab_manager is not None
         active_groups = set(self._get_active_child_groups())
 
+        # Bulk-prefetch every (job, child_group) state in ONE MGET — the per-pair
+        # get() loop paid a WAN round-trip per delegated job per group on every tick
+        # (D jobs x G groups round-trips; a coordinator's dominant Redis cost).
+        pairs = [(job_id, g)
+                 for job_id, info in list(self.delegated_jobs.items())
+                 for g in info.get('groups', [])]
+        try:
+            prefetched = self.repository.get_many_grouped(
+                pairs, key_prefix=Repository.KEY_JOB, level=self.topology.level - 1)
+        except Exception as e:
+            self.logger.warning(f"Delegation prefetch failed, skipping this tick: {e}")
+            return
+
         # Check all delegated jobs
         for job_id, delegation_info in list(self.delegated_jobs.items()):
             delegated_at = delegation_info.get('delegated_at', 0)
@@ -819,12 +832,7 @@ class ResourceAgent(Agent):
 
             for child_group in child_groups:
                 try:
-                    job_data = self.repository.get(
-                        obj_id=job_id,
-                        key_prefix=Repository.KEY_JOB,
-                        level=self.topology.level - 1,
-                        group=child_group
-                    )
+                    job_data = prefetched.get((job_id, child_group))
 
                     if job_data:
                         job_found = True
@@ -1305,6 +1313,12 @@ class ResourceAgent(Agent):
 
         return agent_info
 
+    def _agent_key_ttl_s(self) -> int:
+        """TTL for this agent's Redis key: comfortably above the peer-expiry threshold
+        (refreshed every ~0.5s tick, so only a dead agent's key ever expires)."""
+        expiry = int(self.runtime_config.get("peer_expiry_seconds", 300))
+        return max(60, expiry * 2)
+
     def on_periodic(self):
         # Start SWIM lazily on first tick (transport and neighbor_map are ready by now).
         if self.swim is not None and getattr(self.swim, "_thread", None) is None:
@@ -1350,9 +1364,13 @@ class ResourceAgent(Agent):
 
         agent_info = self._generate_agent_info()
         self.last_agent_info = agent_info  # snapshot reused by inbound hot paths
-        self.repository.save(agent_info.to_dict(), key_prefix=Repository.KEY_AGENT,
-                             level=self.topology.level,
-                             group=self.topology.group)
+        # save_fast: agent-info is single-writer (only this agent writes its key), so the
+        # WATCH/read-back optimistic lock was pure overhead. TTL lets dead agents' keys
+        # age out of Redis instead of accumulating forever.
+        self.repository.save_fast(agent_info.to_dict(), key_prefix=Repository.KEY_AGENT,
+                                  level=self.topology.level,
+                                  group=self.topology.group,
+                                  ttl_s=self._agent_key_ttl_s())
 
         self._refresh_neighbors(current_time=current_time)
 

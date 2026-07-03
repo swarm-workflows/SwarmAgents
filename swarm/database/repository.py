@@ -95,6 +95,8 @@ class Repository:
                 old_data = pipeline.get(key)
                 pipeline.multi()
                 pipeline.set(key, json.dumps(obj))
+                if key_prefix == self.KEY_AGENT:
+                    pipeline.sadd(self._members_key(level, group), key)
 
                 # Maintain secondary index by state
                 new_state = obj.get(self.KEY_STATE)
@@ -122,6 +124,31 @@ class Repository:
                           key, attempt, max_retries, backoff)
                 time.sleep(backoff)
 
+    @staticmethod
+    def _members_key(level: int, group: int) -> str:
+        return f"members:{level}:{group}"
+
+    def save_fast(self, obj: dict, key_prefix: str = KEY_AGENT, key: Optional[str] = None,
+                  level: int = 0, group: int = 0, ttl_s: Optional[int] = None):
+        """Save for SINGLE-WRITER keys (each agent writes only its own agent-info):
+        plain pipelined SET — no WATCH/read-back (that optimistic-lock round-trip is
+        pure overhead when there is exactly one writer). Also maintains the
+        members:{level}:{group} registry SET so discovery is one SMEMBERS+MGET instead
+        of a keyspace SCAN every refresh tick, and applies a TTL so keys of dead
+        agents age out instead of accumulating (they previously lived forever).
+        """
+        if not key:
+            obj_id = obj.get("id") or obj.get(f"{key_prefix}_id") or obj.get("agent_id")
+            if obj_id is None:
+                raise ValueError("obj_id must be set to save an object")
+            key = f"{key_prefix}:{level}:{group}:{obj_id}"
+        pipe = self.redis.pipeline(transaction=False)
+        pipe.set(key, json.dumps(obj), ex=ttl_s)
+        if key_prefix == self.KEY_AGENT:
+            pipe.sadd(self._members_key(level, group), key)
+        pipe.execute()
+        self.saves += 1
+
     def get(self, obj_id: str, key_prefix: str = KEY_JOB, level: int = 0, group: int = 0) -> dict:
         """
         Retrieve a generic object from Redis.
@@ -138,6 +165,30 @@ class Repository:
         key = f"{key_prefix}:{level}:{group}:{obj_id}"
         data = self.redis.get(key)
         return json.loads(data) if data else {}
+
+    def get_many(self, obj_ids: List[str], key_prefix: str = KEY_JOB,
+                 level: int = 0, group: int = 0) -> Dict[str, dict]:
+        """Fetch many objects in ONE MGET round-trip (the per-id get() loop it replaces
+        paid one WAN RTT per object every periodic tick). Missing ids are omitted."""
+        if not obj_ids:
+            return {}
+        keys = [f"{key_prefix}:{level}:{group}:{oid}" for oid in obj_ids]
+        values = self.redis.mget(keys)
+        out: Dict[str, dict] = {}
+        for oid, v in zip(obj_ids, values):
+            if v:
+                out[oid] = json.loads(v)
+        return out
+
+    def get_many_grouped(self, pairs: List[tuple], key_prefix: str = KEY_JOB,
+                         level: int = 0) -> Dict[tuple, dict]:
+        """Fetch (obj_id, group) pairs across groups in ONE MGET round-trip.
+        Returns {(obj_id, group): obj}; missing pairs are omitted."""
+        if not pairs:
+            return {}
+        keys = [f"{key_prefix}:{level}:{group}:{oid}" for oid, group in pairs]
+        values = self.redis.mget(keys)
+        return {pair: json.loads(v) for pair, v in zip(pairs, values) if v}
 
     def delete(self, obj_id: str, key_prefix: str = KEY_JOB, level: int = 0, group: int = 0):
         """
@@ -157,6 +208,8 @@ class Repository:
             if state is not None:
                 state_key = f"state:{level}:{group}:{state}"
                 self.redis.srem(state_key, key)
+        if key_prefix == self.KEY_AGENT:
+            self.redis.srem(self._members_key(level, group), key)
         self.redis.delete(key)
 
     def get_all_ids(self, key_prefix: str = KEY_JOB, level: int = 0, group: int = 0, state: int = None) -> List[str]:
@@ -226,6 +279,21 @@ class Repository:
                 keys = set()
                 for state_key in self.redis.scan_iter(f"state:{level}:*:{state}"):
                     keys |= self.redis.smembers(state_key)
+        elif key_prefix == self.KEY_AGENT and level is not None and group is not None:
+            # Hot path (every agent, every periodic tick): use the members registry SET
+            # instead of a keyspace SCAN — SCAN restarts its cursor on every call and
+            # its cost grows with total keyspace, not group size. Prune registry entries
+            # whose agent key has expired (TTL) or been deleted; fall back to SCAN only
+            # when the registry is empty (first boot / mixed-version migration).
+            mkey = self._members_key(level, group)
+            keys = list(self.redis.smembers(mkey))
+            if keys:
+                values = self.redis.mget(keys)
+                stale = [k for k, v in zip(keys, values) if not v]
+                if stale:
+                    self.redis.srem(mkey, *stale)
+                return [json.loads(v) for v in values if v]
+            keys = self.redis.scan_iter(f'{key_prefix}:{level}:{group}:*')
         else:
             if level is None:
                 keys = self.redis.scan_iter(f'{key_prefix}:*')
