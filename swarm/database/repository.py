@@ -57,6 +57,10 @@ class Repository:
             redis_client (redis.Redis): Redis client connection object.
         """
         self.redis = redis_client
+        # Contention instrumentation: total WatchError retries across all save() calls.
+        # A high rate at scale means hot keys are serializing writers (see SCALABILITY_REVIEW).
+        self.watch_retries = 0
+        self.saves = 0
 
     ##########################
     # GENERIC JOB OPERATIONS #
@@ -105,8 +109,10 @@ class Repository:
                             old_state_key = f"{self.KEY_STATE}:{level}:{group}:{old_state}"
                             pipeline.srem(old_state_key, key)
                 pipeline.execute()
+                self.saves += 1
                 return  # success
             except redis.WatchError:
+                self.watch_retries += 1
                 if attempt == max_retries:
                     raise RuntimeError(
                         f"Redis optimistic lock failed after {max_retries} attempts for key={key}"
@@ -212,10 +218,14 @@ class Repository:
         """
         if state:
             if group is not None:
-                state_key = f"state:{level}:{group}:{state}"
+                keys = self.redis.smembers(f"state:{level}:{group}:{state}")
             else:
-                state_key = f"state:{level}:*:{state}"
-            keys = self.redis.smembers(state_key)
+                # SMEMBERS does not support glob patterns — a wildcard key here silently
+                # returned an empty set. Find the per-group state-index keys and union
+                # their members instead.
+                keys = set()
+                for state_key in self.redis.scan_iter(f"state:{level}:*:{state}"):
+                    keys |= self.redis.smembers(state_key)
         else:
             if level is None:
                 keys = self.redis.scan_iter(f'{key_prefix}:*')

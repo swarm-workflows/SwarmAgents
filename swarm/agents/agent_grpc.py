@@ -23,6 +23,7 @@
 # Author: Komal Thareja(kthare10@renci.org)
 
 import json
+import queue
 import logging
 import os
 import threading
@@ -50,6 +51,7 @@ class Agent(Observer):
     def __init__(self, agent_id: int, config_file: str, debug: bool = False):
         self.debug = debug
         self.agent_id = agent_id
+        self.messages_dropped = 0  # inbound messages shed by the bounded queue
         self.neighbor_map = ThreadSafeDict[int, AgentInfo]()
         self.children = ThreadSafeDict[int, AgentInfo]()
         self.parents = ThreadSafeDict[int, AgentInfo]()
@@ -224,8 +226,17 @@ class Agent(Observer):
             log_msg += f", Payload: {json.dumps(payload)}"
             self.logger.debug(log_msg)
 
-            # Queue message
-            self.queues.message_queue.put_nowait(payload)
+            # Queue message; the queue is bounded — under overload drop-and-count instead
+            # of growing without limit (consensus re-proposal recovers dropped votes).
+            try:
+                self.queues.message_queue.put_nowait(payload)
+            except queue.Full:
+                self.messages_dropped += 1
+                if self.messages_dropped % 1000 == 1:
+                    self.logger.warning(
+                        f"Inbound queue full ({self.queues.message_queue.maxsize}); "
+                        f"dropped {self.messages_dropped} messages so far")
+                return
             self.queues.message_event.set()
 
             with self.condition:

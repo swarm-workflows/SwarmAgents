@@ -94,6 +94,32 @@ class _HostAdapter(ConsensusHost):
             self.agent.logger.warning(f"Failed to fetch job {object_id} from Redis: {e}")
             return None
 
+    # Out-of-order consensus messages: a Proposal/Prepare/Commit can arrive before this
+    # agent has the job locally or in Redis (job-distributor/delegation lag). Stash them
+    # for replay when the job shows up (see _replay_pending_consensus) instead of losing
+    # the vote. Bounded so a burst can't grow memory without limit.
+    _PENDING_MAX_OBJECTS = 2048
+    _PENDING_MAX_PER_OBJECT = 32
+
+    def _stash_pending(self, store: dict, object_id: str, msg) -> None:
+        if object_id not in store and len(store) >= self._PENDING_MAX_OBJECTS:
+            self.agent.pending_consensus_dropped += 1
+            return
+        bucket = store.setdefault(object_id, [])
+        if len(bucket) >= self._PENDING_MAX_PER_OBJECT:
+            self.agent.pending_consensus_dropped += 1
+            return
+        bucket.append(msg)
+
+    def set_pending_proposal(self, proposal, object_id: str):
+        self._stash_pending(self.agent.pending_proposals, object_id, proposal)
+
+    def set_pending_prepare(self, prepare, object_id: str):
+        self._stash_pending(self.agent.pending_prepares, object_id, prepare)
+
+    def set_pending_commit(self, commit, object_id: str):
+        self._stash_pending(self.agent.pending_commits, object_id, commit)
+
     def is_agreement_achieved(self, object_id: str): return self.agent.is_job_completed(object_id)
     def calculate_quorum(self): return self.agent.calculate_quorum()
     def on_leader_elected(self, obj: Object, proposal_id: str): self.agent.select_job(obj)
@@ -336,6 +362,13 @@ class ResourceAgent(Agent):
         # Track failed agents and job assignments
         self.failed_agents = ThreadSafeDict[int, float]()  # agent_id -> failure_timestamp
         self.job_assignments = ThreadSafeDict[str, int]()  # job_id -> assigned_agent_id
+
+        # Consensus messages that arrived before their job (see _HostAdapter.set_pending_*).
+        # Replayed by _replay_pending_consensus once the job lands in the pending queue.
+        self.pending_proposals: dict[str, list] = {}
+        self.pending_prepares: dict[str, list] = {}
+        self.pending_commits: dict[str, list] = {}
+        self.pending_consensus_dropped = 0
 
         # Track jobs delegated to children for hierarchical monitoring
         # Maps: job_id -> {'delegated_at': timestamp, 'groups': [list of child groups]}
@@ -622,7 +655,27 @@ class ResourceAgent(Agent):
                 job_obj = Job()
                 job_obj.from_dict(job)
                 self.queues.pending_queue.add(job_obj)
+            # Job is (now) locally known — replay any consensus messages that raced ahead
+            # of it so our votes aren't lost (mirrors ColmenaAgent's replay).
+            self._replay_pending_consensus(job_id)
         self.queues.pending_event.set()
+
+    def _replay_pending_consensus(self, job_id: str) -> None:
+        for msg in self.pending_proposals.pop(job_id, []):
+            try:
+                self.engine.on_proposal(msg)
+            except Exception as e:
+                self.logger.warning(f"Replaying pending proposal for {job_id} failed: {e}")
+        for msg in self.pending_prepares.pop(job_id, []):
+            try:
+                self.engine.on_prepare(msg)
+            except Exception as e:
+                self.logger.warning(f"Replaying pending prepare for {job_id} failed: {e}")
+        for msg in self.pending_commits.pop(job_id, []):
+            try:
+                self.engine.on_commit(msg)
+            except Exception as e:
+                self.logger.warning(f"Replaying pending commit for {job_id} failed: {e}")
 
     def _update_ready_jobs(self, jobs: list[str]):
         for j in jobs:
@@ -1287,6 +1340,36 @@ class ResourceAgent(Agent):
         #self.save_neighbors()
 
         self.check_queue()
+        self._log_perf_stats(current_time)
+
+    # Emit one [STATS] line every ~30s so scaling bottlenecks are observable in agent
+    # logs without a profiler (see docs/SCALABILITY_REVIEW.md Phase 0).
+    _stats_interval_s = 30
+
+    def _log_perf_stats(self, now: float) -> None:
+        last = getattr(self, "_stats_last_logged", 0)
+        if now - last < self._stats_interval_s:
+            return
+        self._stats_last_logged = now
+        try:
+            cache = self.selector.cache_stats()
+            parts = [
+                f"cache_hit_rate={cache['hit_rate']:.2f} ({cache['hits']}/{cache['hits'] + cache['misses']})",
+                f"inbound_q={self.queues.message_queue.qsize()}",
+                f"msgs_dropped={self.messages_dropped}",
+                f"pending_consensus_dropped={self.pending_consensus_dropped}",
+                f"watch_retries={self.repository.watch_retries}/{self.repository.saves} saves",
+            ]
+            t = getattr(self, "transport", None)
+            if t is not None and getattr(t, "broadcasts", 0):
+                parts.append(
+                    f"bcast_mean={t.broadcast_time_total / t.broadcasts:.3f}s "
+                    f"max={t.broadcast_time_max:.3f}s n={t.broadcasts}")
+            if isinstance(self.engine, GossipConsensusEngine):
+                parts.append(f"snow_sends_dropped={self.engine.sends_dropped}")
+            self.logger.info("[STATS] " + " ".join(parts))
+        except Exception as exc:
+            self.logger.debug(f"stats logging failed: {exc}")
 
     def is_job_feasible(self, job: Job, agent: AgentInfo) -> bool:
         """

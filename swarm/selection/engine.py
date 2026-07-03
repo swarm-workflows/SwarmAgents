@@ -179,6 +179,8 @@ class SelectionEngine:
         self.cache_enabled = cache_enabled
         self._feas_cache = _LRU(maxsize=feas_cache_size, ttl_s=cache_ttl_s) if cache_enabled else None
         self._cost_cache = _LRU(maxsize=cost_cache_size, ttl_s=cache_ttl_s) if cache_enabled else None
+        self.cache_hits = 0
+        self.cache_misses = 0
 
     def clear_caches(self) -> None:
         """
@@ -308,7 +310,9 @@ class SelectionEngine:
         key = (self._ak(asg), self._ck(cand), self._av(asg), self._cv(cand), "feas")
         hit = self._feas_cache.get(key)
         if hit is not None:
+            self.cache_hits += 1
             return bool(hit)
+        self.cache_misses += 1
         val = self.feasible(cand, asg)
         self._feas_cache.set(key, bool(val))
         return val
@@ -320,7 +324,19 @@ class SelectionEngine:
         key = (self._ak(asg), self._ck(cand), self._av(asg), self._cv(cand), "cost")
         hit = self._cost_cache.get(key)
         if hit is not None:
+            self.cache_hits += 1
             return float(hit)
+        self.cache_misses += 1
         val = self.cost(cand, asg)
         self._cost_cache.set(key, float(val))
         return val
+
+    def cache_stats(self) -> dict:
+        """Hit/miss counters — added to prove/disprove version-thrashing (a near-zero
+        hit rate means the O(candidates x assignees) matrix recomputes every pass)."""
+        total = self.cache_hits + self.cache_misses
+        return {
+            "hits": self.cache_hits,
+            "misses": self.cache_misses,
+            "hit_rate": (self.cache_hits / total) if total else 0.0,
+        }

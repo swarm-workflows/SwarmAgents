@@ -42,6 +42,12 @@ class GrpcTransport(Observer):
         self.client = GrpcClient(on_peer_status=on_peer_status)
         self.observers = []
         self.logger = logger
+        # Broadcast latency instrumentation: the serial per-peer send loop is a suspected
+        # scaling bottleneck (one dead peer stalls the whole phase); track totals so the
+        # mean/worst broadcast time is observable without a profiler.
+        self.broadcasts = 0
+        self.broadcast_time_total = 0.0
+        self.broadcast_time_max = 0.0
 
     def register_observers(self, observer: Observer):
         if observer not in self.observers:
@@ -96,6 +102,7 @@ class GrpcTransport(Observer):
         payload.path.append(sender)
         payload_json = json.dumps(payload.to_dict())
         msg_type = str(payload.message_type)
+        begin = time.time()
         for peer_id in peers:
             if peer_id in payload.path:
                 continue
@@ -108,3 +115,12 @@ class GrpcTransport(Observer):
             self._send_raw(host=peer_info.host, port=peer_info.port,
                            payload_json=payload_json, msg_type=msg_type,
                            dest=peer_info.agent_id, src=sender)
+        elapsed = time.time() - begin
+        self.broadcasts += 1
+        self.broadcast_time_total += elapsed
+        if elapsed > self.broadcast_time_max:
+            self.broadcast_time_max = elapsed
+        if elapsed > 5.0:
+            self.logger.warning(
+                f"[BCAST_SLOW] {msg_type} to {len(peers)} peers took {elapsed:.2f}s "
+                f"(serial send loop — likely a dead/slow peer)")

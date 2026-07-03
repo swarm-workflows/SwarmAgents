@@ -31,8 +31,13 @@ from swarm.queue.simple_queue import SimpleQueue
 
 @dataclass
 class AgentQueues:
+    # Inbound message backlog cap. Under consensus storms the previous unbounded queue
+    # grew without limit (OOM risk) and hid overload; beyond this, newest messages are
+    # dropped and counted (see Agent.on_message) — PBFT re-proposal handles the loss.
+    MESSAGE_QUEUE_MAXSIZE = 20000
+
     def __init__(self):
-        self.message_queue = queue.Queue()
+        self.message_queue = queue.Queue(maxsize=self.MESSAGE_QUEUE_MAXSIZE)
         self.pending_queue = SimpleQueue()
         self.selected_queue = SimpleQueue()
         self.message_event = threading.Event()   # wakes _do_inbound
