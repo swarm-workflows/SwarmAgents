@@ -124,6 +124,10 @@ def _make_engine(agent_id=1, peers=(2, 3, 4), my_cost=1.0, cas=None,
         agent_id=agent_id, host=host, transport=transport, router=router,
         k=k, alpha=alpha, beta=beta, max_rounds=20,
         round_timeout_s=0.5, tick_interval_s=0.01,
+        # Tests drive _tick(now=...) with a synthetic timeline starting at 0.0; the
+        # engine's own clock must match or propose() stamps wall-clock deadlines that
+        # the _tick send gate compares against synthetic `now`.
+        time_fn=lambda: 0.0,
     )
     return eng, host, transport, cas
 
@@ -340,7 +344,8 @@ class SnowDroppedSendAccountingTests(unittest.TestCase):
         eng = self._DroppyEngine(
             agent_id=1, host=host, transport=transport, router=_Router(),
             k=k, alpha=0.7, beta=beta, max_rounds=20,
-            round_timeout_s=0.5, tick_interval_s=0.01)
+            round_timeout_s=0.5, tick_interval_s=0.01,
+            time_fn=lambda: 0.0)
         eng.drop_to = set(drop_to)
         return eng, host, transport, cas
 
@@ -365,14 +370,31 @@ class SnowDroppedSendAccountingTests(unittest.TestCase):
         self.assertEqual(cas.get("j-d"), 1)
         self.assertEqual(eng.sends_dropped, 4)  # 2 dropped peers x 2 rounds
 
-    def test_fully_dropped_round_retries_instead_of_idling(self):
+    def test_fully_dropped_round_backs_off_before_retry(self):
+        # A saturated pool must NOT retry on the next 50ms tick — that spin multiplied
+        # send demand ~20x and congestion-collapsed the coordinator tier (2M drops).
         eng, host, transport, cas = self._make(peers=[2, 3], drop_to={2, 3})
         eng.propose([ProposalInfo(p_id="p", object_id="j-z", cost=1.0, agent_id="1")])
         eng._tick(now=0.0)  # all sends dropped
         st = eng._states["j-z"]
-        # Round abandoned for retry: no pending query id, nothing waiting on a deadline.
         self.assertIsNone(st.pending_query_id)
-        self.assertGreaterEqual(eng.sends_dropped, 2)
+        self.assertEqual(st.round_no, 0)          # a round that never left doesn't count
+        drops_after_first = eng.sends_dropped
+        eng._tick(now=0.1)                        # inside the backoff window: no resend
+        self.assertEqual(eng.sends_dropped, drops_after_first)
+        eng.drop_to = set()                       # pool recovers
+        eng._tick(now=0.6)                        # past round_timeout: retry fires
+        self.assertIsNotNone(st.pending_query_id)
+        self.assertEqual(st.queried, 2)
+
+    def test_max_inflight_caps_concurrent_rounds(self):
+        eng, host, transport, cas = self._make(peers=[2, 3], drop_to=set())
+        eng.max_inflight = 1
+        eng.propose([ProposalInfo(p_id="p1", object_id="j-1", cost=1.0, agent_id="1"),
+                     ProposalInfo(p_id="p2", object_id="j-2", cost=1.0, agent_id="1")])
+        eng._tick(now=0.0)
+        pending = [s for s in eng._states.values() if s.pending_query_id]
+        self.assertEqual(len(pending), 1)         # only one round in flight at the cap
 
 
 class SnowAsyncFinalizeTests(unittest.TestCase):

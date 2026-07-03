@@ -125,6 +125,7 @@ class GossipConsensusEngine:
         local_sample_frac: float = 1.0,
         send_workers: int = 32,
         send_timeout_s: float = 0.3,
+        max_inflight: int = 64,
         time_fn: Callable[[], float] = time.time,
     ):
         self.agent_id = int(agent_id)
@@ -146,6 +147,9 @@ class GossipConsensusEngine:
         # asynchronously), so the driver tick must never block on a slow gRPC send.
         self.send_workers = max(1, int(send_workers))
         self.send_timeout_s = float(send_timeout_s)
+        # Max Snow decisions with an outstanding query round at once — bounds total send
+        # demand to what the pool can drain (Snow's analog of PBFT max_pending_elections).
+        self.max_inflight = max(1, int(max_inflight))
         self._send_pool: Optional[ThreadPoolExecutor] = None
         self._send_sem: Optional[threading.BoundedSemaphore] = None
         self.sends_dropped = 0
@@ -309,11 +313,18 @@ class GossipConsensusEngine:
     def _tick(self, now: float) -> None:
         with self._lock:
             jobs = list(self._states.values())
+            # Rounds currently awaiting responses count against the in-flight cap.
+            in_flight = sum(1 for s in jobs if not s.finalized and s.pending_query_id)
         for state in jobs:
             if state.finalized:
                 continue
             if state.pending_query_id is None:
-                self._send_round(state, now)
+                # Deadline gate doubles as retry backoff for pool-saturated rounds.
+                # The in-flight cap bounds total send demand to what the pool can
+                # drain (uncapped, a delegation burst congestion-collapsed the tier).
+                if state.round_deadline <= now and in_flight < self.max_inflight:
+                    self._send_round(state, now)
+                    in_flight += 1
                 continue
             # A round ends as soon as every peer we actually queried has responded
             # (capped at k), or the deadline is hit. Using min(k, queried) instead of
@@ -363,15 +374,22 @@ class GossipConsensusEngine:
             # (measured as snow_sends_dropped=5742 with rounds resolving by deadline).
             state.queried = dispatched
             if dispatched == 0:
-                # Send pool fully saturated — abandon this round attempt and retry on a
-                # later tick rather than idling out the deadline with zero peers queried.
+                # Send pool fully saturated. Retry AFTER a full round_timeout — retrying
+                # on the next 50ms tick multiplied send demand ~20x and congestion-
+                # collapsed the tier (measured: 2M dropped sends, inbound queue full,
+                # zero finalizes). The deadline gate in _tick provides the backoff.
                 state.pending_query_id = None
+                state.round_no -= 1  # a round that never left the building doesn't count
+                state.round_deadline = now + self.round_timeout_s
 
     def _evaluate_round(self, state: _SnowState, now: float) -> None:
         with self._lock:
             responses = list(state.pending_responses)
             state.pending_query_id = None
             state.pending_responses = []
+            # Allow the next round immediately — an early-completed round must not be
+            # delayed by its own (still-future) deadline via the _tick send gate.
+            state.round_deadline = now
         if not responses:
             # No-one responded; reset confidence and retry.
             with self._lock:
@@ -429,9 +447,12 @@ class GossipConsensusEngine:
 
     def _maybe_abort_or_continue(self, state: _SnowState, now: float) -> None:
         if state.round_no >= self.max_rounds:
+            elapsed = now - state.started_at if state.started_at else -1.0
+            # Same grep surface as SNOW_TIMING — an overloaded tier abandoning every
+            # decision must be visible, not inferred from the absence of finalizes.
             self.host.log_warn(
-                f"[snow] max_rounds exhausted for {state.proposal.object_id}; "
-                f"abandoning Snow attempt"
+                f"[SNOW_ABANDON] Object:{state.proposal.object_id} rounds={state.round_no} "
+                f"elapsed={elapsed:.3f}s — max_rounds exhausted, leaving for reselection"
             )
             with self._lock:
                 state.finalized = True
