@@ -95,9 +95,11 @@ failure_detection:
   protocol: heartbeat       # heartbeat (default) | swim
   swim:
     period_ms: 1000          # Protocol round period
-    probe_timeout_ms: 300    # Direct ping timeout before falling back to ping-req
+    probe_timeout_ms: 1000   # Direct ping timeout before falling back to ping-req.
+                             # WAN + inbound-queue lag under consensus bursts make a
+                             # LAN-tuned 300ms window false-fail healthy peers.
     k_req: 3                 # Indirect probe fanout
-    suspect_timeout_s: 8     # Suspect -> failed transition
+    suspect_timeout_s: 20    # Suspect -> failed transition
 
 # Gossip state dissemination (Phase 2). When enabled, agents push their
 # versioned utilization/load state to `fanout` random peers every round.

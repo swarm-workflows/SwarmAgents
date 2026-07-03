@@ -375,6 +375,28 @@ class SnowDroppedSendAccountingTests(unittest.TestCase):
         self.assertGreaterEqual(eng.sends_dropped, 2)
 
 
+class SnowAsyncFinalizeTests(unittest.TestCase):
+    """With the pool running, _finalize returns immediately and the CAS/callback work
+    completes on a worker; double-finalize is deduped by the finalized flag."""
+
+    def test_async_finalize_completes_and_dedupes(self):
+        import time as _t
+        eng, host, transport, cas = _make_engine(agent_id=1, peers=[2])
+        eng.propose([ProposalInfo(p_id="p", object_id="j-a", cost=1.0, agent_id="1")])
+        state = eng._states["j-a"]
+        eng.start()
+        try:
+            eng._finalize(state, candidate=1, reason="test")
+            eng._finalize(state, candidate=2, reason="dup")  # must be a no-op
+            deadline = _t.time() + 2.0
+            while cas.get("j-a") is None and _t.time() < deadline:
+                _t.sleep(0.01)
+        finally:
+            eng.stop()
+        self.assertEqual(cas.get("j-a"), 1)          # first finalize won
+        self.assertEqual(host.leader_events, ["j-a"])  # exactly one callback
+
+
 class SnowNonBlockingSendTests(unittest.TestCase):
     """With the send pool running, a slow transport must not block the caller/driver."""
 

@@ -440,13 +440,38 @@ class GossipConsensusEngine:
         # else: leave pending_query_id=None so next tick sends a fresh round.
 
     def _finalize(self, state: _SnowState, candidate: int, reason: str = "") -> None:
-        if state.finalized:
-            return
-        winner = self.host.try_claim_assignment(state.proposal.object_id, candidate)
+        """Mark the decision done and hand the slow part (Redis CAS + job fetch +
+        agent callbacks — two-plus WAN round-trips) to the worker pool. Running that
+        inline on the driver tick thread serialized every in-flight decision behind
+        each finalize (measured: elapsed mean 11-16s across ~2k queued jobs)."""
         with self._lock:
+            if state.finalized:
+                return
             state.finalized = True
             self.outgoing.remove_object(object_id=state.proposal.object_id)
             self.incoming.remove_object(object_id=state.proposal.object_id)
+
+        pool = self._send_pool
+        if pool is None:
+            self._finalize_work(state, candidate, reason)
+            return
+        try:
+            # Bypasses the send semaphore deliberately: finalizes are the highest-value
+            # work in the engine and must not be shed like best-effort queries.
+            pool.submit(self._finalize_work, state, candidate, reason)
+        except RuntimeError:  # pool shutting down
+            self._finalize_work(state, candidate, reason)
+
+    def _finalize_work(self, state: _SnowState, candidate: int, reason: str) -> None:
+        try:
+            self._finalize_work_inner(state, candidate, reason)
+        except Exception as exc:
+            # Runs on pool workers whose Future nobody reads — never let an error vanish.
+            self.host.log_warn(
+                f"[snow] finalize of {state.proposal.object_id} failed: {exc}")
+
+    def _finalize_work_inner(self, state: _SnowState, candidate: int, reason: str) -> None:
+        winner = self.host.try_claim_assignment(state.proposal.object_id, candidate)
 
         # Per-decision latency instrumentation: separates Snow round time from any
         # downstream queue/serialization tax so the ~9s selection cost can be diagnosed.

@@ -138,7 +138,14 @@ class _HostAdapter(ConsensusHost):
     # --- Snow-engine extensions (no-ops for PBFT, used by GossipConsensusEngine).
     def live_peer_ids(self):
         if self.agent.swim is not None:
-            return [a for a in self.agent.swim.live_agents() if a != self.agent.agent_id]
+            live = [a for a in self.agent.swim.live_agents() if a != self.agent.agent_id]
+            if live:
+                return live
+            # An EMPTY SWIM live set is almost always a false reading — under consensus
+            # bursts, acks queue behind the single inbound consumer and blow the probe
+            # window, false-failing every peer (measured: 23k single-node self-claims).
+            # A genuinely dead cluster is the rare case; fall back to the Redis-refreshed
+            # neighbor_map so Snow keeps running real rounds.
         return [k for k in self.agent.neighbor_map.keys() if k != self.agent.agent_id]
 
     def my_cost_for_job(self, object_id: str):
@@ -248,9 +255,12 @@ class _GossipAdapter:
 
     def live_peers(self):
         # Prefer SWIM's live set when available so gossip doesn't push to
-        # peers we already know are failed.
+        # peers we already know are failed. An EMPTY live set is treated as a
+        # false reading (load-induced ack lag), not a dead cluster.
         if self.agent.swim is not None:
-            return self.agent.swim.live_agents()
+            live = self.agent.swim.live_agents()
+            if live:
+                return live
         return list(self.agent.neighbor_map.keys())
 
     def log_debug(self, msg: str) -> None:
@@ -405,9 +415,12 @@ class ResourceAgent(Agent):
             self.swim = SwimMembership(
                 host=_SwimAdapter(self),
                 period_s=float(swim_cfg.get("period_ms", 1000)) / 1000.0,
-                probe_timeout_s=float(swim_cfg.get("probe_timeout_ms", 300)) / 1000.0,
+                # WAN-realistic defaults: acks can queue behind consensus bursts on the
+                # single inbound consumer, so a LAN-tuned 300ms probe window false-fails
+                # healthy peers (observed as constant late-ack flapping).
+                probe_timeout_s=float(swim_cfg.get("probe_timeout_ms", 1000)) / 1000.0,
                 k_req=int(swim_cfg.get("k_req", 3)),
-                suspect_timeout_s=float(swim_cfg.get("suspect_timeout_s", 8.0)),
+                suspect_timeout_s=float(swim_cfg.get("suspect_timeout_s", 20.0)),
             )
 
         # Gossip state dissemination (Phase 2). Off by default; turn on with
