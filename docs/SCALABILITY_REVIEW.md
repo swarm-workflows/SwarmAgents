@@ -221,6 +221,25 @@ Delivered 2026-07-03:
   the eliminated traffic was the O(N)-payload MGETs, which is the term that grows quadratically
   cluster-wide with agent count.
 
+### Scale validation — Hier-110 / Hier-250 on the complete stack (2026-07-03)
+
+Single runs, hybrid + swim + gossip + β=6, weak-scaling workloads (2,188 / 5,000 Pegasus jobs),
+4-site testbed (110 = 22 hosts × 5; 250 = 25 hosts × 10; hosts barely loaded at 10/host):
+
+| Tier | Paper (PBFT) selection | Fixed stack (L0 / L1) | Redis ops/s |
+|---|---|---|---|
+| Hier-110 | 1.09 s | **0.09 / 0.25 s** | 1,984 |
+| Hier-250 | **24.53 s** (coordinator O(g²) wall) | **0.03 / 0.32 s (~77×)** | 4,364 |
+
+- Redis load is now **linear at ~17 ops/agent/s** (60→929, 110→1,984, 250→4,364); the old stack
+  burned 13,508 at just 60 agents. Projection at 1000 agents: ~17k ops/s — inside a single Redis.
+- Zero send drops, zero abandons, queues empty at both tiers; L1 *improves* with more coordinators
+  (CAS fast-path propagates faster in larger tiers).
+- Caveats: single run per tier; in-window job counts are capped by fixed run windows + multi-minute
+  deployment at 250 agents, so latency/health (not throughput) are the metrics of record here.
+- Data on the testbed: `runs/scale-hier{110,250}`, `runs/redis_ops_scale-*.csv` (eval-data repo
+  keeps `runs/` unversioned by design).
+
 ### Phase 4 (original plan, for reference)
 13. **Gossip-fed selection state:** Phase-2 gossip dissemination exists but `SelectionEngine` still
     reads Redis; feeding peer load/capacity from the gossip cache removes most of the D1/D2 read
