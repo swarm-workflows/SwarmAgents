@@ -86,7 +86,7 @@ consensus:
     send_workers: 32         # Thread-pool size for non-blocking best-effort query sends
     send_timeout_ms: 300     # Per-send timeout for Snow queries/responses (no retries; a dropped
                              # query just means that peer abstains this round)
-    max_inflight: 64         # Max decisions with an outstanding query round at once — bounds
+    max_inflight: 16         # Max decisions with an outstanding query round at once — bounds
                              # send demand to what the pool can drain (prevents congestion
                              # collapse under delegation bursts)
 

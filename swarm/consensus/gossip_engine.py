@@ -125,7 +125,7 @@ class GossipConsensusEngine:
         local_sample_frac: float = 1.0,
         send_workers: int = 32,
         send_timeout_s: float = 0.3,
-        max_inflight: int = 64,
+        max_inflight: int = 16,
         time_fn: Callable[[], float] = time.time,
     ):
         self.agent_id = int(agent_id)

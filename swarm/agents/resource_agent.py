@@ -297,7 +297,7 @@ class ResourceAgent(Agent):
                     local_sample_frac=float(snow_cfg.get("local_sample_frac", 1.0)),
                     send_workers=int(snow_cfg.get("send_workers", 32)),
                     send_timeout_s=float(snow_cfg.get("send_timeout_ms", 300)) / 1000.0,
-                    max_inflight=int(snow_cfg.get("max_inflight", 64)),
+                    max_inflight=int(snow_cfg.get("max_inflight", 16)),
                 )
             return ConsensusEngine(agent_id, host, transport, router=router)
 

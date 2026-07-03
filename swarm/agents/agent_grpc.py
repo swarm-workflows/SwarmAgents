@@ -219,12 +219,15 @@ class Agent(Observer):
             msg_name = MessageType(message_type)
             fwd = payload.get("forwarded_by")
 
-            # Log message
-            log_msg = f"[IN] [{msg_name}] [SRC: {source_agent_id}]"
-            if fwd:
-                log_msg += f" [FWD: {fwd}]"
-            log_msg += f", Payload: {json.dumps(payload)}"
-            self.logger.debug(log_msg)
+            # Log message. Guarded: the json.dumps of every payload otherwise runs even
+            # with DEBUG off — a large per-message CPU tax on the inbound path exactly
+            # when the consumer is the bottleneck (measured: queue pinned at 20k).
+            if self.logger.isEnabledFor(logging.DEBUG):
+                log_msg = f"[IN] [{msg_name}] [SRC: {source_agent_id}]"
+                if fwd:
+                    log_msg += f" [FWD: {fwd}]"
+                log_msg += f", Payload: {json.dumps(payload)}"
+                self.logger.debug(log_msg)
 
             # Queue message; the queue is bounded — under overload drop-and-count instead
             # of growing without limit (consensus re-proposal recovers dropped votes).

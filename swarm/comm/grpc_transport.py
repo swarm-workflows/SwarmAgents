@@ -111,7 +111,7 @@ class GrpcTransport(Observer):
             if not peer_info:
                 continue
 
-            self.logger.info(f"Sending proposal to peer: {peer_id}")
+            self.logger.debug(f"Sending proposal to peer: {peer_id}")
             self._send_raw(host=peer_info.host, port=peer_info.port,
                            payload_json=payload_json, msg_type=msg_type,
                            dest=peer_info.agent_id, src=sender)
