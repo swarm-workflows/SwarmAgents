@@ -215,8 +215,11 @@ Delivered 2026-07-03:
   failure mode. No re-architecture warranted.
 - **Item 15 (hybrid + bounded groups as the scaling architecture): standing guidance**, validated
   across every run in this campaign.
-- Verification pending at time of writing: Hier-60 run with Redis sampler (expect ops below the
-  Phase-2 ~1,100/s and unchanged selection metrics); results to be appended.
+- **Verified** (Hier-60, Redis sampled): ops **929/s mean** (was 1,133 post-Phase-2; **14.5×**
+  below the 13,508 baseline); L0 0.12s, L1 0.69s, 1,055 jobs in-window, 100% completion —
+  selection quality unchanged on gossip-fed load. Note the ops reduction understates the win:
+  the eliminated traffic was the O(N)-payload MGETs, which is the term that grows quadratically
+  cluster-wide with agent count.
 
 ### Phase 4 (original plan, for reference)
 13. **Gossip-fed selection state:** Phase-2 gossip dissemination exists but `SelectionEngine` still
