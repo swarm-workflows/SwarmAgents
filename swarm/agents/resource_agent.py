@@ -1860,8 +1860,12 @@ class ResourceAgent(Agent):
                 # This handles jobs stuck due to agent failures where consensus was cleared
                 #self._reset_orphaned_jobs()
 
-                self.queues.pending_event.wait(timeout=0.5)
-                self.queues.pending_event.clear()
+                # Only wait when the PENDING backlog is drained — a fixed wait per batch
+                # capped proposal throughput at ~2 batches/s regardless of queued work
+                # (visible as multi-second ramp for coordinators holding 100+ jobs).
+                if not self.queues.pending_queue.gets(states=[ObjectState.PENDING], count=1):
+                    self.queues.pending_event.wait(timeout=0.5)
+                    self.queues.pending_event.clear()
             except Exception as e:
                 self.logger.error(f"Error occurred while executing e: {e}")
                 self.logger.error(traceback.format_exc())

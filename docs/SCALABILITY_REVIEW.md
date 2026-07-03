@@ -171,7 +171,23 @@ wire demand now ∝ peers, not in-flight decisions).
    full object only on real changes. Add TTL = `peer_expiry_seconds` on agent keys (D6).
    *Verify: Redis `INFO stats` ops/sec before/after at Hier-60; DB-node CPU.*
 
-### Phase 3 — Compute: make the cache work, unblock inbound
+### Phase 3 — Compute — ✅ CLOSED (mostly absorbed/falsified by earlier phases)
+
+Disposition 2026-07-03, item by item:
+- **Item 10 (cache versioning): no action — hypothesis falsified.** Workers hit 99% because
+  `assignee_version` resolves to the stable `version` field (the `updated_at` fallback reads an
+  attr that doesn't exist on AgentInfo — accidentally correct). The coordinator tier's low rate
+  (0.00–0.43) is cold-cache on once-seen (job, peer) pairs at tiny volume, not thrashing.
+- **Item 11 (parallel inbound): already absorbed.** `json.loads` was always parallel (gRPC's
+  32-worker pool); the consumer-thread cost collapsed via the local-only query path (`24f4f240`)
+  and per-peer batching (`5ba99454`) — inbound queue has been pinned at 0 for four runs.
+  Native-protobuf (B3) deferred: wire volume is down ~20× via batching and no measured bottleneck
+  remains near serialization; a schema change isn't warranted on current evidence.
+- **Item 12 (event-driven wakeups): shipped** — `selection_main` was already event-driven at the
+  head; the tail waited 0.5s per batch even with a backlog, capping proposal throughput at
+  ~2 batches/s. It now skips the wait while PENDING work remains queued.
+
+### Phase 3 (original plan, for reference)
 10. **Fix selection cache keys (C2):** quantize the assignee version (e.g., bucket `updated_at` to
     5–10s, or bump `version` only when capacity/allocations actually change) so entries survive
     ticks. Counters from Phase 0 prove the delta. Cache the `job_type` weight lookup (C5).
