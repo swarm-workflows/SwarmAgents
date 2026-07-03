@@ -184,9 +184,12 @@ class GossipConsensusEngine:
             )
             # Bound outstanding sends so a burst can't grow memory without limit; excess
             # sends are dropped (best-effort — a missed query just means that peer abstains).
-            # 8x workers: query fan-out is bursty (k sends per job per round) and each is
-            # tiny, so a deeper backlog beats dropping (drops cost a full round_timeout).
-            self._send_sem = threading.BoundedSemaphore(self.send_workers * 8)
+            # The backlog must cover a fully aligned burst of max_inflight rounds x k
+            # peers: once the Phase-2 data-layer fixes removed Redis latency from the
+            # periodic loop, proposals aligned into simultaneous bursts and a
+            # workers-only-sized backlog (256) overflowed at 288 sends/tick.
+            self._send_sem = threading.BoundedSemaphore(
+                max(self.send_workers * 8, self.max_inflight * self.k))
         self._thread = threading.Thread(
             target=self._run, name=f"snow-{self.agent_id}", daemon=True
         )
