@@ -183,9 +183,12 @@ Disposition 2026-07-03, item by item:
   and per-peer batching (`5ba99454`) — inbound queue has been pinned at 0 for four runs.
   Native-protobuf (B3) deferred: wire volume is down ~20× via batching and no measured bottleneck
   remains near serialization; a schema change isn't warranted on current evidence.
-- **Item 12 (event-driven wakeups): shipped** — `selection_main` was already event-driven at the
-  head; the tail waited 0.5s per batch even with a backlog, capping proposal throughput at
-  ~2 batches/s. It now skips the wait while PENDING work remains queued.
+- **Item 12 (event-driven wakeups): shipped** (`a49dbc3e` + `2e70dfed`) — `selection_main` was
+  already event-driven at the head; the tail waited 0.5s per batch even with a backlog. First
+  attempt (skip wait if any PENDING remains) **regressed** — jobs deferred to better-suited peers
+  stay locally PENDING, so the loop busy-spun the cost matrix (L0 0.08s→1.44s, throughput halved) —
+  caught by per-phase verification. Final gate: skip the wait only when the iteration *proposed*
+  and the batch was full. Verified: L0 0.11s, **L1 0.59s (best)**, 1,052 jobs in-window, 100%.
 
 ### Phase 3 (original plan, for reference)
 10. **Fix selection cache keys (C2):** quantize the assignee version (e.g., bucket `updated_at` to
