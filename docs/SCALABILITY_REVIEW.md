@@ -200,7 +200,25 @@ Disposition 2026-07-03, item by item:
 12. Event-driven wakeups where cheap (selection loop already has `pending_event`; use it instead of
     fixed sleeps) (C4).
 
-### Phase 4 — Architecture (already in flight / follow-ups)
+### Phase 4 — Architecture — ✅ SHIPPED `0d170ee1` (verification run in flight at time of writing)
+
+Delivered 2026-07-03:
+- **Item 13 (gossip-fed selection state): shipped.** With gossip enabled, peer `load` flows to
+  `neighbor_map` from the epidemic cache every tick (`_apply_gossip_overlay`; fresher than the old
+  0.5s Redis poll), and the full Redis neighbor refresh — every peer's 2–5KB object, O(N) payload
+  per agent per tick / O(N²) read bytes cluster-wide, **the genuine 1000-agent wall** — drops to a
+  5s default cadence (`runtime.neighbor_refresh_full_s`). Liveness unaffected (SWIM detects; 5s
+  staleness ≪ 45–300s expiry). Behavior unchanged when gossip is off.
+- **Item 14 (coordinator delegation shape): closed, resolved by evidence.** Since per-peer batching,
+  coordinators run genuine consensus — 892 `beta@round=6` commits observed at Hier-60, L1 0.59s;
+  the `peer-decided` majority is the designed CAS fast path (first winner propagates), not a
+  failure mode. No re-architecture warranted.
+- **Item 15 (hybrid + bounded groups as the scaling architecture): standing guidance**, validated
+  across every run in this campaign.
+- Verification pending at time of writing: Hier-60 run with Redis sampler (expect ops below the
+  Phase-2 ~1,100/s and unchanged selection metrics); results to be appended.
+
+### Phase 4 (original plan, for reference)
 13. **Gossip-fed selection state:** Phase-2 gossip dissemination exists but `SelectionEngine` still
     reads Redis; feeding peer load/capacity from the gossip cache removes most of the D1/D2 read
     traffic at the source (the original design intent, `GOSSIP_CONSENSUS_DESIGN.md` §Phase 2).
