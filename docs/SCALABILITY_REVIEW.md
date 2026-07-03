@@ -86,6 +86,21 @@ Delivered 2026-07-02, deployed to all 40 agents: `_set_pending_safe` guard in th
 conflicts dict capped; inbound queue bounded (20k) with drop counter; SMEMBERS glob bug fixed;
 counters live (selection-cache hit rate, WatchError retries, broadcast latency + `[BCAST_SLOW]`,
 per-agent `[STATS]` line every ~30s). Next run's `[STATS]` output decides Phase 1 vs Phase 2 order.
+
+**First counter readout (Hier-60 hybrid, 2026-07-03) — several review hypotheses falsified:**
+- `cache_hit_rate=0.99` at level 0 → **C2 (version-thrashing) is wrong** at this scale; skip the
+  Phase-3 cache-key work. `watch_retries=0/724` → D2 contention is not binding at Hier-60.
+  `bcast_mean=6ms max=11ms`, no `[BCAST_SLOW]` → B1 only bites with dead/slow peers (resilience,
+  not steady-state). Inbound queue empty.
+- **Real finding:** coordinator tier showed `snow_sends_dropped=5742` → fixed in `289b769e`
+  (count only dispatched sends toward round quorum; pool 12→32). Re-run then exposed the deeper
+  pair: **SWIM false-failure flapping under load** (acks processed late behind the single inbound
+  consumer → `live_peer_ids()` empties → 23,668 `single-node` self-claims vs 5,320 `peer-decided`)
+  and **driver-serialized synchronous Redis claims in `_finalize`** (elapsed mean ~11–16s).
+- Post-fix run: **level-0 PBFT 0.17s** (was 0.92s, orig 20.21s); level-1 Snow 8.69s (~unchanged —
+  the two findings above are its binding constraints). Next fixes: (A) SWIM probe/suspect timeouts
+  for WAN + fall back to `neighbor_map` when the live set is empty; (B) move `_finalize`'s Redis
+  claim off the driver tick thread.
 1. **Implement `set_pending_*` in ResourceAgent `_HostAdapter`** (mirror Colmena) + replay pending
    messages when the job arrives in `_update_pending_jobs`. Also make `engine.on_proposal` resilient
    so one bad proposal can't abort the batch. *Expected: fewer lost votes → fewer re-proposals;
