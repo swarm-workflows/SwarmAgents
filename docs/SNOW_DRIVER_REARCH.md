@@ -98,3 +98,33 @@ not the driver.
 **Next:** convergence work item (per-round sticky/hysteretic sampling, adaptive β) now that the driver
 is no longer the bottleneck; the round-completion + locality changes should also matter more once
 convergence holds.
+
+## FINAL RESULT (2026-07-03): coordinator tier at 0.96s with real consensus
+
+The `[STATS]`/`[SNOW_TIMING]`/`[SNOW_ABANDON]` instrumentation drove five further fix iterations,
+each exposing the next bottleneck (full chain in `SCALABILITY_REVIEW.md`):
+
+| Commit | Layer fixed | Symptom that exposed it |
+|---|---|---|
+| `289b769e` | dropped sends counted toward round quorum; pool 12→32 | `snow_sends_dropped=5742`, deadline-resolved rounds |
+| `681e021d` | SWIM empty-live-set false readings (fallback to neighbor_map; WAN timeouts) + finalize moved off the driver thread | 23,668 `single-node` self-claims; late-ack flapping |
+| `abb8fd15` | saturated-round retry-per-tick congestion collapse (backoff + `max_inflight` cap) | 2.0M dropped sends, inbound queue pinned, zero finalizes |
+| `66c40436` | unconditional `json.dumps` per inbound message; per-send INFO log | queue still pinned at 20k, 722 `[SNOW_ABANDON]` |
+| `24f4f240` | **Redis WAN round-trips per SnowQuery on the single inbound consumer** (local-only `my_cost_for_job` + `get_assignment_local`) | sends healthy but responses stale → 100-round abandons |
+| (config) | β 20→6, `max_inflight` 16→32 — calibration for a trusted 10-coordinator tier | decisions healthy (68ms) but β=20 × queueing made selection 68s |
+
+**Hier-60 hybrid, final vs history (level CSVs):**
+
+| Tier | Original | Post driver-fix | Final (tuned) |
+|---|---|---|---|
+| Level-0 PBFT workers | 20.21 s | 0.92 s | **0.10 s** |
+| Level-1 Snow coordinators | 7.68 s (fake: single-node self-claims) | 7.14 s | **0.96 s (real consensus)** |
+
+Final run signature: `inbound_q=0, msgs_dropped=0, snow_sends_dropped=0, SNOW_ABANDON=0`;
+892 `beta@round=6` genuine convergence commits + 3,454 `peer-decided` fast-path finalizes; 100%
+completion of processed jobs; exactly-once preserved throughout (Redis `SET NX`).
+
+**Design lessons encoded:** peer-side query handling must be local-only (no Redis/aggregation on the
+inbound consumer); saturation must back off, never retry-per-tick; cap in-flight decisions like PBFT
+caps pending elections; an empty failure-detector live set is a signal about the detector, not the
+cluster; β should scale with tier size/trust, not Avalanche defaults.

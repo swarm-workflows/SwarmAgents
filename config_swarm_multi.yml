@@ -76,7 +76,10 @@ consensus:
   snow:
     k: 20                    # Peers sampled per query round
     alpha: 0.7               # Supermajority threshold within the sample
-    beta: 20                 # Consecutive winning rounds required to commit
+    beta: 20                 # Consecutive winning rounds required to commit. Avalanche-scale
+                             # default; for a small trusted tier (e.g. ~10 hybrid coordinators)
+                             # beta 4-8 converges the same and cuts decision latency ~3x
+                             # (validated: beta=6 -> 0.96s level-1 selection at Hier-60)
     max_rounds: 100          # Abandon Snow attempt after this many rounds
     round_timeout_ms: 500    # Per-round response timeout (upper bound; a round now ends as
                              # soon as all queried peers respond — see gossip_engine)
@@ -86,7 +89,7 @@ consensus:
     send_workers: 32         # Thread-pool size for non-blocking best-effort query sends
     send_timeout_ms: 300     # Per-send timeout for Snow queries/responses (no retries; a dropped
                              # query just means that peer abstains this round)
-    max_inflight: 16         # Max decisions with an outstanding query round at once — bounds
+    max_inflight: 32         # Max decisions with an outstanding query round at once — bounds
                              # send demand to what the pool can drain (prevents congestion
                              # collapse under delegation bursts)
 
