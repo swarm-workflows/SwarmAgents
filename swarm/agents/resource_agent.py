@@ -1837,6 +1837,7 @@ class ResourceAgent(Agent):
                         proposals.append(proposal)
                         job.state = ObjectState.PRE_PREPARE
 
+                proposed_this_iter = len(proposals) > 0
                 if len(proposals):
                     self.logger.debug(f"Identified jobs to propose: {proposals}")
                     if self.debug:
@@ -1860,10 +1861,14 @@ class ResourceAgent(Agent):
                 # This handles jobs stuck due to agent failures where consensus was cleared
                 #self._reset_orphaned_jobs()
 
-                # Only wait when the PENDING backlog is drained — a fixed wait per batch
-                # capped proposal throughput at ~2 batches/s regardless of queued work
-                # (visible as multi-second ramp for coordinators holding 100+ jobs).
-                if not self.queues.pending_queue.gets(states=[ObjectState.PENDING], count=1):
+                # Skip the inter-batch wait ONLY when this iteration proposed something
+                # AND the batch came back full (real backlog likely behind it). Skipping
+                # on any-PENDING-remaining busy-spun the loop over jobs deferred to
+                # better-suited peers (they stay PENDING locally), recomputing the cost
+                # matrix at full CPU — measured as L0 0.08s->1.44s and ~2x throughput
+                # loss. The wait is load-bearing backoff for the contended/deferred case.
+                backlog_full = len(pending_jobs) >= self.proposal_job_batch_size
+                if not (proposed_this_iter and backlog_full):
                     self.queues.pending_event.wait(timeout=0.5)
                     self.queues.pending_event.clear()
             except Exception as e:
