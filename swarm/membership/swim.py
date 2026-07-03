@@ -198,6 +198,12 @@ class SwimMembership:
         with self._lock:
             return [m.agent_id for m in self._members.values() if m.is_alive()]
 
+    def failed_agents(self) -> List[int]:
+        """Agents currently marked FAILED. Deliberately excludes SUSPECT — suspected
+        peers must keep receiving traffic so they can refute the suspicion."""
+        with self._lock:
+            return [m.agent_id for m in self._members.values() if m.status == FAILED]
+
     def status_of(self, agent_id: int) -> Optional[str]:
         with self._lock:
             m = self._members.get(int(agent_id))

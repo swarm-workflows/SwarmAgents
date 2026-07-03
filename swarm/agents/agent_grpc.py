@@ -249,8 +249,27 @@ class Agent(Observer):
             self.logger.debug(f"Failed to enqueue message: {message}, error: {e}")
 
     def broadcast(self, message: Message):
+        # Skip peers known to be FAILED (SWIM failed set and/or heartbeat detection) —
+        # otherwise every consensus phase pays full send timeouts for dead peers.
+        # SWIM SUSPECT peers still receive traffic so they can refute the suspicion.
+        peers = self.topology.peers
+        skip = set()
+        swim = getattr(self, "swim", None)
+        if swim is not None:
+            try:
+                skip.update(swim.failed_agents())
+            except Exception:
+                pass
+        failed_map = getattr(self, "failed_agents", None)
+        if failed_map is not None:
+            try:
+                skip.update(failed_map.keys())
+            except Exception:
+                pass
+        if skip:
+            peers = [p for p in peers if p not in skip]
         self.transport.broadcast(payload=message,
-                                 peers=self.topology.peers,
+                                 peers=peers,
                                  neighbor_map=self.neighbor_map,
                                  sender=self.agent_id)
 

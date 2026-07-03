@@ -1395,7 +1395,8 @@ class ResourceAgent(Agent):
             if t is not None and getattr(t, "broadcasts", 0):
                 parts.append(
                     f"bcast_mean={t.broadcast_time_total / t.broadcasts:.3f}s "
-                    f"max={t.broadcast_time_max:.3f}s n={t.broadcasts}")
+                    f"max={t.broadcast_time_max:.3f}s n={t.broadcasts} "
+                    f"bcast_dropped={getattr(t, 'bcast_sends_dropped', 0)}")
             if isinstance(self.engine, GossipConsensusEngine):
                 parts.append(f"snow_sends_dropped={self.engine.sends_dropped}")
             self.logger.info("[STATS] " + " ".join(parts))
