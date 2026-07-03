@@ -137,7 +137,30 @@ exists. Tests: `tests/test_broadcast.py`.
    *Verify: Mesh-30/60 PBFT selection latency; whether PBFT-mesh completion extends past the
    30-agent wall (won't fix O(n²) message count, but removes the serial-blocking collapse).*
 
-### Phase 2 — Data layer: stop scanning, start batching
+### Phase 2 — Data layer — ✅ SHIPPED `3a977f17` + `5ba99454`
+
+Delivered 2026-07-03. D1: `members:{level}:{group}` registry SETs replace per-tick `scan_iter`
+(pruned on read; SCAN fallback for migration). D3: `_update_pending_jobs` → one MGET.
+D4: `_monitor_delegated_jobs` → one grouped MGET per tick. D2/D6: agent-info via `save_fast`
+(single-writer, no WATCH) + TTL (2× peer-expiry). Tests: `tests/test_repository.py` (fakeredis).
+
+**Cascade found by the A/B and fixed in the same phase:** removing Redis latency from the periodic
+loop let coordinators feed Snow at full concurrency — per-(job, peer, round) sends hit ~2,900/s
+(~5× pool drain), 96k–300k drops, L1 regressed to 58s. Fixed structurally with **per-peer Snow
+query/response batching** (`SnowQueryBatch`/`SnowResponseBatch`, one message per peer per tick —
+wire demand now ∝ peers, not in-flight decisions).
+
+**A/B verification (Hier-60 hybrid, identical workload, Redis sampled every 10s):**
+| Metric | Baseline (pre-Phase-2) | Final (Phase 2 + batching) |
+|---|---|---|
+| Redis ops/sec (mean) | 13,508 | **1,133 (11.9×)** |
+| Redis net input | 0.74 MB/s | 0.11 MB/s |
+| Level-0 PBFT selection | 0.17 s | **0.08 s** |
+| Level-1 Snow selection | 0.77 s | **0.63 s** |
+| Jobs processed in-window | 426 | **1,069 (~2.5×)** — 100% complete |
+| snow_sends_dropped | 0 | 0 |
+
+### Phase 2 (original plan, for reference)
 7. **Kill SCAN in hot loops (D1):** membership per level:group is known — construct keys directly
    and `MGET`, or maintain a `members:{level}:{group}` SET updated on join/leave. One command per
    refresh instead of a keyspace scan.
