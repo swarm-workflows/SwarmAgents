@@ -59,6 +59,9 @@ runtime:
   enable_agent_recovery: true        # Allow recovered agents to rejoin the pool
   max_infeasible_retries: 10         # Retire infeasible jobs after N attempts (0 = infinite)
   max_delegation_attempts: 3         # Mark job infeasible after N failed delegation timeouts
+  #neighbor_refresh_full_s: 5        # Full Redis neighbor-refresh cadence. Default: per-tick
+                                     # without gossip; 5s with gossip enabled (peer `load` then
+                                     # arrives via the epidemic cache every tick instead)
 
 # Consensus protocol — Phase 3/4 of the gossip-consensus migration.
 #   pbft   : PBFT-like 3-phase engine everywhere (default; best <50 agents / small groups).

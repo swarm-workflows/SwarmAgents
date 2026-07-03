@@ -1328,6 +1328,35 @@ class ResourceAgent(Agent):
         expiry = int(self.runtime_config.get("peer_expiry_seconds", 300))
         return max(60, expiry * 2)
 
+    def _should_full_neighbor_refresh(self, now: float) -> bool:
+        """Full (Redis) neighbor refresh cadence. Per-tick without gossip (status quo);
+        with gossip enabled the default drops to 5s — gossip keeps `load` fresh in
+        between, and liveness is SWIM's job anyway (5s lag is far under the 45-300s
+        peer-expiry threshold)."""
+        default = 5.0 if self.gossip is not None else 0.0
+        interval = float(self.runtime_config.get("neighbor_refresh_full_s", default))
+        last = getattr(self, "_last_full_neighbor_refresh", 0.0)
+        if now - last >= interval:
+            self._last_full_neighbor_refresh = now
+            return True
+        return False
+
+    def _apply_gossip_overlay(self) -> None:
+        """Refresh the fast-changing `load` on neighbor_map entries from the gossip
+        cache. Gossip propagates in ~1-2 epidemic rounds, so between full refreshes
+        selection costs use FRESHER load than the old per-tick Redis poll provided."""
+        if self.gossip is None:
+            return
+        try:
+            for entry in self.gossip.snapshot():
+                if entry.agent_id == self.agent_id:
+                    continue
+                info = self.neighbor_map.get(entry.agent_id)
+                if info is not None:
+                    info.load = float(entry.load)
+        except Exception as exc:
+            self.logger.debug(f"[gossip] overlay failed: {exc}")
+
     def on_periodic(self):
         # Start SWIM lazily on first tick (transport and neighbor_map are ready by now).
         if self.swim is not None and getattr(self.swim, "_thread", None) is None:
@@ -1381,7 +1410,14 @@ class ResourceAgent(Agent):
                                   group=self.topology.group,
                                   ttl_s=self._agent_key_ttl_s())
 
-        self._refresh_neighbors(current_time=current_time)
+        # Gossip-fed neighbor state (design intent of gossip Phase 2, now wired):
+        # when gossip is on, the fast-changing field (load) arrives via the epidemic
+        # cache every tick, and the FULL Redis refresh (every peer's 2-5KB object —
+        # O(N) payload per agent per tick, the 1000-agent read-amplification wall)
+        # drops to a slow cadence for the slow-changing fields (capacities/DTNs/host).
+        if self._should_full_neighbor_refresh(current_time):
+            self._refresh_neighbors(current_time=current_time)
+        self._apply_gossip_overlay()
 
         # Batch update job sets (single Redis pipeline round-trip)
         group = self.topology.group
