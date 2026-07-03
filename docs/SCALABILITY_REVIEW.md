@@ -110,7 +110,23 @@ per-agent `[STATS]` line every ~30s). Next run's `[STATS]` output decides Phase 
 3. **Counters** (cheap, decisive): selection-cache hit/miss, inbound queue depth, per-broadcast
    latency histogram, Redis WatchError rate, `sends_dropped` (exists for Snow). Export via Metrics.
 
-### Phase 1 — Comm layer: parallel best-effort PBFT fan-out (highest latency leverage)
+### Phase 1 — Comm layer: parallel best-effort PBFT fan-out — ✅ SHIPPED `85f26208`
+
+Delivered 2026-07-03: `broadcast()` fans out on a bounded pool (fire-and-forget, retries 4→2);
+`Agent.broadcast` skips FAILED peers (new `SwimMembership.failed_agents()`, suspects excluded so they
+can refute; plus heartbeat `failed_agents`); `bcast_dropped` counter in `[STATS]`. Item 6 (adaptive
+reselection timeout) dropped as designed-out — the broadcast-latency → timeout-storm loop no longer
+exists. Tests: `tests/test_broadcast.py`.
+
+**Failure-scenario verification (Hier-60 hybrid, 6 of 50 level-0 agents killed at T+150s):**
+| Metric | Result |
+|---|---|
+| Broadcast latency through the kills | **mean 0.000s / max 0.002s**, 0 dropped, 0 `[BCAST_SLOW]` (was ~8.7s per dead peer per phase, ×3 phases) |
+| Level-0 PBFT selection under failures | **0.09s** (healthy baseline: 0.10s — failures now cost the worker tier nothing) |
+| Level-1 Snow selection under failures | 1.88s (healthy: 0.96s) |
+| Completion / recovery | 100% of processed jobs; orphaned jobs reselected; 0 abandons; pipeline clean |
+
+### Phase 1 (original plan, for reference)
 4. **Parallelize `broadcast()`** with the bounded send-pool pattern already proven for Snow
    (`7208ee90`): concurrent per-peer sends, short timeout, retries in background — never serially
    block a consensus phase on one peer. PBFT still gets its quorum from responses, so per-send
