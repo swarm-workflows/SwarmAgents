@@ -79,7 +79,13 @@ bottleneck after parameter tuning failed.
 **Principle: instrument → fix → re-measure on the testbed** (Hier-60 hybrid + Mesh-120 are the
 established benchmarks with recorded baselines).
 
-### Phase 0 — Correctness + instrumentation (small effort, do first)
+### Phase 0 — Correctness + instrumentation (small effort, do first) — ✅ SHIPPED `38ed92d2`
+
+Delivered 2026-07-02, deployed to all 40 agents: `_set_pending_safe` guard in the engine +
+`set_pending_*` stash/replay in ResourceAgent (regression tests `tests/test_pbft_pending.py`);
+conflicts dict capped; inbound queue bounded (20k) with drop counter; SMEMBERS glob bug fixed;
+counters live (selection-cache hit rate, WatchError retries, broadcast latency + `[BCAST_SLOW]`,
+per-agent `[STATS]` line every ~30s). Next run's `[STATS]` output decides Phase 1 vs Phase 2 order.
 1. **Implement `set_pending_*` in ResourceAgent `_HostAdapter`** (mirror Colmena) + replay pending
    messages when the job arrives in `_update_pending_jobs`. Also make `engine.on_proposal` resilient
    so one bad proposal can't abort the batch. *Expected: fewer lost votes → fewer re-proposals;
