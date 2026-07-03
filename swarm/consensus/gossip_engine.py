@@ -236,10 +236,16 @@ class GossipConsensusEngine:
     # ---- Snow-message handlers (called from inbound thread) ------------- #
 
     def on_snow_query(self, msg: SnowQuery) -> None:
-        """Peer-side: respond with our preferred assignee for the queried job."""
+        """Peer-side: respond with our preferred assignee for the queried job.
+
+        Runs on the inbound consumer thread — must stay free of Redis/network calls.
+        The already-decided short-circuit therefore uses the host's LOCAL view when
+        available (a per-query Redis GET here collapsed inbound throughput); the
+        authoritative exactly-once check remains the Redis CAS at finalize."""
         if msg.source == self.agent_id or msg.job_id is None:
             return
-        winner = self.host.get_assignment(msg.job_id)
+        get_assignment = getattr(self.host, "get_assignment_local", None) or self.host.get_assignment
+        winner = get_assignment(msg.job_id)
         if winner is not None:
             # Already committed — short-circuit with the decided value.
             resp = SnowResponse(

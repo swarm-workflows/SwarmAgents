@@ -149,13 +149,18 @@ class _HostAdapter(ConsensusHost):
         return [k for k in self.agent.neighbor_map.keys() if k != self.agent.agent_id]
 
     def my_cost_for_job(self, object_id: str):
-        obj = self.get_object(object_id)
+        # LOCAL-ONLY on purpose: this runs per inbound SnowQuery on the single consumer
+        # thread. The previous get_object() Redis fallback + fresh _generate_agent_info()
+        # cost a WAN round-trip (plus child aggregation) per query, collapsing inbound
+        # throughput (queue pinned at 20k, responses stale, every decision abandoning at
+        # max_rounds). A peer that doesn't know the job locally yields to the initiator's
+        # preferred candidate — the engine already treats cost=None exactly that way.
+        obj = self.agent.queues.pending_queue.get(object_id)
         if obj is None:
             return None
         try:
-            return float(self.agent._cost_job_on_agent(
-                obj, self.agent._generate_agent_info()
-            ))
+            info = self.agent.last_agent_info or self.agent._generate_agent_info()
+            return float(self.agent._cost_job_on_agent(obj, info))
         except Exception as exc:
             self.agent.logger.debug(f"my_cost_for_job({object_id}) failed: {exc}")
             return None
@@ -171,6 +176,12 @@ class _HostAdapter(ConsensusHost):
             job_id=object_id,
             level=self.agent.topology.level, group=self.agent.topology.group,
         )
+
+    def get_assignment_local(self, object_id: str):
+        # Peer-side already-decided short-circuit from LOCAL knowledge only (the
+        # authoritative exactly-once check remains try_claim_assignment's Redis CAS).
+        # Returns the assignee if this agent saw the commit, else None — never Redis.
+        return self.agent.job_assignments.get(object_id)
 
     def my_site(self):
         return getattr(self.agent, "site", None)
@@ -380,6 +391,11 @@ class ResourceAgent(Agent):
         self.pending_prepares: dict[str, list] = {}
         self.pending_commits: dict[str, list] = {}
         self.pending_consensus_dropped = 0
+
+        # Latest AgentInfo snapshot (refreshed each periodic tick). Hot paths — e.g.
+        # per-SnowQuery cost answers on the inbound thread — reuse this instead of
+        # re-aggregating children on every message.
+        self.last_agent_info = None
 
         # Track jobs delegated to children for hierarchical monitoring
         # Maps: job_id -> {'delegated_at': timestamp, 'groups': [list of child groups]}
@@ -1333,6 +1349,7 @@ class ResourceAgent(Agent):
             self._check_failure_threshold()
 
         agent_info = self._generate_agent_info()
+        self.last_agent_info = agent_info  # snapshot reused by inbound hot paths
         self.repository.save(agent_info.to_dict(), key_prefix=Repository.KEY_AGENT,
                              level=self.topology.level,
                              group=self.topology.group)
