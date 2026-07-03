@@ -15,6 +15,7 @@ from typing import Dict, List, Optional
 
 from swarm.consensus.gossip_engine import GossipConsensusEngine
 from swarm.consensus.messages.proposal_info import ProposalInfo
+from swarm.consensus.messages.snow_batch import SnowQueryBatch, SnowResponseBatch
 from swarm.consensus.messages.snow_query import SnowQuery
 from swarm.consensus.messages.snow_response import SnowResponse
 
@@ -132,6 +133,23 @@ def _make_engine(agent_id=1, peers=(2, 3, 4), my_cost=1.0, cas=None,
     return eng, host, transport, cas
 
 
+def _query_batches(transport):
+    """(dest, SnowQueryBatch) tuples from the outbox (queries go out batched per peer)."""
+    return [(d, m) for d, m in transport.outbox if isinstance(m, SnowQueryBatch)]
+
+
+def _latest_query_item(transport, job_id):
+    """Newest query item for job_id across all batches."""
+    items = [it for _d, m in _query_batches(transport) for it in m.items
+             if it["job_id"] == job_id]
+    return max(items, key=lambda x: x["round"])
+
+
+def _batches_with_query(transport, query_id):
+    return [(d, m) for d, m in _query_batches(transport)
+            if any(it["query_id"] == query_id for it in m.items)]
+
+
 class SnowProposeRoundTests(unittest.TestCase):
     """A proposal that gets unanimous peer agreement commits via CAS."""
 
@@ -140,16 +158,15 @@ class SnowProposeRoundTests(unittest.TestCase):
         p = ProposalInfo(p_id="p-1", object_id="job-1", cost=1.0, agent_id="1")
         eng.propose([p])
 
-        # First round: tick sends queries to peers 2,3,4.
+        # First round: tick sends ONE batch per peer (2,3,4), each carrying the query.
         eng._tick(now=0.0)
-        first_round_outbox = [m for m in transport.outbox if isinstance(m[1], SnowQuery)]
-        self.assertEqual(len(first_round_outbox), 3)
-        query = first_round_outbox[0][1]
+        query = _latest_query_item(transport, "job-1")
+        self.assertEqual(len(_batches_with_query(transport, query["query_id"])), 3)
 
         # Simulate unanimous "yield to initiator (agent 1)" responses.
         for peer in (2, 3, 4):
             eng.on_snow_response(SnowResponse(
-                source=peer, query_id=query.query_id, job_id="job-1",
+                source=peer, query_id=query["query_id"], job_id="job-1",
                 preferred_agent=1, cost=1.0, already_decided=False,
             ))
 
@@ -157,14 +174,12 @@ class SnowProposeRoundTests(unittest.TestCase):
         eng._tick(now=0.0)
         # confidence == 1 now; the next tick fires round 2 (pending_query_id is None).
         eng._tick(now=0.0)
-        second_round = [m for m in transport.outbox
-                        if isinstance(m[1], SnowQuery)
-                        and m[1].query_id != query.query_id]
-        self.assertEqual(len(second_round), 3)
-        q2 = second_round[0][1]
+        q2 = _latest_query_item(transport, "job-1")
+        self.assertNotEqual(q2["query_id"], query["query_id"])
+        self.assertEqual(len(_batches_with_query(transport, q2["query_id"])), 3)
         for peer in (2, 3, 4):
             eng.on_snow_response(SnowResponse(
-                source=peer, query_id=q2.query_id, job_id="job-1",
+                source=peer, query_id=q2["query_id"], job_id="job-1",
                 preferred_agent=1, cost=1.0, already_decided=False,
             ))
         eng._tick(now=0.0)  # evaluates round 2 -> confidence reaches beta -> finalize
@@ -249,11 +264,11 @@ class SnowFastFinalizeTests(unittest.TestCase):
         p = ProposalInfo(p_id="p", object_id="job-y", cost=1.0, agent_id="1")
         eng.propose([p])
         eng._tick(now=0.0)  # sends round 1
-        q = next(m[1] for m in transport.outbox if isinstance(m[1], SnowQuery))
+        q = _latest_query_item(transport, "job-y")
 
         # First response says already_decided -> finalize as participant.
         eng.on_snow_response(SnowResponse(
-            source=2, query_id=q.query_id, job_id="job-y",
+            source=2, query_id=q["query_id"], job_id="job-y",
             preferred_agent=99, cost=0.0, already_decided=True,
         ))
         self.assertEqual(host.participant_events, [("job-y", 99)])
@@ -277,13 +292,11 @@ class SnowFewPeersTests(unittest.TestCase):
         # Two rounds, both evaluated at t=0.0 — well before the 0.5s round deadline.
         for _ in range(2):
             eng._tick(now=0.0)  # send a round
-            q = max((m[1] for m in transport.outbox if isinstance(m[1], SnowQuery)),
-                    key=lambda x: x.round)
-            self.assertEqual(len([m for m in transport.outbox
-                                  if isinstance(m[1], SnowQuery) and m[1].query_id == q.query_id]), 2)
+            q = _latest_query_item(transport, "job-s")
+            self.assertEqual(len(_batches_with_query(transport, q["query_id"])), 2)
             for peer in (2, 3):
                 eng.on_snow_response(SnowResponse(
-                    source=peer, query_id=q.query_id, job_id="job-s",
+                    source=peer, query_id=q["query_id"], job_id="job-s",
                     preferred_agent=1, cost=1.0, already_decided=False))
             eng._tick(now=0.0)  # evaluate the round at t=0.0 (no deadline wait)
 
@@ -294,12 +307,10 @@ class SnowFewPeersTests(unittest.TestCase):
 def _deliver_round(eng, transport, job_id, votes):
     """Send the next round for job_id and deliver (peer, choice) votes, then evaluate."""
     eng._tick(now=0.0)  # sends a round (pending_query_id was None)
-    q = max((m[1] for m in transport.outbox
-             if isinstance(m[1], SnowQuery) and m[1].job_id == job_id),
-            key=lambda x: x.round)
+    q = _latest_query_item(transport, job_id)
     for peer, choice in votes:
         eng.on_snow_response(SnowResponse(
-            source=peer, query_id=q.query_id, job_id=job_id,
+            source=peer, query_id=q["query_id"], job_id=job_id,
             preferred_agent=choice, cost=1.0, already_decided=False))
     eng._tick(now=0.0)  # evaluates the round
 
@@ -360,11 +371,10 @@ class SnowDroppedSendAccountingTests(unittest.TestCase):
             if st is None:  # finalized during previous evaluate
                 break
             self.assertEqual(st.queried, 2)  # only dispatched sends counted
-            q = max((m[1] for m in transport.outbox if isinstance(m[1], SnowQuery)),
-                    key=lambda x: x.round)
+            q = _latest_query_item(transport, "j-d")
             for peer in (2, 3):
                 eng.on_snow_response(SnowResponse(
-                    source=peer, query_id=q.query_id, job_id="j-d",
+                    source=peer, query_id=q["query_id"], job_id="j-d",
                     preferred_agent=1, cost=1.0, already_decided=False))
             eng._tick(now=0.0)  # evaluates at t=0.0 — no deadline wait
         self.assertEqual(cas.get("j-d"), 1)
@@ -417,6 +427,54 @@ class SnowAsyncFinalizeTests(unittest.TestCase):
             eng.stop()
         self.assertEqual(cas.get("j-a"), 1)          # first finalize won
         self.assertEqual(host.leader_events, ["j-a"])  # exactly one callback
+
+
+class SnowBatchingTests(unittest.TestCase):
+    """Wire demand must be proportional to PEER count, not in-flight decisions —
+    per-(job, peer) sends measured ~2,900/s at a 10-coordinator tier (~5x pool drain),
+    causing sustained drops once the data layer stopped throttling proposals."""
+
+    def test_one_message_per_peer_regardless_of_job_count(self):
+        eng, host, transport, cas = _make_engine(k=8, peers=(2, 3, 4))
+        eng.propose([ProposalInfo(p_id=f"p{i}", object_id=f"j{i}", cost=1.0, agent_id="1")
+                     for i in range(20)])
+        eng._tick(now=0.0)
+        batches = _query_batches(transport)
+        self.assertEqual(len(batches), 3)                       # one per peer, not 60
+        self.assertEqual(sorted(d for d, _ in batches), [2, 3, 4])
+        for _d, m in batches:
+            self.assertEqual(len(m.items), 20)                  # all jobs coalesced
+
+    def test_query_batch_round_trip(self):
+        # Initiator (agent 1) and peer (agent 5) exchange one batch each way.
+        init, ihost, itr, cas = _make_engine(agent_id=1, peers=(5,), k=3, beta=1)
+        peer, phost, ptr, _ = _make_engine(agent_id=5, peers=(1,), my_cost=10.0, cas=cas)
+        init.propose([ProposalInfo(p_id="p", object_id="jb", cost=1.0, agent_id="1")])
+        init._tick(now=0.0)
+        (dest, qbatch), = _query_batches(itr)
+        self.assertEqual(dest, 5)
+
+        peer.on_snow_query_batch(qbatch)                        # peer answers in ONE msg
+        rbatches = [(d, m) for d, m in ptr.outbox if isinstance(m, SnowResponseBatch)]
+        self.assertEqual(len(rbatches), 1)
+        rdest, rbatch = rbatches[0]
+        self.assertEqual(rdest, 1)
+        self.assertEqual(len(rbatch.items), 1)
+        self.assertEqual(rbatch.items[0]["preferred_agent"], 1)  # costlier peer yields
+
+        init.on_snow_response_batch(rbatch)
+        init._tick(now=0.0)                                      # beta=1 -> finalize
+        self.assertEqual(cas.get("jb"), 1)
+        self.assertEqual(ihost.leader_events, ["jb"])
+
+    def test_batch_serialization_round_trip(self):
+        from swarm.consensus.messages.message_builder import MessageBuilder
+        b = SnowQueryBatch(source=1, items=[{"query_id": "q", "job_id": "j",
+                                             "preferred_agent": 1, "preferred_cost": 0.5,
+                                             "round": 1}])
+        rebuilt = MessageBuilder.from_dict(b.to_dict())
+        self.assertIsInstance(rebuilt, SnowQueryBatch)
+        self.assertEqual(rebuilt.items[0]["job_id"], "j")
 
 
 class SnowNonBlockingSendTests(unittest.TestCase):

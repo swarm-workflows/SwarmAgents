@@ -43,6 +43,9 @@ class MessageType(enum.Enum):
     # Snow/Avalanche consensus (Phase 3)
     SnowQuery = enum.auto()   #10
     SnowResponse = enum.auto()#11
+    # Per-peer batched Snow messages (one message per peer per tick)
+    SnowQueryBatch = enum.auto()    #12
+    SnowResponseBatch = enum.auto() #13
 
     def __repr__(self):
         return self.name

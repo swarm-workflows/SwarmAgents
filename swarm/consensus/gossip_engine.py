@@ -47,6 +47,7 @@ from typing import Callable, Dict, List, Optional, Protocol
 
 from swarm.consensus.interfaces import ConsensusHost, TopologyRouter
 from swarm.consensus.messages.proposal_info import ProposalContainer, ProposalInfo
+from swarm.consensus.messages.snow_batch import SnowQueryBatch, SnowResponseBatch
 from swarm.consensus.messages.snow_query import SnowQuery
 from swarm.consensus.messages.snow_response import SnowResponse
 
@@ -238,42 +239,33 @@ class GossipConsensusEngine:
 
     # ---- Snow-message handlers (called from inbound thread) ------------- #
 
-    def on_snow_query(self, msg: SnowQuery) -> None:
-        """Peer-side: respond with our preferred assignee for the queried job.
+    def _answer_query(self, query_id, job_id, q_preferred, q_cost) -> Optional[dict]:
+        """Peer-side answer for one query. Returns a response item dict, or None.
 
         Runs on the inbound consumer thread — must stay free of Redis/network calls.
         The already-decided short-circuit therefore uses the host's LOCAL view when
         available (a per-query Redis GET here collapsed inbound throughput); the
         authoritative exactly-once check remains the Redis CAS at finalize."""
-        if msg.source == self.agent_id or msg.job_id is None:
-            return
+        if job_id is None:
+            return None
         get_assignment = getattr(self.host, "get_assignment_local", None) or self.host.get_assignment
-        winner = get_assignment(msg.job_id)
+        winner = get_assignment(job_id)
         if winner is not None:
             # Already committed — short-circuit with the decided value.
-            resp = SnowResponse(
-                source=self.agent_id,
-                query_id=msg.query_id,
-                job_id=msg.job_id,
-                preferred_agent=winner,
-                cost=0.0,
-                already_decided=True,
-            )
-            self._safe_send(int(msg.source), resp)
-            return
+            return {"query_id": query_id, "job_id": job_id,
+                    "preferred_agent": int(winner), "cost": 0.0, "already_decided": True}
 
-        my_cost = self.host.my_cost_for_job(msg.job_id)
+        my_cost = self.host.my_cost_for_job(job_id)
         # Dominance rule: if I'm cheaper than the initiator's preferred, vote
         # for myself; otherwise yield to the initiator's candidate. Ties broken
         # by lexicographic agent_id to match the PBFT engine's tiebreak.
-        preferred = self.agent_id
         if my_cost is None:
             # Can't evaluate locally — yield.
-            preferred = int(msg.preferred_agent) if msg.preferred_agent is not None else self.agent_id
-            cost_out = float(msg.preferred_cost or 0.0)
+            preferred = int(q_preferred) if q_preferred is not None else self.agent_id
+            cost_out = float(q_cost or 0.0)
         else:
-            init_cost = float(msg.preferred_cost) if msg.preferred_cost is not None else float("inf")
-            init_agent = int(msg.preferred_agent) if msg.preferred_agent is not None else -1
+            init_cost = float(q_cost) if q_cost is not None else float("inf")
+            init_agent = int(q_preferred) if q_preferred is not None else -1
             mine_dominates = (my_cost < init_cost) or (
                 my_cost == init_cost and self.agent_id < init_agent
             )
@@ -283,30 +275,59 @@ class GossipConsensusEngine:
             else:
                 preferred = init_agent if init_agent >= 0 else self.agent_id
                 cost_out = init_cost if init_cost != float("inf") else my_cost
-        resp = SnowResponse(
-            source=self.agent_id,
-            query_id=msg.query_id,
-            job_id=msg.job_id,
-            preferred_agent=preferred,
-            cost=cost_out,
-            already_decided=False,
-        )
-        self._safe_send(int(msg.source), resp)
+        return {"query_id": query_id, "job_id": job_id,
+                "preferred_agent": int(preferred), "cost": float(cost_out),
+                "already_decided": False}
 
-    def on_snow_response(self, msg: SnowResponse) -> None:
-        """Initiator-side: accumulate responses; the driver thread evaluates."""
-        if msg.job_id is None or msg.query_id is None:
+    def on_snow_query(self, msg: SnowQuery) -> None:
+        """Single-query wrapper (mixed-version compatibility; batches are the hot path)."""
+        if msg.source == self.agent_id:
+            return
+        item = self._answer_query(msg.query_id, msg.job_id, msg.preferred_agent, msg.preferred_cost)
+        if item:
+            self._safe_send(int(msg.source), SnowResponse(source=self.agent_id, **item))
+
+    def on_snow_query_batch(self, msg: SnowQueryBatch) -> None:
+        """Answer a whole tick's queries from one peer with ONE response message —
+        collapses response traffic the same way query batching collapses queries."""
+        if msg.source == self.agent_id or not msg.items:
+            return
+        items = []
+        for q in msg.items:
+            item = self._answer_query(q.get("query_id"), q.get("job_id"),
+                                      q.get("preferred_agent"), q.get("preferred_cost"))
+            if item:
+                items.append(item)
+        if items:
+            self._safe_send(int(msg.source), SnowResponseBatch(source=self.agent_id, items=items))
+
+    def _absorb_response(self, job_id, query_id, preferred_agent, cost, already_decided) -> None:
+        """Initiator-side: accumulate one response; the driver thread evaluates."""
+        if job_id is None or query_id is None:
             return
         with self._lock:
-            state = self._states.get(msg.job_id)
+            state = self._states.get(job_id)
             if state is None or state.finalized:
                 return
-            if state.pending_query_id != msg.query_id:
+            if state.pending_query_id != query_id:
                 return  # response for a prior round; discard
-            state.pending_responses.append(msg)
+            state.pending_responses.append(SnowResponse(
+                source=None, query_id=query_id, job_id=job_id,
+                preferred_agent=preferred_agent, cost=cost,
+                already_decided=bool(already_decided)))
             # If a peer reports the job is already decided, fast-finalize.
-            if msg.already_decided and msg.preferred_agent is not None:
-                self._finalize(state, int(msg.preferred_agent), reason="peer-decided")
+            if already_decided and preferred_agent is not None:
+                self._finalize(state, int(preferred_agent), reason="peer-decided")
+
+    def on_snow_response(self, msg: SnowResponse) -> None:
+        self._absorb_response(msg.job_id, msg.query_id, msg.preferred_agent,
+                              msg.cost, msg.already_decided)
+
+    def on_snow_response_batch(self, msg: SnowResponseBatch) -> None:
+        for r in msg.items:
+            self._absorb_response(r.get("job_id"), r.get("query_id"),
+                                  r.get("preferred_agent"), r.get("cost"),
+                                  r.get("already_decided"))
 
     # ---- Driver thread --------------------------------------------------- #
 
@@ -324,6 +345,7 @@ class GossipConsensusEngine:
             jobs = list(self._states.values())
             # Rounds currently awaiting responses count against the in-flight cap.
             in_flight = sum(1 for s in jobs if not s.finalized and s.pending_query_id)
+        pending_sends: List[tuple] = []  # (state, peers, query_item)
         for state in jobs:
             if state.finalized:
                 continue
@@ -332,8 +354,10 @@ class GossipConsensusEngine:
                 # The in-flight cap bounds total send demand to what the pool can
                 # drain (uncapped, a delegation burst congestion-collapsed the tier).
                 if state.round_deadline <= now and in_flight < self.max_inflight:
-                    self._send_round(state, now)
-                    in_flight += 1
+                    prepared = self._prepare_round(state, now)
+                    if prepared is not None:
+                        pending_sends.append((state, *prepared))
+                        in_flight += 1
                 continue
             # A round ends as soon as every peer we actually queried has responded
             # (capped at k), or the deadline is hit. Using min(k, queried) instead of
@@ -346,17 +370,25 @@ class GossipConsensusEngine:
             if got >= needed or deadline_hit:
                 self._evaluate_round(state, now)
 
+        if pending_sends:
+            self._flush_query_batches(pending_sends, now)
+
         # Drop finalized state entries.
         with self._lock:
             for oid in [k for k, s in self._states.items() if s.finalized]:
                 self._states.pop(oid, None)
 
-    def _send_round(self, state: _SnowState, now: float) -> None:
+    def _prepare_round(self, state: _SnowState, now: float) -> Optional[tuple]:
+        """Arm the next round for `state` and return (peers, query_item) for batching —
+        the actual send happens in _flush_query_batches, ONE message per peer per tick.
+        Per-(job, peer) sends measured ~2,900/s at a 10-coordinator tier (~5x the pool
+        drain rate) once the data-layer fixes let proposals arrive full-rate; batching
+        makes wire demand proportional to peer count, not in-flight decisions."""
         peers = self._pick_query_peers(exclude=self.agent_id)
         if not peers:
             # No peers yet — degenerate single-node case: claim immediately.
             self._finalize(state, self.agent_id, reason="single-node")
-            return
+            return None
         query_id = uuid.uuid4().hex
         with self._lock:
             state.pending_query_id = query_id
@@ -364,32 +396,38 @@ class GossipConsensusEngine:
             state.round_deadline = now + self.round_timeout_s
             state.last_round_at = now
             state.round_no += 1
-            # state.queried is set after the send loop, to the count actually dispatched.
-        msg = SnowQuery(
-            source=self.agent_id,
-            query_id=query_id,
-            job_id=state.proposal.object_id,
-            preferred_agent=state.preferred,
-            preferred_cost=state.preferred_cost,
-            round=state.round_no,
-        )
-        dispatched = 0
-        for dest in peers:
-            if self._safe_send(dest, msg):
-                dispatched += 1
-        with self._lock:
-            # Count only queries actually dispatched: a pool-dropped send will never be
-            # answered, and waiting on it burns the full round_timeout every round
-            # (measured as snow_sends_dropped=5742 with rounds resolving by deadline).
-            state.queried = dispatched
-            if dispatched == 0:
-                # Send pool fully saturated. Retry AFTER a full round_timeout — retrying
-                # on the next 50ms tick multiplied send demand ~20x and congestion-
-                # collapsed the tier (measured: 2M dropped sends, inbound queue full,
-                # zero finalizes). The deadline gate in _tick provides the backoff.
-                state.pending_query_id = None
-                state.round_no -= 1  # a round that never left the building doesn't count
-                state.round_deadline = now + self.round_timeout_s
+            # state.queried is set in _flush_query_batches to the count dispatched.
+        item = {
+            "query_id": query_id,
+            "job_id": state.proposal.object_id,
+            "preferred_agent": state.preferred,
+            "preferred_cost": state.preferred_cost,
+            "round": state.round_no,
+        }
+        return peers, item
+
+    def _flush_query_batches(self, pending_sends: List[tuple], now: float) -> None:
+        buckets: Dict[int, List[dict]] = {}
+        for _state, peers, item in pending_sends:
+            for dest in peers:
+                buckets.setdefault(dest, []).append(item)
+        dispatched_peers = set()
+        for dest, items in buckets.items():
+            if self._safe_send(dest, SnowQueryBatch(source=self.agent_id, items=items)):
+                dispatched_peers.add(dest)
+        for state, peers, _item in pending_sends:
+            dispatched = sum(1 for p in peers if p in dispatched_peers)
+            with self._lock:
+                # Count only queries actually dispatched: a dropped batch will never be
+                # answered, and waiting on it burns the full round_timeout every round.
+                state.queried = dispatched
+                if dispatched == 0:
+                    # Pool fully saturated. Retry AFTER a full round_timeout — retrying
+                    # on the next 50ms tick multiplied send demand ~20x and congestion-
+                    # collapsed the tier. The deadline gate in _tick is the backoff.
+                    state.pending_query_id = None
+                    state.round_no -= 1  # a round that never left doesn't count
+                    state.round_deadline = now + self.round_timeout_s
 
     def _evaluate_round(self, state: _SnowState, now: float) -> None:
         with self._lock:

@@ -33,6 +33,7 @@ from swarm.consensus.gossip_engine import GossipConsensusEngine
 from swarm.consensus.interfaces import ConsensusHost, ConsensusTransport, TopologyRouter
 from swarm.consensus.messages.message import MessageType
 from swarm.consensus.messages.gossip_state import GossipState
+from swarm.consensus.messages.snow_batch import SnowQueryBatch, SnowResponseBatch
 from swarm.consensus.messages.snow_query import SnowQuery
 from swarm.consensus.messages.snow_response import SnowResponse
 from swarm.consensus.messages.swim_ack import SwimAck
@@ -662,6 +663,14 @@ class ResourceAgent(Agent):
                 elif isinstance(incoming, SnowResponse):
                     if isinstance(self.engine, GossipConsensusEngine):
                         self.engine.on_snow_response(incoming)
+
+                elif isinstance(incoming, SnowQueryBatch):
+                    if isinstance(self.engine, GossipConsensusEngine):
+                        self.engine.on_snow_query_batch(incoming)
+
+                elif isinstance(incoming, SnowResponseBatch):
+                    if isinstance(self.engine, GossipConsensusEngine):
+                        self.engine.on_snow_response_batch(incoming)
 
                 else:
                     self.logger.info(f"Ignoring unsupported message: {message}")

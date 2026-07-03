@@ -35,13 +35,15 @@ from swarm.consensus.messages.swim_ping_req import SwimPingReq
 from swarm.consensus.messages.gossip_state import GossipState
 from swarm.consensus.messages.snow_query import SnowQuery
 from swarm.consensus.messages.snow_response import SnowResponse
+from swarm.consensus.messages.snow_batch import SnowQueryBatch, SnowResponseBatch
 
 
 class MessageBuilder:
     @staticmethod
     def from_dict(message: dict) -> Union[HeartBeat, Proposal, Prepare, Commit, JobStatus,
                                           SwimPing, SwimAck, SwimPingReq, GossipState,
-                                          SnowQuery, SnowResponse]:
+                                          SnowQuery, SnowResponse,
+                                          SnowQueryBatch, SnowResponseBatch]:
         message_type = MessageType(message.get('message_type'))
 
         if message_type == MessageType.HeartBeat:
@@ -76,6 +78,12 @@ class MessageBuilder:
 
         elif message_type == MessageType.SnowResponse:
             return SnowResponse.from_dict(message)
+
+        elif message_type == MessageType.SnowQueryBatch:
+            return SnowQueryBatch.from_dict(message)
+
+        elif message_type == MessageType.SnowResponseBatch:
+            return SnowResponseBatch.from_dict(message)
 
         else:
             raise MessageException(f"Unsupported Message: {message}")
