@@ -21,7 +21,7 @@ Add the `mab` section to your config file (e.g., `config_swarm_multi.yml`):
 ```yaml
 mab:
   enabled: true                    # Enable MAB for hierarchical delegation
-  algorithm: "epsilon_greedy"      # "epsilon_greedy" or "ucb1"
+  algorithm: "epsilon_greedy"      # "epsilon_greedy", "ucb1", or "linucb" (contextual)
 
   # Epsilon-Greedy parameters
   epsilon: 0.1                     # Initial exploration rate (probability of random selection)
@@ -34,6 +34,23 @@ mab:
   # Delegation control
   top_k: 1                         # Number of child groups to delegate to per job
                                    # Set to large number to recover original behavior
+
+  # Non-stationarity (epsilon_greedy / ucb1)
+  step_size: null                  # Recency-weighted Q update; null = lifetime average
+
+  # Contextual bandit (algorithm: "linucb") — see CONTEXTUAL_BANDIT_DESIGN.md
+  linucb:
+    alpha: 1.0                     # Exploration width
+    discount: 0.995                # Forgetting factor; 1.0 = standard LinUCB
+  context:
+    job_types: []                  # One-hot vocabulary, e.g. ["compute", "transfer"]
+    failure_window: 20             # Window length for per-group/per-type failure rates
+    # max_group_size / max_inflight / max_dtns / long_job_threshold / max_caps: normalization caps
+  reward:
+    shaped: false                  # Latency-shaped rewards instead of binary +/-1
+    exit_failure: -0.5             # Shaped reward for non-zero exit status
+    timeout: -1.0                  # Shaped reward for delegation timeout
+    non_winner: null               # Reward for co-selected groups that lost the job
 
   # State persistence
   persist_to_redis: false          # Save/load bandit state across restarts
@@ -66,6 +83,18 @@ mab:
 - Score = Q-value + exploration_weight * sqrt(ln(total_pulls) / arm_pulls)
 - Arms with zero pulls are selected first
 - Good for: Optimizing regret, adaptive exploration based on uncertainty
+
+### LinUCB (Contextual)
+
+- One shared linear model scores each candidate group from a per-(job, group)
+  feature vector: score = theta . x + alpha * sqrt(x . A^-1 . x)
+- Learns job-dependent routing (e.g. which group succeeds at which job type)
+  via job-x-group interaction features; non-contextual policies can only
+  learn a single per-group average
+- Newly added child groups are scored from their features immediately (no
+  cold start); `discount` < 1 forgets stale observations under shifting load
+- Full design, feature schema, and evaluation plan:
+  [CONTEXTUAL_BANDIT_DESIGN.md](CONTEXTUAL_BANDIT_DESIGN.md)
 
 ## How It Works
 
@@ -343,9 +372,9 @@ grep -i "MAB" runs/mab-test-001/agent-*.log
       [CONTEXTUAL_BANDIT_DESIGN.md](CONTEXTUAL_BANDIT_DESIGN.md) (shared-model
       LinUCB); also covers Thompson Sampling (`lin_ts`), forgetting/discounting
       for non-stationary environments, and reward shaping.
-      **Phase 1 done:** `LinUCBPolicy` (`swarm/rl/bandit.py`) and
-      `ContextExtractor` (`swarm/rl/context.py`) implemented and unit-tested;
-      not yet selectable via `mab.algorithm` until MABManager plumbing (Phase 2)
+      **Phases 1–2 done:** `LinUCBPolicy` + `ContextExtractor` implemented and
+      selectable via `mab.algorithm: linucb`; agent-side wiring (Phase 3) and
+      evaluation (Phase 4) pending
 - [x] Sliding window for non-stationary environments — optional `step_size`
       on Epsilon-Greedy/UCB1 (exponential recency-weighted Q) and `discount`
       on LinUCB

@@ -156,6 +156,27 @@ mab:
   epsilon_min: 0.01                # Minimum epsilon floor (epsilon_greedy only)
   exploration_weight: 1.41         # UCB1 exploration weight (ucb1 only)
   top_k: 1                         # Number of child groups to delegate to per job
+  step_size: null                  # Optional recency-weighted Q for epsilon_greedy/ucb1 (null = lifetime average)
+  linucb:                          # Contextual bandit settings (algorithm: "linucb")
+    alpha: 1.0                     # Exploration width (UCB bonus multiplier)
+    discount: 0.995                # Forgetting factor gamma; 1.0 = standard LinUCB
+  context:                         # Feature extraction (linucb only) — changing these changes the schema version and resets persisted model state
+    job_types: []                  # One-hot vocabulary, e.g. ["compute", "transfer"]
+    max_group_size: 10             # Normalization caps
+    max_inflight: 32
+    max_dtns: 4
+    long_job_threshold: 20.0
+    failure_window: 20             # Sliding-window length for per-group/per-type failure rates
+    max_caps:
+      core: 16
+      ram: 64                      # G, matching Capacities units
+      disk: 500                    # G
+      gpu: 4
+  reward:
+    shaped: false                  # Latency-shaped rewards instead of binary +/-1
+    exit_failure: -0.5             # Reward for non-zero exit status (shaped mode)
+    timeout: -1.0                  # Reward for delegation timeout (shaped mode)
+    non_winner: null               # Reward for co-selected groups that didn't complete the job (null = no update)
   persist_to_redis: false          # Persist bandit state to Redis
   persist_interval_s: 30.0         # Seconds between Redis persistence writes
   failure_simulation:

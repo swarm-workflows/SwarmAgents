@@ -1,10 +1,12 @@
 # Contextual Bandit Design for Hierarchical Job Delegation
 
-**Status:** Phase 1 implemented (policy + context core: `LinUCBPolicy`,
-`ContextExtractor`, interface extension, unit tests). Phases 2–4 (manager
-plumbing, agent wiring, evaluation) pending — `linucb` is deliberately not
-selectable via `mab.algorithm` until Phase 2 wires context through
-`MABManager`.
+**Status:** Phases 1–2 implemented. `linucb` is selectable via
+`mab.algorithm`: MABManager builds contexts, replays them on delayed
+rewards, maintains per-(group, job-type) failure windows, and supports
+shaped rewards. Without Phase 3 the group snapshots carry only
+manager-owned failure rates (load/capacity features stay at idle
+defaults), and `report_outcome` receives no latency/timeout detail from
+the agent. Phase 3 (agent wiring) and Phase 4 (evaluation) pending.
 **Builds on:** `docs/MAB_README.md` (existing Epsilon-Greedy / UCB1 layer)
 **Target modules:** `swarm/rl/bandit.py`, `swarm/rl/mab_manager.py`, `swarm/rl/context.py` (new), `swarm/agents/resource_agent.py`
 
@@ -412,7 +414,7 @@ through the existing `metrics.json` export (`mab_stats`, `mab_selections`,
 | Phase | Scope | Deliverables |
 |-------|-------|--------------|
 | 1 | Policy + context core | `LinUCBPolicy`, `ContextExtractor`, interface extension, unit tests — **done** |
-| 2 | Manager plumbing | Pending-context map, reward shaping, TTL sweep, per-(group, job-type) failure windows feeding `GroupSnapshot`, persistence with schema versioning |
+| 2 | Manager plumbing | Pending-context map, reward shaping, TTL sweep, per-(group, job-type) failure windows feeding `GroupSnapshot`, persistence with schema versioning — **done** |
 | 3 | Agent wiring | Group-snapshot callable, latency into `report_outcome`, multi-group attribution (`top_k > 1` fix) |
 | 4 | Evaluation | Scenarios A–C via `run_test.py` + failure simulation, plotting extensions, `lin_ts` comparison |
 
