@@ -375,8 +375,11 @@ The existing failure simulator is the ready-made testbed:
 outcomes — precisely the regime where contextual beats non-contextual.
 
 **Scenario A — context-dependent failure rates.**
-Hierarchical topology, 2–4 child groups. Configure e.g. group 1 to fail 60%
-of `dtn` jobs, group 2 to fail 60% of `compute` jobs, mixed job stream.
+Hierarchical topology, 2–4 child groups (use `--co-parents 2+` so each
+coordinator leads multiple groups/arms). `per_agent_failure_rates` accepts a
+per-job-type dict (`{job_type: rate, "default": rate}`) so failure profiles
+can depend on (agent, job type). Configure e.g. group 1's agents to fail 60%
+of `dtn` jobs, group 2's to fail 60% of `compute` jobs, mixed job stream.
 Compare `epsilon_greedy`, `ucb1`, `linucb` on cumulative reward, delegation
 success rate, and per-type routing accuracy. Expected: non-contextual
 policies plateau at the best single group's average; LinUCB approaches the

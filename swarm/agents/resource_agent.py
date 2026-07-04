@@ -25,6 +25,7 @@ import threading
 import time
 import traceback
 from concurrent.futures.thread import ThreadPoolExecutor
+from typing import Optional
 
 from google.genai.types import JobState
 
@@ -2300,13 +2301,34 @@ class ResourceAgent(Agent):
 
     def _get_failure_rate(self, job: Job) -> float:
         """Determine failure probability for a job: per-agent > per-job-type > base."""
-        agent_key = str(self.agent_id)
-        if agent_key in self.failure_sim_per_agent:
-            return float(self.failure_sim_per_agent[agent_key])
-        job_type = getattr(job, 'job_type', None)
-        if job_type and job_type in self.failure_sim_per_job_type:
-            return float(self.failure_sim_per_job_type[job_type])
-        return self.failure_sim_base_prob
+        return self._resolve_failure_rate(
+            agent_key=str(self.agent_id),
+            job_type=getattr(job, 'job_type', None),
+            per_agent=self.failure_sim_per_agent,
+            per_job_type=self.failure_sim_per_job_type,
+            base=self.failure_sim_base_prob,
+        )
+
+    @staticmethod
+    def _resolve_failure_rate(agent_key: str, job_type: Optional[str],
+                              per_agent: dict, per_job_type: dict,
+                              base: float) -> float:
+        """Per-agent entries may be a flat rate or a per-job-type dict
+        ({job_type: rate, "default": rate}) so failure profiles can depend on
+        (agent, job type) — the regime where contextual delegation beats
+        context-blind (see docs/CONTEXTUAL_BANDIT_DESIGN.md section 8)."""
+        entry = per_agent.get(agent_key)
+        if entry is not None:
+            if isinstance(entry, dict):
+                if job_type is not None and job_type in entry:
+                    return float(entry[job_type])
+                if "default" in entry:
+                    return float(entry["default"])
+            else:
+                return float(entry)
+        if job_type and job_type in per_job_type:
+            return float(per_job_type[job_type])
+        return base
 
 
     def on_shutdown(self):
