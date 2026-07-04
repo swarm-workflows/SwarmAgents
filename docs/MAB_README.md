@@ -339,7 +339,15 @@ grep -i "MAB" runs/mab-test-001/agent-*.log
 
 ## Future Enhancements
 
-- [ ] Contextual bandits (consider job features in selection)
-- [ ] Thompson Sampling algorithm
-- [ ] Sliding window for non-stationary environments
-- [ ] Per-job-type bandits (separate learners for different job types)
+- [ ] Contextual bandits (consider job features in selection) — designed in
+      [CONTEXTUAL_BANDIT_DESIGN.md](CONTEXTUAL_BANDIT_DESIGN.md) (shared-model
+      LinUCB); also covers Thompson Sampling (`lin_ts`), forgetting/discounting
+      for non-stationary environments, and reward shaping.
+      **Phase 1 done:** `LinUCBPolicy` (`swarm/rl/bandit.py`) and
+      `ContextExtractor` (`swarm/rl/context.py`) implemented and unit-tested;
+      not yet selectable via `mab.algorithm` until MABManager plumbing (Phase 2)
+- [x] Sliding window for non-stationary environments — optional `step_size`
+      on Epsilon-Greedy/UCB1 (exponential recency-weighted Q) and `discount`
+      on LinUCB
+- [ ] Per-job-type bandits (separate learners for different job types) —
+      subsumed by the contextual design (job type is a context feature)
