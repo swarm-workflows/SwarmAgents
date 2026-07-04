@@ -167,7 +167,7 @@ Consensus and selection engines are **decoupled** from agents via adapter classe
 - `docs/CO_PARENT_USAGE.md` — Multi-parent shared parenting for hierarchical topology
 - `docs/HIERARCHICAL_LLM_AGENTS.md` — LLM agents as Level 1 coordinators
 - `docs/MAB_README.md` — Multi-Armed Bandit configuration for delegation
-- `docs/CONTEXTUAL_BANDIT_DESIGN.md` — Contextual bandit (LinUCB) design for delegation. Phases 1–2 done (`LinUCBPolicy`/`ContextExtractor` in `swarm/rl/`, MABManager plumbing; selectable via `mab.algorithm: linucb`); Phase 3 (agent wiring: snapshot provider, latency/timeout into `report_outcome`, top_k>1 attribution) and Phase 4 (evaluation) pending
+- `docs/CONTEXTUAL_BANDIT_DESIGN.md` — Contextual bandit (LinUCB) for delegation. Phases 1–3 done: `LinUCBPolicy`/`ContextExtractor` in `swarm/rl/`, MABManager context plumbing, and agent wiring (live group snapshots, latency-shaped rewards, any-top_k attribution). Select via `mab.algorithm: linucb`. Phase 4 (at-scale evaluation) pending
 - `docs/COMPLEXITY.md` — PBFT message complexity analysis (mesh and hierarchical)
 - `docs/GOSSIP_CONSENSUS_DESIGN.md` — Gossip-based consensus stack (SWIM + gossip + Snow). Phases 1-3 implemented, wired, and unit-tested; Phase 4 (hybrid hierarchical) and at-scale evaluation pending
 - `docs/DISTRIBUTED_BASELINE_DESIGN.md` — Distributed baseline scheduler design

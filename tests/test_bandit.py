@@ -5,7 +5,8 @@ import random
 import numpy as np
 import pytest
 from swarm.rl.bandit import ArmStats, EpsilonGreedyPolicy, LinUCBPolicy, UCB1Policy
-from swarm.rl.context import ContextExtractor, GroupSnapshot
+from swarm.rl.context import (ContextExtractor, GroupSnapshot,
+                              snapshots_from_children)
 
 
 class TestArmStats:
@@ -462,6 +463,40 @@ class TestContextExtractor:
         names = extractor.feature_names
         assert vec[names.index("job_core")] == 0.5     # 8 / 16
         assert vec[names.index("job_type:compute")] == 1.0
+
+    def test_snapshots_from_children(self):
+        """Aggregation of the coordinator's child view (real AgentInfo model)."""
+        from swarm.models.agent_info import AgentInfo
+        from swarm.models.capacities import Capacities
+
+        def child(group, core=8, ram=32, gpu=2, used_core=0):
+            info = AgentInfo()
+            info.group = group
+            info.capacities = Capacities(core=core, ram=ram, gpu=gpu)
+            info.capacity_allocations = Capacities(core=used_core)
+            return info
+
+        children = [child(1, used_core=4), child(1), child(2), child(None)]
+        delegations = [{"groups": [1]}, {"groups": [1, 2]}]
+        snaps = snapshots_from_children(children, delegations)
+
+        assert snaps[1].active_children == 2
+        assert snaps[1].cpu_headroom == pytest.approx(1 - 4 / 16)
+        assert snaps[1].ram_headroom == 1.0
+        assert snaps[1].inflight == 2
+        assert snaps[2].active_children == 1
+        assert snaps[2].inflight == 1
+        assert snaps[0].active_children == 1   # None group defaults to 0
+        # Failure fields stay at defaults — manager owns them
+        assert snaps[1].failure_rate == 0.0 and snaps[1].type_failure_rates == {}
+
+    def test_snapshots_zero_capacity_reads_idle(self):
+        from swarm.models.agent_info import AgentInfo
+        info = AgentInfo()
+        info.group = 3
+        snaps = snapshots_from_children([info], [])
+        assert snaps[3].cpu_headroom == 1.0
+        assert snaps[3].gpu_headroom == 1.0
 
     def test_linucb_end_to_end_with_extractor(self):
         """Extractor vectors drive LinUCB end-to-end: group 1 fails compute

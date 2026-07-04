@@ -59,6 +59,7 @@ from swarm.models.capacities import Capacities
 from swarm.models.agent_info import AgentInfo
 from swarm.consensus.messages.proposal_info import ProposalInfo
 from swarm.models.job import Job, ObjectState
+from swarm.rl.context import snapshots_from_children
 from swarm.rl.mab_manager import MABManager
 
 from swarm.utils.utils import generate_id, job_capacities
@@ -416,9 +417,6 @@ class ResourceAgent(Agent):
         self.failure_sim_per_agent = fail_sim_cfg.get("per_agent_failure_rates", {})
         self.failure_sim_per_job_type = fail_sim_cfg.get("per_job_type_failure_rates", {})
 
-        # Track which group each delegated job was sent to for MAB reward attribution
-        self.job_delegation_map = ThreadSafeDict[str, int]()  # job_id -> group_id
-
         # Max retries before retiring an infeasible job (0 = infinite retries)
         self.max_infeasible_retries = self.runtime_config.get("max_infeasible_retries", 10)
 
@@ -514,10 +512,23 @@ class ResourceAgent(Agent):
             config=self.mab_config,
             repository=self.repository,
             logger=self.logger,
+            group_snapshot_provider=self._build_group_snapshots,
+            delegation_timeout_s=self.delegation_timeout_s,
         )
         self.mab_manager.load_state()
         self.logger.info(
             f"MAB initialised for agent {self.agent_id} with child groups {child_groups}"
+        )
+
+    def _build_group_snapshots(self):
+        """Current per-child-group load view for contextual MAB selection.
+
+        Called by MABManager inside select_groups(); failure-rate fields are
+        filled in by the manager from its own outcome windows.
+        """
+        return snapshots_from_children(
+            self.children.values(),
+            (info for _, info in self.delegated_jobs.items()),
         )
 
     @property
@@ -838,6 +849,7 @@ class ResourceAgent(Agent):
             job_found = False
             job_complete = False
             job_exit_status = 0
+            completed_group = None
 
             for child_group in child_groups:
                 try:
@@ -849,6 +861,7 @@ class ResourceAgent(Agent):
 
                         if job_state == ObjectState.COMPLETE.value:
                             job_complete = True
+                            completed_group = child_group
                             job_exit_status = int(job_data.get('exit_status', 0))
                             self.logger.debug(
                                 f"Delegated job {job_id} COMPLETE at child group {child_group}, "
@@ -880,18 +893,16 @@ class ResourceAgent(Agent):
                         f"group {child_group}: {e}"
                     )
 
-            # Feed MAB reward for completed jobs
-            if mab_active and job_complete:
-                delegated_group = self.job_delegation_map.get(job_id)
-                if delegated_group is not None:
-                    success = (job_exit_status == 0)
-                    self.mab_manager.report_outcome(delegated_group, job_id, success)
-                    # Track in metrics
-                    reward = 1.0 if success else -1.0
-                    self.metrics.mab_rewards.setdefault(delegated_group, []).append(
-                        (current_time, reward)
-                    )
-                    self.job_delegation_map.remove(job_id)
+            # Feed MAB reward for completed jobs — credit the group where
+            # completion was observed (works for any top_k)
+            if mab_active and job_complete and completed_group is not None:
+                success = (job_exit_status == 0)
+                latency_s = time_since_delegation if delegated_at else None
+                reward = self.mab_manager.report_outcome(
+                    completed_group, job_id, success, latency_s=latency_s)
+                self.metrics.mab_rewards.setdefault(completed_group, []).append(
+                    (current_time, reward)
+                )
 
             # Re-add to parent queue if timed out and still pending or not found
             if timed_out and (not job_found or job_still_pending):
@@ -899,9 +910,6 @@ class ResourceAgent(Agent):
 
         for job_id in jobs_processed:
             self.delegated_jobs.remove(job_id)
-            # Clean up delegation map entry if not already handled by MAB
-            if job_id in self.job_delegation_map:
-                self.job_delegation_map.remove(job_id)
             # Propagate completion to L1: mark the parent-level job as COMPLETE
             try:
                 parent_job_data = self.repository.get(
@@ -930,15 +938,15 @@ class ResourceAgent(Agent):
 
         # Process reassignments
         for job_id, delegation_info, time_since_delegation in jobs_to_reassign:
-            # Report failure to MAB when delegation times out
+            # Report timeout failure to MAB for every group the job was
+            # delegated to — none of them completed it
             if mab_active:
-                delegated_group = self.job_delegation_map.get(job_id)
-                if delegated_group is not None:
-                    self.mab_manager.report_outcome(delegated_group, job_id, success=False)
+                for delegated_group in delegation_info.get('groups', []):
+                    reward = self.mab_manager.report_outcome(
+                        delegated_group, job_id, success=False, timed_out=True)
                     self.metrics.mab_rewards.setdefault(delegated_group, []).append(
-                        (current_time, -1.0)
+                        (current_time, reward)
                     )
-                    self.job_delegation_map.remove(job_id)
             self._reassign_delegated_job(job_id, delegation_info, time_since_delegation)
 
     def _reassign_delegated_job(self, job_id: str, delegation_info: dict, time_since_delegation: float):
@@ -2196,10 +2204,6 @@ class ResourceAgent(Agent):
                             'delegated_at': time.time(),
                             'groups': selected_groups
                         })
-
-                        # Track which group this job was delegated to for MAB reward attribution
-                        if self.mab_enabled and self.mab_manager and len(selected_groups) == 1:
-                            self.job_delegation_map.set(job_id, selected_groups[0])
 
                         self.logger.debug(
                             f"Tracking delegated job {job_id} for monitoring "

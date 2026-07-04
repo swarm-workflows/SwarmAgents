@@ -105,19 +105,22 @@ mab:
    selected_groups = mab_manager.select_groups(capable_groups, job, top_k=1)
    ```
 
-3. **Delegation Tracking**: The job-to-group mapping is stored for reward attribution:
-   ```python
-   job_delegation_map[job_id] = selected_group
-   ```
+3. **Delegation Tracking**: MABManager stashes each selected (job, group)
+   pair — with its selection-time feature vector in contextual mode — in a
+   TTL-swept pending map for reward attribution (works for any `top_k`)
 
 4. **Outcome Monitoring**: `_monitor_delegated_jobs()` checks job completion status at child level:
    - Reads `exit_status` from completed jobs in Redis
-   - Reports success (exit_status=0) or failure (exit_status≠0) to MAB
+   - Credits the group where completion was observed, passing the
+     delegation-to-completion latency
+   - On delegation timeout, reports failure for every group the job was
+     delegated to
 
-5. **Reward Update**: MAB updates Q-values:
-   - Success: reward = +1.0
-   - Failure: reward = -1.0
-   - Timeout (job not completed): reward = -1.0
+5. **Reward Update**: MAB updates Q-values (and the LinUCB model in
+   contextual mode):
+   - Default: success = +1.0, failure/timeout = -1.0
+   - With `reward.shaped: true`: success = 1 − latency/delegation_timeout,
+     non-zero exit = `reward.exit_failure`, timeout = `reward.timeout`
 
 ## Running Tests
 
@@ -372,9 +375,10 @@ grep -i "MAB" runs/mab-test-001/agent-*.log
       [CONTEXTUAL_BANDIT_DESIGN.md](CONTEXTUAL_BANDIT_DESIGN.md) (shared-model
       LinUCB); also covers Thompson Sampling (`lin_ts`), forgetting/discounting
       for non-stationary environments, and reward shaping.
-      **Phases 1–2 done:** `LinUCBPolicy` + `ContextExtractor` implemented and
-      selectable via `mab.algorithm: linucb`; agent-side wiring (Phase 3) and
-      evaluation (Phase 4) pending
+      **Phases 1–3 done:** `LinUCBPolicy` + `ContextExtractor` implemented,
+      selectable via `mab.algorithm: linucb`, and fully wired into
+      ResourceAgent (live group snapshots, latency-shaped rewards, any-top_k
+      attribution); at-scale evaluation (Phase 4) pending
 - [x] Sliding window for non-stationary environments — optional `step_size`
       on Epsilon-Greedy/UCB1 (exponential recency-weighted Q) and `discount`
       on LinUCB

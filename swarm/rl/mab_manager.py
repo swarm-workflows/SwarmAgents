@@ -245,20 +245,26 @@ class MABManager:
 
     def report_outcome(self, group_id: int, job_id: str, success: bool,
                        latency_s: Optional[float] = None,
-                       timed_out: bool = False):
-        """Feed a reward signal back to the bandit for *group_id*.
+                       timed_out: bool = False) -> float:
+        """Feed a reward signal back to the bandit for *group_id*; returns
+        the (possibly shaped) reward applied so callers can record it.
 
         *latency_s* (delegation-to-completion) sharpens the reward when
         ``reward.shaped`` is on; *timed_out* distinguishes delegation
-        timeouts from non-zero exit status. An outcome is terminal for the
-        job: pending entries for other groups selected for the same job are
-        resolved too (``reward.non_winner``, default: dropped with no update).
+        timeouts from non-zero exit status.
+
+        A *success* is terminal for the job: pending entries for other groups
+        selected for the same job are resolved too (``reward.non_winner``,
+        default: dropped with no update). A failure resolves only *group_id*'s
+        entry — on a multi-group timeout the agent reports each group
+        separately so every one is updated with its own context.
         """
         reward = self._shape_reward(success, latency_s, timed_out)
 
         with self._lock:
-            entry = self._pending.get(job_id, {}).pop(group_id, None)
-            siblings = self._pending.pop(job_id, {})
+            job_entries = self._pending.get(job_id, {})
+            entry = job_entries.pop(group_id, None)
+            siblings = self._pending.pop(job_id, {}) if success or not job_entries else {}
 
             self.policy.update(group_id, reward,
                                context=entry.context if entry else None)
@@ -273,7 +279,7 @@ class MABManager:
                         (group_id, job_type),
                         deque(maxlen=self._window_len)).append(outcome)
 
-                if self._reward_non_winner is not None:
+                if success and self._reward_non_winner is not None:
                     for g, e in siblings.items():
                         self.policy.update(g, self._reward_non_winner,
                                            context=e.context)
@@ -292,6 +298,8 @@ class MABManager:
             if now - self._last_persist_time >= self._persist_interval:
                 self.save_state()
                 self._last_persist_time = now
+
+        return reward
 
     def _redis_key(self) -> str:
         return f"mab:{self.agent_id}"

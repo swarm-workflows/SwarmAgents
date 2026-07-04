@@ -52,6 +52,56 @@ class GroupSnapshot:
     type_failure_rates: Dict[str, float] = field(default_factory=dict)
 
 
+def _headroom(total: float, used: float) -> float:
+    """Free fraction of a capacity dimension; unknown capacity reads as idle."""
+    if total <= 0:
+        return 1.0
+    return float(min(1.0, max(0.0, 1.0 - used / total)))
+
+
+def snapshots_from_children(children, delegation_infos) -> Dict[int, GroupSnapshot]:
+    """Aggregate per-group GroupSnapshots from a coordinator's view.
+
+    *children*: iterable of AgentInfo-like records (``group``, ``capacities``,
+    ``capacity_allocations``). *delegation_infos*: iterable of delegated-job
+    tracking dicts (``{'groups': [...]}``) for in-flight counts.
+
+    Failure-rate fields are left at defaults — MABManager owns those and
+    overwrites them from its outcome windows.
+    """
+    per_group: Dict[int, list] = {}
+    for child in children:
+        group = child.group if child.group is not None else 0
+        per_group.setdefault(group, []).append(child)
+
+    inflight: Dict[int, int] = {}
+    for info in delegation_infos:
+        for group in info.get("groups", []):
+            inflight[group] = inflight.get(group, 0) + 1
+
+    snapshots = {}
+    for group, members in per_group.items():
+        total_core = total_ram = total_gpu = 0.0
+        used_core = used_ram = used_gpu = 0.0
+        for child in members:
+            caps = child.capacities
+            alloc = child.capacity_allocations
+            total_core += getattr(caps, "core", 0) or 0
+            total_ram += getattr(caps, "ram", 0) or 0
+            total_gpu += getattr(caps, "gpu", 0) or 0
+            used_core += getattr(alloc, "core", 0) or 0
+            used_ram += getattr(alloc, "ram", 0) or 0
+            used_gpu += getattr(alloc, "gpu", 0) or 0
+        snapshots[group] = GroupSnapshot(
+            active_children=len(members),
+            cpu_headroom=_headroom(total_core, used_core),
+            ram_headroom=_headroom(total_ram, used_ram),
+            gpu_headroom=_headroom(total_gpu, used_gpu),
+            inflight=inflight.get(group, 0),
+        )
+    return snapshots
+
+
 class ContextExtractor:
     """Produces per-(job, group) feature vectors for contextual bandits.
 

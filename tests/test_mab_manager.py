@@ -98,8 +98,8 @@ class TestLinUCBPlumbing:
         assert manager.select_groups([1, 2, 3], job=job, top_k=5) == [1, 2, 3]
         assert set(manager._pending["j1"]) == {1, 2, 3}
 
-    def test_outcome_is_terminal_for_job(self):
-        """Reporting one group's outcome clears sibling pending entries."""
+    def test_success_is_terminal_for_job(self):
+        """A success clears sibling pending entries (the job is done)."""
         manager = make_manager(linucb_config(), groups=(1, 2, 3))
         job = _FakeJob("j1", job_type="compute")
         manager.select_groups([1, 2, 3], job=job, top_k=2)
@@ -109,6 +109,33 @@ class TestLinUCBPlumbing:
         # Siblings dropped without update (non_winner defaults to null)
         total_pulls = sum(a.pull_count for a in manager.policy.arms.values())
         assert total_pulls == 1
+
+    def test_failure_resolves_only_reported_group(self):
+        """On a multi-group timeout the agent reports each group separately;
+        each must be updated with its own stashed context."""
+        manager = make_manager(linucb_config(), groups=(1, 2, 3))
+        job = _FakeJob("j1", job_type="compute")
+        selected = manager.select_groups([1, 2, 3], job=job, top_k=2)
+
+        manager.report_outcome(selected[0], "j1", success=False, timed_out=True)
+        assert set(manager._pending["j1"]) == {selected[1]}
+
+        manager.report_outcome(selected[1], "j1", success=False, timed_out=True)
+        assert manager._pending == {}
+        # Both groups updated through their own contexts
+        assert all(manager.policy.arms[g].pull_count == 1 for g in selected)
+
+    def test_report_outcome_returns_reward(self):
+        manager = make_manager(linucb_config(reward={"shaped": True}),
+                               delegation_timeout_s=60.0)
+        assert manager.report_outcome(1, "j1", success=True,
+                                      latency_s=15.0) == pytest.approx(0.75)
+        assert manager.report_outcome(2, "j2", success=False,
+                                      timed_out=True) == pytest.approx(-1.0)
+
+        unshaped = make_manager(linucb_config())
+        assert unshaped.report_outcome(1, "j1", success=True,
+                                       latency_s=15.0) == 1.0
 
     def test_non_winner_reward(self):
         config = linucb_config(reward={"non_winner": -0.1})

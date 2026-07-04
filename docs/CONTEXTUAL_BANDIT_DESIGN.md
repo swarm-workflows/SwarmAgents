@@ -1,12 +1,12 @@
 # Contextual Bandit Design for Hierarchical Job Delegation
 
-**Status:** Phases 1–2 implemented. `linucb` is selectable via
-`mab.algorithm`: MABManager builds contexts, replays them on delayed
-rewards, maintains per-(group, job-type) failure windows, and supports
-shaped rewards. Without Phase 3 the group snapshots carry only
-manager-owned failure rates (load/capacity features stay at idle
-defaults), and `report_outcome` receives no latency/timeout detail from
-the agent. Phase 3 (agent wiring) and Phase 4 (evaluation) pending.
+**Status:** Phases 1–3 implemented. `linucb` is fully wired: the agent
+provides live group snapshots (children capacity headroom + in-flight
+delegations via `snapshots_from_children`), passes completion latency and
+timeout detail into `report_outcome`, and credits the group where
+completion was observed — `top_k > 1` attribution works and
+`job_delegation_map` was removed (superseded by the manager's pending
+map). Phase 4 (at-scale evaluation, Scenarios A–C) pending.
 **Builds on:** `docs/MAB_README.md` (existing Epsilon-Greedy / UCB1 layer)
 **Target modules:** `swarm/rl/bandit.py`, `swarm/rl/mab_manager.py`, `swarm/rl/context.py` (new), `swarm/agents/resource_agent.py`
 
@@ -415,7 +415,7 @@ through the existing `metrics.json` export (`mab_stats`, `mab_selections`,
 |-------|-------|--------------|
 | 1 | Policy + context core | `LinUCBPolicy`, `ContextExtractor`, interface extension, unit tests — **done** |
 | 2 | Manager plumbing | Pending-context map, reward shaping, TTL sweep, per-(group, job-type) failure windows feeding `GroupSnapshot`, persistence with schema versioning — **done** |
-| 3 | Agent wiring | Group-snapshot callable, latency into `report_outcome`, multi-group attribution (`top_k > 1` fix) |
+| 3 | Agent wiring | Group-snapshot callable, latency into `report_outcome`, multi-group attribution (`top_k > 1` fix) — **done** |
 | 4 | Evaluation | Scenarios A–C via `run_test.py` + failure simulation, plotting extensions, `lin_ts` comparison |
 
 Estimated footprint: ~150 lines in `bandit.py`, ~120 lines in `context.py`
