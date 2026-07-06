@@ -6,9 +6,11 @@ delegations via `snapshots_from_children`), passes completion latency and
 timeout detail into `report_outcome`, and credits the group where
 completion was observed — `top_k > 1` attribution works and
 `job_delegation_map` was removed (superseded by the manager's pending
-map). Phase 4: Scenario A executed on the swarm deployment — LinUCB beats
-epsilon-greedy 73.4% vs 61.9% job success with 69% vs 50% (coin-flip)
-routing accuracy; see section 8.1. Scenarios B–C pending.
+map). Phase 4: Scenario A — LinUCB beats epsilon-greedy 73.4% vs 61.9%
+job success, 69% vs 50% routing (section 8.1). Scenario B — under a
+mid-run failure flip, discount 0.98 avoids the post-flip success crash
+that discount 1.0 suffers (68.0% vs 61.1% overall; section 8.2).
+Scenario C pending.
 **Builds on:** `docs/MAB_README.md` (existing Epsilon-Greedy / UCB1 layer)
 **Target modules:** `swarm/rl/bandit.py`, `swarm/rl/mab_manager.py`, `swarm/rl/context.py` (new), `swarm/agents/resource_agent.py`
 
@@ -436,8 +438,35 @@ Operational notes for reruns: (1) enable `mab.persist_to_redis` — agents
 are SIGKILLed at run end, so end-of-run `save_results()` metrics are lost;
 the 10s persistence interval preserves near-final policy state under
 `mab:{agent_id}`. (2) Snapshot Redis (`extract_scenario_a.py`) before the
-next run's cleanup flushes it. (3) Scenarios B (non-stationarity flip) and
-C (dynamic agent addition) remain to be run.
+next run's cleanup flushes it.
+
+### 8.2 Scenario B Results (2026-07-06, swarm deployment)
+
+Same setup as 8.1, but the failure parity **flips mid-run** via
+`failure_simulation.phases` (`after_s: 160` ≈ mid-workload at 1 job/s):
+even groups switch from failing ram_bound to failing cpu_bound and vice
+versa. Two LinUCB runs differing only in `linucb.discount`. Tooling in
+`evaluation/scenario_b/`.
+
+| Metric (L0 records, per decile) | discount 1.0 | discount 0.98 |
+|---|---|---|
+| Pre-flip peak routing / success | 97–100% / 88% | ~74% / 77% |
+| Post-flip success trough | **27–33%** (~2 deciles of stale routing) | **≥57%** (no crash) |
+| Records to 70% new-parity routing after trough | 44 | n/a — transition smooth |
+| Overall job success | 61.1% (203/332) | **68.0%** (240/353) |
+
+Without forgetting (γ=1.0) the model locks in hard, keeps routing by the
+stale parity for ~60+ records after the flip (success 27–33%), and only
+then swings. With γ=0.98 exploitation is softer pre-flip but the model
+tracks the flip almost immediately — success never dips below ~57% and
+overall success is +6.9pp. Classic stability-plasticity trade-off,
+reproduced on the deployment. Note both runs also adapt through the
+per-(group, job-type) failure windows (20 outcomes), which refresh the
+`grp_type_failure_rate` input regardless of γ; the discount additionally
+controls how fast θ itself un-commits from the stale mapping — the curves
+show that effect dominating the recovery shape.
+
+Remaining: Scenario C (dynamic agent addition) and plotting extensions.
 
 **Unit tests** (extend `tests/test_bandit.py`, 13 tests today):
 
@@ -459,7 +488,7 @@ C (dynamic agent addition) remain to be run.
 | 1 | Policy + context core | `LinUCBPolicy`, `ContextExtractor`, interface extension, unit tests — **done** |
 | 2 | Manager plumbing | Pending-context map, reward shaping, TTL sweep, per-(group, job-type) failure windows feeding `GroupSnapshot`, persistence with schema versioning — **done** |
 | 3 | Agent wiring | Group-snapshot callable, latency into `report_outcome`, multi-group attribution (`top_k > 1` fix) — **done** |
-| 4 | Evaluation | Scenarios A–C via `run_test.py` + failure simulation, plotting extensions, `lin_ts` comparison — **Scenario A done** (section 8.1: LinUCB 73.4% vs eps-greedy 61.9% success; 69% vs 50% routing); B/C and plotting extensions pending |
+| 4 | Evaluation | Scenarios A–C via `run_test.py` + failure simulation, plotting extensions, `lin_ts` comparison — **Scenarios A and B done** (8.1: LinUCB 73.4% vs eps-greedy 61.9%; 8.2: discount 0.98 avoids the post-flip crash, 68.0% vs 61.1%); C and plotting extensions pending |
 
 Estimated footprint: ~150 lines in `bandit.py`, ~120 lines in `context.py`
 (new), ~60 lines in `mab_manager.py`, minor touches in `resource_agent.py`,
