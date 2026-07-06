@@ -167,7 +167,7 @@ Consensus and selection engines are **decoupled** from agents via adapter classe
 - `docs/CO_PARENT_USAGE.md` — Multi-parent shared parenting for hierarchical topology
 - `docs/HIERARCHICAL_LLM_AGENTS.md` — LLM agents as Level 1 coordinators
 - `docs/MAB_README.md` — Multi-Armed Bandit configuration for delegation
-- `docs/CONTEXTUAL_BANDIT_DESIGN.md` — Contextual bandit (LinUCB) for delegation. Phases 1–3 done: `LinUCBPolicy`/`ContextExtractor` in `swarm/rl/`, MABManager context plumbing, and agent wiring. Select via `mab.algorithm: linucb`. Phase 4 Scenario A validated on the swarm deployment (LinUCB 73.4% vs eps-greedy 61.9% success, 69% vs 50% routing; tooling in `evaluation/scenario_a/`, results in design doc section 8.1); Scenarios B–C pending
+- `docs/CONTEXTUAL_BANDIT_DESIGN.md` — Contextual bandit (LinUCB) for delegation, all 4 phases done. Select via `mab.algorithm: linucb`. Deployment-validated (design doc section 8, tooling in `evaluation/scenario_{a,b,c}/`): A — LinUCB 73.4% vs eps 61.9% success; B — discount 0.98 avoids post-flip crash; C — instant vs never rejoin re-adoption, plus dead-group dog-piling / poisoned-window gaps identified. Offline plots: `plot_mab_results.py --dump <redis-dump.json> --events <file>`
 - `docs/COMPLEXITY.md` — PBFT message complexity analysis (mesh and hierarchical)
 - `docs/GOSSIP_CONSENSUS_DESIGN.md` — Gossip-based consensus stack (SWIM + gossip + Snow). Phases 1-3 implemented, wired, and unit-tested; Phase 4 (hybrid hierarchical) and at-scale evaluation pending
 - `docs/DISTRIBUTED_BASELINE_DESIGN.md` — Distributed baseline scheduler design

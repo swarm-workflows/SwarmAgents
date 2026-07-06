@@ -6,11 +6,14 @@ delegations via `snapshots_from_children`), passes completion latency and
 timeout detail into `report_outcome`, and credits the group where
 completion was observed — `top_k > 1` attribution works and
 `job_delegation_map` was removed (superseded by the manager's pending
-map). Phase 4: Scenario A — LinUCB beats epsilon-greedy 73.4% vs 61.9%
-job success, 69% vs 50% routing (section 8.1). Scenario B — under a
-mid-run failure flip, discount 0.98 avoids the post-flip success crash
-that discount 1.0 suffers (68.0% vs 61.1% overall; section 8.2).
-Scenario C pending.
+map). Phase 4 complete: Scenario A — LinUCB beats epsilon-greedy 73.4%
+vs 61.9% job success, 69% vs 50% routing (8.1). Scenario B — discount
+0.98 avoids the post-flip success crash that discount 1.0 suffers
+(68.0% vs 61.1%; 8.2). Scenario C (group outage/rejoin) — LinUCB
+re-adopts the recovered group instantly, epsilon-greedy never does
+(79.5% vs 74.0%; 8.3, including two design gaps found: dead-group
+dog-piling and poisoned-window hysteresis). Offline plotting via
+`plot_mab_results.py --dump`.
 **Builds on:** `docs/MAB_README.md` (existing Epsilon-Greedy / UCB1 layer)
 **Target modules:** `swarm/rl/bandit.py`, `swarm/rl/mab_manager.py`, `swarm/rl/context.py` (new), `swarm/agents/resource_agent.py`
 
@@ -466,7 +469,60 @@ per-(group, job-type) failure windows (20 outcomes), which refresh the
 controls how fast θ itself un-commits from the stale mapping — the curves
 show that effect dominating the recovery shape.
 
-Remaining: Scenario C (dynamic agent addition) and plotting extensions.
+### 8.3 Scenario C Results (2026-07-06, swarm deployment)
+
+Implemented as **group outage and rejoin** (a pure never-seen-group cold
+start would require dynamic topology support): groups 0–3 fail all jobs at
+0.30, group 4 (agents 21–25) is the superior resource at 0.05. The driver
+(`evaluation/scenario_c/scenario_c_driver.sh`) kills group 4's leaves 75s
+after launch and restarts them at ~181s (mid-workload);
+`delegation_timeout_s: 60` so delegations to the dead group fail fast.
+
+| Metric | LinUCB | Epsilon-Greedy |
+|---|---|---|
+| Overall job success | **79.5%** | 74.0% |
+| Records to first group-4 use after rejoin | **0** | 26 |
+| Post-rejoin group-4 share (first quarter) | **62%** | 0% |
+| Post-rejoin group-4 share (steady) | 15% (dips to 0 — see below) | ~4% (pure ε-noise; never re-adopts) |
+
+Epsilon-greedy's arm-4 Q-value is poisoned by outage timeouts and can
+never recover except by ε-random pulls — re-adoption effectively never
+happens. LinUCB re-adopts instantly at rejoin because the context changed
+(children reappear, headroom resets) even though the arm identity is the
+same.
+
+**Two design gaps surfaced (both algorithms affected, LinUCB more):**
+
+1. **Dead-group dog-piling.** During the outage the bandit routed *toward*
+   the dead group (LinUCB rolling share reached ~96%): an empty group looks
+   attractive — idle-default snapshot features, empty failure windows
+   (falling back to a 0.0 aggregate rate), and `grp_inflight` under-counts
+   because delegation-timeout handling removes the `delegated_jobs` entries
+   that feed it. Optimism amplifies the effect. The jobs eventually
+   completed (many executed from the backlog after rejoin), so *success*
+   barely dipped — the damage shows up as latency, not failures.
+2. **Poisoned-window hysteresis.** The outage's timeout storm filled group
+   4's per-type failure windows with failures; post-rejoin those windows
+   only refresh if the arm is tried, so after burning the backlog LinUCB
+   avoided the now-best group for ~50 records before uncertainty retried it.
+
+**Recommendations (future work):** gate liveness at the *feasibility*
+layer — a group with zero fresh child heartbeats should not be offered to
+the bandit at all (this also preserves cold-start optimism for genuinely
+new groups, which do heartbeat); consider a time-decayed timeout-rate
+feature immune to refresh hysteresis; count in-flight delegations from
+delegation records rather than the monitor's tracking dict.
+
+Additional operational note: `cleanup.py --cleanup-redis` does not clear
+`mab:*` keys, so persisted policy state from prior runs leaks into later
+dumps — only trust `mab:{agent_id}` for coordinators active in the
+current run.
+
+Remaining: plotting extensions are implemented (`plot_mab_results.py
+--dump/--events/--job-types` offline mode over full Redis dumps: rolling
+success + delegation-share timeline with event markers, class-x-group
+outcome heatmap, learned-theta chart); `lin_ts` comparison and batch runs
+for error bars remain open.
 
 **Unit tests** (extend `tests/test_bandit.py`, 13 tests today):
 
@@ -488,7 +544,7 @@ Remaining: Scenario C (dynamic agent addition) and plotting extensions.
 | 1 | Policy + context core | `LinUCBPolicy`, `ContextExtractor`, interface extension, unit tests — **done** |
 | 2 | Manager plumbing | Pending-context map, reward shaping, TTL sweep, per-(group, job-type) failure windows feeding `GroupSnapshot`, persistence with schema versioning — **done** |
 | 3 | Agent wiring | Group-snapshot callable, latency into `report_outcome`, multi-group attribution (`top_k > 1` fix) — **done** |
-| 4 | Evaluation | Scenarios A–C via `run_test.py` + failure simulation, plotting extensions, `lin_ts` comparison — **Scenarios A and B done** (8.1: LinUCB 73.4% vs eps-greedy 61.9%; 8.2: discount 0.98 avoids the post-flip crash, 68.0% vs 61.1%); C and plotting extensions pending |
+| 4 | Evaluation | Scenarios A–C + plotting extensions — **done** (8.1: LinUCB 73.4% vs eps 61.9%; 8.2: discount 0.98 avoids post-flip crash; 8.3: instant vs never rejoin re-adoption, plus two design gaps found; offline dump plotting in `plot_mab_results.py --dump`). `lin_ts` comparison and batch error bars remain open |
 
 Estimated footprint: ~150 lines in `bandit.py`, ~120 lines in `context.py`
 (new), ~60 lines in `mab_manager.py`, minor touches in `resource_agent.py`,
