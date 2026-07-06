@@ -541,6 +541,16 @@ class ResourceAgent(Agent):
             (info for _, info in self.delegated_jobs.items()),
         )
 
+    def _get_live_child_groups(self) -> set:
+        """Groups with at least one fresh child heartbeat in the children map
+        (stale entries are pruned by peer expiry). Used to gate delegation:
+        a dead group must not be offered to the bandit at all — idle-default
+        features plus an empty failure history make it look attractive
+        (Scenario C dog-piling). Genuinely new groups do heartbeat, so
+        cold-start optimism is preserved."""
+        return {child.group if child.group is not None else 0
+                for child in self.children.values()}
+
     @property
     def empty_timeout_seconds(self):
         return self.runtime_config.get("empty_timeout_seconds", 3)
@@ -2180,6 +2190,25 @@ class ResourceAgent(Agent):
                                 f"delegating to all active groups"
                             )
                             capable_groups = active_groups
+
+                        # Liveness gate (Scenario C fix): drop groups with no
+                        # fresh child heartbeats before the bandit sees them.
+                        # If everything looks dead, keep the ungated list so
+                        # delegation never stalls on a transient blind spot.
+                        live_groups = self._get_live_child_groups()
+                        gated = [g for g in capable_groups if g in live_groups]
+                        if gated:
+                            if len(gated) < len(capable_groups):
+                                self.logger.debug(
+                                    f"Liveness gate for job {job_id}: excluded "
+                                    f"{sorted(set(capable_groups) - set(gated))}"
+                                )
+                            capable_groups = gated
+                        else:
+                            self.logger.warning(
+                                f"Liveness gate found no live child groups for job "
+                                f"{job_id}; delegating ungated"
+                            )
 
                         # MAB-guided selection: pick top_k groups instead of all
                         if self.mab_enabled and self.mab_manager:

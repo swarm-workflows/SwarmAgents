@@ -206,9 +206,10 @@ for job-dependent routing, see Section 4.1):
 | Feature | Definition |
 |---------|------------|
 | fit_core / fit_ram / fit_gpu | job demand norm x group headroom (elementwise product) |
-| type failure rate | group `a`'s recent failure rate *for this job's type* (sliding window per (group, job type) in `MABManager`; falls back to the aggregate rate for unseen types) |
+| type failure rate | group `a`'s recent failure rate *for this job's type* (sliding window per (group, job type) in `MABManager`; falls back to the aggregate rate for unseen types). Delegation timeouts are excluded — they are liveness signals, not job-type fit |
+| timeout rate | time-decayed per-group delegation-timeout signal (`context.timeout_decay_s` e-folding, ~3 recent timeouts saturate). Fades with wall-clock time even when the arm is never tried — no refresh hysteresis after an outage (Scenario C fix) |
 
-Plus a constant bias term. `d = 17 + |job_types|` with the Phase 1 layout.
+Plus a constant bias term. `d = 18 + |job_types|` with the current layout.
 
 **Schema versioning.** The extractor exposes `schema_version` (hash of
 feature names + config). Persisted state carries the version; on mismatch at
@@ -506,23 +507,40 @@ same.
    only refresh if the arm is tried, so after burning the backlog LinUCB
    avoided the now-best group for ~50 records before uncertainty retried it.
 
-**Recommendations (future work):** gate liveness at the *feasibility*
-layer — a group with zero fresh child heartbeats should not be offered to
-the bandit at all (this also preserves cold-start optimism for genuinely
-new groups, which do heartbeat); consider a time-decayed timeout-rate
-feature immune to refresh hysteresis; count in-flight delegations from
-delegation records rather than the monitor's tracking dict.
+**Fixes — implemented (2026-07-06, post-evaluation):**
+
+1. *Liveness gating* — `scheduling_main` now intersects capable groups with
+   `_get_live_child_groups()` (groups holding at least one fresh child
+   heartbeat) before the bandit sees them; if every group looks dead the
+   ungated list is kept so delegation never stalls. Cold-start optimism for
+   genuinely new groups is preserved — they heartbeat.
+2. *Time-decayed timeout signal* — delegation timeouts no longer touch the
+   per-type failure windows at all (they are liveness, not fit); they feed
+   a per-group exponentially-decaying score (`grp_timeout_rate` feature,
+   `context.timeout_decay_s`, default 120s e-folding) that fades on its own
+   after an outage ends — no refresh hysteresis.
+3. *In-flight robustness* — `_build_snapshots` takes the max of the agent's
+   delegated-jobs count and the manager's own unresolved pending selections,
+   closing the undercount during reassignment churn.
+
+These change the feature schema (dim +1), so previously persisted LinUCB
+state is discarded on load by the schema-version check, as designed. A
+Scenario C re-run to quantify the fixes is pending.
 
 Additional operational note: `cleanup.py --cleanup-redis` does not clear
 `mab:*` keys, so persisted policy state from prior runs leaks into later
 dumps — only trust `mab:{agent_id}` for coordinators active in the
 current run.
 
-Remaining: plotting extensions are implemented (`plot_mab_results.py
+Plotting extensions are implemented (`plot_mab_results.py
 --dump/--events/--job-types` offline mode over full Redis dumps: rolling
 success + delegation-share timeline with event markers, class-x-group
-outcome heatmap, learned-theta chart); `lin_ts` comparison and batch runs
-for error bars remain open.
+outcome heatmap, learned-theta chart). `lin_ts` (Linear Thompson Sampling)
+is implemented and selectable via `mab.algorithm: lin_ts`
+(`linucb.ts_variance`, default 0.25) — it shares LinUCB's model, updates,
+persistence, and discounting, replacing the UCB width with posterior
+sampling. Remaining open: the deployment `lin_ts` head-to-head, a
+Scenario C re-run validating the 8.3 fixes, and batch runs for error bars.
 
 **Unit tests** (extend `tests/test_bandit.py`, 13 tests today):
 

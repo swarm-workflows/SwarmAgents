@@ -4,7 +4,8 @@ import random
 
 import numpy as np
 import pytest
-from swarm.rl.bandit import ArmStats, EpsilonGreedyPolicy, LinUCBPolicy, UCB1Policy
+from swarm.rl.bandit import (ArmStats, EpsilonGreedyPolicy, LinTSPolicy,
+                             LinUCBPolicy, UCB1Policy)
 from swarm.rl.context import (ContextExtractor, GroupSnapshot,
                               snapshots_from_children)
 
@@ -367,6 +368,49 @@ class TestLinUCBLearning:
         assert selections.count(99) >= 18
 
 
+class TestLinTSPolicy:
+    @staticmethod
+    def _ctx(right_arm, arms):
+        return {a: np.array([1.0 if a == right_arm else 0.0, 1.0]) for a in arms}
+
+    def test_zero_variance_is_greedy(self):
+        policy = LinTSPolicy(ts_variance=0.0, discount=1.0, dim=2)
+        for _ in range(20):
+            policy.update(1, 1.0, context=np.array([1.0, 1.0]))
+            policy.update(1, -1.0, context=np.array([0.0, 1.0]))
+        ctx = {1: np.array([1.0, 1.0]), 2: np.array([0.0, 1.0])}
+        assert all(policy.select_arm([1, 2], context=ctx) == 1 for _ in range(20))
+
+    def test_learns_context_dependent_routing(self):
+        random.seed(5)
+        np.random.seed(5)
+        policy = LinTSPolicy(ts_variance=0.25, discount=1.0)
+        arms = [1, 2]
+        correct = 0
+        for t in range(300):
+            right = 1 if t % 2 == 0 else 2
+            ctx = self._ctx(right, arms)
+            arm = policy.select_arm(arms, context=ctx)
+            policy.update(arm, 1.0 if arm == right else -1.0, context=ctx[arm])
+            if t >= 200 and arm == right:
+                correct += 1
+        assert correct >= 85
+
+    def test_state_roundtrip_includes_variance(self):
+        policy = LinTSPolicy(ts_variance=0.4)
+        policy.update(1, 1.0, context=np.array([1.0, 0.0]))
+        state = policy.get_state()
+        policy2 = LinTSPolicy()
+        policy2.load_state(state)
+        assert policy2.ts_variance == 0.4
+        assert policy2.dim == 2
+
+    def test_fallback_without_context(self):
+        policy = LinTSPolicy()
+        assert policy.select_arm([1, 2, 3]) in [1, 2, 3]
+        assert policy.A_inv is None
+
+
 class _FakeCapacities:
     def __init__(self, core=0, ram=0, disk=0, gpu=0):
         self.core, self.ram, self.disk, self.gpu = core, ram, disk, gpu
@@ -427,6 +471,14 @@ class TestContextExtractor:
         vec = extractor.build(_FakeJob(), [1])[1]
         assert extractor.feature_names[-1] == "bias"
         assert vec[-1] == 1.0
+
+    def test_timeout_rate_feature(self):
+        extractor = ContextExtractor(self.CONFIG)
+        names = extractor.feature_names
+        assert "grp_timeout_rate" in names
+        vec = extractor.build(_FakeJob(), [1],
+                              {1: GroupSnapshot(timeout_rate=0.8)})[1]
+        assert vec[names.index("grp_timeout_rate")] == pytest.approx(0.8)
 
     def test_missing_snapshot_uses_idle_defaults(self):
         extractor = ContextExtractor(self.CONFIG)

@@ -50,6 +50,11 @@ class GroupSnapshot:
     inflight: int = 0
     failure_rate: float = 0.0
     type_failure_rates: Dict[str, float] = field(default_factory=dict)
+    # Time-decayed delegation-timeout signal in [0, 1] (maintained by
+    # MABManager). Unlike the failure windows, it fades with wall-clock time
+    # even when the arm is never tried — no refresh hysteresis after an
+    # outage ends (design doc section 8.3).
+    timeout_rate: float = 0.0
 
 
 def _headroom(total: float, used: float) -> float:
@@ -135,6 +140,7 @@ class ContextExtractor:
             + [f"job_type:{t}" for t in self.job_types]
             + ["grp_children", "grp_cpu_headroom", "grp_ram_headroom",
                "grp_gpu_headroom", "grp_inflight", "grp_failure_rate",
+               "grp_timeout_rate",
                "fit_core", "fit_ram", "fit_gpu", "grp_type_failure_rate",
                "bias"]
         )
@@ -204,6 +210,7 @@ class ContextExtractor:
             self._clip01(snapshot.gpu_headroom),
             self._clip01(snapshot.inflight / self.max_inflight),
             self._clip01(snapshot.failure_rate),
+            self._clip01(snapshot.timeout_rate),
         ], dtype=float)
 
     def interaction_features(self, job, snapshot: GroupSnapshot) -> np.ndarray:

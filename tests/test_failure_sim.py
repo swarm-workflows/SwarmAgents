@@ -65,5 +65,22 @@ class TestSelectFailurePhase:
         assert (pa, pt, idx) == (self.BASE_PA, self.BASE_PT, -1)
 
 
+class TestLivenessGate:
+    def test_live_groups_from_children(self):
+        class Child:
+            def __init__(self, group):
+                self.group = group
+
+        class Stub:
+            class children:
+                @staticmethod
+                def values():
+                    return [Child(0), Child(0), Child(3), Child(None)]
+
+        live = ResourceAgent._get_live_child_groups(Stub())
+        assert live == {0, 3}  # None group folds into 0; group with no
+        # heartbeats (e.g. 1, 2, 4) is absent — gated out of delegation
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

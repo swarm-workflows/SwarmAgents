@@ -384,3 +384,46 @@ class LinUCBPolicy(BanditPolicy):
         super().reset()
         if self.dim is not None:
             self._init_model(self.dim)
+
+
+class LinTSPolicy(LinUCBPolicy):
+    """Linear Thompson Sampling over the same shared model as LinUCB.
+
+    Instead of an explicit uncertainty bonus, exploration comes from
+    posterior sampling: each selection draws theta_tilde ~ N(theta,
+    ts_variance * A^-1) and ranks arms by theta_tilde . x_a. Arms in
+    well-explored feature regions get near-deterministic scores; uncertain
+    regions get noisy draws and are therefore tried occasionally. Updates,
+    persistence, discounting, and fallbacks are inherited from LinUCB.
+    """
+
+    def __init__(self, ts_variance: float = 0.25, discount: float = 0.995,
+                 dim: Optional[int] = None, schema_version: Optional[str] = None):
+        super().__init__(alpha=0.0, discount=discount, dim=dim,
+                         schema_version=schema_version)
+        self.ts_variance = float(ts_variance)
+
+    def _scores(self, eligible_arms: List[int],
+                context: Dict[int, np.ndarray]) -> Dict[int, float]:
+        theta = self.theta
+        if self.ts_variance > 0:
+            try:
+                # A_inv is kept symmetric; jitter guards float drift at the
+                # PD boundary
+                chol = np.linalg.cholesky(
+                    self.A_inv + 1e-10 * np.eye(self.dim))
+                z = np.random.standard_normal(self.dim)
+                theta = theta + math.sqrt(self.ts_variance) * (chol @ z)
+            except np.linalg.LinAlgError:
+                logger.warning("LinTS: Cholesky failed, using mean theta")
+        return {a: float(theta @ np.asarray(context[a], dtype=float))
+                for a in eligible_arms}
+
+    def get_state(self) -> dict:
+        state = super().get_state()
+        state["ts_variance"] = self.ts_variance
+        return state
+
+    def load_state(self, state: dict):
+        super().load_state(state)
+        self.ts_variance = state.get("ts_variance", self.ts_variance)

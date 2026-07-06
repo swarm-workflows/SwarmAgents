@@ -256,6 +256,73 @@ class TestPersistence:
         assert all(a.pull_count == 0 for a in manager2.policy.arms.values())
 
 
+class TestTimeoutSignal:
+    """Scenario C fixes: timeouts feed a time-decayed score, not the
+    failure windows; in-flight counts include unresolved selections."""
+
+    def test_timeout_does_not_poison_failure_windows(self):
+        manager = make_manager(linucb_config())
+        job = _FakeJob("j1", job_type="compute")
+        manager.select_groups([1, 2], job=job)
+        manager.report_outcome(1, "j1", success=False, timed_out=True)
+
+        snaps = manager._build_snapshots([1])
+        assert snaps[1].type_failure_rates == {}   # windows untouched
+        assert snaps[1].failure_rate == 0.0
+        assert snaps[1].timeout_rate > 0.3         # timeout signal present
+
+    def test_exit_failure_still_feeds_windows(self):
+        manager = make_manager(linucb_config())
+        job = _FakeJob("j1", job_type="compute")
+        manager.select_groups([1, 2], job=job)
+        manager.report_outcome(1, "j1", success=False)  # exit failure
+        snaps = manager._build_snapshots([1])
+        assert snaps[1].type_failure_rates == {"compute": 1.0}
+        assert snaps[1].timeout_rate == 0.0
+
+    def test_timeout_signal_decays_without_trials(self):
+        config = linucb_config()
+        config["context"]["timeout_decay_s"] = 0.05
+        manager = make_manager(config)
+        manager.report_outcome(1, "j1", success=False, timed_out=True)
+        assert manager._build_snapshots([1])[1].timeout_rate > 0.2
+        time.sleep(0.25)  # ~5 e-folding times, no new outcomes
+        assert manager._build_snapshots([1])[1].timeout_rate < 0.05
+
+    def test_inflight_counts_unresolved_selections(self):
+        manager = make_manager(linucb_config())
+        for i in range(3):
+            manager.select_groups([1, 2], job=_FakeJob(f"j{i}", job_type="compute"))
+        snaps = manager._build_snapshots([1, 2])
+        assert snaps[1].inflight + snaps[2].inflight == 3
+        # resolving outcomes drains the count
+        for i in range(3):
+            for g in (1, 2):
+                manager.report_outcome(g, f"j{i}", success=True)
+        snaps = manager._build_snapshots([1, 2])
+        assert snaps[1].inflight == snaps[2].inflight == 0
+
+    def test_stats_include_timeout_rates(self):
+        manager = make_manager(linucb_config())
+        manager.report_outcome(2, "j1", success=False, timed_out=True)
+        assert manager.get_stats()["context"]["timeout_rates"][2] > 0
+
+
+class TestLinTS:
+    def test_lin_ts_policy_created(self):
+        config = linucb_config()
+        config["algorithm"] = "lin_ts"
+        config["linucb"]["ts_variance"] = 0.1
+        manager = make_manager(config)
+        from swarm.rl.bandit import LinTSPolicy
+        assert isinstance(manager.policy, LinTSPolicy)
+        assert manager.policy.ts_variance == 0.1
+        assert manager.contextual
+        selected = manager.select_groups(
+            [1, 2], job=_FakeJob("j1", job_type="compute"))
+        assert len(selected) == 1
+
+
 class TestEndToEndRouting:
     def test_manager_learns_job_type_routing(self):
         """Full manager loop: group 1 fails compute, group 2 fails transfer.

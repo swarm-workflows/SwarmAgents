@@ -30,8 +30,10 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from swarm.rl.bandit import (BanditPolicy, EpsilonGreedyPolicy, LinUCBPolicy,
-                             UCB1Policy)
+import math
+
+from swarm.rl.bandit import (BanditPolicy, EpsilonGreedyPolicy, LinTSPolicy,
+                             LinUCBPolicy, UCB1Policy)
 from swarm.rl.context import ContextExtractor, GroupSnapshot
 
 
@@ -99,11 +101,20 @@ class MABManager:
 
         # Delayed-reward replay: job_id -> {group_id: _PendingSelection}
         self._pending: Dict[str, Dict[int, _PendingSelection]] = {}
-        # Outcome sliding windows (1.0 = failure): per group and per (group, type)
+        # Outcome sliding windows (1.0 = failure): per group and per (group, type).
+        # Delegation timeouts are deliberately EXCLUDED — they are liveness
+        # signals, not job-type fit, and they poisoned the windows after a
+        # group outage (Scenario C). They feed the time-decayed score below.
         window_len = int(config.get("context", {}).get("failure_window", 20))
         self._window_len = max(window_len, 1)
         self._group_windows: Dict[int, deque] = {}
         self._type_windows: Dict[Tuple[int, str], deque] = {}
+        # Time-decayed timeout score per group: (decayed_count, last_ts).
+        # Decays with wall-clock time even when the arm is never tried, so a
+        # recovered group sheds its outage history on its own.
+        self._timeout_decay_s = float(
+            config.get("context", {}).get("timeout_decay_s", 120.0))
+        self._timeout_scores: Dict[int, Tuple[float, float]] = {}
 
         # Ensure all child groups are registered as arms
         for group_id in self.child_groups:
@@ -121,9 +132,16 @@ class MABManager:
     def _create_policy(self, config: dict) -> BanditPolicy:
         algorithm = config.get("algorithm", "epsilon_greedy")
         step_size = config.get("step_size", None)
-        if algorithm == "linucb":
+        if algorithm in ("linucb", "lin_ts"):
             self.extractor = ContextExtractor(config.get("context", {}))
             linucb_cfg = config.get("linucb", {})
+            if algorithm == "lin_ts":
+                return LinTSPolicy(
+                    ts_variance=linucb_cfg.get("ts_variance", 0.25),
+                    discount=linucb_cfg.get("discount", 0.995),
+                    dim=self.extractor.dim,
+                    schema_version=self.extractor.schema_version,
+                )
             return LinUCBPolicy(
                 alpha=linucb_cfg.get("alpha", 1.0),
                 discount=linucb_cfg.get("discount", 0.995),
@@ -153,8 +171,29 @@ class MABManager:
             return 0.0
         return sum(window) / len(window)
 
+    def _timeout_rate(self, group_id: int, now: float) -> float:
+        """Time-decayed timeout signal in [0, 1]; fades without new trials."""
+        entry = self._timeout_scores.get(group_id)
+        if entry is None:
+            return 0.0
+        score, ts = entry
+        decayed = score * math.exp(-(now - ts) / self._timeout_decay_s)
+        return min(1.0, decayed / 3.0)  # ~3 recent timeouts saturate the signal
+
+    def _record_timeout(self, group_id: int, now: float):
+        score, ts = self._timeout_scores.get(group_id, (0.0, now))
+        decayed = score * math.exp(-(now - ts) / self._timeout_decay_s)
+        self._timeout_scores[group_id] = (decayed + 1.0, now)
+
+    def _pending_inflight(self) -> Dict[int, int]:
+        counts: Dict[int, int] = {}
+        for entries in self._pending.values():
+            for g in entries:
+                counts[g] = counts.get(g, 0) + 1
+        return counts
+
     def _build_snapshots(self, group_ids: List[int]) -> Dict[int, GroupSnapshot]:
-        """Provider load data merged with manager-owned failure windows."""
+        """Provider load data merged with manager-owned outcome signals."""
         base: Dict[int, GroupSnapshot] = {}
         if self._snapshot_provider is not None:
             try:
@@ -162,16 +201,24 @@ class MABManager:
             except Exception as e:
                 self.logger.warning(f"Group snapshot provider failed: {e}")
 
+        now = time.time()
+        # The agent's delegated-jobs dict undercounts during reassignment
+        # churn (timeout handling removes entries) — take the max with the
+        # bandit's own unresolved selections (Scenario C fix).
+        pending = self._pending_inflight()
         default = GroupSnapshot()
         snapshots = {}
         for g in group_ids:
+            snap = base.get(g, default)
             snapshots[g] = replace(
-                base.get(g, default),
+                snap,
+                inflight=max(snap.inflight, pending.get(g, 0)),
                 failure_rate=self._window_rate(self._group_windows.get(g)),
                 type_failure_rates={
                     t: self._window_rate(w)
                     for (gg, t), w in self._type_windows.items() if gg == g
                 },
+                timeout_rate=self._timeout_rate(g, now),
             )
         return snapshots
 
@@ -270,14 +317,20 @@ class MABManager:
                                context=entry.context if entry else None)
 
             if self.contextual:
-                outcome = 0.0 if success else 1.0
-                self._group_windows.setdefault(
-                    group_id, deque(maxlen=self._window_len)).append(outcome)
-                job_type = entry.job_type if entry else None
-                if job_type is not None:
-                    self._type_windows.setdefault(
-                        (group_id, job_type),
-                        deque(maxlen=self._window_len)).append(outcome)
+                if timed_out and not success:
+                    # Liveness signal, not job-type fit: feed the time-decayed
+                    # timeout score and keep the failure windows clean
+                    # (Scenario C poisoned-window fix).
+                    self._record_timeout(group_id, time.time())
+                else:
+                    outcome = 0.0 if success else 1.0
+                    self._group_windows.setdefault(
+                        group_id, deque(maxlen=self._window_len)).append(outcome)
+                    job_type = entry.job_type if entry else None
+                    if job_type is not None:
+                        self._type_windows.setdefault(
+                            (group_id, job_type),
+                            deque(maxlen=self._window_len)).append(outcome)
 
                 if success and self._reward_non_winner is not None:
                     for g, e in siblings.items():
@@ -359,6 +412,10 @@ class MABManager:
                     "type_failure_rates": {
                         f"{g}:{t}": self._window_rate(w)
                         for (g, t), w in self._type_windows.items()
+                    },
+                    "timeout_rates": {
+                        g: self._timeout_rate(g, time.time())
+                        for g in self._timeout_scores
                     },
                 }
             return stats

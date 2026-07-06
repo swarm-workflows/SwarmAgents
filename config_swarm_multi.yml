@@ -157,16 +157,18 @@ mab:
   exploration_weight: 1.41         # UCB1 exploration weight (ucb1 only)
   top_k: 1                         # Number of child groups to delegate to per job
   step_size: null                  # Optional recency-weighted Q for epsilon_greedy/ucb1 (null = lifetime average)
-  linucb:                          # Contextual bandit settings (algorithm: "linucb")
-    alpha: 1.0                     # Exploration width (UCB bonus multiplier)
+  linucb:                          # Contextual bandit settings (algorithm: "linucb" or "lin_ts")
+    alpha: 1.0                     # Exploration width (UCB bonus multiplier; linucb only)
     discount: 0.995                # Forgetting factor gamma; 1.0 = standard LinUCB
-  context:                         # Feature extraction (linucb only) — changing these changes the schema version and resets persisted model state
+    ts_variance: 0.25              # Posterior-sampling variance (lin_ts only)
+  context:                         # Feature extraction (linucb/lin_ts) — changing these changes the schema version and resets persisted model state
     job_types: []                  # One-hot vocabulary, e.g. ["compute", "transfer"]
     max_group_size: 10             # Normalization caps
     max_inflight: 32
     max_dtns: 4
     long_job_threshold: 20.0
-    failure_window: 20             # Sliding-window length for per-group/per-type failure rates
+    failure_window: 20             # Sliding-window length for per-group/per-type failure rates (timeouts excluded)
+    timeout_decay_s: 120.0         # e-folding time of the per-group timeout signal (fades without new trials)
     max_caps:
       core: 16
       ram: 64                      # G, matching Capacities units
