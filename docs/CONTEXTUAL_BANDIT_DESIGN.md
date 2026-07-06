@@ -6,7 +6,9 @@ delegations via `snapshots_from_children`), passes completion latency and
 timeout detail into `report_outcome`, and credits the group where
 completion was observed — `top_k > 1` attribution works and
 `job_delegation_map` was removed (superseded by the manager's pending
-map). Phase 4 (at-scale evaluation, Scenarios A–C) pending.
+map). Phase 4: Scenario A executed on the swarm deployment — LinUCB beats
+epsilon-greedy 73.4% vs 61.9% job success with 69% vs 50% (coin-flip)
+routing accuracy; see section 8.1. Scenarios B–C pending.
 **Builds on:** `docs/MAB_README.md` (existing Epsilon-Greedy / UCB1 layer)
 **Target modules:** `swarm/rl/bandit.py`, `swarm/rl/mab_manager.py`, `swarm/rl/context.py` (new), `swarm/agents/resource_agent.py`
 
@@ -399,6 +401,44 @@ learned-θ inspection (feature weights) for interpretability. Raw data flows
 through the existing `metrics.json` export (`mab_stats`, `mab_selections`,
 `mab_rewards`).
 
+### 8.1 Scenario A Results (2026-07-04, swarm deployment)
+
+Executed on the FABRIC swarm deployment: 30 agents (25 leaves in 5 groups +
+5 coordinators), `--co-parents 5` so coordinator 26 is elected active leader
+for all 5 groups (5 bandit arms; lowest-ID-alive election makes co-parenting
+failover, not load-sharing — with `--co-parents 2` most coordinators lead a
+single group and the bandit is bypassed via the `top_k >= len` shortcut).
+Workload: 231 Pegasus jobs (`pegasus-data/all_profiles_nodtn.txt` — data
+nodes stripped; every DTN job referenced the same `local` site, which
+constrained group capability without carrying routing signal). Failure
+profiles: groups 0/2/4 fail ram_bound jobs at 0.8, groups 1/3 fail
+cpu_bound at 0.8, 0.05 otherwise; workload splits 116 ram / 115 cpu.
+Jobs paced at 1/s so delayed rewards train the model online. Tooling in
+`evaluation/scenario_a/`.
+
+| Metric (L0 job records) | LinUCB | Epsilon-Greedy |
+|---|---|---|
+| Job success rate | **73.4%** (234/319) | 61.9% (156/252) |
+| Routing accuracy (job type -> non-failing parity) | **69.0%** | 50.0% |
+| Routing accuracy, 2nd half | **70.6%** (rising) | 46.0% (flat) |
+| Routing by quarter | 47 -> 87 -> 67 -> 74% | 62 -> 46 -> 49 -> 43% |
+
+Epsilon-greedy sits at exactly coin-flip routing, as predicted — a
+context-blind bandit cannot condition on job type, and its per-arm averages
+locked onto cpu-success-heavy arms, dragging ram jobs into ram-failing
+groups (95 of 127 ram jobs misrouted). LinUCB's learning transition is
+visible between the first and second quarter (47% -> 87%), and the learned
+weights are interpretable: `grp_type_failure_rate` -0.263 (the designed
+avoid-groups-that-fail-this-type mechanism) and `grp_inflight` -0.488
+(load balancing emerged as secondary behavior).
+
+Operational notes for reruns: (1) enable `mab.persist_to_redis` — agents
+are SIGKILLed at run end, so end-of-run `save_results()` metrics are lost;
+the 10s persistence interval preserves near-final policy state under
+`mab:{agent_id}`. (2) Snapshot Redis (`extract_scenario_a.py`) before the
+next run's cleanup flushes it. (3) Scenarios B (non-stationarity flip) and
+C (dynamic agent addition) remain to be run.
+
 **Unit tests** (extend `tests/test_bandit.py`, 13 tests today):
 
 - Synthetic linear environment: reward `= wᵀx + noise`; assert LinUCB regret
@@ -419,7 +459,7 @@ through the existing `metrics.json` export (`mab_stats`, `mab_selections`,
 | 1 | Policy + context core | `LinUCBPolicy`, `ContextExtractor`, interface extension, unit tests — **done** |
 | 2 | Manager plumbing | Pending-context map, reward shaping, TTL sweep, per-(group, job-type) failure windows feeding `GroupSnapshot`, persistence with schema versioning — **done** |
 | 3 | Agent wiring | Group-snapshot callable, latency into `report_outcome`, multi-group attribution (`top_k > 1` fix) — **done** |
-| 4 | Evaluation | Scenarios A–C via `run_test.py` + failure simulation, plotting extensions, `lin_ts` comparison |
+| 4 | Evaluation | Scenarios A–C via `run_test.py` + failure simulation, plotting extensions, `lin_ts` comparison — **Scenario A done** (section 8.1: LinUCB 73.4% vs eps-greedy 61.9% success; 69% vs 50% routing); B/C and plotting extensions pending |
 
 Estimated footprint: ~150 lines in `bandit.py`, ~120 lines in `context.py`
 (new), ~60 lines in `mab_manager.py`, minor touches in `resource_agent.py`,
