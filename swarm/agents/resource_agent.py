@@ -417,6 +417,15 @@ class ResourceAgent(Agent):
         self.failure_sim_base_prob = fail_sim_cfg.get("failure_probability", 0.1)
         self.failure_sim_per_agent = fail_sim_cfg.get("per_agent_failure_rates", {})
         self.failure_sim_per_job_type = fail_sim_cfg.get("per_job_type_failure_rates", {})
+        # Time-phased profiles for non-stationarity experiments (Scenario B):
+        # each {after_s, per_agent_failure_rates, per_job_type_failure_rates}
+        # replaces the active rates once `after_s` seconds have elapsed since
+        # agent start; the last matching phase wins.
+        self.failure_sim_phases = sorted(
+            fail_sim_cfg.get("phases", []) or [],
+            key=lambda p: float(p.get("after_s", 0)))
+        self.failure_sim_start = time.time()
+        self._failure_sim_phase_logged = -1
 
         # Max retries before retiring an infeasible job (0 = infinite retries)
         self.max_infeasible_retries = self.runtime_config.get("max_infeasible_retries", 10)
@@ -2301,13 +2310,35 @@ class ResourceAgent(Agent):
 
     def _get_failure_rate(self, job: Job) -> float:
         """Determine failure probability for a job: per-agent > per-job-type > base."""
+        elapsed = time.time() - self.failure_sim_start
+        per_agent, per_job_type, phase_idx = self._select_failure_phase(
+            elapsed, self.failure_sim_phases,
+            self.failure_sim_per_agent, self.failure_sim_per_job_type)
+        if phase_idx != self._failure_sim_phase_logged:
+            self._failure_sim_phase_logged = phase_idx
+            self.logger.info(
+                f"[FAILURE_SIM] phase {phase_idx} active (elapsed {elapsed:.0f}s)")
         return self._resolve_failure_rate(
             agent_key=str(self.agent_id),
             job_type=getattr(job, 'job_type', None),
-            per_agent=self.failure_sim_per_agent,
-            per_job_type=self.failure_sim_per_job_type,
+            per_agent=per_agent,
+            per_job_type=per_job_type,
             base=self.failure_sim_base_prob,
         )
+
+    @staticmethod
+    def _select_failure_phase(elapsed: float, phases: list,
+                              per_agent: dict, per_job_type: dict):
+        """Pick the active failure profile: the last phase whose after_s has
+        elapsed replaces the base rates. Returns (per_agent, per_job_type,
+        phase_index) with phase_index -1 for the base profile."""
+        active = -1
+        for i, phase in enumerate(phases):
+            if elapsed >= float(phase.get("after_s", 0)):
+                per_agent = phase.get("per_agent_failure_rates", per_agent)
+                per_job_type = phase.get("per_job_type_failure_rates", per_job_type)
+                active = i
+        return per_agent, per_job_type, active
 
     @staticmethod
     def _resolve_failure_rate(agent_key: str, job_type: Optional[str],
