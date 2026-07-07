@@ -524,8 +524,23 @@ same.
    closing the undercount during reassignment churn.
 
 These change the feature schema (dim +1), so previously persisted LinUCB
-state is discarded on load by the schema-version check, as designed. A
-Scenario C re-run to quantify the fixes is pending.
+state is discarded on load by the schema-version check, as designed.
+
+**Validation re-run (2026-07-06, `ctx-C2-linucb-1`, same protocol):**
+
+| Metric | pre-fix | with fixes |
+|---|---|---|
+| Group-4 share during outage (dog-piling) | 53.8% | **1.4%** |
+| Post-rejoin share by quarter | 62 → 15 → **0** → 15% (collapse) | 18 → 21 → **39** → 29% (sustained) |
+| Post-rejoin success by quarter | 92 → 62 → 77 → 81% | 70 → 73 → 88 → 74% |
+
+The timeline plot shows group 4's delegation share flat at zero through the
+entire outage (the liveness gate removes it within one heartbeat-expiry
+window of the kill) and a steady climb after rejoin with no avoidance
+phase. Note the pre-fix run's high pre-join success (81%) was the backlog
+artifact — jobs piled onto the dead group completing after restart under
+pre-join timestamps; the fixed run's 69% is the honest outage-period
+number for live groups at 0.30 failure.
 
 Additional operational note: `cleanup.py --cleanup-redis` does not clear
 `mab:*` keys, so persisted policy state from prior runs leaks into later
@@ -539,8 +554,21 @@ outcome heatmap, learned-theta chart). `lin_ts` (Linear Thompson Sampling)
 is implemented and selectable via `mab.algorithm: lin_ts`
 (`linucb.ts_variance`, default 0.25) — it shares LinUCB's model, updates,
 persistence, and discounting, replacing the UCB width with posterior
-sampling. Remaining open: the deployment `lin_ts` head-to-head, a
-Scenario C re-run validating the 8.3 fixes, and batch runs for error bars.
+sampling.
+
+**`lin_ts` deployment head-to-head (2026-07-06, `ctx-A-lints-2`, Scenario A
+protocol):** 65.6% success / 52.3% routing — between epsilon-greedy
+(61.9% / 50%) and LinUCB (73.4% / 69%). Routing rises monotonically by
+quarter (45 → 52 → 53 → 59%), so the model learns, but posterior sampling
+at the default variance over-explores within the ~230-decision horizon
+where LinUCB's deterministic optimism has already committed. Lowering
+`ts_variance` should close the gap; untuned single run. Caveats: ran on
+substitute hosts (agents 31–40 standing in for the powered-down MAX site
+hosts 11–20 — agent IDs and failure profiles unchanged, physical placement
+different), and on the post-fix dim-30 schema vs LinUCB's dim-29 run.
+
+Remaining open: `ts_variance` tuning, and batch runs for error bars
+(all deployment results are n=1 per configuration).
 
 **Unit tests** (extend `tests/test_bandit.py`, 13 tests today):
 
