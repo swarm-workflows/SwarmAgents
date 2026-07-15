@@ -12,4 +12,3 @@ grpcio-health-checking
 pydantic
 pydantic_ai
 psutil
-google-genai
