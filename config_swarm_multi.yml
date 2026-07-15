@@ -144,12 +144,38 @@ job_selection:
     ram: 0.3       # Relative importance of RAM utilization in job cost (0–1)
     disk: 0.2      # Relative importance of Disk utilization in job cost (0–1)
     gpu: 0.1       # Relative importance of GPU utilization in job cost (0–1)
+    qpu: 0.0       # Relative importance of QPU (qubit) utilization (0–1); set >0 when quantum backends are deployed
+                   # (weights are re-normalized per job type, so enabling qpu does not require re-tuning the others)
 
   long_job_threshold: 20.0            # Execution time (in seconds) beyond which jobs incur extra penalty
   connectivity_penalty_factor: 1.0    # Multiplier for DTN connectivity penalty (0=no effect, >1 increases penalty severity)
+  quantum_penalty_factor: 1.0         # Multiplier for quantum backend quality penalty (error rate + calibration downtime)
   selection_threshold_pct: 10.0       # % above min cost allowed in candidate selection (lower = stricter, higher = more agents considered)
+
+# Quantum runtime (Phase 2: data-triggered split hybrid scheduling).
+# Applies to all agents; inert unless split hybrid jobs / post-processing
+# jobs exist in the pool. See docs/QUANTUM_HYBRID_DESIGN.md.
+quantum:
+  comm_penalty_factor: 1.0    # Cross-site penalty for stream consumers (0 = ignore locality)
+  consumer_timeout_s: 60.0    # Consumer fails if the measurement stream stalls this long
+  predicate_cache_s: 1.0      # Snapshot-count cache TTL for data-predicate gating
+  measurement_ttl_s: 3600     # Redis TTL for measurement streams
+
+# Quantum backend owned by this agent (omit for classical-only agents).
+# Qubit count is mirrored into capacities.qubits for allocation arithmetic;
+# quality attributes are used for feasibility (arch/fidelity/gate set) and
+# cost penalties (error rate, calibration downtime). See docs/QUANTUM_HYBRID_DESIGN.md.
+#quantum_backend:
+#  name: aer-sim-64
+#  arch: superconducting        # superconducting | ion-trap | neutral-atom | photonic
+#  qubits: 64
+#  clops: 100000                # circuit layer operations per second
+#  gate_fidelity: 0.999
+#  error_rate: 0.001
+#  calibration_downtime_pct: 0.0
+#  simulator: true
 mab:
-  enabled: true                    # Enable Multi-Armed Bandit for hierarchical delegation
+  enabled: false                   # Enable Multi-Armed Bandit for hierarchical delegation
   algorithm: "epsilon_greedy"      # "epsilon_greedy" or "ucb1"
   epsilon: 0.1                     # Initial exploration rate (epsilon_greedy only)
   epsilon_decay: 0.995             # Epsilon decay per update (epsilon_greedy only)
@@ -182,7 +208,7 @@ mab:
   persist_to_redis: false          # Persist bandit state to Redis
   persist_interval_s: 30.0         # Seconds between Redis persistence writes
   failure_simulation:
-    enabled: true                  # Enable simulated job failures for testing
+    enabled: false                 # Enable simulated job failures for testing
     failure_probability: 0.5       # Base failure probability (0.0–1.0)
     per_agent_failure_rates: {}    # Per-agent overrides, e.g. {3: 0.5}
     per_job_type_failure_rates: {} # Per-job-type overrides, e.g. {"compute": 0.2}

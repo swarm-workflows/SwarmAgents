@@ -25,6 +25,7 @@
 from swarm.models.capacities import Capacities
 from swarm.models.data_node import DataNode
 from swarm.models.json_field import JSONField
+from swarm.models.quantum import QuantumBackend
 
 
 class AgentInfo(JSONField):
@@ -44,6 +45,7 @@ class AgentInfo(JSONField):
         self.last_updated = 0.0
         self._version = 0  # Incremented when agent state changes (e.g., failure detection) to invalidate caches
         self._dtns = {}
+        self._quantum_backend = None  # QuantumBackend when the agent owns a QPU/simulator
         self._group = None
         self._level = None
         self.site = None  # Locality/site label for topology-aware Snow sampling (may be None)
@@ -114,6 +116,19 @@ class AgentInfo(JSONField):
             raise ValueError("Unsupported value type for dtns")
 
     @property
+    def quantum_backend(self) -> QuantumBackend:
+        return self._quantum_backend
+
+    @quantum_backend.setter
+    def quantum_backend(self, value):
+        if value is None or isinstance(value, QuantumBackend):
+            self._quantum_backend = value
+        elif isinstance(value, dict):
+            self._quantum_backend = QuantumBackend.from_dict(value)
+        else:
+            raise ValueError("Unsupported value type for quantum_backend")
+
+    @property
     def capacities(self) -> Capacities:
         return self._capacities
 
@@ -181,6 +196,8 @@ class AgentInfo(JSONField):
             result += f" capacity_allocations: {self.capacity_allocations}"
         if self.max_child_capacity:
             result += f" max_child_capacity: {self.max_child_capacity}"
+        if self.quantum_backend:
+            result += f" quantum_backend: {self.quantum_backend}"
         return result
 
 

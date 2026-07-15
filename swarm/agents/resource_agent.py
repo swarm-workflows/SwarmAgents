@@ -60,6 +60,9 @@ from swarm.models.capacities import Capacities
 from swarm.models.agent_info import AgentInfo
 from swarm.consensus.messages.proposal_info import ProposalInfo
 from swarm.models.job import Job, ObjectState
+from swarm.models.quantum import QuantumBackend
+from swarm.quantum.measurement_layer import MeasurementLayer
+from swarm.quantum.split import build_post_process_job, experiment_id_for, split_comm_penalty
 from swarm.rl.context import snapshots_from_children
 from swarm.rl.mab_manager import MABManager
 
@@ -340,6 +343,27 @@ class ResourceAgent(Agent):
         self.site = self.config.get("site")
 
         self._capacities = Capacities().from_dict(self.config.get("capacities", {}))
+
+        # Quantum backend owned by this agent (None for classical-only agents).
+        # Qubit count is mirrored into capacities so the standard feasibility,
+        # allocation, and load arithmetic covers the additive quantum resource.
+        self.quantum_backend = QuantumBackend.from_dict(self.config.get("quantum_backend") or {})
+        if self.quantum_backend and not self._capacities.qubits:
+            self._capacities.qubits = self.quantum_backend.qubits
+
+        # Quantum measurement data layer (Phase 2): Redis streams of snapshot
+        # batches; gates data-triggered jobs and feeds split hybrid execution
+        quantum_cfg = self.config.get("quantum", {})
+        self.measurement_layer = MeasurementLayer(
+            redis_client=self.repository.redis,
+            ttl_s=int(quantum_cfg.get("measurement_ttl_s", 3600)),
+            predicate_cache_s=float(quantum_cfg.get("predicate_cache_s", 1.0)),
+        )
+        # Multiplier for the cross-site penalty applied to stream consumers
+        self.split_comm_penalty_factor = float(quantum_cfg.get("comm_penalty_factor", 1.0))
+        # Stream-stall timeout for consumer sub-jobs (producer death -> failure path)
+        self.consumer_timeout_s = float(quantum_cfg.get("consumer_timeout_s", 60.0))
+
         self._load = 0
         self.metrics = Metrics()
         self.completed_lock = threading.RLock()
@@ -364,10 +388,15 @@ class ResourceAgent(Agent):
         self.disk_weight = weights_cfg.get("disk", 0.2)
         # Relative importance of GPU utilization in job cost (0–1)
         self.gpu_weight = weights_cfg.get("gpu", 0.1)
+        # Relative importance of QPU (qubit) utilization in job cost (0–1);
+        # 0.0 keeps classical-only deployments byte-identical to previous behavior
+        self.qpu_weight = weights_cfg.get("qpu", 0.0)
         # Execution time (in seconds) beyond which jobs incur extra penalty
         self.long_job_threshold = job_cfg.get("long_job_threshold", 20.0)
         # Multiplier for DTN connectivity penalty (0=no effect, >1 increases penalty severity)
         self.connectivity_penalty_factor = job_cfg.get("connectivity_penalty_factor", 1.0)
+        # Multiplier for quantum backend quality penalty (error rate + calibration downtime)
+        self.quantum_penalty_factor = job_cfg.get("quantum_penalty_factor", 1.0)
         # % above min cost allowed in candidate selection (lower = stricter, higher = more agents considered)
         self.selection_threshold_pct = job_cfg.get("selection_threshold_pct", 10.0)
 
@@ -582,6 +611,35 @@ class ResourceAgent(Agent):
             )
             return False
         return True
+
+    def _data_predicate_ready(self, job: Job) -> bool:
+        """
+        True when the job's data predicate is satisfied (or absent). Gated
+        jobs are not proposed for selection — computation is steered by the
+        availability of quantum measurement data.
+        """
+        pred = job.data_predicate
+        if not pred:
+            return True
+        try:
+            return self.measurement_layer.predicate_satisfied(
+                pred.get("experiment_id", ""), int(pred.get("min_snapshots", 1)))
+        except Exception as e:
+            self.logger.debug(f"predicate check failed for {job.job_id}: {e}")
+            return False
+
+    @staticmethod
+    def _quantum_feasible(job: Job, backend: Optional[QuantumBackend]) -> bool:
+        """
+        Returns True if the job's quantum component (if any) can run on the
+        given backend. Classical jobs are always quantum-feasible; quantum and
+        hybrid jobs require a backend that satisfies the spec (qubits, CLOPS,
+        architecture, fidelity, gate set).
+        """
+        spec = job.quantum
+        if spec is None:
+            return True
+        return backend is not None and backend.supports(spec)
 
     @staticmethod
     def resource_usage_score(allocated: Capacities, total: Capacities):
@@ -1276,6 +1334,7 @@ class ResourceAgent(Agent):
                 proposed_load=proposed_load,
                 last_updated=current_time,
                 dtns=self.config.get("dtns"),
+                quantum_backend=self.quantum_backend,
                 group=self.topology.group,
                 level=self.topology.level,
                 site=self.site
@@ -1290,6 +1349,10 @@ class ResourceAgent(Agent):
             # Track: {dtn_name: {'scores': [list of scores], 'info': DataNode}}
             dtn_aggregation = {}
 
+            # Best (max-qubit) quantum backend across children — an optimistic
+            # aggregate with the same limitation as max_child_capacity
+            best_backend = None
+
             active_groups = set(self._get_active_child_groups())
 
             for child in self.children.values():
@@ -1302,10 +1365,14 @@ class ResourceAgent(Agent):
                 if max_child_capacity is None:
                     max_child_capacity = Capacities(**child.capacities.to_dict())
                 else:
-                    for field in ['cpu', 'core', 'gpu', 'ram', 'disk', 'bw', 'burst_size', 'unit', 'mtu']:
+                    for field in ['cpu', 'core', 'gpu', 'ram', 'disk', 'bw', 'burst_size', 'unit', 'mtu', 'qubits']:
                         current_max = getattr(max_child_capacity, field)
                         child_value = getattr(child.capacities, field)
                         setattr(max_child_capacity, field, max(current_max, child_value))
+
+                if child.quantum_backend is not None:
+                    if best_backend is None or child.quantum_backend.qubits > best_backend.qubits:
+                        best_backend = child.quantum_backend
 
                 if child.dtns:
                     for dtn_name, dtn_obj in child.dtns.items():
@@ -1342,6 +1409,7 @@ class ResourceAgent(Agent):
                 load=self._load,
                 last_updated=current_time,
                 dtns=dtns,
+                quantum_backend=best_backend,
                 proposed_load=proposed_load,
                 group=self.topology.group,
                 level=self.topology.level,
@@ -1541,6 +1609,10 @@ class ResourceAgent(Agent):
                 if not self._has_sufficient_capacity(job, child_info.capacities):
                     continue  # Skip this child, try next
 
+                # Quantum component requires a child backend meeting the spec
+                if not self._quantum_feasible(job, child_info.quantum_backend):
+                    continue  # Skip this child, try next
+
                 # Check child DTN connectivity only if job requires DTNs
                 # Jobs without DTN requirements (empty _required_dtns_cache) skip this check
                 if job._required_dtns_cache:
@@ -1604,6 +1676,15 @@ class ResourceAgent(Agent):
             self.logger.debug(f"Agent: {self.agent_id} does not have capacity for Job {job.job_id}")
             return False
 
+        # Quantum component: agent (or, for parents, its best child backend)
+        # must meet the spec's qubit/CLOPS/arch/fidelity/gate-set requirements
+        if not self._quantum_feasible(job, agent.quantum_backend):
+            self.logger.debug(
+                f"[QPU] Agent {agent.agent_id} backend {agent.quantum_backend} "
+                f"cannot run quantum spec of Job {job.job_id}"
+            )
+            return False
+
         # DTN connectivity check using aggregated DTN info from peer's children
         # NOTE: This checks if the peer has ANY children with required DTNs,
         # not whether a SINGLE child has all required DTNs (see limitation above)
@@ -1647,15 +1728,32 @@ class ResourceAgent(Agent):
             rout = {e.name for e in (job.data_out or [])}
             job._required_dtns_cache = frozenset((rin | rout) - {"local"})
         caps = job.capacities
+        spec = job.quantum
+        quantum_sig = None
+        if spec is not None:
+            quantum_sig = (
+                spec.qubits, spec.circuit_depth, spec.required_shots(),
+                spec.iterations, spec.hybrid, spec.arch,
+                round(spec.fidelity, 4), spec.clops,
+            )
+        pred = job.data_predicate
+        pred_sig = None
+        if pred:
+            pred_sig = (pred.get("experiment_id"), int(pred.get("min_snapshots", 1)),
+                        int(pred.get("total_snapshots", 1)))
         return (
             job.job_id,
             round(caps.core, 3),
             round(caps.ram, 3),
             round(caps.disk, 3),
             round(getattr(caps, "gpu", 0.0), 3),
+            round(getattr(caps, "qubits", 0.0), 3),
             round(job.wall_time or 0.0, 3),
             job.job_type or "",
             job._required_dtns_cache,
+            quantum_sig,
+            job.sub_role,
+            pred_sig,
             #job.state.value,  # flips when PENDING→READY/COMPLETE, invalidates cache automatically
         )
 
@@ -1672,18 +1770,29 @@ class ResourceAgent(Agent):
                 return (name, round(float(score), 3))
             dtn_pairs = tuple(sorted(_pair(x) for x in (agent.dtns or [])))
 
+        backend = agent.quantum_backend
+        backend_sig = None
+        if backend is not None:
+            backend_sig = (
+                backend.name, backend.arch, backend.qubits, backend.clops,
+                round(backend.gate_fidelity, 4), round(backend.error_rate, 4),
+                round(backend.calibration_downtime_pct, 3),
+            )
         return (
             agent.agent_id, agent.version,
-            caps.core, caps.ram, caps.disk, caps.gpu,
+            caps.core, caps.ram, caps.disk, caps.gpu, getattr(caps, "qubits", 0),
             #round(caps.core, 3), round(caps.ram, 3), round(caps.disk, 3), round(getattr(caps, "gpu", 0.0), 3),
             dtn_pairs,
+            backend_sig,
         )
 
     def compute_job_cost(
             self,  # now uses self so it can read config defaults
             job: Job,
             total: Capacities,
-            dtns: dict[str, DataNode]
+            dtns: dict[str, DataNode],
+            backend: Optional[QuantumBackend] = None,
+            site: Optional[str] = None
     ) -> float:
         """
         Compute the cost of executing a job on an agent based on weighted resource usage,
@@ -1693,6 +1802,8 @@ class ResourceAgent(Agent):
           - High single-resource utilization (bottleneck penalty)
           - Long execution times beyond a configurable threshold
           - Poor connectivity to DTNs required by the job
+          - Quantum backend quality (error rate + calibration downtime) and
+            estimated quantum execution time, for jobs with a quantum component
 
         :param job: The job whose cost is to be computed.
         :type job: Job
@@ -1700,6 +1811,8 @@ class ResourceAgent(Agent):
         :type total: Capacities
         :param dtns: DTN info for the agent
         :type dtns: dict[str, DataNode]
+        :param backend: Quantum backend of the agent (None for classical agents)
+        :type backend: Optional[QuantumBackend]
         :return: Calculated job cost (higher is more expensive).
         :rtype: float
         """
@@ -1709,6 +1822,7 @@ class ResourceAgent(Agent):
         ram_weight = self.ram_weight
         disk_weight = self.disk_weight
         gpu_weight = self.gpu_weight
+        qpu_weight = self.qpu_weight
         long_job_threshold = self.long_job_threshold
         connectivity_penalty_factor = self.connectivity_penalty_factor
 
@@ -1740,13 +1854,21 @@ class ResourceAgent(Agent):
                 cpu_weight *= 0.7
                 ram_weight *= 0.7
                 disk_weight *= 0.7
+            elif "quantum" in jt or "hybrid" in jt:
+                # QPU is the scarce resource for quantum/hybrid jobs
+                qpu_weight = max(qpu_weight, 0.1) * 1.5
+                cpu_weight *= 0.7
+                ram_weight *= 0.7
+                disk_weight *= 0.7
+                gpu_weight *= 0.7
 
             # Normalize weights to sum to ~1
-            total_w = cpu_weight + ram_weight + disk_weight + gpu_weight
+            total_w = cpu_weight + ram_weight + disk_weight + gpu_weight + qpu_weight
             cpu_weight /= total_w
             ram_weight /= total_w
             disk_weight /= total_w
             gpu_weight /= total_w
+            qpu_weight /= total_w
 
             # Execution time sensitivity
             if "long" in jt:
@@ -1764,28 +1886,40 @@ class ResourceAgent(Agent):
         total_gpu = getattr(total, "gpu", 0) or 1
         job_gpu = getattr(job.capacities, "gpu", 0)
 
+        # Prevent division by zero for QPUs (qubits)
+        total_qubits = getattr(total, "qubits", 0) or 1
+        job_qubits = getattr(job.capacities, "qubits", 0)
+
         # Resource usage ratios
         core_ratio = job.capacities.core / total.core
         ram_ratio = job.capacities.ram / total.ram
         disk_ratio = job.capacities.disk / total.disk
         gpu_ratio = job_gpu / total_gpu
+        qpu_ratio = job_qubits / total_qubits
 
         # Weighted base score
         base_score = (
                 cpu_weight * core_ratio +
                 ram_weight * ram_ratio +
                 disk_weight * disk_ratio +
-                gpu_weight * gpu_ratio
+                gpu_weight * gpu_ratio +
+                qpu_weight * qpu_ratio
         )
 
         # Bottleneck penalty
-        bottleneck_penalty = max(core_ratio, ram_ratio, disk_ratio, gpu_ratio) ** 2
+        bottleneck_penalty = max(core_ratio, ram_ratio, disk_ratio, gpu_ratio, qpu_ratio) ** 2
+
+        # Effective runtime includes the quantum component estimated from the
+        # backend's CLOPS: iterations * shots * depth / CLOPS
+        effective_wall_time = job.wall_time or 0.0
+        if job.quantum is not None and backend is not None:
+            effective_wall_time += job.quantum.estimated_quantum_time(backend.clops)
 
         # Execution time penalty
-        if job.wall_time > long_job_threshold:
-            time_penalty = 1.5 + (job.wall_time - long_job_threshold) / long_job_threshold
+        if effective_wall_time > long_job_threshold:
+            time_penalty = 1.5 + (effective_wall_time - long_job_threshold) / long_job_threshold
         else:
-            time_penalty = 1 + (job.wall_time / long_job_threshold) ** 2
+            time_penalty = 1 + (effective_wall_time / long_job_threshold) ** 2
 
         # DTN connectivity penalty
         avg_conn = 1.0
@@ -1800,8 +1934,28 @@ class ResourceAgent(Agent):
 
         connectivity_penalty = 1 + connectivity_penalty_factor * (1 - avg_conn)
 
+        # Quantum backend quality penalty: noisier or calibration-heavy backends
+        # cost more for jobs with a quantum component (re-execution/wait risk)
+        quantum_penalty = 1.0
+        if job.quantum is not None and backend is not None:
+            quantum_penalty = 1 + self.quantum_penalty_factor * backend.quality_penalty_factor()
+
+        # Split-hybrid communication penalty: a stream consumer placed off the
+        # producer's site pays per-iteration measurement transfer. Predicate
+        # gating guarantees the producer (and its site key) exists before this
+        # job is ever costed, so the lookup is stable and cacheable.
+        comm_penalty = 1.0
+        pred = job.data_predicate
+        if pred and self.split_comm_penalty_factor > 0:
+            producer_site = self.measurement_layer.producer_site(pred.get("experiment_id", ""))
+            comm_penalty = split_comm_penalty(
+                self.split_comm_penalty_factor,
+                int(pred.get("total_snapshots", 1)),
+                site, producer_site)
+
         # Final cost
-        cost = (base_score + bottleneck_penalty) * time_penalty * connectivity_penalty * 100
+        cost = ((base_score + bottleneck_penalty) * time_penalty * connectivity_penalty
+                * quantum_penalty * comm_penalty * 100)
         return round(cost, 2)
 
 
@@ -1824,6 +1978,19 @@ class ResourceAgent(Agent):
                     self.queues.pending_event.wait(timeout=0.5)
                     self.queues.pending_event.clear()
                     continue
+
+                # Data-triggered gating: jobs whose data predicate isn't
+                # satisfied yet (e.g. "at least N snapshots from experiment X")
+                # stay PENDING at the back of the queue until the data exists
+                gated = [j for j in pending_jobs if not self._data_predicate_ready(j)]
+                if gated:
+                    for job in gated:
+                        self.queues.pending_queue.move_to_end(job)
+                    pending_jobs = [j for j in pending_jobs if j not in gated]
+                    if not pending_jobs:
+                        time.sleep(0.5)
+                        continue
+
                 proposals = []
                 jobs = []
 
@@ -2296,7 +2463,21 @@ class ResourceAgent(Agent):
         try:
             job_id = job.job_id
             self.logger.info(f"[EXECUTE] Starting job {job_id} on agent {self.agent_id}")
-            job.execute()
+            if job.sub_role == "quantum":
+                # Split hybrid: produce snapshot batches into the measurement layer
+                job.execute_producer(self.measurement_layer, site=self.site)
+            elif job.sub_role == "classical" and job.data_predicate:
+                # Split hybrid / post-processing: consume the snapshot stream,
+                # persisting partial state each update (stateful job pool)
+                job.execute_consumer(
+                    self.measurement_layer,
+                    timeout_s=self.consumer_timeout_s,
+                    persist_cb=lambda j: self.repository.save(
+                        obj=j.to_dict(), key_prefix=Repository.KEY_JOB,
+                        level=self.topology.level, group=self.topology.group),
+                )
+            else:
+                job.execute()
 
             # Simulated failure injection for MAB testing (overrides real exit_status)
             if self.failure_sim_enabled:
@@ -2307,6 +2488,11 @@ class ResourceAgent(Agent):
                         f"[FAILURE_SIM] Injected failure for job {job_id} on agent {self.agent_id} "
                         f"(rate={fail_rate:.2f})"
                     )
+
+            # Self-expanding pool: successful one-shot quantum jobs with
+            # post_process push a classical post-processing job (data-triggered)
+            if job.sub_role is None and job.exit_status == 0:
+                self._maybe_push_post_process(job)
 
             # Always persist job with exit_status so parent coordinator can read outcome
             self.repository.save(
@@ -2336,6 +2522,37 @@ class ResourceAgent(Agent):
                 )
             except Exception as e:
                 self.logger.error(f"Failed to persist failure status for job {job}: {e}")
+
+    def _maybe_push_post_process(self, job: Job):
+        """
+        Quantum agents feeding the classical pool: after a one-shot quantum
+        job with post_process completes, publish its measurements to the data
+        layer and push a classical post-processing job. The pool self-expands
+        — the successor job exists only because measurement data now does.
+        """
+        spec = job.quantum
+        if spec is None or spec.hybrid or not spec.post_process:
+            return
+        try:
+            exp = job.experiment_id or experiment_id_for(job.job_id)
+            self.measurement_layer.announce_producer(exp, self.site)
+            self.measurement_layer.publish(exp, {
+                "job_id": job.job_id,
+                "shots": spec.required_shots(),
+                "output_type": spec.output_type,
+            })
+            post = Job()
+            post.from_dict({**build_post_process_job(job.job_id, exp, spec.output_type),
+                            "state": ObjectState.PENDING.value})
+            post.level = self.topology.level
+            post.mark_submitted()
+            self.repository.save(obj=post.to_dict(), key_prefix=Repository.KEY_JOB,
+                                 level=self.topology.level, group=self.topology.group)
+            self.logger.info(
+                f"[POOL_PUSH] Agent {self.agent_id} pushed post-processing job "
+                f"{post.job_id} for experiment {exp}")
+        except Exception as e:
+            self.logger.error(f"Failed to push post-process job for {job.job_id}: {e}")
 
     def _get_failure_rate(self, job: Job) -> float:
         """Determine failure probability for a job: per-agent > per-job-type > base."""
@@ -2422,7 +2639,8 @@ class ResourceAgent(Agent):
         self.save_results()
 
     def _cost_job_on_agent(self, job: Job, agent: AgentInfo) -> float:
-        return self.compute_job_cost(job=job, total=agent.capacities, dtns=agent.dtns)
+        return self.compute_job_cost(job=job, total=agent.capacities, dtns=agent.dtns,
+                                     backend=agent.quantum_backend, site=agent.site)
 
     @staticmethod
     def _projected_load_factor(agent: AgentInfo) -> float:

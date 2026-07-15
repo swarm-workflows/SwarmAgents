@@ -54,6 +54,10 @@ python job_generator.py --job-count 100 --agent-profile-path agent_profiles.json
 python job_distributor.py --redis-host localhost --jobs-dir jobs/ --jobs-per-interval 10
 ```
 
+**Quantum/hybrid jobs** (see `docs/QUANTUM_HYBRID_DESIGN.md`): `generate_configs.py --quantum-agents-pct 0.25` gives a subset of agents a `quantum_backend`; `job_generator.py --quantum-fraction 0.2 --hybrid-fraction 0.1` emits jobs with a quantum component (one-shot offload or variational classical<->quantum loop). `run_test.py` accepts the same three flags and forwards them. Models in `swarm/models/quantum.py` (`QuantumSpec`/`QuantumBackend`); `Capacities.qubits` carries the allocatable qubit count; feasibility/cost wiring in `resource_agent.py` (`_quantum_feasible`, `qpu` cost weight — default 0.0, classical runs unchanged).
+
+**Phase 2 — data-triggered split scheduling** (`--split-hybrid` on run_test/job_distributor): hybrid jobs decompose into a quantum sub-job (`<id>-q`, measurement producer) and a classical sub-job (`<id>-c`, stream consumer) placed on different agents. `swarm/quantum/measurement_layer.py` = Redis-streams measurement layer; `swarm/quantum/split.py` = split/post-process builders + `split_comm_penalty`. Data predicates (`Job.data_predicate`) gate selection until snapshots exist; consumers keep partial state in `Job.state_data` (persisted per update); one-shot quantum jobs with `post_process` push `<id>-post` classical jobs into the pool (`[POOL_PUSH]` in logs). Config under `quantum:` (comm_penalty_factor, consumer_timeout_s). Note: split + pushed jobs make completed counts exceed submitted counts. Tests: `tests/test_quantum_phase2.py`.
+
 ### Utilities
 ```bash
 python dump_db.py --host localhost --type redis          # Inspect Redis state
@@ -171,5 +175,6 @@ Consensus and selection engines are **decoupled** from agents via adapter classe
 - `docs/COMPLEXITY.md` — PBFT message complexity analysis (mesh and hierarchical)
 - `docs/GOSSIP_CONSENSUS_DESIGN.md` — Gossip-based consensus stack (SWIM + gossip + Snow). Phases 1-3 implemented, wired, and unit-tested; Phase 4 (hybrid hierarchical) and at-scale evaluation pending
 - `docs/DISTRIBUTED_BASELINE_DESIGN.md` — Distributed baseline scheduler design
-- `docs/ARCHITECTURE.md` — System architecture, five-layer design, and adapter patterns
+- `docs/QUANTUM_HYBRID_DESIGN.md` — Hybrid quantum-classical job support (classical/quantum/hybrid taxonomy, QuantumSpec/QuantumBackend models, feasibility/cost integration, Phase 2 split co-scheduling, Phase 3 roadmap)
+- `docs/QUANTUM_HYBRID_IMPLEMENTATION.md` — Code-level walkthrough of the quantum support: module map, data-flow, cost formula term by term, cache-signature correctness, measurement layer internals, execution paths, end-to-end job trace, known gotchas
 - `docs/ROADMAP.md` — Feature roadmap and identified improvements

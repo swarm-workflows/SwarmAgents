@@ -29,6 +29,7 @@ from typing import Any, List, Optional, Dict
 from swarm.models.object import Object, ObjectState
 from swarm.models.capacities import Capacities
 from swarm.models.data_node import DataNode
+from swarm.models.quantum import QuantumSpec
 
 
 class Job(Object):
@@ -56,6 +57,26 @@ class Job(Object):
         self._job_type: Optional[str] = None
         self._exit_status: int = 0
         self._should_fail: bool = False  # Pre-determined failure flag from job generator
+
+        # Quantum component (None = purely classical job). When present,
+        # capacities/wall_time describe the classical component and the spec
+        # describes the quantum component (see swarm/models/quantum.py).
+        self._quantum: Optional[QuantumSpec] = None
+        self._quantum_time: Optional[float] = None  # simulated quantum execution seconds
+
+        # Split hybrid sub-jobs (Phase 2, docs/QUANTUM_HYBRID_DESIGN.md):
+        #   sub_role      : None (whole job) | "quantum" (measurement producer)
+        #                   | "classical" (stream consumer)
+        #   linked_job_id : the other half of a split pair
+        #   experiment_id : measurement stream this job produces/consumes
+        #   data_predicate: {"experiment_id", "min_snapshots", "total_snapshots"} —
+        #                   job is not selectable until min_snapshots exist
+        #   state_data    : stateful-job-pool state (partial results, progress)
+        self._sub_role: Optional[str] = None
+        self._linked_job_id: Optional[str] = None
+        self._experiment_id: Optional[str] = None
+        self._data_predicate: Optional[Dict] = None
+        self._state_data: Dict = {}
 
         # Data deps
         self.data_in: List[DataNode] = []
@@ -190,6 +211,87 @@ class Job(Object):
         with self.lock:
             assert cap is None or isinstance(cap, Capacities)
             self._capacity_allocations = cap
+
+    # ---------- Quantum component ----------
+    @property
+    def quantum(self) -> Optional[QuantumSpec]:
+        with self.lock:
+            return self._quantum
+
+    @quantum.setter
+    def quantum(self, spec) -> None:
+        with self.lock:
+            if spec is None or isinstance(spec, QuantumSpec):
+                self._quantum = spec
+            elif isinstance(spec, dict):
+                self._quantum = QuantumSpec.from_dict(spec)
+            else:
+                raise ValueError("Unsupported value type for quantum spec")
+
+    @property
+    def job_class(self) -> str:
+        """classical (no quantum spec), quantum (one-shot offload), or hybrid
+        (continuous classical<->quantum loop)."""
+        with self.lock:
+            if self._quantum is None:
+                return "classical"
+            return "hybrid" if self._quantum.hybrid else "quantum"
+
+    @property
+    def quantum_time(self) -> Optional[float]:
+        with self.lock:
+            return self._quantum_time
+
+    # ---------- Split sub-jobs / data-triggered fields ----------
+    @property
+    def sub_role(self) -> Optional[str]:
+        with self.lock:
+            return self._sub_role
+
+    @sub_role.setter
+    def sub_role(self, value: Optional[str]) -> None:
+        with self.lock:
+            assert value in (None, "quantum", "classical")
+            self._sub_role = value
+
+    @property
+    def linked_job_id(self) -> Optional[str]:
+        with self.lock:
+            return self._linked_job_id
+
+    @linked_job_id.setter
+    def linked_job_id(self, value: Optional[str]) -> None:
+        with self.lock:
+            self._linked_job_id = value
+
+    @property
+    def experiment_id(self) -> Optional[str]:
+        with self.lock:
+            return self._experiment_id
+
+    @experiment_id.setter
+    def experiment_id(self, value: Optional[str]) -> None:
+        with self.lock:
+            self._experiment_id = value
+
+    @property
+    def data_predicate(self) -> Optional[Dict]:
+        with self.lock:
+            return self._data_predicate
+
+    @data_predicate.setter
+    def data_predicate(self, value: Optional[Dict]) -> None:
+        with self.lock:
+            self._data_predicate = value
+
+    @property
+    def state_data(self) -> Dict:
+        with self.lock:
+            return dict(self._state_data)
+
+    def update_state_data(self, **kwargs) -> None:
+        with self.lock:
+            self._state_data.update(kwargs)
 
     # ---------- Times ----------
     @property
@@ -358,11 +460,14 @@ class Job(Object):
             # TODO: staged-in transfers using self.data_in if data_transfer
 
             # Simulate execution
-            wt = self.wall_time or 0.0
-            self.logger.info("Sleeping for %s seconds to simulate job execution", wt)
-            if wt > 0:
-                #time.sleep(wt)
-                time.sleep(1)
+            if self._quantum is not None:
+                self._execute_quantum()
+            else:
+                wt = self.wall_time or 0.0
+                self.logger.info("Sleeping for %s seconds to simulate job execution", wt)
+                if wt > 0:
+                    #time.sleep(wt)
+                    time.sleep(1)
 
             # TODO: staged-out transfers using self.data_out if data_transfer
 
@@ -382,6 +487,158 @@ class Job(Object):
             self.logger.error(traceback.format_exc())
             self.state = ObjectState.COMPLETE
             self._exit_status = 1  # Real failure
+            self.mark_completed()
+
+    def _execute_quantum(self):
+        """
+        Simulate a quantum or hybrid job (data-triggered runtime model):
+          quantum  : classical prep (compile/state-prep) -> one circuit offload
+          hybrid   : `iterations` rounds of circuit execution; each round's
+                     measurement data satisfies the shot predicate and triggers
+                     the classical update step (e.g. variational parameter update)
+        Total simulated sleep stays ~1s to match classical job simulation;
+        the phase breakdown is recorded in quantum_time / logs.
+        """
+        spec = self._quantum
+        shots = spec.required_shots()
+        iterations = max(1, spec.iterations) if spec.hybrid else 1
+        wt = self.wall_time or 0.0
+
+        self.logger.info(
+            "Job %s (%s): %d iteration(s) x %d shots on %d qubits (depth=%d)",
+            self.job_id, self.job_class, iterations, shots, spec.qubits, spec.circuit_depth)
+
+        # Split the 1s simulation budget across classical and quantum phases
+        step_sleep = 1.0 / (iterations * 2 + 1)
+        q_time = 0.0
+
+        time.sleep(step_sleep)  # classical prep: compile circuit, prepare state
+        for i in range(iterations):
+            q_start = time.time()
+            time.sleep(step_sleep)  # quantum phase: execute circuit, collect shots
+            q_time += time.time() - q_start
+            self.logger.debug(
+                "Job %s iteration %d/%d: %d shots collected (predicate satisfied), "
+                "running classical update", self.job_id, i + 1, iterations, shots)
+            time.sleep(step_sleep)  # classical phase: post-process measurements
+
+        with self.lock:
+            self._quantum_time = round(q_time, 3)
+        self.logger.info(
+            "Job %s (%s) simulated: wall_time=%s quantum_time=%.3fs",
+            self.job_id, self.job_class, wt, q_time)
+
+    # ---------- Split execution (Phase 2: data-triggered runtime) ----------
+    def execute_producer(self, layer, site: Optional[str] = None):
+        """
+        Execute the quantum half of a split hybrid job: announce the producer
+        site, then publish one snapshot batch per iteration to the measurement
+        layer. `layer` is duck-typed (see MeasurementLayer): announce_producer,
+        publish.
+        """
+        try:
+            spec = self._quantum
+            exp = self._experiment_id or f"exp-{self.job_id}"
+            iterations = max(1, spec.iterations if spec else 1)
+            shots = spec.required_shots() if spec else 0
+
+            self.logger.info("Job %s (producer): %d snapshot batches x %d shots -> %s",
+                             self.job_id, iterations, shots, exp)
+            self.state = ObjectState.RUNNING
+            self.mark_started()
+
+            layer.announce_producer(exp, site)
+            step_sleep = 1.0 / (iterations + 1)
+            q_start = time.time()
+            time.sleep(step_sleep)  # compile + state-prep
+            for i in range(1, iterations + 1):
+                time.sleep(step_sleep)  # circuit execution for this iteration
+                count = layer.publish(exp, {"job_id": self.job_id, "iteration": i,
+                                            "shots": shots})
+                self.logger.debug("Job %s published snapshot %d/%d (stream=%d)",
+                                  self.job_id, i, iterations, count)
+            with self.lock:
+                self._quantum_time = round(time.time() - q_start, 3)
+                self._state_data.update({"snapshots_published": iterations})
+
+            self.state = ObjectState.COMPLETE
+            self._exit_status = 1 if self._should_fail else 0
+            self.mark_completed()
+            self.logger.info("Job %s (producer) completed: %d snapshots (exit_status=%d)",
+                             self.job_id, iterations, self._exit_status)
+        except Exception as e:
+            self.logger.error("Error executing producer job %s: %s", self.job_id, e)
+            self.logger.error(traceback.format_exc())
+            self.state = ObjectState.COMPLETE
+            self._exit_status = 1
+            self.mark_completed()
+
+    def execute_consumer(self, layer, timeout_s: float = 60.0, persist_cb=None):
+        """
+        Execute the classical half of a split hybrid job (or a post-processing
+        job): consume snapshot batches from the measurement layer as they
+        arrive and run one incremental update per batch, maintaining partial
+        state (stateful job pool). Completes when `total_snapshots` batches
+        are processed; fails if the stream stalls for `timeout_s` (e.g. the
+        producer died — the standard failure machinery then takes over).
+
+        `persist_cb(job)`, when given, is invoked after each update so partial
+        state survives agent failure.
+        """
+        try:
+            pred = self._data_predicate or {}
+            exp = pred.get("experiment_id") or self._experiment_id or f"exp-{self.job_id}"
+            total = int(pred.get("total_snapshots", 1))
+
+            self.logger.info("Job %s (consumer): awaiting %d snapshot batches from %s",
+                             self.job_id, total, exp)
+            self.state = ObjectState.RUNNING
+            self.mark_started()
+
+            processed = int(self._state_data.get("snapshots_processed", 0))
+            partial = float(self._state_data.get("partial_result", 0.0))
+            last_id = self._state_data.get("last_stream_id", "0-0")
+            step_sleep = min(0.2, 1.0 / (total + 1))
+            last_data_at = time.time()
+
+            while processed < total:
+                entries = layer.read_from(exp, last_id=last_id, block_ms=500)
+                if not entries:
+                    if time.time() - last_data_at > timeout_s:
+                        raise TimeoutError(
+                            f"measurement stream {exp} stalled: "
+                            f"{processed}/{total} snapshots after {timeout_s}s")
+                    continue
+                last_data_at = time.time()
+                for entry_id, payload in entries:
+                    time.sleep(step_sleep)  # incremental classical update
+                    processed += 1
+                    # Simulated running estimate (e.g. moment/expectation update)
+                    partial += float(payload.get("shots", 0))
+                    last_id = entry_id
+                    with self.lock:
+                        self._state_data.update({
+                            "snapshots_processed": processed,
+                            "partial_result": partial,
+                            "last_stream_id": last_id,
+                        })
+                    if persist_cb is not None:
+                        try:
+                            persist_cb(self)
+                        except Exception as e:
+                            self.logger.debug("persist_cb failed for %s: %s", self.job_id, e)
+                    if processed >= total:
+                        break
+
+            self.state = ObjectState.COMPLETE
+            self._exit_status = 1 if self._should_fail else 0
+            self.mark_completed()
+            self.logger.info("Job %s (consumer) completed: %d snapshots processed (exit_status=%d)",
+                             self.job_id, processed, self._exit_status)
+        except Exception as e:
+            self.logger.error("Error executing consumer job %s: %s", self.job_id, e)
+            self.state = ObjectState.COMPLETE
+            self._exit_status = 1
             self.mark_completed()
 
     # ---------- Introspection helpers ----------
@@ -432,6 +689,13 @@ class Job(Object):
             snap_deleg_failed = self._delegation_failed
             snap_deleg_count = self._delegation_failed_count
             snap_level = self.level
+            snap_quantum = self._quantum
+            snap_quantum_time = self._quantum_time
+            snap_sub_role = self._sub_role
+            snap_linked = self._linked_job_id
+            snap_experiment = self._experiment_id
+            snap_predicate = dict(self._data_predicate) if self._data_predicate else None
+            snap_state_data = dict(self._state_data) if self._state_data else None
 
         # Serialize outside lock (slow — dict building, DataNode conversion)
         result = {
@@ -461,6 +725,13 @@ class Job(Object):
             "delegation_failed": snap_deleg_failed,
             "delegation_failed_count": snap_deleg_count,
             "level": snap_level,
+            "quantum": snap_quantum.to_dict() if snap_quantum else None,
+            "quantum_time": snap_quantum_time,
+            "sub_role": snap_sub_role,
+            "linked_job_id": snap_linked,
+            "experiment_id": snap_experiment,
+            "data_predicate": snap_predicate,
+            "state_data": snap_state_data,
         }
 
         if compact:
@@ -483,8 +754,8 @@ class Job(Object):
             else None
         )
         parsed_wall_time = job_data.get("wall_time")
-        parsed_data_in = [DataNode.from_dict(d) for d in job_data.get("data_in", [])]
-        parsed_data_out = [DataNode.from_dict(d) for d in job_data.get("data_out", [])]
+        parsed_data_in = [DataNode.from_dict(d) for d in (job_data.get("data_in") or [])]
+        parsed_data_out = [DataNode.from_dict(d) for d in (job_data.get("data_out") or [])]
         parsed_state = ObjectState(job_data["state"]) if job_data.get("state") else ObjectState.PENDING
         parsed_exit_status = int(job_data.get("exit_status", 0))
         parsed_should_fail = bool(job_data.get("should_fail", False))
@@ -547,6 +818,15 @@ class Job(Object):
         parsed_deleg_agents = job_data.get("delegation_failed_agents")
         parsed_deleg_failed = job_data.get("delegation_failed")
         parsed_deleg_count = job_data.get("delegation_failed_count")
+        parsed_quantum = (
+            QuantumSpec.from_dict(job_data["quantum"]) if job_data.get("quantum") else None
+        )
+        parsed_quantum_time = job_data.get("quantum_time")
+        parsed_sub_role = job_data.get("sub_role")
+        parsed_linked = job_data.get("linked_job_id")
+        parsed_experiment = job_data.get("experiment_id")
+        parsed_predicate = job_data.get("data_predicate")
+        parsed_state_data = job_data.get("state_data") or {}
 
         # Assign all parsed values under lock (fast — just reference assignments)
         with self.lock:
@@ -573,6 +853,13 @@ class Job(Object):
             self._delegation_failed_agents = parsed_deleg_agents if parsed_deleg_agents is not None else []
             self._delegation_failed = parsed_deleg_failed if parsed_deleg_failed is not None else False
             self._delegation_failed_count = parsed_deleg_count if parsed_deleg_count is not None else 0
+            self._quantum = parsed_quantum
+            self._quantum_time = float(parsed_quantum_time) if parsed_quantum_time is not None else None
+            self._sub_role = parsed_sub_role
+            self._linked_job_id = parsed_linked
+            self._experiment_id = parsed_experiment
+            self._data_predicate = parsed_predicate
+            self._state_data = parsed_state_data
 
         self.classify_job_type()
 
@@ -596,6 +883,11 @@ class Job(Object):
                 "gpu_bound": gpu,
             }
             resource_class = max(resource_ratios, key=resource_ratios.get)
+
+            # A quantum component dominates the classification: the QPU is the
+            # scarce resource regardless of the classical demand profile
+            if self._quantum is not None:
+                resource_class = "hybrid" if self._quantum.hybrid else "quantum"
 
             wt = self._wall_time or 0
             if wt <= 5:
