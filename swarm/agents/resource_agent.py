@@ -27,8 +27,6 @@ import traceback
 from concurrent.futures.thread import ThreadPoolExecutor
 from typing import Optional
 
-from google.genai.types import JobState
-
 from swarm.consensus.engine import ConsensusEngine
 from swarm.consensus.gossip_engine import GossipConsensusEngine
 from swarm.consensus.interfaces import ConsensusHost, ConsensusTransport, TopologyRouter
