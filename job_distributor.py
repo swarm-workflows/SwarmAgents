@@ -78,7 +78,10 @@ class JobDistributor(threading.Thread):
         def file_iter():
             with os.scandir(self.jobs_dir) as it:
                 for entry in it:
-                    if entry.name.endswith(".json") and entry.is_file():
+                    # Only actual job files (job_*.json) — never sidecars like
+                    # conversion_summary.json / pegasus_baseline.json, which are
+                    # metadata, not jobs.
+                    if entry.name.startswith("job_") and entry.name.endswith(".json") and entry.is_file():
                         yield (entry.stat().st_ctime, entry.path)
 
         # Lazily sort and yield just file paths
@@ -102,32 +105,33 @@ class JobDistributor(threading.Thread):
             # the whole distribution batch.
             print(f"Skipping unreadable job file {file_path}: {e}")
             return []
-            if 'id' not in job_data:
-                return []  # Skip non-job files (e.g., conversion_summary.json)
 
-            if self.split_hybrid:
-                split = split_hybrid_job(job_data)
-                if split is not None:
-                    jobs = []
-                    for sub in split:
-                        job = Job()
-                        job.from_dict({**sub, "state": 1})
-                        jobs.append(job)
-                    return jobs
+        if not isinstance(job_data, dict) or 'id' not in job_data:
+            return []  # Skip non-job / non-dict files (metadata sidecars, etc.)
 
-            job = Job()
-            job.job_id = job_data['id']
-            job.capacities = Capacities.from_dict(job_data['capacities'])
-            job.wall_time = job_data['wall_time']
-            if job_data.get('data_in'):
-                for data_in in job_data['data_in']:
-                    job.add_incoming_data_dep(DataNode.from_dict(data_in))
-            if job_data.get('data_out'):
-                for data_out in job_data['data_out']:
-                    job.add_outgoing_data_dep(DataNode.from_dict(data_out))
-            if job_data.get('quantum'):
-                job.quantum = job_data['quantum']
-            return [job]
+        if self.split_hybrid:
+            split = split_hybrid_job(job_data)
+            if split is not None:
+                jobs = []
+                for sub in split:
+                    job = Job()
+                    job.from_dict({**sub, "state": 1})
+                    jobs.append(job)
+                return jobs
+
+        job = Job()
+        job.job_id = job_data['id']
+        job.capacities = Capacities.from_dict(job_data['capacities'])
+        job.wall_time = job_data['wall_time']
+        if job_data.get('data_in'):
+            for data_in in job_data['data_in']:
+                job.add_incoming_data_dep(DataNode.from_dict(data_in))
+        if job_data.get('data_out'):
+            for data_out in job_data['data_out']:
+                job.add_outgoing_data_dep(DataNode.from_dict(data_out))
+        if job_data.get('quantum'):
+            job.quantum = job_data['quantum']
+        return [job]
 
     def run(self) -> None:
         """
