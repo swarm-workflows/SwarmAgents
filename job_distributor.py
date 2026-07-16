@@ -93,8 +93,15 @@ class JobDistributor(threading.Thread):
         :param file_path: Path to the job JSON file.
         :return: List of parsed Job objects (empty for non-job files).
         """
-        with open(file_path, 'r') as f:
-            job_data = json.load(f)
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                job_data = json.load(f)
+        except (UnicodeDecodeError, json.JSONDecodeError, OSError) as e:
+            # Skip unreadable / non-JSON files (e.g. conversion_summary.json,
+            # sidecar files with non-UTF-8 bytes). One bad file must not abort
+            # the whole distribution batch.
+            print(f"Skipping unreadable job file {file_path}: {e}")
+            return []
             if 'id' not in job_data:
                 return []  # Skip non-job files (e.g., conversion_summary.json)
 
