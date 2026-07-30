@@ -1,8 +1,0 @@
-Configuration,Agents,Jobs,Jobs_per_Agent,Runs,Selection_Mean_s,Selection_Std_s,Selection_P95_s,Selection_P95_Std_s,Data_Source,Run_Dirs
-hierarchical-30,30,1089,36.3,2,0.9749,0.0164,1.4086,0.0443,level0_jobs.csv,"run01,run03,run04,run07,run09,run10"
-hierarchical-60,60,2188,36.5,1,0.9657,0.0,1.4088,0.0,level0_jobs.csv,run08
-hierarchical-110,110,4172,37.9,1,0.9936,0.0,1.3121,0.0,level0_jobs.csv,run04
-mesh-30,30,547,18.2,4,97.7916,8.3514,227.1895,21.3675,level0_jobs.csv,"run01,run03,run04,run05,run06,run07,run08,run09"
-llm-gpt-oss-hier-30,30,1158,38.6,5,1.0461,0.0302,1.5476,0.0903,level0_jobs.csv,run01-05
-llm-qwen3-hier-30,30,1249,41.6,5,1.0695,0.028,1.593,0.0486,level0_jobs.csv,run01-05
-llm-glm-4.7-hier-30,30,1232,41.1,4,1.0717,0.0206,1.6404,0.0733,level0_jobs.csv,run01-04
