@@ -11,6 +11,7 @@ Identified improvement areas based on codebase analysis, organized by priority.
 
 ## Next Up
 
+- **Decentralized job pool** — remove Redis from the control plane: submit-to-any-agent ingestion, epidemic pending-pool, rendezvous-hash referee for exactly-once claims, replicated job state with epoch fencing. Design: `docs/DECENTRALIZED_POOL_DESIGN.md`
 - **Quantum Phase 3** — joint pair consensus for split jobs, VQE-style variational runtime, OpenQASM circuit payloads
 - **Wall-time-faithful replay** — `Job.execute()` sleeps a flat 1s (`time.sleep(wt)` disabled); add a configurable `wall_time_scale` so replayed workloads exercise realistic execution times and load spreading (see item 7)
 - **DAG dependency gating** — the Pegasus converter flattens workflows into an independent job pool; honor `jobDependencies` (e.g. via the data-predicate mechanism) so replayed makespans are comparable to Pegasus
