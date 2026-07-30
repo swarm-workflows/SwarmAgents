@@ -25,12 +25,21 @@ import threading
 import time
 import traceback
 from concurrent.futures.thread import ThreadPoolExecutor
-
-from google.genai.types import JobState
+from typing import Optional
 
 from swarm.consensus.engine import ConsensusEngine
+from swarm.consensus.gossip_engine import GossipConsensusEngine
 from swarm.consensus.interfaces import ConsensusHost, ConsensusTransport, TopologyRouter
 from swarm.consensus.messages.message import MessageType
+from swarm.consensus.messages.gossip_state import GossipState
+from swarm.consensus.messages.snow_batch import SnowQueryBatch, SnowResponseBatch
+from swarm.consensus.messages.snow_query import SnowQuery
+from swarm.consensus.messages.snow_response import SnowResponse
+from swarm.consensus.messages.swim_ack import SwimAck
+from swarm.consensus.messages.swim_ping import SwimPing
+from swarm.consensus.messages.swim_ping_req import SwimPingReq
+from swarm.gossip.disseminator import GossipStateDisseminator
+from swarm.membership.swim import SwimMembership
 from swarm.models.data_node import DataNode
 from swarm.models.object import Object
 from swarm.selection.engine import SelectionEngine
@@ -49,6 +58,10 @@ from swarm.models.capacities import Capacities
 from swarm.models.agent_info import AgentInfo
 from swarm.consensus.messages.proposal_info import ProposalInfo
 from swarm.models.job import Job, ObjectState
+from swarm.models.quantum import QuantumBackend
+from swarm.quantum.measurement_layer import MeasurementLayer
+from swarm.quantum.split import build_post_process_job, experiment_id_for, split_comm_penalty
+from swarm.rl.context import snapshots_from_children
 from swarm.rl.mab_manager import MABManager
 
 from swarm.utils.utils import generate_id, job_capacities
@@ -85,6 +98,32 @@ class _HostAdapter(ConsensusHost):
             self.agent.logger.warning(f"Failed to fetch job {object_id} from Redis: {e}")
             return None
 
+    # Out-of-order consensus messages: a Proposal/Prepare/Commit can arrive before this
+    # agent has the job locally or in Redis (job-distributor/delegation lag). Stash them
+    # for replay when the job shows up (see _replay_pending_consensus) instead of losing
+    # the vote. Bounded so a burst can't grow memory without limit.
+    _PENDING_MAX_OBJECTS = 2048
+    _PENDING_MAX_PER_OBJECT = 32
+
+    def _stash_pending(self, store: dict, object_id: str, msg) -> None:
+        if object_id not in store and len(store) >= self._PENDING_MAX_OBJECTS:
+            self.agent.pending_consensus_dropped += 1
+            return
+        bucket = store.setdefault(object_id, [])
+        if len(bucket) >= self._PENDING_MAX_PER_OBJECT:
+            self.agent.pending_consensus_dropped += 1
+            return
+        bucket.append(msg)
+
+    def set_pending_proposal(self, proposal, object_id: str):
+        self._stash_pending(self.agent.pending_proposals, object_id, proposal)
+
+    def set_pending_prepare(self, prepare, object_id: str):
+        self._stash_pending(self.agent.pending_prepares, object_id, prepare)
+
+    def set_pending_commit(self, commit, object_id: str):
+        self._stash_pending(self.agent.pending_commits, object_id, commit)
+
     def is_agreement_achieved(self, object_id: str): return self.agent.is_job_completed(object_id)
     def calculate_quorum(self): return self.agent.calculate_quorum()
     def on_leader_elected(self, obj: Object, proposal_id: str): self.agent.select_job(obj)
@@ -100,6 +139,61 @@ class _HostAdapter(ConsensusHost):
     def log_info(self, m): self.agent.logger.info(m)
     def log_warn(self, m): self.agent.logger.warning(m)
 
+    # --- Snow-engine extensions (no-ops for PBFT, used by GossipConsensusEngine).
+    def live_peer_ids(self):
+        if self.agent.swim is not None:
+            live = [a for a in self.agent.swim.live_agents() if a != self.agent.agent_id]
+            if live:
+                return live
+            # An EMPTY SWIM live set is almost always a false reading — under consensus
+            # bursts, acks queue behind the single inbound consumer and blow the probe
+            # window, false-failing every peer (measured: 23k single-node self-claims).
+            # A genuinely dead cluster is the rare case; fall back to the Redis-refreshed
+            # neighbor_map so Snow keeps running real rounds.
+        return [k for k in self.agent.neighbor_map.keys() if k != self.agent.agent_id]
+
+    def my_cost_for_job(self, object_id: str):
+        # LOCAL-ONLY on purpose: this runs per inbound SnowQuery on the single consumer
+        # thread. The previous get_object() Redis fallback + fresh _generate_agent_info()
+        # cost a WAN round-trip (plus child aggregation) per query, collapsing inbound
+        # throughput (queue pinned at 20k, responses stale, every decision abandoning at
+        # max_rounds). A peer that doesn't know the job locally yields to the initiator's
+        # preferred candidate — the engine already treats cost=None exactly that way.
+        obj = self.agent.queues.pending_queue.get(object_id)
+        if obj is None:
+            return None
+        try:
+            info = self.agent.last_agent_info or self.agent._generate_agent_info()
+            return float(self.agent._cost_job_on_agent(obj, info))
+        except Exception as exc:
+            self.agent.logger.debug(f"my_cost_for_job({object_id}) failed: {exc}")
+            return None
+
+    def try_claim_assignment(self, object_id: str, agent_id: int) -> int:
+        return self.agent.repository.try_claim_assignment(
+            job_id=object_id, agent_id=int(agent_id),
+            level=self.agent.topology.level, group=self.agent.topology.group,
+        )
+
+    def get_assignment(self, object_id: str):
+        return self.agent.repository.get_assignment(
+            job_id=object_id,
+            level=self.agent.topology.level, group=self.agent.topology.group,
+        )
+
+    def get_assignment_local(self, object_id: str):
+        # Peer-side already-decided short-circuit from LOCAL knowledge only (the
+        # authoritative exactly-once check remains try_claim_assignment's Redis CAS).
+        # Returns the assignee if this agent saw the commit, else None — never Redis.
+        return self.agent.job_assignments.get(object_id)
+
+    def my_site(self):
+        return getattr(self.agent, "site", None)
+
+    def peer_site(self, peer_id: int):
+        info = self.agent.neighbor_map.get(int(peer_id))
+        return getattr(info, "site", None) if info is not None else None
+
 
 class _TransportAdapter(ConsensusTransport):
     def __init__(self, agent: "ResourceAgent"):
@@ -108,6 +202,10 @@ class _TransportAdapter(ConsensusTransport):
         self.agent.send(dest, payload)
     def broadcast(self, payload: object) -> None:
         self.agent.broadcast(payload)
+    def send_besteffort(self, dest: int, payload: object, timeout_s: float = 0.3) -> None:
+        # Low-latency, no-retry send for best-effort Snow queries/responses so a slow or
+        # unreachable peer can't stall the Snow driver.
+        self.agent.send(dest, payload, timeout=timeout_s, retries=0)
 
 
 class _RouteAdapter(TopologyRouter):
@@ -120,13 +218,150 @@ class _RouteAdapter(TopologyRouter):
         return False
 
 
+class _SwimAdapter:
+    """Adapter that lets SwimMembership drive itself off ResourceAgent's
+    transport, peer list, logger, and failure-handling callbacks."""
+
+    def __init__(self, agent: "ResourceAgent"):
+        self.agent = agent
+        self.agent_id = agent.agent_id
+
+    def send(self, dest: int, payload: object) -> None:
+        self.agent.send(dest, payload)
+
+    def known_peers(self):
+        # neighbor_map is the canonical peer set; SWIM seeds from it.
+        return list(self.agent.neighbor_map.keys())
+
+    def log_debug(self, msg: str) -> None:
+        self.agent.logger.debug(msg)
+
+    def log_info(self, msg: str) -> None:
+        self.agent.logger.info(msg)
+
+    def log_warn(self, msg: str) -> None:
+        self.agent.logger.warning(msg)
+
+    def on_agent_alive(self, agent_id: int) -> None:
+        pass  # advisory in Phase 1
+
+    def on_agent_joined(self, agent_id: int) -> None:
+        self.agent.logger.info(f"[SWIM] joined: {agent_id}")
+
+    def on_agent_suspected(self, agent_id: int) -> None:
+        self.agent.logger.info(f"[SWIM] suspected: {agent_id}")
+
+    def on_agent_failed(self, agent_id: int) -> None:
+        # Phase 1 is advisory; heartbeat-driven failure detection still owns
+        # reassignment. Surface the event so operators can correlate.
+        self.agent.logger.warning(f"[SWIM] failed: {agent_id}")
+
+
+class _GossipAdapter:
+    """Adapter that lets GossipStateDisseminator drive itself off the agent's
+    transport, peer list, and logger."""
+
+    def __init__(self, agent: "ResourceAgent"):
+        self.agent = agent
+        self.agent_id = agent.agent_id
+
+    def send(self, dest: int, payload: object) -> None:
+        self.agent.send(dest, payload)
+
+    def live_peers(self):
+        # Prefer SWIM's live set when available so gossip doesn't push to
+        # peers we already know are failed. An EMPTY live set is treated as a
+        # false reading (load-induced ack lag), not a dead cluster.
+        if self.agent.swim is not None:
+            live = self.agent.swim.live_agents()
+            if live:
+                return live
+        return list(self.agent.neighbor_map.keys())
+
+    def log_debug(self, msg: str) -> None:
+        self.agent.logger.debug(msg)
+
+    def log_warn(self, msg: str) -> None:
+        self.agent.logger.warning(msg)
+
+
 class ResourceAgent(Agent):
     def __init__(self, agent_id: int, config_file: str, debug: bool = False):
         super().__init__(agent_id, config_file, debug)
-        self.engine = ConsensusEngine(agent_id, _HostAdapter(self), _TransportAdapter(self),
-                                      router=_RouteAdapter(self))
+        consensus_cfg = self.config.get("consensus", {})
+        protocol = (consensus_cfg.get("protocol") or "pbft").lower()
+        host = _HostAdapter(self)
+        transport = _TransportAdapter(self)
+        router = _RouteAdapter(self)
+
+        def _make_engine(engine_name: str):
+            """Build a consensus engine by name ('pbft' | 'snow')."""
+            if engine_name == "snow":
+                snow_cfg = consensus_cfg.get("snow", {})
+                return GossipConsensusEngine(
+                    agent_id=agent_id,
+                    host=host,
+                    transport=transport,
+                    router=router,
+                    k=int(snow_cfg.get("k", 20)),
+                    alpha=float(snow_cfg.get("alpha", 0.7)),
+                    beta=int(snow_cfg.get("beta", 20)),
+                    max_rounds=int(snow_cfg.get("max_rounds", 100)),
+                    round_timeout_s=float(snow_cfg.get("round_timeout_ms", 500)) / 1000.0,
+                    tick_interval_s=float(snow_cfg.get("tick_interval_ms", 50)) / 1000.0,
+                    local_sample_frac=float(snow_cfg.get("local_sample_frac", 1.0)),
+                    send_workers=int(snow_cfg.get("send_workers", 32)),
+                    send_timeout_s=float(snow_cfg.get("send_timeout_ms", 300)) / 1000.0,
+                    max_inflight=int(snow_cfg.get("max_inflight", 32)),
+                )
+            return ConsensusEngine(agent_id, host, transport, router=router)
+
+        # Phase 4 hybrid: PBFT within small level-0 worker groups; Snow across the
+        # (potentially large) coordinator tiers where flat PBFT hits O(g^2). Engine is
+        # chosen from the agent's immutable topology level; consensus only ever flows
+        # among same-level peers, so a level exchanges messages of a single engine type.
+        if protocol == "hybrid":
+            hybrid_cfg = consensus_cfg.get("hybrid", {})
+            level0_engine = (hybrid_cfg.get("level0") or "pbft").lower()
+            coord_engine = (hybrid_cfg.get("coordinator") or "snow").lower()
+            resolved = level0_engine if int(self.topology.level) == 0 else coord_engine
+        elif protocol == "snow":
+            resolved = "snow"
+        else:
+            resolved = "pbft"
+
+        self.engine = _make_engine(resolved)
+        self.consensus_protocol = resolved
+        self.logger.info(
+            f"[consensus] protocol={protocol} level={self.topology.level} -> engine={resolved}"
+        )
+
+        # Site/locality label (e.g. FABRIC site) for topology-aware Snow sampling.
+        # None when not configured -> sampling falls back to uniform.
+        self.site = self.config.get("site")
 
         self._capacities = Capacities().from_dict(self.config.get("capacities", {}))
+
+        # Quantum backend owned by this agent (None for classical-only agents).
+        # Qubit count is mirrored into capacities so the standard feasibility,
+        # allocation, and load arithmetic covers the additive quantum resource.
+        self.quantum_backend = QuantumBackend.from_dict(self.config.get("quantum_backend") or {})
+        if self.quantum_backend and not self._capacities.qubits:
+            self._capacities.qubits = self.quantum_backend.qubits
+
+        # Quantum measurement data layer (Phase 2): Redis streams of snapshot
+        # batches; gates data-triggered jobs and feeds split hybrid execution
+        quantum_cfg = self.config.get("quantum", {})
+        self.measurement_layer = MeasurementLayer(
+            redis_client=self.repository.redis,
+            ttl_s=int(quantum_cfg.get("measurement_ttl_s", 3600)),
+            predicate_cache_s=float(quantum_cfg.get("predicate_cache_s", 1.0)),
+        )
+        # Multiplier for the cross-site penalty applied to stream consumers
+        self.split_comm_penalty_factor = float(quantum_cfg.get("comm_penalty_factor", 1.0))
+        # Stream-stall timeout for consumer sub-jobs (producer death -> failure path)
+        self.consumer_timeout_s = float(quantum_cfg.get("consumer_timeout_s", 60.0))
+
         self._load = 0
         self.metrics = Metrics()
         self.completed_lock = threading.RLock()
@@ -151,10 +386,15 @@ class ResourceAgent(Agent):
         self.disk_weight = weights_cfg.get("disk", 0.2)
         # Relative importance of GPU utilization in job cost (0–1)
         self.gpu_weight = weights_cfg.get("gpu", 0.1)
+        # Relative importance of QPU (qubit) utilization in job cost (0–1);
+        # 0.0 keeps classical-only deployments byte-identical to previous behavior
+        self.qpu_weight = weights_cfg.get("qpu", 0.0)
         # Execution time (in seconds) beyond which jobs incur extra penalty
         self.long_job_threshold = job_cfg.get("long_job_threshold", 20.0)
         # Multiplier for DTN connectivity penalty (0=no effect, >1 increases penalty severity)
         self.connectivity_penalty_factor = job_cfg.get("connectivity_penalty_factor", 1.0)
+        # Multiplier for quantum backend quality penalty (error rate + calibration downtime)
+        self.quantum_penalty_factor = job_cfg.get("quantum_penalty_factor", 1.0)
         # % above min cost allowed in candidate selection (lower = stricter, higher = more agents considered)
         self.selection_threshold_pct = job_cfg.get("selection_threshold_pct", 10.0)
 
@@ -175,6 +415,18 @@ class ResourceAgent(Agent):
         self.failed_agents = ThreadSafeDict[int, float]()  # agent_id -> failure_timestamp
         self.job_assignments = ThreadSafeDict[str, int]()  # job_id -> assigned_agent_id
 
+        # Consensus messages that arrived before their job (see _HostAdapter.set_pending_*).
+        # Replayed by _replay_pending_consensus once the job lands in the pending queue.
+        self.pending_proposals: dict[str, list] = {}
+        self.pending_prepares: dict[str, list] = {}
+        self.pending_commits: dict[str, list] = {}
+        self.pending_consensus_dropped = 0
+
+        # Latest AgentInfo snapshot (refreshed each periodic tick). Hot paths — e.g.
+        # per-SnowQuery cost answers on the inbound thread — reuse this instead of
+        # re-aggregating children on every message.
+        self.last_agent_info = None
+
         # Track jobs delegated to children for hierarchical monitoring
         # Maps: job_id -> {'delegated_at': timestamp, 'groups': [list of child groups]}
         self.delegated_jobs = ThreadSafeDict[str, dict]()  # job_id -> delegation_info
@@ -192,12 +444,51 @@ class ResourceAgent(Agent):
         self.failure_sim_base_prob = fail_sim_cfg.get("failure_probability", 0.1)
         self.failure_sim_per_agent = fail_sim_cfg.get("per_agent_failure_rates", {})
         self.failure_sim_per_job_type = fail_sim_cfg.get("per_job_type_failure_rates", {})
-
-        # Track which group each delegated job was sent to for MAB reward attribution
-        self.job_delegation_map = ThreadSafeDict[str, int]()  # job_id -> group_id
+        # Time-phased profiles for non-stationarity experiments (Scenario B):
+        # each {after_s, per_agent_failure_rates, per_job_type_failure_rates}
+        # replaces the active rates once `after_s` seconds have elapsed since
+        # agent start; the last matching phase wins.
+        self.failure_sim_phases = sorted(
+            fail_sim_cfg.get("phases", []) or [],
+            key=lambda p: float(p.get("after_s", 0)))
+        self.failure_sim_start = time.time()
+        self._failure_sim_phase_logged = -1
 
         # Max retries before retiring an infeasible job (0 = infinite retries)
         self.max_infeasible_retries = self.runtime_config.get("max_infeasible_retries", 10)
+
+        # SWIM membership (Phase 1 of gossip-consensus migration). Enabled when
+        # `failure_detection.protocol` is "swim"; otherwise the legacy heartbeat
+        # path remains authoritative and SWIM stays inert.
+        fd_cfg = self.config.get("failure_detection", {})
+        self.swim_enabled = fd_cfg.get("protocol", "heartbeat") == "swim"
+        self.swim = None
+        if self.swim_enabled:
+            swim_cfg = fd_cfg.get("swim", {})
+            self.swim = SwimMembership(
+                host=_SwimAdapter(self),
+                period_s=float(swim_cfg.get("period_ms", 1000)) / 1000.0,
+                # WAN-realistic defaults: acks can queue behind consensus bursts on the
+                # single inbound consumer, so a LAN-tuned 300ms probe window false-fails
+                # healthy peers (observed as constant late-ack flapping).
+                probe_timeout_s=float(swim_cfg.get("probe_timeout_ms", 1000)) / 1000.0,
+                k_req=int(swim_cfg.get("k_req", 3)),
+                suspect_timeout_s=float(swim_cfg.get("suspect_timeout_s", 20.0)),
+            )
+
+        # Gossip state dissemination (Phase 2). Off by default; turn on with
+        # `gossip.enabled: true`. The disseminator is independent of SWIM and
+        # safe to run with either failure-detection protocol.
+        gossip_cfg = self.config.get("gossip", {})
+        self.gossip_enabled = bool(gossip_cfg.get("enabled", False))
+        self.gossip = None
+        if self.gossip_enabled:
+            self.gossip = GossipStateDisseminator(
+                host=_GossipAdapter(self),
+                period_s=float(gossip_cfg.get("period_ms", 1000)) / 1000.0,
+                fanout=int(gossip_cfg.get("fanout", 3)),
+                state_ttl_s=float(gossip_cfg.get("state_ttl_s", 30.0)),
+            )
 
     @property
     def peer_expiry_seconds(self) -> int:
@@ -258,11 +549,34 @@ class ResourceAgent(Agent):
             config=self.mab_config,
             repository=self.repository,
             logger=self.logger,
+            group_snapshot_provider=self._build_group_snapshots,
+            delegation_timeout_s=self.delegation_timeout_s,
         )
         self.mab_manager.load_state()
         self.logger.info(
             f"MAB initialised for agent {self.agent_id} with child groups {child_groups}"
         )
+
+    def _build_group_snapshots(self):
+        """Current per-child-group load view for contextual MAB selection.
+
+        Called by MABManager inside select_groups(); failure-rate fields are
+        filled in by the manager from its own outcome windows.
+        """
+        return snapshots_from_children(
+            self.children.values(),
+            (info for _, info in self.delegated_jobs.items()),
+        )
+
+    def _get_live_child_groups(self) -> set:
+        """Groups with at least one fresh child heartbeat in the children map
+        (stale entries are pruned by peer expiry). Used to gate delegation:
+        a dead group must not be offered to the bandit at all — idle-default
+        features plus an empty failure history make it look attractive
+        (Scenario C dog-piling). Genuinely new groups do heartbeat, so
+        cold-start optimism is preserved."""
+        return {child.group if child.group is not None else 0
+                for child in self.children.values()}
 
     @property
     def empty_timeout_seconds(self):
@@ -295,6 +609,35 @@ class ResourceAgent(Agent):
             )
             return False
         return True
+
+    def _data_predicate_ready(self, job: Job) -> bool:
+        """
+        True when the job's data predicate is satisfied (or absent). Gated
+        jobs are not proposed for selection — computation is steered by the
+        availability of quantum measurement data.
+        """
+        pred = job.data_predicate
+        if not pred:
+            return True
+        try:
+            return self.measurement_layer.predicate_satisfied(
+                pred.get("experiment_id", ""), int(pred.get("min_snapshots", 1)))
+        except Exception as e:
+            self.logger.debug(f"predicate check failed for {job.job_id}: {e}")
+            return False
+
+    @staticmethod
+    def _quantum_feasible(job: Job, backend: Optional[QuantumBackend]) -> bool:
+        """
+        Returns True if the job's quantum component (if any) can run on the
+        given backend. Classical jobs are always quantum-feasible; quantum and
+        hybrid jobs require a backend that satisfies the spec (qubits, CLOPS,
+        architecture, fidelity, gate set).
+        """
+        spec = job.quantum
+        if spec is None:
+            return True
+        return backend is not None and backend.supports(spec)
 
     @staticmethod
     def resource_usage_score(allocated: Capacities, total: Capacities):
@@ -384,6 +727,38 @@ class ResourceAgent(Agent):
                 elif isinstance(incoming, Proposal):
                     self.__on_proposal(incoming=incoming)
 
+                elif isinstance(incoming, SwimPing):
+                    if self.swim is not None:
+                        self.swim.on_ping(incoming)
+
+                elif isinstance(incoming, SwimAck):
+                    if self.swim is not None:
+                        self.swim.on_ack(incoming)
+
+                elif isinstance(incoming, SwimPingReq):
+                    if self.swim is not None:
+                        self.swim.on_ping_req(incoming)
+
+                elif isinstance(incoming, GossipState):
+                    if self.gossip is not None:
+                        self.gossip.on_gossip(incoming)
+
+                elif isinstance(incoming, SnowQuery):
+                    if isinstance(self.engine, GossipConsensusEngine):
+                        self.engine.on_snow_query(incoming)
+
+                elif isinstance(incoming, SnowResponse):
+                    if isinstance(self.engine, GossipConsensusEngine):
+                        self.engine.on_snow_response(incoming)
+
+                elif isinstance(incoming, SnowQueryBatch):
+                    if isinstance(self.engine, GossipConsensusEngine):
+                        self.engine.on_snow_query_batch(incoming)
+
+                elif isinstance(incoming, SnowResponseBatch):
+                    if isinstance(self.engine, GossipConsensusEngine):
+                        self.engine.on_snow_response_batch(incoming)
+
                 else:
                     self.logger.info(f"Ignoring unsupported message: {message}")
                 diff = int(time.time() - begin)
@@ -394,19 +769,39 @@ class ResourceAgent(Agent):
                 self.logger.error(traceback.format_exc())
 
     def _update_pending_jobs(self, jobs: list[str]):
+        # One MGET for every job we don't have locally — the per-id get() loop paid a
+        # WAN round-trip per pending job on every periodic tick.
+        missing = [j for j in jobs if j not in self.queues.pending_queue]
+        fetched = self.repository.get_many(
+            missing, key_prefix=Repository.KEY_JOB,
+            level=self.topology.level, group=self.topology.group) if missing else {}
         for job_id in jobs:
-            #job_id = key.split(":")[-1]
-            if job_id not in self.queues.pending_queue:
-                #group = self.topology.level if self.topology.type == TopologyType.Ring else self.topology.group
-                group = self.topology.group
-                #self.logger.info(f"Adding job {job_id} for: {group}")
-                job = self.repository.get(obj_id=job_id, key_prefix=Repository.KEY_JOB,
-                                          level=self.topology.level,
-                                          group=group)
+            job = fetched.get(job_id)
+            if job:
                 job_obj = Job()
                 job_obj.from_dict(job)
                 self.queues.pending_queue.add(job_obj)
+            # Job is (now) locally known — replay any consensus messages that raced ahead
+            # of it so our votes aren't lost (mirrors ColmenaAgent's replay).
+            self._replay_pending_consensus(job_id)
         self.queues.pending_event.set()
+
+    def _replay_pending_consensus(self, job_id: str) -> None:
+        for msg in self.pending_proposals.pop(job_id, []):
+            try:
+                self.engine.on_proposal(msg)
+            except Exception as e:
+                self.logger.warning(f"Replaying pending proposal for {job_id} failed: {e}")
+        for msg in self.pending_prepares.pop(job_id, []):
+            try:
+                self.engine.on_prepare(msg)
+            except Exception as e:
+                self.logger.warning(f"Replaying pending prepare for {job_id} failed: {e}")
+        for msg in self.pending_commits.pop(job_id, []):
+            try:
+                self.engine.on_commit(msg)
+            except Exception as e:
+                self.logger.warning(f"Replaying pending commit for {job_id} failed: {e}")
 
     def _update_ready_jobs(self, jobs: list[str]):
         for j in jobs:
@@ -495,6 +890,19 @@ class ResourceAgent(Agent):
         mab_active = self.mab_enabled and self.mab_manager is not None
         active_groups = set(self._get_active_child_groups())
 
+        # Bulk-prefetch every (job, child_group) state in ONE MGET — the per-pair
+        # get() loop paid a WAN round-trip per delegated job per group on every tick
+        # (D jobs x G groups round-trips; a coordinator's dominant Redis cost).
+        pairs = [(job_id, g)
+                 for job_id, info in list(self.delegated_jobs.items())
+                 for g in info.get('groups', [])]
+        try:
+            prefetched = self.repository.get_many_grouped(
+                pairs, key_prefix=Repository.KEY_JOB, level=self.topology.level - 1)
+        except Exception as e:
+            self.logger.warning(f"Delegation prefetch failed, skipping this tick: {e}")
+            return
+
         # Check all delegated jobs
         for job_id, delegation_info in list(self.delegated_jobs.items()):
             delegated_at = delegation_info.get('delegated_at', 0)
@@ -517,15 +925,11 @@ class ResourceAgent(Agent):
             job_found = False
             job_complete = False
             job_exit_status = 0
+            completed_group = None
 
             for child_group in child_groups:
                 try:
-                    job_data = self.repository.get(
-                        obj_id=job_id,
-                        key_prefix=Repository.KEY_JOB,
-                        level=self.topology.level - 1,
-                        group=child_group
-                    )
+                    job_data = prefetched.get((job_id, child_group))
 
                     if job_data:
                         job_found = True
@@ -533,6 +937,7 @@ class ResourceAgent(Agent):
 
                         if job_state == ObjectState.COMPLETE.value:
                             job_complete = True
+                            completed_group = child_group
                             job_exit_status = int(job_data.get('exit_status', 0))
                             self.logger.debug(
                                 f"Delegated job {job_id} COMPLETE at child group {child_group}, "
@@ -564,18 +969,16 @@ class ResourceAgent(Agent):
                         f"group {child_group}: {e}"
                     )
 
-            # Feed MAB reward for completed jobs
-            if mab_active and job_complete:
-                delegated_group = self.job_delegation_map.get(job_id)
-                if delegated_group is not None:
-                    success = (job_exit_status == 0)
-                    self.mab_manager.report_outcome(delegated_group, job_id, success)
-                    # Track in metrics
-                    reward = 1.0 if success else -1.0
-                    self.metrics.mab_rewards.setdefault(delegated_group, []).append(
-                        (current_time, reward)
-                    )
-                    self.job_delegation_map.remove(job_id)
+            # Feed MAB reward for completed jobs — credit the group where
+            # completion was observed (works for any top_k)
+            if mab_active and job_complete and completed_group is not None:
+                success = (job_exit_status == 0)
+                latency_s = time_since_delegation if delegated_at else None
+                reward = self.mab_manager.report_outcome(
+                    completed_group, job_id, success, latency_s=latency_s)
+                self.metrics.mab_rewards.setdefault(completed_group, []).append(
+                    (current_time, reward)
+                )
 
             # Re-add to parent queue if timed out and still pending or not found
             if timed_out and (not job_found or job_still_pending):
@@ -583,9 +986,6 @@ class ResourceAgent(Agent):
 
         for job_id in jobs_processed:
             self.delegated_jobs.remove(job_id)
-            # Clean up delegation map entry if not already handled by MAB
-            if job_id in self.job_delegation_map:
-                self.job_delegation_map.remove(job_id)
             # Propagate completion to L1: mark the parent-level job as COMPLETE
             try:
                 parent_job_data = self.repository.get(
@@ -614,15 +1014,15 @@ class ResourceAgent(Agent):
 
         # Process reassignments
         for job_id, delegation_info, time_since_delegation in jobs_to_reassign:
-            # Report failure to MAB when delegation times out
+            # Report timeout failure to MAB for every group the job was
+            # delegated to — none of them completed it
             if mab_active:
-                delegated_group = self.job_delegation_map.get(job_id)
-                if delegated_group is not None:
-                    self.mab_manager.report_outcome(delegated_group, job_id, success=False)
+                for delegated_group in delegation_info.get('groups', []):
+                    reward = self.mab_manager.report_outcome(
+                        delegated_group, job_id, success=False, timed_out=True)
                     self.metrics.mab_rewards.setdefault(delegated_group, []).append(
-                        (current_time, -1.0)
+                        (current_time, reward)
                     )
-                    self.job_delegation_map.remove(job_id)
             self._reassign_delegated_job(job_id, delegation_info, time_since_delegation)
 
     def _reassign_delegated_job(self, job_id: str, delegation_info: dict, time_since_delegation: float):
@@ -932,8 +1332,10 @@ class ResourceAgent(Agent):
                 proposed_load=proposed_load,
                 last_updated=current_time,
                 dtns=self.config.get("dtns"),
+                quantum_backend=self.quantum_backend,
                 group=self.topology.group,
-                level=self.topology.level
+                level=self.topology.level,
+                site=self.site
             )
         # Non-leaf agent: aggregate info from children in actively-led groups only
         else:
@@ -944,6 +1346,10 @@ class ResourceAgent(Agent):
             # Aggregate DTNs with proper connectivity score averaging
             # Track: {dtn_name: {'scores': [list of scores], 'info': DataNode}}
             dtn_aggregation = {}
+
+            # Best (max-qubit) quantum backend across children — an optimistic
+            # aggregate with the same limitation as max_child_capacity
+            best_backend = None
 
             active_groups = set(self._get_active_child_groups())
 
@@ -957,10 +1363,14 @@ class ResourceAgent(Agent):
                 if max_child_capacity is None:
                     max_child_capacity = Capacities(**child.capacities.to_dict())
                 else:
-                    for field in ['cpu', 'core', 'gpu', 'ram', 'disk', 'bw', 'burst_size', 'unit', 'mtu']:
+                    for field in ['cpu', 'core', 'gpu', 'ram', 'disk', 'bw', 'burst_size', 'unit', 'mtu', 'qubits']:
                         current_max = getattr(max_child_capacity, field)
                         child_value = getattr(child.capacities, field)
                         setattr(max_child_capacity, field, max(current_max, child_value))
+
+                if child.quantum_backend is not None:
+                    if best_backend is None or child.quantum_backend.qubits > best_backend.qubits:
+                        best_backend = child.quantum_backend
 
                 if child.dtns:
                     for dtn_name, dtn_obj in child.dtns.items():
@@ -997,14 +1407,81 @@ class ResourceAgent(Agent):
                 load=self._load,
                 last_updated=current_time,
                 dtns=dtns,
+                quantum_backend=best_backend,
                 proposed_load=proposed_load,
                 group=self.topology.group,
-                level=self.topology.level
+                level=self.topology.level,
+                site=self.site
             )
 
         return agent_info
 
+    def _agent_key_ttl_s(self) -> int:
+        """TTL for this agent's Redis key: comfortably above the peer-expiry threshold
+        (refreshed every ~0.5s tick, so only a dead agent's key ever expires)."""
+        expiry = int(self.runtime_config.get("peer_expiry_seconds", 300))
+        return max(60, expiry * 2)
+
+    def _should_full_neighbor_refresh(self, now: float) -> bool:
+        """Full (Redis) neighbor refresh cadence. Per-tick without gossip (status quo);
+        with gossip enabled the default drops to 5s — gossip keeps `load` fresh in
+        between, and liveness is SWIM's job anyway (5s lag is far under the 45-300s
+        peer-expiry threshold)."""
+        default = 5.0 if self.gossip is not None else 0.0
+        interval = float(self.runtime_config.get("neighbor_refresh_full_s", default))
+        last = getattr(self, "_last_full_neighbor_refresh", 0.0)
+        if now - last >= interval:
+            self._last_full_neighbor_refresh = now
+            return True
+        return False
+
+    def _apply_gossip_overlay(self) -> None:
+        """Refresh the fast-changing `load` on neighbor_map entries from the gossip
+        cache. Gossip propagates in ~1-2 epidemic rounds, so between full refreshes
+        selection costs use FRESHER load than the old per-tick Redis poll provided."""
+        if self.gossip is None:
+            return
+        try:
+            for entry in self.gossip.snapshot():
+                if entry.agent_id == self.agent_id:
+                    continue
+                info = self.neighbor_map.get(entry.agent_id)
+                if info is not None:
+                    info.load = float(entry.load)
+        except Exception as exc:
+            self.logger.debug(f"[gossip] overlay failed: {exc}")
+
     def on_periodic(self):
+        # Start SWIM lazily on first tick (transport and neighbor_map are ready by now).
+        if self.swim is not None and getattr(self.swim, "_thread", None) is None:
+            self.swim.start()
+            self.logger.info("[SWIM] membership protocol started")
+
+        # Same for gossip dissemination.
+        if self.gossip is not None and getattr(self.gossip, "_thread", None) is None:
+            self.gossip.start()
+            self.logger.info("[gossip] state disseminator started")
+
+        # Snow engine driver thread.
+        if isinstance(self.engine, GossipConsensusEngine) \
+                and getattr(self.engine, "_thread", None) is None:
+            self.engine.start()
+            self.logger.info("[snow] consensus engine started")
+
+        # Refresh our own gossip entry every tick so peers' TTLs don't expire us.
+        if self.gossip is not None:
+            try:
+                cap = self._capacities
+                alloc = self.capacity_allocations
+                self.gossip.publish_local(
+                    cpu_util=(alloc.core / cap.core * 100.0) if cap.core else 0.0,
+                    ram_util=(alloc.ram / cap.ram * 100.0) if cap.ram else 0.0,
+                    disk_util=(alloc.disk / cap.disk * 100.0) if cap.disk else 0.0,
+                    load=float(self._load),
+                )
+            except Exception as exc:
+                self.logger.debug(f"[gossip] publish_local failed: {exc}")
+
         self._restart_selection()
         self._monitor_delegated_jobs()
         current_time = int(time.time())
@@ -1018,11 +1495,23 @@ class ResourceAgent(Agent):
             self._check_failure_threshold()
 
         agent_info = self._generate_agent_info()
-        self.repository.save(agent_info.to_dict(), key_prefix=Repository.KEY_AGENT,
-                             level=self.topology.level,
-                             group=self.topology.group)
+        self.last_agent_info = agent_info  # snapshot reused by inbound hot paths
+        # save_fast: agent-info is single-writer (only this agent writes its key), so the
+        # WATCH/read-back optimistic lock was pure overhead. TTL lets dead agents' keys
+        # age out of Redis instead of accumulating forever.
+        self.repository.save_fast(agent_info.to_dict(), key_prefix=Repository.KEY_AGENT,
+                                  level=self.topology.level,
+                                  group=self.topology.group,
+                                  ttl_s=self._agent_key_ttl_s())
 
-        self._refresh_neighbors(current_time=current_time)
+        # Gossip-fed neighbor state (design intent of gossip Phase 2, now wired):
+        # when gossip is on, the fast-changing field (load) arrives via the epidemic
+        # cache every tick, and the FULL Redis refresh (every peer's 2-5KB object —
+        # O(N) payload per agent per tick, the 1000-agent read-amplification wall)
+        # drops to a slow cadence for the slow-changing fields (capacities/DTNs/host).
+        if self._should_full_neighbor_refresh(current_time):
+            self._refresh_neighbors(current_time=current_time)
+        self._apply_gossip_overlay()
 
         # Batch update job sets (single Redis pipeline round-trip)
         group = self.topology.group
@@ -1039,6 +1528,37 @@ class ResourceAgent(Agent):
         #self.save_neighbors()
 
         self.check_queue()
+        self._log_perf_stats(current_time)
+
+    # Emit one [STATS] line every ~30s so scaling bottlenecks are observable in agent
+    # logs without a profiler (see docs/SCALABILITY_REVIEW.md Phase 0).
+    _stats_interval_s = 30
+
+    def _log_perf_stats(self, now: float) -> None:
+        last = getattr(self, "_stats_last_logged", 0)
+        if now - last < self._stats_interval_s:
+            return
+        self._stats_last_logged = now
+        try:
+            cache = self.selector.cache_stats()
+            parts = [
+                f"cache_hit_rate={cache['hit_rate']:.2f} ({cache['hits']}/{cache['hits'] + cache['misses']})",
+                f"inbound_q={self.queues.message_queue.qsize()}",
+                f"msgs_dropped={self.messages_dropped}",
+                f"pending_consensus_dropped={self.pending_consensus_dropped}",
+                f"watch_retries={self.repository.watch_retries}/{self.repository.saves} saves",
+            ]
+            t = getattr(self, "transport", None)
+            if t is not None and getattr(t, "broadcasts", 0):
+                parts.append(
+                    f"bcast_mean={t.broadcast_time_total / t.broadcasts:.3f}s "
+                    f"max={t.broadcast_time_max:.3f}s n={t.broadcasts} "
+                    f"bcast_dropped={getattr(t, 'bcast_sends_dropped', 0)}")
+            if isinstance(self.engine, GossipConsensusEngine):
+                parts.append(f"snow_sends_dropped={self.engine.sends_dropped}")
+            self.logger.info("[STATS] " + " ".join(parts))
+        except Exception as exc:
+            self.logger.debug(f"stats logging failed: {exc}")
 
     def is_job_feasible(self, job: Job, agent: AgentInfo) -> bool:
         """
@@ -1085,6 +1605,10 @@ class ResourceAgent(Agent):
 
                 # Check if child has sufficient capacity for this job
                 if not self._has_sufficient_capacity(job, child_info.capacities):
+                    continue  # Skip this child, try next
+
+                # Quantum component requires a child backend meeting the spec
+                if not self._quantum_feasible(job, child_info.quantum_backend):
                     continue  # Skip this child, try next
 
                 # Check child DTN connectivity only if job requires DTNs
@@ -1150,6 +1674,15 @@ class ResourceAgent(Agent):
             self.logger.debug(f"Agent: {self.agent_id} does not have capacity for Job {job.job_id}")
             return False
 
+        # Quantum component: agent (or, for parents, its best child backend)
+        # must meet the spec's qubit/CLOPS/arch/fidelity/gate-set requirements
+        if not self._quantum_feasible(job, agent.quantum_backend):
+            self.logger.debug(
+                f"[QPU] Agent {agent.agent_id} backend {agent.quantum_backend} "
+                f"cannot run quantum spec of Job {job.job_id}"
+            )
+            return False
+
         # DTN connectivity check using aggregated DTN info from peer's children
         # NOTE: This checks if the peer has ANY children with required DTNs,
         # not whether a SINGLE child has all required DTNs (see limitation above)
@@ -1193,15 +1726,32 @@ class ResourceAgent(Agent):
             rout = {e.name for e in (job.data_out or [])}
             job._required_dtns_cache = frozenset((rin | rout) - {"local"})
         caps = job.capacities
+        spec = job.quantum
+        quantum_sig = None
+        if spec is not None:
+            quantum_sig = (
+                spec.qubits, spec.circuit_depth, spec.required_shots(),
+                spec.iterations, spec.hybrid, spec.arch,
+                round(spec.fidelity, 4), spec.clops,
+            )
+        pred = job.data_predicate
+        pred_sig = None
+        if pred:
+            pred_sig = (pred.get("experiment_id"), int(pred.get("min_snapshots", 1)),
+                        int(pred.get("total_snapshots", 1)))
         return (
             job.job_id,
             round(caps.core, 3),
             round(caps.ram, 3),
             round(caps.disk, 3),
             round(getattr(caps, "gpu", 0.0), 3),
+            round(getattr(caps, "qubits", 0.0), 3),
             round(job.wall_time or 0.0, 3),
             job.job_type or "",
             job._required_dtns_cache,
+            quantum_sig,
+            job.sub_role,
+            pred_sig,
             #job.state.value,  # flips when PENDING→READY/COMPLETE, invalidates cache automatically
         )
 
@@ -1218,18 +1768,29 @@ class ResourceAgent(Agent):
                 return (name, round(float(score), 3))
             dtn_pairs = tuple(sorted(_pair(x) for x in (agent.dtns or [])))
 
+        backend = agent.quantum_backend
+        backend_sig = None
+        if backend is not None:
+            backend_sig = (
+                backend.name, backend.arch, backend.qubits, backend.clops,
+                round(backend.gate_fidelity, 4), round(backend.error_rate, 4),
+                round(backend.calibration_downtime_pct, 3),
+            )
         return (
             agent.agent_id, agent.version,
-            caps.core, caps.ram, caps.disk, caps.gpu,
+            caps.core, caps.ram, caps.disk, caps.gpu, getattr(caps, "qubits", 0),
             #round(caps.core, 3), round(caps.ram, 3), round(caps.disk, 3), round(getattr(caps, "gpu", 0.0), 3),
             dtn_pairs,
+            backend_sig,
         )
 
     def compute_job_cost(
             self,  # now uses self so it can read config defaults
             job: Job,
             total: Capacities,
-            dtns: dict[str, DataNode]
+            dtns: dict[str, DataNode],
+            backend: Optional[QuantumBackend] = None,
+            site: Optional[str] = None
     ) -> float:
         """
         Compute the cost of executing a job on an agent based on weighted resource usage,
@@ -1239,6 +1800,8 @@ class ResourceAgent(Agent):
           - High single-resource utilization (bottleneck penalty)
           - Long execution times beyond a configurable threshold
           - Poor connectivity to DTNs required by the job
+          - Quantum backend quality (error rate + calibration downtime) and
+            estimated quantum execution time, for jobs with a quantum component
 
         :param job: The job whose cost is to be computed.
         :type job: Job
@@ -1246,6 +1809,8 @@ class ResourceAgent(Agent):
         :type total: Capacities
         :param dtns: DTN info for the agent
         :type dtns: dict[str, DataNode]
+        :param backend: Quantum backend of the agent (None for classical agents)
+        :type backend: Optional[QuantumBackend]
         :return: Calculated job cost (higher is more expensive).
         :rtype: float
         """
@@ -1255,6 +1820,7 @@ class ResourceAgent(Agent):
         ram_weight = self.ram_weight
         disk_weight = self.disk_weight
         gpu_weight = self.gpu_weight
+        qpu_weight = self.qpu_weight
         long_job_threshold = self.long_job_threshold
         connectivity_penalty_factor = self.connectivity_penalty_factor
 
@@ -1286,13 +1852,21 @@ class ResourceAgent(Agent):
                 cpu_weight *= 0.7
                 ram_weight *= 0.7
                 disk_weight *= 0.7
+            elif "quantum" in jt or "hybrid" in jt:
+                # QPU is the scarce resource for quantum/hybrid jobs
+                qpu_weight = max(qpu_weight, 0.1) * 1.5
+                cpu_weight *= 0.7
+                ram_weight *= 0.7
+                disk_weight *= 0.7
+                gpu_weight *= 0.7
 
             # Normalize weights to sum to ~1
-            total_w = cpu_weight + ram_weight + disk_weight + gpu_weight
+            total_w = cpu_weight + ram_weight + disk_weight + gpu_weight + qpu_weight
             cpu_weight /= total_w
             ram_weight /= total_w
             disk_weight /= total_w
             gpu_weight /= total_w
+            qpu_weight /= total_w
 
             # Execution time sensitivity
             if "long" in jt:
@@ -1310,28 +1884,40 @@ class ResourceAgent(Agent):
         total_gpu = getattr(total, "gpu", 0) or 1
         job_gpu = getattr(job.capacities, "gpu", 0)
 
+        # Prevent division by zero for QPUs (qubits)
+        total_qubits = getattr(total, "qubits", 0) or 1
+        job_qubits = getattr(job.capacities, "qubits", 0)
+
         # Resource usage ratios
         core_ratio = job.capacities.core / total.core
         ram_ratio = job.capacities.ram / total.ram
         disk_ratio = job.capacities.disk / total.disk
         gpu_ratio = job_gpu / total_gpu
+        qpu_ratio = job_qubits / total_qubits
 
         # Weighted base score
         base_score = (
                 cpu_weight * core_ratio +
                 ram_weight * ram_ratio +
                 disk_weight * disk_ratio +
-                gpu_weight * gpu_ratio
+                gpu_weight * gpu_ratio +
+                qpu_weight * qpu_ratio
         )
 
         # Bottleneck penalty
-        bottleneck_penalty = max(core_ratio, ram_ratio, disk_ratio, gpu_ratio) ** 2
+        bottleneck_penalty = max(core_ratio, ram_ratio, disk_ratio, gpu_ratio, qpu_ratio) ** 2
+
+        # Effective runtime includes the quantum component estimated from the
+        # backend's CLOPS: iterations * shots * depth / CLOPS
+        effective_wall_time = job.wall_time or 0.0
+        if job.quantum is not None and backend is not None:
+            effective_wall_time += job.quantum.estimated_quantum_time(backend.clops)
 
         # Execution time penalty
-        if job.wall_time > long_job_threshold:
-            time_penalty = 1.5 + (job.wall_time - long_job_threshold) / long_job_threshold
+        if effective_wall_time > long_job_threshold:
+            time_penalty = 1.5 + (effective_wall_time - long_job_threshold) / long_job_threshold
         else:
-            time_penalty = 1 + (job.wall_time / long_job_threshold) ** 2
+            time_penalty = 1 + (effective_wall_time / long_job_threshold) ** 2
 
         # DTN connectivity penalty
         avg_conn = 1.0
@@ -1346,8 +1932,28 @@ class ResourceAgent(Agent):
 
         connectivity_penalty = 1 + connectivity_penalty_factor * (1 - avg_conn)
 
+        # Quantum backend quality penalty: noisier or calibration-heavy backends
+        # cost more for jobs with a quantum component (re-execution/wait risk)
+        quantum_penalty = 1.0
+        if job.quantum is not None and backend is not None:
+            quantum_penalty = 1 + self.quantum_penalty_factor * backend.quality_penalty_factor()
+
+        # Split-hybrid communication penalty: a stream consumer placed off the
+        # producer's site pays per-iteration measurement transfer. Predicate
+        # gating guarantees the producer (and its site key) exists before this
+        # job is ever costed, so the lookup is stable and cacheable.
+        comm_penalty = 1.0
+        pred = job.data_predicate
+        if pred and self.split_comm_penalty_factor > 0:
+            producer_site = self.measurement_layer.producer_site(pred.get("experiment_id", ""))
+            comm_penalty = split_comm_penalty(
+                self.split_comm_penalty_factor,
+                int(pred.get("total_snapshots", 1)),
+                site, producer_site)
+
         # Final cost
-        cost = (base_score + bottleneck_penalty) * time_penalty * connectivity_penalty * 100
+        cost = ((base_score + bottleneck_penalty) * time_penalty * connectivity_penalty
+                * quantum_penalty * comm_penalty * 100)
         return round(cost, 2)
 
 
@@ -1370,6 +1976,19 @@ class ResourceAgent(Agent):
                     self.queues.pending_event.wait(timeout=0.5)
                     self.queues.pending_event.clear()
                     continue
+
+                # Data-triggered gating: jobs whose data predicate isn't
+                # satisfied yet (e.g. "at least N snapshots from experiment X")
+                # stay PENDING at the back of the queue until the data exists
+                gated = [j for j in pending_jobs if not self._data_predicate_ready(j)]
+                if gated:
+                    for job in gated:
+                        self.queues.pending_queue.move_to_end(job)
+                    pending_jobs = [j for j in pending_jobs if j not in gated]
+                    if not pending_jobs:
+                        time.sleep(0.5)
+                        continue
+
                 proposals = []
                 jobs = []
 
@@ -1447,6 +2066,7 @@ class ResourceAgent(Agent):
                         proposals.append(proposal)
                         job.state = ObjectState.PRE_PREPARE
 
+                proposed_this_iter = len(proposals) > 0
                 if len(proposals):
                     self.logger.debug(f"Identified jobs to propose: {proposals}")
                     if self.debug:
@@ -1470,8 +2090,16 @@ class ResourceAgent(Agent):
                 # This handles jobs stuck due to agent failures where consensus was cleared
                 #self._reset_orphaned_jobs()
 
-                self.queues.pending_event.wait(timeout=0.5)
-                self.queues.pending_event.clear()
+                # Skip the inter-batch wait ONLY when this iteration proposed something
+                # AND the batch came back full (real backlog likely behind it). Skipping
+                # on any-PENDING-remaining busy-spun the loop over jobs deferred to
+                # better-suited peers (they stay PENDING locally), recomputing the cost
+                # matrix at full CPU — measured as L0 0.08s->1.44s and ~2x throughput
+                # loss. The wait is load-bearing backoff for the contended/deferred case.
+                backlog_full = len(pending_jobs) >= self.proposal_job_batch_size
+                if not (proposed_this_iter and backlog_full):
+                    self.queues.pending_event.wait(timeout=0.5)
+                    self.queues.pending_event.clear()
             except Exception as e:
                 self.logger.error(f"Error occurred while executing e: {e}")
                 self.logger.error(traceback.format_exc())
@@ -1728,6 +2356,25 @@ class ResourceAgent(Agent):
                             )
                             capable_groups = active_groups
 
+                        # Liveness gate (Scenario C fix): drop groups with no
+                        # fresh child heartbeats before the bandit sees them.
+                        # If everything looks dead, keep the ungated list so
+                        # delegation never stalls on a transient blind spot.
+                        live_groups = self._get_live_child_groups()
+                        gated = [g for g in capable_groups if g in live_groups]
+                        if gated:
+                            if len(gated) < len(capable_groups):
+                                self.logger.debug(
+                                    f"Liveness gate for job {job_id}: excluded "
+                                    f"{sorted(set(capable_groups) - set(gated))}"
+                                )
+                            capable_groups = gated
+                        else:
+                            self.logger.warning(
+                                f"Liveness gate found no live child groups for job "
+                                f"{job_id}; delegating ungated"
+                            )
+
                         # MAB-guided selection: pick top_k groups instead of all
                         if self.mab_enabled and self.mab_manager:
                             selected_groups = self.mab_manager.select_groups(
@@ -1761,10 +2408,6 @@ class ResourceAgent(Agent):
                             'delegated_at': time.time(),
                             'groups': selected_groups
                         })
-
-                        # Track which group this job was delegated to for MAB reward attribution
-                        if self.mab_enabled and self.mab_manager and len(selected_groups) == 1:
-                            self.job_delegation_map.set(job_id, selected_groups[0])
 
                         self.logger.debug(
                             f"Tracking delegated job {job_id} for monitoring "
@@ -1818,7 +2461,21 @@ class ResourceAgent(Agent):
         try:
             job_id = job.job_id
             self.logger.info(f"[EXECUTE] Starting job {job_id} on agent {self.agent_id}")
-            job.execute()
+            if job.sub_role == "quantum":
+                # Split hybrid: produce snapshot batches into the measurement layer
+                job.execute_producer(self.measurement_layer, site=self.site)
+            elif job.sub_role == "classical" and job.data_predicate:
+                # Split hybrid / post-processing: consume the snapshot stream,
+                # persisting partial state each update (stateful job pool)
+                job.execute_consumer(
+                    self.measurement_layer,
+                    timeout_s=self.consumer_timeout_s,
+                    persist_cb=lambda j: self.repository.save(
+                        obj=j.to_dict(), key_prefix=Repository.KEY_JOB,
+                        level=self.topology.level, group=self.topology.group),
+                )
+            else:
+                job.execute()
 
             # Simulated failure injection for MAB testing (overrides real exit_status)
             if self.failure_sim_enabled:
@@ -1829,6 +2486,11 @@ class ResourceAgent(Agent):
                         f"[FAILURE_SIM] Injected failure for job {job_id} on agent {self.agent_id} "
                         f"(rate={fail_rate:.2f})"
                     )
+
+            # Self-expanding pool: successful one-shot quantum jobs with
+            # post_process push a classical post-processing job (data-triggered)
+            if job.sub_role is None and job.exit_status == 0:
+                self._maybe_push_post_process(job)
 
             # Always persist job with exit_status so parent coordinator can read outcome
             self.repository.save(
@@ -1859,15 +2521,89 @@ class ResourceAgent(Agent):
             except Exception as e:
                 self.logger.error(f"Failed to persist failure status for job {job}: {e}")
 
+    def _maybe_push_post_process(self, job: Job):
+        """
+        Quantum agents feeding the classical pool: after a one-shot quantum
+        job with post_process completes, publish its measurements to the data
+        layer and push a classical post-processing job. The pool self-expands
+        — the successor job exists only because measurement data now does.
+        """
+        spec = job.quantum
+        if spec is None or spec.hybrid or not spec.post_process:
+            return
+        try:
+            exp = job.experiment_id or experiment_id_for(job.job_id)
+            self.measurement_layer.announce_producer(exp, self.site)
+            self.measurement_layer.publish(exp, {
+                "job_id": job.job_id,
+                "shots": spec.required_shots(),
+                "output_type": spec.output_type,
+            })
+            post = Job()
+            post.from_dict({**build_post_process_job(job.job_id, exp, spec.output_type),
+                            "state": ObjectState.PENDING.value})
+            post.level = self.topology.level
+            post.mark_submitted()
+            self.repository.save(obj=post.to_dict(), key_prefix=Repository.KEY_JOB,
+                                 level=self.topology.level, group=self.topology.group)
+            self.logger.info(
+                f"[POOL_PUSH] Agent {self.agent_id} pushed post-processing job "
+                f"{post.job_id} for experiment {exp}")
+        except Exception as e:
+            self.logger.error(f"Failed to push post-process job for {job.job_id}: {e}")
+
     def _get_failure_rate(self, job: Job) -> float:
         """Determine failure probability for a job: per-agent > per-job-type > base."""
-        agent_key = str(self.agent_id)
-        if agent_key in self.failure_sim_per_agent:
-            return float(self.failure_sim_per_agent[agent_key])
-        job_type = getattr(job, 'job_type', None)
-        if job_type and job_type in self.failure_sim_per_job_type:
-            return float(self.failure_sim_per_job_type[job_type])
-        return self.failure_sim_base_prob
+        elapsed = time.time() - self.failure_sim_start
+        per_agent, per_job_type, phase_idx = self._select_failure_phase(
+            elapsed, self.failure_sim_phases,
+            self.failure_sim_per_agent, self.failure_sim_per_job_type)
+        if phase_idx != self._failure_sim_phase_logged:
+            self._failure_sim_phase_logged = phase_idx
+            self.logger.info(
+                f"[FAILURE_SIM] phase {phase_idx} active (elapsed {elapsed:.0f}s)")
+        return self._resolve_failure_rate(
+            agent_key=str(self.agent_id),
+            job_type=getattr(job, 'job_type', None),
+            per_agent=per_agent,
+            per_job_type=per_job_type,
+            base=self.failure_sim_base_prob,
+        )
+
+    @staticmethod
+    def _select_failure_phase(elapsed: float, phases: list,
+                              per_agent: dict, per_job_type: dict):
+        """Pick the active failure profile: the last phase whose after_s has
+        elapsed replaces the base rates. Returns (per_agent, per_job_type,
+        phase_index) with phase_index -1 for the base profile."""
+        active = -1
+        for i, phase in enumerate(phases):
+            if elapsed >= float(phase.get("after_s", 0)):
+                per_agent = phase.get("per_agent_failure_rates", per_agent)
+                per_job_type = phase.get("per_job_type_failure_rates", per_job_type)
+                active = i
+        return per_agent, per_job_type, active
+
+    @staticmethod
+    def _resolve_failure_rate(agent_key: str, job_type: Optional[str],
+                              per_agent: dict, per_job_type: dict,
+                              base: float) -> float:
+        """Per-agent entries may be a flat rate or a per-job-type dict
+        ({job_type: rate, "default": rate}) so failure profiles can depend on
+        (agent, job type) — the regime where contextual delegation beats
+        context-blind (see docs/CONTEXTUAL_BANDIT_DESIGN.md section 8)."""
+        entry = per_agent.get(agent_key)
+        if entry is not None:
+            if isinstance(entry, dict):
+                if job_type is not None and job_type in entry:
+                    return float(entry[job_type])
+                if "default" in entry:
+                    return float(entry["default"])
+            else:
+                return float(entry)
+        if job_type and job_type in per_job_type:
+            return float(per_job_type[job_type])
+        return base
 
 
     def on_shutdown(self):
@@ -1879,11 +2615,30 @@ class ResourceAgent(Agent):
                              group=self.topology.group)
         self.logger.info(f"Agent {self.agent_id} marked as shutting_down in Redis")
 
+        if self.swim is not None:
+            try:
+                self.swim.stop()
+            except Exception as exc:
+                self.logger.debug(f"SWIM stop raised: {exc}")
+
+        if self.gossip is not None:
+            try:
+                self.gossip.stop()
+            except Exception as exc:
+                self.logger.debug(f"gossip stop raised: {exc}")
+
+        if isinstance(self.engine, GossipConsensusEngine):
+            try:
+                self.engine.stop()
+            except Exception as exc:
+                self.logger.debug(f"snow engine stop raised: {exc}")
+
         self.executor.shutdown(wait=True)
         self.save_results()
 
     def _cost_job_on_agent(self, job: Job, agent: AgentInfo) -> float:
-        return self.compute_job_cost(job=job, total=agent.capacities, dtns=agent.dtns)
+        return self.compute_job_cost(job=job, total=agent.capacities, dtns=agent.dtns,
+                                     backend=agent.quantum_backend, site=agent.site)
 
     @staticmethod
     def _projected_load_factor(agent: AgentInfo) -> float:

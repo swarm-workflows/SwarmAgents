@@ -23,6 +23,7 @@
 # Author: Komal Thareja(kthare10@renci.org)
 
 import json
+import queue
 import logging
 import os
 import threading
@@ -50,6 +51,7 @@ class Agent(Observer):
     def __init__(self, agent_id: int, config_file: str, debug: bool = False):
         self.debug = debug
         self.agent_id = agent_id
+        self.messages_dropped = 0  # inbound messages shed by the bounded queue
         self.neighbor_map = ThreadSafeDict[int, AgentInfo]()
         self.children = ThreadSafeDict[int, AgentInfo]()
         self.parents = ThreadSafeDict[int, AgentInfo]()
@@ -217,15 +219,27 @@ class Agent(Observer):
             msg_name = MessageType(message_type)
             fwd = payload.get("forwarded_by")
 
-            # Log message
-            log_msg = f"[IN] [{msg_name}] [SRC: {source_agent_id}]"
-            if fwd:
-                log_msg += f" [FWD: {fwd}]"
-            log_msg += f", Payload: {json.dumps(payload)}"
-            self.logger.debug(log_msg)
+            # Log message. Guarded: the json.dumps of every payload otherwise runs even
+            # with DEBUG off — a large per-message CPU tax on the inbound path exactly
+            # when the consumer is the bottleneck (measured: queue pinned at 20k).
+            if self.logger.isEnabledFor(logging.DEBUG):
+                log_msg = f"[IN] [{msg_name}] [SRC: {source_agent_id}]"
+                if fwd:
+                    log_msg += f" [FWD: {fwd}]"
+                log_msg += f", Payload: {json.dumps(payload)}"
+                self.logger.debug(log_msg)
 
-            # Queue message
-            self.queues.message_queue.put_nowait(payload)
+            # Queue message; the queue is bounded — under overload drop-and-count instead
+            # of growing without limit (consensus re-proposal recovers dropped votes).
+            try:
+                self.queues.message_queue.put_nowait(payload)
+            except queue.Full:
+                self.messages_dropped += 1
+                if self.messages_dropped % 1000 == 1:
+                    self.logger.warning(
+                        f"Inbound queue full ({self.queues.message_queue.maxsize}); "
+                        f"dropped {self.messages_dropped} messages so far")
+                return
             self.queues.message_event.set()
 
             with self.condition:
@@ -235,15 +249,37 @@ class Agent(Observer):
             self.logger.debug(f"Failed to enqueue message: {message}, error: {e}")
 
     def broadcast(self, message: Message):
+        # Skip peers known to be FAILED (SWIM failed set and/or heartbeat detection) —
+        # otherwise every consensus phase pays full send timeouts for dead peers.
+        # SWIM SUSPECT peers still receive traffic so they can refute the suspicion.
+        peers = self.topology.peers
+        skip = set()
+        swim = getattr(self, "swim", None)
+        if swim is not None:
+            try:
+                skip.update(swim.failed_agents())
+            except Exception:
+                pass
+        failed_map = getattr(self, "failed_agents", None)
+        if failed_map is not None:
+            try:
+                skip.update(failed_map.keys())
+            except Exception:
+                pass
+        if skip:
+            peers = [p for p in peers if p not in skip]
         self.transport.broadcast(payload=message,
-                                 peers=self.topology.peers,
+                                 peers=peers,
                                  neighbor_map=self.neighbor_map,
                                  sender=self.agent_id)
 
-    def send(self, dest: int, payload: object) -> None:
+    def send(self, dest: int, payload: object, timeout: float = 2.0, retries: int = 4) -> None:
         peer_info = self.neighbor_map.get(dest)
+        if peer_info is None:
+            return
         self.transport.send(host=peer_info.host, port=peer_info.port, payload=payload,
-                      dest=peer_info.agent_id, src=self.agent_id)
+                      dest=peer_info.agent_id, src=self.agent_id,
+                      timeout=timeout, retries=retries)
 
     def calculate_quorum(self) -> int:
         # Simple majority quorum calculation

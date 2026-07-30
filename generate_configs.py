@@ -19,6 +19,24 @@ INSTANCE_FLAVORS = [
 
 DEFAULT_FLAVOR_PERCENTAGES = [0.4, 0.25, 0.15, 0.15, 0.05]
 
+# Quantum backends assignable to agents via --quantum-agents-pct.
+# Mix of noisy simulators and hardware-like profiles across architectures
+# (CLOPS/fidelity values are representative, not vendor measurements).
+QUANTUM_BACKEND_CATALOG = [
+    {"name": "aer-sim-64", "arch": "superconducting", "qubits": 64, "clops": 100000,
+     "gate_fidelity": 0.999, "error_rate": 0.001, "calibration_downtime_pct": 0.0,
+     "simulator": True},
+    {"name": "heron-133", "arch": "superconducting", "qubits": 133, "clops": 150000,
+     "gate_fidelity": 0.998, "error_rate": 0.002, "calibration_downtime_pct": 0.05,
+     "simulator": False},
+    {"name": "aqt-ion-32", "arch": "ion-trap", "qubits": 32, "clops": 2000,
+     "gate_fidelity": 0.9995, "error_rate": 0.0005, "calibration_downtime_pct": 0.08,
+     "simulator": False},
+    {"name": "neutral-atom-100", "arch": "neutral-atom", "qubits": 100, "clops": 5000,
+     "gate_fidelity": 0.995, "error_rate": 0.005, "calibration_downtime_pct": 0.1,
+     "simulator": False},
+]
+
 
 class SwarmConfigGenerator:
     """
@@ -46,6 +64,7 @@ class SwarmConfigGenerator:
         agent_type: str = "resource",
         initial_group_size: Optional[int] = None,
         co_parent_count: int = 1,
+        quantum_agents_pct: float = 0.0,
     ):
         self.num_agents = num_agents
         self.jobs_per_proposal = jobs_per_proposal
@@ -73,9 +92,27 @@ class SwarmConfigGenerator:
         # co-parent count for hierarchical topology shared parenting
         self.co_parent_count = co_parent_count
 
+        # fraction of agents that own a quantum backend (0.0 = classical only)
+        self.quantum_agents_pct = quantum_agents_pct
+
         # legacy ring helper (used when no grouping flags provided for ring)
         self.rings_default = self._create_default_rings()
         self.agent_dtns_map: Dict[str, List[dict]] = self._load_agent_dtns(path=self.AGENT_DTNS)
+
+    def assign_quantum_backends(self) -> Dict[int, dict]:
+        """
+        Assign a quantum backend (round-robin from the catalog) to a random
+        subset of agents sized by quantum_agents_pct. Hierarchical level-1
+        coordinators are never assigned backends (leaf agents execute jobs).
+        """
+        if self.quantum_agents_pct <= 0:
+            return {}
+        count = max(1, round(self.quantum_agents_pct * self.num_agents))
+        chosen = random.sample(range(1, self.num_agents + 1), min(count, self.num_agents))
+        return {
+            agent_id: copy.deepcopy(QUANTUM_BACKEND_CATALOG[i % len(QUANTUM_BACKEND_CATALOG)])
+            for i, agent_id in enumerate(sorted(chosen))
+        }
 
     # -----------------------------
     # Flavor assignment
@@ -402,6 +439,7 @@ class SwarmConfigGenerator:
         self,
         flavor_percentages,
         agent_hosts: Optional[List[str]],
+        agent_sites: Optional[List[str]] = None,
         save_agent_profiles_path: str = "agent_profiles.json",
     ):
         if not os.path.exists(self.output_dir):
@@ -681,6 +719,9 @@ class SwarmConfigGenerator:
             flavor_percentages = DEFAULT_FLAVOR_PERCENTAGES
         agent_flavors = self.assign_flavors(flavor_percentages)
 
+        # Quantum backends (subset of agents when --quantum-agents-pct > 0)
+        quantum_backends = self.assign_quantum_backends()
+
         agent_profiles = {}
 
         if agent_hosts:
@@ -697,6 +738,10 @@ class SwarmConfigGenerator:
                 host_idx = (agent_id - 1) // self.agents_per_host
                 host = agent_hosts[host_idx]
                 config['grpc']['host'] = host
+                # Site label parallels the hosts file (one site per host line), so all
+                # agents on the same host share a site. Enables topology-aware Snow sampling.
+                if agent_sites and host_idx < len(agent_sites):
+                    config['site'] = agent_sites[host_idx]
                 if self.agents_per_host > 1:
                     config['grpc']['port'] += agent_id
             else:
@@ -723,6 +768,13 @@ class SwarmConfigGenerator:
             config.setdefault("redis", {})
             config["redis"]["host"] = self.db_host
             topo = agent_topo.get(agent_id, {"peers": [], "parent": None, "children": None, "group": 0, "level": 0})
+
+            # Quantum backend (execution-capable agents only, never coordinators);
+            # mirror qubit count into capacities for allocation arithmetic
+            backend = quantum_backends.get(agent_id)
+            if backend and not topo.get("children"):
+                config["quantum_backend"] = backend
+                caps['qubits'] = backend["qubits"]
 
             # Use initial_group_size for initial agents if specified (for dynamic agent addition)
             group_size_to_use = topo["group_size"]
@@ -765,6 +817,8 @@ class SwarmConfigGenerator:
                 "ram": caps['ram'],
                 "disk": caps['disk'],
                 "gpu": caps['gpu'],
+                "qubits": caps.get('qubits', 0),
+                "quantum_backend": config.get("quantum_backend"),
                 "dtns": dtns,
                 "grpc": {
                     "host": config.get('grpc', {}).get('host', 'localhost'),
@@ -797,6 +851,18 @@ def load_agent_hosts(path: str) -> List[str]:
     return hosts
 
 
+def load_agent_sites(path: str) -> List[str]:
+    """
+    Read SITE labels (one per line), parallel to the agent hosts file: line i is the
+    site of host i. Used for topology-aware (locality-weighted) Snow sampling.
+    """
+    with open(path, "r") as f:
+        sites = [line.strip() for line in f if line.strip()]
+    if not sites:
+        raise ValueError("No sites found in agent sites file")
+    return sites
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate agent configuration files.")
     parser.add_argument("num_agents", type=int, help="Number of agents to generate configurations for.")
@@ -811,6 +877,9 @@ if __name__ == "__main__":
     parser.add_argument("--flavor-percentages", nargs='*', type=float, metavar='PERCENT',
                         help="Percentages for small, medium, large, xtralarge, xxtralarge (e.g. 0.4 0.25 0.15 0.15 0.05)")
     parser.add_argument("--agent-hosts-file", type=str, help="Path to file with agent hosts (one per line)")
+    parser.add_argument("--agent-sites-file", type=str,
+                        help="Path to file with site labels (one per line), parallel to the hosts file. "
+                             "Enables topology-aware Snow sampling (each host's agents get that site).")
     parser.add_argument("--agents-per-host", type=int, default=1,
                         help="Number of agents per host (for grpc.host assignment)")
 
@@ -841,12 +910,27 @@ if __name__ == "__main__":
                         help="Size every job to fit ALL agents (min capacities). "
                              "Enables any agent to take over jobs from failed agents.")
 
+    parser.add_argument("--quantum-agents-pct", type=float, default=0.0,
+                        help="Fraction (0.0-1.0) of agents that own a quantum backend "
+                             "from the built-in catalog (default: 0.0, classical only)")
+
+    parser.add_argument("--quantum-fraction", type=float, default=0.0,
+                        help="Fraction (0.0-1.0) of generated jobs with a one-shot quantum component")
+
+    parser.add_argument("--hybrid-fraction", type=float, default=0.0,
+                        help="Fraction (0.0-1.0) of generated jobs with a hybrid classical<->quantum loop")
+
     args = parser.parse_args()
 
     if args.agent_hosts_file:
         agent_hosts = load_agent_hosts(args.agent_hosts_file)
     else:
         agent_hosts = None
+
+    if args.agent_sites_file:
+        agent_sites = load_agent_sites(args.agent_sites_file)
+    else:
+        agent_sites = None
 
     # Normalize flavor percentages: fill missing with defaults
     if args.flavor_percentages:
@@ -872,10 +956,14 @@ if __name__ == "__main__":
         agent_type=args.agent_type,
         initial_group_size=args.initial_group_size,
         co_parent_count=args.co_parents,
+        quantum_agents_pct=args.quantum_agents_pct,
     )
-    generator.generate_configs(flavor_percentages=flavor_percentages, agent_hosts=agent_hosts)
+    generator.generate_configs(flavor_percentages=flavor_percentages, agent_hosts=agent_hosts,
+                               agent_sites=agent_sites)
 
     # Create jobs if not present
     if not os.path.exists("jobs"):
-        jg = JobGenerator(job_count=args.job_cnt, agent_profile_path='agent_profiles.json')
+        jg = JobGenerator(job_count=args.job_cnt, agent_profile_path='agent_profiles.json',
+                          quantum_fraction=args.quantum_fraction,
+                          hybrid_fraction=args.hybrid_fraction)
         jg.generate_job_files(output_dir="jobs", enable_dtns=args.dtns, fit_all=args.fit_all)

@@ -35,7 +35,8 @@ class Capacities(JSONField):
              'core': '', 'gpu': '', 'ram': 'G',
              'disk': 'G', 'bw': 'Gbps',
              'burst_size': 'Mbits',
-             'mtu': 'B'}
+             'mtu': 'B',
+             'qubits': ''}
 
     def __init__(self, **kwargs):
         self.cpu = 0
@@ -47,6 +48,7 @@ class Capacities(JSONField):
         self.burst_size = 0
         self.unit = 0
         self.mtu = 0
+        self.qubits = 0
         self._set_fields(**kwargs)
 
     def _set_fields(self, forgiving=False, **kwargs):

@@ -59,6 +59,66 @@ runtime:
   enable_agent_recovery: true        # Allow recovered agents to rejoin the pool
   max_infeasible_retries: 10         # Retire infeasible jobs after N attempts (0 = infinite)
   max_delegation_attempts: 3         # Mark job infeasible after N failed delegation timeouts
+  #neighbor_refresh_full_s: 5        # Full Redis neighbor-refresh cadence. Default: per-tick
+                                     # without gossip; 5s with gossip enabled (peer `load` then
+                                     # arrives via the epidemic cache every tick instead)
+
+# Consensus protocol — Phase 3/4 of the gossip-consensus migration.
+#   pbft   : PBFT-like 3-phase engine everywhere (default; best <50 agents / small groups).
+#   snow   : Snow/Avalanche engine everywhere (k-peer sampling + Redis SET-NX finalization;
+#            livelock-free at flat scale but higher latency; benefits from gossip + SWIM).
+#   hybrid : Phase 4 — engine chosen per topology level (see `hybrid` below). PBFT within small
+#            level-0 worker groups (low latency) + Snow across the large coordinator tier
+#            (removes the O(g^2) wall). Consensus only flows among same-level peers, so each
+#            level runs a single engine type.
+consensus:
+  protocol: pbft            # pbft (default) | snow | hybrid
+  hybrid:
+    level0: pbft            # engine for level-0 worker groups (small, <=10 agents)
+    coordinator: snow       # engine for level >= 1 coordinator tiers (large pools)
+  snow:
+    k: 20                    # Peers sampled per query round
+    alpha: 0.7               # Supermajority threshold within the sample
+    beta: 20                 # Consecutive winning rounds required to commit. Avalanche-scale
+                             # default; for a small trusted tier (e.g. ~10 hybrid coordinators)
+                             # beta 4-8 converges the same and cuts decision latency ~3x
+                             # (validated: beta=6 -> 0.96s level-1 selection at Hier-60)
+    max_rounds: 100          # Abandon Snow attempt after this many rounds
+    round_timeout_ms: 500    # Per-round response timeout (upper bound; a round now ends as
+                             # soon as all queried peers respond — see gossip_engine)
+    tick_interval_ms: 50     # Driver-thread polling interval
+    local_sample_frac: 1.0   # Fraction of each k-sample drawn from same-site peers (1.0 = uniform;
+                             # <1.0 enables topology-aware sampling when agents have a `site`)
+    send_workers: 32         # Thread-pool size for non-blocking best-effort query sends
+    send_timeout_ms: 300     # Per-send timeout for Snow queries/responses (no retries; a dropped
+                             # query just means that peer abstains this round)
+    max_inflight: 32         # Max decisions with an outstanding query round at once — bounds
+                             # send demand to what the pool can drain (prevents congestion
+                             # collapse under delegation bursts)
+
+# Failure detection — Phase 1 of the gossip-consensus migration (see
+# docs/GOSSIP_CONSENSUS_DESIGN.md). With `protocol: swim`, the SWIM membership
+# layer runs alongside the heartbeat mechanism; heartbeats remain authoritative
+# for job reassignment in this phase.
+failure_detection:
+  protocol: heartbeat       # heartbeat (default) | swim
+  swim:
+    period_ms: 1000          # Protocol round period
+    probe_timeout_ms: 1000   # Direct ping timeout before falling back to ping-req.
+                             # WAN + inbound-queue lag under consensus bursts make a
+                             # LAN-tuned 300ms window false-fail healthy peers.
+    k_req: 3                 # Indirect probe fanout
+    suspect_timeout_s: 20    # Suspect -> failed transition
+
+# Gossip state dissemination (Phase 2). When enabled, agents push their
+# versioned utilization/load state to `fanout` random peers every round.
+# Independent of SWIM.
+gossip:
+  enabled: false
+  fanout: 3
+  period_ms: 1000
+  state_ttl_s: 30
+
 logging:
   ## The directory in which actor should create log files.
   ## This directory will be automatically created if it does not exist.
@@ -84,22 +144,71 @@ job_selection:
     ram: 0.3       # Relative importance of RAM utilization in job cost (0–1)
     disk: 0.2      # Relative importance of Disk utilization in job cost (0–1)
     gpu: 0.1       # Relative importance of GPU utilization in job cost (0–1)
+    qpu: 0.0       # Relative importance of QPU (qubit) utilization (0–1); set >0 when quantum backends are deployed
+                   # (weights are re-normalized per job type, so enabling qpu does not require re-tuning the others)
 
   long_job_threshold: 20.0            # Execution time (in seconds) beyond which jobs incur extra penalty
   connectivity_penalty_factor: 1.0    # Multiplier for DTN connectivity penalty (0=no effect, >1 increases penalty severity)
+  quantum_penalty_factor: 1.0         # Multiplier for quantum backend quality penalty (error rate + calibration downtime)
   selection_threshold_pct: 10.0       # % above min cost allowed in candidate selection (lower = stricter, higher = more agents considered)
+
+# Quantum runtime (Phase 2: data-triggered split hybrid scheduling).
+# Applies to all agents; inert unless split hybrid jobs / post-processing
+# jobs exist in the pool. See docs/QUANTUM_HYBRID_DESIGN.md.
+quantum:
+  comm_penalty_factor: 1.0    # Cross-site penalty for stream consumers (0 = ignore locality)
+  consumer_timeout_s: 60.0    # Consumer fails if the measurement stream stalls this long
+  predicate_cache_s: 1.0      # Snapshot-count cache TTL for data-predicate gating
+  measurement_ttl_s: 3600     # Redis TTL for measurement streams
+
+# Quantum backend owned by this agent (omit for classical-only agents).
+# Qubit count is mirrored into capacities.qubits for allocation arithmetic;
+# quality attributes are used for feasibility (arch/fidelity/gate set) and
+# cost penalties (error rate, calibration downtime). See docs/QUANTUM_HYBRID_DESIGN.md.
+#quantum_backend:
+#  name: aer-sim-64
+#  arch: superconducting        # superconducting | ion-trap | neutral-atom | photonic
+#  qubits: 64
+#  clops: 100000                # circuit layer operations per second
+#  gate_fidelity: 0.999
+#  error_rate: 0.001
+#  calibration_downtime_pct: 0.0
+#  simulator: true
 mab:
-  enabled: true                    # Enable Multi-Armed Bandit for hierarchical delegation
+  enabled: false                   # Enable Multi-Armed Bandit for hierarchical delegation
   algorithm: "epsilon_greedy"      # "epsilon_greedy" or "ucb1"
   epsilon: 0.1                     # Initial exploration rate (epsilon_greedy only)
   epsilon_decay: 0.995             # Epsilon decay per update (epsilon_greedy only)
   epsilon_min: 0.01                # Minimum epsilon floor (epsilon_greedy only)
   exploration_weight: 1.41         # UCB1 exploration weight (ucb1 only)
   top_k: 1                         # Number of child groups to delegate to per job
+  step_size: null                  # Optional recency-weighted Q for epsilon_greedy/ucb1 (null = lifetime average)
+  linucb:                          # Contextual bandit settings (algorithm: "linucb" or "lin_ts")
+    alpha: 1.0                     # Exploration width (UCB bonus multiplier; linucb only)
+    discount: 0.995                # Forgetting factor gamma; 1.0 = standard LinUCB
+    ts_variance: 0.25              # Posterior-sampling variance (lin_ts only)
+  context:                         # Feature extraction (linucb/lin_ts) — changing these changes the schema version and resets persisted model state
+    job_types: []                  # One-hot vocabulary, e.g. ["compute", "transfer"]
+    max_group_size: 10             # Normalization caps
+    max_inflight: 32
+    max_dtns: 4
+    long_job_threshold: 20.0
+    failure_window: 20             # Sliding-window length for per-group/per-type failure rates (timeouts excluded)
+    timeout_decay_s: 120.0         # e-folding time of the per-group timeout signal (fades without new trials)
+    max_caps:
+      core: 16
+      ram: 64                      # G, matching Capacities units
+      disk: 500                    # G
+      gpu: 4
+  reward:
+    shaped: false                  # Latency-shaped rewards instead of binary +/-1
+    exit_failure: -0.5             # Reward for non-zero exit status (shaped mode)
+    timeout: -1.0                  # Reward for delegation timeout (shaped mode)
+    non_winner: null               # Reward for co-selected groups that didn't complete the job (null = no update)
   persist_to_redis: false          # Persist bandit state to Redis
   persist_interval_s: 30.0         # Seconds between Redis persistence writes
   failure_simulation:
-    enabled: true                  # Enable simulated job failures for testing
+    enabled: false                 # Enable simulated job failures for testing
     failure_probability: 0.5       # Base failure probability (0.0–1.0)
     per_agent_failure_rates: {}    # Per-agent overrides, e.g. {3: 0.5}
     per_job_type_failure_rates: {} # Per-job-type overrides, e.g. {"compute": 0.2}

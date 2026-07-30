@@ -29,13 +29,16 @@ import csv
 import random
 from typing import Dict, Any, List, Optional
 
+from swarm.models.quantum import QuantumBackend, QuantumSpec
+
 class JobGenerator:
     """
     Generates random jobs and stores them as JSON files.
     """
 
     def __init__(self, job_count: int = 0, agent_profile_path: str = None,
-                 failure_rate: float = 0.0, failure_agents: Dict[str, float] = None) -> None:
+                 failure_rate: float = 0.0, failure_agents: Dict[str, float] = None,
+                 quantum_fraction: float = 0.0, hybrid_fraction: float = 0.0) -> None:
         """
         Initialize the JobGenerator.
 
@@ -43,11 +46,24 @@ class JobGenerator:
         :param agent_profile_path: Path to JSON file mapping agent_id -> profile dict (capacities, dtns)
         :param failure_rate: Base probability (0.0-1.0) that a job should fail
         :param failure_agents: Dict mapping agent_id -> failure_rate for targeted failures
+        :param quantum_fraction: Fraction (0.0-1.0) of jobs with a one-shot quantum component
+        :param hybrid_fraction: Fraction (0.0-1.0) of jobs with a hybrid (variational-style)
+                                classical<->quantum loop
         """
         self.job_count = job_count
         self.agent_profiles = self._load_agent_profiles(agent_profile_path)
         self.failure_rate = failure_rate
         self.failure_agents = failure_agents or {}
+        self.quantum_fraction = quantum_fraction
+        self.hybrid_fraction = hybrid_fraction
+        # Agents that own a quantum backend — targets for quantum/hybrid jobs
+        self.quantum_profiles = {
+            aid: p for aid, p in self.agent_profiles.items() if p.get("quantum_backend")
+        }
+        if (quantum_fraction > 0 or hybrid_fraction > 0) and not self.quantum_profiles:
+            raise ValueError(
+                "quantum/hybrid fractions requested but no agent profile has a quantum_backend"
+            )
 
     def _load_agent_profiles(self, path: Optional[str]) -> Dict[str, Dict[str, Any]]:
         """
@@ -99,6 +115,49 @@ class JobGenerator:
 
         return min_profile
 
+    def _generate_quantum_spec(self, backend: Dict[str, Any], hybrid: bool) -> Dict[str, Any]:
+        """
+        Generate a quantum spec sized to fit the given backend profile.
+        Half the jobs request explicit shots; the other half specify a target
+        (error, confidence) pair from which the runtime derives the shot count.
+        """
+        spec = {
+            "qubits": random.randint(2, max(2, backend.get("qubits", 2))),
+            "circuit_depth": random.randint(10, 200),
+            "output_type": random.choice(["expectation", "histogram"]),
+            "hybrid": hybrid,
+            "iterations": random.randint(5, 50) if hybrid else 1,
+        }
+        # Histogram output of one-shot jobs needs classical post-processing —
+        # the executing agent pushes that job to the pool on completion
+        if not hybrid and spec["output_type"] == "histogram":
+            spec["post_process"] = True
+        if random.random() < 0.5:
+            spec["shots"] = random.choice([1024, 2048, 4096, 8192])
+        else:
+            spec["error"] = round(random.uniform(0.01, 0.05), 3)
+            spec["confidence"] = random.choice([0.90, 0.95, 0.99])
+        # Fidelity floor at or below what the target backend offers
+        backend_fidelity = backend.get("gate_fidelity", 1.0)
+        if random.random() < 0.5:
+            spec["fidelity"] = round(random.uniform(0.9, backend_fidelity), 4)
+        # Architecture preference half the time (pins the job to that arch)
+        if backend.get("arch") and random.random() < 0.5:
+            spec["arch"] = backend["arch"]
+        return spec
+
+    def _pick_job_class(self, fit_all: bool) -> str:
+        """Sample the job class from the configured fractions. fit_all jobs stay
+        classical — quantum jobs can never fit agents without a backend."""
+        if fit_all:
+            return "classical"
+        r = random.random()
+        if r < self.hybrid_fraction:
+            return "hybrid"
+        if r < self.hybrid_fraction + self.quantum_fraction:
+            return "quantum"
+        return "classical"
+
     def generate_job(self, x: int, enable_dtns: bool, fit_all: bool = False) -> Dict[str, Any]:
         """
         Generate a single job dictionary with randomized fields,
@@ -110,12 +169,18 @@ class JobGenerator:
         :param fit_all: If True, size jobs to fit every agent (for failure resilience)
         """
         job_id = str(x)
+        job_class = self._pick_job_class(fit_all)
 
         if fit_all:
             # Use minimum profile so every agent can run this job
             agent_id = None
             profile = self._compute_min_profile()
             fail_prob = self.failure_rate
+        elif job_class in ("quantum", "hybrid"):
+            # Quantum/hybrid jobs must target an agent that owns a backend
+            agent_id = random.choice(list(self.quantum_profiles.keys()))
+            profile = self.quantum_profiles[agent_id]
+            fail_prob = self.failure_agents.get(agent_id, self.failure_rate)
         else:
             # Choose a random agent profile
             agent_id = random.choice(list(self.agent_profiles.keys()))
@@ -159,14 +224,25 @@ class JobGenerator:
                 for dtn in dtns
             ]
 
+        # Quantum component: sized to fit the target agent's backend. The
+        # classical capacities above model the classical component (compile/
+        # state-prep for one-shot quantum, the optimizer loop for hybrid).
+        quantum = None
+        capacities = {'core': core, 'ram': ram, 'disk': disk, 'gpu': gpu}
+        if job_class in ("quantum", "hybrid"):
+            quantum = self._generate_quantum_spec(
+                profile["quantum_backend"], hybrid=(job_class == "hybrid"))
+            capacities['qubits'] = quantum['qubits']
+
         return {
             'id': job_id,
             'wall_time': wall_time,
-            'capacities': {'core': core, 'ram': ram, 'disk': disk, 'gpu': gpu},
+            'capacities': capacities,
             'data_in': data_in if enable_dtns else None,
             'data_out': data_out if enable_dtns else None,
             'exit_status': exit_status,
             'should_fail': should_fail,
+            'quantum': quantum,
             'target_agent': agent_id,  # Agent this job was designed for (None when fit_all=True)
         }
 
@@ -190,6 +266,16 @@ class JobGenerator:
             return False
         if job_caps.get('gpu', 0) > agent_caps.get('gpu', 0):
             return False
+
+        # Quantum component: agent must own a backend that satisfies the spec
+        if job.get('quantum'):
+            backend_dict = agent_profile.get('quantum_backend')
+            if not backend_dict:
+                return False
+            backend = QuantumBackend.from_dict(backend_dict)
+            spec = QuantumSpec.from_dict(job['quantum'])
+            if not backend.supports(spec):
+                return False
 
         # Check DTN requirements
         job_data_in = job.get('data_in', []) or []
@@ -233,7 +319,7 @@ class JobGenerator:
         """
         with open(output_path, 'w', newline='') as csvfile:
             fieldnames = [
-                'job_id', 'core', 'ram', 'disk', 'gpu', 'wall_time',
+                'job_id', 'job_class', 'core', 'ram', 'disk', 'gpu', 'qubits', 'wall_time',
                 'feasible_agents', 'infeasible_agents',
                 'total_feasible', 'total_agents', 'feasibility_pct'
             ]
@@ -258,12 +344,19 @@ class JobGenerator:
                 total_feasible = len(feasible_agents)
                 feasibility_pct = (total_feasible / total_agents * 100) if total_agents > 0 else 0
 
+                quantum = job.get('quantum') or {}
+                if quantum:
+                    job_class = 'hybrid' if quantum.get('hybrid') else 'quantum'
+                else:
+                    job_class = 'classical'
                 writer.writerow({
                     'job_id': job_id,
+                    'job_class': job_class,
                     'core': caps.get('core', 0),
                     'ram': caps.get('ram', 0),
                     'disk': caps.get('disk', 0),
                     'gpu': caps.get('gpu', 0),
+                    'qubits': caps.get('qubits', 0),
                     'wall_time': job.get('wall_time', 0),
                     'feasible_agents': ','.join(map(str, feasible_agents)),
                     'infeasible_agents': ','.join(map(str, infeasible_agents)),
@@ -321,6 +414,12 @@ if __name__ == "__main__":
                         help="Base failure probability (0.0-1.0) for generated jobs")
     parser.add_argument("--failure-agents", type=str, default=None,
                         help="JSON string of agent_id:failure_rate, e.g. '{\"3\":0.5,\"4\":0.3}'")
+    parser.add_argument("--quantum-fraction", type=float, default=0.0,
+                        help="Fraction (0.0-1.0) of jobs with a one-shot quantum component "
+                             "(requires agent profiles with quantum_backend)")
+    parser.add_argument("--hybrid-fraction", type=float, default=0.0,
+                        help="Fraction (0.0-1.0) of jobs with a hybrid classical<->quantum loop "
+                             "(requires agent profiles with quantum_backend)")
     args = parser.parse_args()
 
     # Parse failure_agents if provided
@@ -332,11 +431,17 @@ if __name__ == "__main__":
             print(f"Error parsing --failure-agents: {e}")
             exit(1)
 
+    if args.quantum_fraction + args.hybrid_fraction > 1.0:
+        print("Error: --quantum-fraction + --hybrid-fraction must be <= 1.0")
+        exit(1)
+
     generator = JobGenerator(
         job_count=args.job_count,
         agent_profile_path=args.agent_profile_path,
         failure_rate=args.failure_rate,
         failure_agents=failure_agents,
+        quantum_fraction=args.quantum_fraction,
+        hybrid_fraction=args.hybrid_fraction,
     )
     generator.generate_job_files(output_dir=args.output_dir, enable_dtns=args.enable_dtns,
                                  fit_all=args.fit_all)

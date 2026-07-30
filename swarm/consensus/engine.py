@@ -48,6 +48,30 @@ class ConsensusEngine:
         self.outgoing = ProposalContainer()  # proposals initiated by me
         self.incoming = ProposalContainer()  # proposals initiated by peers
         self.conflicts = {}
+        # conflicts is diagnostic (per-job conflict counts, read by plotting); cap it so
+        # long runs with high job churn can't grow it without bound.
+        self._conflicts_max = 4096
+
+    def _bump_conflict(self, object_id: str) -> None:
+        if object_id not in self.conflicts and len(self.conflicts) >= self._conflicts_max:
+            # evict oldest entry (dict preserves insertion order)
+            self.conflicts.pop(next(iter(self.conflicts)), None)
+        self.conflicts[object_id] = self.conflicts.get(object_id, 0) + 1
+
+    def _set_pending_safe(self, kind: str, msg, object_id: str) -> None:
+        """Hand an out-of-order message to the host for later replay. Hosts that don't
+        implement the set_pending_* hooks must not abort the batch — before this guard a
+        missing hook raised AttributeError mid-loop, silently dropping every remaining
+        proposal in the message (lost quorum votes -> re-proposal storms)."""
+        fn = getattr(self.host, f"set_pending_{kind}", None)
+        if fn is None:
+            self.host.log_warn(
+                f"host lacks set_pending_{kind}; dropping out-of-order {kind} for {object_id}")
+            return
+        try:
+            fn(msg, object_id)
+        except Exception as exc:
+            self.host.log_warn(f"set_pending_{kind}({object_id}) failed: {exc}")
 
     def _remove_worse_proposals_from_container(self, incoming_proposal: ProposalInfo,
                                                container: ProposalContainer) -> None:
@@ -101,7 +125,7 @@ class ConsensusEngine:
             if not object or self.host.is_agreement_achieved(object.object_id):
                 if not object:
                     self.host.log_debug(f"Enqueued proposal {proposal.p_id} for {proposal.object_id} (missing)")
-                    self.host.set_pending_proposal(msg, proposal.object_id)
+                    self._set_pending_safe("proposal", msg, proposal.object_id)
                 else:
                     self.host.log_debug(f"Skip proposal {proposal.p_id} for {proposal.object_id} (complete)")
                     self.outgoing.remove_object(object_id=proposal.object_id)
@@ -115,11 +139,11 @@ class ConsensusEngine:
             if my_better:
                 # I think my own proposal for this object is better; ignore/forward if topology requires
                 self.host.log_debug(f"Retaining my better proposal for Object {object.object_id}")
-                self.conflicts[object.object_id] = self.conflicts.get(object.object_id, 0) + 1
+                self._bump_conflict(object.object_id)
             elif peer_better:
                 # adopt better peer proposal (already handled by containers)
                 self.host.log_debug(f"Already accepted better proposal for Object {object.object_id} from peer {peer_better.agent_id} Cost: {peer_better.cost}")
-                self.conflicts[object.object_id] = self.conflicts.get(object.object_id, 0) + 1
+                self._bump_conflict(object.object_id)
             else:
                 # Incoming proposal is better - remove ALL worse existing proposals
                 # FIX: Use helper method to remove ALL worse proposals, not just one arbitrary one
@@ -147,7 +171,7 @@ class ConsensusEngine:
             object = self.host.get_object(p.object_id)
             if not object or self.host.is_agreement_achieved(object.object_id):
                 if not object:
-                    self.host.set_pending_prepare(msg, p.object_id)
+                    self._set_pending_safe("prepare", msg, p.object_id)
                     self.host.log_debug(f"Enqueued prepare {p.p_id}/{p.object_id} (missing)")
                 else:
                     self.outgoing.remove_object(object_id=p.object_id)
@@ -173,7 +197,7 @@ class ConsensusEngine:
                         f"Ignoring PREPARE for {p.p_id} (cost={p.cost}) - "
                         f"retaining my better proposal (cost={my_better.cost})"
                     )
-                    self.conflicts[object.object_id] = self.conflicts.get(object.object_id, 0) + 1
+                    self._bump_conflict(object.object_id)
                     continue
                 elif peer_better:
                     # We already have a better peer proposal, ignore this PREPARE
@@ -181,7 +205,7 @@ class ConsensusEngine:
                         f"Ignoring PREPARE for {p.p_id} (cost={p.cost}) - "
                         f"already have better peer proposal {peer_better.p_id} (cost={peer_better.cost})"
                     )
-                    self.conflicts[object.object_id] = self.conflicts.get(object.object_id, 0) + 1
+                    self._bump_conflict(object.object_id)
                     continue
                 else:
                     # This is the best proposal we've seen so far
@@ -234,7 +258,7 @@ class ConsensusEngine:
             object = self.host.get_object(p.object_id)
             if not object or self.host.is_agreement_achieved(object.object_id):
                 if not object:
-                    self.host.set_pending_commit(msg, p.object_id)
+                    self._set_pending_safe("commit", msg, p.object_id)
                     self.host.log_debug(f"Enqueued commit {p.p_id}/{p.object_id} (missing)")
                 else:
                     self.outgoing.remove_object(object_id=p.object_id)
@@ -261,7 +285,7 @@ class ConsensusEngine:
                         f"Ignoring COMMIT for {p.p_id} (cost={p.cost}) - "
                         f"already have better proposal {better.p_id} (cost={better.cost})"
                     )
-                    self.conflicts[object.object_id] = self.conflicts.get(object.object_id, 0) + 1
+                    self._bump_conflict(object.object_id)
                     continue
                 else:
                     # Remove worse proposals before adding

@@ -244,6 +244,14 @@ def generate_configs(args, agent_hosts_list: list[str]) -> Path:
         gen_args += ["--initial-group-size", str(args.initial_group_size)]
     if hasattr(args, 'fit_all') and args.fit_all:
         gen_args += ["--fit-all"]
+    if getattr(args, "agent_sites_file", None):
+        gen_args += ["--agent-sites-file", str(args.agent_sites_file)]
+    if getattr(args, "quantum_agents_pct", 0.0) > 0:
+        gen_args += ["--quantum-agents-pct", str(args.quantum_agents_pct)]
+    if getattr(args, "quantum_fraction", 0.0) > 0:
+        gen_args += ["--quantum-fraction", str(args.quantum_fraction)]
+    if getattr(args, "hybrid_fraction", 0.0) > 0:
+        gen_args += ["--hybrid-fraction", str(args.hybrid_fraction)]
 
     log("Generating configs …")
     run_blocking(gen_args, check=True)
@@ -454,6 +462,8 @@ def produce_jobs(args) -> None:
             jobs_cmd.extend(["--level", "2"])
         else:
             jobs_cmd.extend(["--level", "1"])
+    if getattr(args, "split_hybrid", False):
+        jobs_cmd.append("--split-hybrid")
     if args.debug:
         jobs_cmd.append("--debug")
     log("Producing jobs …")
@@ -699,6 +709,9 @@ def parse_args() -> argparse.Namespace:
     # Remote host options
     ap.add_argument("--agent-hosts", default=None, help="Comma-separated hostnames")
     ap.add_argument("--agent-hosts-file", default=None, help="File with one hostname per line")
+    ap.add_argument("--agent-sites-file", default=None,
+                    help="File with one site label per line, parallel to the hosts file "
+                         "(enables topology-aware Snow sampling)")
     ap.add_argument("--remote-repo-dir", default="/root/SwarmAgents", help="Remote repo root")
 
     # Test control
@@ -734,6 +747,15 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--fit-all", action="store_true",
                     help="Size every job to fit ALL agents (min capacities). "
                          "Enables any agent to take over jobs from failed agents.")
+    ap.add_argument("--quantum-agents-pct", type=float, default=0.0,
+                    help="Fraction (0.0-1.0) of agents that own a quantum backend (default: 0.0)")
+    ap.add_argument("--quantum-fraction", type=float, default=0.0,
+                    help="Fraction (0.0-1.0) of jobs with a one-shot quantum component")
+    ap.add_argument("--hybrid-fraction", type=float, default=0.0,
+                    help="Fraction (0.0-1.0) of jobs with a hybrid classical<->quantum loop")
+    ap.add_argument("--split-hybrid", action="store_true",
+                    help="Split hybrid jobs into quantum/classical sub-jobs co-scheduled on "
+                         "different agents via the measurement data layer")
 
     # Plot generation
     ap.add_argument("--generate-plots", action="store_true",
