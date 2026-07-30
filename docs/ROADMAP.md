@@ -2,24 +2,38 @@
 
 Identified improvement areas based on codebase analysis, organized by priority.
 
+## Recently Landed
+
+- **Gossip consensus stack** — SWIM membership, epidemic dissemination, Snow/Snowball engine (`consensus.protocol: snow`) with per-peer batching and congestion control; scalability Phases 0-4 (broadcast fan-out, Redis batching/registry discovery, backlog drain, gossip-fed selection state) validated at scale
+- **Contextual bandit delegation** — LinUCB/LinTS (`mab.algorithm: linucb`), deployment-validated (Scenarios A/B/C incl. outage/rejoin fixes)
+- **Hybrid quantum-classical jobs (Phases 1-2)** — `QuantumSpec`/`QuantumBackend`, qubit-aware feasibility/cost, `--split-hybrid` producer/consumer co-scheduling over a Redis-streams measurement layer
+- **Pegasus replay pipeline** — `pegasus_profile_extractor.py` + converter `--data-nodes per-file` / `--dtn-map` / `--dtn-names`; see `docs/PEGASUS_TO_SWARM.md`
+
+## Next Up
+
+- **Quantum Phase 3** — joint pair consensus for split jobs, VQE-style variational runtime, OpenQASM circuit payloads
+- **Wall-time-faithful replay** — `Job.execute()` sleeps a flat 1s (`time.sleep(wt)` disabled); add a configurable `wall_time_scale` so replayed workloads exercise realistic execution times and load spreading (see item 7)
+- **DAG dependency gating** — the Pegasus converter flattens workflows into an independent job pool; honor `jobDependencies` (e.g. via the data-predicate mechanism) so replayed makespans are comparable to Pegasus
+- **Bandit tuning** — `ts_variance` sweep for LinTS; error bars over batched scenario runs
+
 ---
 
 ## Critical
 
 ### 1. Test Coverage Expansion
-**Current state:** Only `tests/test_bandit.py` exists (~2% module coverage).
+**Current state:** `tests/` covers consensus (Snow, PBFT pending/out-of-order, broadcast), SWIM, gossip dissemination, bandits/MAB manager, failure simulation, quantum (models + Phase 2), and the Redis repository.
 
-**Missing tests (by priority):**
+**Remaining gaps (by priority):**
 | Module | Why Critical |
 |--------|-------------|
-| `swarm/consensus/engine.py` | Core consensus logic — dominance checks, quorum, out-of-order messages |
 | `swarm/selection/engine.py` | Cost matrix computation, thresholded selection, cache invalidation |
-| `swarm/database/repository.py` | Redis transactions, state index consistency, optimistic locking |
 | `swarm/agents/resource_agent.py` | Adapter pattern, cost computation, failure detection |
 | `swarm/comm/grpc_client.py` | Channel pool, retry logic, health checks |
 | `swarm/topology/topology.py` | Neighbor computation, routing for all topology types |
 | `swarm/models/job.py` | State transitions, lifecycle timestamps, job classification |
 | `swarm/queue/object_queue.py` | Thread-safe queue operations |
+
+Also: `test_bandit.py::TestStepSize::test_greedy_uses_recency_estimate` is seed-dependent and flakes intermittently — needs a fixed seed or a tolerance.
 
 ### 2. TLS/SSL for gRPC
 All gRPC channels use `grpc.insecure_channel()`. No encryption or authentication for inter-agent communication.
@@ -59,10 +73,10 @@ Several `except Exception: pass` blocks silently swallow errors:
 
 **Recommendation:** Either formalize this as the intended design for hierarchical agents and document it, or implement proper multi-agent evaluation for parent-level selection.
 
-### 7. Data Transfer Simulation
-`job.py:358,367` has TODO comments for staged-in/staged-out data transfers. The `execute()` method currently uses `time.sleep(1)` instead of the job's actual `wall_time`, and data transfer simulation is not implemented.
+### 7. Data Transfer + Execution Simulation
+`Job.execute()` sleeps a flat 1s — `time.sleep(wt)` is commented out — and the staged-in/staged-out transfer TODOs remain. Flat-1s execution also distorts load balance (one agent can win every election because utilization never rises) and makes replayed makespans meaningless.
 
-**Recommendation:** Implement data transfer time simulation using `data_in`/`data_out` nodes with `transfer_in_time`/`transfer_out_time` fields (already defined in the Job model).
+**Recommendation:** Add a configurable `wall_time_scale` (1.0 = faithful, 0 = current stub) and implement transfer time simulation using `data_in`/`data_out` nodes — `DataNode.size_bytes` (populated by the Pegasus pipeline) gives real transfer volumes; `transfer_in_time`/`transfer_out_time` fields already exist on the Job model.
 
 ### 8. Remove Backup Code
 `swarm/agents/bkp/` contains 3 old agent versions (`agent_grpc_v0.py`, `resource_agent_v0.py`, `resource_agent_v1.py`) that are no longer referenced.
@@ -111,9 +125,9 @@ When evaluating peer parent agents in hierarchical topology, feasibility uses ag
 **Recommendation:** Consider adding a "delegation confidence" score or a pre-delegation feasibility query to children.
 
 ### 14. Agent Recovery
-`resource_agent.py:2256` has a TODO for agent recovery when `enable_agent_recovery` is True. Currently, failed agents are only detected and removed — there is no mechanism to rejoin after recovery.
+Failed agents are detected and removed but have no first-class rejoin protocol. Partially addressed: SWIM membership tracks rejoining peers, and the contextual-bandit layer re-adopts recovered delegation targets (Scenario C: liveness gate + decayed timeout signal).
 
-**Recommendation:** Implement agent rejoin protocol: re-announce via heartbeat, re-enter neighbor maps, re-add to quorum.
+**Recommendation:** Complete the rejoin protocol at the agent layer: re-announce via heartbeat, re-enter neighbor maps, re-add to quorum (`enable_agent_recovery` TODO in `resource_agent.py`).
 
 ---
 
@@ -144,9 +158,8 @@ Currently, cost weights (`cpu=0.4, ram=0.3, disk=0.2, gpu=0.1`) are static per c
 Current selection optimizes a single scalar cost. Consider Pareto-optimal selection for multi-objective scenarios (minimize latency + maximize utilization + balance load).
 
 ### Consensus Protocol Variants
-The current PBFT-like protocol works well for moderate agent counts. Consider implementing:
+The PBFT-like protocol works well for moderate agent counts, and the Snow/Avalanche gossip engine (implemented — see `docs/GOSSIP_CONSENSUS_DESIGN.md`) covers large deployments. Remaining idea:
 - **Raft-based consensus** for stronger leader-based ordering
-- **Gossip-based protocol** for very large deployments (1000+ agents)
 
 ### Observability Dashboard
 Metrics are exported to JSON/CSV files. Consider adding:
