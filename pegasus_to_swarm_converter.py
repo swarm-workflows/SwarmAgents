@@ -163,18 +163,45 @@ def _map_capacities(profile: dict, default_cores: float, min_ram_gb: float,
     }
 
 
+def make_dtn_resolver(dtn_map: Optional[Dict[str, str]] = None,
+                      dtn_names: Optional[List[str]] = None):
+    """Build a (site, lfn) -> DTN-name resolver.
+
+    dtn_map renames Pegasus site names (e.g. {"local": "dtn1"}); sites not in
+    the map pass through unchanged. dtn_names, if given, instead spreads files
+    across the listed DTNs by a stable hash of the lfn, so the same file maps
+    to the same DTN in every job (consistent data locality). dtn_names wins
+    over dtn_map when both are provided.
+    """
+    import hashlib
+
+    def resolve(site: str, lfn: str) -> str:
+        if dtn_names:
+            idx = int(hashlib.md5(lfn.encode()).hexdigest(), 16) % len(dtn_names)
+            return dtn_names[idx]
+        if dtn_map:
+            return dtn_map.get(site, site)
+        return site
+
+    return resolve
+
+
 def _map_data_nodes(files_list: Optional[list],
-                    mode: str = "per-site") -> Optional[list]:
+                    mode: str = "per-site",
+                    resolve=None) -> Optional[list]:
     """Map Pegasus input/output file lists to SwarmAgents DataNode dicts.
 
-    mode="per-site": one DataNode per unique non-empty site name (first lfn
+    mode="per-site": one DataNode per unique non-empty DTN name (first lfn
     seen wins) — the historical behavior.
     mode="per-file": one DataNode per file, preserving every lfn (and its
     size_bytes when present).
-    Files with empty site are skipped in both modes.
+    Files with empty site are skipped in both modes. *resolve* (see
+    make_dtn_resolver) turns a Pegasus site + lfn into a DTN name.
     """
     if not files_list:
         return None
+    if resolve is None:
+        resolve = lambda site, lfn: site  # noqa: E731
 
     if mode == "per-file":
         nodes = []
@@ -182,24 +209,27 @@ def _map_data_nodes(files_list: Optional[list],
             site = (f.get("site") or "").strip()
             if not site:
                 continue
-            node = {"name": site, "file": f.get("lfn", "")}
+            lfn = f.get("lfn", "")
+            node = {"name": resolve(site, lfn), "file": lfn}
             if f.get("size_bytes") is not None:
                 node["size_bytes"] = f["size_bytes"]
             nodes.append(node)
         return nodes or None
 
-    seen_sites: Dict[str, str] = {}  # site -> first lfn
+    seen_sites: Dict[str, str] = {}  # dtn name -> first lfn
     for f in files_list:
         site = (f.get("site") or "").strip()
         if not site:
             continue
-        if site not in seen_sites:
-            seen_sites[site] = f.get("lfn", "")
+        lfn = f.get("lfn", "")
+        name = resolve(site, lfn)
+        if name not in seen_sites:
+            seen_sites[name] = lfn
 
     if not seen_sites:
         return None
 
-    return [{"name": site, "file": lfn} for site, lfn in seen_sites.items()]
+    return [{"name": name, "file": lfn} for name, lfn in seen_sites.items()]
 
 
 # ---------------------------------------------------------------------------
@@ -211,7 +241,8 @@ def map_profile(profile: dict, job_number: int,
                 default_cores: float = 1.0,
                 min_ram_gb: float = 0.1,
                 min_disk_gb: float = 1.0,
-                data_nodes_mode: str = "per-site") -> Tuple[dict, List[str]]:
+                data_nodes_mode: str = "per-site",
+                dtn_resolver=None) -> Tuple[dict, List[str]]:
     """Convert a single Pegasus profile to a SwarmAgents job dict."""
     warnings: List[str] = []
 
@@ -225,8 +256,10 @@ def map_profile(profile: dict, job_number: int,
 
     capacities = _map_capacities(profile, default_cores, min_ram_gb, min_disk_gb)
 
-    data_in = _map_data_nodes(profile.get("input_files_db"), data_nodes_mode)
-    data_out = _map_data_nodes(profile.get("output_files_db"), data_nodes_mode)
+    data_in = _map_data_nodes(profile.get("input_files_db"), data_nodes_mode,
+                              dtn_resolver)
+    data_out = _map_data_nodes(profile.get("output_files_db"), data_nodes_mode,
+                               dtn_resolver)
 
     exitcode = int(profile.get("exitcode_db", 0) or 0)
     should_fail = exitcode != 0
@@ -519,6 +552,8 @@ def convert_pegasus_profiles(
     min_ram_gb: float = 0.1,
     min_disk_gb: float = 1.0,
     data_nodes_mode: str = "per-site",
+    dtn_map: Optional[Dict[str, str]] = None,
+    dtn_names: Optional[List[str]] = None,
 ) -> dict:
     """Convert Pegasus profiles to SwarmAgents job JSON files.
 
@@ -566,6 +601,7 @@ def convert_pegasus_profiles(
 
     os.makedirs(output_dir, exist_ok=True)
 
+    dtn_resolver = make_dtn_resolver(dtn_map, dtn_names)
     baseline = BaselineBuilder()
     all_warnings: List[dict] = []
     sites_seen: Dict[str, int] = {}
@@ -580,6 +616,7 @@ def convert_pegasus_profiles(
             min_ram_gb=min_ram_gb,
             min_disk_gb=min_disk_gb,
             data_nodes_mode=data_nodes_mode,
+            dtn_resolver=dtn_resolver,
         )
 
         # Write job file
@@ -664,6 +701,14 @@ def convert(args: argparse.Namespace):
 
     os.makedirs(args.output_dir, exist_ok=True)
 
+    dtn_map = None
+    if args.dtn_map:
+        dtn_map = dict(pair.split("=", 1) for pair in args.dtn_map.split(","))
+    dtn_names = None
+    if args.dtn_names:
+        dtn_names = [n.strip() for n in args.dtn_names.split(",") if n.strip()]
+    dtn_resolver = make_dtn_resolver(dtn_map, dtn_names)
+
     baseline = BaselineBuilder()
     all_warnings: List[dict] = []
     sites_seen: Dict[str, int] = {}
@@ -678,6 +723,7 @@ def convert(args: argparse.Namespace):
             min_ram_gb=args.min_ram_gb,
             min_disk_gb=args.min_disk_gb,
             data_nodes_mode=args.data_nodes,
+            dtn_resolver=dtn_resolver,
         )
 
         # Write job file
@@ -813,6 +859,17 @@ def parse_args() -> argparse.Namespace:
         help="data_in/data_out granularity: 'per-site' dedups to one DataNode "
              "per site (historical behavior); 'per-file' keeps every "
              "input/output file with its size. Default: per-site."
+    )
+    parser.add_argument(
+        "--dtn-map", type=str, default=None,
+        help="Rename Pegasus sites to DTN names, e.g. 'local=dtn1,condorpool=dtn2'. "
+             "Unlisted sites pass through unchanged."
+    )
+    parser.add_argument(
+        "--dtn-names", type=str, default=None,
+        help="Comma-separated DTN pool, e.g. 'dtn1,dtn2,dtn3'. Files are spread "
+             "across the pool by a stable hash of the file name (same file -> "
+             "same DTN in every job). Overrides --dtn-map."
     )
 
     # Agent config generation
