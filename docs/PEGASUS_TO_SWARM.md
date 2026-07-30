@@ -114,6 +114,28 @@ requests (RAM falls back to maxrss; disk from total input bytes; floors set by
 `DataNode` (`swarm/models/data_node.py`) carries the optional `size_bytes`
 field, so converted jobs round-trip cleanly through `Job.from_dict()`.
 
+### DTN naming (`--dtn-map`, `--dtn-names`)
+
+Single-site Pegasus runs record every file at site `local`. Two options control
+the DTN names in the converted jobs:
+
+- `--dtn-map local=dtn1,condorpool=dtn2` — rename Pegasus site names to DTN
+  names one-for-one. Unlisted sites pass through unchanged.
+- `--dtn-names dtn1,dtn2,dtn3` — spread files across the listed DTN pool by a
+  stable hash of the file name: the same file maps to the same DTN in **every**
+  job, giving consistent producer/consumer data locality while exercising
+  multi-DTN selection. Overrides `--dtn-map`.
+
+```bash
+python pegasus_to_swarm_converter.py --input all_runs_jobs_profile.json \
+    --input-type json --output-dir converted_jobs/ \
+    --data-nodes per-file --dtn-names dtn1,dtn2,dtn3
+```
+
+`--generate-agent-configs` collects DTN names from the converted jobs, so the
+generated `agent_profiles.json`/YAML configs automatically list whichever DTNs
+these options produce.
+
 Use `--generate-agent-configs --num-agents N --base-config config_swarm_multi.yml`
 to also emit agent profiles/configs sized to the converted workload (agents get
 every DTN site referenced by the jobs).
