@@ -1,6 +1,6 @@
 # SwarmAgents
 
-A framework for greedy distributed consensus and selection algorithms, designed for scalable, resilient decision-making across multiple agents. Agents reach consensus on job assignments using a PBFT-like protocol with cost-based selection strategies.
+A framework for greedy distributed consensus and selection algorithms, designed for scalable, resilient decision-making across multiple agents. Agents reach consensus on job assignments using cost-based selection with a choice of consensus protocols: a PBFT-like three-phase protocol or a Snow/Avalanche-style sampling protocol backed by SWIM membership and epidemic state dissemination.
 
 ## Table of Contents
 
@@ -19,9 +19,12 @@ A framework for greedy distributed consensus and selection algorithms, designed 
 
 - Greedy distributed selection and consensus algorithms
 - PBFT-like consensus with cost-based self-selection and dominance filtering
+- Snow/Avalanche-style gossip consensus (`consensus.protocol: snow`) with SWIM failure detection and epidemic state dissemination — scales past the PBFT broadcast ceiling
 - Multiple network topologies: Ring, Mesh, Star, Hierarchical
 - LLM-enhanced agents (OpenAI/Ollama) alongside rule-based resource agents
-- Multi-Armed Bandit (MAB) reinforcement learning for hierarchical delegation
+- Multi-Armed Bandit (Epsilon-Greedy, UCB1) and contextual bandit (LinUCB, LinTS) reinforcement learning for hierarchical delegation
+- Hybrid quantum-classical job support: quantum backends on agents, qubit-aware feasibility/cost, and split producer/consumer co-scheduling over a Redis-streams measurement layer
+- Replay of real Pegasus workflow executions as swarm workloads (extractor + converter pipeline)
 - Agent failure detection, job reassignment, and dynamic agent addition
 - Extensible for other distributed resource allocation problems
 
@@ -36,13 +39,23 @@ A generic PBFT-like consensus engine for distributed agreement. Framework-agnost
 - Quorum-based rounds trigger selection or commit actions
 - See `resource_agent.py` for integration via adapter classes
 
+### Snow Consensus Engine (`swarm/consensus/gossip_engine.py`)
+
+A Snow/Avalanche-style alternative to PBFT, selected via `consensus.protocol: snow`. Replaces the three-phase broadcast with repeated k-peer sampling and finalizes exactly-once through Redis `SET NX`. Tunables under `consensus.snow.{k,alpha,beta,max_rounds,round_timeout_ms,tick_interval_ms}`.
+
+Runs alongside two supporting layers (usable independently):
+- **SWIM membership** (`swarm/membership/swim.py`) — probe/indirect-probe failure detection, `failure_detection.protocol: swim`
+- **Gossip dissemination** (`swarm/gossip/disseminator.py`) — epidemic state spread, `gossip.{enabled,fanout,period_ms,state_ttl_s}`
+
+See [GOSSIP_CONSENSUS_DESIGN.md](docs/GOSSIP_CONSENSUS_DESIGN.md).
+
 ### Selection Engine (`swarm/selection/engine.py`)
 
 A cache-enabled engine for assigning candidates to assignees based on feasibility and cost functions.
 
 - Computes cost matrices for all candidate-assignee pairs (infeasible = infinity)
 - Greedy or thresholded selection with tie-breaking and acceptance criteria
-- Internal LRU caches for repeated feasibility and cost checks
+- Internal LRU caches for repeated feasibility and cost checks; live (non-cached) penalty helpers in `swarm/selection/penalties.py`
 
 ## Job Selection
 
@@ -84,10 +97,13 @@ The selection engine builds a cost matrix (agents x jobs), then selects the mini
 
 ### Consensus Protocol
 
+**PBFT (default):**
 1. Agents broadcast proposals for job assignments
 2. Peers respond with prepare and commit messages
 3. Quorum reached (`ceil((n+1)/2)`) finalizes assignment
 4. Dynamic quorum adjusts based on live agent count
+
+**Snow (`consensus.protocol: snow`):** each undecided agent repeatedly samples `k` live peers for their preferred assignee; a candidate seen by ≥ `alpha` of the sample increments confidence, and `beta` consecutive successful rounds finalize the decision via an atomic Redis claim. Message load scales with `k`, not the agent count.
 
 See [COMPLEXITY.md](docs/COMPLEXITY.md) for detailed message complexity analysis.
 
@@ -133,6 +149,12 @@ pip install -r requirements.txt
 docker run -d -p 6379:6379 redis
 ```
 
+### Unit Tests
+
+```bash
+python -m pytest tests/   # consensus (Snow/PBFT), SWIM, gossip, bandits, quantum, repository, broadcast
+```
+
 ### Resource Agents
 
 ```bash
@@ -166,6 +188,30 @@ python run_test.py --agent-type llm --agents 5 --topology ring --jobs 100 --db-h
 python batch_tests_v2.py --runs 10 --base-out runs/batch --mode local --agent-type resource --agents 20 --topology mesh --jobs 500 --db-host localhost
 ```
 
+### Replaying Pegasus Workflows
+
+Real Pegasus workflow executions can be replayed as swarm workloads. Extract job profiles on the Pegasus submit host, then feed them to the test runner:
+
+```bash
+# On the Pegasus submit host
+python3 pegasus_profile_extractor.py --root /path/to/workflows --output all_runs_jobs_profile.json
+
+# Replay through swarm
+python run_test.py --mode local --agents 10 --topology mesh --jobs <N> --db-host localhost \
+    --run-dir runs/pegasus-replay --pegasus-profiles all_runs_jobs_profile.json --pegasus-input-type json
+```
+
+See [PEGASUS_TO_SWARM.md](docs/PEGASUS_TO_SWARM.md) for the full pipeline, DTN naming options, and field mappings.
+
+### Quantum / Hybrid Jobs
+
+```bash
+python run_test.py --mode local --agents 20 --topology mesh --jobs 200 --db-host localhost \
+    --run-dir runs/quantum --quantum-agents-pct 0.25 --quantum-fraction 0.2 --hybrid-fraction 0.1 [--split-hybrid]
+```
+
+`--split-hybrid` decomposes hybrid jobs into co-scheduled quantum producer / classical consumer sub-jobs. See [QUANTUM_HYBRID_DESIGN.md](docs/QUANTUM_HYBRID_DESIGN.md).
+
 ### Visualizations
 
 All plotting functionality lives in the `plotting/` package. Top-level scripts are thin CLI wrappers for backward compatibility.
@@ -188,31 +234,7 @@ Generated plots include scheduling latency histograms, jobs per agent, agent loa
 
 ## Results
 
-**Evaluation Data** for **SWARM(CCGrid'25)** and **SWARM+(CCGrid'26)** can be found [here](https://github.com/swarm-workflows/swarm-evaluation-data).
-
-### Example Visualizations
-
-#### Resource Agents — Mesh Topology
-![Scheduling Latency](runs/simulation/resource_agent/mesh/30/scheduling_latency_histogram.png)
-![Jobs Per Agent](runs/simulation/resource_agent/mesh/30/jobs_per_agent.png)
-![Agent Load](runs/simulation/resource_agent/mesh/30/agent_loads_summary.png)
-
-#### Resource Agents — Ring Topology
-![Scheduling Latency](runs/simulation/resource_agent/ring/30/scheduling_latency_histogram.png)
-![Jobs Per Agent](runs/simulation/resource_agent/ring/30/jobs_per_agent.png)
-![Agent Load](runs/simulation/resource_agent/ring/30/agent_loads_summary.png)
-
-#### Resource Agents — Hierarchical Topology
-![Scheduling Latency](runs/simulation/resource_agent/hierarchical/30/scheduling_latency_histogram.png)
-![Jobs Per Agent](runs/simulation/resource_agent/hierarchical/30/jobs_per_agent.png)
-![Agent Load](runs/simulation/resource_agent/hierarchical/30/agent_loads_summary.png)
-
-#### LLM Agents — Mesh Topology
-![Scheduling Latency](runs/simulation/llm_agent/mesh/5/scheduling_latency_histogram.png)
-![Reasoning Vs Scheduling](runs/simulation/llm_agent/mesh/5/reasoning_vs_latency_scatter.png)
-![Reasoning Time](runs/simulation/llm_agent/mesh/5/mean_reasoning_time_per_agent.png)
-![Jobs Per Agent](runs/simulation/llm_agent/mesh/5/jobs_per_agent.png)
-![Agent Load](runs/simulation/llm_agent/mesh/5/agent_loads_summary.png)
+**Evaluation Data** for **SWARM (CCGrid'25)** and **SWARM+ (CCGrid'26)** can be found [here](https://github.com/swarm-workflows/swarm-evaluation-data). Every run also produces its own plots under `<run-dir>/` (see [Visualizations](#visualizations)).
 
 ## Agent Failure Handling
 
@@ -279,6 +301,8 @@ Dynamic agents are pre-configured, started when the trigger fires, and join the 
 | `job_generator.py` | Generate synthetic job descriptions matching agent profiles |
 | `generate_configs.py` | Create agent configs for different topologies and agent counts |
 | `job_distributor.py` | Distribute jobs to Redis at a controlled rate |
+| `pegasus_profile_extractor.py` | Extract job profiles from Pegasus runs (runs on the submit host) |
+| `pegasus_to_swarm_converter.py` | Convert Pegasus profiles into swarm job files (+ optional agent configs) |
 | `dump_db.py` | Inspect Redis database state for debugging |
 | `kill_agents.py` | Simulate agent failures (local/remote, gradual/instant) |
 
@@ -302,12 +326,18 @@ All documentation lives in the [`docs/`](docs/) directory.
 ### Architecture & Design
 - [ARCHITECTURE.md](docs/ARCHITECTURE.md) — System architecture, five-layer design, and adapter patterns
 - [COMPLEXITY.md](docs/COMPLEXITY.md) — PBFT message complexity analysis for mesh and hierarchical topologies
-- [GOSSIP_CONSENSUS_DESIGN.md](docs/GOSSIP_CONSENSUS_DESIGN.md) — Gossip-based consensus stack (SWIM + gossip + Snow); Phases 1-3 implemented, wired, and unit-tested, Phase 4 (hybrid hierarchical) and at-scale evaluation pending
+- [GOSSIP_CONSENSUS_DESIGN.md](docs/GOSSIP_CONSENSUS_DESIGN.md) — Gossip-based consensus stack (SWIM + gossip + Snow), implemented through Phase 4 (hybrid hierarchical) and validated at scale
 
-### Hierarchical Topology
+### Quantum & Workloads
+- [QUANTUM_HYBRID_DESIGN.md](docs/QUANTUM_HYBRID_DESIGN.md) — Hybrid quantum-classical job taxonomy, models, and split co-scheduling design
+- [QUANTUM_HYBRID_IMPLEMENTATION.md](docs/QUANTUM_HYBRID_IMPLEMENTATION.md) — Code-level walkthrough of the quantum support
+- [PEGASUS_TO_SWARM.md](docs/PEGASUS_TO_SWARM.md) — Replaying real Pegasus workflow executions as swarm workloads
+
+### Hierarchical Topology & Delegation
 - [HIERARCHICAL_LLM_AGENTS.md](docs/HIERARCHICAL_LLM_AGENTS.md) — LLM agents as Level-1 coordinators in hierarchical topology
 - [CO_PARENT_USAGE.md](docs/CO_PARENT_USAGE.md) — Multi-parent shared parenting and coordinator failover
 - [MAB_README.md](docs/MAB_README.md) — Multi-Armed Bandit configuration and tuning for delegation
+- [CONTEXTUAL_BANDIT_DESIGN.md](docs/CONTEXTUAL_BANDIT_DESIGN.md) — Contextual bandit (LinUCB/LinTS) delegation with deployment validation
 
 ### Baselines & Evaluation
 - [DISTRIBUTED_BASELINE_DESIGN.md](docs/DISTRIBUTED_BASELINE_DESIGN.md) — Design for distributed baseline schedulers with remote execution
