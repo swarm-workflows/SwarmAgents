@@ -36,6 +36,7 @@ class DataNode(JSONField):
         self._ip = None
         self._user = None
         self._connectivity_score = 0.0
+        self._size_bytes = None
         self._set_fields(**kwargs)
 
     @property
@@ -77,6 +78,14 @@ class DataNode(JSONField):
     @connectivity_score.setter
     def connectivity_score(self, connectivity_score: float):
         self._connectivity_score = connectivity_score
+
+    @property
+    def size_bytes(self):
+        return self._size_bytes
+
+    @size_bytes.setter
+    def size_bytes(self, size_bytes: int):
+        self._size_bytes = size_bytes
 
     def _set_fields(self, forgiving=False, **kwargs):
         """

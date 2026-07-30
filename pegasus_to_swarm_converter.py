@@ -163,14 +163,30 @@ def _map_capacities(profile: dict, default_cores: float, min_ram_gb: float,
     }
 
 
-def _map_data_nodes(files_list: Optional[list]) -> Optional[list]:
+def _map_data_nodes(files_list: Optional[list],
+                    mode: str = "per-site") -> Optional[list]:
     """Map Pegasus input/output file lists to SwarmAgents DataNode dicts.
 
-    Per-job dedup: one DataNode per unique non-empty site name.
-    Files with empty site are skipped.
+    mode="per-site": one DataNode per unique non-empty site name (first lfn
+    seen wins) — the historical behavior.
+    mode="per-file": one DataNode per file, preserving every lfn (and its
+    size_bytes when present).
+    Files with empty site are skipped in both modes.
     """
     if not files_list:
         return None
+
+    if mode == "per-file":
+        nodes = []
+        for f in files_list:
+            site = (f.get("site") or "").strip()
+            if not site:
+                continue
+            node = {"name": site, "file": f.get("lfn", "")}
+            if f.get("size_bytes") is not None:
+                node["size_bytes"] = f["size_bytes"]
+            nodes.append(node)
+        return nodes or None
 
     seen_sites: Dict[str, str] = {}  # site -> first lfn
     for f in files_list:
@@ -194,7 +210,8 @@ def map_profile(profile: dict, job_number: int,
                 min_wall_time: float = 0.1,
                 default_cores: float = 1.0,
                 min_ram_gb: float = 0.1,
-                min_disk_gb: float = 1.0) -> Tuple[dict, List[str]]:
+                min_disk_gb: float = 1.0,
+                data_nodes_mode: str = "per-site") -> Tuple[dict, List[str]]:
     """Convert a single Pegasus profile to a SwarmAgents job dict."""
     warnings: List[str] = []
 
@@ -208,8 +225,8 @@ def map_profile(profile: dict, job_number: int,
 
     capacities = _map_capacities(profile, default_cores, min_ram_gb, min_disk_gb)
 
-    data_in = _map_data_nodes(profile.get("input_files_db"))
-    data_out = _map_data_nodes(profile.get("output_files_db"))
+    data_in = _map_data_nodes(profile.get("input_files_db"), data_nodes_mode)
+    data_out = _map_data_nodes(profile.get("output_files_db"), data_nodes_mode)
 
     exitcode = int(profile.get("exitcode_db", 0) or 0)
     should_fail = exitcode != 0
@@ -501,6 +518,7 @@ def convert_pegasus_profiles(
     default_cores: float = 1.0,
     min_ram_gb: float = 0.1,
     min_disk_gb: float = 1.0,
+    data_nodes_mode: str = "per-site",
 ) -> dict:
     """Convert Pegasus profiles to SwarmAgents job JSON files.
 
@@ -561,6 +579,7 @@ def convert_pegasus_profiles(
             default_cores=default_cores,
             min_ram_gb=min_ram_gb,
             min_disk_gb=min_disk_gb,
+            data_nodes_mode=data_nodes_mode,
         )
 
         # Write job file
@@ -658,6 +677,7 @@ def convert(args: argparse.Namespace):
             default_cores=args.default_cores,
             min_ram_gb=args.min_ram_gb,
             min_disk_gb=args.min_disk_gb,
+            data_nodes_mode=args.data_nodes,
         )
 
         # Write job file
@@ -787,6 +807,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--default-cores", type=float, default=1.0,
         help="Default core count when request_cpus_db is 0. Default: 1.0."
+    )
+    parser.add_argument(
+        "--data-nodes", choices=["per-site", "per-file"], default="per-site",
+        help="data_in/data_out granularity: 'per-site' dedups to one DataNode "
+             "per site (historical behavior); 'per-file' keeps every "
+             "input/output file with its size. Default: per-site."
     )
 
     # Agent config generation
