@@ -57,6 +57,8 @@ runtime:
   job_reassignment_enabled: true       # Enable automatic job reassignment
   aggressive_failure_detection: true # Use proactive failure detection from gRPC
   enable_agent_recovery: true        # Allow recovered agents to rejoin the pool
+  recovery_grace_seconds: 10         # Heartbeat must stay fresh this long before a failed agent rejoins
+  recovery_cooldown_seconds: 15      # After rejoin, channel-DOWN events can't re-fail the agent (reconnect settling)
   max_infeasible_retries: 10         # Retire infeasible jobs after N attempts (0 = infinite)
   max_delegation_attempts: 3         # Mark job infeasible after N failed delegation timeouts
   #neighbor_refresh_full_s: 5        # Full Redis neighbor-refresh cadence. Default: per-tick

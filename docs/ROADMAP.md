@@ -124,10 +124,10 @@ When evaluating peer parent agents in hierarchical topology, feasibility uses ag
 
 **Recommendation:** Consider adding a "delegation confidence" score or a pre-delegation feasibility query to children.
 
-### 14. Agent Recovery
-Failed agents are detected and removed but have no first-class rejoin protocol. Partially addressed: SWIM membership tracks rejoining peers, and the contextual-bandit layer re-adopts recovered delegation targets (Scenario C: liveness gate + decayed timeout signal).
+### 14. Agent Recovery — DONE
+Implemented via `RecoveryTracker` (`swarm/utils/recovery.py`) + wiring in `resource_agent.py`. Three rejoin signals: heartbeat progress (record written *after* the failure timestamp, fresh for `recovery_grace_seconds`), gRPC channel-up, and SWIM alive/joined — all funnel through `_on_agent_recovered`, and the agent re-enters neighbor maps/quorum via the normal refresh path. A `recovery_cooldown_seconds` window keeps stale channel-DOWN events from flapping a just-recovered agent while its reconnect settles. Unit tests in `tests/test_agent_recovery.py`; validated end-to-end (SIGKILL → detect 1s → 0 spurious recoveries while dead → rejoin ~7s after restart, one clean recovery per peer).
 
-**Recommendation:** Complete the rejoin protocol at the agent layer: re-announce via heartbeat, re-enter neighbor maps, re-add to quorum (`enable_agent_recovery` TODO in `resource_agent.py`).
+Remaining nuance: recovery trusts the restarted process; there is no state resync for jobs the agent held pre-crash (they are reassigned by the failure path).
 
 ---
 

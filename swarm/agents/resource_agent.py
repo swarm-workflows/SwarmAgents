@@ -46,6 +46,7 @@ from swarm.selection.engine import SelectionEngine
 from swarm.selection.penalties import apply_multiplicative_penalty
 from swarm.topology.topology import TopologyType
 from swarm.utils.metrics import Metrics
+from swarm.utils.recovery import RecoveryTracker
 from swarm.utils.resource_queues import ResourceAgentQueues
 from swarm.utils.thread_safe_dict import ThreadSafeDict
 from swarm.agents.agent_grpc import Agent
@@ -243,10 +244,13 @@ class _SwimAdapter:
         self.agent.logger.warning(msg)
 
     def on_agent_alive(self, agent_id: int) -> None:
-        pass  # advisory in Phase 1
+        # SWIM got an ack from the agent — direct recovery evidence for a
+        # previously failed peer (no-op for healthy peers).
+        self.agent.on_swim_member_alive(agent_id)
 
     def on_agent_joined(self, agent_id: int) -> None:
         self.agent.logger.info(f"[SWIM] joined: {agent_id}")
+        self.agent.on_swim_member_alive(agent_id)
 
     def on_agent_suspected(self, agent_id: int) -> None:
         self.agent.logger.info(f"[SWIM] suspected: {agent_id}")
@@ -413,6 +417,19 @@ class ResourceAgent(Agent):
 
         # Track failed agents and job assignments
         self.failed_agents = ThreadSafeDict[int, float]()  # agent_id -> failure_timestamp
+        # Rejoin decisions for failed agents (ROADMAP item 14): passive
+        # heartbeat recovery needs a grace window; direct evidence (channel
+        # up, SWIM ack) promotes immediately. The tracker is the only thing
+        # that removes entries from failed_agents.
+        self.recovery = RecoveryTracker(
+            self.failed_agents,
+            grace_seconds=self.recovery_grace_seconds,
+        )
+        # agent_id -> last recovery ts; used to keep the aggressive (channel-
+        # DOWN) path from re-failing a just-recovered agent while its channel
+        # reconnect is still in flight. Heartbeat-staleness detection is not
+        # suppressed, so a truly dead agent is still re-failed promptly.
+        self._recovered_at = ThreadSafeDict[int, float]()
         self.job_assignments = ThreadSafeDict[str, int]()  # job_id -> assigned_agent_id
 
         # Consensus messages that arrived before their job (see _HostAdapter.set_pending_*).
@@ -698,8 +715,18 @@ class ResourceAgent(Agent):
 
     @property
     def enable_agent_recovery(self) -> bool:
-        """Allow recovered agents to rejoin the pool when their gRPC channel comes back UP."""
+        """Allow recovered agents to rejoin the pool (heartbeat, channel-up, or SWIM evidence)."""
         return self.runtime_config.get("enable_agent_recovery", True)
+
+    @property
+    def recovery_grace_seconds(self) -> float:
+        """How long a failed agent's heartbeat must stay fresh before it may rejoin."""
+        return float(self.runtime_config.get("recovery_grace_seconds", 10.0))
+
+    @property
+    def recovery_cooldown_seconds(self) -> float:
+        """After a rejoin, channel-DOWN events can't re-fail the agent for this long."""
+        return float(self.runtime_config.get("recovery_cooldown_seconds", 15.0))
 
     def __on_proposal(self, incoming: Proposal):
         self.engine.on_proposal(incoming)
@@ -1242,13 +1269,23 @@ class ResourceAgent(Agent):
             for agent_data in agent_dicts:
                 agent = AgentInfo.from_dict(agent_data)
 
-                # Skip agents that have been marked as failed
+                # Failed agents stay excluded until the recovery tracker
+                # promotes them: their heartbeat must stay fresh for the full
+                # grace window (or direct channel-up/SWIM evidence arrives).
                 if agent.agent_id in self.failed_agents:
-                    self.logger.debug(
-                        f"Skipping failed agent {agent.agent_id} during neighbor refresh "
-                        f"(failed at {self.failed_agents.get(agent.agent_id)})"
-                    )
-                    continue
+                    fresh = (current_time - agent.last_updated) <= self.failure_threshold_seconds
+                    if self.enable_agent_recovery and self.recovery.observe(
+                            agent.agent_id, last_updated=agent.last_updated,
+                            fresh=fresh, now=current_time):
+                        self._on_agent_recovered(agent.agent_id, source="heartbeat")
+                        # fall through: re-add to the map below
+                    else:
+                        self.logger.debug(
+                            f"Skipping failed agent {agent.agent_id} during neighbor refresh "
+                            f"(failed at {self.failed_agents.get(agent.agent_id)}, "
+                            f"fresh={fresh}, recovering_since={self.recovery.recovering_since(agent.agent_id)})"
+                        )
+                        continue
 
                 # Skip agents that are shutting down gracefully
                 if getattr(agent, 'shutting_down', False):
@@ -2763,6 +2800,47 @@ class ResourceAgent(Agent):
                 else:
                     self.logger.info(f"Job reassignment disabled, not reassigning jobs from agent {agent_id}")
 
+    def _on_agent_recovered(self, agent_id: int, source: str) -> None:
+        """
+        Record the rejoin of a previously failed agent (ROADMAP item 14).
+
+        Called after the recovery tracker has removed the agent from
+        ``failed_agents``. The agent re-enters the neighbor/children map via
+        the normal refresh path (immediately for heartbeat-driven recovery,
+        on the next refresh cycle for channel-up/SWIM-driven recovery), which
+        also restores it to quorum accounting since quorum derives from the
+        live map.
+
+        :param agent_id: recovered agent
+        :param source: recovery evidence ("heartbeat", "channel-up", "swim")
+        """
+        now = time.time()
+        self._recovered_at.set(agent_id, now)
+        self.logger.info(
+            f"Agent {agent_id} RECOVERED (source: {source}) — rejoining pool. "
+            f"Live agents before re-add: {self.live_agent_count}/{self.configured_agent_count}"
+        )
+        self.metrics.agent_recoveries.append({
+            'agent_id': agent_id,
+            'recovered_at': now,
+            'source': source,
+        })
+        self.metrics.quorum_changes.append({
+            'timestamp': now,
+            'live_agents': self.live_agent_count,
+            'quorum': self.calculate_quorum(),
+            'reason': f'recovered_agent_{agent_id}'
+        })
+
+    def on_swim_member_alive(self, agent_id: int) -> None:
+        """SWIM saw the agent answer (alive/joined) — direct recovery evidence."""
+        if self.shutdown or not self.enable_agent_recovery:
+            return
+        if agent_id not in self.failed_agents:  # cheap guard: fires per SWIM ack
+            return
+        if self.recovery.recover_direct(agent_id):
+            self._on_agent_recovered(agent_id, source="swim")
+
     def _clear_consensus_for_failed_agent(self, failed_agent_id: int) -> None:
         """
         Clear consensus state for proposals involving a failed agent.
@@ -3119,16 +3197,8 @@ class ResourceAgent(Agent):
                 if agent_id is None:
                     agent_id = self._find_agent_by_endpoint(host, port)
 
-                if agent_id and agent_id in self.failed_agents:
-                    self.logger.info(
-                        f"Agent {agent_id} ({target}) recovered — removing from failed set. "
-                        f"Will rejoin on next neighbor refresh."
-                    )
-                    self.failed_agents.remove(agent_id)
-                    self.metrics.agent_recoveries.append({
-                        'agent_id': agent_id,
-                        'recovered_at': time.time(),
-                    })
+                if agent_id and self.recovery.recover_direct(agent_id):
+                    self._on_agent_recovered(agent_id, source="channel-up")
             except Exception as e:
                 self.logger.error(f"Failed to process peer recovery for {target}: {e}")
             return
@@ -3161,6 +3231,16 @@ class ResourceAgent(Agent):
 
             # Mark as failed immediately
             if failed_agent_id:
+                # Post-recovery settling window: the old channel may still
+                # report DOWN while its reconnect is in flight — don't flap
+                # a just-recovered agent back to failed on channel evidence.
+                recovered_at = self._recovered_at.get(failed_agent_id) or 0.0
+                if (time.time() - recovered_at) < self.recovery_cooldown_seconds:
+                    self.logger.info(
+                        f"Ignoring channel-DOWN for recently recovered agent {failed_agent_id} "
+                        f"(within {self.recovery_cooldown_seconds}s cooldown)"
+                    )
+                    return
                 if failed_agent_id not in self.failed_agents:
                     current_time = time.time()
                     self.failed_agents.set(failed_agent_id, current_time)
