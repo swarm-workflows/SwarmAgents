@@ -64,35 +64,54 @@ runtime:
                                      # arrives via the epidemic cache every tick instead)
 
 # Consensus protocol — Phase 3/4 of the gossip-consensus migration.
-#   pbft   : PBFT-like 3-phase engine everywhere (default; best <50 agents / small groups).
+#   pbft   : PBFT-like 3-phase engine everywhere (best <50 agents / small groups).
 #   snow   : Snow/Avalanche engine everywhere (k-peer sampling + Redis SET-NX finalization;
-#            livelock-free at flat scale but higher latency; benefits from gossip + SWIM).
+#            livelock-free at flat scale; benefits from gossip + SWIM). Default in this file,
+#            tuned below for a 20-agent flat mesh.
 #   hybrid : Phase 4 — engine chosen per topology level (see `hybrid` below). PBFT within small
 #            level-0 worker groups (low latency) + Snow across the large coordinator tier
 #            (removes the O(g^2) wall). Consensus only flows among same-level peers, so each
 #            level runs a single engine type.
 consensus:
-  protocol: pbft            # pbft (default) | snow | hybrid
+  protocol: snow            # pbft | snow (default here) | hybrid
   hybrid:
     level0: pbft            # engine for level-0 worker groups (small, <=10 agents)
     coordinator: snow       # engine for level >= 1 coordinator tiers (large pools)
+  # Snow parameters tuned for a 20-agent FLAT MESH (n=20, every agent a peer).
+  # For larger pools (>=100 agents) move back toward k=15-20 / beta=15-20; for a
+  # small hybrid coordinator tier (~10 agents) k=8 / beta=6 is a good starting point.
   snow:
-    k: 20                    # Peers sampled per query round
-    alpha: 0.7               # Supermajority threshold within the sample
-    beta: 20                 # Consecutive winning rounds required to commit. Avalanche-scale
-                             # default; for a small trusted tier (e.g. ~10 hybrid coordinators)
-                             # beta 4-8 converges the same and cuts decision latency ~3x
-                             # (validated: beta=6 -> 0.96s level-1 selection at Hier-60)
+    k: 10                    # Peers sampled per query round. Half the 20-agent pool: keeps
+                             # sampling genuinely sub-linear (k=20 would query every peer
+                             # each round, degenerating into a broadcast) while still giving
+                             # a solid majority sample. The engine caps k to live peers, so
+                             # this stays correct if agents fail or join.
+    alpha: 0.7               # Supermajority threshold within the sample -> 7 of 10 must agree.
+                             # Threshold is computed against the peers actually sampled, so
+                             # a shrunken pool can still commit.
+    beta: 6                  # Consecutive winning rounds required to commit. 20 is the
+                             # Avalanche large-scale default; at n=20 the candidate set is
+                             # tiny and converges in a few rounds, so beta=6 commits with the
+                             # same outcome at ~3x lower decision latency (validated at
+                             # Hier-60 level-1: beta=6 -> 0.96s selection). Safety margin is
+                             # still (1-alpha)^beta ~ 7e-4 per decision, and the Redis SET-NX
+                             # claim in repository.try_claim_assignment is the hard
+                             # exactly-once backstop.
     max_rounds: 100          # Abandon Snow attempt after this many rounds
-    round_timeout_ms: 500    # Per-round response timeout (upper bound; a round now ends as
-                             # soon as all queried peers respond — see gossip_engine)
+    round_timeout_ms: 300    # Per-round response timeout (upper bound; a round ends as soon
+                             # as all k queried peers respond — see gossip_engine). 20 agents
+                             # on one LAN/site respond well inside 300ms, so the lower bound
+                             # only matters when a peer is already dead.
     tick_interval_ms: 50     # Driver-thread polling interval
     local_sample_frac: 1.0   # Fraction of each k-sample drawn from same-site peers (1.0 = uniform;
-                             # <1.0 enables topology-aware sampling when agents have a `site`)
-    send_workers: 32         # Thread-pool size for non-blocking best-effort query sends
+                             # <1.0 enables topology-aware sampling when agents have a `site`).
+                             # Keep 1.0 for a single-site 20-agent mesh.
+    send_workers: 16         # Thread-pool size for non-blocking best-effort query sends.
+                             # Peak demand is max_inflight * k = 160 sends/tick; 16 workers
+                             # drain that comfortably at this scale.
     send_timeout_ms: 300     # Per-send timeout for Snow queries/responses (no retries; a dropped
                              # query just means that peer abstains this round)
-    max_inflight: 32         # Max decisions with an outstanding query round at once — bounds
+    max_inflight: 16         # Max decisions with an outstanding query round at once — bounds
                              # send demand to what the pool can drain (prevents congestion
                              # collapse under delegation bursts)
 
@@ -101,7 +120,8 @@ consensus:
 # layer runs alongside the heartbeat mechanism; heartbeats remain authoritative
 # for job reassignment in this phase.
 failure_detection:
-  protocol: heartbeat       # heartbeat (default) | swim
+  protocol: swim            # heartbeat | swim (enabled here to keep Snow's live-peer
+                            # sample fresh; heartbeat still drives job reassignment)
   swim:
     period_ms: 1000          # Protocol round period
     probe_timeout_ms: 1000   # Direct ping timeout before falling back to ping-req.
@@ -114,8 +134,9 @@ failure_detection:
 # versioned utilization/load state to `fanout` random peers every round.
 # Independent of SWIM.
 gossip:
-  enabled: false
-  fanout: 3
+  enabled: true            # Peer load/utilization reaches Snow cost estimates via the
+                           # epidemic cache instead of a per-tick Redis neighbor refresh
+  fanout: 3                # 3 pushes/round covers a 20-agent pool in ~3 rounds
   period_ms: 1000
   state_ttl_s: 30
 
