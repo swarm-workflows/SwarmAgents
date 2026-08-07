@@ -135,9 +135,9 @@ Consensus and selection engines are **decoupled** from agents via adapter classe
 - `runtime.reselection_timeout_s` — Job timeout before reselection (default: 60s)
 - `mab.algorithm` — "epsilon_greedy" or "ucb1" for hierarchical delegation
 - `llm.provider` — "openai" or "none"; `llm.model` for model selection
-- `consensus.protocol` — "pbft" (default) or "snow"; Snow tuning under `consensus.snow.{k,alpha,beta,max_rounds,round_timeout_ms,tick_interval_ms}`
-- `failure_detection.protocol` — "heartbeat" (default) or "swim" (runs alongside heartbeat)
-- `gossip.enabled` / `gossip.fanout` / `gossip.period_ms` / `gossip.state_ttl_s` — Epidemic state dissemination
+- `consensus.protocol` — "pbft", "snow", or "hybrid". **The shipped config ships `snow`**, tuned for a 20-agent flat mesh (`k: 10`, `alpha: 0.7`, `beta: 6`, `round_timeout_ms: 300`, `send_workers`/`max_inflight: 16`). Set `pbft` for small clusters where its 3-phase latency wins, or scale `k`/`beta` back toward 15-20 above ~100 agents. Note the *code* fallback when the key is absent is still `pbft`. Full tuning under `consensus.snow.{k,alpha,beta,max_rounds,round_timeout_ms,tick_interval_ms,local_sample_frac,send_workers,send_timeout_ms,max_inflight}`
+- `failure_detection.protocol` — "heartbeat" or "swim". **The shipped config ships `swim`** (it keeps Snow's live-peer sample fresh); heartbeat still runs alongside and remains authoritative for job reassignment. Code fallback when absent is `heartbeat`
+- `gossip.enabled` / `gossip.fanout` / `gossip.period_ms` / `gossip.state_ttl_s` — Epidemic state dissemination. **The shipped config ships `enabled: true`** so peer `load` reaches Snow cost estimates via the epidemic cache; this also switches the neighbor refresh from per-tick Redis to every 5s (`runtime.neighbor_refresh_full_s`)
 
 ## Development Guidelines
 
