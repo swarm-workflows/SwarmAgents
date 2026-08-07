@@ -327,6 +327,7 @@ All documentation lives in the [`docs/`](docs/) directory.
 - [ARCHITECTURE.md](docs/ARCHITECTURE.md) — System architecture, five-layer design, and adapter patterns
 - [COMPLEXITY.md](docs/COMPLEXITY.md) — PBFT message complexity analysis for mesh and hierarchical topologies
 - [GOSSIP_CONSENSUS_DESIGN.md](docs/GOSSIP_CONSENSUS_DESIGN.md) — Gossip-based consensus stack (SWIM + gossip + Snow), implemented through Phase 4 (hybrid hierarchical) and validated at scale
+- [DECENTRALIZED_POOL_DESIGN.md](docs/DECENTRALIZED_POOL_DESIGN.md) — Proposed design for removing Redis from the control plane (p2p job pool, referee-based exactly-once claims, replicated job state)
 
 ### Quantum & Workloads
 - [QUANTUM_HYBRID_DESIGN.md](docs/QUANTUM_HYBRID_DESIGN.md) — Hybrid quantum-classical job taxonomy, models, and split co-scheduling design
