@@ -135,15 +135,29 @@ def scp_to(host: str, src: str, dst: str) -> None:
 # ------------------------------
 # Pegasus job conversion
 # ------------------------------
+# Must match generate_configs.AgentConfigGenerator.generate_global_dtn_pool(total_count=10):
+# job data-node sites that share no names with the agent DTN pool make the connectivity
+# term unsatisfiable, so it drops out of the cost model entirely.
+AGENT_DTN_POOL = [f"dtn{i}" for i in range(1, 11)]
+
+
 def convert_pegasus_jobs(args) -> dict:
     """Convert Pegasus profiles into SwarmAgents job files in jobs/."""
     from pegasus_to_swarm_converter import convert_pegasus_profiles
 
-    log(f"Converting Pegasus profiles: {args.pegasus_profiles} ({args.pegasus_input_type}) …")
+    if args.pegasus_dtn_names:
+        dtn_names = [n.strip() for n in args.pegasus_dtn_names.split(",") if n.strip()]
+    else:
+        dtn_names = AGENT_DTN_POOL
+
+    log(f"Converting Pegasus profiles: {args.pegasus_profiles} ({args.pegasus_input_type}) "
+        f"[data-nodes={args.pegasus_data_nodes}, dtns={','.join(dtn_names)}] …")
     result = convert_pegasus_profiles(
         input_path=args.pegasus_profiles,
         input_type=args.pegasus_input_type,
         output_dir="jobs",
+        data_nodes_mode=args.pegasus_data_nodes,
+        dtn_names=dtn_names,
     )
     log(f"Pegasus conversion: {result['jobs_written']} jobs written, "
         f"{result['warnings_count']} warnings")
@@ -246,6 +260,8 @@ def generate_configs(args, agent_hosts_list: list[str]) -> Path:
         gen_args += ["--fit-all"]
     if getattr(args, "agent_sites_file", None):
         gen_args += ["--agent-sites-file", str(args.agent_sites_file)]
+    if getattr(args, "seed", None) is not None:
+        gen_args += ["--seed", str(args.seed)]
     if getattr(args, "quantum_agents_pct", 0.0) > 0:
         gen_args += ["--quantum-agents-pct", str(args.quantum_agents_pct)]
     if getattr(args, "quantum_fraction", 0.0) > 0:
@@ -771,9 +787,18 @@ def parse_args() -> argparse.Namespace:
                          "When set, jobs are converted from Pegasus profiles instead of generated synthetically.")
     ap.add_argument("--pegasus-input-type", choices=["text", "redis", "export", "json"], default="text",
                     help="Format of the Pegasus profiles source (default: text)")
+    ap.add_argument("--pegasus-data-nodes", choices=["per-site", "per-file"], default="per-file",
+                    help="Granularity of job data_in/data_out nodes (default: per-file, keeps every "
+                         "file and its size)")
+    ap.add_argument("--pegasus-dtn-names", type=str, default=None,
+                    help="Comma-separated DTN pool to spread job files across. Defaults to the same "
+                         "dtn1..dtn10 pool generate_configs.py gives agents, so the connectivity "
+                         "cost term actually matches.")
 
     # Output
     ap.add_argument("--run-dir", default="run_out")
+    ap.add_argument("--seed", type=int, default=None,
+                    help="Seed agent-profile generation so fleets are reproducible across runs")
     ap.add_argument("--log-dir", default="logs")
 
     return ap.parse_args()
