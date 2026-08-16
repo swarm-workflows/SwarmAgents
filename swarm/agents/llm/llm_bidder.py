@@ -12,11 +12,12 @@ import time
 from typing import Dict, Any, Optional
 
 from pydantic import BaseModel, Field
-from pydantic_ai import Agent as PydanticAgent, ModelSettings
+from pydantic_ai import Agent as PydanticAgent, ModelSettings, NativeOutput
 
 # Models
 from pydantic_ai.models.google import GoogleModel
 from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.providers.ollama import OllamaProvider
 
 from swarm.agents.llm.llm_config import LlmConfig
 
@@ -59,13 +60,17 @@ class LlmBidder:
         elif provider in {"gemini", "gemma", "google"}:
             model = GoogleModel(model_name)  # uses Google credentials envs
         elif provider == "ollama":
-            base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
-            api_key = os.getenv("OLLAMA_API_KEY")  # optional (needed for Ollama Cloud)
-            model = OpenAIChatModel(model_name, provider="ollama")
+            # Env wins over config so a proxy can be interposed without rewriting per-agent configs.
+            base_url = os.getenv("OLLAMA_BASE_URL") or cfg.base_url or "http://localhost:11434/v1"
+            api_key = os.getenv("OLLAMA_API_KEY") or "ollama"  # local Ollama ignores it, client requires non-empty
+            model = OpenAIChatModel(model_name, provider=OllamaProvider(base_url=base_url, api_key=api_key))
         else:
             raise ValueError(
                 f"Unsupported provider: {cfg.provider!r}. Use 'openai', 'gemini'/'gemma', or 'ollama'."
             )
+
+        # Small local models emit malformed tool-call args; Ollama's json_schema mode is reliable.
+        self.output_type = NativeOutput(Bid) if provider == "ollama" else Bid
 
         system_prompt = (cfg.prompts or {}).get("cost") or (
             "You are a scheduler. Given a JSON job and an agent's resource state, "
@@ -126,7 +131,7 @@ class LlmBidder:
             start = time.perf_counter()
             res = self.agent.run_sync(
                 prompt,
-                output_type=Bid,
+                output_type=self.output_type,
                 model_settings=ModelSettings(
                     temperature=(self.cfg.temperature if hasattr(self.cfg, "temperature") else 0.0),
                 ),
