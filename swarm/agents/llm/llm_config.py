@@ -7,6 +7,7 @@ class LlmConfig:
     enabled: bool = False
     provider: str = "none"          # e.g., "openai", "vertex", "ollama", "none"
     model: str = ""
+    base_url: str = ""              # overridden by the provider's *_BASE_URL env var
     temperature: float = 0.0
     timeout_seconds: int = 6
     use_for_selection: bool = True
@@ -18,6 +19,7 @@ class LlmConfig:
             enabled=bool(d.get("enabled", False)),
             provider=str(d.get("provider", "none")),
             model=str(d.get("model", "")),
+            base_url=str(d.get("base_url", "")),
             temperature=float(d.get("temperature", 0.0)),
             timeout_seconds=int(d.get("timeout_seconds", 6)),
             use_for_selection=bool(d.get("use_for_selection", True)),
