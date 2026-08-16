@@ -26,7 +26,7 @@ uses your FABRIC sliver key (the one already injected into every VM as the
 ```bash
 cd notebooks/db_node_setup
 python3 gen_inventory.py                  # defaults match SWARM-2slice.ipynb
-# options: --total-agents 100 --branch agent-recovery --slice1/--slice2 ...
+# options: --total-agents 100 --branch swarm-multi-deploy --slice1/--slice2 ...
 ```
 
 Writes `plan/`: management IPs + users, NIC MACs with their assigned

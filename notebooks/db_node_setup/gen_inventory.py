@@ -41,7 +41,7 @@ def main():
     ap.add_argument("--monitor-node", default="monitor")
     ap.add_argument("--network-prefix", default="fabv4")
     ap.add_argument("--mon-network-prefix", default="fabv4mon")
-    ap.add_argument("--branch", default="agent-recovery")
+    ap.add_argument("--branch", default="swarm-multi-deploy")
     ap.add_argument("--out", default=os.path.join(here, "plan"))
     args = ap.parse_args()
 
