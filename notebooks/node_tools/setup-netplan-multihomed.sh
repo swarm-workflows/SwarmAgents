@@ -213,7 +213,11 @@ fi
 # =======================
 if [ "$DO_LAN" -eq 1 ]; then
   [ -n "${LAN_IF:-}" ] || die "Provide -i <lan-if> to configure LAN"
-  
+
+  # Per-interface file so multi-NIC nodes (e.g. nic1 + monitoring nic2)
+  # don't clobber each other's LAN config on successive invocations.
+  NETPLAN_LAN_FILE="/etc/netplan/91-lan-route-${LAN_IF}.yaml"
+
   if [ -z "$LAN_ADDR" ]; then
     LAN_ADDR="$(get_ip_cidr "$LAN_IF" || true)"
     [ -n "$LAN_ADDR" ] || die "LAN_ADDR not set and could not detect IPv4 on $LAN_IF"
@@ -227,6 +231,25 @@ if [ "$DO_LAN" -eq 1 ]; then
 
   log "LAN (Netplan): if=$LAN_IF addr=$LAN_ADDR net=$LAN_NET gw=$LAN_GW"
 
+  # Skip the via-route when LAN_NET is directly connected (on-link) --
+  # the kernel already has the connected route and a duplicate via-route
+  # would conflict.
+  ON_LINK=$(python3 - "$LAN_ADDR" "$LAN_NET" <<'PY'
+import sys, ipaddress
+conn = ipaddress.ip_interface(sys.argv[1]).network
+net = ipaddress.ip_network(sys.argv[2], strict=False)
+print(1 if net.subnet_of(conn) else 0)
+PY
+)
+  ROUTE_BLOCK="      routes:
+        # Add the route for the internal LAN network to the LAN gateway
+        - to: $LAN_NET
+          via: $LAN_GW"
+  if [ "$ON_LINK" = "1" ]; then
+    log "LAN_NET $LAN_NET is on-link for $LAN_ADDR; skipping via-route"
+    ROUTE_BLOCK=""
+  fi
+
   # Generate Netplan YAML for the LAN interface
   NETPLAN_YAML_LAN=$(cat <<YAML
 network:
@@ -237,10 +260,7 @@ network:
       dhcp4: no
       addresses:
         - $LAN_ADDR
-      routes:
-        # Add the route for the internal LAN network to the LAN gateway
-        - to: $LAN_NET
-          via: $LAN_GW
+$ROUTE_BLOCK
 YAML
 )
 

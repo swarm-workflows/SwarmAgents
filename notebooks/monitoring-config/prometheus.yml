@@ -1,0 +1,139 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: node
+    static_configs:
+      - targets:
+          - 'localhost:9100'
+        labels:
+          node: monitor
+      - targets:
+          - '10.136.137.4:9100'
+        labels:
+          node: agent-1
+      - targets:
+          - '10.141.6.6:9100'
+        labels:
+          node: agent-10
+      - targets:
+          - '10.130.134.2:9100'
+        labels:
+          node: agent-11
+      - targets:
+          - '10.130.134.4:9100'
+        labels:
+          node: agent-12
+      - targets:
+          - '10.130.134.5:9100'
+        labels:
+          node: agent-13
+      - targets:
+          - '10.130.134.3:9100'
+        labels:
+          node: agent-14
+      - targets:
+          - '10.132.10.2:9100'
+        labels:
+          node: agent-15
+      - targets:
+          - '10.132.10.4:9100'
+        labels:
+          node: agent-16
+      - targets:
+          - '10.132.10.5:9100'
+        labels:
+          node: agent-17
+      - targets:
+          - '10.132.10.3:9100'
+        labels:
+          node: agent-18
+      - targets:
+          - '10.129.133.2:9100'
+        labels:
+          node: agent-19
+      - targets:
+          - '10.136.137.2:9100'
+        labels:
+          node: agent-2
+      - targets:
+          - '10.129.133.4:9100'
+        labels:
+          node: agent-20
+      - targets:
+          - '10.129.133.5:9100'
+        labels:
+          node: agent-21
+      - targets:
+          - '10.129.133.3:9100'
+        labels:
+          node: agent-22
+      - targets:
+          - '10.141.134.4:9100'
+        labels:
+          node: agent-23
+      - targets:
+          - '10.141.134.2:9100'
+        labels:
+          node: agent-24
+      - targets:
+          - '10.141.134.3:9100'
+        labels:
+          node: agent-25
+      - targets:
+          - '10.141.134.5:9100'
+        labels:
+          node: agent-26
+      - targets:
+          - '10.133.130.3:9100'
+        labels:
+          node: agent-27
+      - targets:
+          - '10.133.130.5:9100'
+        labels:
+          node: agent-28
+      - targets:
+          - '10.133.130.2:9100'
+        labels:
+          node: agent-29
+      - targets:
+          - '10.136.137.8:9100'
+        labels:
+          node: agent-3
+      - targets:
+          - '10.133.130.4:9100'
+        labels:
+          node: agent-30
+      - targets:
+          - '10.136.137.5:9100'
+        labels:
+          node: agent-4
+      - targets:
+          - '10.136.137.3:9100'
+        labels:
+          node: agent-5
+      - targets:
+          - '10.141.6.2:9100'
+        labels:
+          node: agent-6
+      - targets:
+          - '10.141.6.5:9100'
+        labels:
+          node: agent-7
+      - targets:
+          - '10.141.6.4:9100'
+        labels:
+          node: agent-8
+      - targets:
+          - '10.141.6.3:9100'
+        labels:
+          node: agent-9
+      - targets:
+          - '10.136.137.6:9100'
+        labels:
+          node: database

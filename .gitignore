@@ -172,3 +172,17 @@ swarm-multi/**
 jobs/
 *.json
 shutdown
+
+# Local run artifacts and archives (evaluation data lives in
+# swarmplus-evaluation-data, not here)
+*.tgz
+*.tar.gz
+notebooks/run-h-*/
+configs-recovery/
+cpegasus
+
+# Claude Code per-session usage log (local bookkeeping)
+cc-usage-log.md
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
