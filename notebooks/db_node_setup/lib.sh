@@ -25,6 +25,17 @@ STATE_DIR="$SETUP_DIR/state"
 LOG_DIR="$SETUP_DIR/logs"
 SLICE_KEY="${SLICE_KEY:-$KEY_DIR/slice_key}"
 BASTION_KEY="${BASTION_KEY:-$KEY_DIR/bastion_key}"
+
+# When driven from the machine that runs the notebook (rather than from the
+# database node, where upload_to_db.sh stages copies into keys/), the keys are
+# wherever fablib keeps them. gen_inventory.py recorded those paths, so fall
+# back to them instead of making the user copy keys around.
+if [ ! -f "$SLICE_KEY" ] && [ -f "$PLAN_DIR/upload.env" ]; then
+    # shellcheck disable=SC1091
+    . "$PLAN_DIR/upload.env"
+    [ -f "${SLICE_KEY_PATH:-}" ]   && SLICE_KEY="$SLICE_KEY_PATH"
+    [ -f "${BASTION_KEY_PATH:-}" ] && BASTION_KEY="$BASTION_KEY_PATH"
+fi
 PARALLEL="${PARALLEL:-16}"
 
 mkdir -p "$STATE_DIR/transport" "$STATE_DIR/status" "$LOG_DIR"

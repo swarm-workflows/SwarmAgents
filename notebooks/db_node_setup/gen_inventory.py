@@ -35,6 +35,10 @@ def main():
     ap.add_argument("--project-id", default="3a05ccb3-a4b9-4bc8-9bc8-4c8eb65c9d3e")
     ap.add_argument("--total-agents", type=int, default=100)
     ap.add_argument("--base-slice-name", default="SWARM-MULTI")
+    ap.add_argument("--slices", nargs="+", default=None,
+                    help="explicit slice name(s). Use for single-slice "
+                         "deployments (e.g. --slices MySlice-swarm-multi-site-30) "
+                         "or to name both parts. Overrides --slice1/--slice2.")
     ap.add_argument("--slice1", default=None, help="override slice 1 name")
     ap.add_argument("--slice2", default=None, help="override slice 2 name")
     ap.add_argument("--db-node", default="database")
@@ -48,26 +52,41 @@ def main():
     from fabrictestbed_extensions.fablib.fablib import FablibManager as fablib_manager
     fablib = fablib_manager(project_id=args.project_id)
 
-    slice_name_1 = args.slice1 or f"{args.base_slice_name}-{args.total_agents}-p1"
-    slice_name_2 = args.slice2 or f"{args.base_slice_name}-{args.total_agents}-p2"
+    if args.slices:
+        slice_names = list(args.slices)
+    else:
+        slice_names = [
+            args.slice1 or f"{args.base_slice_name}-{args.total_agents}-p1",
+            args.slice2 or f"{args.base_slice_name}-{args.total_agents}-p2",
+        ]
 
-    print(f"Loading slices: {slice_name_1}, {slice_name_2}")
-    slice1 = fablib.get_slice(slice_name_1)
-    slice2 = fablib.get_slice(slice_name_2)
+    print(f"Loading slice(s): {', '.join(slice_names)}")
+    nodes, networks = [], []
+    for sn in slice_names:
+        sl = fablib.get_slice(sn)
+        nodes.extend(sl.get_nodes())
+        networks.extend(sl.get_networks())
 
-    nodes = list(slice1.get_nodes()) + list(slice2.get_nodes())
-    networks = list(slice1.get_networks()) + list(slice2.get_networks())
     node_by_name = {n.get_name(): n for n in nodes}
     nw_by_name = {nw.get_name(): nw for nw in networks
                   if nw.get_name().startswith(args.network_prefix)}
 
-    assert args.db_node in node_by_name, "database node not found -- is slice 1 up?"
-    assert args.monitor_node in node_by_name, "monitor node not found -- is slice 1 up?"
-    print(f"Combined fleet: {len(nodes)} nodes, {len(nw_by_name)} networks")
+    if args.db_node not in node_by_name:
+        sys.exit(f"ERROR: database node '{args.db_node}' not found in "
+                 f"{slice_names}. Is the slice holding it up?")
+    print(f"Fleet: {len(nodes)} nodes, {len(nw_by_name)} networks")
 
-    monitor_site = node_by_name[args.monitor_node].get_site()
-    monitor_mon_nw = nw_by_name[f"{args.mon_network_prefix}-{monitor_site}"]
-    monitor_mon_subnet = monitor_mon_nw.get_subnet()
+    # The monitor VM is optional -- deployments without Prometheus/Grafana
+    # simply have no monitoring network to special-case.
+    has_monitor = args.monitor_node in node_by_name
+    monitor_mon_subnet = None
+    if has_monitor:
+        monitor_site = node_by_name[args.monitor_node].get_site()
+        mon_nw_name = f"{args.mon_network_prefix}-{monitor_site}"
+        if mon_nw_name in nw_by_name:
+            monitor_mon_subnet = nw_by_name[mon_nw_name].get_subnet()
+    else:
+        print(f"NOTE: no '{args.monitor_node}' node -- monitoring step will be skipped")
 
     # ------------------------------------------------------------------
     # Per-node management info (control plane only)
@@ -106,8 +125,10 @@ def main():
 
             if is_mon and node_name == args.monitor_node:
                 lan_net = "10.128.0.0/10"          # monitor reaches ALL mon subnets
-            elif is_mon:
+            elif is_mon and monitor_mon_subnet is not None:
                 lan_net = str(monitor_mon_subnet)  # agents: only monitor's subnet
+            elif is_mon:
+                lan_net = "10.128.0.0/10"          # no monitor VM to scope toward
             else:
                 lan_net = "10.128.0.0/10"          # nic1 carries full FABNetv4
 
@@ -201,7 +222,7 @@ def main():
 
     with open(os.path.join(out, "inventory.json"), "w") as f:
         json.dump({
-            "slices": [slice_name_1, slice_name_2],
+            "slices": slice_names,
             "db_node": args.db_node,
             "monitor_node": args.monitor_node,
             "branch": args.branch,

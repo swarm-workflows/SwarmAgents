@@ -30,13 +30,18 @@ BASTION_KEY="${BASTION_KEY:-$BASTION_KEY_PATH}"
 
 echo "==> Bundling setup package"
 BUNDLE="$(mktemp -t swarm-setup-XXXXXX).tgz"
-tar -czf "$BUNDLE" \
-    -C "$NBDIR" \
-    db_node_setup \
-    node_tools \
-    push_swarmagents.sh \
-    Prometheus_Grafana_Monitor/tools \
-    Prometheus_Grafana_Monitor/build
+
+# The monitoring stack is optional -- if Prometheus_Grafana_Monitor/ is absent
+# the core pipeline (steps 0-5) still works, so bundle what exists rather than
+# failing the whole upload on a missing path.
+BUNDLE_PATHS=(db_node_setup node_tools push_swarmagents.sh)
+if [ -d "$NBDIR/Prometheus_Grafana_Monitor/tools" ] && [ -d "$NBDIR/Prometheus_Grafana_Monitor/build" ]; then
+    BUNDLE_PATHS+=(Prometheus_Grafana_Monitor/tools Prometheus_Grafana_Monitor/build)
+else
+    echo "    (no Prometheus_Grafana_Monitor/ -- monitoring step 6 will be skipped)"
+fi
+
+tar -czf "$BUNDLE" -C "$NBDIR" "${BUNDLE_PATHS[@]}"
 
 echo "==> Uploading bundle to $HOST:~/$REMOTE_DIR"
 ssh "$HOST" "mkdir -p ~/$REMOTE_DIR"

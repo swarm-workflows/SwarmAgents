@@ -66,6 +66,10 @@ cd ~/swarm-setup/db_node_setup
 | 5 | `05_deps.sh` | cell 28 (pip requirements + protobuf pin) |
 | 6 | `06_monitoring.sh` | cells 23–25 (node_exporter, Prometheus/Grafana, target check) |
 
+Step 6 is optional: if `notebooks/Prometheus_Grafana_Monitor/{tools,build}` is
+absent it skips with a message rather than failing, and `upload_to_db.sh`
+bundles without it. Steps 0–5 produce a fully working cluster on their own.
+
 All steps are idempotent and safe to re-run. Per-node logs land in
 `logs/<step-func>-<node>.log`; a step fails loudly listing the failed nodes.
 Parallelism is 16 nodes at a time (`PARALLEL=32 ./setup_all.sh` to change).
@@ -85,6 +89,40 @@ Fetch results: `scp -r swarm:/root/SwarmAgents/run-h-30-100 .`
 Grafana/Prometheus from your laptop (monitor VM is only on FABNetv4, so
 tunnel via the db node): `ssh -L 3000:<monitor-ip>:3000 -L 9090:<monitor-ip>:9090 swarm`
 (step 6 prints the monitor IP).
+
+## Driving it from the notebook
+
+`SWARM-2slice.ipynb` and `SWARM-topo-multi-site.ipynb` call these scripts
+directly, so there is no separate terminal workflow unless you want one. Their
+per-node `fablib` `upload_directory()` / `execute()` cells have been replaced
+by:
+
+```python
+# 1. plan (control plane only)
+subprocess.run([sys.executable, "db_node_setup/gen_inventory.py",
+                "--slices", slice_name, ...])
+```
+```python
+!bash db_node_setup/00_check_access.sh   # 2. reachability
+!bash db_node_setup/setup_all.sh         # 3. full pipeline
+```
+
+`fablib` is still used for slice creation and status — that is control plane
+only and unaffected by the SSH problems these scripts work around.
+
+Keys are picked up automatically: if `keys/` is absent (the normal case when
+driving from the notebook machine), `lib.sh` falls back to the fablib key paths
+that `gen_inventory.py` recorded in `plan/upload.env`.
+
+### Talking to nodes without fablib
+
+Two helpers replace `node.execute()` and `node.download_file()`, reusing the
+transport step 0 worked out:
+
+```bash
+./run_on.sh database 'sudo bash -c "cd /root/SwarmAgents && docker compose up -d redis"'
+./fetch.sh  database /tmp/run-h-30-100.tgz ./run-h-30-100.tgz
+```
 
 ## Where to run the steps
 

@@ -9,6 +9,17 @@ set -euo pipefail
 
 MON_DIR="$ROOT_DIR/Prometheus_Grafana_Monitor"
 
+# Monitoring is optional. Without the Prometheus_Grafana_Monitor sources there
+# is nothing to install, so skip cleanly instead of failing the pipeline --
+# steps 0-5 already produced a working cluster.
+if [ ! -d "$MON_DIR/tools" ] || [ ! -d "$MON_DIR/build" ]; then
+    banner "Step 6: SKIPPED (no $MON_DIR)"
+    echo "Prometheus/Grafana sources are not present, so node_exporter and the"
+    echo "monitor VM were not provisioned. The cluster itself is fully set up."
+    echo "To enable monitoring, restore the directory and re-run: ./06_monitoring.sh"
+    exit 0
+fi
+
 banner "Step 6a: node_exporter on SWARM nodes"
 
 setup_exporter() {
