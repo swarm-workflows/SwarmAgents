@@ -920,7 +920,14 @@ if __name__ == "__main__":
     parser.add_argument("--hybrid-fraction", type=float, default=0.0,
                         help="Fraction (0.0-1.0) of generated jobs with a hybrid classical<->quantum loop")
 
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Seed the RNG so agent capacities, flavors and DTN assignments are "
+                             "reproducible. Required to compare runs against each other.")
+
     args = parser.parse_args()
+
+    if args.seed is not None:
+        random.seed(args.seed)
 
     if args.agent_hosts_file:
         agent_hosts = load_agent_hosts(args.agent_hosts_file)
