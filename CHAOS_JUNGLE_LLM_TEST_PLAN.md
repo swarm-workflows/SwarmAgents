@@ -5,9 +5,10 @@ framework to evaluate the resilience of **SwarmAgents' LLM-driven scheduling age
 LLM-layer faults, producing figures and hypothesis tests for the Chaos Jungle paper. The focus is
 the LLM plane; infrastructure faults appear only as a single composite scenario.
 
-**Status (2026-08-16):** environment fully provisioned and validated — **Phase 0 complete**. Both
-LLM backends have fault-free baselines at 30-agent scale, CJ is installed and proven to intercept
-SwarmAgents' LLM path. Ready to begin Phase 1 (fault sweeps).
+**Status (2026-08-17):** **Phase 0 complete.** A reproducible reference baseline
+(`cj-baseline-frozen2`) is established on a frozen seed-42 fleet with a live DTN connectivity term:
+300/300 jobs, 0 fallbacks, 0 failures. CJ is installed and proven to intercept SwarmAgents' LLM
+path. Ready to begin Phase 1 (fault sweeps).
 
 | | |
 |---|---|
@@ -105,15 +106,56 @@ With the frozen trace: every job needs 0 or 1 DTN, **0 infeasible**, and the med
 
 ## 3. Validated baselines (fault-free)
 
-Both arms: 30 agents, mesh topology, Snow consensus, 300 Pegasus jobs.
+All: 30 agents, mesh topology, Snow consensus, 300 Pegasus jobs.
 
-| Arm | Model | LLM calls | Fallbacks | Failed jobs | Latency (mean) |
-|-----|-------|-----------|-----------|-------------|----------------|
-| Gateway | `gpt-oss-20b` | 3062 | **0** | **0** | 5.85 s (under 30-agent contention) |
-| Ollama | `qwen2.5:3b` | 3331 | **0** | **0** | 9.61 s (p50 9.72 / p95 11.46) |
+| Run | Model | Fleet / trace | LLM calls | Fallbacks | Failed jobs | Latency (mean) |
+|-----|-------|---------------|-----------|-----------|-------------|----------------|
+| **`cj-baseline-frozen2`** ← **reference** | `qwen2.5:3b` | frozen seed-42 fleet, mixed 16-workflow trace, DTN term live | 1096 | **0** | **0** | 10.13 s (p50 10.09 / p95 13.06) |
+| `cj-baseline-ollama` (superseded) | `qwen2.5:3b` | random fleet, 6-workflow trace, DTN term inert | 3331 | 0 | 0 | 9.61 s |
+| `cj-baseline-gw` (superseded) | `gpt-oss-20b` | random fleet, 6-workflow trace, DTN term inert | 3062 | 0 | 0 | 5.85 s (shared-endpoint contention) |
 
-Every scoring call succeeded on every agent, and all jobs reached a terminal state. These are the
-reference points every fault scenario is measured against.
+**`cj-baseline-frozen2` is the reference** every fault scenario is measured against — it is the only
+run with a reproducible fleet, the full-diversity trace, and a live connectivity term. The earlier
+two remain valid as fault-free sanity checks but are not comparable to fault runs.
+
+Characteristics of the reference run:
+- **300/300 jobs completed**, 0 infeasible, 0 reassigned; drained in ~11 min.
+- **Load is deliberately uneven** — 1 to 36 jobs per agent, Jain's fairness 0.73 on scoring effort.
+  This is the DTN feasibility gate working: the median job is feasible on only 9 of 30 agents.
+- **LLM calls dropped 3331 → 1096** versus the inert-DTN run. The ratio (0.33) tracks the
+  feasibility ratio (9/30 = 0.30): agents no longer score jobs they cannot run, so infeasible
+  pairs never reach the model.
+
+> ⚠ **This run logged 52 SWIM `suspect-timeout` events naming 7 distinct agents (26 of 30 hosts
+> reporting) — all false positives.** Every agent ran to completion and 0 jobs were reassigned
+> (heartbeat, not SWIM, is authoritative for reassignment). **Now mitigated — see §2.3.** Fault runs
+> should still be compared against a re-measured baseline rate rather than against zero.
+
+### 2.3 Isolating inference from the agent (SWIM false positives)
+
+Co-locating inference with the agent starved the agent process of CPU: Ollama saturated all 8 cores
+for ~10 s per bid (**worst case 19.2 s**), which sat right at the **20 s** `suspect_timeout_s`, so
+healthy-but-busy agents were marked failed. Two changes, applied to the whole fleet:
+
+1. **Pin Ollama to 6 of 8 cores** — `taskset -c 0-5 ollama serve` (`/root/cj_ollama_pin.sh`),
+   leaving 2 cores for the agent so it can always answer SWIM probes. Ollama exposes no thread-count
+   env var, so CPU affinity is the reliable lever. Costs some inference speed.
+2. **Raise `suspect_timeout_s` 20 → 60** in `config_swarm_multi.yml`, above worst-case bid latency.
+   Tradeoff: genuine failures now take proportionally longer to detect — relevant if process-kill
+   faults are added later (composite X1).
+
+Regenerating the fleet after the config change reproduced **byte-identical** `agent_profiles.json`
+(`755eccc2…`), so the timeout propagated to all 30 agent configs without perturbing the fleet — the
+reference baseline stays comparable.
+
+**Why not host the model on one shared VM instead?** Considered and rejected for CPU-only hosting:
+the fleet currently runs 30 × 8 = **240 cores** of concurrent inference, and the reference run's 1096
+bids represent ~3 CPU-hours — hours of wall-clock on a single 8-core VM versus 11 minutes. A shared
+endpoint also reintroduces load-dependent queueing that would contaminate baseline-vs-fault deltas,
+which is precisely why the gateway arm was rejected for fault work (1.3 s single-call → 5.85 s under
+30-agent load). **A GPU inference node would flip this conclusion** — likely ~1 s per bid while
+removing agent-host contention entirely — and would keep partial-fault studies working by running
+one CJ proxy port per agent on that node.
 
 > **Runtime planning:** at ~9.6 s per bid, one 300-job Ollama run takes roughly 25–30 min. A full
 > Tier-1 sweep with repeats is many hours — consider a 100-job trace for wide sweeps.
