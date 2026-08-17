@@ -128,7 +128,11 @@ failure_detection:
                              # WAN + inbound-queue lag under consensus bursts make a
                              # LAN-tuned 300ms window false-fail healthy peers.
     k_req: 3                 # Indirect probe fanout
-    suspect_timeout_s: 20    # Suspect -> failed transition
+    suspect_timeout_s: 60    # Suspect -> failed transition. LLM agents block on local
+                             # inference for ~10s per bid (worst case ~19s observed), which
+                             # sat right at the previous 20s window and false-failed healthy
+                             # peers. Raise above worst-case bid latency; real failures then
+                             # take proportionally longer to detect.
 
 # Gossip state dissemination (Phase 2). When enabled, agents push their
 # versioned utilization/load state to `fanout` random peers every round.
