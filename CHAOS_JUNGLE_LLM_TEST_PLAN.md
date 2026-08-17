@@ -135,25 +135,29 @@ Characteristics of the reference run:
 
 Co-locating inference with the agent starved the agent process of CPU: Ollama saturated all 8 cores
 for ~10 s per bid (**worst case 19.2 s**), which sat right at the **20 s** `suspect_timeout_s`, so
-healthy-but-busy agents were marked failed. Two changes, applied to the whole fleet:
+healthy-but-busy agents were marked failed. Two mitigations were attempted; **only the second was
+kept** — the timeout bump alone gives ample margin (19.2 s worst case against a 60 s window):
 
-1. **Pin Ollama to 6 of 8 cores** (`/root/cj_ollama_pin.sh`), leaving 2 cores for the agent so it can
-   always answer SWIM probes. Ollama exposes **no thread-count env var** (check
-   `ollama serve --help`), so CPU affinity is the lever. Costs some inference speed.
-   The fleet is split and the script handles both cases:
-   - **15 hosts have a systemd `ollama.service`** that respawns the server *unpinned* and wins the
-     port race — `pkill` + `nohup taskset` silently does not stick there. Install a drop-in instead
-     (`/etc/systemd/system/ollama.service.d/10-chaos.conf` with `CPUAffinity=0-5` and
-     `Environment="OLLAMA_KEEP_ALIVE=-1"`), which also survives reboots.
-   - **15 hosts have no unit** → `taskset -c 0-5 ollama serve` under `nohup`.
-   - The systemd service runs as the **`ollama` user** and reads `/usr/share/ollama/.ollama/models`,
-     *not* `/root/.ollama` — so a model pulled as root is invisible to it (`model not found`). Copy
-     the blobs across (`cp -an /root/.ollama/models/. /usr/share/ollama/.ollama/models/` +
-     `chown -R ollama:ollama`) rather than re-downloading.
-   - **Verify every matching process, not just the first.** `pgrep -f "ollama serve" | head -1`
-     picks an arbitrary PID when several match and gave contradictory readings (20/30, then 30/30,
-     then 7 unpinned) on an unchanged fleet. `/root/cj_verify_fleet.sh` walks all
-     `ollama serve|llama-server` PIDs; current state is **30/30 hosts `unpinned=0 INFER-OK`**.
+1. ~~**Pin Ollama to 6 of 8 cores**~~ — **TRIED AND REVERTED. Do not repeat.** Restricting Ollama to
+   a subset of cores (`taskset -c 0-5`, or a systemd `CPUAffinity=0-5` drop-in) **collapsed inference
+   from ~0.9 s to 34–69 s per call**; one bid in a re-baseline took **20 minutes**, and host load sat
+   at ~7 with *only* ollama running and no agents. Cause: llama.cpp spawns one **busy-waiting** thread
+   per core and Ollama exposes **no thread-count env var** (`ollama serve --help`), so the extra
+   threads spin against siblings that cannot be scheduled. Restricting CPU without also lowering the
+   thread count is actively harmful. Reverted fleet-wide with `/root/cj_ollama_reset.sh`
+   (30/30 hosts back to `aff=0-7`, one server each).
+
+   Operational traps found while doing it, which still apply to any Ollama change:
+   - **15 of 30 hosts run a systemd `ollama.service`** that respawns the server and wins the port
+     race, so `pkill` + `nohup` silently does not stick; and a leftover server can survive
+     `systemctl restart` while still holding port 11434. Kill *all* `ollama serve` and `llama-server`
+     processes before starting one.
+   - The systemd service reads `/usr/share/ollama/.ollama/models`, *not* `/root/.ollama` — a model
+     pulled as root is invisible to it (`model not found`). Copy the blobs across
+     (`cp -an` + `chown -R ollama:ollama`) rather than re-downloading.
+   - **Verify every matching process, not just the first.** `pgrep -f "ollama serve" | head -1` picks
+     an arbitrary PID among matches and gave three different answers (20/30, 30/30, 7 unpinned) for
+     one unchanged fleet.
 2. **Raise `suspect_timeout_s` 20 → 60** in `config_swarm_multi.yml`, above worst-case bid latency.
    Tradeoff: genuine failures now take proportionally longer to detect — relevant if process-kill
    faults are added later (composite X1).
@@ -477,7 +481,7 @@ ssh chaos 'sudo bash -c '"'"'for h in $(cat /root/SwarmAgents/agent_hosts_cj.txt
 | `/root/cj_ollama_setup.sh` | Install Ollama, pull model, pre-warm |
 | `/root/cj_ollama_fastfix.sh` | Repair a broken Ollama install from a local tarball |
 | `/root/cj_infer_check.sh` | **Real** inference health check |
-| `/root/cj_ollama_pin.sh` | Pin Ollama to cores 0-5 (systemd drop-in or taskset) |
+| `/root/cj_ollama_reset.sh` | Reset Ollama: drop pinning, kill all servers, start one on all cores |
 | `/root/cj_verify_fleet.sh` | Verify **all** ollama PIDs pinned + inference OK |
 | `/root/SwarmAgents/cj_proxy.py` | Per-host CJ fault proxy driver |
 
@@ -501,8 +505,11 @@ Each of these cost real debugging time; all are guarded against above.
 - **Local-mode runs overwrite `agent_hosts.txt`** with `localhost`. Restore from `/etc/hosts`.
 - **`pgrep -f <pattern>` matches its own command line** — a check for "no agents running" can report
   phantom processes. Use a bracket pattern like `mai[n].py`.
-- **Half the fleet runs Ollama under systemd**, which respawns it unpinned and ignores a
-  `pkill`+`nohup` restart; and its service user reads a different models directory than root. See §2.3.
+- **Never restrict Ollama's CPUs without also cutting its thread count** — llama.cpp busy-waits one
+  thread per core, so pinning alone made inference 35-70x slower. Ollama has no thread-count env var. See §2.3.
+- **Half the fleet runs Ollama under systemd**, which respawns it and ignores a `pkill`+`nohup`
+  restart; a leftover server can survive `systemctl restart` still holding the port; and its service
+  user reads a different models directory than root. See §2.3.
 - **`pgrep -f <pat> | head -1` is not a fleet check** — it picks an arbitrary PID among matches and
   produced three different answers for one unchanged fleet. Walk every matching PID.
 - **`timeout_seconds` in the LLM config is not a hard client timeout** — calls of 14.9 s were
