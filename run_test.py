@@ -158,6 +158,9 @@ def convert_pegasus_jobs(args) -> dict:
         output_dir="jobs",
         data_nodes_mode=args.pegasus_data_nodes,
         dtn_names=dtn_names,
+        # One DTN per job: agents hold only a few DTNs and feasibility requires all of a
+        # job's DTNs, so spreading a job's files would make multi-file jobs unschedulable.
+        dtn_scope="job",
     )
     log(f"Pegasus conversion: {result['jobs_written']} jobs written, "
         f"{result['warnings_count']} warnings")

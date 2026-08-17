@@ -14,7 +14,7 @@ SwarmAgents' LLM path. Ready to begin Phase 1 (fault sweeps).
 | **Code** | `SwarmAgents` @ `dabe53f0`, branch `chaos` |
 | **Testbed** | FABRIC slice: 1 orchestrator (`database`) + 30 agent hosts, 8-core CPU / 7 GB RAM each, no GPU |
 | **Chaos Jungle** | v0.1.0, pinned commit `5044939` (see [§6](#6-findings-for-the-cj-maintainers)) |
-| **Workload** | 1413 job profiles extracted from real Pegasus workflow runs |
+| **Workload** | Frozen 300-job trace (16 workflows) merged from real Pegasus runs — see [§2.2](#22-workload--a-frozen-reproducible-mixed-pegasus-trace) |
 
 ---
 
@@ -77,18 +77,29 @@ population (jobs with no data movement), and its source hosts are no longer reac
 `pegasus2` (13,908 jobs) was evaluated and **excluded**: 97% is a single workflow of near-identical
 2-second jobs, so it adds volume but almost no signal for LLM scoring.
 
-**DTN names must match the agents' pool.** Convert with
-`--dtn-names dtn1,…,dtn10`; otherwise job data-nodes keep the raw Pegasus site name (`local`) and
-share *zero* names with agent DTNs, silently removing the connectivity term from the cost model.
-With the frozen trace, every data-job matches ≥1 agent DTN and on average 50% of agents share a
-DTN with a given job — real differentiation.
+**DTN names must match the agents' pool, and each job must need only one DTN.** Convert with
+`--dtn-names dtn1,…,dtn10 --dtn-scope job`. Two distinct traps:
 
-> **Fixed in `run_test.py`.** `--pegasus-profiles` previously converted with per-site naming and no
-> DTN spread, leaving every job on site `local` — no overlap with the agents' `dtn1..dtn10`, so the
-> connectivity term silently dropped out of the cost model (this affected the first two baselines).
-> It now defaults to `--pegasus-data-nodes per-file` and spreads files across the *same* pool
-> `generate_configs.py` gives agents, so the two match by construction. Both are overridable
-> (`--pegasus-dtn-names`).
+1. *Names must match.* Without `--dtn-names`, data-nodes keep the raw Pegasus site name (`local`),
+   which shares zero names with agent DTNs. `local` is also explicitly excluded from the required-DTN
+   set (it means local filesystem, not a transfer node), so the connectivity term silently vanishes.
+2. *Scope must be per-job.* Feasibility requires an agent to hold **every** DTN a job references,
+   and agents are given only 1–4. Hashing per **file** (`--dtn-scope file`) spread one job's files
+   across up to 8 DTNs, making **76/300 jobs unschedulable on any agent**; with a 10-job proposal
+   window they head-of-line blocked the queue and stalled a whole run. `--dtn-scope job` puts all of
+   a job's files on one DTN — also the realistic model, since workflows stage from one or two sites.
+
+With the frozen trace: every job needs 0 or 1 DTN, **0 infeasible**, and the median job fits **9 of
+30** agents — so the connectivity term differentiates agents without making jobs unschedulable.
+
+> **Always verify feasibility offline before launching a run** — intersect each job's required DTNs
+> and capacities against `agent_profiles.json`. A stalled run looks identical to a slow one for the
+> first hour.
+
+> **Both traps are fixed in `run_test.py`.** `--pegasus-profiles` now converts with
+> `--pegasus-data-nodes per-file`, spreads jobs across the *same* `dtn1..dtn10` pool
+> `generate_configs.py` gives agents, and uses per-**job** scope — so names match and every job
+> needs exactly one DTN, by construction. Override with `--pegasus-dtn-names`.
 
 ---
 
@@ -303,7 +314,7 @@ python3 build_mixed_trace.py \
   --pegasus  <pegasus>/profiles/all_runs_jobs_profile.json \
   --n-cpegasus 200 --n-pegasus 100 --seed 42 --output mixed_profile_300.json
 python3 pegasus_to_swarm_converter.py --input mixed_profile_300.json --input-type json \
-  --output-dir mixed_jobs_300/ --data-nodes per-file \
+  --output-dir mixed_jobs_300/ --data-nodes per-file --dtn-scope job \
   --dtn-names dtn1,dtn2,dtn3,dtn4,dtn5,dtn6,dtn7,dtn8,dtn9,dtn10
 
 # (b) Generate the frozen fleet ON THE SLICE. Start from a clean state — generate_configs REUSES
@@ -441,7 +452,10 @@ Each of these cost real debugging time; all are guarded against above.
   clean state.
 - **DTN names must match between jobs and agents**, or the connectivity term silently disappears.
   Fixed in `run_test.py` (§2.2); if you call `pegasus_to_swarm_converter.py` directly, pass
-  `--dtn-names dtn1,…,dtn10` yourself — its own default is still the historical per-site naming.
+  `--dtn-names dtn1,…,dtn10 --dtn-scope job` yourself — its own defaults are still the historical
+  per-site naming and per-file scope.
+- **A job may not require more DTNs than an agent holds.** Feasibility is all-or-nothing over a
+  job's DTNs; per-file spreading deadlocked a run (§2.2).
 
 ---
 
