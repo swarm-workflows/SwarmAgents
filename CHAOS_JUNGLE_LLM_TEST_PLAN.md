@@ -6,7 +6,7 @@ LLM-layer faults, producing figures and hypothesis tests for the Chaos Jungle pa
 the LLM plane; infrastructure faults appear only as a single composite scenario.
 
 **Status (2026-08-17):** **Phase 0 complete.** A reproducible reference baseline
-(`cj-baseline-frozen2`) is established on a frozen seed-42 fleet with a live DTN connectivity term:
+(`cj-baseline-ref`) is established on a frozen seed-42 fleet with a live DTN connectivity term:
 300/300 jobs, 0 fallbacks, 0 failures. CJ is installed and proven to intercept SwarmAgents' LLM
 path. Ready to begin Phase 1 (fault sweeps).
 
@@ -110,17 +110,22 @@ All: 30 agents, mesh topology, Snow consensus, 300 Pegasus jobs.
 
 | Run | Model | Fleet / trace | LLM calls | Fallbacks | Failed jobs | Latency (mean) |
 |-----|-------|---------------|-----------|-----------|-------------|----------------|
-| **`cj-baseline-frozen2`** ← **reference** | `qwen2.5:3b` | frozen seed-42 fleet, mixed 16-workflow trace, DTN term live | 1096 | **0** | **0** | 10.13 s (p50 10.09 / p95 13.06) |
+| **`cj-baseline-ref`** ← **reference** | `qwen2.5:3b` | frozen seed-42 fleet, 16-workflow trace, DTN term live, `suspect_timeout_s: 60` | 1064 | **0** | **0** | 9.90 s (p50 9.96 / p95 12.52) |
+| `cj-baseline-frozen2` (pre-SWIM-fix) | `qwen2.5:3b` | same fleet/trace, `suspect_timeout_s: 20` | 1096 | 0 | 0 | 10.13 s (p50 10.09 / p95 13.06) |
 | `cj-baseline-ollama` (superseded) | `qwen2.5:3b` | random fleet, 6-workflow trace, DTN term inert | 3331 | 0 | 0 | 9.61 s |
 | `cj-baseline-gw` (superseded) | `gpt-oss-20b` | random fleet, 6-workflow trace, DTN term inert | 3062 | 0 | 0 | 5.85 s (shared-endpoint contention) |
 
-**`cj-baseline-frozen2` is the reference** every fault scenario is measured against — it is the only
-run with a reproducible fleet, the full-diversity trace, and a live connectivity term. The earlier
-two remain valid as fault-free sanity checks but are not comparable to fault runs.
+**`cj-baseline-ref` is the reference** every fault scenario is measured against. `frozen2` is the
+same fleet and trace before the SWIM timeout fix and is retained only to show that fix's effect:
+suspect-timeout events **52 → 9** and reported failed agents **3 → 0**, while LLM calls (1096 vs
+1064), latency (~10 s) and fairness stayed statistically identical — so the two are comparable and
+the change altered membership behaviour only. The `random fleet` rows below are superseded.
 
 Characteristics of the reference run:
-- **300/300 jobs completed**, 0 infeasible, 0 reassigned; drained in ~11 min.
-- **Load is deliberately uneven** — 1 to 36 jobs per agent, Jain's fairness 0.73 on scoring effort.
+- **300/300 jobs completed**, 0 infeasible, 0 reassigned, **0 failed agents**; drained in ~11 min.
+- **Residual noise: 9 SWIM suspect-timeout events** (down from 52). Not zero — compare fault runs
+  against this rate, not against zero.
+- **Load is deliberately uneven** — 3 to 85 scoring calls per agent, Jain's fairness 0.71.
   This is the DTN feasibility gate working: the median job is feasible on only 9 of 30 agents.
 - **LLM calls dropped 3331 → 1096** versus the inert-DTN run. The ratio (0.33) tracks the
   feasibility ratio (9/30 = 0.30): agents no longer score jobs they cannot run, so infeasible
