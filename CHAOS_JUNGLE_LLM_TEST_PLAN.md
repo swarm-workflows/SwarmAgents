@@ -330,6 +330,16 @@ New config keys in `config_swarm_multi.yml`: `llm.base_url`, plus `provider: oll
 `ssh chaos` lands on `database` as `ubuntu`; the repo is at `/root/SwarmAgents` (use `sudo`).
 `database` has passwordless root SSH to `agent-1 … agent-30`. Python is `python3.11`.
 
+### 8.0 Mandatory pre-run health gate — before EVERY run
+**Every host must prove it can infer.** A single host whose Ollama has lost the model still runs, and
+its agent silently falls back to analytic cost for the whole run — that contaminated one baseline
+with 130 fallbacks from one host (agent-11) before it was caught. Process count and `/api/tags` do
+**not** detect this; only a real generate does.
+```bash
+ssh chaos 'sudo bash -c '"'"'for h in $(cat /root/SwarmAgents/agent_hosts_cj.txt); do (ssh -o StrictHostKeyChecking=no $h "bash /root/fixmodels.sh" 2>/dev/null) & done; wait'"'"'' | awk '{print $2}' | sort | uniq -c
+# expect: 30 OK   (fixmodels.sh repairs model visibility if needed, then verifies with a real generate)
+```
+
 ### 8.1 Mandatory pre-run cleanup — before EVERY run
 Leftover agents on *any* host register into the shared Redis and stall the next run at
 `[SEL_WAIT] … live≠configured`. Stale per-host logs also inflate the result counters, since they
@@ -481,6 +491,7 @@ ssh chaos 'sudo bash -c '"'"'for h in $(cat /root/SwarmAgents/agent_hosts_cj.txt
 | `/root/cj_ollama_setup.sh` | Install Ollama, pull model, pre-warm |
 | `/root/cj_ollama_fastfix.sh` | Repair a broken Ollama install from a local tarball |
 | `/root/cj_infer_check.sh` | **Real** inference health check |
+| `/root/fixmodels.sh` | Repair model visibility for the running ollama user, then verify (§8.0 gate) |
 | `/root/cj_ollama_reset.sh` | Reset Ollama: drop pinning, kill all servers, start one on all cores |
 | `/root/cj_verify_fleet.sh` | Verify **all** ollama PIDs pinned + inference OK |
 | `/root/SwarmAgents/cj_proxy.py` | Per-host CJ fault proxy driver |
