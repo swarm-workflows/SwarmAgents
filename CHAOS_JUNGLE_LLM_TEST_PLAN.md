@@ -214,6 +214,55 @@ Redis `SET NX` in the Snow engine. Safety must never degrade, only performance.
 
 ---
 
+## 4b. Scenario harness and first result
+
+Experiments are scripted as **scenario files mirroring Chaos Jungle's own
+`LLM_SCENARIOS.md`** — same numbering (S01 latency, S05 unavailable, …) so results are
+directly comparable with the framework's catalogue.
+
+```
+scenarios/
+  helpers.py               health gate, cleanup, per-host injection, metrics, report
+  reference_baseline.json  the fault-free reference (§3)
+  run_all.py               batch runner (--list); ~15 min per scenario
+  api/s01_latency.py       S01  [delay_s] [fraction]
+  api/s05_unavailable.py   S05  [fraction]
+```
+Each scenario takes a **host fraction**, so the same file yields the blast-radius curve
+(`s05_unavailable.py 0.25 / 0.5 / 1.0`). Teardown runs in a `finally` — a leaked proxy or
+`OLLAMA_BASE_URL` would silently fault every later run. Unlike CJ's scenarios (one LLM
+call, seconds), ours is a full 30-agent run, so `run_all.py` is a batch job.
+
+### S05 — LLMUnavailable, 30/30 hosts (2026-08-17)
+
+| metric | baseline | fault | delta |
+|---|---|---|---|
+| jobs completed | 300 | **300** | +0 |
+| LLM calls OK | 1064 | 0 | −1064 |
+| fallback rate | 0.0% | **100.0%** | +100.0% |
+| load fairness (placed jobs) | 0.681 | **0.836** | **+0.155** |
+| SWIM false-fails | 9 | 5 | −4 |
+| failed agents / jobs stuck | 0 / 0 | **0 / 0** | +0 |
+
+**Graceful degradation holds.** With every LLM call 503-ing on all 30 agents, the swarm
+completed 300/300 jobs with nothing stuck and no agent lost — it degrades into a purely
+analytical scheduler, exactly as designed.
+
+Two results beyond mere survival:
+- **The analytic scheduler balances load *better*** (fairness 0.681 → 0.836). Losing the
+  LLM did not just cost nothing, it improved placement evenness — worth investigating as
+  a finding about the LLM's scoring rather than a footnote.
+- **SWIM false-fails fell** (9 → 5), confirming the earlier causal story: it is blocking
+  on ~10 s inference that delays probe replies, so removing inference calms membership.
+
+*Metric caveats fixed while producing this table (they would have misread the result):*
+bid latency is parsed only from `LLM_COST_COMPLETE` — `LLM_BID_WON` also carries a
+`ReasoningTime` but logs `0.000s` for analytic bids, which read as "instant LLM" instead
+of "no LLM"; and fairness is computed over **placed jobs**, not scoring calls, so it stays
+measurable when every call fails.
+
+---
+
 ## 5. Experiment matrix
 
 Each row is one CJ `Scenario`, run baseline-vs-fault with n≥5 repeats on a fixed job trace, across

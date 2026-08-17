@@ -1,0 +1,222 @@
+#!/usr/bin/env python3.11
+"""
+Shared helpers for the SwarmAgents Chaos Jungle scenarios.
+
+Runs on the orchestrator (`database`), which has passwordless root SSH to every agent
+host. Scenario scripts stay declarative: pick the faulted hosts, name the fault, and
+compare the resulting run against the stored fault-free reference.
+
+Scenario numbering follows Chaos Jungle's own LLM_SCENARIOS.md (S01 latency, S05
+unavailable, …) so results are directly comparable with the framework's catalogue.
+
+Unlike CJ's reference scenarios, the workload here is not a single LLM call but a full
+30-agent scheduling run over a frozen job trace — so the signal is scheduler behaviour
+(completion, fallback rate, load fairness), not one reply.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from glob import glob
+from typing import Iterable
+
+REPO = "/root/SwarmAgents"
+HOSTS_FILE = f"{REPO}/agent_hosts_cj.txt"
+REFERENCE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reference_baseline.json")
+
+# Frozen experiment parameters — every scenario must use these so runs stay comparable.
+AGENTS = 30
+JOBS = 300
+TOPOLOGY = "mesh"
+PROXY_PORT = 18011
+OLLAMA_UPSTREAM = "http://127.0.0.1:11434/v1"
+
+
+def hosts() -> list[str]:
+    with open(HOSTS_FILE) as fh:
+        return [h.strip() for h in fh if h.strip()]
+
+
+def _sh(cmd: str, timeout: int = 900) -> str:
+    p = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, timeout=timeout)
+    return p.stdout
+
+
+def _fan_out(host_list: Iterable[str], remote_cmd: str, timeout: int = 900) -> str:
+    """Run remote_cmd on each host in parallel; returns concatenated stdout."""
+    parts = " ".join(
+        f'(ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no {h} {json.dumps(remote_cmd)} 2>/dev/null) &'
+        for h in host_list
+    )
+    return _sh(parts + " wait", timeout=timeout)
+
+
+# ---------------------------------------------------------------------------
+# Fleet preparation
+# ---------------------------------------------------------------------------
+
+def health_gate() -> None:
+    """Every host must prove it can infer. A host whose Ollama lost the model keeps
+    running and its agent silently falls back to analytic cost for the whole run."""
+    out = _fan_out(hosts(), "bash /root/fixmodels.sh")
+    ok = out.count(" OK")
+    if ok != len(hosts()):
+        raise SystemExit(f"health gate failed: only {ok}/{len(hosts())} hosts can infer\n{out}")
+    print(f"  health gate:    {ok}/{len(hosts())} hosts inferring")
+
+
+def cleanup() -> None:
+    """Kill agents and stale logs everywhere, flush Redis. Leftover agents register into
+    the shared Redis and stall the next run at [SEL_WAIT] live != configured."""
+    _fan_out(hosts(), f"pkill -9 -f main[.]py; rm -f {REPO}/swarm-multi/agent-*.log")
+    _sh(f"pkill -9 -f main[.]py; rm -f {REPO}/swarm-multi/agent-*.log; "
+        "docker exec redis redis-cli flushall >/dev/null")
+
+
+# ---------------------------------------------------------------------------
+# Fault injection (per host, so blast radius is a host subset)
+# ---------------------------------------------------------------------------
+
+def start_fault(faulted: list[str], fault: str, **params) -> None:
+    """Start a CJ fault proxy on `faulted` hosts and point their agents at it.
+
+    The agent resolves its endpoint as OLLAMA_BASE_URL -> config -> default, so exporting
+    the env var on a host redirects only that host's agent.
+    """
+    args = " ".join(f"--{k.replace('_', '-')} {v}" for k, v in params.items())
+    cmd = (
+        f"cd {REPO} && nohup python3.11 cj_proxy.py --fault {fault} {args} "
+        f"--port {PROXY_PORT} --upstream {OLLAMA_UPSTREAM} --base-url-env OLLAMA_BASE_URL "
+        f"> /var/log/cj_proxy.log 2>&1 & "
+        f"grep -q OLLAMA_BASE_URL /root/.profile || "
+        f"echo export OLLAMA_BASE_URL=http://127.0.0.1:{PROXY_PORT}/v1 >> /root/.profile"
+    )
+    _fan_out(faulted, cmd, timeout=120)
+    time.sleep(5)
+    live = _fan_out(faulted, "pgrep -fc cj_proxy.py || echo 0").split()
+    started = sum(1 for n in live if n.strip().isdigit() and int(n) > 0)
+    print(f"  fault injected: {fault} on {len(faulted)}/{len(hosts())} hosts "
+          f"({started} proxies up)")
+
+
+def stop_fault() -> None:
+    """Always run, even on failure — a leaked proxy or env var silently faults later runs."""
+    _fan_out(hosts(), "pkill -f cj_proxy.py; sed -i /OLLAMA_BASE_URL/d /root/.profile")
+
+
+# ---------------------------------------------------------------------------
+# Run + measure
+# ---------------------------------------------------------------------------
+
+def run_swarm(run_dir: str, runtime: int = 3000) -> None:
+    log = f"{REPO}/runs_{os.path.basename(run_dir)}.log"
+    cmd = (
+        f"cd {REPO} && nohup python3.11 run_test.py --mode remote --agent-type llm "
+        f"--agents {AGENTS} --agents-per-host 1 --topology {TOPOLOGY} --jobs {JOBS} "
+        f"--db-host database --agent-hosts-file agent_hosts_cj.txt --use-config-dir "
+        f"--jobs-per-interval 30 --stable-seconds 120 --runtime {runtime} "
+        f"--generate-plots --run-dir {run_dir} > {log} 2>&1"
+    )
+    _sh(cmd, timeout=runtime + 900)
+
+
+def collect(run_dir: str) -> dict:
+    """Parse per-host agent logs and the orchestrator log into scenario metrics."""
+    m = {"llm_complete": 0, "llm_fallback": 0, "swim_failed": 0}
+    lat, per_agent = [], []
+    for path in sorted(glob(f"{REPO}/{run_dir}/**/agent-*.log", recursive=True)):
+        text = open(path, errors="ignore").read()
+        c = text.count("LLM_COST_COMPLETE")
+        m["llm_complete"] += c
+        m["llm_fallback"] += text.count("LLM_COST_FALLBACK")
+        m["swim_failed"] += text.count("FAILED (suspect-timeout)")
+        per_agent.append(c)
+        # Only LLM_COST_COMPLETE marks a real call. LLM_BID_WON also carries a
+        # ReasoningTime, but logs 0.000s when the bid came from the analytic fallback,
+        # which would otherwise read as "instant LLM" instead of "no LLM".
+        lat += [float(x) for x in
+                re.findall(r"LLM_COST_COMPLETE.*?ReasoningTime=([0-9.]+)s", text)]
+
+    calls = m["llm_complete"] + m["llm_fallback"]
+    m["fallback_rate"] = round(m["llm_fallback"] / calls, 4) if calls else 0.0
+    # Latency comes from ReasoningTime, which only exists on successful LLM calls. Under a
+    # full outage there are no samples — report n/a rather than 0, which would read as
+    # "instant" instead of "never happened".
+    if lat:
+        lat.sort()
+        m["latency_mean_s"] = round(sum(lat) / len(lat), 2)
+        m["latency_p95_s"] = round(lat[int(len(lat) * 0.95)], 2)
+
+    # Orchestrator logs written by hand use underscores where run dirs use hyphens.
+    base = os.path.basename(run_dir)
+    run_log = next((p for p in (f"{REPO}/runs_{base}.log",
+                                f"{REPO}/runs_{base.replace('-', '_')}.log")
+                    if os.path.isfile(p)), "")
+    if run_log:
+        text = open(run_log, errors="ignore").read()
+        placed = [int(x) for x in re.findall(r"Agent \d+: (\d+) jobs", text)]
+        m["jobs_completed"] = sum(placed)
+        # Fairness over jobs actually placed, not scoring effort: placement is what a fault
+        # can degrade, and it stays measurable when every LLM call fails.
+        if placed and sum(placed):
+            total = sum(placed)
+            m["jains_fairness"] = round(total * total / (len(placed) * sum(x * x for x in placed)), 3)
+        fa = re.search(r"Total failed agents: (\d+)", text)
+        m["failed_agents"] = int(fa.group(1)) if fa else None
+        inf = re.search(r"Infeasible/Failed jobs: (\d+) retired, (\d+) still", text)
+        m["jobs_stuck"] = int(inf.group(2)) if inf else None
+    return m
+
+
+def load_reference() -> dict:
+    if not os.path.isfile(REFERENCE):
+        raise SystemExit(f"no reference baseline at {REFERENCE}; run save_reference() first")
+    return json.load(open(REFERENCE))
+
+
+def save_reference(metrics: dict) -> None:
+    json.dump(metrics, open(REFERENCE, "w"), indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Reporting — mirrors the baseline / fault / delta shape of CJ's own scenarios
+# ---------------------------------------------------------------------------
+
+_KEYS = [
+    ("jobs_completed", "jobs completed", "{}"),
+    ("llm_complete", "LLM calls OK", "{}"),
+    ("llm_fallback", "LLM fallbacks", "{}"),
+    ("fallback_rate", "fallback rate", "{:.1%}"),
+    ("latency_mean_s", "bid latency mean", "{}s"),
+    ("latency_p95_s", "bid latency p95", "{}s"),
+    ("jains_fairness", "load fairness", "{}"),
+    ("swim_failed", "SWIM false-fails", "{}"),
+    ("failed_agents", "failed agents", "{}"),
+    ("jobs_stuck", "jobs stuck", "{}"),
+]
+
+
+def report(name: str, title: str, baseline: dict, fault: dict, expectations: list[str]) -> None:
+    bar = "─" * 74
+    print(f"\n{bar}\n  {name} — {title}\n{bar}")
+    print(f"  {'metric':<20}{'baseline':>14}{'fault':>14}{'delta':>16}")
+    for key, label, fmt in _KEYS:
+        b, f = baseline.get(key), fault.get(key)
+        if b is None and f is None:
+            continue
+        bs = fmt.format(b) if b is not None else "-"
+        fs = fmt.format(f) if f is not None else "-"
+        if isinstance(b, (int, float)) and isinstance(f, (int, float)):
+            d = f - b
+            ds = f"{d:+.1%}" if fmt.endswith("%}") else f"{d:+g}"
+        else:
+            ds = "-"
+        print(f"  {label:<20}{bs:>14}{fs:>14}{ds:>16}")
+    print("\n  expected signals:")
+    for line in expectations:
+        print(f"    - {line}")
+    print(bar)
