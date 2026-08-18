@@ -336,40 +336,23 @@ link (it is at the site root and returns 200).
 
 ## 7. SwarmAgents bugs found and fixed
 
-Both in `swarm/agents/llm/llm_bidder.py`; needed before the Ollama arm could run at all.
+Full write-up with reproductions and suggested fixes:
+**[`SWARMAGENTS_FINDINGS.md`](SWARMAGENTS_FINDINGS.md)**.
 
-1. **Dead endpoint configuration.** The `ollama` branch computed `base_url`/`api_key` from the
-   environment and then **discarded them**, calling `OpenAIChatModel(model, provider="ollama")` —
-   which demands the `OLLAMA_BASE_URL` env var and raises otherwise. Now resolves
-   **env → config `base_url` → default** and passes it explicitly via `OllamaProvider(...)`.
-2. **Wrong structured-output mode for small models.** `qwen2.5:3b` supports tool calling but
-   invents its own schema in the arguments — emitting `{"bid":{"agent":2,"job":1.5,...}}` instead
-   of `{"score":…,"explanation":…}` — so pydantic-ai failed with *"Exceeded maximum output
-   retries"*. Measured across modes:
+Most were **silent** — the system kept running and produced plausible results while a scheduling
+term was inert, the fleet differed between runs, or the LLM was never consulted.
 
-   | Output mode | Success |
-   |---|---|
-   | `ToolOutput` (pydantic-ai default) | 0/3 |
-   | `PromptedOutput` | 0/3 |
-   | **`NativeOutput`** (Ollama json_schema) | **3/3** |
-
-   The bidder now uses `NativeOutput(Bid)` **for the ollama provider only**; the gateway path keeps
-   default tool output (proven 3062/3062).
-
-New config keys in `config_swarm_multi.yml`: `llm.base_url`, plus `provider: ollama`,
-`model: "qwen2.5:3b"`.
-
-3. **DTN names never matched between jobs and agents.** `run_test.py --pegasus-profiles` called the
-   converter without `data_nodes_mode`/`dtn_names`, so every job data-node kept the raw Pegasus site
-   name `local` while agents held `dtn1..dtn10` — zero overlap, so the connectivity term could never
-   be satisfied and dropped out of the cost model. Now defaults to `per-file` granularity and the
-   agent DTN pool, with `--pegasus-data-nodes` / `--pegasus-dtn-names` to override.
-4. **Agent fleets were unreproducible.** `generate_configs.py` used unseeded `random` for
-   capacities, flavors and DTN assignment, and `cleanup_between_runs` deletes the profiles before
-   every run — so each run built a different fleet. Added `--seed` (threaded through `run_test.py`);
-   verified identical profiles/DTNs/configs across regenerations from a clean state.
-
----
+| # | Status | Summary |
+|---|--------|---------|
+| 1 | Fixed `c51b6af9` | Ollama provider unusable — the resolved endpoint was computed then discarded |
+| 2 | Fixed `c51b6af9` | Small models fail tool-call schemas; `NativeOutput` is the working mode (3/3 vs 0/3) |
+| 3 | Fixed `bf5e2e44` | Job DTN names never matched agent DTNs → connectivity term dead in two baselines |
+| 4 | Fixed `bf5e2e44` | Unseeded per-run fleet regeneration made runs incomparable (`--seed`) |
+| 5 | Fixed `fb60a3ef` | Per-file DTN spread left 76/300 jobs unschedulable and stalled a run (`--dtn-scope job`) |
+| 6 | **Open** | `run_test.py` deletes `agent_hosts.txt` then crashes reading it — use another filename |
+| 7 | **Open** | `llm.timeout_seconds` is parsed but never enforced; bids ran 14.9 s, 19.2 s, once 20 min |
+| 8 | **Open** | Converter mutates module-level `INSTANCE_FLAVORS` via aliased dicts |
+| 9 | **Open** | `Job.execute()` sleeps a flat 1 s, so **makespan is not comparable** to the source workflows |
 
 ## 8. Runbook
 
