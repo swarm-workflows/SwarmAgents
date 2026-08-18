@@ -281,6 +281,45 @@ applied to all agents equally would restore the intended competition.
 > above is the re-run on a harness that verifies the injected fault type, the blast radius, and
 > teardown (commit `67d4fa5e`).
 
+### S01 — LLMLatency: +3 s per call (2026-08-18)
+
+| faulted hosts | fallback rate | bid latency mean | **load fairness** | jobs completed |
+|---|---|---|---|---|
+| 0% (reference) | 0.0% | 9.90 s | 0.681 | 300 |
+| **50%** (15/30) | **0.0%** | 10.98 s (+1.08) | **0.849** | 300 |
+| **100%** (30/30) | **0.0%** | **12.65 s (+2.75)** | 0.738 | 300 |
+
+The +2.75 s shift at full fleet matches the injected +3 s, so the fault is being measured
+correctly. **Latency is absorbed completely**: zero fallbacks, 300/300 jobs, no agent lost.
+Scheduling gets slower and nothing else breaks.
+
+*Side effect:* zero fallbacks at +3 s on a ~10 s bid is direct evidence that
+`llm.timeout_seconds: 6` is not enforced (SwarmAgents finding 7) — a 12.65 s call should have
+breached it.
+
+### S01 vs S05 — it is not slowness that hurts, it is skipping the LLM
+
+Per-agent job capture, faulted vs healthy agents in the same run:
+
+| scenario | faulted agents | healthy agents | ratio |
+|---|---|---|---|
+| **S01** +3 s on 15/30 (slowed) | 150 jobs (10.0/agent) | 150 jobs (10.0/agent) | **1.00×** |
+| **S05** outage on 8/30 (instant-fail) | 280 jobs (35.0/agent) | 20 jobs (1.8/agent) | **19.25×** |
+
+We expected slowed agents to *lose* work, mirroring S05's race dynamic in reverse. They do not —
+placement stays exactly even, and fairness actually improves to 0.849.
+
+The difference is one of **regime, not degree**. A +3 s handicap on a ~10 s bid is a ~30%
+slowdown: both groups still operate on the same timescale, so neither wins races. An agent whose
+LLM is down skips inference entirely and bids in **~0 s** — two orders of magnitude faster. That
+categorical gap, not relative slowness, is what lets degraded agents monopolise the workload.
+
+**Design implication (revised).** The problem is not that failed agents are fast; it is that the
+**fallback path is orders of magnitude cheaper than the LLM path**, so any agent that errors out
+is rewarded with a decisive scheduling advantage. Penalising *slow* agents would not help — S01
+shows slowness is already harmless. What is needed is to make a fallback bid cost what an LLM bid
+costs, whether by delaying fallback proposals or by applying a bid deadline uniformly.
+
 ---
 
 ## 5. Experiment matrix

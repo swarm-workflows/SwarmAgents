@@ -15,6 +15,7 @@ Unlike CJ's reference scenarios, the workload here is not a single LLM call but 
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import shlex
