@@ -233,33 +233,51 @@ Each scenario takes a **host fraction**, so the same file yields the blast-radiu
 `OLLAMA_BASE_URL` would silently fault every later run. Unlike CJ's scenarios (one LLM
 call, seconds), ours is a full 30-agent run, so `run_all.py` is a batch job.
 
-### S05 — LLMUnavailable, 30/30 hosts (2026-08-17)
+### S05 — LLMUnavailable: the blast-radius curve (2026-08-17)
 
-| metric | baseline | fault | delta |
+Same fleet and trace throughout; only the share of hosts whose LLM returns 503 changes.
+
+| faulted hosts | fallback rate | LLM calls OK | **load fairness** | jobs completed | jobs stuck |
+|---|---|---|---|---|---|
+| 0% (reference) | 0.0% | 1064 | 0.681 | 300 | 0 |
+| **25%** (8/30) | 53.9% | 337 | **0.331** | 300 | 0 |
+| **50%** (15/30) | 78.7% | 186 | **0.570** | 300 | 0 |
+| **100%** (30/30) | 100.0% | 0 | **0.843** | 300 | 0 |
+
+**Headline: a partial LLM outage is far more damaging than a total one.** Load fairness
+collapses to **0.331** at 25% — less than half the healthy baseline — then recovers
+monotonically as the outage spreads, ending *best* under total failure. Completion never
+moves: 300/300 jobs, 0 stuck, 0 agents lost at every point.
+
+**Mechanism** — the LLM-blind agents capture the work:
+
+| outage | faulted agents | healthy agents | ratio |
 |---|---|---|---|
-| jobs completed | 300 | **300** | +0 |
-| LLM calls OK | 1064 | 0 | −1064 |
-| fallback rate | 0.0% | **100.0%** | +100.0% |
-| load fairness (placed jobs) | 0.681 | **0.836** | **+0.155** |
-| SWIM false-fails | 9 | 5 | −4 |
-| failed agents / jobs stuck | 0 / 0 | **0 / 0** | +0 |
+| 25% | 8 agents took **280/300 jobs** (35.0 each) | 11 agents took 20 (1.8 each) | **19×** |
+| 50% | 15 agents took **292/300 jobs** (19.5 each) | 6 agents took 8 (1.3 each) | **15×** |
 
-**Graceful degradation holds.** With every LLM call 503-ing on all 30 agents, the swarm
-completed 300/300 jobs with nothing stuck and no agent lost — it degrades into a purely
-analytical scheduler, exactly as designed.
+A faulted agent gets its 503 and falls back to the analytic cost in ~0 s, while a healthy
+agent spends ~10 s producing an LLM bid. In race-to-propose consensus the broken agents win
+almost every election, so **8 of 30 agents being LLM-blind is enough to schedule 93% of the
+workload analytically** — the healthy majority's LLM reasoning is bought and paid for, then
+discarded. This is a gray-failure pattern: the system survives total failure gracefully and is
+harmed most by partial failure.
 
-Two results beyond mere survival:
-- **The analytic scheduler balances load *better*** (fairness 0.681 → 0.836). Losing the
-  LLM did not just cost nothing, it improved placement evenness — worth investigating as
-  a finding about the LLM's scoring rather than a footnote.
-- **SWIM false-fails fell** (9 → 5), confirming the earlier causal story: it is blocking
-  on ~10 s inference that delays probe replies, so removing inference calms membership.
+It also explains the disproportionate fallback rate — 26.7% of hosts generate 53.9% of scoring
+events, because failing fast lets them cycle the selection loop far more often. **Fallback rate
+is a rate over calls, not over agents**, and over-represents fast-failing agents; read it
+alongside the per-agent job split.
 
-*Metric caveats fixed while producing this table (they would have misread the result):*
-bid latency is parsed only from `LLM_COST_COMPLETE` — `LLM_BID_WON` also carries a
-`ReasoningTime` but logs `0.000s` for analytic bids, which read as "instant LLM" instead
-of "no LLM"; and fairness is computed over **placed jobs**, not scoring calls, so it stays
-measurable when every call fails.
+*Design implication:* if LLM scoring is meant to add value, an agent that has fallen back should
+not be able to out-race one that is still reasoning — a fallback penalty or a bid deadline
+applied to all agents equally would restore the intended competition.
+
+> **Correction.** An earlier S05 100% run reported here was **not a Chaos Jungle fault**:
+> `cj_proxy.py` had never been deployed to the agent hosts, so the proxies never started and the
+> agents' fallbacks came from `Connection error` against a dead port rather than an injected
+> 503. The graceful-degradation conclusion survived, but the attribution was wrong. The table
+> above is the re-run on a harness that verifies the injected fault type, the blast radius, and
+> teardown (commit `67d4fa5e`).
 
 ---
 
