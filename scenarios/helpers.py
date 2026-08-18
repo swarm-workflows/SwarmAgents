@@ -15,9 +15,9 @@ Unlike CJ's reference scenarios, the workload here is not a single LLM call but 
 """
 from __future__ import annotations
 
-import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -36,6 +36,10 @@ PROXY_PORT = 18011
 # Bracketed so the pattern never matches the shell command carrying it — an unbracketed
 # `pkill -f cj_proxy.py` kills its own parent before the rest of the command runs.
 _PROXY_PAT = "cj_prox[y].py"
+# CJ spawns its own long-lived proxy script; killing only our driver leaves this bound to
+# PROXY_PORT, still serving the PREVIOUS fault. One survived ~12h and silently answered a
+# later latency scenario with the earlier scenario's 503s.
+_CJ_PROXY_PAT = "llm_prox[y].py"
 OLLAMA_UPSTREAM = "http://127.0.0.1:11434/v1"
 
 
@@ -57,9 +61,11 @@ def _fan_out(host_list: Iterable[str], remote_cmd: str, timeout: int = 900,
     long-lived process: ssh does not return even with -n and </dev/null, because the child
     keeps the channel open. Bound the wait and confirm the effect by polling instead.
     """
+    # shlex.quote, not json.dumps: double quotes let the LOCAL shell expand $(...) before
+    # ssh ever runs, so a remote state check silently reports the orchestrator's state.
     pre = f"timeout {per_host_timeout} " if per_host_timeout else ""
     parts = " ".join(
-        f'({pre}ssh -n -o ConnectTimeout=10 -o StrictHostKeyChecking=no {h} {json.dumps(remote_cmd)} 2>/dev/null) &'
+        f'({pre}ssh -n -o ConnectTimeout=10 -o StrictHostKeyChecking=no {h} {shlex.quote(remote_cmd)} 2>/dev/null) &'
         for h in host_list
     )
     return _sh(parts + " wait", timeout=timeout)
@@ -124,21 +130,60 @@ def start_fault(faulted: list[str], fault: str, **params) -> None:
         time.sleep(5)
     if started < len(faulted):
         raise SystemExit(f"only {started}/{len(faulted)} fault proxies started")
+
+    # Assert the fault actually behaves as named. A live process proves nothing: a stale
+    # proxy from an earlier scenario answers on the same port, so a latency run once
+    # measured the previous run's 503s.
+    observed = _probe_fault(faulted[0])
+    _assert_semantics(fault, observed, params)
     print(f"  fault injected: {fault} on {len(faulted)}/{len(hosts())} hosts "
-          f"({started} proxies up)")
+          f"({started} proxies up, probe: {observed['code']} in {observed['ms']}ms)")
+
+
+def _probe_fault(host: str) -> dict:
+    """Send one real request through a faulted host's proxy and time it."""
+    body = '{"model":"qwen2.5:3b","messages":[{"role":"user","content":"hi"}],"max_tokens":5}'
+    cmd = (f"curl -s -o /dev/null -w %{{http_code}} --max-time 120 "
+           f"http://127.0.0.1:{PROXY_PORT}/v1/chat/completions "
+           f"-H 'Content-Type: application/json' -d '{body}'")
+    t0 = time.time()
+    out = _fan_out([host], cmd, timeout=180).strip()
+    return {"code": out or "none", "ms": int((time.time() - t0) * 1000)}
+
+
+def _assert_semantics(fault: str, obs: dict, params: dict) -> None:
+    code, ms = obs["code"], obs["ms"]
+    if fault == "unavailable":
+        if code != "503":
+            raise SystemExit(f"expected 503 from LLMUnavailable, got {code}")
+    elif fault == "latency":
+        want = float(params.get("delay", 0))
+        if code != "200":
+            raise SystemExit(
+                f"LLMLatency should slow a call, not fail it — got HTTP {code} after {ms}ms. "
+                f"A stale proxy from a previous scenario may still own :{PROXY_PORT}.")
+        if ms < want * 1000 * 0.8:
+            raise SystemExit(f"latency fault not applied: {ms}ms < expected ~{want*1000:.0f}ms")
+
+
+def _state_probe() -> str:
+    """env-var count, our driver count, and whether PROXY_PORT is still bound."""
+    return (f"echo $(grep -c OLLAMA_BASE_URL /root/.profile) "
+            f"$(pgrep -fc '{_PROXY_PAT}' || true) "
+            f"$(ss -lnt 2>/dev/null | grep -c ':{PROXY_PORT} ' || true)")
 
 
 def assert_clean() -> None:
-    """Fail before a run rather than after: a leaked OLLAMA_BASE_URL points an agent at a
-    dead proxy port, which looks exactly like a total LLM outage on every host."""
-    out = _fan_out(hosts(),
-                   f"echo $(grep -c OLLAMA_BASE_URL /root/.profile) $(pgrep -fc '{_PROXY_PAT}' || echo 0)")
-    dirty = [ln for ln in out.splitlines() if ln.strip() and ln.split() != ["0", "0"]]
+    """Fail before a run rather than after. Checks the port too: a stale CJ proxy keeps
+    serving the previous fault, so a later scenario measures the earlier one."""
+    out = _fan_out(hosts(), _state_probe())
+    dirty = [ln for ln in out.splitlines() if ln.strip() and ln.split() != ["0", "0", "0"]]
     if dirty:
         raise SystemExit(
-            f"fleet is dirty on {len(dirty)} host(s) — leaked fault env var or proxy.\n"
-            f"run stop_fault() (or scenarios/clear_faults.py) before measuring.")
-    print(f"  clean check:    0 leaked proxies / env vars on {len(hosts())} hosts")
+            f"fleet is dirty on {len(dirty)} host(s) — leaked env var, driver, or a proxy "
+            f"still bound to :{PROXY_PORT}.\nrun scenarios/clear_faults.py before measuring.")
+    print(f"  clean check:    no leaked env vars / drivers / :{PROXY_PORT} listeners "
+          f"on {len(hosts())} hosts")
 
 
 def stop_fault() -> None:
@@ -148,11 +193,12 @@ def stop_fault() -> None:
     so an unbracketed pattern kills this command before later statements execute, which is how
     a leaked env var once made three scenarios report an identical 100% fallback rate.
     """
-    _fan_out(hosts(), f"sed -i /OLLAMA_BASE_URL/d /root/.profile; pkill -f '{_PROXY_PAT}'")
-    time.sleep(2)
-    out = _fan_out(hosts(),
-                   f"echo $(grep -c OLLAMA_BASE_URL /root/.profile) $(pgrep -fc '{_PROXY_PAT}' || echo 0)")
-    dirty = [ln for ln in out.splitlines() if ln.strip() and ln.split() != ["0", "0"]]
+    _fan_out(hosts(), f"sed -i /OLLAMA_BASE_URL/d /root/.profile; "
+                      f"pkill -f '{_PROXY_PAT}'; pkill -f '{_CJ_PROXY_PAT}'; "
+                      f"fuser -k {PROXY_PORT}/tcp 2>/dev/null")
+    time.sleep(3)
+    out = _fan_out(hosts(), _state_probe())
+    dirty = [ln for ln in out.splitlines() if ln.strip() and ln.split() != ["0", "0", "0"]]
     if dirty:
         print(f"  !! teardown incomplete on {len(dirty)} host(s) — next run will be invalid")
 
