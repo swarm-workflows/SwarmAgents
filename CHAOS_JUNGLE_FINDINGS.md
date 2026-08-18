@@ -19,6 +19,7 @@ below are about *getting to* that point.
 | 1 | **Blocker** | `main` / v1.5.0 cannot be imported at all — two undefined re-exports |
 | 2 | High | Documented `pip install chaos-jungle` cannot work — package is not on PyPI |
 | 3 | Medium | `upstream` must be an **origin**; a `/v1` base path silently yields 404s, turning a forwarding fault into an outage |
+| 4 | **High** | `chaos-jungle stop` always crashes — `ChaosRunner.attach()` skips `__init__`, so a session can never be reverted from the CLI |
 
 ---
 
@@ -108,6 +109,60 @@ so outage scenarios pass happily with a misconfigured upstream and only forwardi
 **Suggested fix** — validate `upstream` and reject (or strip) a path component, or document
 explicitly that it is an origin. A warning when an upstream response is 404 while the fault
 expects a proxied success would also surface it immediately.
+
+## 4. `chaos-jungle stop` always crashes, so a session can never be reverted from the CLI
+
+**Reproduce** — start any fault, then stop it from another process (the documented "separate
+mode" that `attach()` exists for):
+
+```bash
+chaos-jungle stop
+# AttributeError: 'ChaosRunner' object has no attribute '_timer'
+#   chaos_jungle/cli.py:137 in stop  ->  runner.stop()
+#   chaos_jungle/runner.py:706       ->  if self._timer is not None:
+```
+
+**Root cause** — `ChaosRunner.attach()` (runner.py ~1493) reconstructs the runner with
+`cls.__new__(cls)`, deliberately bypassing `__init__`, and then sets only six attributes:
+
+```python
+runner = cls.__new__(cls)
+runner.scenario = Scenario(session["name"], faults=[])
+runner.target = target or LocalTarget()
+runner.db = db
+runner.auto_preflight = False
+runner._session_id = session["id"]
+runner._fault_ids = []
+return runner
+```
+
+`__init__` also initialises `_timer`, `_resource_thread` and `_resource_stop` (runner.py ~484),
+and `stop()` dereferences `_timer` unconditionally. Every CLI stop therefore raises.
+
+**Impact** — the CLI has no working way to end a chaos session. Faults started with
+`chaos-jungle start` must be cleared by killing processes by hand, which is how we ended up
+here. Because the session row is only flipped to `reverted` inside `stop()`, killing the process
+instead leaves it permanently `running`:
+
+```
+  ID  NAME              STATUS      STARTED
+   3  swarm-latency     running     2026-08-18T14:35:13Z     <- process long dead
+   1  smoke-latency     running     2026-08-16T08:11:54Z     <- two days dead
+```
+
+We confirmed nothing was actually active: no listener on the proxy port on any of the 30 hosts.
+Note the tell — sessions we stopped with **SIGTERM** (letting the driver's handler call
+`runner.stop()`) show `reverted` correctly; only the **SIGKILL**ed ones are stuck, which is
+consistent with the revert living solely in `stop()`.
+
+**Secondary issue** — `chaos-jungle list` and `status` report a session's stored status without
+checking whether anything is alive, so they confidently show an active fault that is not running.
+For an audit trail of destructive experiments, "believed running" and "verified running" are worth
+distinguishing.
+
+**Suggested fix** — initialise the missing attributes in `attach()` (or factor the state setup
+into a helper both paths call), and reconcile liveness in `list`/`status` — a session whose port
+is unbound and whose process is gone should not be displayed as `running`.
 
 ## Corrections to earlier drafts of this list
 

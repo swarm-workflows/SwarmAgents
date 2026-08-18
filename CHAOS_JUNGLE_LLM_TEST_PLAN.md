@@ -382,6 +382,7 @@ Full report with reproductions, evidence and suggested fixes:
 |---|----------|---------|
 | 1 | **Blocker** | `main` / v1.5.0 cannot be imported — `InjectResult` and `ChaosFuzzer` are re-exported by `__init__.py` but defined nowhere. Broken since `21765afb` (2026-07-06); every later commit is docs-only. Pin `5044939…`. |
 | 2 | High | The docs site's first install option, `pip install chaos-jungle`, cannot work — not on PyPI (404). The README's `git+https://…` form is correct. |
+| 4 | **High** | `chaos-jungle stop` always crashes (`ChaosRunner.attach()` bypasses `__init__`, leaving `_timer` unset), so a session can never be reverted from the CLI and stale `running` rows accumulate. |
 | 3 | Medium | `upstream` must be an **origin**: CJ appends the request path, so a `/v1` suffix yields `/v1/v1/…` → 404. The delay still applies, so the fault looks installed while nothing is forwarded — a latency experiment silently becomes an outage experiment. |
 
 **CJ works as advertised once installed from the right commit** — we reproduced a clean
