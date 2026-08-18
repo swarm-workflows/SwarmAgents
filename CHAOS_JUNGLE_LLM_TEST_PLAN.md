@@ -51,10 +51,12 @@ Because faults are injected per host, the natural blast-radius knob is *which ho
 | **Ollama** (primary) | `127.0.0.1:11434`, per host | `qwen2.5:3b` | All fault sweeps — plain HTTP, no shared contention |
 | **Gateway** | FABRIC LiteLLM proxy | `gpt-oss-20b` | Realism spot-check, fault-free only |
 
-**Why fault-inject on Ollama, not the gateway:** CJ's proxy is built for plain-HTTP upstreams.
-Against the authenticated-HTTPS gateway it injects the delay but then fails to forward the
-call — turning a *latency* fault into an *outage*, which would confound every measurement. Ollama
-also avoids shared-endpoint contention that would otherwise pollute baseline-vs-fault deltas.
+**Why fault-inject on Ollama, not the gateway:** a shared endpoint adds load-dependent queueing
+that would contaminate baseline-vs-fault deltas — the gateway went from 1.3 s single-call to
+5.85 s under 30-agent load. Local Ollama keeps each agent's latency independent.
+(An earlier version of this note claimed CJ's proxy could not forward to authenticated-HTTPS
+upstreams. That was wrong: the failure was the `/v1` upstream suffix in §6-3, and the proxy
+forwards to the HTTPS gateway correctly once given an origin.)
 
 **Gateway access note:** the slice has **no IPv4 default route** (IPv6-only public egress), and the
 gateway publishes only an A record — so its public address is unreachable from the slice. It *is*
@@ -341,16 +343,17 @@ Full report with reproductions, evidence and suggested fixes:
 |---|----------|---------|
 | 1 | **Blocker** | `main` / v1.5.0 cannot be imported — `InjectResult` and `ChaosFuzzer` are re-exported by `__init__.py` but defined nowhere. Broken since `21765afb` (2026-07-06); every later commit is docs-only. Pin `5044939…`. |
 | 2 | High | The docs site's first install option, `pip install chaos-jungle`, cannot work — not on PyPI (404). The README's `git+https://…` form is correct. |
-| 3 | High | The LLM proxy does not forward to authenticated-HTTPS upstreams: `LLMLatency` applied its delay but the upstream leg failed (success 1.0 → 0.0), silently turning a latency fault into an outage. Plain-HTTP upstreams are fine. |
+| 3 | Medium | `upstream` must be an **origin**: CJ appends the request path, so a `/v1` suffix yields `/v1/v1/…` → 404. The delay still applies, so the fault looks installed while nothing is forwarded — a latency experiment silently becomes an outage experiment. |
 
 **CJ works as advertised once installed from the right commit** — we reproduced a clean
 `measure()` delta (1.02 s → 3.08 s under `LLMLatency(delay_s=3)`) and ran a full-fleet
 `LLMUnavailable` scenario end to end (§4b).
 
-Two items in earlier drafts were **withdrawn after checking the source**: a supposed
-parameter-name drift in `LLMRateLimit`/`LLMTimeout` (the library and `LLM_SCENARIOS.md` agree;
-we had confused it with the separate `intercept.RateLimit`), and a supposed broken Quickstart
-link (it is at the site root and returns 200).
+Three items in earlier drafts were **withdrawn after checking**: a supposed parameter-name drift
+in `LLMRateLimit`/`LLMTimeout` (the library and `LLM_SCENARIOS.md` agree; we had confused it with
+the separate `intercept.RateLimit`), a supposed broken Quickstart link (it is at the site root and
+returns 200), and a supposed HTTPS-forwarding defect (it was our own `/v1` upstream suffix; a
+control call bypassing the proxy reproduced the identical error).
 
 ## 7. SwarmAgents bugs found and fixed
 

@@ -18,7 +18,7 @@ below are about *getting to* that point.
 |---|----------|---------|
 | 1 | **Blocker** | `main` / v1.5.0 cannot be imported at all — two undefined re-exports |
 | 2 | High | Documented `pip install chaos-jungle` cannot work — package is not on PyPI |
-| 3 | High | The LLM proxy does not forward to authenticated-HTTPS upstreams; a latency fault silently becomes an outage |
+| 3 | Medium | `upstream` must be an **origin**; a `/v1` base path silently yields 404s, turning a forwarding fault into an outage |
 
 ---
 
@@ -79,35 +79,35 @@ confined to the documentation site.
 
 ---
 
-## 3. LLM proxy does not forward to authenticated-HTTPS upstreams
+## 3. `upstream` must be an origin — a base path silently breaks forwarding faults
 
-Against an HTTPS upstream requiring a `Authorization: Bearer …` header (a LiteLLM gateway),
-`LLMLatency` **applied its delay but the forwarded request failed**, so the workload saw an
-outage rather than added latency.
+The proxy **appends the incoming request path** to `upstream`. Passing a base path that already
+ends in `/v1` therefore produces `/v1/v1/chat/completions` upstream, and every forwarded call
+404s.
 
-**Evidence** — `ChaosRunner.measure()` around a real client call:
+**Reproduce** (local Ollama, `LLMLatency(delay_s=3)`):
 
-| | latency | success |
-|---|---|---|
-| baseline | 1.02 s | 1.0 |
-| fault (`LLMLatency(delay_s=3)`) | 3.08 s | **0.0** |
+| `upstream` | result through the proxy |
+|---|---|
+| `http://127.0.0.1:11434/v1` | **HTTP 404** after 3192 ms |
+| `http://127.0.0.1:11434` | **HTTP 200** after 3866 ms ✓ |
 
-The +2.06 s delta shows the proxy is intercepting correctly; the `success` collapse shows the
-upstream leg failing. The same fault against a **plain-HTTP** upstream (local Ollama) behaves
-correctly, which is consistent with the documented examples all using Ollama.
+The delay is applied in both cases, so the fault *looks* installed; only the response body
+reveals that nothing was forwarded.
 
-**Why it matters** — this silently changes what is being measured. A latency experiment becomes
-an availability experiment, and any conclusion drawn about timeout/retry behaviour would be
-wrong. It is also invisible unless the workload reports success separately from latency.
+**Why it matters** — this is silent and it changes what the experiment measures. A latency
+experiment becomes an availability experiment, and any conclusion about timeout or retry
+behaviour drawn from it would be wrong. It is invisible unless the workload distinguishes
+"slow success" from "fast failure": we lost a full 30-agent run to it. It is also easy to hit,
+since `/v1` is exactly the base URL an OpenAI-compatible client is configured with, so copying
+that value into `upstream` is the natural mistake.
 
-**Suggested fix** — forward the inbound `Authorization` header (and any other client headers) and
-support TLS to the upstream; failing that, document the plain-HTTP-only limitation prominently,
-since "point CJ at your provider" is the natural reading of the current docs.
+Note the asymmetry that hides it: **`LLMUnavailable` never forwards** (it answers 503 directly),
+so outage scenarios pass happily with a misconfigured upstream and only forwarding faults break.
 
-**Workaround** — we run all fault injection against local plain-HTTP Ollama endpoints and use the
-HTTPS gateway only for fault-free runs.
-
----
+**Suggested fix** — validate `upstream` and reject (or strip) a path component, or document
+explicitly that it is an origin. A warning when an upstream response is 404 while the fault
+expects a proxied success would also surface it immediately.
 
 ## Corrections to earlier drafts of this list
 
@@ -121,6 +121,12 @@ withdrawn — noted here so they are not re-filed:
   (`RateLimit` vs `LLMRateLimit`), not a defect.
 - *"The Quickstart docs link is broken."* False. `quickstart.html` is at the site root and
   returns 200; we had guessed a `guides/` prefix.
+- *"The LLM proxy cannot forward to authenticated-HTTPS upstreams."* **Withdrawn.** The original
+  evidence — `LLMLatency` against the HTTPS gateway delaying correctly but returning no successful
+  response — was caused by the `/v1` upstream suffix in issue 3, not by TLS or auth. Retested with
+  an origin-only upstream, the proxy forwards to the HTTPS gateway correctly and the upstream's own
+  auth error comes back intact; a control call bypassing the proxy produced the identical error,
+  confirming our test harness, not CJ, was at fault.
 
 ---
 

@@ -40,7 +40,7 @@ _PROXY_PAT = "cj_prox[y].py"
 # PROXY_PORT, still serving the PREVIOUS fault. One survived ~12h and silently answered a
 # later latency scenario with the earlier scenario's 503s.
 _CJ_PROXY_PAT = "llm_prox[y].py"
-OLLAMA_UPSTREAM = "http://127.0.0.1:11434/v1"
+OLLAMA_UPSTREAM = "http://127.0.0.1:11434"  # origin only: CJ appends the request path, so a /v1 suffix yields /v1/v1/... -> 404
 
 
 def hosts() -> list[str]:
