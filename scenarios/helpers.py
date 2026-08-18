@@ -33,6 +33,9 @@ AGENTS = 30
 JOBS = 300
 TOPOLOGY = "mesh"
 PROXY_PORT = 18011
+# Bracketed so the pattern never matches the shell command carrying it — an unbracketed
+# `pkill -f cj_proxy.py` kills its own parent before the rest of the command runs.
+_PROXY_PAT = "cj_prox[y].py"
 OLLAMA_UPSTREAM = "http://127.0.0.1:11434/v1"
 
 
@@ -46,10 +49,17 @@ def _sh(cmd: str, timeout: int = 900) -> str:
     return p.stdout
 
 
-def _fan_out(host_list: Iterable[str], remote_cmd: str, timeout: int = 900) -> str:
-    """Run remote_cmd on each host in parallel; returns concatenated stdout."""
+def _fan_out(host_list: Iterable[str], remote_cmd: str, timeout: int = 900,
+             per_host_timeout: int = 0) -> str:
+    """Run remote_cmd on each host in parallel; returns concatenated stdout.
+
+    per_host_timeout bounds each connection. Needed when the remote command backgrounds a
+    long-lived process: ssh does not return even with -n and </dev/null, because the child
+    keeps the channel open. Bound the wait and confirm the effect by polling instead.
+    """
+    pre = f"timeout {per_host_timeout} " if per_host_timeout else ""
     parts = " ".join(
-        f'(ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no {h} {json.dumps(remote_cmd)} 2>/dev/null) &'
+        f'({pre}ssh -n -o ConnectTimeout=10 -o StrictHostKeyChecking=no {h} {json.dumps(remote_cmd)} 2>/dev/null) &'
         for h in host_list
     )
     return _sh(parts + " wait", timeout=timeout)
@@ -87,25 +97,64 @@ def start_fault(faulted: list[str], fault: str, **params) -> None:
     The agent resolves its endpoint as OLLAMA_BASE_URL -> config -> default, so exporting
     the env var on a host redirects only that host's agent.
     """
+    # The driver lives on the orchestrator; agent hosts need their own copy. Without this
+    # the proxy never starts, agents hit a dead port, and "connection refused" masquerades
+    # as an injected fault — the failure looks like a successful outage experiment.
+    for host in faulted:
+        _sh(f"scp -o ConnectTimeout=10 -o StrictHostKeyChecking=no "
+            f"{REPO}/cj_proxy.py {host}:{REPO}/cj_proxy.py >/dev/null 2>&1")
+
     args = " ".join(f"--{k.replace('_', '-')} {v}" for k, v in params.items())
     cmd = (
-        f"cd {REPO} && nohup python3.11 cj_proxy.py --fault {fault} {args} "
+        f"cd {REPO} && setsid nohup python3.11 cj_proxy.py --fault {fault} {args} "
         f"--port {PROXY_PORT} --upstream {OLLAMA_UPSTREAM} --base-url-env OLLAMA_BASE_URL "
-        f"> /var/log/cj_proxy.log 2>&1 & "
+        f"> /var/log/cj_proxy.log 2>&1 < /dev/null & disown; "
         f"grep -q OLLAMA_BASE_URL /root/.profile || "
         f"echo export OLLAMA_BASE_URL=http://127.0.0.1:{PROXY_PORT}/v1 >> /root/.profile"
     )
-    _fan_out(faulted, cmd, timeout=120)
-    time.sleep(5)
-    live = _fan_out(faulted, "pgrep -fc cj_proxy.py || echo 0").split()
-    started = sum(1 for n in live if n.strip().isdigit() and int(n) > 0)
+    _fan_out(faulted, cmd, timeout=300, per_host_timeout=20)
+
+    # Poll for readiness rather than trusting the ssh return.
+    started, deadline = 0, time.time() + 120
+    while time.time() < deadline:
+        live = _fan_out(faulted, f"pgrep -fc '{_PROXY_PAT}' || true").split()
+        started = sum(1 for n in live if n.strip().isdigit() and int(n) > 0)
+        if started >= len(faulted):
+            break
+        time.sleep(5)
+    if started < len(faulted):
+        raise SystemExit(f"only {started}/{len(faulted)} fault proxies started")
     print(f"  fault injected: {fault} on {len(faulted)}/{len(hosts())} hosts "
           f"({started} proxies up)")
 
 
+def assert_clean() -> None:
+    """Fail before a run rather than after: a leaked OLLAMA_BASE_URL points an agent at a
+    dead proxy port, which looks exactly like a total LLM outage on every host."""
+    out = _fan_out(hosts(),
+                   f"echo $(grep -c OLLAMA_BASE_URL /root/.profile) $(pgrep -fc '{_PROXY_PAT}' || echo 0)")
+    dirty = [ln for ln in out.splitlines() if ln.strip() and ln.split() != ["0", "0"]]
+    if dirty:
+        raise SystemExit(
+            f"fleet is dirty on {len(dirty)} host(s) — leaked fault env var or proxy.\n"
+            f"run stop_fault() (or scenarios/clear_faults.py) before measuring.")
+    print(f"  clean check:    0 leaked proxies / env vars on {len(hosts())} hosts")
+
+
 def stop_fault() -> None:
-    """Always run, even on failure — a leaked proxy or env var silently faults later runs."""
-    _fan_out(hosts(), "pkill -f cj_proxy.py; sed -i /OLLAMA_BASE_URL/d /root/.profile")
+    """Always run, even on failure — a leaked proxy or env var silently faults later runs.
+
+    The env var is removed *first*: `pkill -f cj_proxy.py` matches the very shell running it,
+    so an unbracketed pattern kills this command before later statements execute, which is how
+    a leaked env var once made three scenarios report an identical 100% fallback rate.
+    """
+    _fan_out(hosts(), f"sed -i /OLLAMA_BASE_URL/d /root/.profile; pkill -f '{_PROXY_PAT}'")
+    time.sleep(2)
+    out = _fan_out(hosts(),
+                   f"echo $(grep -c OLLAMA_BASE_URL /root/.profile) $(pgrep -fc '{_PROXY_PAT}' || echo 0)")
+    dirty = [ln for ln in out.splitlines() if ln.strip() and ln.split() != ["0", "0"]]
+    if dirty:
+        print(f"  !! teardown incomplete on {len(dirty)} host(s) — next run will be invalid")
 
 
 # ---------------------------------------------------------------------------

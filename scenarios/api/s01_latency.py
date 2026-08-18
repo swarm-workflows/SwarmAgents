@@ -43,6 +43,7 @@ def main() -> int:
     tag = f"cj-s01-d{int(delay)}-{int(fraction * 100)}pct"
 
     print(f"\n{NAME} — {TITLE} +{delay}s  |  faulting {n}/{len(all_hosts)} hosts")
+    h.assert_clean()
     h.health_gate()
     h.cleanup()
     try:

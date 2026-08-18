@@ -41,6 +41,7 @@ def main() -> int:
     tag = f"cj-s05-{int(fraction * 100)}pct"
 
     print(f"\n{NAME} — {TITLE}  |  faulting {n}/{len(all_hosts)} hosts")
+    h.assert_clean()
     h.health_gate()
     h.cleanup()
     try:
