@@ -316,31 +316,23 @@ targeted (coordinators only, hierarchical arm).
 
 ## 6. Findings for the CJ maintainers
 
-Issues found while deploying Chaos Jungle 0.1.0 — all reproducible, and relevant to the paper.
+Full report with reproductions, evidence and suggested fixes:
+**[`CHAOS_JUNGLE_FINDINGS.md`](CHAOS_JUNGLE_FINDINGS.md)** — written to be filed upstream.
 
-1. **`pip install chaos-jungle` does not work** — the package is not on PyPI, despite the docs
-   instructing this. Install from GitHub.
-2. **The repo HEAD / v1.5.0 cannot be imported at all.** `chaos_jungle/__init__.py` re-exports
-   `InjectResult`, `ChaosFuzzer`, and other names that are **defined nowhere in the repository**
-   (a repo-wide code search returns no definition). Introduced by the 2026-07-06 "v1.5.0" commit;
-   every commit after it is docs-only, so `main` has been unimportable since.
-   **Workaround:** pin the last good pre-v1.5.0 commit —
-   ```bash
-   pip install "git+https://github.com/swarmourr/CJ.git@5044939950f3ac020c6fe02073642295865cbeae"
-   ```
-   Verified at that commit: imports clean, all LLM/semantic fault classes instantiate, and
-   `ChaosRunner` exposes `.measure()` / `.start()` / `.stop()`.
-3. **The LLM proxy does not handle authenticated-HTTPS upstreams.** Against a Bearer-auth TLS
-   endpoint, `LLMLatency` applied the delay but the forwarded request failed, silently converting a
-   latency fault into an outage. Works correctly against plain-HTTP upstreams (e.g. Ollama).
-4. **Docs/API drift:** `LLMRateLimit` takes `n` (docs suggest `after`); `LLMTimeout` takes
-   `timeout_s`.
+| # | Severity | Summary |
+|---|----------|---------|
+| 1 | **Blocker** | `main` / v1.5.0 cannot be imported — `InjectResult` and `ChaosFuzzer` are re-exported by `__init__.py` but defined nowhere. Broken since `21765afb` (2026-07-06); every later commit is docs-only. Pin `5044939…`. |
+| 2 | High | The docs site's first install option, `pip install chaos-jungle`, cannot work — not on PyPI (404). The README's `git+https://…` form is correct. |
+| 3 | High | The LLM proxy does not forward to authenticated-HTTPS upstreams: `LLMLatency` applied its delay but the upstream leg failed (success 1.0 → 0.0), silently turning a latency fault into an outage. Plain-HTTP upstreams are fine. |
 
-**CJ works as advertised once pinned.** Validated end-to-end: `ChaosRunner.measure()` around a real
-`LlmBidder.score()` call produced a clean delta — **baseline 1.02 s → fault 3.08 s (Δ +2.06 s)**
-with `LLMLatency(delay_s=3)`.
+**CJ works as advertised once installed from the right commit** — we reproduced a clean
+`measure()` delta (1.02 s → 3.08 s under `LLMLatency(delay_s=3)`) and ran a full-fleet
+`LLMUnavailable` scenario end to end (§4b).
 
----
+Two items in earlier drafts were **withdrawn after checking the source**: a supposed
+parameter-name drift in `LLMRateLimit`/`LLMTimeout` (the library and `LLM_SCENARIOS.md` agree;
+we had confused it with the separate `intercept.RateLimit`), and a supposed broken Quickstart
+link (it is at the site root and returns 200).
 
 ## 7. SwarmAgents bugs found and fixed
 
