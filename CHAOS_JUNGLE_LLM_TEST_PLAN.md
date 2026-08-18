@@ -567,6 +567,16 @@ ssh chaos 'sudo bash -lc "cd /root/SwarmAgents && python3.11 pegasus_to_swarm_co
   --data-nodes per-file --dtn-names dtn1,dtn2,dtn3,dtn4,dtn5,dtn6,dtn7,dtn8"'
 ```
 
+### 8.6b Leave the slice idle when you stop
+
+Scenarios call `cleanup()` at their *start*, so a run tidies up after its predecessor but never
+after itself — stop a batch and 29 agents and ~1700 Redis keys are left behind, which will stall
+the next run at `[SEL_WAIT] live != configured`. When finished:
+```bash
+ssh chaos 'sudo bash -lc "cd /root/SwarmAgents && python3.11 scenarios/clear_faults.py"'
+# expects: clean check ... / idle check: 0 stray agents, 0 Redis keys / slice idle
+```
+
 ### 8.7 Teardown / secret hygiene
 ```bash
 # Remove the gateway API key from all hosts when finished:
@@ -584,6 +594,7 @@ ssh chaos 'sudo bash -c '"'"'for h in $(cat /root/SwarmAgents/agent_hosts_cj.txt
 | `/root/cj_ollama_reset.sh` | Reset Ollama: drop pinning, kill all servers, start one on all cores |
 | `/root/cj_verify_fleet.sh` | Verify **all** ollama PIDs pinned + inference OK |
 | `/root/SwarmAgents/cj_proxy.py` | Per-host CJ fault proxy driver |
+| `scenarios/clear_faults.py` | **Return the slice to idle** — clear faults, stop agents, flush Redis |
 
 ---
 

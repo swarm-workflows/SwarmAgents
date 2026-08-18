@@ -174,9 +174,14 @@ def _state_probe() -> str:
             f"$(ss -lnt 2>/dev/null | grep -c ':{PROXY_PORT} ' || true)")
 
 
-def assert_clean() -> None:
+def assert_clean(strict: bool = False) -> None:
     """Fail before a run rather than after. Checks the port too: a stale CJ proxy keeps
-    serving the previous fault, so a later scenario measures the earlier one."""
+    serving the previous fault, so a later scenario measures the earlier one.
+
+    strict also rejects leftover agents and Redis state. Those are normally cleared by
+    cleanup() at the start of a run, which means a scenario tidies up after its predecessor
+    but never after itself — so the slice is left dirty whenever a batch ends.
+    """
     out = _fan_out(hosts(), _state_probe())
     dirty = [ln for ln in out.splitlines() if ln.strip() and ln.split() != ["0", "0", "0"]]
     if dirty:
@@ -185,6 +190,14 @@ def assert_clean() -> None:
             f"still bound to :{PROXY_PORT}.\nrun scenarios/clear_faults.py before measuring.")
     print(f"  clean check:    no leaked env vars / drivers / :{PROXY_PORT} listeners "
           f"on {len(hosts())} hosts")
+    if strict:
+        agents = sum(int(n) for n in _fan_out(hosts(), 'pgrep -fc "mai[n].py" || true').split()
+                     if n.strip().isdigit())
+        keys = int((_sh("docker exec redis redis-cli dbsize").strip() or "0").split()[-1])
+        if agents or keys:
+            raise SystemExit(f"slice not idle: {agents} stray agent process(es), "
+                             f"{keys} Redis key(s). Run scenarios/clear_faults.py.")
+        print("  idle check:     0 stray agents, 0 Redis keys")
 
 
 def stop_fault() -> None:
