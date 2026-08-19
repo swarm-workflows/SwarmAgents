@@ -50,6 +50,7 @@ from swarm.consensus.messages.proposal_info import ProposalContainer, ProposalIn
 from swarm.consensus.messages.snow_batch import SnowQueryBatch, SnowResponseBatch
 from swarm.consensus.messages.snow_query import SnowQuery
 from swarm.consensus.messages.snow_response import SnowResponse
+from swarm.utils.tiebreak import tiebreak_rank
 
 
 class SnowTransport(Protocol):
@@ -257,8 +258,10 @@ class GossipConsensusEngine:
 
         my_cost = self.host.my_cost_for_job(job_id)
         # Dominance rule: if I'm cheaper than the initiator's preferred, vote
-        # for myself; otherwise yield to the initiator's candidate. Ties broken
-        # by lexicographic agent_id to match the PBFT engine's tiebreak.
+        # for myself; otherwise yield to the initiator's candidate. Exact ties go
+        # to the lower tiebreak_rank for this job — the same rule the PBFT engine
+        # and the selection tie-break use, so all three agree on a winner without
+        # any of them systematically favouring low agent ids (finding 10).
         if my_cost is None:
             # Can't evaluate locally — yield.
             preferred = int(q_preferred) if q_preferred is not None else self.agent_id
@@ -267,7 +270,8 @@ class GossipConsensusEngine:
             init_cost = float(q_cost) if q_cost is not None else float("inf")
             init_agent = int(q_preferred) if q_preferred is not None else -1
             mine_dominates = (my_cost < init_cost) or (
-                my_cost == init_cost and self.agent_id < init_agent
+                my_cost == init_cost
+                and tiebreak_rank(job_id, self.agent_id) < tiebreak_rank(job_id, init_agent)
             )
             if mine_dominates:
                 preferred = self.agent_id

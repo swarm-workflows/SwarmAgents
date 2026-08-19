@@ -74,6 +74,7 @@ from swarm.models.agent_info import AgentInfo
 from swarm.models.object import ObjectState
 from swarm.selection.engine import SelectionEngine
 from swarm.selection.penalties import apply_multiplicative_penalty
+from swarm.utils.tiebreak import tiebreak_rank
 from swarm.utils.utils import generate_id
 
 
@@ -312,7 +313,8 @@ class LlmAgent(ResourceAgent):
                     cost_matrix=cost_matrix_with_penalities,
                     objective="min",
                     threshold_pct=self.selection_threshold_pct,  # e.g., 10 means within +10% of best
-                    tie_break_key=lambda ag, s: getattr(ag, "agent_id", "")
+                    tie_break_key=lambda ag, s, cand: tiebreak_rank(
+                        getattr(cand, "job_id", ""), getattr(ag, "agent_id", ""))
                 )
 
                 # Step 3: If this agent is assigned, start proposal
@@ -322,7 +324,9 @@ class LlmAgent(ResourceAgent):
                             p_id=generate_id(),
                             object_id=job.job_id,
                             agent_id=self.agent_id,
-                            cost=round((cost + self.agent_id), 2)
+                            # Real cost, not `cost + self.agent_id` — see the same change in
+                            # ResourceAgent. Exact ties are broken by tiebreak_rank now.
+                            cost=round(cost, 2)
                         )
                         proposals.append(proposal)
                         job.state = ObjectState.PRE_PREPARE

@@ -49,6 +49,7 @@ from swarm.models.role import Role, ObjectState
 
 import grpc
 
+from swarm.utils.tiebreak import tiebreak_rank
 from swarm.utils.utils import generate_id
 
 import threading
@@ -512,7 +513,8 @@ class ColmenaAgent(Agent):
             cost_matrix=cost_matrix,
             objective="min",
             threshold_pct=10.0,  # e.g., 10 means within +10% of best, TODO: Take from config file
-            tie_break_key=lambda ag, s: getattr(ag, "agent_id", "")
+            tie_break_key=lambda ag, s, cand: tiebreak_rank(
+                getattr(cand, "role_id", ""), getattr(ag, "agent_id", ""))
         )
 
         # Step 3: If this agent is assigned, start proposal
