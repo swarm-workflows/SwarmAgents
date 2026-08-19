@@ -64,6 +64,83 @@ reachable over the **FABNet dataplane** at `10.141.1.2`; mapping the hostname to
 `/etc/hosts` keeps TLS/SNI valid. The gateway serves 4 reasoning+tool_use models; of these only
 `gpt-oss-20b` is fast enough for a per-job scoring loop (1.3 s vs 37–43 s for the others).
 
+### 2.1b Ollama Cloud — evaluated and rejected as a primary arm (2026-08-19)
+
+Motivated by a real question: local `qwen2.5:3b` produces a degenerate cost signal (59% of bids
+are the identical value), so would a frontier model give the scheduler something to work with?
+Ollama Cloud (`https://ollama.com/v1`, key in root-only `/root/.ollama_cloud_key`, **never in the
+repo or a config**) exposes 19 models including `gpt-oss:20b`, `gpt-oss:120b` and `qwen3.5:397b`.
+
+**Reachability is fine** — unlike the FABRIC gateway, `ollama.com` publishes AAAA records and the
+slice reaches it over IPv6 in 0.15 s, no `/etc/hosts` mapping needed.
+
+**Signal quality is genuinely better.** 40 identical `<job, agent>` pairs drawn from the frozen
+trace and frozen profiles, through the production system prompt and the same json_schema output
+the agents use:
+
+| model | where | latency (mean) | distinct scores /40 | modal share | top-2 share | sd |
+|---|---|---|---|---|---|---|
+| `qwen2.5:3b` | local | 5.77 s | 15 | 25% | 40% | 24.2 |
+| `gpt-oss:20b` | cloud | 2.57 s | 11 | 32% | 57% | 38.2 |
+| **`gpt-oss:120b`** | cloud | **1.24 s** | **19** | **18%** | **28%** | 31.0 |
+
+`gpt-oss:120b` discriminates best *and* is 4.6x faster than the local 3B. Note `gpt-oss:20b`
+reproduces the coarseness seen in the `cj-baseline-gw` gateway run of the same model — two
+independent measurements agreeing that 20B is worse than 3B here.
+
+**But it fails at fleet scale, in two separate ways.** Sweeping concurrency against
+`gpt-oss:120b` (the 1.24 s figure above is a *single-client* measurement):
+
+| simultaneous requests | mean latency | slowdown vs sequential | responses |
+|---|---|---|---|
+| 1 (sequential) | 1.63 s | — | all 200 |
+| 4 | 2.27 s | 1.54x | all 200 |
+| 8 | 4.03 s | 2.66x | all 200 |
+| 16 | 6.24 s | 4.00x | all 200 |
+| **30** (fleet size) | 4.10 s (p95 11.72 s) | 2.51x | **13x 429**, 17x 200 |
+
+*First:* **the endpoint serializes.** Latency scales with concurrency — by 16 simultaneous
+bidders it is 6.24 s, i.e. *slower than the local 3B it was meant to replace*, and the 4.6x speed
+advantage has evaporated. Worse than the raw number, agent i's bid latency now depends on what
+agents j≠i are doing. Local per-host Ollama makes bid latency independent by construction; that
+independence is exactly what a controlled blast-radius study needs, and it is precisely what §S09
+showed decides placement. Coupling it means every agent's outcome depends on fleet-wide load.
+
+*Second:* **at fleet concurrency, 13 of 30 requests are rate-limited** — and a 429 is not benign
+here. In `LlmAgent._llm_or_analytic_cost` *any* exception becomes `[LLM_COST_FALLBACK]` and an
+analytic cost returned in ~0 s, and S05 established that a ~0 s bid **wins** the race to propose.
+A shared quota would hand the workload to whichever agents happened to be throttled, on every
+run — reproducing the exact pathology under study as an uncontrolled background fault beneath
+whatever CJ is deliberately injecting.
+
+> *Caveat on the 429s:* this fires 30 requests in the same instant, which is the worst case. A
+> real run makes ~1064 calls over ~11 minutes (~1.6/s average), so sustained rate may sit under
+> the limit — the agents' loops are synchronised enough that bursts are likely, but that has not
+> been measured. The serialization result above needs no such caveat: it reproduces at every
+> concurrency level tested.
+
+**Not every cloud model is usable at all, regardless of the above.** `qwen3.5:397b` is a
+reasoning model: it returns `"content":""` with the budget spent in a hidden `reasoning` field,
+and — the disqualifier — it **ignores `response_format: json_schema` and answers in prose**.
+SwarmAgents requires structured output (`NativeOutput(Bid)`, finding 2), so every bid would fail
+to parse, fall back to analytic cost, and the LLM arm would silently cease to exist. It is also
+far too slow for a per-job scoring loop once it starts reasoning — the same reason §2.1 ruled out
+three of the gateway's four models at 37-43 s. **Verify two things before adopting any cloud
+model: that it honours json_schema, and that it does not reason by default.** `gpt-oss:120b`
+passes both (40/40 parsed).
+
+**Verdict:** keep local per-host Ollama as the primary arm — its independence is the property the
+whole design rests on. Ollama Cloud is worth keeping for two bounded uses where concurrency stays
+under the limit:
+
+1. **Sequential ablations** like the granularity table above — cheap, no 429s, and it answers
+   "is this an artifact of a 3B model?" without a single 30-agent run.
+2. **A small-fleet realism check** (well under 30 agents) for the paper, if a reviewer asks
+   whether the findings survive a frontier model.
+
+Before either is scaled up, check the account's actual rate limit — the ceiling here was measured,
+not looked up, and a paid tier may move it.
+
 ### 2.2 Workload — a frozen, reproducible mixed Pegasus trace
 
 Experiments run on a **fixed 300-job trace merged from two extractions**, built by
@@ -229,6 +306,9 @@ scenarios/
   run_all.py               batch runner (--list); ~15 min per scenario
   api/s01_latency.py       S01  [delay_s] [fraction]
   api/s05_unavailable.py   S05  [fraction]
+  api/s09_semantic.py      S09  [mode] [fraction]
+cj_proxy.py                per-host CJ fault proxy (agents reach it via OLLAMA_BASE_URL)
+cj_probe.py                per-host semantic-fault probe (prompt tokens, with vs without)
 ```
 Each scenario takes a **host fraction**, so the same file yields the blast-radius curve
 (`s05_unavailable.py 0.25 / 0.5 / 1.0`). Teardown runs in a `finally` — a leaked proxy or
@@ -319,6 +399,192 @@ categorical gap, not relative slowness, is what lets degraded agents monopolise 
 is rewarded with a decisive scheduling advantage. Penalising *slow* agents would not help — S01
 shows slowness is already harmless. What is needed is to make a fallback bid cost what an LLM bid
 costs, whether by delaying fallback proposals or by applying a bid deadline uniformly.
+
+### S09 — SemanticCorrupt(entity_swap): the silent-wrong tier (2026-08-19)
+
+The first Tier 2 scenario. HTTP and JSON stay intact and the reply parses, so **the fallback
+path is unreachable by construction** — there is no exception to catch. Only the *content* of
+the request changes, on its way to the model.
+
+Applying CJ's own mutation offline to SwarmAgents' real scheduling prompt shows exactly what
+`entity_swap` does to it — one word, in the system prompt:
+
+```
+-Score this job for THIS agent (higher = better fit, 0-100).
++Score this job for THIS agent (lower = better fit, 0-100).
+```
+
+The JOB/AGENT/PEERS payload is untouched. A poisoned agent therefore **inverts its own bid
+polarity** while paying the same ~10 s it always paid — the controlled contrast S01 and S05
+could not give us: same timing regime, wrong content.
+
+The model obeys precisely. The modal bid flips to its own complement:
+
+| | modal score | count |
+|---|---|---|
+| fault-free reference | **75.00** | 626 of 1064 calls |
+| poisoned agents (50%) | **25.00** | most common, ahead of 75.00 |
+
+| poisoned hosts | fallback rate | **LLM score mean** | load fairness | sched latency mean | jobs completed | jobs stuck |
+|---|---|---|---|---|---|---|
+| 0% (reference) | 0.0% | 70.4 | 0.681 | 368.9 s | 300 | 0 |
+| **25%** (8/30) | **0.0%** | **63.4** | 0.719 | 356.2 s | 300 | 0 |
+| **50%** (15/30) | **0.0%** | **59.9** | 0.675 | 349.2 s | 300 | 0 |
+| **100%** (30/30) | **0.0%** | **44.1** | 0.640 | 374.4 s | 300 | 0 |
+
+Within the mixed runs the corruption is sharply localised, and the healthy group reproduces
+the fault-free baseline (70.4) to within a point — an internal control that the poisoning did
+not leak across the fleet:
+
+| poisoned | poisoned-agent score | healthy-agent score |
+|---|---|---|
+| 25% | **43.1** | 71.3 |
+| 50% | **48.3** | 70.7 |
+
+**Headline: the bids were corrupted and the schedule did not move.** Fallback rate stays at
+0.0% (the fault is silent, as designed), and completion, stuck jobs, scheduling latency and
+fairness are all flat — but so is *placement itself*. Jobs per agent-id decile barely move
+between a clean run and a fully poisoned one:
+
+| run | agents 1-10 | 11-20 | 21-30 |
+|---|---|---|---|
+| fault-free reference | 153 | 82 | 65 |
+| 50% poisoned | 151 | 70 | 79 |
+| 100% poisoned | 150 | 89 | 61 |
+
+**Mechanism — placement is decided by a race, not by the bid.** The first explanation we
+reached for was the tie-break: 59% of all bids in the clean run are the *identical* value 75.00,
+exact ties went to the lowest agent id, and the proposal advertised `cost + self.agent_id`
+(a ±30 term on a 0-100 scale). All of that is real and is now fixed — see §S09b — **and fixing
+it changed nothing**, which is how we found the actual mechanism.
+
+What decides placement is **how fast an agent produces a bid**. Ranking agents by mean bid
+latency against jobs won gives a consistent negative correlation in every run measured, with no
+fault present:
+
+| run | spearman(bid latency, jobs won) | slowest / fastest agent |
+|---|---|---|
+| fault-free reference | −0.38 | 13.0 s / 7.0 s |
+| fault-free, tie-break fixed | −0.34 | 249.6 s / 6.5 s |
+| S09 100% poisoned | −0.42 | 13.0 s / 7.2 s |
+| S09 50% poisoned | −0.64 | 20.0 s / 6.8 s |
+
+The extremes make it plain. In the tie-break-fixed run the two agents whose inference had
+degraded — 76.7 s and 249.6 s per bid — won **zero** jobs between them, while the fastest agent
+at 6.5 s took **43 of 300**, four times the fleet mean. Agent id looked like the cause because
+on this slice low-numbered hosts happen to infer faster: `corr(agent id, bid latency)` runs
++0.13 to +0.35.
+
+This is **S05's race-to-propose mechanism, present with no fault at all**. There it took a 503
+to make an agent bid in ~0 s instead of ~10 s; here ordinary variation in inference speed does a
+weaker version of the same thing, continuously. And it explains S09 exactly: `entity_swap`
+changes *what* an agent bids, not *when*, so it cannot move an outcome that timing decides.
+**The chaos fault did not find a weakness in the scheduler's tolerance; it showed that the
+LLM's output has little influence on the scheduler's decision.** That is the finding worth
+reporting, and only a semantic fault could produce it — every Tier 1 fault perturbs timing,
+which is precisely the channel that works.
+
+> **Method note — a capture ratio is meaningless without its no-fault control.** The poisoned
+> group appears to take 1.48-1.56x the work per agent of the healthy group. It does not: the
+> same split of the *fault-free* run gives 1.86x (at id 8) and 1.59x (at id 15). Both S09
+> fractions are at or below their own control, i.e. **no capture at all**.
+> `helpers.load_split()` now computes the reference run's ratio at the same split point and
+> prints both, so the confound cannot recur. S05's 19.25x stands — it clears its 1.86x control
+> by an order of magnitude — but it should be quoted against that control, not against 1.0.
+
+> **Correction.** An earlier version of this section stated that placement "is dominated by
+> agent id". That was inference from code reading, not measurement: the id tie-break and the
+> id-laden proposal cost exist and point that way, but removing both left the distribution
+> where it was. Agent id was a proxy for host inference speed. The observation — corrupted
+> bids, unchanged schedule — held; the explanation did not.
+
+**The SWIM churn has an answer, and it is the same one.** Churn looked random across the S09
+fractions (60 and 50 events in the mixed runs, 9 in the reference, 6 at 100%). In the
+tie-break-fixed runs it hit 89 then 98, and the per-target breakdown named two agents: **22 and
+14** — exactly the two whose inference had degraded to **139-250 s** per bid, and exactly the
+two that won **zero** jobs. Both were declared failed, in both runs.
+
+An agent blocked for minutes inside a bid answers its SWIM probes late, is suspected, and is
+dropped from the live set — LLM-plane latency surfacing as membership churn. That is the
+**S01 hypothesis confirmed, but by an unplanned fault rather than an injected one**: +3 s of
+injected latency produced no membership effect at all, while a spontaneous ~25x slowdown
+produced a complete one. The interesting quantity is therefore the *threshold* between them,
+which S01 can measure directly — rerun it at 30 s and 60 s rather than 3 s.
+
+#### Root cause of the unplanned fault: memory, not the model (2026-08-19)
+
+Diagnosed after the fact, because it changes what the health gate has to check. With the fleet
+idle, **agents 14 and 22 answer a single inference in 0.39 s** — as fast as anyone. They are not
+slow hosts. What they are is *full*:
+
+| host | `llama-server` RSS | available RAM | buff/cache | bid latency under load | jobs won |
+|---|---|---|---|---|---|
+| agent-14 | 7.4 GB | **79 MB** | 192 MB | 77-139 s | **0** |
+| agent-22 | 7.4 GB | **102 MB** | 196 MB | 150-250 s | **0** |
+| agent-24 | — | 136 MB | — | 12.0 s | 1 |
+| agent-8 | 7.0 GB | 504 MB | 493 MB | **6.5 s** (fastest) | 46 |
+| agent-7 | 4.3 GB | 3133 MB | 2660 MB | 6.8 s | 14 |
+
+These hosts have 7.9 GB and **no swap**. A `llama-server` left running for days grows to ~7.4 GB
+— the model itself is only 2.2 GB — leaving under 100 MB for everything else. Start a Python
+agent next to that and the two thrash: page cache collapses to ~190 MB (versus 2.7 GB on a
+healthy host) and a bid takes minutes.
+
+Across the fleet, free memory predicts bid latency well: **spearman(available MB, bid latency)
+= −0.60**. It does *not* predict jobs won (+0.05), because the effect is a **cliff rather than a
+slope** — agent-8 sits at 504 MB and is the fastest bidder in the fleet, while below ~150 MB an
+agent stops winning work entirely. Restarting Ollama restores it completely: agent-14 went from
+**79 MB to 7360 MB available**, llama-server released in full.
+
+Three consequences:
+
+1. **The health gate now checks memory** (`helpers.MIN_AVAILABLE_MB = 300`). Proving a host can
+   infer proves nothing here — a starved host answers an idle probe in 0.4 s and still fails to
+   place a single job for an entire run.
+2. **Restart Ollama across the fleet before a measurement campaign**, not just between runs. The
+   growth is cumulative over days.
+3. **Ollama is not managed the same way on every host.** `systemctl restart ollama` is a silent
+   no-op on agent-4 and agent-8, where `ollama serve` runs outside systemd (PPID 1, started by
+   hand). Those two did not recover from the fleet restart. They are above the cliff, so this
+   did not affect the results — but a restart script that assumes systemd will quietly skip them.
+
+*Still to run in this tier:* `rag_poison` (injects a false-context line mid-payload — it also
+splits the JOB JSON), `inject_distractor` (contradictory instruction appended to the system
+prompt), `context_truncate` (the agent bids on a job it can only half see, and never sees PEERS
+at all). All three are wired and their fault semantics verified; only `entity_swap` has been run.
+
+
+### S09b — fixing the tie-break, and what it proved (2026-08-19)
+
+S09's first explanation was the tie-break, so we fixed it and re-measured. The change
+(`swarm/utils/tiebreak.py`) replaces "lowest agent id wins a tie" with a per-object
+pseudorandom rank, in all four places that ordered agents by id — the selection engine, the
+PBFT engine, the Snow engine's dominance rule, and `ProposalContainer` — and removes the
+`+ self.agent_id` term from the advertised proposal cost.
+
+Deployment and liveness were verified, not assumed: all 30 hosts import the module and return
+an identical rank for the same key, and the agent logs show `Cost=25.00 FinalCost=25.00` where
+the same run previously showed `Cost=25.00 FinalCost=50.00` for agent 25.
+
+| run | code | agents 1-10 | 11-20 | 21-30 | idle agents |
+|---|---|---|---|---|---|
+| `cj-baseline-ref` | id tie-break | 153 | 82 | 65 | none |
+| `cj-baseline-fixedtb` | fixed | 146 | 70 | 84 | 14, 22 |
+| `cj-baseline-fixedtb2` | fixed | 158 | 76 | 66 | 14, 22 |
+
+**The distribution did not move.** Two runs under the fix bracket the pre-fix run. The
+hypothesis that placement was decided by agent id is therefore rejected by its own experiment,
+and §S09's mechanism was rewritten around what the data does support: bid latency.
+
+The fix is kept regardless. A ±30 id term on a 0-100 cost scale is not defensible whatever the
+measured effect, it silently confounds every per-group analysis split by id, and 59% of bids
+really do tie. It is now covered by `tests/test_tiebreak.py`, which pins both properties the
+tie-break has to have at once — every agent computes the same winner (blake2b, since `hash()`
+is salted per process), and no agent wins disproportionately (which is how the first attempt,
+crc32, was caught: it left a 4x spread across 30 agents).
+
+*Cost of the experiment:* three 30-agent runs, ~15 min each, all 300/300 complete, 0 stuck.
+*Value:* a wrong explanation removed from the paper before it was published in it.
 
 ---
 
@@ -421,6 +687,13 @@ term was inert, the fleet differed between runs, or the LLM was never consulted.
 `database` has passwordless root SSH to `agent-1 … agent-30`. Python is `python3.11`.
 
 ### 8.0 Mandatory pre-run health gate — before EVERY run
+
+> **Check memory, not just inference.** A host whose `llama-server` has grown to ~7.4 GB of its
+> 7.9 GB answers a single probe in 0.4 s and passes any "can it infer" test, then places zero
+> jobs for a whole run once an agent is competing with it for RAM (§S09). `helpers.health_gate()`
+> now fails the run below 300 MB available. Release it with `systemctl restart ollama` — and note
+> that on some hosts `ollama serve` runs outside systemd, where that command silently does
+> nothing.
 **Every host must prove it can infer.** A single host whose Ollama has lost the model still runs, and
 its agent silently falls back to analytic cost for the whole run — that contaminated one baseline
 with 130 fallbacks from one host (agent-11) before it was caught. Process count and `/api/tags` do
@@ -550,6 +823,25 @@ Available faults (`cj_proxy.py`, in this repo):
 
 Then run §8.1 → §8.3 into a fault-labelled run dir and compare with §8.4.
 
+**Verifying a `semantic` fault takes a different probe.** Every Tier 1 fault announces itself in
+the HTTP response (503, +3 s, malformed body), so one curl proves it landed. A semantic fault does
+not: HTTP and JSON stay valid and the reply still comes from the real model. Two checks replace
+the curl, and `helpers.start_fault()` runs both:
+
+1. **Which mutation** — read the listener's own command line and require
+   `--fault semantic_corrupt --semantic-mode <mode>`. A leftover proxy from an earlier mode
+   answers on the same port and is otherwise indistinguishable.
+2. **That it reaches the model** — `cj_probe.py` sends one payload straight to Ollama and the same
+   payload through the proxy, and compares `usage.prompt_tokens`. That number is what the model
+   actually received, so a delta proves the rewrite happened, with no dependence on a 3B model
+   choosing to obey a probe instruction. Observed: `entity_swap` **+17**, `rag_poison` **+22**,
+   `inject_distractor` **+10**, `context_truncate` **−11**.
+
+The expansion has to be engineered into the probe payload: a swap can be token-neutral — on the
+real scheduling prompt `entity_swap` changes exactly one word, `higher` → `lower`, for a delta of
+**0**. To see what a mode does to *our* prompt, apply CJ's own mutation functions offline rather
+than inferring it from token counts.
+
 **Tear down before the next scenario** — otherwise the fault leaks into later runs:
 ```bash
 ssh chaos 'sudo bash -c '"'"'
@@ -646,6 +938,14 @@ Each of these cost real debugging time; all are guarded against above.
    dose-response curve) or **L3 `LLMUnavailable`** (sharpest graceful-degradation signal — should
    drive fallback from 0% to 100% and prove the analytic safety net).
 2. **Phase 2 — Tier 2 semantic sweep**, including the poisoned-fraction tolerance curve.
+   `entity_swap` is done at 25/50/100% (§S09) and found **no tolerance threshold to locate** —
+   placement never moved, because it is decided by *when* an agent bids, not by *what* it bids
+   (§S09b). The remaining three modes are wired and verified but unrun, and none of them
+   changes timing either, so expect the same answer from all three.
+   The experiment the evidence actually points to is **S01 at 30 s and 60 s**: latency is the
+   channel that works, and somewhere between the +3 s that was absorbed completely and the
+   ~250 s that cost two agents their entire share of the workload lies the threshold where
+   scheduling — and then membership — gives way. That is the dose-response curve worth having.
 3. **Phase 3 — ablations**, especially fallback-disabled.
 4. **Phase 4 — composite X1** and hierarchical/targeted-coordinator scenarios.
 5. **Report the CJ issues in §6 upstream.**

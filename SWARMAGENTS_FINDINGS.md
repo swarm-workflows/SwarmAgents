@@ -20,6 +20,8 @@ is "quietly invalid experiment", not "crash".
 | 7 | **Open** | Medium (silent) | `llm.timeout_seconds` is parsed but never enforced — dead config |
 | 8 | **Open** | Low | Converter mutates its module-level flavour table through aliased dicts |
 | 9 | **Open** | Low (caveat) | `Job.execute()` ignores `wall_time`, so makespan is not meaningful |
+| 10 | Fixed (uncommitted) | Medium (silent) | Selection and consensus both tie-break on agent id, and the proposal cost carries the id |
+| 11 | **Open** | **High (silent)** | Under Snow, peers vote with the analytic cost — an LLM agent's bid is never consulted |
 
 ---
 
@@ -179,3 +181,101 @@ cost model and the LLM prompt.
 
 Worth either restoring a scaled sleep (`wall_time * scale`) or stating the limitation wherever
 makespan is reported.
+
+### 10. Tie-breaking on agent id, and a proposal cost that carries it (fixed)
+
+Three places composed into one bias toward low agent ids:
+
+```python
+# swarm/selection/engine.py — exact ties went to the lowest agent id
+tied = [i for i in finite_idx if col[i] == best_val]
+best_idx = min(tied, key=lambda i: tie_break_key(assignees[i], float(col[i])))
+
+# swarm/agents/llm/llm_agent.py:325 (and resource_agent.py:2064)
+cost=round((cost + self.agent_id), 2)
+
+# swarm/consensus/engine.py and gossip_engine.py — equal cost, lower id wins
+existing.cost == incoming.cost and (existing.agent_id or "") > (incoming.agent_id or "")
+```
+
+`tie_break_key=agent_id` is documented as a *deterministic tie-break*, which assumes ties are
+rare. They are not: in the fault-free reference run **626 of 1064 bids (59%) are the identical
+value `Score=75.00`**, because a 3B model asked for a 0-100 score answers in round steps. The
+proposal cost is worse than a tie-break — adding the raw agent id is a **±30 swing on a 0-100
+scale** for a 30-agent fleet, larger than most real cost differences, and always in the same
+direction. Observed directly in the logs: agent 25 advertised `Cost=25.00 FinalCost=50.00`
+while agent 7 advertised `Cost=25.00 FinalCost=32.00` for the same bid.
+
+**Fix** — `swarm/utils/tiebreak.py`: `tiebreak_rank(object_id, agent_id)` is a per-object
+pseudorandom permutation of agents (blake2b, not `hash()` which is salted per process, and not
+crc32 whose linearity left a measurable 4x bias — see `tests/test_tiebreak.py`). Selection, the
+PBFT engine, the Snow engine and `ProposalContainer` all now break exact ties on it, so the
+three layers still agree on a winner without any of them favouring low ids. The `+ agent_id`
+term is gone; proposals advertise their real cost (confirmed in a live run: `FinalCost` now
+equals `Cost`).
+
+> **What the fix did *not* do.** It was expected to spread placement, and it did not. Agents
+> 1-10 took 153 of 300 jobs before the fix, and 146 then 158 in two runs after it. The
+> earlier conclusion that "placement is decided by agent id" was wrong: id was standing in for
+> **bid latency**, which is what actually decides placement (see the test plan's S09 section).
+> Low-numbered hosts on this slice happen to infer faster — `corr(agent id, bid latency)` is
+> +0.13 to +0.35 across runs — and it is the speed, not the number, that wins the race to
+> propose. The tie-break is still worth fixing: a ±30 id term on a 0-100 cost cannot be
+> defended, and it silently confounds any per-group analysis split by id. It is simply not the
+> cause of the concentration it appeared to explain.
+
+**Still open, and unaffected by this fix** — a cost that ties 59% of the time is worth
+addressing at the source.
+
+**A bigger model does not fix it — it makes it worse.** Comparing the two arms already run:
+
+| model | bids | distinct score values | modal value | top-2 share |
+|---|---|---|---|---|
+| `qwen2.5:3b` (local Ollama) | 1064 | 46 | 75.00 (58.8%) | 73.2% |
+| `gpt-oss-20b` (FABRIC gateway) | 3062 | **24** | 95.00 (69.6%) | **92.1%** |
+
+The 6x larger model emits *half* as many distinct values and puts 92% of its bids on two of
+them, both at the top of the range (95 and 90) — i.e. it rates nearly every agent an excellent
+fit and discriminates between them barely at all. Degenerate cost signals are a property of
+asking an LLM for a 0-100 rating, not of model size, so scaling the model is not the lever.
+(Caveat: the gateway run used the older random fleet and 6-workflow trace, so the job mix
+differed; the concentration comparison is indicative, not controlled.)
+
+What is likely to work is changing the *elicitation*: ask for a finer scale, ask for a pairwise
+or rank judgement instead of an absolute score, or break score ties with the analytic cost so a
+tie falls back to a signal that is actually continuous. Note the sequencing, though — while
+placement is decided by bid latency rather than bid value (see the test plan's S09/S09b), a
+better cost signal cannot change placement on its own.
+
+### 11. Under Snow, peer votes never see the LLM bid (silent)
+
+`LlmAgent` replaces the cost function *in the selection engine only*:
+
+```python
+# swarm/agents/llm/llm_agent.py — the LLM cost reaches the selector
+self.selector = SelectionEngine(cost=self._llm_or_analytic_cost, ...)
+```
+
+The Snow engine asks its host a different question, through an adapter `LlmAgent` does not
+override:
+
+```python
+# swarm/agents/resource_agent.py — _HostAdapter.my_cost_for_job, used by every SnowQuery
+return float(self.agent._cost_job_on_agent(obj, info))   # the ANALYTIC model
+```
+
+`_cost_job_on_agent` is defined once, in `ResourceAgent`; `LlmAgent` calls it only as its
+fallback. So with `consensus.protocol: snow` — the shipped default — **an agent answering a
+query prices the job analytically**, and the LLM's opinion enters the protocol only through
+whoever initiated the proposal. The reasoning the fleet spends ~10 s per bid producing is
+consulted once and then out-voted by a model it was meant to replace.
+
+There is a second, sharper edge: the two costs are not on the same scale. The analytic cost is
+roughly 0-1 (weighted utilisations plus penalties); the LLM cost is `100 - score`, so 25-75.
+A peer comparing `my_cost` against the initiator's advertised cost is therefore comparing 0.5
+against 45 and concluding it dominates, essentially always — the dominance rule degenerates.
+
+This is not a tie-break problem and finding 10's fix does not touch it. It needs either the
+LLM cost made available to the inbound query path (a cache, not a call — `_answer_query` runs
+on the single inbound consumer thread and must not block), or the two cost models normalised
+onto one scale before they are ever compared.
