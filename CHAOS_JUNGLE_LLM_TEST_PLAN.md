@@ -113,11 +113,17 @@ A shared quota would hand the workload to whichever agents happened to be thrott
 run — reproducing the exact pathology under study as an uncontrolled background fault beneath
 whatever CJ is deliberately injecting.
 
-> *Caveat on the 429s:* this fires 30 requests in the same instant, which is the worst case. A
-> real run makes ~1064 calls over ~11 minutes (~1.6/s average), so sustained rate may sit under
-> the limit — the agents' loops are synchronised enough that bursts are likely, but that has not
-> been measured. The serialization result above needs no such caveat: it reproduces at every
-> concurrency level tested.
+> *Caveat on the 429s — since resolved by measurement, against the prediction.* The sweep above
+> fires 30 requests in the same instant, which is the worst case; a real run makes ~1074 calls
+> over ~11 minutes. A full 30-agent cloud run produced **2 fallbacks in 1076 calls (0.2%)**, so
+> the agents' bidding is spread enough in practice that the rate limit is essentially never hit.
+> The predicted "uncontrolled L4 fault under every run" did not happen. The serialization result
+> stands and needs no caveat — it reproduces at every concurrency level tested, and it shows up
+> in the run as bid-latency p95 (20.75 s cloud vs 12.52 s local) even while the mean improves.
+
+**Measured end to end, the cloud arm is better on every scheduling metric** (§3, `cj-baseline-cloud`).
+The health gate is the one place the concurrency ceiling still bites: probing all 30 hosts at
+once rate-limits the *health check*, so it runs in batches of 4.
 
 **Not every cloud model is usable at all, regardless of the above.** `qwen3.5:397b` is a
 reasoning model: it returns `"content":""` with the budget spent in a hidden `reasoning` field,
@@ -193,6 +199,31 @@ All: 30 agents, mesh topology, Snow consensus, 300 Pegasus jobs.
 | `cj-baseline-frozen2` (pre-SWIM-fix) | `qwen2.5:3b` | same fleet/trace, `suspect_timeout_s: 20` | 1096 | 0 | 0 | 10.13 s (p50 10.09 / p95 13.06) |
 | `cj-baseline-ollama` (superseded) | `qwen2.5:3b` | random fleet, 6-workflow trace, DTN term inert | 3331 | 0 | 0 | 9.61 s |
 | `cj-baseline-gw` (superseded) | `gpt-oss-20b` | random fleet, 6-workflow trace, DTN term inert | 3062 | 0 | 0 | 5.85 s (shared-endpoint contention) |
+
+**`cj-baseline-cloud`** (2026-08-19) is the reference for the **cloud arm** —
+`gpt-oss:120b` over Ollama Cloud with local Ollama stopped fleet-wide, same frozen fleet, trace
+and gate (§2.1b). Deltas only mean anything within one arm, so cloud scenarios compare against
+this and never against `cj-baseline-ref`; point a run at it with
+`CJ_REFERENCE=scenarios/reference_cloud.json`.
+
+| metric | `cj-baseline-ref` (local 3B) | **`cj-baseline-cloud`** (120B) |
+|---|---|---|
+| jobs completed / stuck | 300 / 0 | 300 / 0 |
+| fallback rate | 0.0% | 0.2% (2 of 1076) |
+| bid latency mean / p95 | 9.90 s / 12.52 s | **7.48 s** / 20.75 s |
+| **sched latency mean** | 368.9 s | **235.8 s** (−36%) |
+| **load fairness** | 0.681 | **0.809** |
+| LLM score mean / sd | 70.4 / 14.8 | 89.5 / 10.2 |
+| SWIM false-fails | 9 | **1** |
+| low-id capture ratio | 1.59x | **1.14x** |
+
+Two results worth separating. The queue drains 36% faster and fairness rises to 0.809 — but note
+*why*: the local arm's figures were dragged down by two starved hosts bidding at 139-250 s
+(§S09), and moving inference off the hosts removes that failure mode entirely rather than
+improving scheduling per se. The **capture ratio falling from 1.59x to 1.14x** is the more
+interesting one: it is independent confirmation of the S09b mechanism. Uniform bid latency
+across the fleet flattens the positional skew that no tie-break change could touch, because the
+skew was never about ordering — it was about who bids first.
 
 **`cj-baseline-ref` is the reference** every fault scenario is measured against. `frozen2` is the
 same fleet and trace before the SWIM timeout fix and is retained only to show that fix's effect:
@@ -585,6 +616,58 @@ crc32, was caught: it left a 4x spread across 30 agents).
 
 *Cost of the experiment:* three 30-agent runs, ~15 min each, all 300/300 complete, 0 stuck.
 *Value:* a wrong explanation removed from the paper before it was published in it.
+
+
+### Cloud arm — S01, S05 and S09 once each (2026-08-19)
+
+`gpt-oss:120b` over Ollama Cloud, local Ollama stopped fleet-wide, same frozen fleet and trace.
+Every row compares against `cj-baseline-cloud`, never the local reference.
+
+| | baseline | S01 (+3 s, 100%) | S05 (503, 100%) | S09 (entity_swap, 100%) |
+|---|---|---|---|---|
+| jobs completed / stuck | 300 / 0 | 300 / 0 | 300 / 0 | 300 / 0 |
+| fallback rate | 0.2% | 0.1% | **100%** | 16.8% |
+| bid latency mean | 7.48 s | 7.34 s | — | 7.60 s |
+| LLM score mean | 89.5 | 89.1 | — | **11.6** |
+| sched latency mean | 235.8 s | 223.8 s | **66.7 s** | 202.2 s |
+| load fairness | 0.809 | 0.823 | **0.878** | 0.764 |
+
+**The headline is what did not happen: the low-id skew is gone.** Jobs per agent-id decile are
+112 / 100 / 88 on the cloud baseline and 119 / 89 / 92 under S09, against 153 / 82 / 65 on the
+local arm — and no agent sits idle. Nothing in the scheduler changed between these runs; the
+tie-break fix (§S09b) moved none of it. What changed is that bid latency became uniform across
+the fleet once inference left the hosts. That is the S09b mechanism confirmed from the opposite
+direction: **placement follows bid speed, and the "positional bias" was heterogeneous host
+inference all along.**
+
+**S01 — absorbed, and a lesson about which statistic to read.** The mean bid latency *fell*
+(7.48 → 7.34 s), which looks like the fault never applied. It did: the per-call **minimum rose
+from 1.03 s to 3.94 s**, exactly the injected +3 s, and p10 rose 3.74 → 4.26 s. The mean is
+simply the wrong statistic here — the shared endpoint's queueing tail (baseline p95 20.75 s)
+swamps a 3 s shift, whereas on the local arm the same injection moved the mean by +2.75 s.
+**On a shared endpoint, verify a latency injection with order statistics, not the mean.**
+The finding itself replicates: latency is absorbed, 300/300, 1 fallback, fairness slightly up.
+
+**S05 — replicates the local arm exactly.** 100% fallback, completion untouched, fairness
+*improves* (0.809 → 0.878), and the queue drains 3.5x faster (235.8 → 66.7 s) because a fallback
+bid costs ~0 s. Same shape as the local arm's 0.681 → 0.843.
+
+**S09 — the corruption bites far harder on a capable model.** `qwen2.5:3b` inverted its modal
+bid 75 → 25; `gpt-oss:120b` moves its mean score **89.5 → 11.6**, very nearly the exact
+complement, because it follows the flipped instruction precisely rather than approximately. And
+still: 300/300 jobs, 0 stuck, fairness off by 0.045. A model that reasons better does not make
+the swarm more fragile to having that reasoning corrupted — it makes the corrupted signal
+cleaner, and the schedule absorbs it either way.
+
+> **Caveat — S09's 16.8% fallback rate is not the fault, it is the endpoint.** All 180 fallbacks
+> are `429: too many concurrent requests`, spread across all 30 agents (1-13 each), not the
+> semantic corruption, which produces no exception by construction. The baseline saw 0.2% and
+> S09 16.8%, so the rate limit is an **uncontrolled background fault that varies run to run** —
+> the confound §2.1b predicted, absent from three of the four runs and material in the fourth.
+> Because it is spread evenly rather than concentrated on a subset, it should not have triggered
+> the S05 capture pathology, and completion and score are unaffected. But S09-cloud's *fairness*
+> figure carries this asterisk, and any cloud-arm campaign needs the fallback reason checked, not
+> just the rate.
 
 ---
 

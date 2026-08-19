@@ -213,6 +213,15 @@ def start_fault(faulted: list[str], fault: str, **params) -> None:
     for host in faulted:
         _sh(f"scp -o ConnectTimeout=10 -o StrictHostKeyChecking=no "
             f"{REPO}/cj_proxy.py {REPO}/cj_probe.py {host}:{REPO}/ >/dev/null 2>&1")
+        # The probes run ON the agent host, so the key has to be there too. It was only on the
+        # orchestrator once, and the probe duly sent `Authorization: Bearer ` — an empty token,
+        # a 401, and an S01 abort that read as "the proxy is not forwarding auth". The proxy was
+        # fine. Ship the key with the probe that needs it.
+        if ARM == "cloud":
+            _sh(f"scp -o ConnectTimeout=10 -o StrictHostKeyChecking=no "
+                f"{CLOUD_KEY_FILE} {host}:{CLOUD_KEY_FILE} >/dev/null 2>&1; "
+                f"ssh -n -o StrictHostKeyChecking=no {host} 'chmod 600 {CLOUD_KEY_FILE}' "
+                f">/dev/null 2>&1")
 
     args = " ".join(f"--{k.replace('_', '-')} {v}" for k, v in params.items())
     cmd = (
