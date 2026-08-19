@@ -28,7 +28,23 @@ from typing import Iterable
 
 REPO = "/root/SwarmAgents"
 HOSTS_FILE = f"{REPO}/agent_hosts_cj.txt"
-REFERENCE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reference_baseline.json")
+REFERENCE = os.getenv("CJ_REFERENCE") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "reference_baseline.json")
+
+# Which LLM arm the fleet is running. "local" = per-host Ollama on 11434. "cloud" = Ollama
+# Cloud over IPv6, with local Ollama stopped. Deltas are only meaningful within one arm, so a
+# cloud run must be compared against a cloud baseline — set CJ_REFERENCE to point at it.
+ARM = os.getenv("CJ_ARM", "local").strip().lower()
+CLOUD_ORIGIN = "https://ollama.com"
+CLOUD_KEY_FILE = "/root/.ollama_cloud_key"   # root-only; never in the repo or a config file
+# gpt-oss:120b is the only cloud model measured to both honour json_schema (which LlmBidder
+# requires) and not reason by default — qwen3.5:397b answers in prose and would fall back on
+# every bid. See the test plan, section 2.1b.
+CLOUD_MODEL = os.getenv("CJ_CLOUD_MODEL", "gpt-oss:120b")
+# The cloud endpoint is configured through llm.base_url in the YAML, deliberately NOT through
+# OLLAMA_BASE_URL. That env var is the fault-injection channel: start_fault only sets it when
+# absent, and assert_clean requires it absent, so parking the cloud URL there would make every
+# injection a silent no-op — the exact failure mode this harness exists to prevent.
 # The run the reference metrics came from; kept so a scenario can also compare *shapes*
 # (which agents took the work) and not only fleet-wide totals.
 REFERENCE_RUN = "runs/cj-baseline-ref"
@@ -45,7 +61,8 @@ _PROXY_PAT = "cj_prox[y].py"
 # PROXY_PORT, still serving the PREVIOUS fault. One survived ~12h and silently answered a
 # later latency scenario with the earlier scenario's 503s.
 _CJ_PROXY_PAT = "llm_prox[y].py"
-OLLAMA_UPSTREAM = "http://127.0.0.1:11434"  # origin only: CJ appends the request path, so a /v1 suffix yields /v1/v1/... -> 404
+# Origin only: CJ appends the request path, so a /v1 suffix yields /v1/v1/... -> 404.
+OLLAMA_UPSTREAM = CLOUD_ORIGIN if ARM == "cloud" else "http://127.0.0.1:11434"
 
 
 def hosts() -> list[str]:
@@ -97,6 +114,9 @@ def health_gate(min_available_mb: int = MIN_AVAILABLE_MB) -> None:
     it and both thrash, bids take minutes, the agent wins nothing and SWIM declares it failed.
     Two hosts sat in exactly that state through three runs before anyone measured memory.
     """
+    if ARM == "cloud":
+        return _cloud_health_gate()
+
     out = _fan_out(hosts(), "bash /root/fixmodels.sh")
     ok = out.count(" OK")
     if ok != len(hosts()):
@@ -116,6 +136,57 @@ def health_gate(min_available_mb: int = MIN_AVAILABLE_MB) -> None:
             f"Restart Ollama there to release llama-server ('systemctl restart ollama', or kill "
             f"'ollama serve' and restart it on hosts where it is not a systemd unit).")
     print(f"  health gate:    {ok}/{len(hosts())} hosts inferring, all >= {min_available_mb}MB free")
+
+
+def _cloud_health_gate() -> None:
+    """Cloud arm: every host must reach ollama.com and hold a working key.
+
+    Three ways a host can be silently wrong here, all of which end as
+    `[LLM_COST_FALLBACK]` for the whole run rather than as an error anyone sees: no IPv6 route
+    (the slice has no IPv4 egress), no `OLLAMA_API_KEY` in root's profile, or a key the service
+    rejects. Each is indistinguishable from "the LLM arm is working" unless it is probed.
+
+    Local Ollama must also be *down* — if it is still listening, a stale `OLLAMA_BASE_URL` or a
+    config fallback would quietly route some hosts to the 3B model, and the run would be a
+    mixture of two arms.
+    """
+    body = ('{"model":"' + CLOUD_MODEL + '","messages":[{"role":"user","content":"hi"}],'
+            '"max_tokens":4}')
+    probe = (f". /root/.profile 2>/dev/null; "
+             f"echo $(hostname) "
+             f"$(curl -s -o /dev/null -w %{{http_code}} --max-time 90 "
+             f"{CLOUD_ORIGIN}/v1/chat/completions "
+             f"-H \"Authorization: Bearer $OLLAMA_API_KEY\" "
+             f"-H 'Content-Type: application/json' -d '{body}') "
+             f"$(pgrep -c 'ollama' || true)")
+    # Probed in small batches, not all 30 at once. Firing the whole fleet at the endpoint
+    # rate-limits the *health check itself* — 5 hosts came back 429 on the first attempt — which
+    # would report a reachability failure that is really a concurrency failure. Batching keeps
+    # the gate measuring what it is supposed to measure. It does not fix the run: the agents
+    # will hit the same ceiling, and every 429 there becomes a fallback.
+    all_hosts = hosts()
+    batch = int(os.getenv("CJ_CLOUD_PROBE_BATCH", "4"))
+    bad, serving = [], []
+    for i in range(0, len(all_hosts), batch):
+        for line in _fan_out(all_hosts[i:i + batch], probe, timeout=600).splitlines():
+            parts = line.split()
+            if len(parts) != 3:
+                continue
+            host, code, local = parts
+            if code != "200":
+                bad.append(f"{host}={code}")
+            if local.isdigit() and int(local) > 0:
+                serving.append(host)
+    if bad:
+        raise SystemExit(
+            f"cloud health gate failed on {len(bad)} host(s): {', '.join(bad[:8])}\n"
+            f"Check IPv6 egress and that OLLAMA_API_KEY is exported in /root/.profile.")
+    if serving:
+        raise SystemExit(
+            f"local Ollama still running on {len(serving)} host(s): {', '.join(serving[:8])}\n"
+            f"Stop it, or the run silently mixes the cloud and 3B arms.")
+    print(f"  health gate:    {len(hosts())}/{len(hosts())} hosts reach {CLOUD_ORIGIN} "
+          f"({CLOUD_MODEL}), local Ollama down everywhere")
 
 
 def cleanup() -> None:
@@ -185,9 +256,14 @@ def start_fault(faulted: list[str], fault: str, **params) -> None:
 
 def _probe_fault(host: str) -> dict:
     """Send one real request through a faulted host's proxy and time it."""
-    body = '{"model":"qwen2.5:3b","messages":[{"role":"user","content":"hi"}],"max_tokens":5}'
+    model = CLOUD_MODEL if ARM == "cloud" else "qwen2.5:3b"
+    body = f'{{"model":"{model}","messages":[{{"role":"user","content":"hi"}}],"max_tokens":5}}'
+    # On the cloud arm the agent authenticates, so the probe must too — otherwise the proxy
+    # forwards an unauthenticated request, gets 401, and a latency assertion reads that as the
+    # fault failing to apply.
+    auth = (f"-H \"Authorization: Bearer $(cat {CLOUD_KEY_FILE})\" " if ARM == "cloud" else "")
     cmd = (f"curl -s -o /dev/null -w %{{http_code}} --max-time 120 "
-           f"http://127.0.0.1:{PROXY_PORT}/v1/chat/completions "
+           f"http://127.0.0.1:{PROXY_PORT}/v1/chat/completions {auth}"
            f"-H 'Content-Type: application/json' -d '{body}'")
     t0 = time.time()
     out = _fan_out([host], cmd, timeout=180).strip()
@@ -201,7 +277,11 @@ def _probe_semantic(host: str) -> dict:
     probe cannot see it. cj_probe.py sends the same payload both ways; the delta in
     usage.prompt_tokens is the mutation, measured at the only place it is observable.
     """
-    out = _fan_out([host], f"cd {REPO} && python3.11 cj_probe.py --port {PROXY_PORT}",
+    extra = ""
+    if ARM == "cloud":
+        extra = (f" --upstream-url {CLOUD_ORIGIN}/v1/chat/completions"
+                 f" --api-key-file {CLOUD_KEY_FILE} --model {CLOUD_MODEL}")
+    out = _fan_out([host], f"cd {REPO} && python3.11 cj_probe.py --port {PROXY_PORT}{extra}",
                    timeout=300).strip()
     try:
         return json.loads(out.splitlines()[-1])

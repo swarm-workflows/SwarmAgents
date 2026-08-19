@@ -14,8 +14,10 @@ Why
     graceful-degradation claim, and this is the scenario that proves or breaks it.
 
 How
-    scenarios/api/s05_unavailable.py [fraction]
+    scenarios/api/s05_unavailable.py [fraction] [suffix]
         fraction — share of the 30 hosts to fault (default 1.0 = full outage).
+        suffix   — appended to the run dir, so a repeat under a different LLM arm or code
+                   version lands beside the original instead of overwriting it.
         Run it at 0.25 / 0.5 / 1.0 to get the blast-radius curve.
 
 Results
@@ -35,10 +37,11 @@ TITLE = "LLMUnavailable (503)"
 
 def main() -> int:
     fraction = float(sys.argv[1]) if len(sys.argv) > 1 else 1.0
+    suffix = f"-{sys.argv[2]}" if len(sys.argv) > 2 else ""
     all_hosts = h.hosts()
     n = max(1, math.ceil(len(all_hosts) * fraction))
     faulted = all_hosts[:n]
-    tag = f"cj-s05-{int(fraction * 100)}pct"
+    tag = f"cj-s05-{int(fraction * 100)}pct{suffix}"
 
     print(f"\n{NAME} — {TITLE}  |  faulting {n}/{len(all_hosts)} hosts")
     h.assert_clean()

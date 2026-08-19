@@ -15,9 +15,11 @@ Why
     reference already carries ~9 such events, so compare against that, not against zero.
 
 How
-    scenarios/api/s01_latency.py [delay_s] [fraction]
+    scenarios/api/s01_latency.py [delay_s] [fraction] [suffix]
         delay_s  — seconds added per call (default 3.0)
         fraction — share of the 30 hosts to fault (default 1.0)
+        suffix   — appended to the run dir, so a repeat under a different LLM arm or code
+                   version lands beside the original instead of overwriting it
 
 Results
     Compared against the stored fault-free reference (scenarios/reference_baseline.json).
@@ -37,10 +39,11 @@ TITLE = "LLMLatency"
 def main() -> int:
     delay = float(sys.argv[1]) if len(sys.argv) > 1 else 3.0
     fraction = float(sys.argv[2]) if len(sys.argv) > 2 else 1.0
+    suffix = f"-{sys.argv[3]}" if len(sys.argv) > 3 else ""
     all_hosts = h.hosts()
     n = max(1, math.ceil(len(all_hosts) * fraction))
     faulted = all_hosts[:n]
-    tag = f"cj-s01-d{int(delay)}-{int(fraction * 100)}pct"
+    tag = f"cj-s01-d{int(delay)}-{int(fraction * 100)}pct{suffix}"
 
     print(f"\n{NAME} — {TITLE} +{delay}s  |  faulting {n}/{len(all_hosts)} hosts")
     h.assert_clean()

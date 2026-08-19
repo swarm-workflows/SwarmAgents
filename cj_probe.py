@@ -47,7 +47,7 @@ USER = (
 )
 
 
-def call(url: str, model: str, timeout: float) -> tuple[int, int]:
+def call(url: str, model: str, timeout: float, api_key: str = "") -> tuple[int, int]:
     """POST the probe payload; return (http_code, prompt_tokens)."""
     body = json.dumps({
         "model": model,
@@ -56,7 +56,10 @@ def call(url: str, model: str, timeout: float) -> tuple[int, int]:
         "max_tokens": 1,
         "temperature": 0,
     }).encode()
-    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    req = urllib.request.Request(url, data=body, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             payload = json.load(resp)
@@ -72,14 +75,25 @@ def main() -> int:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--port", type=int, default=18011, help="fault proxy port")
     p.add_argument("--upstream-port", type=int, default=11434, help="unfaulted Ollama port")
+    p.add_argument("--upstream-url", default="",
+                   help="full unfaulted endpoint, e.g. https://ollama.com/v1/chat/completions. "
+                        "Needed on the cloud arm, where local Ollama is stopped and there is no "
+                        "127.0.0.1 endpoint to compare against.")
+    p.add_argument("--api-key-file", default="", help="bearer token file for --upstream-url")
     p.add_argument("--model", default="qwen2.5:3b")
     p.add_argument("--timeout", type=float, default=120.0)
     args = p.parse_args()
 
     path = "/v1/chat/completions"
-    d_code, direct = call(f"http://127.0.0.1:{args.upstream_port}{path}", args.model, args.timeout)
+    key = ""
+    if args.api_key_file:
+        with open(args.api_key_file) as fh:
+            key = fh.read().strip()
+    direct_url = args.upstream_url or f"http://127.0.0.1:{args.upstream_port}{path}"
+    d_code, direct = call(direct_url, args.model, args.timeout, key)
     t0 = time.time()
-    p_code, proxied = call(f"http://127.0.0.1:{args.port}{path}", args.model, args.timeout)
+    # The proxied call carries the key too: the agent sends it, so the proxy must forward it.
+    p_code, proxied = call(f"http://127.0.0.1:{args.port}{path}", args.model, args.timeout, key)
     print(json.dumps({
         "direct_code": d_code,
         "proxied_code": p_code,
