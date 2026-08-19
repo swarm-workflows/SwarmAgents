@@ -15,6 +15,7 @@ Unlike CJ's reference scenarios, the workload here is not a single LLM call but 
 """
 from __future__ import annotations
 
+import csv
 import json
 import os
 import re
@@ -28,6 +29,9 @@ from typing import Iterable
 REPO = "/root/SwarmAgents"
 HOSTS_FILE = f"{REPO}/agent_hosts_cj.txt"
 REFERENCE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reference_baseline.json")
+# The run the reference metrics came from; kept so a scenario can also compare *shapes*
+# (which agents took the work) and not only fleet-wide totals.
+REFERENCE_RUN = "runs/cj-baseline-ref"
 
 # Frozen experiment parameters — every scenario must use these so runs stay comparable.
 AGENTS = 30
@@ -76,14 +80,42 @@ def _fan_out(host_list: Iterable[str], remote_cmd: str, timeout: int = 900,
 # Fleet preparation
 # ---------------------------------------------------------------------------
 
-def health_gate() -> None:
-    """Every host must prove it can infer. A host whose Ollama lost the model keeps
-    running and its agent silently falls back to analytic cost for the whole run."""
+# A host below this has no room to run an agent alongside llama-server, and there is no swap.
+# Measured: at 79 MB and 102 MB two hosts bid at 139 s and 150 s and won zero jobs all run,
+# while a host at 504 MB was the fastest bidder in the fleet — so this is a cliff, not a slope,
+# and the threshold sits well under the healthy fleet's 1-4 GB.
+MIN_AVAILABLE_MB = 300
+
+
+def health_gate(min_available_mb: int = MIN_AVAILABLE_MB) -> None:
+    """Every host must prove it can infer, and that it has room to.
+
+    Inference alone is not enough. A host whose Ollama lost the model keeps running and its
+    agent silently falls back to analytic cost for the whole run — that is what the model probe
+    catches. But a host whose long-lived `llama-server` has grown to ~7 GB of its 7.9 GB still
+    passes that probe: it answers a single idle request in 0.4 s. Put an agent process next to
+    it and both thrash, bids take minutes, the agent wins nothing and SWIM declares it failed.
+    Two hosts sat in exactly that state through three runs before anyone measured memory.
+    """
     out = _fan_out(hosts(), "bash /root/fixmodels.sh")
     ok = out.count(" OK")
     if ok != len(hosts()):
         raise SystemExit(f"health gate failed: only {ok}/{len(hosts())} hosts can infer\n{out}")
-    print(f"  health gate:    {ok}/{len(hosts())} hosts inferring")
+
+    mem = _fan_out(hosts(), "echo $(hostname) $(free -m | awk '/Mem:/{print $7}')")
+    starved = []
+    for line in mem.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1].isdigit() and int(parts[1]) < min_available_mb:
+            starved.append((parts[0], int(parts[1])))
+    if starved:
+        detail = ", ".join(f"{h}={mb}MB" for h, mb in sorted(starved, key=lambda x: x[1]))
+        raise SystemExit(
+            f"health gate failed: {len(starved)} host(s) under {min_available_mb}MB "
+            f"available — {detail}\n"
+            f"Restart Ollama there to release llama-server ('systemctl restart ollama', or kill "
+            f"'ollama serve' and restart it on hosts where it is not a systemd unit).")
+    print(f"  health gate:    {ok}/{len(hosts())} hosts inferring, all >= {min_available_mb}MB free")
 
 
 def cleanup() -> None:
@@ -109,7 +141,7 @@ def start_fault(faulted: list[str], fault: str, **params) -> None:
     # as an injected fault — the failure looks like a successful outage experiment.
     for host in faulted:
         _sh(f"scp -o ConnectTimeout=10 -o StrictHostKeyChecking=no "
-            f"{REPO}/cj_proxy.py {host}:{REPO}/cj_proxy.py >/dev/null 2>&1")
+            f"{REPO}/cj_proxy.py {REPO}/cj_probe.py {host}:{REPO}/ >/dev/null 2>&1")
 
     args = " ".join(f"--{k.replace('_', '-')} {v}" for k, v in params.items())
     cmd = (
@@ -135,10 +167,20 @@ def start_fault(faulted: list[str], fault: str, **params) -> None:
     # Assert the fault actually behaves as named. A live process proves nothing: a stale
     # proxy from an earlier scenario answers on the same port, so a latency run once
     # measured the previous run's 503s.
-    observed = _probe_fault(faulted[0])
+    if fault == "semantic":
+        # Two independent checks, because a semantic fault is invisible at the HTTP layer:
+        # the listener must be the mode we asked for, and the mutation must actually reach
+        # the model. Either alone would pass with a stale proxy of a different mode.
+        _assert_proxy_mode(faulted[0], params.get("mode", "entity_swap"))
+        observed = _probe_semantic(faulted[0])
+        detail = f"prompt tokens {observed['direct']}->{observed['proxied']} " \
+                 f"({observed['delta']:+d})"
+    else:
+        observed = _probe_fault(faulted[0])
+        detail = f"{observed['code']} in {observed['ms']}ms"
     _assert_semantics(fault, observed, params)
     print(f"  fault injected: {fault} on {len(faulted)}/{len(hosts())} hosts "
-          f"({started} proxies up, probe: {observed['code']} in {observed['ms']}ms)")
+          f"({started} proxies up, probe: {detail})")
 
 
 def _probe_fault(host: str) -> dict:
@@ -152,7 +194,55 @@ def _probe_fault(host: str) -> dict:
     return {"code": out or "none", "ms": int((time.time() - t0) * 1000)}
 
 
+def _probe_semantic(host: str) -> dict:
+    """Measure how many prompt tokens the model receives with and without the proxy.
+
+    A semantic fault leaves HTTP and JSON intact, so the usual "did it return an error"
+    probe cannot see it. cj_probe.py sends the same payload both ways; the delta in
+    usage.prompt_tokens is the mutation, measured at the only place it is observable.
+    """
+    out = _fan_out([host], f"cd {REPO} && python3.11 cj_probe.py --port {PROXY_PORT}",
+                   timeout=300).strip()
+    try:
+        return json.loads(out.splitlines()[-1])
+    except (ValueError, IndexError):
+        raise SystemExit(f"semantic probe returned no JSON from {host}: {out!r}")
+
+
+def _assert_proxy_mode(host: str, mode: str) -> None:
+    """The listener on PROXY_PORT must be a semantic_corrupt proxy in the mode we asked for.
+
+    CJ spawns its own long-lived llm_proxy.py; a leftover one from an earlier mode answers
+    on the same port and would otherwise be measured as this scenario.
+    """
+    out = _fan_out([host], "ps -eo args= | grep llm_prox[y].py || true", timeout=120)
+    line = next((ln for ln in out.splitlines() if "llm_proxy.py" in ln), "")
+    if "--fault semantic_corrupt" not in line:
+        raise SystemExit(f"no semantic_corrupt proxy on {host}; found: {line.strip()[:200]!r}")
+    if f"--semantic-mode {mode}" not in line:
+        raise SystemExit(f"proxy on {host} is not in mode {mode!r}: {line.strip()[:200]!r}")
+
+
 def _assert_semantics(fault: str, obs: dict, params: dict) -> None:
+    if fault == "semantic":
+        mode = params.get("mode", "entity_swap")
+        if obs["proxied_code"] != 200 or obs["direct_code"] != 200:
+            raise SystemExit(
+                f"semantic corruption must stay silent — got HTTP {obs['proxied_code']} "
+                f"through the proxy, {obs['direct_code']} direct. A visible error means the "
+                f"agent would fall back, which is a different experiment.")
+        delta = obs["delta"]
+        if delta is None:
+            raise SystemExit(f"probe could not read prompt_tokens: {obs}")
+        # context_truncate drops half the user turn; every other mode adds text. A delta of
+        # 0 means the request reached the model unmutated — the proxy is a pass-through.
+        want_negative = mode == "context_truncate"
+        if want_negative and delta > -3:
+            raise SystemExit(f"context_truncate did not shorten the prompt: {delta:+d} tokens")
+        if not want_negative and delta < 3:
+            raise SystemExit(f"{mode} did not alter the prompt: {delta:+d} tokens")
+        return
+
     code, ms = obs["code"], obs["ms"]
     if fault == "unavailable":
         if code != "503":
@@ -236,19 +326,22 @@ def run_swarm(run_dir: str, runtime: int = 3000) -> None:
 def collect(run_dir: str) -> dict:
     """Parse per-host agent logs and the orchestrator log into scenario metrics."""
     m = {"llm_complete": 0, "llm_fallback": 0, "swim_failed": 0}
-    lat, per_agent = [], []
+    lat, scores = [], []
     for path in sorted(glob(f"{REPO}/{run_dir}/**/agent-*.log", recursive=True)):
         text = open(path, errors="ignore").read()
         c = text.count("LLM_COST_COMPLETE")
         m["llm_complete"] += c
         m["llm_fallback"] += text.count("LLM_COST_FALLBACK")
         m["swim_failed"] += text.count("FAILED (suspect-timeout)")
-        per_agent.append(c)
         # Only LLM_COST_COMPLETE marks a real call. LLM_BID_WON also carries a
         # ReasoningTime, but logs 0.000s when the bid came from the analytic fallback,
         # which would otherwise read as "instant LLM" instead of "no LLM".
         lat += [float(x) for x in
                 re.findall(r"LLM_COST_COMPLETE.*?ReasoningTime=([0-9.]+)s", text)]
+        # The bid itself. Under a semantic fault the call succeeds and nothing falls back,
+        # so the score is the only place the corruption is visible before it reaches
+        # consensus — it is to Tier 2 what fallback_rate is to Tier 1.
+        scores += [float(x) for x in re.findall(r"LLM_COST_COMPLETE.*?Score=([0-9.]+)", text)]
 
     calls = m["llm_complete"] + m["llm_fallback"]
     m["fallback_rate"] = round(m["llm_fallback"] / calls, 4) if calls else 0.0
@@ -259,6 +352,24 @@ def collect(run_dir: str) -> dict:
         lat.sort()
         m["latency_mean_s"] = round(sum(lat) / len(lat), 2)
         m["latency_p95_s"] = round(lat[int(len(lat) * 0.95)], 2)
+    if scores:
+        mean = sum(scores) / len(scores)
+        m["score_mean"] = round(mean, 1)
+        m["score_sd"] = round((sum((s - mean) ** 2 for s in scores) / len(scores)) ** 0.5, 1)
+
+    # Queue-drain quality. A fault that leaves every count intact can still schedule badly,
+    # and under a semantic fault this is the only place the damage can land: the bids are
+    # wrong but nothing errors, so completion and fallback_rate both stay clean. Read from
+    # all_jobs.csv rather than the plotting step's stdout, which not every run has.
+    jobs_csv = f"{REPO}/{run_dir}/all_jobs.csv"
+    if os.path.isfile(jobs_csv):
+        with open(jobs_csv, newline="") as fh:
+            sl = [float(r["scheduling_latency"]) for r in csv.DictReader(fh)
+                  if r.get("scheduling_latency")]
+        if sl:
+            sl.sort()
+            m["sched_latency_mean_s"] = round(sum(sl) / len(sl), 1)
+            m["sched_latency_p95_s"] = round(sl[int(len(sl) * 0.95)], 1)
 
     # Orchestrator logs written by hand use underscores where run dirs use hyphens.
     base = os.path.basename(run_dir)
@@ -279,6 +390,79 @@ def collect(run_dir: str) -> dict:
         inf = re.search(r"Infeasible/Failed jobs: (\d+) retired, (\d+) still", text)
         m["jobs_stuck"] = int(inf.group(2)) if inf else None
     return m
+
+
+def load_split(run_dir: str, n_faulted: int, reference: bool = False) -> dict:
+    """Split placement and bidding between the faulted hosts and the healthy ones.
+
+    Agent i runs on hosts()[i-1] (--agents-per-host 1, hosts consumed in file order), so
+    the faulted hosts are agent ids 1..n_faulted. Verified against the S05 runs, where
+    every fallback landed on exactly those ids and none outside them.
+
+    This is the measurement that carried the S05 story: the fleet-wide totals held steady
+    while one group quietly took the other group's work.
+
+    A raw capture ratio is not usable on its own. SwarmAgents already favours low agent
+    ids — `tie_break_key=agent_id` in the selection, plus `cost + self.agent_id` on the
+    proposal — so *any* split at id n shows the low group ahead even with no fault at all
+    (1.86x at n=8, 1.59x at n=15 in the fault-free reference). The faulted hosts are always
+    the low ids, so the confound points the same way as the effect. Every split therefore
+    carries the reference run's ratio at the same split point: only the gap between them is
+    the fault.
+    """
+    base = os.path.basename(run_dir)
+    run_log = next((p for p in (f"{REPO}/runs_{base}.log",
+                                f"{REPO}/runs_{base.replace('-', '_')}.log")
+                    if os.path.isfile(p)), "")
+    if not run_log:
+        return {}
+    text = open(run_log, errors="ignore").read()
+    placed = {int(a): int(j) for a, j in re.findall(r"Agent (\d+): (\d+) jobs", text)}
+    if not placed:
+        return {}
+
+    scores: dict[int, list[float]] = {}
+    for path in sorted(glob(f"{REPO}/{run_dir}/**/agent-*.log", recursive=True)):
+        aid = int(re.search(r"agent-(\d+)\.log$", path).group(1))
+        body = open(path, errors="ignore").read()
+        scores[aid] = [float(x) for x in re.findall(r"LLM_COST_COMPLETE.*?Score=([0-9.]+)", body)]
+
+    def group(ids: list[int]) -> dict:
+        jobs = [placed.get(i, 0) for i in ids]
+        sc = [s for i in ids for s in scores.get(i, [])]
+        return {"agents": len(ids), "jobs": sum(jobs),
+                "jobs_per_agent": round(sum(jobs) / len(ids), 2) if ids else 0.0,
+                "score_mean": round(sum(sc) / len(sc), 1) if sc else None}
+
+    ids = sorted(placed)
+    out = {"faulted": group([i for i in ids if i <= n_faulted]),
+           "healthy": group([i for i in ids if i > n_faulted])}
+    fpa, hpa = out["faulted"]["jobs_per_agent"], out["healthy"]["jobs_per_agent"]
+    out["capture_ratio"] = round(fpa / hpa, 2) if hpa else None
+    if not reference:
+        ref = load_split(REFERENCE_RUN, n_faulted, reference=True)
+        out["reference_ratio"] = ref.get("capture_ratio")
+    return out
+
+
+def print_split(split: dict) -> None:
+    if not split or not split.get("healthy", {}).get("agents"):
+        return
+    print(f"\n  {'group':<12}{'agents':>8}{'jobs':>8}{'jobs/agent':>13}{'LLM score':>12}")
+    for name in ("faulted", "healthy"):
+        g = split[name]
+        sc = "-" if g["score_mean"] is None else g["score_mean"]
+        print(f"  {name:<12}{g['agents']:>8}{g['jobs']:>8}{g['jobs_per_agent']:>13}{sc:>12}")
+    ratio, ref = split.get("capture_ratio"), split.get("reference_ratio")
+    if ratio is None:
+        return
+    if ref:
+        verdict = "no capture beyond the id bias" if ratio <= ref * 1.15 else \
+                  f"{round(ratio / ref, 2)}x beyond the id bias"
+        print(f"  capture ratio {ratio}x vs {ref}x for the same split with no fault "
+              f"-> {verdict}")
+    else:
+        print(f"  capture ratio {ratio}x (no reference split available)")
 
 
 def load_reference() -> dict:
@@ -302,6 +486,10 @@ _KEYS = [
     ("fallback_rate", "fallback rate", "{:.1%}"),
     ("latency_mean_s", "bid latency mean", "{}s"),
     ("latency_p95_s", "bid latency p95", "{}s"),
+    ("score_mean", "LLM score mean", "{}"),
+    ("score_sd", "LLM score sd", "{}"),
+    ("sched_latency_mean_s", "sched latency mean", "{}s"),
+    ("sched_latency_p95_s", "sched latency p95", "{}s"),
     ("jains_fairness", "load fairness", "{}"),
     ("swim_failed", "SWIM false-fails", "{}"),
     ("failed_agents", "failed agents", "{}"),
