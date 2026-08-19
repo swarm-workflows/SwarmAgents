@@ -29,6 +29,7 @@ from swarm.consensus.messages.commit import Commit
 from .interfaces import ConsensusHost, ConsensusTransport, TopologyRouter
 from ..models.agent_info import AgentInfo
 from ..models.object import ObjectState
+from ..utils.tiebreak import dominates
 
 
 class ConsensusEngine:
@@ -80,9 +81,13 @@ class ConsensusEngine:
 
         A proposal is "worse" if:
         - It has higher cost, OR
-        - It has equal cost but lexicographically larger agent_id
+        - It has equal cost but a higher tiebreak_rank for this object
 
         This prevents accumulation of inferior proposals when messages arrive out of order.
+
+        The equal-cost arm used to compare agent ids lexicographically, which hands every tie
+        to the lowest id. That is only harmless if ties are rare; they are not (finding 10),
+        so it is now a per-object rank that no agent wins systematically.
         """
         all_proposals = container.get_proposals_by_object_id(incoming_proposal.object_id)
 
@@ -91,9 +96,9 @@ class ConsensusEngine:
                 continue  # Don't compare proposal to itself
 
             # Determine if existing proposal is worse
-            is_worse = (existing.cost > incoming_proposal.cost) or \
-                       (existing.cost == incoming_proposal.cost and
-                        (existing.agent_id or "") > (incoming_proposal.agent_id or ""))
+            is_worse = dominates(incoming_proposal.object_id,
+                                 incoming_proposal.cost, incoming_proposal.agent_id,
+                                 existing.cost, existing.agent_id)
 
             if is_worse:
                 self.host.log_debug(

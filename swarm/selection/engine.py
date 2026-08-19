@@ -221,7 +221,7 @@ class SelectionEngine:
             objective: Objective = "min",
             threshold_pct: float | None = None,
             accept_if: Callable[[float], bool] | None = None,
-            tie_break_key: Callable[[Assignee, float], Any] | None = None,
+            tie_break_key: Callable[[Assignee, float, Candidate], Any] | None = None,
     ) -> list[tuple[Assignee | None, float]]:
         """
         Select the best assignee for each candidate (column) given a cost/score matrix.
@@ -239,9 +239,12 @@ class SelectionEngine:
             - For ``"max"``: keep only if selected >= best * (1 - pct/100).
             Note: if the selected index is the true best, this threshold never rejects it.
         :param accept_if: Optional final predicate on the selected score (e.g., ``lambda s: s < 1e9``).
-        :param tie_break_key: Optional deterministic key for breaking exact-score ties.
-            To match your old (cost, agent_id) behavior, pass:
-            ``tie_break_key=lambda ag, s: getattr(ag, "agent_id", "")``.
+        :param tie_break_key: Optional deterministic key for breaking exact-score ties,
+            called as ``tie_break_key(assignee, score, candidate)``. It takes the candidate
+            because a key over the assignee alone is a *ranking of assignees*: whichever one
+            sorts first wins every tie, everywhere. With coarse costs that is most of the
+            workload, so pass a key that varies with the candidate — see
+            ``swarm.utils.tiebreak.tiebreak_rank``.
         :returns: List of (assignee-or-None, score) with length == number of candidates.
         """
         A, C = cost_matrix.shape
@@ -268,12 +271,16 @@ class SelectionEngine:
             else:
                 best_idx = int(finite_idx[np.argmax(col[finite_idx])])  # avoid +inf
 
-            # Optional tie-break when multiple indices have exactly the same best value
+            # Optional tie-break when multiple indices have exactly the same best value.
+            # Without it np.argmin/argmax silently returns the FIRST such row, which is the
+            # same positional bias by another name.
             if tie_break_key is not None:
                 best_val = col[best_idx]
                 tied = [i for i in finite_idx if col[i] == best_val]
                 if len(tied) > 1:
-                    best_idx = min(tied, key=lambda i: tie_break_key(assignees[i], float(col[i])))
+                    cand = candidates[ci] if ci < len(candidates) else None
+                    best_idx = min(tied,
+                                   key=lambda i: tie_break_key(assignees[i], float(col[i]), cand))
 
             sel_cost = float(col[best_idx])
             sel_agent = assignees[best_idx]

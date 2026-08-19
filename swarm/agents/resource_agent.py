@@ -64,6 +64,7 @@ from swarm.quantum.split import build_post_process_job, experiment_id_for, split
 from swarm.rl.context import snapshots_from_children
 from swarm.rl.mab_manager import MABManager
 
+from swarm.utils.tiebreak import tiebreak_rank
 from swarm.utils.utils import generate_id, job_capacities
 
 
@@ -2018,7 +2019,8 @@ class ResourceAgent(Agent):
                     cost_matrix=cost_matrix_with_penalities,
                     objective="min",
                     threshold_pct=self.selection_threshold_pct,  # e.g., 10 means within +10% of best
-                    tie_break_key=lambda ag, s: getattr(ag, "agent_id", "")
+                    tie_break_key=lambda ag, s, cand: tiebreak_rank(
+                        getattr(cand, "job_id", ""), getattr(ag, "agent_id", ""))
                 )
 
                 # Step 3: If this agent is assigned, start proposal
@@ -2061,7 +2063,12 @@ class ResourceAgent(Agent):
                             p_id=generate_id(),
                             object_id=job.job_id,
                             agent_id=self.agent_id,
-                            cost=round((cost + self.agent_id), 2)
+                            # Advertise the real cost. This used to be `cost + self.agent_id`,
+                            # which made every proposal cost unique and so served as a tie-break
+                            # — but a raw id is a ±N swing on a 0-100 scale for an N-agent fleet,
+                            # larger than most genuine cost differences and always favouring low
+                            # ids. Peers now break exact ties on tiebreak_rank instead.
+                            cost=round(cost, 2)
                         )
                         proposals.append(proposal)
                         job.state = ObjectState.PRE_PREPARE
