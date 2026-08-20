@@ -35,8 +35,13 @@ REFERENCE = os.getenv("CJ_REFERENCE") or os.path.join(
 # Cloud over IPv6, with local Ollama stopped. Deltas are only meaningful within one arm, so a
 # cloud run must be compared against a cloud baseline — set CJ_REFERENCE to point at it.
 ARM = os.getenv("CJ_ARM", "local").strip().lower()
-CLOUD_ORIGIN = "https://ollama.com"
-CLOUD_KEY_FILE = "/root/.ollama_cloud_key"   # root-only; never in the repo or a config file
+# "cloud" means any remote OpenAI-compatible endpoint, not Ollama Cloud specifically. Two are in
+# use: Ollama Cloud, and the FABRIC LiteLLM gateway (reachable only over the FABNet dataplane at
+# 10.141.1.2, mapped in /etc/hosts so TLS/SNI stays valid). Both are driven through the `ollama`
+# provider, because LlmBidder only honours llm.base_url on that path — the `openai` path takes
+# its endpoint from OPENAI_BASE_URL, which would collide with fault injection.
+CLOUD_ORIGIN = os.getenv("CJ_CLOUD_ORIGIN", "https://ollama.com").rstrip("/")
+CLOUD_KEY_FILE = os.getenv("CJ_CLOUD_KEY_FILE", "/root/.ollama_cloud_key")  # root-only, never in the repo
 # gpt-oss:120b is the only cloud model measured to both honour json_schema (which LlmBidder
 # requires) and not reason by default — qwen3.5:397b answers in prose and would fall back on
 # every bid. See the test plan, section 2.1b.
@@ -184,8 +189,8 @@ def _cloud_health_gate() -> None:
     if serving:
         raise SystemExit(
             f"local Ollama still running on {len(serving)} host(s): {', '.join(serving[:8])}\n"
-            f"Stop it, or the run silently mixes the cloud and 3B arms.")
-    print(f"  health gate:    {len(hosts())}/{len(hosts())} hosts reach {CLOUD_ORIGIN} "
+            f"Stop it, or the run silently mixes the remote and 3B arms.")
+    print(f"  health gate:    {len(all_hosts)}/{len(all_hosts)} hosts reach {CLOUD_ORIGIN} "
           f"({CLOUD_MODEL}), local Ollama down everywhere")
 
 

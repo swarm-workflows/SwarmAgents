@@ -140,17 +140,21 @@ the schema makes every bid fall back and the LLM arm silently ceases to exist. A
 is also far too slow for a per-job scoring loop — the same reason §2.1 ruled out three of the
 gateway's four models at 37-43 s.
 
-**Verdict:** keep local per-host Ollama as the primary arm — its independence is the property the
-whole design rests on. Ollama Cloud is worth keeping for two bounded uses where concurrency stays
-under the limit:
+**Verdict (revised 2026-08-20 — the FABRIC gateway is the better remote arm).** Ollama Cloud's
+signal quality is the best of any endpoint, but its rate limit makes it unfit as a campaign's
+primary: 13 of 30 concurrent requests 429, and a 429 becomes a fallback, which wins the race to
+propose. The **FABRIC LiteLLM gateway takes all 30 concurrent with no 429s at all** and has a far
+tighter latency tail (p95 7.47 s vs 20.75 s), at the cost of a coarser cost signal — see the
+gateway-arm section for the full three-arm comparison.
 
-1. **Sequential ablations** like the granularity table above — cheap, no 429s, and it answers
-   "is this an artifact of a 3B model?" without a single 30-agent run.
-2. **A small-fleet realism check** (well under 30 agents) for the paper, if a reviewer asks
-   whether the findings survive a frontier model.
+| use | arm |
+|---|---|
+| fault campaigns at 30 agents | **FABRIC gateway** (no rate limit, tight tail) — or local Ollama, whose per-host independence is still the cleanest |
+| sequential ablations (e.g. score granularity) | Ollama Cloud — cheap, no concurrency, best models |
+| "does this survive a frontier model?" | Ollama Cloud `gpt-oss:120b`, small fleet |
 
-Before either is scaled up, check the account's actual rate limit — the ceiling here was measured,
-not looked up, and a paid tier may move it.
+Before scaling any cloud usage up, check the account's actual rate limit — the ceiling here was
+measured, not looked up, and a paid tier may move it.
 
 ### 2.2 Workload — a frozen, reproducible mixed Pegasus trace
 
@@ -364,7 +368,14 @@ Same fleet and trace throughout; only the share of hosts whose LLM returns 503 c
 
 **Headline: a partial LLM outage is far more damaging than a total one.** Load fairness
 collapses to **0.331** at 25% — less than half the healthy baseline — then recovers
-monotonically as the outage spreads, ending *best* under total failure. Completion never
+monotonically as the outage spreads, ending *best* under total failure.
+
+> **Later correction to the "ending best" half of that.** The recovery to 0.843 at 100% is
+> relative to a baseline (0.681) that was itself depressed by heterogeneous host inference. On
+> the FABRIC gateway arm, where the fault-free baseline is already 0.849, the same total outage
+> takes fairness *down* to 0.795. The U-shape across the blast radius is real; the claim that a
+> total outage *improves* fairness is an artefact of a poor baseline. See the gateway-arm
+> section. Completion never
 moves: 300/300 jobs, 0 stuck, 0 agents lost at every point.
 
 **Mechanism** — the LLM-blind agents capture the work:
@@ -739,6 +750,95 @@ reasons better does not make the swarm more fragile to that reasoning being corr
 > spread evenly rather than concentrated, so it should not have triggered the S05 capture
 > pathology, and completion and score are unaffected; S09-cloud's *fairness* figure carries the
 > asterisk. **Check the fallback reason on a cloud campaign, not just the rate.**
+
+
+### FABRIC gateway arm — S01, S05 and S09 once each (2026-08-20)
+
+Run to answer one question: does the FABRIC LiteLLM gateway avoid the rate limiting that
+contaminated the Ollama Cloud arm? It does — **0 fallbacks in all three fault-free-path runs**,
+where the cloud arm saw 0.2% to 16.8%.
+
+Driven through `provider: ollama` pointing at the gateway, not `provider: openai`: `LlmBidder`
+only honours `llm.base_url` on the ollama path, while the openai path reads `OPENAI_BASE_URL` —
+the same env channel CJ injects through, so the two would collide and faults would silently
+no-op. Model `gpt-oss-20b`, local Ollama stopped fleet-wide, same frozen fleet and trace.
+
+**Concurrency — the reason to prefer this endpoint:**
+
+| simultaneous requests | FABRIC gateway (`gpt-oss-20b`) | Ollama Cloud (`gpt-oss:120b`) |
+|---|---|---|
+| 1 (sequential) | 2.02 s | 1.63 s |
+| 8 | 4.47 s · all 200 | 4.03 s · all 200 |
+| 16 | 4.62 s · all 200 | 6.24 s · all 200 |
+| **30** (fleet size) | **6.11 s · all 200** | 4.10 s · **13x 429** |
+
+> *Measurement trap:* the first sweep reported 0.05 s sequential and 0.27 s at 30-way, which is
+> impossible for a 20B model. The probe sent an identical payload each time and the gateway
+> **caches responses**. Vary the payload per request *and* per run — repeating ids across runs
+> hits the previous run's cache, which is what produced a 0.06 s "sequential" baseline mid-sweep.
+
+**Results** — every column against `cj-baseline-gw2`:
+
+| | baseline | S01 (+3 s, 100%) | S05 (503, 100%) | S09 (entity_swap, 100%) |
+|---|---|---|---|---|
+| jobs completed / stuck | 300 / 0 | 300 / 0 | 300 / 0 | 300 / 0 |
+| **fallback rate** | **0.0%** | **0.0%** | 100% | **0.0%** |
+| bid latency mean / p95 | 4.95 s / 7.47 s | 7.09 s / 8.78 s | — | 5.22 s / 7.81 s |
+| LLM score mean / sd | 91.0 / 10.7 | 91.5 / 10.4 | — | **13.6** / 17.9 |
+| sched latency mean | 191.1 s | 261.6 s | **63.1 s** | 190.8 s |
+| load fairness | 0.849 | 0.842 | **0.795** | 0.809 |
+| SWIM false-fails | 7 | 0 | 2 | 1 |
+| placement deciles | 125/88/87 | 133/81/86 | 123/98/79 | 121/78/101 |
+| idle agents | none | none | none | none |
+
+**Three-arm comparison, fault-free:**
+
+| metric | local 3B | Ollama Cloud 120B | **FABRIC gw 20B** |
+|---|---|---|---|
+| fallback rate | 0.0% | 0.2% | **0.0%** |
+| bid latency mean / **p95** | 9.90 / 12.52 s | 7.48 / **20.75 s** | **4.95 / 7.47 s** |
+| sched latency mean | 368.9 s | 235.8 s | **191.1 s** |
+| load fairness | 0.681 | 0.809 | **0.849** |
+| placement deciles | 153/82/65 | 112/100/88 | 125/88/87 |
+
+**S01 — the mean moves here.** +2.14 s against an injected +3.0 s, visible without order
+statistics, because the gateway's tail is tight (p95 7.47 s versus the cloud arm's 20.75 s). That
+confirms the cloud-arm reading was a measurement artefact and not a difference in the system:
+same fault, same absorption, and the statistic that failed there works here.
+
+**S09 — the cleanest silent-wrong measurement of the three arms.** No 429s means no confound:
+the score mean inverts **91.0 → 13.6** while the queue drain is unchanged to within 0.3 s
+(191.1 → 190.8 s) and fairness moves 0.04. Corrupted bids, unmoved schedule, nothing else
+touched.
+
+> **S05's fairness improvement does *not* replicate — and that is a correction to the S05 story.**
+>
+> | arm | fault-free fairness | under 100% outage | change |
+> |---|---|---|---|
+> | local 3B | 0.681 | **0.843** | **+0.162** |
+> | Ollama Cloud 120B | 0.809 | **0.878** | +0.069 |
+> | **FABRIC gw 20B** | **0.849** | **0.795** | **−0.054** |
+>
+> Losing the LLM entirely looked like it *improved* load balance. It does not: the improvement
+> tracks how bad the baseline was. The local arm's 0.681 was depressed by heterogeneous host
+> inference (§S09 root cause), so replacing every bid with an instant analytic one evened things
+> out. Start from a baseline that is already fair — the gateway's 0.849 — and the same total
+> outage makes fairness slightly *worse*. **The correct statement is that a total outage costs
+> little, not that it helps.** Completion, stuck jobs and agent losses are untouched on all
+> three arms, which is the claim that does replicate.
+
+**Gateway model screening** (40 identical pairs, production prompt, json_schema):
+
+| model | latency mean | distinct scores /40 | top-2 share | usable |
+|---|---|---|---|---|
+| **`gpt-oss-20b`** | **1.77 s** | 14 | 48% | **yes — used here** |
+| `nemotron-nano-30b` | 15.70 s | **18** | **25%** | best signal, 9x too slow |
+| `minimax-m2.7` | >22 s/call | — | — | no (900 s screen timeout) |
+| `qwen3.5-122b` | >180 s | — | — | no (request times out) |
+
+`nemotron-nano-30b` has the best cost signal measured on any endpoint — better than
+`gpt-oss:120b` — but 15.7 s per bid puts it in the same range as the starved hosts that lost
+their entire share of the workload, and bid latency decides placement. Speed wins.
 
 ---
 
