@@ -840,6 +840,41 @@ touched.
 `gpt-oss:120b` — but 15.7 s per bid puts it in the same range as the starved hosts that lost
 their entire share of the workload, and bid latency decides placement. Speed wins.
 
+
+### S01 complete — the L1 dose-response curve (FABRIC gateway, 2026-08-20)
+
+The matrix's L1 row, swept on the arm that does not rate-limit, 100% of hosts faulted at every
+point, each against `cj-baseline-gw2`.
+
+| injected delay | bid latency mean | measured Δ | Δ / injected | sched latency mean | load fairness | SWIM false-fails | **jobs completed** | **fallbacks** |
+|---|---|---|---|---|---|---|---|---|
+| 0 (baseline) | 4.95 s | — | — | 191.1 s | 0.849 | 7 | **300** | **0** |
+| **+1 s** | 5.73 s | +0.78 | 78% | 219.7 s | 0.804 | 0 | **300** | **0** |
+| **+3 s** | 7.09 s | +2.14 | 71% | 261.6 s | 0.842 | 0 | **300** | **0** |
+| **+6 s** | 9.50 s | +4.55 | 76% | 364.1 s | 0.813 | 7 | **300** | **0** |
+| **+10 s** | 13.05 s | +8.10 | 81% | 497.0 s | 0.859 | 2 | **300** | **0** |
+
+**Throughput degrades linearly; correctness does not degrade at all.** Across a 10x sweep:
+300/300 jobs at every point, zero fallbacks, zero stuck jobs, zero agents lost. Fairness has no
+trend (0.804-0.859, straddling the baseline's 0.849). The only thing that moves is speed.
+
+**Each second of LLM delay costs ~31 s of scheduling latency.** Mean scheduling latency runs
+191 → 497 s across the sweep, a slope of ~30.6 s per injected second — a **~31x amplification**,
+because a job's placement waits on several sequential bid rounds rather than one. That is the
+number to quote for "what does a slow LLM cost the scheduler": not the per-call delay, but ~31x
+it in queue time.
+
+**The injected delay partially pays for itself.** The measured rise is consistently 71-81% of
+what was injected, at every point. Slowing every agent reduces concurrent pressure on the shared
+endpoint, so part of the injected delay is returned as queueing relief. The effect is a property
+of the *endpoint*, not the scheduler — worth remembering before reading a sub-unit delta as the
+fault under-applying.
+
+**No membership leak up to +10 s.** SWIM false-fails are 0, 0, 7 and 2 against a baseline of 7 —
+no trend, no agents declared failed anywhere in the sweep. This bounds the S01 hypothesis from
+below: the membership collapse observed on the local arm needed hosts bidding at **77-250 s**
+(§S09 root cause), and +10 s does not approach it. The threshold lies somewhere above 10 s.
+
 ---
 
 ## 5. Experiment matrix
@@ -851,7 +886,7 @@ enabling the *targeted-fault-on-coordinators* story).
 ### Tier 1 — LLM API faults (CJ Layer 1) — core of the paper
 | # | Fault | Sweep | Hypothesis |
 |---|-------|-------|------------|
-| L1 | `LLMLatency` | 1/3/6/10 s | Latency degrades throughput; fallback absorbs the worst case |
+| L1 | `LLMLatency` | 1/3/6/10 s | **DONE** (gateway arm) — throughput degrades linearly at ~31x the injected delay; completion, fallbacks and membership untouched across the whole sweep |
 | L2 | `LLMTimeout` | hang 8/15 s | Cancellation + fallback keeps scheduling live |
 | L3 | `LLMUnavailable` (503) | 25/50/100% of agents | Full outage ⇒ degrades to pure analytic scheduler, no correctness loss |
 | L4 | `LLMRateLimit` (429 after n) | n = 5/20 | Back-off vs fallback; graceful or collapse? |

@@ -405,7 +405,16 @@ def stop_fault() -> None:
 # Run + measure
 # ---------------------------------------------------------------------------
 
-def run_swarm(run_dir: str, runtime: int = 3000) -> None:
+def run_swarm(run_dir: str, runtime: int | None = None) -> None:
+    """Launch the fleet. `CJ_RUNTIME` raises the cap for scenarios that are meant to be slow.
+
+    The default 3000 s comfortably fits a fault-free run (~11 min). A large injected delay does
+    not fit: at +30 s on a ~5 s bid the fleet is 7x slower, and a run that hits the cap reports
+    fewer than 300 jobs completed — which reads as "the fault broke scheduling" when it actually
+    means "the harness stopped watching". Raise the cap for the slow points of a sweep so the
+    completion figure keeps meaning what it means everywhere else.
+    """
+    runtime = runtime if runtime is not None else int(os.getenv("CJ_RUNTIME", "3000"))
     log = f"{REPO}/runs_{os.path.basename(run_dir)}.log"
     cmd = (
         f"cd {REPO} && nohup python3.11 run_test.py --mode remote --agent-type llm "
