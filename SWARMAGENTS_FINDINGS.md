@@ -214,8 +214,17 @@ three layers still agree on a winner without any of them favouring low ids. The 
 term is gone; proposals advertise their real cost (confirmed in a live run: `FinalCost` now
 equals `Cost`).
 
-> **What the fix did *not* do.** It was expected to spread placement, and it did not. Agents
-> 1-10 took 153 of 300 jobs before the fix, and 146 then 158 in two runs after it. The
+> **What the fix did *not* do.** It was expected to spread placement, and it did not:
+>
+> | run | code | agents 1-10 take |
+> |---|---|---|
+> | `cj-baseline-ref` | id tie-break | 153 of 300 |
+> | `cj-baseline-fixedtb` | fixed | 146 of 300 |
+> | `cj-baseline-fixedtb2` | fixed | 158 of 300 |
+> | `cj-baseline-cloud` | fixed, uniform bid latency | **112 of 300** |
+>
+> Two runs under the fix bracket the pre-fix run; only removing the *latency* heterogeneity
+> (moving inference off-host) moved the distribution. The
 > earlier conclusion that "placement is decided by agent id" was wrong: id was standing in for
 > **bid latency**, which is what actually decides placement (see the test plan's S09 section).
 > Low-numbered hosts on this slice happen to infer faster — `corr(agent id, bid latency)` is

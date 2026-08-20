@@ -125,15 +125,20 @@ whatever CJ is deliberately injecting.
 The health gate is the one place the concurrency ceiling still bites: probing all 30 hosts at
 once rate-limits the *health check*, so it runs in batches of 4.
 
-**Not every cloud model is usable at all, regardless of the above.** `qwen3.5:397b` is a
-reasoning model: it returns `"content":""` with the budget spent in a hidden `reasoning` field,
-and — the disqualifier — it **ignores `response_format: json_schema` and answers in prose**.
-SwarmAgents requires structured output (`NativeOutput(Bid)`, finding 2), so every bid would fail
-to parse, fall back to analytic cost, and the LLM arm would silently cease to exist. It is also
-far too slow for a per-job scoring loop once it starts reasoning — the same reason §2.1 ruled out
-three of the gateway's four models at 37-43 s. **Verify two things before adopting any cloud
-model: that it honours json_schema, and that it does not reason by default.** `gpt-oss:120b`
-passes both (40/40 parsed).
+**Not every cloud model is usable at all, regardless of the above.** Two properties have to be
+checked before adopting one, because failing either shows up in a run as `[LLM_COST_FALLBACK]`
+rather than as an error:
+
+| model | honours `json_schema` | reasons by default | usable |
+|---|---|---|---|
+| **`gpt-oss:120b`** | **yes** (40/40 parsed) | no | **yes** |
+| `gpt-oss:20b` | yes (40/40 parsed) | no | yes, but coarser than the 3B |
+| `qwen3.5:397b` | **no** — answers in prose | **yes** — `"content":""`, budget spent in `reasoning` | **no** |
+
+SwarmAgents requires structured output (`NativeOutput(Bid)`, finding 2), so a model that ignores
+the schema makes every bid fall back and the LLM arm silently ceases to exist. A reasoning model
+is also far too slow for a per-job scoring loop — the same reason §2.1 ruled out three of the
+gateway's four models at 37-43 s.
 
 **Verdict:** keep local per-host Ollama as the primary arm — its independence is the property the
 whole design rests on. Ollama Cloud is worth keeping for two bounded uses where concurrency stays
@@ -500,11 +505,17 @@ fault present:
 | S09 100% poisoned | −0.42 | 13.0 s / 7.2 s |
 | S09 50% poisoned | −0.64 | 20.0 s / 6.8 s |
 
-The extremes make it plain. In the tie-break-fixed run the two agents whose inference had
-degraded — 76.7 s and 249.6 s per bid — won **zero** jobs between them, while the fastest agent
-at 6.5 s took **43 of 300**, four times the fleet mean. Agent id looked like the cause because
-on this slice low-numbered hosts happen to infer faster: `corr(agent id, bid latency)` runs
-+0.13 to +0.35.
+The extremes make it plain (`cj-baseline-fixedtb`, 30 agents, 300 jobs, fleet mean 10 jobs):
+
+| agent | mean bid latency | jobs won |
+|---|---|---|
+| 22 | 249.6 s | **0** |
+| 14 | 76.7 s | **0** |
+| 8 | **6.5 s** (fastest) | **43** |
+| 7 | 6.8 s | 14 |
+
+Agent id looked like the cause only because low-numbered hosts on this slice happen to infer
+faster: `corr(agent id, bid latency)` runs +0.13 to +0.35 across runs.
 
 This is **S05's race-to-propose mechanism, present with no fault at all**. There it took a 503
 to make an agent bid in ~0 s instead of ~10 s; here ordinary variation in inference speed does a
@@ -515,13 +526,18 @@ LLM's output has little influence on the scheduler's decision.** That is the fin
 reporting, and only a semantic fault could produce it — every Tier 1 fault perturbs timing,
 which is precisely the channel that works.
 
-> **Method note — a capture ratio is meaningless without its no-fault control.** The poisoned
-> group appears to take 1.48-1.56x the work per agent of the healthy group. It does not: the
-> same split of the *fault-free* run gives 1.86x (at id 8) and 1.59x (at id 15). Both S09
-> fractions are at or below their own control, i.e. **no capture at all**.
-> `helpers.load_split()` now computes the reference run's ratio at the same split point and
-> prints both, so the confound cannot recur. S05's 19.25x stands — it clears its 1.86x control
-> by an order of magnitude — but it should be quoted against that control, not against 1.0.
+> **Method note — a capture ratio is meaningless without its no-fault control.**
+>
+> | scenario | split at id | measured ratio | fault-free control | verdict |
+> |---|---|---|---|---|
+> | S09 25% | 8 | 1.56x | 1.86x | **no capture** |
+> | S09 50% | 15 | 1.48x | 1.59x | **no capture** |
+> | S05 25% | 8 | **19.25x** | 1.86x | real, 10x its control |
+>
+> The faulted hosts are always the low agent ids, so the positional bias points the same way as
+> the effect being measured. `helpers.load_split()` now computes the reference run's ratio at the
+> same split point and prints both, so the confound cannot recur. S05's finding stands — but it
+> should be quoted against its 1.86x control, not against 1.0.
 
 > **Correction.** An earlier version of this section stated that placement "is dominated by
 > agent id". That was inference from code reading, not measurement: the id tie-break and the
@@ -529,11 +545,17 @@ which is precisely the channel that works.
 > where it was. Agent id was a proxy for host inference speed. The observation — corrupted
 > bids, unchanged schedule — held; the explanation did not.
 
-**The SWIM churn has an answer, and it is the same one.** Churn looked random across the S09
-fractions (60 and 50 events in the mixed runs, 9 in the reference, 6 at 100%). In the
-tie-break-fixed runs it hit 89 then 98, and the per-target breakdown named two agents: **22 and
-14** — exactly the two whose inference had degraded to **139-250 s** per bid, and exactly the
-two that won **zero** jobs. Both were declared failed, in both runs.
+**The SWIM churn has an answer, and it is the same one.**
+
+| run | SWIM false-fails | agents declared failed | most-suspected targets |
+|---|---|---|---|
+| fault-free reference | 9 | 0 | spread |
+| S09 25% / 50% / 100% | 60 / 50 / 6 | 1 / 2 / 0 | spread |
+| tie-break fixed, run 1 | 89 | 2 | **22** (13), **14** (11) |
+| tie-break fixed, run 2 | 98 | 3 | **22** (7), 24 (7) |
+
+The named targets are exactly the agents bidding at 139-250 s, and exactly the ones that won
+**zero** jobs.
 
 An agent blocked for minutes inside a bid answers its SWIM probes late, is suspected, and is
 dropped from the live set — LLM-plane latency surfacing as membership churn. That is the
@@ -561,11 +583,21 @@ These hosts have 7.9 GB and **no swap**. A `llama-server` left running for days 
 agent next to that and the two thrash: page cache collapses to ~190 MB (versus 2.7 GB on a
 healthy host) and a bid takes minutes.
 
-Across the fleet, free memory predicts bid latency well: **spearman(available MB, bid latency)
-= −0.60**. It does *not* predict jobs won (+0.05), because the effect is a **cliff rather than a
-slope** — agent-8 sits at 504 MB and is the fastest bidder in the fleet, while below ~150 MB an
-agent stops winning work entirely. Restarting Ollama restores it completely: agent-14 went from
-**79 MB to 7360 MB available**, llama-server released in full.
+Rank correlations across the fleet, and what restarting Ollama recovers:
+
+| relationship | spearman | reading |
+|---|---|---|
+| available MB → bid latency | **−0.60** | memory pressure predicts slowness |
+| bid latency → jobs won | −0.49 | slow bidders lose work |
+| available MB → jobs won | **+0.05** | **a cliff, not a slope** |
+
+| agent-14 | before restart | after `systemctl restart ollama` |
+|---|---|---|
+| available RAM | 79 MB | **7360 MB** |
+| `llama-server` RSS | 7.4 GB | released in full |
+
+Memory does not predict *jobs won* because the effect is a cliff: agent-8 sits at 504 MB and is
+the fastest bidder in the fleet, while below ~150 MB an agent stops winning work entirely.
 
 Three consequences:
 
@@ -593,9 +625,15 @@ pseudorandom rank, in all four places that ordered agents by id — the selectio
 PBFT engine, the Snow engine's dominance rule, and `ProposalContainer` — and removes the
 `+ self.agent_id` term from the advertised proposal cost.
 
-Deployment and liveness were verified, not assumed: all 30 hosts import the module and return
-an identical rank for the same key, and the agent logs show `Cost=25.00 FinalCost=25.00` where
-the same run previously showed `Cost=25.00 FinalCost=50.00` for agent 25.
+Deployment and liveness were verified, not assumed:
+
+| check | result |
+|---|---|
+| module imports on every host | 30/30 |
+| identical rank for the same key across hosts | 30/30 (`14912286594027844952`) |
+| advertised proposal cost, agent 7 | `Cost=25.00 FinalCost=32.00` → **`25.00`** |
+| advertised proposal cost, agent 25 | `Cost=25.00 FinalCost=50.00` → **`25.00`** |
+| unit tests | 163 pass (6 new) |
 
 | run | code | agents 1-10 | 11-20 | 21-30 | idle agents |
 |---|---|---|---|---|---|
@@ -607,12 +645,16 @@ the same run previously showed `Cost=25.00 FinalCost=50.00` for agent 25.
 hypothesis that placement was decided by agent id is therefore rejected by its own experiment,
 and §S09's mechanism was rewritten around what the data does support: bid latency.
 
-The fix is kept regardless. A ±30 id term on a 0-100 cost scale is not defensible whatever the
+The fix is kept regardless: a ±30 id term on a 0-100 cost scale is not defensible whatever the
 measured effect, it silently confounds every per-group analysis split by id, and 59% of bids
-really do tie. It is now covered by `tests/test_tiebreak.py`, which pins both properties the
-tie-break has to have at once — every agent computes the same winner (blake2b, since `hash()`
-is salted per process), and no agent wins disproportionately (which is how the first attempt,
-crc32, was caught: it left a 4x spread across 30 agents).
+really do tie. `tests/test_tiebreak.py` pins both properties the tie-break must have at once —
+which is how the first hash choice was caught:
+
+| hash | deterministic across agents | win spread over 30 agents (3000 ties) | verdict |
+|---|---|---|---|
+| `hash()` | **no** — salted per process | — | unusable |
+| `crc32` | yes | 166 max / 42 min (**4x**) | biased |
+| **`blake2b`** | yes | **125 max / 68 min** (fair = 100) | adopted |
 
 *Cost of the experiment:* three 30-agent runs, ~15 min each, all 300/300 complete, 0 stuck.
 *Value:* a wrong explanation removed from the paper before it was published in it.
@@ -632,42 +674,71 @@ Every row compares against `cj-baseline-cloud`, never the local reference.
 | sched latency mean | 235.8 s | 223.8 s | **66.7 s** | 202.2 s |
 | load fairness | 0.809 | 0.823 | **0.878** | 0.764 |
 
-**The headline is what did not happen: the low-id skew is gone.** Jobs per agent-id decile are
-112 / 100 / 88 on the cloud baseline and 119 / 89 / 92 under S09, against 153 / 82 / 65 on the
-local arm — and no agent sits idle. Nothing in the scheduler changed between these runs; the
-tie-break fix (§S09b) moved none of it. What changed is that bid latency became uniform across
-the fleet once inference left the hosts. That is the S09b mechanism confirmed from the opposite
-direction: **placement follows bid speed, and the "positional bias" was heterogeneous host
-inference all along.**
+**Placement by agent-id decile** — the headline is what did not happen:
 
-**S01 — absorbed, and a lesson about which statistic to read.** The mean bid latency *fell*
-(7.48 → 7.34 s), which looks like the fault never applied. It did: the per-call **minimum rose
-from 1.03 s to 3.94 s**, exactly the injected +3 s, and p10 rose 3.74 → 4.26 s. The mean is
-simply the wrong statistic here — the shared endpoint's queueing tail (baseline p95 20.75 s)
-swamps a 3 s shift, whereas on the local arm the same injection moved the mean by +2.75 s.
-**On a shared endpoint, verify a latency injection with order statistics, not the mean.**
-The finding itself replicates: latency is absorbed, 300/300, 1 fallback, fairness slightly up.
+| run | arm | 1-10 | 11-20 | 21-30 | idle agents |
+|---|---|---|---|---|---|
+| `cj-baseline-ref` | local 3B | 153 | 82 | 65 | none |
+| `cj-baseline-fixedtb` | local, tie-break fixed | 146 | 70 | 84 | 14, 22 |
+| `cj-baseline-fixedtb2` | local, tie-break fixed | 158 | 76 | 66 | 14, 22 |
+| **`cj-baseline-cloud`** | **cloud 120B** | **112** | **100** | **88** | **none** |
+| **`cj-s09-…-cloud`** | **cloud 120B** | **119** | **89** | **92** | **none** |
 
-**S05 — replicates the local arm exactly.** 100% fallback, completion untouched, fairness
-*improves* (0.809 → 0.878), and the queue drains 3.5x faster (235.8 → 66.7 s) because a fallback
-bid costs ~0 s. Same shape as the local arm's 0.681 → 0.843.
+The skew disappears with no scheduler change — the tie-break fix (§S09b) moved none of it. Bid
+latency became uniform once inference left the hosts, which confirms the S09b mechanism from the
+opposite direction: **placement follows bid speed, not agent id.**
 
-**S09 — the corruption bites far harder on a capable model.** `qwen2.5:3b` inverted its modal
-bid 75 → 25; `gpt-oss:120b` moves its mean score **89.5 → 11.6**, very nearly the exact
-complement, because it follows the flipped instruction precisely rather than approximately. And
-still: 300/300 jobs, 0 stuck, fairness off by 0.045. A model that reasons better does not make
-the swarm more fragile to having that reasoning corrupted — it makes the corrupted signal
-cleaner, and the schedule absorbs it either way.
+**S01 — which statistic to read.** Per-call `ReasoningTime`, cloud arm:
 
-> **Caveat — S09's 16.8% fallback rate is not the fault, it is the endpoint.** All 180 fallbacks
-> are `429: too many concurrent requests`, spread across all 30 agents (1-13 each), not the
-> semantic corruption, which produces no exception by construction. The baseline saw 0.2% and
-> S09 16.8%, so the rate limit is an **uncontrolled background fault that varies run to run** —
-> the confound §2.1b predicted, absent from three of the four runs and material in the fourth.
-> Because it is spread evenly rather than concentrated on a subset, it should not have triggered
-> the S05 capture pathology, and completion and score are unaffected. But S09-cloud's *fairness*
-> figure carries this asterisk, and any cloud-arm campaign needs the fallback reason checked, not
-> just the rate.
+| statistic | baseline (n=1074) | S01 +3 s (n=1138) | delta |
+|---|---|---|---|
+| **min** | **1.03 s** | **3.94 s** | **+2.91** |
+| p10 | 3.74 s | 4.26 s | +0.52 |
+| p50 | 6.45 s | 7.12 s | +0.67 |
+| mean | 7.48 s | 7.34 s | **−0.14** |
+| p90 | 9.32 s | 11.42 s | +2.10 |
+
+The mean *falls*, which reads as "the fault never applied". The minimum shows it applied to every
+call. The endpoint's queueing tail (baseline p95 20.75 s) swamps a 3 s shift, whereas the same
+injection moved the local arm's mean by +2.75 s. **On a shared endpoint, verify a latency
+injection with order statistics, not the mean.**
+
+**Does each finding replicate across arms?**
+
+| scenario | metric | local 3B | cloud 120B | replicates? |
+|---|---|---|---|---|
+| S01 +3 s | completion | 300/300 | 300/300 | yes |
+| | fallback rate | 0.0% | 0.1% | yes |
+| | latency shift | mean +2.75 s | min +2.91 s | yes (different statistic) |
+| | fairness | 0.681 → 0.738 | 0.809 → 0.823 | yes |
+| S05 503 | fallback rate | 100% | 100% | yes |
+| | completion | 300/300 | 300/300 | yes |
+| | fairness | 0.681 → **0.843** | 0.809 → **0.878** | yes |
+| | sched latency | 368.9 → 61.3 s | 235.8 → 66.7 s | yes |
+| S09 swap | score signal | modal 75 → **25** | mean 89.5 → **11.6** | yes, sharper |
+| | completion | 300/300 | 300/300 | yes |
+| | fairness | −0.041 | −0.045 | yes |
+
+Every finding survives the arm switch. S09 is *sharper* on the capable model: `gpt-oss:120b`
+follows the flipped instruction precisely rather than approximately, landing on very nearly the
+exact complement of its baseline score — and the schedule absorbs it either way. **A model that
+reasons better does not make the swarm more fragile to that reasoning being corrupted.**
+
+> **Caveat — S09's 16.8% fallback rate is the endpoint, not the fault.**
+>
+> | | value |
+> |---|---|
+> | fallbacks | 180 of 1072 calls (16.8%) |
+> | cause | `429: too many concurrent requests` — **all 180** |
+> | distribution | all 30 agents, 1-13 each (not a subset) |
+> | range across the 4 cloud runs | 0.2% (baseline) … 16.8% (S09) |
+>
+> Semantic corruption produces no exception by construction, so none of these come from the
+> fault. The rate limit is an **uncontrolled background fault that varies run to run** — the
+> confound §2.1b predicted, absent from three of four runs and material in the fourth. It is
+> spread evenly rather than concentrated, so it should not have triggered the S05 capture
+> pathology, and completion and score are unaffected; S09-cloud's *fairness* figure carries the
+> asterisk. **Check the fallback reason on a cloud campaign, not just the rate.**
 
 ---
 
