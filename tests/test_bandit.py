@@ -57,6 +57,41 @@ class TestEpsilonGreedyPolicy:
             normal.update(1, 1.0)
         assert normal.epsilon == pytest.approx(0.01), "decay must still bottom out at the floor"
 
+    def test_restored_epsilon_respects_the_current_config(self):
+        """Persisted state picks a position inside the config's bounds; it cannot escape them.
+
+        MABManager persists policy state to Redis, so a restart resumes from it. Assigning the
+        stored epsilon directly let it override the config it resumed under: lowering
+        mab.epsilon and restarting silently kept the old, higher rate.
+        """
+        decayed = EpsilonGreedyPolicy(epsilon=0.5, epsilon_min=0.01)
+        for _ in range(20):
+            decayed.update(1, 1.0)
+        saved = decayed.get_state()
+        assert 0.01 < saved["epsilon"] < 0.5, "precondition: mid-decay state to restore"
+
+        # Operator drops exploration to zero in config, then restarts onto the old state.
+        pure = EpsilonGreedyPolicy(epsilon=0.0)
+        pure.load_state(saved)
+        assert pure.epsilon == 0.0, "a pure-greedy config must not inherit a stored rate"
+        assert all(pure.select_arm([1, 2]) in (1, 2) for _ in range(10))
+
+        # Operator lowers it to a smaller non-zero rate: clamp to the new ceiling.
+        lowered = EpsilonGreedyPolicy(epsilon=0.05, epsilon_min=0.01)
+        lowered.load_state(saved)
+        assert lowered.epsilon == 0.05
+
+        # A value inside the bounds is preserved exactly — normal resume.
+        same = EpsilonGreedyPolicy(epsilon=0.5, epsilon_min=0.01)
+        same.load_state(saved)
+        assert same.epsilon == pytest.approx(saved["epsilon"])
+
+        # A stored value below a raised floor comes back up to it. saved["epsilon"] is ~0.452
+        # (0.5 decayed 20x), so the floor has to sit above that to exercise this branch.
+        stale = EpsilonGreedyPolicy(epsilon=0.5, epsilon_min=0.48)
+        stale.load_state(saved)
+        assert stale.epsilon == 0.48
+
     def test_pure_greedy_never_explores(self):
         """With epsilon=0.0 the arm choice is decided by Q alone, whatever the RNG does."""
         policy = EpsilonGreedyPolicy(epsilon=0.0, step_size=0.9)
