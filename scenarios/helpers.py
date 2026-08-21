@@ -52,7 +52,14 @@ CLOUD_MODEL = os.getenv("CJ_CLOUD_MODEL", "gpt-oss:120b")
 # injection a silent no-op — the exact failure mode this harness exists to prevent.
 # The run the reference metrics came from; kept so a scenario can also compare *shapes*
 # (which agents took the work) and not only fleet-wide totals.
-REFERENCE_RUN = "runs/cj-baseline-ref"
+#
+# This MUST be switched alongside CJ_REFERENCE when changing arms. The id-bias control it
+# supplies is arm-specific and not a small difference: at n=8 the local arm's fault-free split
+# is 1.86x but the gateway arm's is 1.27x, because the bias comes from low-numbered hosts
+# inferring faster (see the test plan, 4f.2) and that disappears once inference leaves the
+# hosts. Comparing a gateway capture ratio against the local control silently reintroduces the
+# exact confound load_split() exists to remove.
+REFERENCE_RUN = os.getenv("CJ_REFERENCE_RUN") or "runs/cj-baseline-ref"
 
 # Frozen experiment parameters — every scenario must use these so runs stay comparable.
 AGENTS = 30
@@ -426,6 +433,46 @@ def run_swarm(run_dir: str, runtime: int | None = None) -> None:
     _sh(cmd, timeout=runtime + 900)
 
 
+def _orchestrator_log(run_dir: str) -> str:
+    """Orchestrator logs written by hand use underscores where run dirs use hyphens."""
+    base = os.path.basename(run_dir)
+    return next((p for p in (f"{REPO}/runs_{base}.log",
+                             f"{REPO}/runs_{base.replace('-', '_')}.log")
+                 if os.path.isfile(p)), "")
+
+
+def placement(run_dir: str) -> tuple[dict, int]:
+    """Jobs placed per agent id, and the fleet size every per-agent metric must divide by.
+
+    THE single parser for "Agent N: M jobs". collect() and load_split() both go through it so
+    they cannot drift apart, which they had: collect() summed a *list* of matches while
+    load_split() built a *dict*. On a log carrying the summary twice those two disagree — the
+    list double-counts placements and inflates both jobs_completed and fairness, while the dict
+    silently keeps the last value and leaves the capture ratio right. Two metrics, one log, two
+    answers, no error.
+
+    Keyed by id with the last occurrence winning, because the summary can legitimately appear
+    more than once: a job restart or a reassignment (`reselection_timeout_s`, `RESTART: Job`)
+    makes the orchestrator re-emit it, and the final block is the authoritative one. A genuine
+    restart that moves a job between agents needs no special handling — each agent still gets
+    its own line, and no id repeats.
+
+    The fleet size is the CONFIGURED count, never the number of ids the log happens to mention:
+    an agent that wins no jobs emits no line at all, and dropping it from a denominator inflates
+    fairness and deflates capture (see collect() and load_split()). It only exceeds AGENTS if the
+    log actually names a higher id, as a dynamic-agent run would.
+    """
+    log = _orchestrator_log(run_dir)
+    if not log:
+        return {}, AGENTS
+    text = open(log, errors="ignore").read()
+    placed: dict[int, int] = {}
+    for aid, jobs in re.findall(r"Agent (\d+): (\d+) jobs", text):
+        placed[int(aid)] = int(jobs)          # last occurrence wins
+    fleet = max(AGENTS, max(placed, default=0))
+    return placed, fleet
+
+
 def collect(run_dir: str) -> dict:
     """Parse per-host agent logs and the orchestrator log into scenario metrics."""
     m = {"llm_complete": 0, "llm_fallback": 0, "swim_failed": 0}
@@ -474,20 +521,26 @@ def collect(run_dir: str) -> dict:
             m["sched_latency_mean_s"] = round(sum(sl) / len(sl), 1)
             m["sched_latency_p95_s"] = round(sl[int(len(sl) * 0.95)], 1)
 
-    # Orchestrator logs written by hand use underscores where run dirs use hyphens.
-    base = os.path.basename(run_dir)
-    run_log = next((p for p in (f"{REPO}/runs_{base}.log",
-                                f"{REPO}/runs_{base.replace('-', '_')}.log")
-                    if os.path.isfile(p)), "")
+    run_log = _orchestrator_log(run_dir)
     if run_log:
         text = open(run_log, errors="ignore").read()
-        placed = [int(x) for x in re.findall(r"Agent \d+: (\d+) jobs", text)]
+        placed_by_id, fleet = placement(run_dir)
+        placed = list(placed_by_id.values())
         m["jobs_completed"] = sum(placed)
+        m["agents_placing"] = len(placed)
+        m["fleet_size"] = fleet
         # Fairness over jobs actually placed, not scoring effort: placement is what a fault
         # can degrade, and it stays measurable when every LLM call fails.
+        #
+        # n is the fleet size from placement(), NOT len(placed). An agent that wins no jobs never
+        # appears in an "Agent N: M jobs" line, and Jain's index is (sum x)^2 / (n * sum x^2):
+        # dropping a zero-load agent leaves both sums untouched while shrinking n, so it
+        # *inflates* fairness by exactly n_logged/fleet. The inflation is largest in the runs
+        # where agents are starved of work — the partial-outage runs whose whole finding is that
+        # work is unevenly captured. Using len(placed) understated every collapse it measured.
         if placed and sum(placed):
             total = sum(placed)
-            m["jains_fairness"] = round(total * total / (len(placed) * sum(x * x for x in placed)), 3)
+            m["jains_fairness"] = round(total * total / (fleet * sum(x * x for x in placed)), 3)
         fa = re.search(r"Total failed agents: (\d+)", text)
         m["failed_agents"] = int(fa.group(1)) if fa else None
         inf = re.search(r"Infeasible/Failed jobs: (\d+) retired, (\d+) still", text)
@@ -513,14 +566,7 @@ def load_split(run_dir: str, n_faulted: int, reference: bool = False) -> dict:
     carries the reference run's ratio at the same split point: only the gap between them is
     the fault.
     """
-    base = os.path.basename(run_dir)
-    run_log = next((p for p in (f"{REPO}/runs_{base}.log",
-                                f"{REPO}/runs_{base.replace('-', '_')}.log")
-                    if os.path.isfile(p)), "")
-    if not run_log:
-        return {}
-    text = open(run_log, errors="ignore").read()
-    placed = {int(a): int(j) for a, j in re.findall(r"Agent (\d+): (\d+) jobs", text)}
+    placed, fleet = placement(run_dir)
     if not placed:
         return {}
 
@@ -537,14 +583,33 @@ def load_split(run_dir: str, n_faulted: int, reference: bool = False) -> dict:
                 "jobs_per_agent": round(sum(jobs) / len(ids), 2) if ids else 0.0,
                 "score_mean": round(sum(sc) / len(sc), 1) if sc else None}
 
-    ids = sorted(placed)
+    # Every agent in the fleet, not just those the orchestrator log mentions. An agent that won no
+    # jobs never appears in a "Agent N: M jobs" line, so keying off the log drops it from its
+    # group's denominator and *understates* capture — precisely backwards, since losing every job
+    # is the strongest evidence of being out-raced. The S05 25% gateway run lists 25 of 30 agents
+    # while its jobs still sum to 300: the 5 absent ones won zero, and excluding them reported
+    # that run's capture as 13.1x when it is really 16.9x.
+    ids = list(range(1, fleet + 1))
     out = {"faulted": group([i for i in ids if i <= n_faulted]),
            "healthy": group([i for i in ids if i > n_faulted])}
     fpa, hpa = out["faulted"]["jobs_per_agent"], out["healthy"]["jobs_per_agent"]
     out["capture_ratio"] = round(fpa / hpa, 2) if hpa else None
     if not reference:
+        # Never quote another arm's control: a wrong control does not look wrong, it just moves
+        # the verdict, which is worse than having no control at all. Warn and omit rather than
+        # raise — this runs after a ~15 min run has already succeeded, and a metadata problem
+        # should not discard the measurement.
+        if os.getenv("CJ_REFERENCE") and not os.getenv("CJ_REFERENCE_RUN"):
+            print(f"  !! CJ_REFERENCE is set but CJ_REFERENCE_RUN is not — the id-bias control "
+                  f"would come from {REFERENCE_RUN}, a different arm than the metrics baseline. "
+                  f"Reporting the raw ratio with no control; set CJ_REFERENCE_RUN to this arm's "
+                  f"fault-free run dir and re-read with load_split().")
+            out["reference_ratio"] = None
+            out["reference_run"] = None
+            return out
         ref = load_split(REFERENCE_RUN, n_faulted, reference=True)
         out["reference_ratio"] = ref.get("capture_ratio")
+        out["reference_run"] = REFERENCE_RUN
     return out
 
 

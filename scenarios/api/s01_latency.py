@@ -62,7 +62,12 @@ def main() -> int:
         "jobs completed stays at 300 — latency slows scheduling, it does not break it",
         "SWIM false-fails may rise above the ~9 baseline: latency leaking into membership",
         "a delta near 0 would mean the proxy is not intercepting",
+        "the per-agent split should stay FLAT — a same-order slowdown costs an agent no work, "
+        "which is what separates S01 from S05",
     ])
+    # Printed for the same reason as in S05, but to show the opposite: slowed agents keep their
+    # share (1.00x at 50%), and that contrast is the whole argument of the cross-scenario section.
+    h.print_split(h.load_split(f"runs/{tag}", n))
     return 0
 
 

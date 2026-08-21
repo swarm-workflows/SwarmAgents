@@ -60,7 +60,13 @@ def main() -> int:
         "jobs completed stays at 300 — the analytic cost model absorbs the outage",
         "jobs stuck stays 0; no job is left unschedulable",
         "fallback rate near 0 would mean the proxy is not intercepting",
+        "the per-agent split below is the actual finding — fleet-wide totals hold steady while "
+        "the faulted group takes the healthy group's work",
     ])
+    # The split IS S05's result. Fleet totals barely move (300/300 either way); what the fault
+    # does is redistribute, and that is only visible per agent. This was computed by hand for
+    # three runs before it was wired in, which is how the two denominator bugs survived so long.
+    h.print_split(h.load_split(f"runs/{tag}", n))
     return 0
 
 
