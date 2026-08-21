@@ -327,7 +327,7 @@ computes the delta; our workload is one full SwarmAgents run.
 - Job **completion rate** and failed/orphaned count
 - **Makespan**, P50/P95 job latency
 - **Consensus conflicts** and reselections/restarts
-- **Load fairness** (Jain's index)
+- **Load fairness** (Jain's index) — **secondary in practice; see [§4.1](#41-is-jains-fairness-the-right-metric-here-partly--and-it-must-be-quoted-differently)** for why it is close to a restatement of the blast radius under S05
 - **Fallback rate** — `[LLM_COST_FALLBACK]` vs `[LLM_COST_COMPLETE]`; *the* key LLM-resilience signal
 
 **Secondary (LLM plane)**
@@ -337,6 +337,67 @@ computes the delta; our workload is one full SwarmAgents run.
 
 **Correctness invariant (must hold under every fault):** **zero double-assignments** — enforced by
 Redis `SET NX` in the Snow engine. Safety must never degrade, only performance.
+
+### 4.1 Is Jain's fairness the right metric here? Partly — and it must be quoted differently
+
+Load fairness carries a lot of the S05 story, so it is worth stating what it does and does not
+measure on this fleet. Three problems, one of them serious.
+
+**1. Equal shares are not the goal, so the absolute value means little.** The fleet is
+deliberately heterogeneous — 1–8 cores, up to 46 GB, 1–4 DTNs each — and the median job is
+feasible on only **9 of 30** agents. The fault-free baseline is therefore *supposed* to be
+unequal (0.681 local, 0.849 gateway), and Jain's index, which is capacity-blind, scores a
+correctly-heterogeneous schedule as unfair. It penalises giving a big agent more work. This is
+survivable only because every figure is quoted as a delta against the same arm's own baseline,
+never against 1.0 — and it is why the arm-specific baseline matters so much (§4d.3).
+
+**2. At partial outage it is close to a restatement of the blast radius.** If the *k* faulted
+agents took every job and split it evenly, Jain's index would be exactly `k/n`. Measured against
+that ceiling:
+
+| arm | radius | k | **J** | ceiling `k/30` | J / ceiling | faulted group's share | J *within* the faulted group |
+|---|---|---|---|---|---|---|---|
+| local | 25% | 8 | 0.209 | 0.267 | 0.79 | 93.3% | 0.686 |
+| local | 50% | 15 | 0.399 | 0.500 | 0.80 | 97.3% | 0.757 |
+| local | 100% | 30 | 0.843 | 1.000 | 0.84 | 100% | 0.843 |
+| gateway | 25% | 8 | **0.253** | **0.267** | **0.95** | 86.0% | 0.711 |
+| gateway | 50% | 15 | 0.452 | 0.500 | 0.90 | 93.7% | 0.805 |
+| gateway | 100% | 30 | 0.795 | 1.000 | 0.80 | 100% | 0.795 |
+
+The gateway 25% run sits at **95% of the ceiling its blast radius already implies**. So the
+index is largely determined by the experimental knob rather than by anything independent: it is
+mostly answering "how many agents are participating?", which we set. Read alone it risks looking
+like a discovery when it is close to arithmetic.
+
+**3. It is computed over jobs *placed*, not work done.** `Job.execute()` sleeps a flat 1 s
+(finding 9), so job count and work are currently interchangeable **by accident**. Fix that bug
+and this metric silently changes meaning; it would need weighting by `wall_time`.
+
+**How to quote it instead.** Two reframings make it honest and more informative:
+
+- **Effective active agents = `J × n`.** This is the standard reading of Jain's index and it is
+  directly interpretable: at 25% outage on the gateway arm, **7.6 of 30 agents** are effectively
+  carrying the workload — and exactly **8** were LLM-blind. The pathology in one number, with no
+  0-to-1 abstraction to explain. Baselines: 25.5 of 30 (gateway), 20.4 (local).
+- **Fairness *within* the faulted group** — the rightmost column above — is the genuinely
+  independent signal, and it says something the fleet-wide number hides: at 0.686–0.805 it is
+  close to each arm's own fault-free fairness. **The analytic scheduler distributes work among
+  its own group about as evenly as the LLM scheduler does across the whole fleet.** So the
+  collapse is not the fallback path being *bad* at balancing; it is the participating population
+  shrinking to the faulted subset. That is a sharper statement of the finding than any fleet-wide
+  fairness delta, and it is what makes §4d.2's capture ratio the primary metric rather than this.
+
+**What would be better, and is computable from the frozen fleet.** A **feasibility-normalised
+share** — jobs won divided by the number of jobs actually feasible for that agent, from
+`agent_profiles.json` / `agent_dtns.json` and the trace's DTN requirements. That answers the
+question we mean ("did each agent get its share of the work it *could* run?") and is immune to
+both the heterogeneity objection and the blast-radius saturation. Not yet implemented.
+
+**Bottom line.** Jain's index is a reasonable *secondary* indicator and its deltas within one arm
+are real, but it should not be the headline for S05, and its absolute value should never be read
+as "how fair is this scheduler". The capture ratio against a same-arm control (§4d.5) and the
+effective-agent count are the defensible primaries. Where this document quotes a fairness delta,
+treat it as corroboration of the split, not as independent evidence.
 
 **Oracles / quality gates**
 - `result.passed("completion_rate", threshold=…)` as a CI-style gate per scenario
@@ -554,8 +615,11 @@ the share of hosts running the proxy.
 
 **Headline: a partial LLM outage is far more damaging than a total one — and this is the one
 finding that gets *worse* on a clean baseline.** Fairness collapses to **0.209** at 25% on the
-local arm and to **0.253** on the gateway arm — a quarter of perfect balance — then recovers
-monotonically as the outage spreads.
+local arm and to **0.253** on the gateway arm, then recovers monotonically as the outage spreads.
+Read as an effective agent count (`J × 30`, §4.1), the gateway trough means **7.6 of 30 agents are
+effectively carrying the workload — and exactly 8 were LLM-blind.** Note per §4.1 that fairness
+under a partial outage is largely set by the blast radius; the capture ratio in §4d.2 is the
+independent measurement.
 Completion never moves: 300/300 jobs, 0 stuck, 0 agents lost at every point on every arm. The
 queue drains **1.9–6× faster** under an outage, because an analytic bid costs ~0 s.
 
