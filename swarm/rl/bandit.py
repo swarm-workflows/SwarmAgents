@@ -151,7 +151,13 @@ class EpsilonGreedyPolicy(BanditPolicy):
         self.epsilon = epsilon
         self.initial_epsilon = epsilon
         self.epsilon_decay = epsilon_decay
-        self.epsilon_min = epsilon_min
+        # The floor may not exceed the starting rate. `update` applies
+        # `max(epsilon_min, epsilon * epsilon_decay)`, so a floor above `epsilon` does not decay
+        # exploration, it *raises* it: asking for `epsilon=0.0` and leaving the default floor
+        # gave 1% exploration forever after the first update, making a pure-greedy policy
+        # impossible to construct. No effect on the shipped config (epsilon 0.1, floor 0.01) or
+        # on any caller whose floor is already below its starting rate.
+        self.epsilon_min = min(epsilon_min, epsilon)
 
     def select_arm(self, eligible_arms: List[int],
                    context: Optional[Dict[int, np.ndarray]] = None) -> int:
