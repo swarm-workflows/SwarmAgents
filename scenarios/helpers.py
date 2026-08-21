@@ -484,12 +484,16 @@ def placement(run_dir: str) -> tuple[dict, int]:
     summing every match double-counts placements, while deduplicating by id silently substitutes
     the restart-filtered population for the real one. `[all]` is the block these experiments mean
     — a restarted job really was placed, and jobs_completed is meant to reconcile with the 300
-    submitted. Two shapes are refused rather than guessed at:
+    submitted. **Exactly one `[all]` block is required**; anything else is refused rather than
+    guessed at:
 
       * several blocks with no `[all]` among them — what a **hierarchical** run produces, since
         `label_suffix="_level0"` is truthy and every level is therefore mislabelled
         `[no_restarts]` (SwarmAgents finding 12). Picking one would silently report a single
         level's placement as the whole fleet's.
+      * a *lone* non-`[all]` block, which one level-filtered or restart-filtered invocation
+        emits on its own. Being the only block in the file makes it unambiguous as a block, not
+        the fleet's placement — it still describes a subset.
       * a legacy log with no block header at all *and* repeated agent ids, where there is no
         evidence for which occurrence is authoritative.
 
@@ -508,19 +512,22 @@ def placement(run_dir: str) -> tuple[dict, int]:
 
     blocks = _job_blocks(text)
     if blocks:
+        # Exactly one block labelled `all`, or nothing. No special case for a *lone* block:
+        # being the only block makes it unambiguous as a block, not the whole fleet's placement.
+        # A single `[no_restarts]` is what one level-filtered invocation emits, and accepting it
+        # would report that level as the fleet — the same corruption this guard exists to stop,
+        # with one block instead of three.
         canonical = [b for lbl, b in blocks if lbl == "all"]
-        if len(canonical) == 1:
-            placed = canonical[0]
-        elif len(blocks) == 1:
-            placed = blocks[0][1]           # a single block is unambiguous whatever its label
-        else:
+        if len(canonical) != 1:
             labels = ", ".join(lbl for lbl, _ in blocks)
             raise SystemExit(
-                f"{log}: {len(blocks)} 'Jobs per agent' blocks ({labels}) and "
-                f"{len(canonical)} labelled 'all' — cannot tell which is the whole-fleet "
-                f"placement. A hierarchical run mislabels every level as 'no_restarts' "
-                f"(finding 12); parse the level you want explicitly rather than letting this "
-                f"guess.")
+                f"{log}: {len(blocks)} 'Jobs per agent' block(s) [{labels}], "
+                f"{len(canonical)} of them labelled 'all' — no unambiguous whole-fleet "
+                f"placement. Exactly one 'all' block is required. A hierarchical run labels "
+                f"every level 'no_restarts' (finding 12), and a restart-filtered invocation on "
+                f"its own emits only 'no_restarts'; in both cases the block describes a subset, "
+                f"so parse the population you want explicitly rather than letting this guess.")
+        placed = canonical[0]
     else:
         pairs = re.findall(r"Agent (\d+): (\d+) jobs", text)
         ids = [int(a) for a, _ in pairs]

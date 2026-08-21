@@ -142,7 +142,29 @@ def test_hierarchical_log_is_refused(fake_repo):
                     + block("no_restarts", {2: 100})
                     + block("no_restarts", {3: 100}))
 
-    with pytest.raises(SystemExit, match="cannot tell which is the whole-fleet placement"):
+    with pytest.raises(SystemExit, match="no unambiguous whole-fleet placement"):
+        helpers.placement(run)
+
+
+def test_lone_non_all_block_is_refused(fake_repo):
+    """Being the only block does not make a subset the fleet.
+
+    One level-filtered or restart-filtered invocation emits a single [no_restarts] block. A
+    'len(blocks) == 1 is unambiguous' shortcut accepted it and reported that subset as the whole
+    fleet — the same corruption as the hierarchical case, with one block instead of three.
+    """
+    run = fake_repo("lone_filtered", block("no_restarts", {i: 10 for i in range(1, 31)}))
+
+    with pytest.raises(SystemExit, match="no unambiguous whole-fleet placement"):
+        helpers.placement(run)
+
+
+def test_duplicate_all_blocks_are_refused(fake_repo):
+    """Two blocks both claiming to be the whole fleet is also unresolvable."""
+    run = fake_repo("two_all",
+                    block("all", {1: 300}) + block("all", {2: 300}))
+
+    with pytest.raises(SystemExit, match="no unambiguous whole-fleet placement"):
         helpers.placement(run)
 
 
