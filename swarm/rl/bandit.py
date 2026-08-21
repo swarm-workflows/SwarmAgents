@@ -187,7 +187,17 @@ class EpsilonGreedyPolicy(BanditPolicy):
 
     def load_state(self, state: dict):
         super().load_state(state)
-        self.epsilon = state.get("epsilon", self.initial_epsilon)
+        # Clamp into the range the CURRENT config allows. Decay only ever moves epsilon down
+        # from `initial_epsilon` toward `epsilon_min`, so any legitimate value lies in that
+        # interval: config defines the bounds, persisted state only picks the position inside
+        # them. Assigning the stored value directly let it override the config it was supposed
+        # to resume under — lower `mab.epsilon`, restart, and MABManager.load_state would
+        # restore the old higher rate from Redis and silently discard the change. With
+        # `epsilon: 0.0` that meant a pure-greedy policy carried on exploring, which is the
+        # constructor bug again by a different route. `epsilon_min` is deliberately not
+        # persisted for the same reason.
+        restored = state.get("epsilon", self.initial_epsilon)
+        self.epsilon = min(max(restored, self.epsilon_min), self.initial_epsilon)
 
 
 class UCB1Policy(BanditPolicy):

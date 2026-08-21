@@ -78,6 +78,10 @@ mab:
 - `epsilon_min` is clamped to `epsilon` at construction, since a floor above the starting
   rate would *raise* exploration rather than decay it. Set `epsilon: 0.0` for a pure-greedy
   policy — the floor follows it down, so no `epsilon_min: 0.0` is needed.
+- Policy state persisted to Redis is clamped to `[epsilon_min, epsilon]` on load, so config
+  defines the bounds and the stored value only picks a position inside them. Lowering
+  `mab.epsilon` therefore takes effect on the next restart instead of being overridden by
+  the rate saved under the previous config.
 - Good for: Simple scenarios, when you want predictable exploration rate
 
 ### UCB1 (Upper Confidence Bound)
