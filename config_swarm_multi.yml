@@ -204,7 +204,7 @@ mab:
   algorithm: "epsilon_greedy"      # "epsilon_greedy" or "ucb1"
   epsilon: 0.1                     # Initial exploration rate (epsilon_greedy only)
   epsilon_decay: 0.995             # Epsilon decay per update (epsilon_greedy only)
-  epsilon_min: 0.01                # Minimum epsilon floor (epsilon_greedy only)
+  epsilon_min: 0.01                # Minimum epsilon floor, clamped to <= epsilon (epsilon_greedy only)
   exploration_weight: 1.41         # UCB1 exploration weight (ucb1 only)
   top_k: 1                         # Number of child groups to delegate to per job
   step_size: null                  # Optional recency-weighted Q for epsilon_greedy/ucb1 (null = lifetime average)

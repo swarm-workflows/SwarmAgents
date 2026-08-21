@@ -37,9 +37,40 @@ class TestEpsilonGreedyPolicy:
             arm = policy.select_arm([1, 2, 3])
             assert arm in [1, 2, 3]
 
+    def test_epsilon_min_cannot_exceed_epsilon(self):
+        """A floor above the starting rate would raise exploration, not decay it.
+
+        `update` applies max(epsilon_min, epsilon * epsilon_decay), so with the default floor of
+        0.01 a policy built with epsilon=0.0 jumped to 1% exploration after its first update and
+        stayed there — a pure-greedy policy was unconstructable. This is the regression guard.
+        """
+        pure = EpsilonGreedyPolicy(epsilon=0.0)          # default epsilon_min=0.01
+        assert pure.epsilon_min == 0.0, "the floor must clamp down to the requested epsilon"
+        for _ in range(50):
+            pure.update(1, 1.0)
+        assert pure.epsilon == 0.0, "pure greedy must stay pure across updates"
+
+        # A floor below the starting rate is untouched — the shipped config's case.
+        normal = EpsilonGreedyPolicy(epsilon=0.1, epsilon_min=0.01)
+        assert normal.epsilon_min == 0.01
+        for _ in range(10_000):
+            normal.update(1, 1.0)
+        assert normal.epsilon == pytest.approx(0.01), "decay must still bottom out at the floor"
+
+    def test_pure_greedy_never_explores(self):
+        """With epsilon=0.0 the arm choice is decided by Q alone, whatever the RNG does."""
+        policy = EpsilonGreedyPolicy(epsilon=0.0, step_size=0.9)
+        policy.update(1, -1.0)
+        policy.update(2, 1.0)
+
+        for seed in range(200):
+            random.seed(seed)
+            assert policy.select_arm([1, 2]) == 2
+
     def test_greedy_selects_best(self):
-        # epsilon_min=0.0 too: the floor would silently raise epsilon back
-        # to 0.01 after the first update, making this test flaky
+        # epsilon_min is now clamped to epsilon in the constructor, so epsilon=0.0 really is
+        # pure greedy and passing epsilon_min=0.0 is no longer needed. Kept explicit here to
+        # state the intent, and pinned on its own in test_epsilon_min_cannot_exceed_epsilon.
         policy = EpsilonGreedyPolicy(epsilon=0.0, epsilon_min=0.0)
         # Arm 2 has highest Q-value
         policy.update(1, -1.0)

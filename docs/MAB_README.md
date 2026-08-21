@@ -26,7 +26,7 @@ mab:
   # Epsilon-Greedy parameters
   epsilon: 0.1                     # Initial exploration rate (probability of random selection)
   epsilon_decay: 0.995             # Decay multiplier applied after each update
-  epsilon_min: 0.01                # Minimum epsilon floor
+  epsilon_min: 0.01                # Minimum epsilon floor (clamped to <= epsilon)
 
   # UCB1 parameters
   exploration_weight: 1.41         # sqrt(2) by default; higher = more exploration
@@ -75,6 +75,9 @@ mab:
 - With probability `epsilon`, selects a random child group (exploration)
 - Otherwise, selects the group with highest Q-value (exploitation)
 - Epsilon decays over time: `epsilon = max(epsilon_min, epsilon * epsilon_decay)`
+- `epsilon_min` is clamped to `epsilon` at construction, since a floor above the starting
+  rate would *raise* exploration rather than decay it. Set `epsilon: 0.0` for a pure-greedy
+  policy — the floor follows it down, so no `epsilon_min: 0.0` is needed.
 - Good for: Simple scenarios, when you want predictable exploration rate
 
 ### UCB1 (Upper Confidence Bound)
