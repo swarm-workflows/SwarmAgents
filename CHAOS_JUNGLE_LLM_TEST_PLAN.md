@@ -699,19 +699,35 @@ and is harmed most by partial failure.
 > that sizes itself from a log of *who did work* is blind to whoever did none, which is the
 > population a capture study is about.
 >
-> **A third defect, latent rather than realised.** The two metrics did not merely share a bug,
-> they parsed the same log *differently*: `collect()` summed a **list** of `Agent N: M jobs`
-> matches while `load_split()` built a **dict** keyed by id. On a log carrying that summary twice
-> — which a job restart or reassignment causes the orchestrator to emit — the list double-counts
-> placements while the dict silently keeps the last value. Fairness and `jobs_completed` would
-> inflate while the capture ratio stayed correct: two metrics, one log, two answers, no error.
-> Checked across all 30 orchestrator logs in the campaign: **no duplicate summaries, no restarts,
-> every sum exactly 300**, so nothing published was affected. Both readers now go through a single
-> `placement()` parser that deduplicates by id, takes the final block as authoritative, and sizes
-> the fleet from the configured count (following the log upward for dynamic-agent runs, never
-> downward). `tests/test_scenario_placement.py` pins all three behaviours — 10 tests, including
-> the case that shows the original bug's magnitude: 4 agents holding 10 jobs each while 26 sit
-> idle reported fairness **1.0, "perfectly fair"**, where the truth is **0.133**.
+> **A third defect, latent rather than realised — and the first fix for it was also wrong.** The
+> two metrics did not merely share a bug, they parsed the same log *differently*: `collect()`
+> summed a **list** of `Agent N: M jobs` matches while `load_split()` built a **dict** keyed by id.
+>
+> Reading the producer settles what that means. `plotting/single_run.py:plot_scheduling_latency_and_jobs`
+> prints one `[label] Jobs per agent:` block per invocation, and the flat pipeline invokes it
+> **twice on any run containing restarts** (`plot_latency_jobs.py`, the `if restarted_job_ids:`
+> branch): once over every job as `[all]`, then over the restart-filtered set as `[no_restarts]`.
+> Those are **two populations of one run**, not a summary and a correction. So on a restart run
+> the list-sum double-counts placements *and* merges the populations, while a dict keyed by id
+> silently substitutes the restart-filtered population for the real one. Both are wrong, in
+> opposite directions.
+>
+> This document briefly claimed the fix was "deduplicate by id, last block authoritative". That
+> was the dict behaviour, and it is the second of the two errors above — it would have reported
+> `[no_restarts]` as the whole run. **`[all]` is the block these experiments mean**: a restarted
+> job really was placed, and `jobs_completed` is meant to reconcile against the 300 submitted.
+>
+> The parser is now block-aware, selects `[all]`, and **refuses rather than guesses** on the two
+> ambiguous shapes: a hierarchical run, which mislabels all three of its level blocks
+> `[no_restarts]` (finding 12), and a header-less legacy log with repeated ids. Refusing is the
+> point — every bug in this note was silent, and a wrong choice here does not fail, it just moves
+> the number.
+>
+> **Nothing published was affected.** All 30 campaign logs carry exactly one `[all]` block, 0
+> restarts, and sums of exactly 300; every figure reproduces byte-identically through the new
+> parser. `tests/test_scenario_placement.py` pins all four behaviours — 14 tests, including the
+> case that shows the original denominator bug's magnitude: 4 agents holding 10 jobs each while 26
+> sit idle reported fairness **1.0, "perfectly fair"**, where the truth is **0.133**.
 
 It also explains the disproportionate fallback rate — 26.7% of hosts generate 53.9% of scoring
 events, because failing fast lets them cycle the selection loop far more often. **Fallback rate
@@ -1293,6 +1309,9 @@ term was inert, the fleet differed between runs, or the LLM was never consulted.
 | 7 | **Open** | `llm.timeout_seconds` is parsed but never enforced; bids ran 14.9 s, 19.2 s, once 20 min |
 | 8 | **Open** | Converter mutates module-level `INSTANCE_FLAVORS` via aliased dicts |
 | 9 | **Open** | `Job.execute()` sleeps a flat 1 s, so **makespan is not comparable** to the source workflows |
+| 10 | Fixed `6ea14df1` | Selection and consensus both tie-broke on agent id, and the proposal cost carried it (§4e.3) |
+| 11 | **Open** | Under Snow, peers vote with the **analytic** cost — an LLM agent's bid is never consulted |
+| 12 | **Open** | Hierarchical per-agent summaries are all labelled `[no_restarts]`, so a run's own blocks are indistinguishable |
 
 ## 8. Runbook
 

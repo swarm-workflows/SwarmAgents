@@ -441,21 +441,60 @@ def _orchestrator_log(run_dir: str) -> str:
                  if os.path.isfile(p)), "")
 
 
+_BLOCK_HEADER = re.compile(r"^\[(\w+)\] Jobs per agent:")
+_AGENT_LINE = re.compile(r"^\s*Agent (\d+): (\d+) jobs\s*$")
+
+
+def _job_blocks(text: str) -> list:
+    """Every "[label] Jobs per agent:" block in the orchestrator log, in file order.
+
+    The producer is `plotting/single_run.py:plot_scheduling_latency_and_jobs`, which prints one
+    such block per invocation — and the flat pipeline invokes it **twice whenever a run contains
+    restarts**: once over all jobs (`[all]`) and once over the restart-filtered set
+    (`[no_restarts]`). Those are two different populations of the same run, not a summary and a
+    correction, so they must never be merged or summed.
+    """
+    blocks: list = []
+    current = None
+    for line in text.splitlines():
+        header = _BLOCK_HEADER.match(line)
+        if header:
+            current = (header.group(1), {})
+            blocks.append(current)
+            continue
+        if current is None:
+            continue
+        agent = _AGENT_LINE.match(line)
+        if agent:
+            current[1][int(agent.group(1))] = int(agent.group(2))
+        elif line.strip():
+            current = None      # a block ends at the first non-agent, non-blank line
+    return blocks
+
+
 def placement(run_dir: str) -> tuple[dict, int]:
     """Jobs placed per agent id, and the fleet size every per-agent metric must divide by.
 
     THE single parser for "Agent N: M jobs". collect() and load_split() both go through it so
     they cannot drift apart, which they had: collect() summed a *list* of matches while
-    load_split() built a *dict*. On a log carrying the summary twice those two disagree — the
-    list double-counts placements and inflates both jobs_completed and fairness, while the dict
-    silently keeps the last value and leaves the capture ratio right. Two metrics, one log, two
-    answers, no error.
+    load_split() built a *dict*, so on a multi-block log one double-counted and the other did not.
 
-    Keyed by id with the last occurrence winning, because the summary can legitimately appear
-    more than once: a job restart or a reassignment (`reselection_timeout_s`, `RESTART: Job`)
-    makes the orchestrator re-emit it, and the final block is the authoritative one. A genuine
-    restart that moves a job between agents needs no special handling — each agent still gets
-    its own line, and no id repeats.
+    **Block-aware, because a log can hold several complete blocks for one run.** Reading them as
+    one flat stream of matches corrupts any run containing restarts, in either direction:
+    summing every match double-counts placements, while deduplicating by id silently substitutes
+    the restart-filtered population for the real one. `[all]` is the block these experiments mean
+    — a restarted job really was placed, and jobs_completed is meant to reconcile with the 300
+    submitted. Two shapes are refused rather than guessed at:
+
+      * several blocks with no `[all]` among them — what a **hierarchical** run produces, since
+        `label_suffix="_level0"` is truthy and every level is therefore mislabelled
+        `[no_restarts]` (SwarmAgents finding 12). Picking one would silently report a single
+        level's placement as the whole fleet's.
+      * a legacy log with no block header at all *and* repeated agent ids, where there is no
+        evidence for which occurrence is authoritative.
+
+    Refusing matters more than it looks: every earlier bug here was silent, and a wrong choice
+    does not fail, it just moves the number.
 
     The fleet size is the CONFIGURED count, never the number of ids the log happens to mention:
     an agent that wins no jobs emits no line at all, and dropping it from a denominator inflates
@@ -466,9 +505,32 @@ def placement(run_dir: str) -> tuple[dict, int]:
     if not log:
         return {}, AGENTS
     text = open(log, errors="ignore").read()
-    placed: dict[int, int] = {}
-    for aid, jobs in re.findall(r"Agent (\d+): (\d+) jobs", text):
-        placed[int(aid)] = int(jobs)          # last occurrence wins
+
+    blocks = _job_blocks(text)
+    if blocks:
+        canonical = [b for lbl, b in blocks if lbl == "all"]
+        if len(canonical) == 1:
+            placed = canonical[0]
+        elif len(blocks) == 1:
+            placed = blocks[0][1]           # a single block is unambiguous whatever its label
+        else:
+            labels = ", ".join(lbl for lbl, _ in blocks)
+            raise SystemExit(
+                f"{log}: {len(blocks)} 'Jobs per agent' blocks ({labels}) and "
+                f"{len(canonical)} labelled 'all' — cannot tell which is the whole-fleet "
+                f"placement. A hierarchical run mislabels every level as 'no_restarts' "
+                f"(finding 12); parse the level you want explicitly rather than letting this "
+                f"guess.")
+    else:
+        pairs = re.findall(r"Agent (\d+): (\d+) jobs", text)
+        ids = [int(a) for a, _ in pairs]
+        if len(ids) != len(set(ids)):
+            raise SystemExit(
+                f"{log}: no '[label] Jobs per agent:' header, and agent ids repeat "
+                f"({len(ids)} lines, {len(set(ids))} distinct). Cannot tell whether the repeats "
+                f"are separate populations or a revised summary.")
+        placed = {int(a): int(j) for a, j in pairs}
+
     fleet = max(AGENTS, max(placed, default=0))
     return placed, fleet
 

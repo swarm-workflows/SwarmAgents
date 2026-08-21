@@ -22,6 +22,7 @@ is "quietly invalid experiment", not "crash".
 | 9 | **Open** | Low (caveat) | `Job.execute()` ignores `wall_time`, so makespan is not meaningful |
 | 10 | Fixed (uncommitted) | Medium (silent) | Selection and consensus both tie-break on agent id, and the proposal cost carries the id |
 | 11 | **Open** | **High (silent)** | Under Snow, peers vote with the analytic cost — an LLM agent's bid is never consulted |
+| 12 | **Open** | Low (analysis-only) | Per-agent job summaries are printed once per level but all labelled `[no_restarts]`, so a hierarchical run's blocks are indistinguishable |
 
 ---
 
@@ -288,3 +289,42 @@ This is not a tie-break problem and finding 10's fix does not touch it. It needs
 LLM cost made available to the inbound query path (a cache, not a call — `_answer_query` runs
 on the single inbound consumer thread and must not block), or the two cost models normalised
 onto one scale before they are ever compared.
+
+### 12. Hierarchical per-agent summaries are all labelled `[no_restarts]`
+
+Analysis-only — it corrupts nothing in a run, but it makes a run's own output ambiguous to any
+tool that reads it, which is how it was found (the chaos harness parses these blocks).
+
+`plot_scheduling_latency_and_jobs` labels its per-agent summary from the truthiness of
+`label_suffix`:
+
+```python
+# plotting/single_run.py
+print(f"\n[{('no_restarts' if label_suffix else 'all')}] Jobs per agent:")
+```
+
+`label_suffix` carries two unrelated meanings. In the flat path it is `""` or
+`"_no_restarts"`, and the label is correct. In the hierarchical path it is `"_level0"`,
+`"_level1"`, `"_level2"` — all truthy — so **every level's block is labelled
+`[no_restarts]`**, and a hierarchical run emits three identically-labelled blocks describing
+three different populations:
+
+```
+[no_restarts] Jobs per agent:     <- actually level 0
+[no_restarts] Jobs per agent:     <- actually level 1
+[no_restarts] Jobs per agent:     <- actually level 2
+```
+
+Nothing downstream in SwarmAgents consumes these lines, so the run itself is unaffected — the
+per-level CSVs and PNGs are correctly suffixed. But the log is the only record of placement for
+anyone analysing a finished run, and three blocks that claim to be the same thing cannot be told
+apart. The chaos harness now refuses such a log rather than guess which block is the fleet
+(`scenarios/helpers.py:placement`), because guessing would silently report one level's placement
+as the whole fleet's.
+
+**Fix:** label from the actual meaning rather than from suffix truthiness — pass the label
+explicitly, or derive it as `f"level{level}"` when `level` is set and
+`"no_restarts" if exclude_job_ids else "all"` otherwise.
+
+This matters for the planned hierarchical fault arm: those runs are the ones whose placement most
+needs reading, and today their logs are the ones that cannot be read unambiguously.
