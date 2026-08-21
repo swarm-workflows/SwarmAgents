@@ -568,12 +568,15 @@ which is precisely the channel that works.
 The named targets are exactly the agents bidding at 139-250 s, and exactly the ones that won
 **zero** jobs.
 
-An agent blocked for minutes inside a bid answers its SWIM probes late, is suspected, and is
-dropped from the live set — LLM-plane latency surfacing as membership churn. That is the
-**S01 hypothesis confirmed, but by an unplanned fault rather than an injected one**: +3 s of
-injected latency produced no membership effect at all, while a spontaneous ~25x slowdown
-produced a complete one. The interesting quantity is therefore the *threshold* between them,
-which S01 can measure directly — rerun it at 30 s and 60 s rather than 3 s.
+The obvious reading — an agent blocked for minutes inside a bid answers its SWIM probes late —
+is **wrong, and the S01 sweep is what disproves it.** Injecting +60 s per bid on healthy hosts
+produces *no* membership effect: SWIM churn stays at baseline and no agent is declared failed
+(see the S01 dose-response section). A blocked bid is therefore not the mechanism.
+
+What these two hosts had that a latency-faulted host does not is **memory starvation**, and a
+thrashing host starves the SWIM responder thread itself. The slow bids and the missed probes are
+two symptoms of one cause, not one causing the other. **A slow LLM is not a membership risk; a
+starved host is.**
 
 #### Root cause of the unplanned fault: memory, not the model (2026-08-19)
 
@@ -846,34 +849,60 @@ their entire share of the workload, and bid latency decides placement. Speed win
 The matrix's L1 row, swept on the arm that does not rate-limit, 100% of hosts faulted at every
 point, each against `cj-baseline-gw2`.
 
-| injected delay | bid latency mean | measured Δ | Δ / injected | sched latency mean | load fairness | SWIM false-fails | **jobs completed** | **fallbacks** |
-|---|---|---|---|---|---|---|---|---|
-| 0 (baseline) | 4.95 s | — | — | 191.1 s | 0.849 | 7 | **300** | **0** |
-| **+1 s** | 5.73 s | +0.78 | 78% | 219.7 s | 0.804 | 0 | **300** | **0** |
-| **+3 s** | 7.09 s | +2.14 | 71% | 261.6 s | 0.842 | 0 | **300** | **0** |
-| **+6 s** | 9.50 s | +4.55 | 76% | 364.1 s | 0.813 | 7 | **300** | **0** |
-| **+10 s** | 13.05 s | +8.10 | 81% | 497.0 s | 0.859 | 2 | **300** | **0** |
+| injected delay | bid latency mean | measured Δ | Δ / injected | sched latency mean | load fairness | SWIM false-fails | failed agents | **jobs completed** | **fallbacks** |
+|---|---|---|---|---|---|---|---|---|---|
+| 0 (baseline) | 4.95 s | — | — | 191.1 s | 0.849 | 7 | 0 | **300** | **0** |
+| **+1 s** | 5.73 s | +0.78 | 78% | 219.7 s | 0.804 | 0 | 0 | **300** | **0** |
+| **+3 s** | 7.09 s | +2.14 | 71% | 261.6 s | 0.842 | 0 | 0 | **300** | **0** |
+| **+6 s** | 9.50 s | +4.55 | 76% | 364.1 s | 0.813 | 7 | 0 | **300** | **0** |
+| **+10 s** | 13.05 s | +8.10 | 81% | 497.0 s | 0.859 | 2 | 0 | **300** | **0** |
+| **+30 s** | 32.52 s | +27.57 | 92% | 1157.6 s | 0.827 | 6 | 0 | **300** | **0** |
+| **+60 s** | 62.32 s | +57.37 | 96% | 2237.3 s | 0.808 | 5 | 0 | **300** | **0** |
 
-**Throughput degrades linearly; correctness does not degrade at all.** Across a 10x sweep:
+Extended past the matrix's 1/3/6/10 s to 30 s and 60 s to find where scheduling — and then
+membership — gives way. **Neither does.**
+
+**Throughput degrades linearly; correctness does not degrade at all.** Across a 60x sweep:
 300/300 jobs at every point, zero fallbacks, zero stuck jobs, zero agents lost. Fairness has no
 trend (0.804-0.859, straddling the baseline's 0.849). The only thing that moves is speed.
 
-**Each second of LLM delay costs ~31 s of scheduling latency.** Mean scheduling latency runs
-191 → 497 s across the sweep, a slope of ~30.6 s per injected second — a **~31x amplification**,
+**Each second of LLM delay costs ~34 s of scheduling latency.** Mean scheduling latency runs
+191 → 2237 s across the sweep, a slope of ~34 s per injected second — a **~34x amplification**,
 because a job's placement waits on several sequential bid rounds rather than one. That is the
-number to quote for "what does a slow LLM cost the scheduler": not the per-call delay, but ~31x
+number to quote for "what does a slow LLM cost the scheduler": not the per-call delay, but ~34x
 it in queue time.
 
-**The injected delay partially pays for itself.** The measured rise is consistently 71-81% of
-what was injected, at every point. Slowing every agent reduces concurrent pressure on the shared
-endpoint, so part of the injected delay is returned as queueing relief. The effect is a property
-of the *endpoint*, not the scheduler — worth remembering before reading a sub-unit delta as the
-fault under-applying.
+**The injected delay partially pays for itself, and the shortfall decomposes the baseline.** The
+measured rise is 71-81% of the injected delay at small doses but 92% and 96% at 30 s and 60 s.
+The *absolute* shortfall saturates rather than the ratio:
 
-**No membership leak up to +10 s.** SWIM false-fails are 0, 0, 7 and 2 against a baseline of 7 —
-no trend, no agents declared failed anywhere in the sweep. This bounds the S01 hypothesis from
-below: the membership collapse observed on the local arm needed hosts bidding at **77-250 s**
-(§S09 root cause), and +10 s does not approach it. The threshold lies somewhere above 10 s.
+| injected | 1 s | 3 s | 6 s | 10 s | 30 s | 60 s |
+|---|---|---|---|---|---|---|
+| shortfall | 0.22 s | 0.86 s | 1.45 s | 1.90 s | 2.43 s | 2.63 s |
+
+Slowing every agent removes concurrent pressure on the shared endpoint, and the relief cannot
+exceed the contention that was there to begin with. It converges on **~2.6 s**, which splits the
+4.95 s baseline bid into **~2.3 s of service and ~2.6 s of contention** — confirmed directly by
+the +60 s point, where an uncontended call costs 62.32 − 60 = **2.32 s**. Read a sub-unit delta as
+this effect, not as the fault under-applying.
+
+> **The S01 membership hypothesis is refuted, not merely unconfirmed.** SWIM false-fails are
+> 0, 0, 7, 2, 6, 5 against a baseline of 7 — no trend — and **zero agents were declared failed at
+> any delay, including +60 s**, a 12x slowdown on a 5 s bid. LLM-plane latency does not leak into
+> membership.
+>
+> That forces a correction to the §S09 root-cause section, which read the local arm's collapse
+> (agents bidding at 77-250 s, most-suspected by SWIM, declared failed) as "an agent blocked
+> inside a bid answers its SWIM probes late". This sweep is the control for exactly that claim,
+> and it fails: a bid blocked for 60 s on a *healthy* host costs no membership at all. The
+> collapse was caused by the **memory starvation** that also produced the slow bids — a thrashing
+> host starves the SWIM responder thread itself — not by the bid duration. Same symptom, and the
+> two mechanisms are separable only because this arm could hold one constant while varying the
+> other.
+>
+> Practical consequence: **a slow LLM is not a membership risk; a starved host is.** The health
+> gate's memory check (`MIN_AVAILABLE_MB`) is the mitigation that matters, and `suspect_timeout_s`
+> tuning is not.
 
 ---
 
@@ -886,7 +915,7 @@ enabling the *targeted-fault-on-coordinators* story).
 ### Tier 1 — LLM API faults (CJ Layer 1) — core of the paper
 | # | Fault | Sweep | Hypothesis |
 |---|-------|-------|------------|
-| L1 | `LLMLatency` | 1/3/6/10 s | **DONE** (gateway arm) — throughput degrades linearly at ~31x the injected delay; completion, fallbacks and membership untouched across the whole sweep |
+| L1 | `LLMLatency` | 1/3/6/10/30/60 s | **DONE** (gateway arm) — throughput degrades linearly at ~34x the injected delay; completion, fallbacks and membership untouched to +60 s |
 | L2 | `LLMTimeout` | hang 8/15 s | Cancellation + fallback keeps scheduling live |
 | L3 | `LLMUnavailable` (503) | 25/50/100% of agents | Full outage ⇒ degrades to pure analytic scheduler, no correctness loss |
 | L4 | `LLMRateLimit` (429 after n) | n = 5/20 | Back-off vs fallback; graceful or collapse? |
@@ -1231,10 +1260,9 @@ Each of these cost real debugging time; all are guarded against above.
    placement never moved, because it is decided by *when* an agent bids, not by *what* it bids
    (§S09b). The remaining three modes are wired and verified but unrun, and none of them
    changes timing either, so expect the same answer from all three.
-   The experiment the evidence actually points to is **S01 at 30 s and 60 s**: latency is the
-   channel that works, and somewhere between the +3 s that was absorbed completely and the
-   ~250 s that cost two agents their entire share of the workload lies the threshold where
-   scheduling — and then membership — gives way. That is the dose-response curve worth having.
+   S01 has since been swept to 30 s and 60 s (**done** — see its section): there is no threshold
+   where scheduling or membership gives way, only linear slowdown at ~34x. The membership
+   collapse was memory starvation, not latency.
 3. **Phase 3 — ablations**, especially fallback-disabled.
 4. **Phase 4 — composite X1** and hierarchical/targeted-coordinator scenarios.
 5. **Report the CJ issues in §6 upstream.**
