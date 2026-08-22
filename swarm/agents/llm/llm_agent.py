@@ -334,6 +334,23 @@ class LlmAgent(ResourceAgent):
         for job, (agent, _cost) in zip(pending_jobs, designations):
             if agent is None:
                 infeasible += 1
+                # Nobody in the fleet can run this job, so no bid is ever coming. Leaving it in
+                # place would hold a slot in the shared window permanently — `gets()` returns the
+                # first N PENDING jobs — and enough of them would stall the run outright, which is
+                # the head-of-line blocking §2.2 already cost a run once.
+                #
+                # Requeueing here does NOT desynchronise the window, which is why it is safe when
+                # a designation deferral is not: feasibility is agent-agnostic and deterministic,
+                # so every agent reaches the same verdict on the same job and moves it back at the
+                # same point. A designation depends on live load, so agents disagree and their
+                # queues would drift apart.
+                #
+                # State is deliberately left PENDING rather than BLOCKED: the BLOCKED path is
+                # restored by `_restore_infeasible_jobs`, which only `ResourceAgent.selection_main`
+                # calls — this override never does, so a BLOCKED job here would never come back.
+                # Cycling a genuinely unschedulable job is a pre-existing gap in this agent (it is
+                # never retired via `max_infeasible_retries`), but it no longer blocks the rest.
+                self.queues.pending_queue.move_to_end(job)
                 continue
             if agent.agent_id == self.agent_id:
                 mine.append(job)

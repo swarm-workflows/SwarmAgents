@@ -208,8 +208,17 @@ def test_deadline_is_not_a_loop_counter():
     assert agent.queues.pending_queue.requeued == []
 
 
-def test_fleet_wide_infeasible_job_does_not_start_the_deadline():
-    """A job nobody can run is not a designation failure; it must not arm the fallback."""
+def test_fleet_wide_infeasible_job_is_requeued_and_does_not_arm_the_deadline():
+    """A job nobody can run must not hold a slot in the shared window.
+
+    Under designation, `agent is None` means infeasible for EVERY live agent, so no bid is ever
+    coming. gets() returns the first N PENDING jobs, so leaving it in place would occupy a window
+    slot permanently and enough of them would stall the run — the head-of-line blocking of §2.2.
+
+    Requeueing is safe here even though it is not for a deferral: feasibility is agent-agnostic
+    and deterministic, so every agent reaches the same verdict and moves the job back at the same
+    point, leaving the shared window aligned.
+    """
     job = _Job("too-big")
 
     def designate(j, assignees):
@@ -219,7 +228,22 @@ def test_fleet_wide_infeasible_job_does_not_start_the_deadline():
     for _ in range(5):
         assert agent._designate_bidders([job]) == []
     assert not hasattr(job, "designation_deferred_at"), "infeasible must not arm the deadline"
-    assert agent.queues.pending_queue.requeued == [], "and must not reorder the queue"
+    assert agent.queues.pending_queue.requeued == ["too-big"] * 5, "must not block the window"
+    assert not hasattr(job, "state"), "must stay PENDING: BLOCKED is never restored in this agent"
+
+
+def test_infeasible_job_does_not_block_a_feasible_one_behind_it():
+    """The blocking case, end to end: an unschedulable job at the head of the window."""
+    dead, live = _Job("unschedulable"), _Job("mine")
+
+    def designate(job, assignees):
+        return (None, float("inf")) if job.job_id == "unschedulable" else (_Agent(1), 1.0)
+
+    agent = make_agent(1, [1, 2], designate)
+    kept = agent._designate_bidders([dead, live])
+
+    assert [j.job_id for j in kept] == ["mine"], "the feasible job must still be bid on"
+    assert agent.queues.pending_queue.requeued == ["unschedulable"]
 
 
 def test_single_agent_fleet_is_a_passthrough():
