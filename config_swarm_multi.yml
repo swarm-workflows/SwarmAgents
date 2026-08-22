@@ -177,6 +177,24 @@ job_selection:
   quantum_penalty_factor: 1.0         # Multiplier for quantum backend quality penalty (error rate + calibration downtime)
   selection_threshold_pct: 10.0       # % above min cost allowed in candidate selection (lower = stricter, higher = more agents considered)
 
+  # Designated-bidder mode (LLM agents only). Default false = every agent bids on every job it
+  # can run, which is what the campaign measured: ~3.7 distinct agents pay a full LLM bid per
+  # job placed once, and throughput is flat in fleet size (test plan 4.0b).
+  #
+  # true = each agent first runs the CHEAP analytic cost model over all live peers to work out
+  # who should bid, and only the designated agent spends an LLM call. Analytic cost and
+  # feasibility are peer-computable, so no coordination is needed; peer LLM cost is not
+  # (finding 11), which is why this uses the analytic model and not the LLM one.
+  #
+  # Turn this on only for a throughput experiment, and re-measure capture and fairness (4d)
+  # alongside: it changes HOW MANY agents compete for each job, so those figures are no longer
+  # comparable with the rest of the campaign. It also further reduces the LLM's influence on
+  # placement, since a designated bidder faces no competing proposal.
+  designate_bidder: false
+  # Bid anyway after this many consecutive deferrals, so a job whose designee never bids (stale
+  # gossip) degrades to the default behaviour instead of circulating forever.
+  designate_bidder_max_defers: 3
+
 # Quantum runtime (Phase 2: data-triggered split hybrid scheduling).
 # Applies to all agents; inert unless split hybrid jobs / post-processing
 # jobs exist in the pool. See docs/QUANTUM_HYBRID_DESIGN.md.

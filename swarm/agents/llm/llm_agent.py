@@ -91,6 +91,19 @@ class LlmAgent(ResourceAgent):
 
         self.bidder: Optional[LlmBidder] = LlmBidder(self.llm_cfg, logger=self.logger)
 
+        # Designated-bidder mode. Off by default: it changes who bids, so turning it on changes
+        # every capture and fairness figure the campaign has measured (test plan 4d) and must be
+        # an explicit choice, not a silent default.
+        job_cfg = self.config.get("job_selection", {}) or {}
+        self.designate_bidder = bool(job_cfg.get("designate_bidder", False))
+        self.designate_bidder_max_defers = int(job_cfg.get("designate_bidder_max_defers", 3))
+
+        # ResourceAgent.__init__ has just built a selection engine over the ANALYTIC cost model.
+        # Keep it before overwriting self.selector below: the cheap model is what makes
+        # designation affordable (see _designate_bidders), and rebuilding it here would mean a
+        # second cache for identical work.
+        self.analytic_selector = self.selector
+
         # Re-wire the selection engine to use LLM-driven cost if available
         self.selector = SelectionEngine(
             feasible=lambda job, agent: self.is_job_feasible(job, agent),
@@ -255,6 +268,77 @@ class LlmAgent(ResourceAgent):
                 'child_agents': {},
             }
 
+    def _designate_bidders(self, pending_jobs: list) -> list:
+        """Pick one bidder per job using the ANALYTIC cost, and keep only this agent's share.
+
+        The problem (test plan §4.0b): every agent scores every feasible pending job against
+        itself, so ~3.7 distinct agents each pay a full LLM bid for a job that is placed once.
+        Nothing partitions the pool, so an added agent is a redundant bidder rather than a new
+        server, and measured throughput is flat in fleet size — 4.3x the agents bought 0.86x.
+
+        Why the analytic model can do this and the LLM cannot: `_cost_job_on_agent(job, agent)`
+        and `is_job_feasible(job, agent)` both take an arbitrary `AgentInfo`, so an agent can
+        price a job *for a peer* from gossiped state. Peer LLM cost is not available (finding 11).
+        Each agent therefore reaches the same designation locally, with no coordination and no
+        extra inference, and only the designated agent spends an LLM call.
+
+        This is deliberately NOT the commented-out all-agents LLM matrix a few lines below. That
+        would price every job for every peer with the model — roughly 30x the inference to remove
+        a 3.7x redundancy.
+
+        **Liveness.** Agents can disagree about the designation while gossip is stale, and a job
+        whose designee never bids would otherwise circulate indefinitely. Each agent counts how
+        often it has deferred a given job and bids anyway past `designate_bidder_max_defers`, so
+        the worst case degrades to today's behaviour for that job rather than starving it. A job
+        that is infeasible fleet-wide is requeued without counting a defer, leaving the existing
+        infeasible handling untouched.
+        """
+        agents_map = self.neighbor_map
+        agents = [agents_map.get(aid) for aid in list(agents_map.keys())]
+        agents = [a for a in agents if a is not None]
+        if len(agents) <= 1:
+            return pending_jobs          # nothing to partition against
+
+        matrix = self.analytic_selector.compute_cost_matrix(
+            assignees=agents, candidates=pending_jobs)
+        matrix = apply_multiplicative_penalty(
+            cost_matrix=matrix, assignees=agents, factor_fn=self._projected_load_factor)
+        designations = self.analytic_selector.pick_agent_per_candidate(
+            assignees=agents,
+            candidates=pending_jobs,
+            cost_matrix=matrix,
+            objective="min",
+            threshold_pct=self.selection_threshold_pct,
+            tie_break_key=lambda ag, s, cand: tiebreak_rank(
+                getattr(cand, "job_id", ""), getattr(ag, "agent_id", "")),
+        )
+
+        mine, deferred, forced, infeasible = [], 0, 0, 0
+        for job, (agent, _cost) in zip(pending_jobs, designations):
+            if agent is None:
+                infeasible += 1
+                self.queues.pending_queue.move_to_end(job)
+                continue
+            if agent.agent_id == self.agent_id:
+                mine.append(job)
+                continue
+            defers = int(getattr(job, "designation_defers", 0)) + 1
+            job.designation_defers = defers
+            if defers >= self.designate_bidder_max_defers:
+                forced += 1
+                mine.append(job)
+            else:
+                deferred += 1
+                self.queues.pending_queue.move_to_end(job)
+
+        if deferred or forced or infeasible:
+            self.logger.info(
+                f"[DESIGNATE] Agent={self.agent_id} candidates={len(pending_jobs)} "
+                f"mine={len(mine)} deferred={deferred} forced={forced} "
+                f"infeasible={infeasible} peers={len(agents)}"
+            )
+        return mine
+
     def selection_main(self):
         self.logger.info(f"Starting agent: {self}")
         while self.live_agent_count != self.configured_agent_count:
@@ -272,6 +356,15 @@ class LlmAgent(ResourceAgent):
                     continue
                 proposals = []
                 jobs = []
+
+                # Step 0 (optional): decide who *should* bid on each job using the cheap analytic
+                # model, and drop the rest. This is the only step that reduces LLM calls per
+                # placed job; everything below still scores only this agent.
+                if self.designate_bidder:
+                    pending_jobs = self._designate_bidders(pending_jobs)
+                    if not pending_jobs:
+                        time.sleep(0.5)
+                        continue
 
                 # Step 1: Compute cost matrix ONCE for all agents and jobs
                 # Scoring the jobs on itself.
