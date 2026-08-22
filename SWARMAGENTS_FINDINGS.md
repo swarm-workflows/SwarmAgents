@@ -23,6 +23,7 @@ is "quietly invalid experiment", not "crash".
 | 10 | Fixed (uncommitted) | Medium (silent) | Selection and consensus both tie-break on agent id, and the proposal cost carries the id |
 | 11 | **Open** | **High (silent)** | Under Snow, peers vote with the analytic cost — an LLM agent's bid is never consulted |
 | 12 | **Open** | Low (analysis-only) | Per-agent job summaries are printed once per level but all labelled `[no_restarts]`, so a hierarchical run's blocks are indistinguishable |
+| 13 | **Open** | Low (silent) | `config_swarm_multi.yml` defines `peer_expiry_seconds` twice in `runtime:` — YAML keeps the last, so the documented 300 s is silently 45 s |
 
 ---
 
@@ -328,3 +329,35 @@ explicitly, or derive it as `f"level{level}"` when `level` is set and
 
 This matters for the planned hierarchical fault arm: those runs are the ones whose placement most
 needs reading, and today their logs are the ones that cannot be read unambiguously.
+
+### 13. Duplicate `peer_expiry_seconds` in the shipped config (silent)
+
+`runtime:` in `config_swarm_multi.yml` sets the same key twice:
+
+```yaml
+runtime:
+  peer_expiry_seconds: 300
+  ...
+  peer_expiry_seconds: 45
+```
+
+YAML keeps the **last** occurrence, so the effective value is **45 s**, not the 300 s the first
+line and `CLAUDE.md` both advertise ("Time before marking agent as stale (default: 300s)"). No
+parser warns, and both values are plausible, so reading the file top-down gives the wrong answer.
+
+Found while checking what actually governs the scheduling-latency figures (test plan 4.0). It did
+not affect any result — `failed_agents` is 0 in every run and heartbeat, not peer expiry, is
+authoritative for reassignment — but it means a documented knob has not had its documented value
+in any run of the campaign.
+
+**Fix:** delete one. If 45 s is intended, update `CLAUDE.md` and the surrounding comment to match;
+if 300 s is, remove the later line. Worth a schema check on the config more generally — a
+duplicate-key lint would have caught this and would catch the next one.
+
+Two smaller things in the same block, neither load-bearing:
+
+- `reselection_timeout_s: 300`, while the code default is 60 (`resource_agent.py:500`) and the
+  test plan long assumed 60. Not a bug, but the gap between shipped and default values is worth
+  knowing when reading latency figures.
+- `total_agents: 5` sits in `runtime:` while every run of this campaign uses 30 agents, and
+  nothing appears to read it. Stale, and misleading to anyone auditing the config.

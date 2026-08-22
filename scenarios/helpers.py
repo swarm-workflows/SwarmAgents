@@ -495,20 +495,27 @@ def _restarts_and_conflicts(run_dir: str) -> dict:
         out["restarts"] = marks["restart_log_lines"]
         return out
 
-    # Two sources are only worth having if they are compared. Both are printed by report(), but
-    # a reader has to notice two rows disagree; say it out loud instead. A mismatch means either
-    # Metrics under-recorded restarts or a log carries restarts the export missed, and both
-    # change what a "0 restarts" claim is worth.
-    logged = marks["restart_log_lines"] + marks["reselection_log_lines"]
+    # Two sources are only worth having if they are compared. Both are printed by report(), but a
+    # reader has to notice two rows disagree; say it out loud too.
+    #
+    # These are TWO INDEPENDENT checks, deliberately not chained. An earlier version made the
+    # reselection check an `elif` on `restarts == 0`, which meant that a run with restarts
+    # agreeing at a nonzero value hit neither branch and its reselection evidence disappeared —
+    # the same "collected but never surfaced" bug one level down.
     if out["restarts"] != marks["restart_log_lines"]:
-        print(f"  !! restart sources disagree for {run_dir}: metrics.json={out['restarts']}, "
-              f"'RESTART: Job:' log lines={marks['restart_log_lines']}, "
-              f"'leaving for reselection' log lines={marks['reselection_log_lines']}. "
+        print(f"  !! restart sources disagree for {run_dir}: metrics.json="
+              f"{out['restarts']}, 'RESTART: Job:' log lines={marks['restart_log_lines']}. "
               f"Trust neither until reconciled — metrics.json is what the `restarts` row reports.")
-    elif out["restarts"] == 0 and logged:
-        print(f"  !! metrics.json reports 0 restarts for {run_dir} but the logs show "
-              f"{logged} reselection-related line(s). Any latency attributed to queueing "
-              f"(see 4.0) needs re-checking.")
+
+    # Unconditional, and never folded into `restarts`: the Snow engine's max_rounds path logs
+    # this without touching the restart counter, so it is evidence no value of `restarts` can
+    # account for. Gating it on restarts==0 hid it exactly when restarts was also happening,
+    # i.e. when a run was most disturbed.
+    if marks["reselection_log_lines"]:
+        print(f"  !! {marks['reselection_log_lines']} 'leaving for reselection' line(s) in "
+              f"{run_dir}, from the Snow engine's max_rounds path. That path does not increment "
+              f"the restart counter, so the `job restarts` row ({out['restarts']}) does NOT "
+              f"include them. Any latency attributed to queueing (4.0) needs re-checking.")
     return out
 
 

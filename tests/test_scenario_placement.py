@@ -321,14 +321,38 @@ class TestRestartAndLatencyMetrics:
         assert "restart sources disagree" in out
         assert "metrics.json=0" in out and "log lines=3" in out
 
-    def test_zero_metrics_with_reselection_logs_is_announced(self, tmp_path, monkeypatch, capsys):
+    def test_reselection_logs_announced_when_restarts_are_zero(self, tmp_path, monkeypatch,
+                                                              capsys):
         """The Snow path logs reselection without going through the restart counter."""
         run = self._run(tmp_path, monkeypatch,
                         metrics={"1": {"restarts": {}}},
                         agent_log="elapsed=9s — max_rounds exhausted, leaving for reselection\n")
         helpers.collect(run)
         out = capsys.readouterr().out
-        assert "0 restarts" in out and "reselection-related line" in out
+        assert "leaving for reselection" in out and "does NOT" in out
+
+    def test_reselection_logs_announced_when_restarts_are_nonzero(self, tmp_path, monkeypatch,
+                                                                 capsys):
+        """The case a chained `elif` hid: sources agree at a NONZERO value, and reselection
+        evidence exists anyway.
+
+        `restarts == restart_log_lines == 2` skips the disagreement branch, and gating the
+        reselection check on `restarts == 0` then skipped that too — so 5 lines of Snow-path
+        evidence vanished precisely when the run was most disturbed. The two checks must be
+        independent.
+        """
+        log = ("RESTART: Job: a reset to Pending 60.0 seconds\n"
+               "RESTART: Job: b reset to Pending 60.0 seconds\n"
+               + "elapsed=9s — max_rounds exhausted, leaving for reselection\n" * 5)
+        run = self._run(tmp_path, monkeypatch,
+                        metrics={"1": {"restarts": {"a": 1, "b": 1}}}, agent_log=log)
+        m = helpers.collect(run)
+        out = capsys.readouterr().out
+
+        assert m["restarts"] == 2 == m["restart_log_lines"], "precondition: sources agree, nonzero"
+        assert "disagree" not in out, "they agree, so no disagreement warning"
+        assert "5 'leaving for reselection' line(s)" in out, "the Snow evidence must surface"
+        assert m["reselection_log_lines"] == 5
 
     def test_agreement_is_silent(self, tmp_path, monkeypatch, capsys):
         """No warning when the sources agree — otherwise every clean run cries wolf."""

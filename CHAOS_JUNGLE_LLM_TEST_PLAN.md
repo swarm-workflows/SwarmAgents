@@ -351,9 +351,14 @@ Redis `SET NX` in the Snow engine. Safety must never degrade, only performance.
 
 ### 4.0 What "scheduling latency" actually measures — and why it is not reselection (2026-08-22)
 
-Every result table quotes a scheduling latency of 78–563 s, which looks alarming next to a 60 s
-`reselection_timeout_s`: the natural reading is that jobs are timing out and being restarted. They
-are not, and the check is worth recording because the metric invites that reading.
+Every result table quotes a scheduling latency of 78–563 s against a `reselection_timeout_s` of
+**300 s** (the shipped value — not the 60 s code default), and in the baseline 41 jobs — 146 under
+`inject_distractor` — wait longer than that. The natural reading is that they timed out and were
+restarted. They were not, and the check is worth recording because the metric invites it.
+
+The timer does not apply to these jobs: `resource_agent.py:825` restarts a job that has been
+*selected* and then stalled, while a job accumulating pool wait is still PENDING and has never
+been selected. Waiting to be picked is not the same as being stuck after being picked.
 
 `all_jobs.csv` carries the phase timestamps, so the total can be split rather than guessed at:
 
@@ -399,12 +404,38 @@ with how expensive a bid is — S05's instant analytic bids drain in 140 s, `inj
 > The log counts are reported under their own keys as a cross-check on `metrics.json` rather than
 > merged into it, so a disagreement between the two sources stays visible.
 
-> **Open question worth a look, unrelated to any fault.** The fleet drains ~0.9 jobs/s at baseline
-> and ~2.2 jobs/s when bids are analytic, with 30 agents available and selection costing 1.0 s.
-> A flat 1.0 s that does not vary across three arms and four fault types looks like a tick or
-> sleep granularity rather than measured work (`consensus.snow.tick_interval_ms`; note also that
-> `Job.execute()` sleeps a flat 1 s — finding 9). Whether placement is more serialized than it
-> needs to be is untested; `max_inflight` ships at 16, so it is not a hard cap of one.
+**Why selection costs exactly 1.0 s — it is a tuning choice, not an artefact.** Snow commits
+after `beta: 6` consecutive winning rounds, and the config's own comment records the measurement:
+*"beta=6 → 0.96s selection"*. Six sequential rounds at ~165 ms each is the 1.0 s. It is invariant
+across arms and faults because it depends on round-trip time to k peers, not on the LLM.
+(`tick_interval_ms` is 50 ms, so this is not tick granularity — an earlier draft of this section
+guessed that and was wrong.)
+
+> **Where the queue wait actually comes from, and how it could be addressed.** This is the largest
+> single lever on every latency figure in this document, since scheduling latency *is* pool wait.
+>
+> The fleet drains 300 jobs at **~0.89 jobs/s** at baseline (338 s) and ~2.2 jobs/s when bids are
+> analytic (139 s). With selection at 1.0 s, 0.89 jobs/s is **one placement per selection round,
+> fleet-wide** — 30 agents and `max_inflight: 16` per agent, yet an effective concurrency of ~1.
+>
+> The likely cause is the same mechanism as §4f.2: **race-to-propose.** Every agent scores the
+> *same* pool and proposes the *same* job, and `try_claim_assignment`'s Redis `SET NX` lets
+> exactly one win. Thirty agents racing for one job is one placement per round, not thirty — so
+> adding agents would add contention rather than throughput. That predicts something sharply
+> testable: **drain rate should be roughly independent of fleet size.** Run 10 / 30 / 60 agents on
+> the same trace; if throughput stays near 0.9 jobs/s, the scheduler does not scale with the
+> fleet, which is a more consequential finding than any single fault result here.
+>
+> Three levers, cheapest first:
+>
+> | lever | change | expected | risk |
+> |---|---|---|---|
+> | **Lower `beta`** | 6 → 3 | selection ~1.0 s → ~0.5 s, so ~2× throughput | safety margin `(1-α)^β` goes 7e-4 → 2.7e-2 per decision; the `SET NX` claim is still the hard exactly-once backstop |
+> | **Batch the commit** | one consensus round places N jobs, not one | up to `jobs_per_proposal` (20) × | needs checking whether the engine commits per-proposal or per-job — if per-job, this is a code change, not a config one |
+> | **Partition the pool** | shard candidate jobs across agents (e.g. hash job id → agent subset) so they stop competing for the same job | breaks the 1-per-round ceiling structurally | changes selection semantics; interacts with the fairness and capture measurements throughout §4d |
+>
+> Measure before tuning: the fleet-size sweep above distinguishes "serialized by design" from
+> "some other bottleneck", and it needs no fault injection at all.
 
 ### 4.1 Is Jain's fairness the right metric here? Partly — and it must be quoted differently
 
@@ -1482,6 +1513,7 @@ term was inert, the fleet differed between runs, or the LLM was never consulted.
 | 10 | Fixed `6ea14df1` | Selection and consensus both tie-broke on agent id, and the proposal cost carried it (§4e.3) |
 | 11 | **Open** | Under Snow, peers vote with the **analytic** cost — an LLM agent's bid is never consulted |
 | 12 | **Open** | Hierarchical per-agent summaries are all labelled `[no_restarts]`, so a run's own blocks are indistinguishable |
+| 13 | **Open** | `peer_expiry_seconds` is defined twice in the shipped config — the documented 300 s is silently 45 s |
 
 ## 8. Runbook
 
