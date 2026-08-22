@@ -14,9 +14,11 @@ blast radii: [§4b.1](#4b1-scenario-index--what-has-been-run-and-where).**
 
 **A non-fault result worth reading first (§4.0b):** a 14/30/60-agent sweep on prefix-identical
 fleets shows **placement throughput does not scale with the fleet** — 4.3× the agents buys 0.86×
-the throughput, while the number of agents bidding per job grows 2.76×. With inference removed
-entirely the same sweep gives 1.45×, so there are two limits: a sub-linear scheduler and a
-redundant-inference cost that cancels it.
+the throughput, while the number of *distinct agents bidding per job* grows 2.76× (measured; each
+agent bids exactly once per job). The same sweep with much cheaper bids gives 1.45×. Redundancy
+grows in both arms and bid cost in only one, consistent with the first capping scaling and the
+second turning it negative — a reading the sweep supports but does not prove, since the deciding
+intervention is still unrun.
 
 The result that reframes the rest: **completion never degrades under any LLM fault measured** —
 300/300 jobs across every scenario, arm and blast radius — because placement is decided by *when*
@@ -661,9 +663,10 @@ The analytic arm is also ~3.8× faster in absolute terms (3.64 vs 0.96 jobs/s at
 same effect S05 found from the fault side: replacing LLM bids with analytic ones drains the queue
 several times faster (§4d.1).
 
-**What this means for the levers in §4.0.** Narrowing who bids is now the clearly indicated
-change, because `calls_per_job` is the term that grows with the fleet and it is the term the
-lever targets. It also means the ceiling is *not* something a faster endpoint fixes: bid latency
+**What this means for the levers in §4.0.** Narrowing who bids is the best-supported change,
+because bidders-per-job is measurably the term that grows with the fleet, and it grows in both
+arms. That is an argument for *testing* the lever, not evidence that it will work — the experiment
+is what would establish the causal link. It also means the ceiling is *not* something a faster endpoint fixes: bid latency
 itself degrades 1.76× as the fleet grows, so a faster model buys a constant factor and leaves the
 scaling shape intact. And the analytic control bounds the prize — even free bids only bought
 1.45×, so throughput work should not be sold as unlocking linear scaling.
