@@ -477,13 +477,28 @@ guessed that and was wrong.)
 > | **Cut bid latency** | faster model/endpoint | linear | already characterised in §4c and §4e.6 |
 > | ~~**Lower `beta`**~~ | ~~6 → 3~~ | **withdrawn** | consensus is 1.0 s *per job* but overlaps across jobs (`max_inflight: 16`), so it is not the serial term. An earlier version of this note proposed it as the top lever, from a coincidence between the drain rate and the selection time. |
 >
-> **A rank gate over the whole fleet would strand jobs — do not build that.** The obvious form,
+> **A rank gate over the whole fleet would lose jobs — do not build that.** The obvious form,
 > "bid only if `tiebreak_rank(j, a)` is in the top *m* of all 30 agents", is broken: the gate is
-> blind to feasibility, and **the median job is feasible on only 9 of 30 agents** (§2.2). Gating to
-> *m*=2 out of 30 would leave a job with *no* eligible bidder roughly half the time — and a job
-> with no bidder does not fail fast. It sits PENDING until `reselection_timeout_s` (300 s in the
-> shipped config) or is retired after `max_infeasible_retries: 10`. That is precisely the
-> head-of-line blocking that per-file DTN spreading caused in §2.2, reintroduced deliberately.
+> blind to feasibility, and **the median job is feasible on only 9 of 30 agents** (§2.2). With
+> feasibility at ~30% per agent, gating to *m*=2 leaves a job with no eligible bidder for a large
+> fraction of jobs — order half, if feasibility were independent across agents, which it is not
+> (it is set by DTN and capacity overlap), so treat that as a rough magnitude and not a rate.
+>
+> What happens to such a job is worse than a delay. Tracing it (`resource_agent.py` ~2040): an
+> agent that cannot run a job sets it **BLOCKED** and moves it to the back of the queue, and
+> `_restore_infeasible_jobs` returns it to PENDING after ~5 s. So the cost of a gate miss is a
+> ~5 s retry cycle — *not* the 300 s `reselection_timeout_s`, which as §4.0 established covers a
+> job that stalled **after** being selected, not one that has never been selected. But the retry
+> is not free: `max_infeasible_retries: 10` retires a job that keeps coming back, so a job whose
+> top-*m* ranked agents are permanently infeasible is **eventually dropped**. The failure mode is
+> silent job loss and a completion rate below 300/300 — the one metric no fault in this campaign
+> has moved. That is a strictly worse outcome than the §2.2 stall it resembles, because a stall is
+> visible and a retirement is not.
+>
+> *An aside that corroborates §4.0:* the branch immediately below, deferring a job that is
+> "BETTER suited for agent X", is unreachable in the LLM path — with `agents = [self]` the only
+> candidate assignee is always this agent, so `selected_agent.agent_id != self.agent_id` never
+> holds. Confirmation from a second angle that nothing partitions the pool today.
 >
 > The fix is to rank **within the feasible set**, which is computable locally: `is_job_feasible`
 > takes an arbitrary `AgentInfo`, so an agent can evaluate feasibility *for its peers* from
