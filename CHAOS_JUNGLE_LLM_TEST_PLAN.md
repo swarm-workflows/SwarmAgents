@@ -30,11 +30,15 @@ an agent bids, not *what* it bids ([§4f.2](#4f2-one-mechanism-behind-three-scen
 That makes the semantic tier's intended headline (a poisoned-agent tolerance threshold)
 unmeasurable: there is no threshold, which is the finding.
 
-**How this document is organized.** §1–3 are environment and fault-free baselines; §4 is metrics;
-**§4b–4g are the results, one section per CJ scenario** (S01 → §4c, S05 → §4d, S09 → §4e), each
-holding every arm and blast radius for that scenario, followed by cross-scenario findings (§4f)
-and endpoint measurements (§4g). §5 is the forward-looking matrix, §6–7 the bugs found, §8 the
-runbook, §9 gotchas, §10 next steps.
+**How this document is organized.** Six parts, listed in [Contents](#contents) below: **I** setup
+and method (what a number depends on), **II** the scenario results one section per CJ scenario
+(S01 → §4c, S05 → §4d, S09 → §4e), **III** studies and ablations that vary the scheduler rather
+than inject a fault, **IV** the remaining matrix and next steps, **V** findings for CJ and for
+SwarmAgents, **VI** the runbook and operational gotchas.
+
+Read Part I before quoting a number from Part II: nearly every result in this campaign is
+arm-specific, and several were wrong once because a delta was read across arms or against the
+wrong control.
 
 | | |
 |---|---|
@@ -44,6 +48,101 @@ runbook, §9 gotchas, §10 next steps.
 | **Workload** | Frozen 300-job trace (16 workflows) merged from real Pegasus runs — see [§2.2](#22-workload--a-frozen-reproducible-mixed-pegasus-trace) |
 
 ---
+
+## Contents
+
+Section labels (§4d.2, §4f.3, …) are **unchanged**: they are cited ~100 times in this document and from the commit history, so the parts below reorganise *where* sections sit without renumbering them.
+
+**[Part I — Setup and method](#part-i--setup-and-method)** — what a number depends on — fault injection, arms, workload, baselines, metrics
+
+- [1. How CJ injects faults into SwarmAgents](#1-how-cj-injects-faults-into-swarmagents)
+- [2. Environment](#2-environment)
+  - [2.1 Two LLM backends ("arms")](#21-two-llm-backends-arms)
+  - [2.1b Ollama Cloud — evaluated and rejected as a primary arm (2026-08-19)](#21b-ollama-cloud--evaluated-and-rejected-as-a-primary-arm-2026-08-19)
+  - [2.2 Workload — a frozen, reproducible mixed Pegasus trace](#22-workload--a-frozen-reproducible-mixed-pegasus-trace)
+  - [2.3 Isolating inference from the agent (SWIM false positives)](#23-isolating-inference-from-the-agent-swim-false-positives)
+- [3. Validated baselines (fault-free)](#3-validated-baselines-fault-free)
+- [4. Metrics, oracles, and what we are actually measuring](#4-metrics-oracles-and-what-we-are-actually-measuring)
+  - [4.0 What "scheduling latency" actually measures — and why it is not reselection (2026-08-22)](#40-what-scheduling-latency-actually-measures--and-why-it-is-not-reselection-2026-08-22)
+  - [4.1 Is Jain's fairness the right metric here? Partly — and it must be quoted differently](#41-is-jains-fairness-the-right-metric-here-partly--and-it-must-be-quoted-differently)
+- [4b. Scenario harness](#4b-scenario-harness)
+  - [4b.1 Scenario index — what has been run, and where](#4b1-scenario-index--what-has-been-run-and-where)
+
+**[Part II — Scenario results](#part-ii--scenario-results)** — one section per CJ scenario: every arm, every blast radius, mechanism, replication
+
+- [4c. S01 — LLMLatency (matrix row L1)](#4c-s01--llmlatency-matrix-row-l1)
+  - [4c.1 Results — the +3 s / 100% point on all three arms](#4c1-results--the-3-s--100-point-on-all-three-arms)
+  - [4c.2 The L1 dose-response curve (gateway arm, 2026-08-20)](#4c2-the-l1-dose-response-curve-gateway-arm-2026-08-20)
+  - [4c.3 Reading a latency injection: order statistics, not the mean](#4c3-reading-a-latency-injection-order-statistics-not-the-mean)
+  - [4c.4 Does S01 replicate across arms?](#4c4-does-s01-replicate-across-arms)
+  - [4c.5 S01 findings](#4c5-s01-findings)
+- [4d. S05 — LLMUnavailable (503) (matrix row L3)](#4d-s05--llmunavailable-503-matrix-row-l3)
+  - [4d.1 Results — every arm and blast radius](#4d1-results--every-arm-and-blast-radius)
+  - [4d.2 Mechanism — the LLM-blind agents capture the work](#4d2-mechanism--the-llm-blind-agents-capture-the-work)
+  - [4d.3 The fairness improvement does **not** replicate](#4d3-the-fairness-improvement-does-not-replicate)
+  - [4d.4 Does S05 replicate across arms?](#4d4-does-s05-replicate-across-arms)
+  - [4d.5 Method note — a capture ratio is meaningless without its no-fault control](#4d5-method-note--a-capture-ratio-is-meaningless-without-its-no-fault-control)
+  - [4d.6 Correction](#4d6-correction)
+  - [4d.7 S05 findings](#4d7-s05-findings)
+- [4e. S09 — SemanticCorrupt (matrix rows T2-1…T2-4)](#4e-s09--semanticcorrupt-matrix-rows-t2-1t2-4)
+  - [4e.1 Results — every arm and blast radius (`entity_swap`)](#4e1-results--every-arm-and-blast-radius-entity_swap)
+  - [4e.2 Mechanism — placement is decided by a race, not by the bid](#4e2-mechanism--placement-is-decided-by-a-race-not-by-the-bid)
+  - [4e.3 S09b — fixing the tie-break, and what it proved (2026-08-19)](#4e3-s09b--fixing-the-tie-break-and-what-it-proved-2026-08-19)
+  - [4e.4 Does S09 replicate across arms?](#4e4-does-s09-replicate-across-arms)
+  - [4e.5 Correction](#4e5-correction)
+  - [4e.6 All four modes, gateway arm (2026-08-21) — the prediction half held](#4e6-all-four-modes-gateway-arm-2026-08-21--the-prediction-half-held)
+  - [4e.7 S09 findings](#4e7-s09-findings)
+
+**[Part III — Studies and ablations](#part-iii--studies-and-ablations)** — experiments that vary the scheduler instead of injecting a fault
+
+- [4.0b Fleet-size sweep — throughput does not scale with the fleet (2026-08-22)](#40b-fleet-size-sweep--throughput-does-not-scale-with-the-fleet-2026-08-22)
+  - [A second, cheap-bid regime — obtained by accident, and not a control](#a-second-cheap-bid-regime--obtained-by-accident-and-not-a-control)
+- [4.0c Designated bidding, run once — one clear answer, and a confounded run (2026-08-22)](#40c-designated-bidding-run-once--one-clear-answer-and-a-confounded-run-2026-08-22)
+- [4.0d Figure D — the fallback is not a safety net at partial radius, it is the pathology (2026-08-22)](#40d-figure-d--the-fallback-is-not-a-safety-net-at-partial-radius-it-is-the-pathology-2026-08-22)
+  - [4.0d.1 The 100% case, measured on the retry (2026-08-22) — a total stall](#40d1-the-100-case-measured-on-the-retry-2026-08-22--a-total-stall)
+- [4f. Cross-scenario findings](#4f-cross-scenario-findings)
+  - [4f.1 S01 vs S05 — it is not slowness that hurts, it is skipping the LLM](#4f1-s01-vs-s05--it-is-not-slowness-that-hurts-it-is-skipping-the-llm)
+  - [4f.2 One mechanism behind three scenarios: race-to-propose](#4f2-one-mechanism-behind-three-scenarios-race-to-propose)
+  - [4f.3 Membership — a slow LLM is not a risk, a starved host is](#4f3-membership--a-slow-llm-is-not-a-risk-a-starved-host-is)
+    - [Root cause of the unplanned fault: memory, not the model (2026-08-19)](#root-cause-of-the-unplanned-fault-memory-not-the-model-2026-08-19)
+- [4g. Endpoint properties measured along the way](#4g-endpoint-properties-measured-along-the-way)
+
+**[Part IV — What is left to do](#part-iv--what-is-left-to-do)** — the experiment matrix with per-row status, and ordered next steps
+
+- [5. Experiment matrix](#5-experiment-matrix)
+  - [Tier 1 — LLM API faults (CJ Layer 1) — core of the paper](#tier-1--llm-api-faults-cj-layer-1--core-of-the-paper)
+  - [Tier 2 — Semantic / RAG faults (CJ Layer 4) — the "silent-wrong" story](#tier-2--semantic--rag-faults-cj-layer-4--the-silent-wrong-story)
+  - [Tier 3 — Composite "bad day" (the single infra touchpoint)](#tier-3--composite-bad-day-the-single-infra-touchpoint)
+  - [Tier 4 — Dosing strategies](#tier-4--dosing-strategies)
+  - [Baselines & ablations](#baselines--ablations)
+- [10. Next steps](#10-next-steps)
+
+**[Part V — Findings](#part-v--findings)** — defects that outlive the campaign — for CJ, and for SwarmAgents
+
+- [6. Findings for the CJ maintainers](#6-findings-for-the-cj-maintainers)
+- [7. SwarmAgents bugs found and fixed](#7-swarmagents-bugs-found-and-fixed)
+
+**[Part VI — Operations](#part-vi--operations)** — the runbook, in order, and the failure modes that have cost runs
+
+- [8. Runbook](#8-runbook)
+  - [8.0 Mandatory pre-run health gate — before EVERY run](#80-mandatory-pre-run-health-gate--before-every-run)
+  - [8.1 Mandatory pre-run cleanup — before EVERY run](#81-mandatory-pre-run-cleanup--before-every-run)
+  - [8.2 Select the LLM arm](#82-select-the-llm-arm)
+  - [8.2b Frozen fleet + trace (do this ONCE, then reuse for every run)](#82b-frozen-fleet--trace-do-this-once-then-reuse-for-every-run)
+  - [8.3 Run](#83-run)
+  - [8.4 Read the results](#84-read-the-results)
+  - [8.5 Inject a fault](#85-inject-a-fault)
+  - [8.6 Regenerating the Pegasus workload (optional)](#86-regenerating-the-pegasus-workload-optional)
+  - [8.6b Leave the slice idle when you stop](#86b-leave-the-slice-idle-when-you-stop)
+  - [8.7 Teardown / secret hygiene](#87-teardown--secret-hygiene)
+  - [8.8 Helper scripts on the slice](#88-helper-scripts-on-the-slice)
+- [9. Operational gotchas](#9-operational-gotchas)
+
+---
+
+# Part I — Setup and method
+
+What a number in this document depends on: how the fault gets in, which LLM arm and workload produced it, what the fault-free reference is, and what each metric can and cannot show. Read this before quoting anything from Part II.
 
 ## 1. How CJ injects faults into SwarmAgents
 
@@ -582,378 +681,6 @@ guessed that and was wrong.)
 > `generate_configs.py 30 10 …`, whose second argument is that batch size, so the per-agent
 > configs carry 10. The base config's value has not been in effect for any run in this campaign.
 
-### 4.0b Fleet-size sweep — throughput does not scale with the fleet (2026-08-22)
-
-The falsifiable prediction from §4.0, run. **It holds: adding agents does not add placement
-throughput, and on the LLM arm it slightly reduces it.**
-
-14 / 30 / 60 agents, gateway arm, the same frozen 300-job Pegasus trace, `jobs_per_proposal: 10`
-throughout. All three fleets are **strict prefixes of one 60-agent master**, so agent *i* has
-identical capacities and DTNs at every size and the only variable is how many agents exist. That
-took building: `generate_configs` allocates capacity flavours as *percentages of fleet size*
-(`generate_configs.py:129`), so `--seed 42` gives agent 3 sixteen cores in a 10-agent fleet and
-two in a 30-agent fleet — a seed cannot make fleets comparable. 14 rather than 10 because agents
-1–10 of the master cannot satisfy two capacity-heavy jobs (DTN coverage is complete even at N=8,
-so it is capacity, not connectivity), and a run that strands work measures stranding.
-
-| fleet | drain | **jobs/s** | calls/job | bid latency | parallel agents | fairness | completed | restarts |
-|---|---|---|---|---|---|---|---|---|
-| 14 | 313 s | **0.96** | 2.17 | 4.06 s | 8.6 | 0.395 | 300 | 0 |
-| 30 | 316 s | **0.95** | 3.70 | 5.02 s | 18.1 | 0.826 | 300 | 0 |
-| 60 | 365 s | **0.82** | 5.98 | 7.15 s | 35.8 | 0.743 | 300 | 0 |
-
-**4.3× the fleet buys 0.86× the throughput.** Flat would be 1.0×; linear would be 4.3×. Every
-number above is a direct measurement; §4.0's throughput model is deliberately *not* quoted as
-corroboration, for the reason in the box below.
-
-> **Withdrawn: the model does not validate against these runs, and cannot.** An earlier version of
-> this section reported that §4.0's model "predicts every point to within 3%" and called it the
-> strongest evidence the bottleneck was understood. **That agreement is an algebraic identity.**
-> Substituting the terms as they are measured —
-> `parallel = matrix_time / drain`, `calls_per_job = n_bids / jobs`, `bid_latency = mean(bids)` —
-> gives
->
-> ```
-> predicted / measured  =  matrix_time / Σ bid_latencies
-> ```
->
-> and cost-matrix computation is *where the LLM calls happen*, so those two quantities are the
-> same clock read twice. Measured: the ratio is 1.018 / 1.026 / 1.019 at 14 / 30 / 60, and
-> predicted-over-measured is 1.021 / 1.032 / 1.024 — the same numbers. The "3%" was the fraction
-> of matrix time that is *not* LLM calls, i.e. loop overhead. The same objection applies to the
-> three-run "within 3%" claim in §4.0, which is withdrawn on the same grounds, and to the
-> decomposition ratio `parallel_ratio / cost_ratio`, which collapses to `drain₁₄ / drain₆₀` for
-> the same reason.
->
-> What the model is good for is **attribution** — it is a correct accounting of where wall-clock
-> goes, and it says the fleet spends its time in redundant bidding. What it cannot do is
-> *predict* throughput, because throughput is one of its inputs.
-
-The decomposition below is therefore offered as accounting, not as evidence:
-
-| term | 14 → 60 | reading |
-|---|---|---|
-| parallel agents | **4.15×** | capacity scales almost perfectly with the fleet |
-| calls per job | **2.76×** | more agents means more agents bidding on the *same* job |
-| bid latency | **1.76×** | more concurrent clients on a shared endpoint (§2.1) |
-
-**What is actually established — one within-arm measurement, and it is thin.** Only one thing
-replaces the withdrawn model fit:
-
-**The redundancy is real, and it is agents rather than retries.** `calls_per_job` could rise
-either because more agents bid on a job or because one agent re-bids on it. Counted per
-`(job, agent)` pair, **every pair produces exactly one bid at every fleet size** — so
-`calls_per_job` *is* distinct bidders per job: **2.17 → 3.70 → 5.98**, a 2.76× rise for a 4.3×
-fleet, with zero re-bidding. That is a measurement, not an inference, and it is confined to the
-LLM arm.
-
-What it supports is one correlation: within the LLM arm, bidders-per-job rises 2.76× while
-throughput falls to 0.86×. **One correlation over three points is thin support for a causal
-mechanism**, and it is all there is. The intervention is what would settle it.
-
-**Both regimes, reported side by side as description only.** Per-term, 14 → 60:
-
-| arm | bidders/job | cost per bid | busy fraction | consensus | **throughput** |
-|---|---|---|---|---|---|
-| LLM | 2.17 → 5.98 (**2.76×**) | 4.06 → 7.15 s (**1.76×**) | 0.61 → 0.60 (flat) | degenerate (finding 11) | **0.86×** |
-| cheap-bid | 2.34 → 7.05 (**3.01×**) | 1.33 s (**flat**) | 0.56 → 0.57 (flat) | normal | **1.45×** |
-
-The only claim this table supports is the descriptive one: **no regime tested comes close to
-linear scaling** — 1.45× and 0.86× against a 4.3× fleet. It does **not** support "redundancy grows
-in both, therefore redundancy is the shared cause", and it does not support "the LLM arm's ceiling
-is not LLM cost because the other arm also has a ceiling". Both were argued here earlier and both
-are withdrawn: the arms differ in five ways including whether the dominance rule degenerates
-(box below), so they may be sub-linear for entirely different reasons.
-
-> **The second arm is NOT a one-variable control, and was wrongly described as one.** It was
-> introduced as varying "the cost of a bid while leaving the number of bidders intact". It differs
-> in at least five ways, and one of them changes consensus itself:
->
-> | | LLM arm | cheap-bid arm |
-> |---|---|---|
-> | cost per bid | 4.06–7.15 s of real inference | 1.33 s of *failed connection* |
-> | cost signal | `100 − score`, range 25–75 | analytic utilisation, range 0–1 |
-> | **dominance rule** | proposer advertises 25–75, **peers price 0–1** → degenerates (finding 11) | both sides 0–1 → behaves normally |
-> | bidders/job | 2.17 → 5.98 | 2.34 → 7.05 (not identical, and scales differently) |
-> | work per bid | parse a score, cache it | throw, then compute the analytic cost anyway |
->
-> The dominance-rule row is the serious one: under Snow a peer compares its own 0–1 analytic cost
-> against an advertised 25–75 LLM cost and concludes it dominates essentially always, so the two
-> arms are not running the same consensus. A throughput difference between them cannot be
-> attributed to bid cost alone.
->
-> So this arm does not bound the LLM arm either — an earlier revision claimed it "shows the
-> sub-linear ceiling is not an artefact of expensive inference", which is the same cross-arm
-> inference in weaker clothing. What it establishes is about *itself*: a fleet with 1.33 s bids and
-> a working dominance rule also fails to scale, which is worth knowing as a second data point and
-> is not an explanation of the first. A closer control would be
-> `--agent-type resource`, which is analytic by design — no failure path, consistent cost scale on
-> both sides, dominance rule intact — and that is worth one run. Even it changes the cost signal,
-> which is why the only genuinely one-variable test remains the rank gate: same agents, same
-> costs, same consensus, fewer bidders.
-
-> **Two corrections to how this was first argued.** The second arm (then called "the analytic
-> control") was described as
-> "removing bids entirely… nothing else about the scheduler changed, so bid cost was the term
-> suppressing it". Both halves were wrong. Its bids were **not free** — each failed connection
-> attempt cost a median **1.33 s** before falling back — and redundancy was **not** held constant,
-> it scaled 3.01× there too. What the control actually varies is the *cost* of a bid while leaving
-> the *number* of bidders intact, which is a useful contrast but a different one.
->
-> And none of this is a causal demonstration. Both terms are correlations across a 4.3× fleet
-> range, consistent with the mechanism and not proof of it. The only test that would settle it is
-> an **intervention**: cut bidders-per-job and see whether throughput moves as the accounting says
-> it should. That is the rank-gate experiment (§4.0), still unrun, and it is now the obvious next
-> step precisely because the observational evidence has gone as far as it can.
-
-**Correctness is untouched at every size:** 300/300 completed, 0 stuck, 0 restarts, 0 reselection
-lines. Whatever this costs in throughput, it costs nothing in safety.
-
-**An open question from §4.0 is answered.** "Why is parallelism ~17 of 30?" — it is not a fixed
-ceiling of 17, it is a constant *fraction*: 8.6/14, 18.1/30, 35.8/60 are all **0.60**. Agents are
-inside cost computation ~60% of the time at every fleet size, and the residual 40% is loop sleeps,
-queue waits and consensus. Parallelism therefore scales fine; the problem is entirely on the cost
-side.
-
-#### A second, cheap-bid regime — obtained by accident, and not a control
-
-A misconfigured earlier attempt pointed all three fleets at a stopped local Ollama, so every bid
-failed and every agent used the analytic cost — 703 fallbacks, 0 LLM completions. It is preserved
-(`runs/fleet{14,30,60}-gw`) because it is a clean control for the same sweep with inference
-removed:
-
-| fleet | drain | jobs/s | parallel | fairness | completed |
-|---|---|---|---|---|---|
-| 14 | 120 s | 2.51 | 7.8 | 0.408 | 300 |
-| 30 | 99 s | 3.03 | 16.9 | 0.799 | 300 |
-| 60 | 82 s | 3.64 | 34.2 | 0.766 | 300 |
-
-**Scaling is positive but still sub-linear: 4.3× the fleet gives 1.45×.** The bids here were not
-free — each failed connection cost a median **1.33 s** before the fallback — so this is a
-*cheap-bid* arm, not a no-bid arm. Taken on its own terms — and it can only be taken on its own
-terms, per the caveat above — it says:
-
-- with bids at 1.33 s, a working dominance rule, and redundancy rising 3.01×, a 4.3× fleet still
-  buys only **1.45×**. Whatever caps scaling here, it is not the cost of an LLM call, because
-  there were none.
-
-What it does *not* license is subtracting one arm from the other. The LLM arm's 0.86× and this
-arm's 1.45× are two separate measurements of two configurations that differ in five ways; the
-difference between them is not attributable to any single term.
-
-This arm is also ~3.8× faster in absolute terms (3.64 vs 0.96 jobs/s at 60 agents), the same
-effect S05 found from the fault side: replacing LLM bids with analytic ones drains the queue
-several times faster (§4d.1).
-
-**What this means for the levers in §4.0.** Narrowing who bids is the best-supported change,
-because bidders-per-job is the one term measured to grow with the fleet. That is an argument for
-*testing* the lever, not evidence that it will work — one correlation over three points is what
-supports it, and only the experiment would establish a causal link.
-
-Two expectation-setting notes, both stated within the LLM arm to avoid the cross-arm trap above.
-A faster endpoint is not the fix: bid latency there degrades 1.76× as the fleet grows, so a faster
-model buys a constant factor and leaves the scaling *shape* intact. And **no configuration tested
-in this campaign has scaled better than 1.45× for a 4.3× fleet** — LLM 0.86×, cheap-bid 1.45× —
-so throughput work should not be sold as unlocking linear scaling. That is a statement about the
-range of observations, not an attribution of either number.
-
-### 4.0c Designated bidding, run once — one clear answer, and a confounded run (2026-08-22)
-
-The intervention §4.0b called for: use the cheap analytic matrix to designate one bidder per job so
-only that agent spends an LLM call (`job_selection.designate_bidder`, off by default). One
-fault-free run, gateway arm, frozen 30-agent fleet and trace, against `cj-baseline-gw2`.
-
-**Read the confound first, because it limits what the rest of the table can be used for.** Of the
-per-iteration decisions to keep a job, **97.8% were deadline-forced rather than designated**
-(`forced=11092` against `mine=11344`). So the active mechanism in this run was mostly *agents
-waiting 30 s and then bidding anyway* — a rate limiter — not a partition.
-
-The deadline is mis-tuned, and my reasoning for 30 s was wrong in the same way as the counter it
-replaced: I sized it against one bid plus consensus (~5-8 s), when the timescale that matters is
-how long the **designee** takes to reach that job in its own window — about 10 jobs at 3.4 s each,
-~34 s, against a ~195 s pool wait. The deadline expires before the designee gets there, routinely.
-The counters cannot resolve this either: `mine`/`deferred`/`forced` increment **per loop iteration**,
-not per job, so they are not job counts. That is a flaw in instrumentation I added and it should be
-per-job-unique before this is run again.
-
-| | baseline | designated | |
-|---|---|---|---|
-| distinct bidders / job | 3.74 | **1.74** | 0.46× |
-| LLM calls | 1123 | **521** | 2.16× fewer |
-| **jobs completed / stuck / restarts** | **300 / 0 / 0** | **300 / 0 / 0** | **unchanged** |
-| inference work (agent-seconds) | 5717 | 1876 | 3.05× less |
-| busy fraction of fleet | 0.56 | 0.17 | 3.3× less |
-| bid latency | 4.95 s | 3.43 s | |
-| drain | 339 s | 368 s | 0.92× throughput |
-| load fairness | 0.849 | 0.276 | −0.573 |
-| placement deciles | 125/88/87 | 37/114/149 | |
-| idle agents | 0 | 2 | |
-
-**What the run establishes.** Two things, and they are the two that were asked for:
-
-1. **Calls per job fell** — 3.74 → 1.74 distinct bidders, 1123 → 521 LLM calls. Whatever produced
-   it, less inference happened per placement.
-2. **Nothing was lost** — 300/300 completed, 0 stuck, 0 restarts, 0 reselection lines, and
-   `requeued`/`infeasible` both 0, so the liveness guards never had to act.
-
-A third, weaker but still direct: **cutting inference by 2.16× did not make the queue drain faster**
-(0.92×). That is a measurement of this configuration, and it is enough to say the naive hope —
-"remove redundant inference, get throughput" — did not materialise here.
-
-> **What the run does NOT establish, despite an earlier version of this section claiming it.**
->
-> - **That redundancy and parallelism are inherently coupled.** Inference work fell 3.05× and the
->   busy fraction 3.3×, and I read that as "the redundant bids were what kept the fleet busy". But
->   agents in this run spent most of their time *waiting out a deadline*, which is a sufficient
->   alternative explanation for the same numbers and an artefact of the mis-tuning rather than a
->   property of partitioning. A correctly tuned run could keep agents busy on *different* jobs and
->   show the opposite. Withdrawn.
-> - **That the analytic cost model concentrates placement.** Fairness fell 0.849 → 0.276 with
->   deciles 37/114/149, which I attributed to the analytic model being less diverse than per-agent
->   LLM bids. With 97.8% of keeps forced by the deadline, placement was largely decided by which
->   agent's window position reached the deadline first, not by analytic designation. The collapse
->   is real and large — larger than any injected fault except S05's partial outage — but its cause
->   is not identified. Withdrawn.
-> - **That bidder-side levers are a dead end.** That followed from the first item and falls with it.
->
-> The pattern is worth naming because it recurs in this document: the caveat was stated and then
-> reasoned past. A confound that makes the *mechanism* ambiguous makes every downstream causal
-> claim ambiguous too, not just the ones that mention it.
-
-**What a decisive run needs**, in order:
-
-1. **Per-job-unique counters**, so `designated` vs `forced` can actually be read as job counts.
-2. **A deadline sized against pool wait**, not against one bid — on this trace that means minutes,
-   not 30 s, and it should be derived rather than guessed.
-3. Then the same two questions, plus the busy fraction and fairness read together: if calls/job
-   approaches 1 *with* the busy fraction holding near 0.56, redundancy and parallelism are
-   separable and the lever is real. If the busy fraction falls again, they are coupled — and that
-   would be the finding, established rather than inferred.
-
-Until then the honest summary is: **the mechanism reduces inference per placement without losing
-work, and there is no evidence yet that it improves anything.**
-
-### 4.0d Figure D — the fallback is not a safety net at partial radius, it is the pathology (2026-08-22)
-
-`llm.disable_fallback: true` removes the analytic safety net: a failed LLM bid returns `+inf`, so
-the agent simply does not bid. Inert without a fault (fault-free fallback rate is 0.0%), so the
-experiment is the flag **combined with S05**. Gateway arm, frozen fleet and trace.
-
-**S05 at 25%, three configurations at the same blast radius:**
-
-| | no fault | fallback **ON** | fallback **OFF** |
-|---|---|---|---|
-| jobs completed / stuck | 300 / 0 | 300 / 0 | **300 / 0** |
-| fallback rate | 0.0% | 44.2% | **0.0%** |
-| LLM calls OK | 1123 | 507 | 974 |
-| **the 8 faulted agents get** | — | **258 of 300** (86%) | **0 of 300** |
-| capture ratio (control 1.27×) | — | **16.9×** | **0.0×** |
-| load fairness | 0.849 | **0.253** | **0.599** |
-| sched latency mean | 191.1 s | 102.6 s | 200.2 s |
-
-**Removing the safety net removes the pathology.** With the fallback, 8 LLM-blind agents take 86%
-of the workload because a 503 becomes an instant analytic bid that out-races real reasoning
-(§4d.2). Without it those agents drop out entirely — **0 jobs** — the healthy 22 absorb all 300,
-and completion is untouched. Capture goes 16.9× → **0.0×**; fairness more than doubles, 0.253 →
-0.599, against a ceiling of 0.733 for 22 of 30 agents carrying everything, so the residual is
-within-group unevenness rather than concentration.
-
-**This is the first experiment in the campaign where removing a resilience mechanism improved a
-metric**, and at this radius it reframes what the fallback does. §4d called the partial outage a
-gray failure the system survives; at 25% the fallback is not what lets it survive — completion is
-300/300 either way — it is what decides *who does the work*, and it decides wrongly. What looked
-like graceful degradation is a mechanism that preferentially routes work to agents that cannot
-reason. **That statement is radius-scoped, and 4.0d.1 below is why it has to be**: at 100% the same
-mechanism is the whole difference between 300 completed and 0.
-
-**What the fallback does buy is speed, and only speed.** The with-fallback run drains in 102.6 s
-against 200.2 s without, because instant analytic bids place jobs faster than 4-7 s LLM bids can.
-That is a real ~2× throughput advantage — bought by handing 86% of the workload to broken agents.
-Whether that trade is worth taking is a design decision, but it should be made knowingly, and the
-"safety net" framing hides it.
-
-#### 4.0d.1 The 100% case, measured on the retry (2026-08-22) — a total stall
-
-`s05_unavailable.py 1.0 nofb`, gateway arm, same frozen fleet and trace, `CJ_DISABLE_FALLBACK=1`,
-503 proxies on 30/30 hosts, run bounded at 1200 s of scheduling:
-
-| metric | fault-free gateway baseline | 100% outage, fallback OFF |
-|---|---|---|
-| jobs completed | 300 | **0** |
-| jobs stuck | 0 | **300** |
-| LLM calls OK | 1123 | **0** |
-| LLM fallbacks | 0 | 0 |
-| **LLM refusals** (`LLM_COST_NO_BID`) | — | **2180 of 2181 attempts** |
-| failed agents / restarts / conflicts | 0 / 0 / 0 | **0 / 0 / 0** |
-| SWIM false-fails | 7 | 1 |
-| load fairness / sched latency | 0.849 / 191.1 s | **neither exists — nothing was placed** |
-
-**The fleet stayed healthy and simply never scheduled.** No agent failed, nothing restarted, no
-consensus conflict, and **all 37** early-exit polls, 18:27:47 to 18:45:47, reported `0/300 jobs
-terminal` — not one of them anything else. This is not a crash and not a degradation: it is a live,
-quiet, fully-connected 30-agent fleet with 300 jobs in the pool and no mechanism left that can
-propose one.
-
-Artifacts: `runs/cj-s05-100pct-nofb` and `runs/cj-s05-100pct-nofb-void` (the first attempt,
-retained with no data — see finding 14). **Log population: exactly agents 1-30, one log each** —
-no gaps, no duplicates, no ids outside the fleet, checked by identity rather than by file count
-(30 files for a 30-agent fleet is also what one duplicate plus one hole looks like). So every
-per-agent figure above is a sum over the whole fleet, not over whatever happened to be collected.
-`collect()` now reports that population alongside the metrics and `report()` states which rows
-degrade, and in which direction, when it is incomplete. `cj-s05-25pct-nofb` and `cj-baseline-gw2`
-re-read the same way, so §4.0d's table is on the same footing.
->
-> Log *contents* were checked against each run's own span as well, not just their copy times: all
-> 30 logs in both no-fallback runs are dated wholly inside their run's window (0 outside, 0
-> undated). That matters because a file's mtime is when it was **copied**, so a log an earlier run
-> left on a host and this run fetched would arrive looking new — the failure `cleanup()` now
-> refuses to start on, and which `.run_window` lets later runs detect at read time.
-
-**The mechanism, from the agent logs the first attempt never produced:**
-
-```
-18:25:52  [LLM_COST_START]  Job=eht-m87_… Agent=1 GatheringPeerContext=yes Peers=29
-18:25:54  [LLM_SCORE_ERROR] 503 {'message': 'Service Unavailable (chaos-jungle)', …}
-18:25:54  [LLM_COST_NO_BID] Job=eht-m87_… FallbackDisabled, not bidding
-```
-
-That sequence is the thing that was previously assumed: agents *do* attempt, the injected fault is
-what they hit, and the refusal is the ablation's, not a startup failure or a crash. It repeats for
-the whole run — the attempting agents' first refusal lands at 18:25:5x and their last at 18:45:3x.
-
-**Three caveats, because the headline number is easy to over-read:**
-
-- **"no-bid rate 100%" means every call that happened was refused, not that all 30 agents
-  refused.** The 2180 refusals come from **14 of 30 agents**; the other 16 made no LLM call at all,
-  logging 2387 cost-matrix passes each at `TotalTime=0.000s`. With nothing ever placed the 10-job
-  window never rotates, so the set of agents that ever get a candidate to score is frozen too.
-  There is no mechanism by which those 16 would have behaved differently — the proxy is up on all
-  30 hosts and 503s by construction — but they were never observed refusing, and the fault probe
-  confirms 503 on one host, not thirty.
-- **The refusal *count* is a harness artefact.** Retries are paced by the selection engine's 60 s
-  cost-cache TTL (`cache_ttl_s=60.0`), and observed rates ranged from one per ~58 s (20 refusals)
-  to one per ~6 s (200). So 2180 is not comparable with the 25% run's 352 as a rate of anything.
-- **"Never terminates" is measured as "no progress for 20 minutes".** The run was deliberately
-  bounded (`--shutdown-after-seconds 1200`); a stall is not proven for all time, only that a live
-  fleet made zero progress over twice the fault-free run's full duration.
-
-**Where this leaves figure D — both halves are now measured, and they disagree.**
-
-| blast radius | with fallback | without fallback | what the fallback is |
-|---|---|---|---|
-| 25% (8 of 30) | 300 done, 86% of work to LLM-blind agents, fairness 0.253 | 300 done, 0% to them, fairness 0.599 | **the pathology** — it decides who works, and wrongly |
-| 100% (30 of 30) | 300 done (§4d, pure analytic scheduler) | **0 done, 300 stuck** | **the safety net** — the only thing that schedules at all |
-
-So the honest statement is narrower than the one this section made before the retry: the analytic
-fallback is *load-bearing* — at total outage it is the difference between a working scheduler and a
-stalled one — **and** it is actively harmful at partial radius, where it hands most of the work to
-the agents that cannot reason. The mechanism has no way to tell the two situations apart, because
-it is a per-call exception handler with no view of how many peers are also failing. That, rather
-than "the safety net is a myth", is the defensible finding: **the fallback is the right behaviour
-for the case it cannot detect, and the wrong behaviour for the case it usually faces.** A radius-
-aware version — fall back only when enough peers are also failing — is the design this pair of
-runs argues for, and it is not what the code does today.
-
 ### 4.1 Is Jain's fairness the right metric here? Partly — and it must be quoted differently
 
 Load fairness carries a lot of the S05 story, so it is worth stating what it does and does not
@@ -1092,6 +819,13 @@ agents**, so it over-represents fast-failing agents (§4d.2). Completion and stu
 the correctness claim; everything else is performance.
 
 ---
+
+
+---
+
+# Part II — Scenario results
+
+One section per Chaos Jungle scenario, each holding every arm and blast radius measured for it, its mechanism, its replication check across arms, and its findings. The scenario index (§4b.1) is the map.
 
 ## 4c. S01 — LLMLatency (matrix row L1)
 
@@ -1749,6 +1483,385 @@ Two things the distributions show that the means hide:
 
 ---
 
+
+---
+
+# Part III — Studies and ablations
+
+Experiments that are not a CJ scenario: they vary the scheduler rather than inject a fault, and they exist to explain or bound what Part II measured.
+
+## 4.0b Fleet-size sweep — throughput does not scale with the fleet (2026-08-22)
+
+The falsifiable prediction from §4.0, run. **It holds: adding agents does not add placement
+throughput, and on the LLM arm it slightly reduces it.**
+
+14 / 30 / 60 agents, gateway arm, the same frozen 300-job Pegasus trace, `jobs_per_proposal: 10`
+throughout. All three fleets are **strict prefixes of one 60-agent master**, so agent *i* has
+identical capacities and DTNs at every size and the only variable is how many agents exist. That
+took building: `generate_configs` allocates capacity flavours as *percentages of fleet size*
+(`generate_configs.py:129`), so `--seed 42` gives agent 3 sixteen cores in a 10-agent fleet and
+two in a 30-agent fleet — a seed cannot make fleets comparable. 14 rather than 10 because agents
+1–10 of the master cannot satisfy two capacity-heavy jobs (DTN coverage is complete even at N=8,
+so it is capacity, not connectivity), and a run that strands work measures stranding.
+
+| fleet | drain | **jobs/s** | calls/job | bid latency | parallel agents | fairness | completed | restarts |
+|---|---|---|---|---|---|---|---|---|
+| 14 | 313 s | **0.96** | 2.17 | 4.06 s | 8.6 | 0.395 | 300 | 0 |
+| 30 | 316 s | **0.95** | 3.70 | 5.02 s | 18.1 | 0.826 | 300 | 0 |
+| 60 | 365 s | **0.82** | 5.98 | 7.15 s | 35.8 | 0.743 | 300 | 0 |
+
+**4.3× the fleet buys 0.86× the throughput.** Flat would be 1.0×; linear would be 4.3×. Every
+number above is a direct measurement; §4.0's throughput model is deliberately *not* quoted as
+corroboration, for the reason in the box below.
+
+> **Withdrawn: the model does not validate against these runs, and cannot.** An earlier version of
+> this section reported that §4.0's model "predicts every point to within 3%" and called it the
+> strongest evidence the bottleneck was understood. **That agreement is an algebraic identity.**
+> Substituting the terms as they are measured —
+> `parallel = matrix_time / drain`, `calls_per_job = n_bids / jobs`, `bid_latency = mean(bids)` —
+> gives
+>
+> ```
+> predicted / measured  =  matrix_time / Σ bid_latencies
+> ```
+>
+> and cost-matrix computation is *where the LLM calls happen*, so those two quantities are the
+> same clock read twice. Measured: the ratio is 1.018 / 1.026 / 1.019 at 14 / 30 / 60, and
+> predicted-over-measured is 1.021 / 1.032 / 1.024 — the same numbers. The "3%" was the fraction
+> of matrix time that is *not* LLM calls, i.e. loop overhead. The same objection applies to the
+> three-run "within 3%" claim in §4.0, which is withdrawn on the same grounds, and to the
+> decomposition ratio `parallel_ratio / cost_ratio`, which collapses to `drain₁₄ / drain₆₀` for
+> the same reason.
+>
+> What the model is good for is **attribution** — it is a correct accounting of where wall-clock
+> goes, and it says the fleet spends its time in redundant bidding. What it cannot do is
+> *predict* throughput, because throughput is one of its inputs.
+
+The decomposition below is therefore offered as accounting, not as evidence:
+
+| term | 14 → 60 | reading |
+|---|---|---|
+| parallel agents | **4.15×** | capacity scales almost perfectly with the fleet |
+| calls per job | **2.76×** | more agents means more agents bidding on the *same* job |
+| bid latency | **1.76×** | more concurrent clients on a shared endpoint (§2.1) |
+
+**What is actually established — one within-arm measurement, and it is thin.** Only one thing
+replaces the withdrawn model fit:
+
+**The redundancy is real, and it is agents rather than retries.** `calls_per_job` could rise
+either because more agents bid on a job or because one agent re-bids on it. Counted per
+`(job, agent)` pair, **every pair produces exactly one bid at every fleet size** — so
+`calls_per_job` *is* distinct bidders per job: **2.17 → 3.70 → 5.98**, a 2.76× rise for a 4.3×
+fleet, with zero re-bidding. That is a measurement, not an inference, and it is confined to the
+LLM arm.
+
+What it supports is one correlation: within the LLM arm, bidders-per-job rises 2.76× while
+throughput falls to 0.86×. **One correlation over three points is thin support for a causal
+mechanism**, and it is all there is. The intervention is what would settle it.
+
+**Both regimes, reported side by side as description only.** Per-term, 14 → 60:
+
+| arm | bidders/job | cost per bid | busy fraction | consensus | **throughput** |
+|---|---|---|---|---|---|
+| LLM | 2.17 → 5.98 (**2.76×**) | 4.06 → 7.15 s (**1.76×**) | 0.61 → 0.60 (flat) | degenerate (finding 11) | **0.86×** |
+| cheap-bid | 2.34 → 7.05 (**3.01×**) | 1.33 s (**flat**) | 0.56 → 0.57 (flat) | normal | **1.45×** |
+
+The only claim this table supports is the descriptive one: **no regime tested comes close to
+linear scaling** — 1.45× and 0.86× against a 4.3× fleet. It does **not** support "redundancy grows
+in both, therefore redundancy is the shared cause", and it does not support "the LLM arm's ceiling
+is not LLM cost because the other arm also has a ceiling". Both were argued here earlier and both
+are withdrawn: the arms differ in five ways including whether the dominance rule degenerates
+(box below), so they may be sub-linear for entirely different reasons.
+
+> **The second arm is NOT a one-variable control, and was wrongly described as one.** It was
+> introduced as varying "the cost of a bid while leaving the number of bidders intact". It differs
+> in at least five ways, and one of them changes consensus itself:
+>
+> | | LLM arm | cheap-bid arm |
+> |---|---|---|
+> | cost per bid | 4.06–7.15 s of real inference | 1.33 s of *failed connection* |
+> | cost signal | `100 − score`, range 25–75 | analytic utilisation, range 0–1 |
+> | **dominance rule** | proposer advertises 25–75, **peers price 0–1** → degenerates (finding 11) | both sides 0–1 → behaves normally |
+> | bidders/job | 2.17 → 5.98 | 2.34 → 7.05 (not identical, and scales differently) |
+> | work per bid | parse a score, cache it | throw, then compute the analytic cost anyway |
+>
+> The dominance-rule row is the serious one: under Snow a peer compares its own 0–1 analytic cost
+> against an advertised 25–75 LLM cost and concludes it dominates essentially always, so the two
+> arms are not running the same consensus. A throughput difference between them cannot be
+> attributed to bid cost alone.
+>
+> So this arm does not bound the LLM arm either — an earlier revision claimed it "shows the
+> sub-linear ceiling is not an artefact of expensive inference", which is the same cross-arm
+> inference in weaker clothing. What it establishes is about *itself*: a fleet with 1.33 s bids and
+> a working dominance rule also fails to scale, which is worth knowing as a second data point and
+> is not an explanation of the first. A closer control would be
+> `--agent-type resource`, which is analytic by design — no failure path, consistent cost scale on
+> both sides, dominance rule intact — and that is worth one run. Even it changes the cost signal,
+> which is why the only genuinely one-variable test remains the rank gate: same agents, same
+> costs, same consensus, fewer bidders.
+
+> **Two corrections to how this was first argued.** The second arm (then called "the analytic
+> control") was described as
+> "removing bids entirely… nothing else about the scheduler changed, so bid cost was the term
+> suppressing it". Both halves were wrong. Its bids were **not free** — each failed connection
+> attempt cost a median **1.33 s** before falling back — and redundancy was **not** held constant,
+> it scaled 3.01× there too. What the control actually varies is the *cost* of a bid while leaving
+> the *number* of bidders intact, which is a useful contrast but a different one.
+>
+> And none of this is a causal demonstration. Both terms are correlations across a 4.3× fleet
+> range, consistent with the mechanism and not proof of it. The only test that would settle it is
+> an **intervention**: cut bidders-per-job and see whether throughput moves as the accounting says
+> it should. That is the rank-gate experiment (§4.0), still unrun, and it is now the obvious next
+> step precisely because the observational evidence has gone as far as it can.
+
+**Correctness is untouched at every size:** 300/300 completed, 0 stuck, 0 restarts, 0 reselection
+lines. Whatever this costs in throughput, it costs nothing in safety.
+
+**An open question from §4.0 is answered.** "Why is parallelism ~17 of 30?" — it is not a fixed
+ceiling of 17, it is a constant *fraction*: 8.6/14, 18.1/30, 35.8/60 are all **0.60**. Agents are
+inside cost computation ~60% of the time at every fleet size, and the residual 40% is loop sleeps,
+queue waits and consensus. Parallelism therefore scales fine; the problem is entirely on the cost
+side.
+
+### A second, cheap-bid regime — obtained by accident, and not a control
+
+A misconfigured earlier attempt pointed all three fleets at a stopped local Ollama, so every bid
+failed and every agent used the analytic cost — 703 fallbacks, 0 LLM completions. It is preserved
+(`runs/fleet{14,30,60}-gw`) because it is a clean control for the same sweep with inference
+removed:
+
+| fleet | drain | jobs/s | parallel | fairness | completed |
+|---|---|---|---|---|---|
+| 14 | 120 s | 2.51 | 7.8 | 0.408 | 300 |
+| 30 | 99 s | 3.03 | 16.9 | 0.799 | 300 |
+| 60 | 82 s | 3.64 | 34.2 | 0.766 | 300 |
+
+**Scaling is positive but still sub-linear: 4.3× the fleet gives 1.45×.** The bids here were not
+free — each failed connection cost a median **1.33 s** before the fallback — so this is a
+*cheap-bid* arm, not a no-bid arm. Taken on its own terms — and it can only be taken on its own
+terms, per the caveat above — it says:
+
+- with bids at 1.33 s, a working dominance rule, and redundancy rising 3.01×, a 4.3× fleet still
+  buys only **1.45×**. Whatever caps scaling here, it is not the cost of an LLM call, because
+  there were none.
+
+What it does *not* license is subtracting one arm from the other. The LLM arm's 0.86× and this
+arm's 1.45× are two separate measurements of two configurations that differ in five ways; the
+difference between them is not attributable to any single term.
+
+This arm is also ~3.8× faster in absolute terms (3.64 vs 0.96 jobs/s at 60 agents), the same
+effect S05 found from the fault side: replacing LLM bids with analytic ones drains the queue
+several times faster (§4d.1).
+
+**What this means for the levers in §4.0.** Narrowing who bids is the best-supported change,
+because bidders-per-job is the one term measured to grow with the fleet. That is an argument for
+*testing* the lever, not evidence that it will work — one correlation over three points is what
+supports it, and only the experiment would establish a causal link.
+
+Two expectation-setting notes, both stated within the LLM arm to avoid the cross-arm trap above.
+A faster endpoint is not the fix: bid latency there degrades 1.76× as the fleet grows, so a faster
+model buys a constant factor and leaves the scaling *shape* intact. And **no configuration tested
+in this campaign has scaled better than 1.45× for a 4.3× fleet** — LLM 0.86×, cheap-bid 1.45× —
+so throughput work should not be sold as unlocking linear scaling. That is a statement about the
+range of observations, not an attribution of either number.
+
+## 4.0c Designated bidding, run once — one clear answer, and a confounded run (2026-08-22)
+
+The intervention §4.0b called for: use the cheap analytic matrix to designate one bidder per job so
+only that agent spends an LLM call (`job_selection.designate_bidder`, off by default). One
+fault-free run, gateway arm, frozen 30-agent fleet and trace, against `cj-baseline-gw2`.
+
+**Read the confound first, because it limits what the rest of the table can be used for.** Of the
+per-iteration decisions to keep a job, **97.8% were deadline-forced rather than designated**
+(`forced=11092` against `mine=11344`). So the active mechanism in this run was mostly *agents
+waiting 30 s and then bidding anyway* — a rate limiter — not a partition.
+
+The deadline is mis-tuned, and my reasoning for 30 s was wrong in the same way as the counter it
+replaced: I sized it against one bid plus consensus (~5-8 s), when the timescale that matters is
+how long the **designee** takes to reach that job in its own window — about 10 jobs at 3.4 s each,
+~34 s, against a ~195 s pool wait. The deadline expires before the designee gets there, routinely.
+The counters cannot resolve this either: `mine`/`deferred`/`forced` increment **per loop iteration**,
+not per job, so they are not job counts. That is a flaw in instrumentation I added and it should be
+per-job-unique before this is run again.
+
+| | baseline | designated | |
+|---|---|---|---|
+| distinct bidders / job | 3.74 | **1.74** | 0.46× |
+| LLM calls | 1123 | **521** | 2.16× fewer |
+| **jobs completed / stuck / restarts** | **300 / 0 / 0** | **300 / 0 / 0** | **unchanged** |
+| inference work (agent-seconds) | 5717 | 1876 | 3.05× less |
+| busy fraction of fleet | 0.56 | 0.17 | 3.3× less |
+| bid latency | 4.95 s | 3.43 s | |
+| drain | 339 s | 368 s | 0.92× throughput |
+| load fairness | 0.849 | 0.276 | −0.573 |
+| placement deciles | 125/88/87 | 37/114/149 | |
+| idle agents | 0 | 2 | |
+
+**What the run establishes.** Two things, and they are the two that were asked for:
+
+1. **Calls per job fell** — 3.74 → 1.74 distinct bidders, 1123 → 521 LLM calls. Whatever produced
+   it, less inference happened per placement.
+2. **Nothing was lost** — 300/300 completed, 0 stuck, 0 restarts, 0 reselection lines, and
+   `requeued`/`infeasible` both 0, so the liveness guards never had to act.
+
+A third, weaker but still direct: **cutting inference by 2.16× did not make the queue drain faster**
+(0.92×). That is a measurement of this configuration, and it is enough to say the naive hope —
+"remove redundant inference, get throughput" — did not materialise here.
+
+> **What the run does NOT establish, despite an earlier version of this section claiming it.**
+>
+> - **That redundancy and parallelism are inherently coupled.** Inference work fell 3.05× and the
+>   busy fraction 3.3×, and I read that as "the redundant bids were what kept the fleet busy". But
+>   agents in this run spent most of their time *waiting out a deadline*, which is a sufficient
+>   alternative explanation for the same numbers and an artefact of the mis-tuning rather than a
+>   property of partitioning. A correctly tuned run could keep agents busy on *different* jobs and
+>   show the opposite. Withdrawn.
+> - **That the analytic cost model concentrates placement.** Fairness fell 0.849 → 0.276 with
+>   deciles 37/114/149, which I attributed to the analytic model being less diverse than per-agent
+>   LLM bids. With 97.8% of keeps forced by the deadline, placement was largely decided by which
+>   agent's window position reached the deadline first, not by analytic designation. The collapse
+>   is real and large — larger than any injected fault except S05's partial outage — but its cause
+>   is not identified. Withdrawn.
+> - **That bidder-side levers are a dead end.** That followed from the first item and falls with it.
+>
+> The pattern is worth naming because it recurs in this document: the caveat was stated and then
+> reasoned past. A confound that makes the *mechanism* ambiguous makes every downstream causal
+> claim ambiguous too, not just the ones that mention it.
+
+**What a decisive run needs**, in order:
+
+1. **Per-job-unique counters**, so `designated` vs `forced` can actually be read as job counts.
+2. **A deadline sized against pool wait**, not against one bid — on this trace that means minutes,
+   not 30 s, and it should be derived rather than guessed.
+3. Then the same two questions, plus the busy fraction and fairness read together: if calls/job
+   approaches 1 *with* the busy fraction holding near 0.56, redundancy and parallelism are
+   separable and the lever is real. If the busy fraction falls again, they are coupled — and that
+   would be the finding, established rather than inferred.
+
+Until then the honest summary is: **the mechanism reduces inference per placement without losing
+work, and there is no evidence yet that it improves anything.**
+
+## 4.0d Figure D — the fallback is not a safety net at partial radius, it is the pathology (2026-08-22)
+
+`llm.disable_fallback: true` removes the analytic safety net: a failed LLM bid returns `+inf`, so
+the agent simply does not bid. Inert without a fault (fault-free fallback rate is 0.0%), so the
+experiment is the flag **combined with S05**. Gateway arm, frozen fleet and trace.
+
+**S05 at 25%, three configurations at the same blast radius:**
+
+| | no fault | fallback **ON** | fallback **OFF** |
+|---|---|---|---|
+| jobs completed / stuck | 300 / 0 | 300 / 0 | **300 / 0** |
+| fallback rate | 0.0% | 44.2% | **0.0%** |
+| LLM calls OK | 1123 | 507 | 974 |
+| **the 8 faulted agents get** | — | **258 of 300** (86%) | **0 of 300** |
+| capture ratio (control 1.27×) | — | **16.9×** | **0.0×** |
+| load fairness | 0.849 | **0.253** | **0.599** |
+| sched latency mean | 191.1 s | 102.6 s | 200.2 s |
+
+**Removing the safety net removes the pathology.** With the fallback, 8 LLM-blind agents take 86%
+of the workload because a 503 becomes an instant analytic bid that out-races real reasoning
+(§4d.2). Without it those agents drop out entirely — **0 jobs** — the healthy 22 absorb all 300,
+and completion is untouched. Capture goes 16.9× → **0.0×**; fairness more than doubles, 0.253 →
+0.599, against a ceiling of 0.733 for 22 of 30 agents carrying everything, so the residual is
+within-group unevenness rather than concentration.
+
+**This is the first experiment in the campaign where removing a resilience mechanism improved a
+metric**, and at this radius it reframes what the fallback does. §4d called the partial outage a
+gray failure the system survives; at 25% the fallback is not what lets it survive — completion is
+300/300 either way — it is what decides *who does the work*, and it decides wrongly. What looked
+like graceful degradation is a mechanism that preferentially routes work to agents that cannot
+reason. **That statement is radius-scoped, and 4.0d.1 below is why it has to be**: at 100% the same
+mechanism is the whole difference between 300 completed and 0.
+
+**What the fallback does buy is speed, and only speed.** The with-fallback run drains in 102.6 s
+against 200.2 s without, because instant analytic bids place jobs faster than 4-7 s LLM bids can.
+That is a real ~2× throughput advantage — bought by handing 86% of the workload to broken agents.
+Whether that trade is worth taking is a design decision, but it should be made knowingly, and the
+"safety net" framing hides it.
+
+### 4.0d.1 The 100% case, measured on the retry (2026-08-22) — a total stall
+
+`s05_unavailable.py 1.0 nofb`, gateway arm, same frozen fleet and trace, `CJ_DISABLE_FALLBACK=1`,
+503 proxies on 30/30 hosts, run bounded at 1200 s of scheduling:
+
+| metric | fault-free gateway baseline | 100% outage, fallback OFF |
+|---|---|---|
+| jobs completed | 300 | **0** |
+| jobs stuck | 0 | **300** |
+| LLM calls OK | 1123 | **0** |
+| LLM fallbacks | 0 | 0 |
+| **LLM refusals** (`LLM_COST_NO_BID`) | — | **2180 of 2181 attempts** |
+| failed agents / restarts / conflicts | 0 / 0 / 0 | **0 / 0 / 0** |
+| SWIM false-fails | 7 | 1 |
+| load fairness / sched latency | 0.849 / 191.1 s | **neither exists — nothing was placed** |
+
+**The fleet stayed healthy and simply never scheduled.** No agent failed, nothing restarted, no
+consensus conflict, and **all 37** early-exit polls, 18:27:47 to 18:45:47, reported `0/300 jobs
+terminal` — not one of them anything else. This is not a crash and not a degradation: it is a live,
+quiet, fully-connected 30-agent fleet with 300 jobs in the pool and no mechanism left that can
+propose one.
+
+Artifacts: `runs/cj-s05-100pct-nofb` and `runs/cj-s05-100pct-nofb-void` (the first attempt,
+retained with no data — see finding 14). **Log population: exactly agents 1-30, one log each** —
+no gaps, no duplicates, no ids outside the fleet, checked by identity rather than by file count
+(30 files for a 30-agent fleet is also what one duplicate plus one hole looks like). So every
+per-agent figure above is a sum over the whole fleet, not over whatever happened to be collected.
+`collect()` now reports that population alongside the metrics and `report()` states which rows
+degrade, and in which direction, when it is incomplete. `cj-s05-25pct-nofb` and `cj-baseline-gw2`
+re-read the same way, so §4.0d's table is on the same footing.
+>
+> Log *contents* were checked against each run's own span as well, not just their copy times: all
+> 30 logs in both no-fallback runs are dated wholly inside their run's window (0 outside, 0
+> undated). That matters because a file's mtime is when it was **copied**, so a log an earlier run
+> left on a host and this run fetched would arrive looking new — the failure `cleanup()` now
+> refuses to start on, and which `.run_window` lets later runs detect at read time.
+
+**The mechanism, from the agent logs the first attempt never produced:**
+
+```
+18:25:52  [LLM_COST_START]  Job=eht-m87_… Agent=1 GatheringPeerContext=yes Peers=29
+18:25:54  [LLM_SCORE_ERROR] 503 {'message': 'Service Unavailable (chaos-jungle)', …}
+18:25:54  [LLM_COST_NO_BID] Job=eht-m87_… FallbackDisabled, not bidding
+```
+
+That sequence is the thing that was previously assumed: agents *do* attempt, the injected fault is
+what they hit, and the refusal is the ablation's, not a startup failure or a crash. It repeats for
+the whole run — the attempting agents' first refusal lands at 18:25:5x and their last at 18:45:3x.
+
+**Three caveats, because the headline number is easy to over-read:**
+
+- **"no-bid rate 100%" means every call that happened was refused, not that all 30 agents
+  refused.** The 2180 refusals come from **14 of 30 agents**; the other 16 made no LLM call at all,
+  logging 2387 cost-matrix passes each at `TotalTime=0.000s`. With nothing ever placed the 10-job
+  window never rotates, so the set of agents that ever get a candidate to score is frozen too.
+  There is no mechanism by which those 16 would have behaved differently — the proxy is up on all
+  30 hosts and 503s by construction — but they were never observed refusing, and the fault probe
+  confirms 503 on one host, not thirty.
+- **The refusal *count* is a harness artefact.** Retries are paced by the selection engine's 60 s
+  cost-cache TTL (`cache_ttl_s=60.0`), and observed rates ranged from one per ~58 s (20 refusals)
+  to one per ~6 s (200). So 2180 is not comparable with the 25% run's 352 as a rate of anything.
+- **"Never terminates" is measured as "no progress for 20 minutes".** The run was deliberately
+  bounded (`--shutdown-after-seconds 1200`); a stall is not proven for all time, only that a live
+  fleet made zero progress over twice the fault-free run's full duration.
+
+**Where this leaves figure D — both halves are now measured, and they disagree.**
+
+| blast radius | with fallback | without fallback | what the fallback is |
+|---|---|---|---|
+| 25% (8 of 30) | 300 done, 86% of work to LLM-blind agents, fairness 0.253 | 300 done, 0% to them, fairness 0.599 | **the pathology** — it decides who works, and wrongly |
+| 100% (30 of 30) | 300 done (§4d, pure analytic scheduler) | **0 done, 300 stuck** | **the safety net** — the only thing that schedules at all |
+
+So the honest statement is narrower than the one this section made before the retry: the analytic
+fallback is *load-bearing* — at total outage it is the difference between a working scheduler and a
+stalled one — **and** it is actively harmful at partial radius, where it hands most of the work to
+the agents that cannot reason. The mechanism has no way to tell the two situations apart, because
+it is a per-call exception handler with no view of how many peers are also failing. That, rather
+than "the safety net is a myth", is the defensible finding: **the fallback is the right behaviour
+for the case it cannot detect, and the wrong behaviour for the case it usually faces.** A radius-
+aware version — fall back only when enough peers are also failing — is the design this pair of
+runs argues for, and it is not what the code does today.
+
 ## 4f. Cross-scenario findings
 
 ### 4f.1 S01 vs S05 — it is not slowness that hurts, it is skipping the LLM
@@ -1919,6 +2032,13 @@ and faults would silently no-op.
 
 ---
 
+
+---
+
+# Part IV — What is left to do
+
+The full experiment matrix with per-row status, and the ordered next steps.
+
 ## 5. Experiment matrix
 
 Each row is one CJ `Scenario`, run baseline-vs-fault with n≥5 repeats on a fixed job trace, across
@@ -1986,6 +2106,58 @@ targeted (coordinators only, hierarchical arm).
 
 ---
 
+## 10. Next steps
+
+Ordered by what each would actually settle. §4b.1 is the per-scenario status table.
+
+1. ~~**Close S05's blast radius on the gateway arm.**~~ **DONE (2026-08-21).** Both points
+   confirm the headline on a clean baseline: fairness troughs at 0.253 (−0.596) at 25% and
+   recovers to 0.452 at 50%, with capture 16.9×/14.8× against 1.27×/1.34× controls
+   (§4d.1–4d.2). L3 is now complete on the arm the campaign runs on, and the partial-outage
+   finding is confirmed as the campaign's strongest result rather than a baseline artefact.
+2. **Phase 3 — ablations, especially fallback-disabled.** Now the most informative work left,
+   because §4f.2 says the LLM's *output* barely reaches the scheduler while its *timing*
+   dominates. Fallback-disabled is the direct test: it removes the cheap path that wins every
+   race, and is what proves the safety net's value (figure D).
+3. **Phase 1 remainder — L2, L4–L8.** L5 `LLMResponseCorrupt` and L7 `LLMTokenStarvation` are the
+   interesting two: L5 exercises the parse-error path rather than the transport-error path, and
+   L7 is the only Tier 1 fault that degrades *content* the way Tier 2 does. L4 has been seen
+   incidentally (§4e.4) but never injected. Expect L2/L6/L8 to reproduce S05 exactly — they are
+   all "an exception, therefore an instant analytic bid".
+4. ~~**Phase 2 remainder — T2-2…T2-4.**~~ **DONE (2026-08-21/22).** All three run at 100% on the
+   gateway arm. The correctness null holds across all four modes — that is now robust rather than
+   one mutation's quirk. Two follow-ups came out of it, in order:
+   **(a)** ~~measure `completion_tokens` per mode~~ **DONE** — the riddles distractor makes the
+   model emit **+60%** more output and `rag_poison` +32%, ordering exactly with their latency
+   shifts, while `entity_swap` is +5% and neutral (§4e.6);
+   **(b)** a **partial-radius** semantic run (`s09_semantic.py inject_distractor 0.5 gw2`), which
+   is the only route by which a content fault could reach placement — poisoned agents become the
+   *slow* ones, so any capture should go to the healthy group, the reverse of S05.
+5. **Phase 4 — composite X1** and hierarchical/targeted-coordinator scenarios. X1 is where the
+   zero-double-assignment invariant is actually stressed, since it is the only scenario that adds
+   node loss.
+6. **Report the CJ issues in §6 upstream** — independent of any further runs.
+
+**Open question for the team:** which figures are must-haves for the paper?
+
+| | figure | supporting data |
+|---|---|---|
+| **A** | Degradation curves: completion rate & P95 latency vs fault severity | **ready** — S01's L1 sweep (§4c.2) is a complete 7-point curve |
+| **B** | Fallback rate by fault type (the graceful-degradation headline) | **ready** for S01/S05/S09; thin until L2, L5–L8 exist |
+| **C** | Poisoned-agent tolerance threshold (fairness & conflicts) | **there is no threshold** (§4e.2). Replace with "corrupted bids, unmoved schedule", or drop |
+| **D** | Default vs fallback-disabled (value of the analytic safety net) | **ready — both radii measured** (§4.0d, §4.0d.1). The two halves disagree, which is the finding: at 25% the fallback hands 86% of the work to LLM-blind agents (fairness 0.253 vs 0.599 without it); at 100% it is the difference between 300 completed and **0 completed, 300 stuck**. Same mechanism, no way to tell the cases apart |
+| **E** | Composite "bad day", annotated with the zero-double-assignment invariant | **not yet run** — step 5 above |
+
+A sixth candidate the results argue for more strongly than C: **placement vs bid latency across
+arms** (§4f.2) — the same scheduler, three endpoints, and the positional skew disappearing as bid
+latency becomes uniform. It is the campaign's most transferable finding and needs no further runs.
+
+---
+
+# Part V — Findings
+
+Defects and observations that outlive this campaign: what Chaos Jungle's maintainers should know, and what is wrong in SwarmAgents itself.
+
 ## 6. Findings for the CJ maintainers
 
 Full report with reproductions, evidence and suggested fixes:
@@ -2032,6 +2204,13 @@ term was inert, the fleet differed between runs, or the LLM was never consulted.
 | 12 | **Open** | Hierarchical per-agent summaries are all labelled `[no_restarts]`, so a run's own blocks are indistinguishable |
 | 13 | **Open** | `peer_expiry_seconds` is defined twice in the shipped config — the documented 300 s is silently 45 s |
 | 14 | **Open** | `run_test.py --runtime` is parsed and **never read**; without `--shutdown-after-seconds` the run waits in an unbounded poll loop, so a run that cannot place jobs never exits |
+
+
+---
+
+# Part VI — Operations
+
+How to actually run this on the slice, in order, and the failure modes that have cost runs.
 
 ## 8. Runbook
 
@@ -2324,48 +2503,3 @@ Each of these cost real debugging time; all are guarded against above.
 
 ---
 
-## 10. Next steps
-
-Ordered by what each would actually settle. §4b.1 is the per-scenario status table.
-
-1. ~~**Close S05's blast radius on the gateway arm.**~~ **DONE (2026-08-21).** Both points
-   confirm the headline on a clean baseline: fairness troughs at 0.253 (−0.596) at 25% and
-   recovers to 0.452 at 50%, with capture 16.9×/14.8× against 1.27×/1.34× controls
-   (§4d.1–4d.2). L3 is now complete on the arm the campaign runs on, and the partial-outage
-   finding is confirmed as the campaign's strongest result rather than a baseline artefact.
-2. **Phase 3 — ablations, especially fallback-disabled.** Now the most informative work left,
-   because §4f.2 says the LLM's *output* barely reaches the scheduler while its *timing*
-   dominates. Fallback-disabled is the direct test: it removes the cheap path that wins every
-   race, and is what proves the safety net's value (figure D).
-3. **Phase 1 remainder — L2, L4–L8.** L5 `LLMResponseCorrupt` and L7 `LLMTokenStarvation` are the
-   interesting two: L5 exercises the parse-error path rather than the transport-error path, and
-   L7 is the only Tier 1 fault that degrades *content* the way Tier 2 does. L4 has been seen
-   incidentally (§4e.4) but never injected. Expect L2/L6/L8 to reproduce S05 exactly — they are
-   all "an exception, therefore an instant analytic bid".
-4. ~~**Phase 2 remainder — T2-2…T2-4.**~~ **DONE (2026-08-21/22).** All three run at 100% on the
-   gateway arm. The correctness null holds across all four modes — that is now robust rather than
-   one mutation's quirk. Two follow-ups came out of it, in order:
-   **(a)** ~~measure `completion_tokens` per mode~~ **DONE** — the riddles distractor makes the
-   model emit **+60%** more output and `rag_poison` +32%, ordering exactly with their latency
-   shifts, while `entity_swap` is +5% and neutral (§4e.6);
-   **(b)** a **partial-radius** semantic run (`s09_semantic.py inject_distractor 0.5 gw2`), which
-   is the only route by which a content fault could reach placement — poisoned agents become the
-   *slow* ones, so any capture should go to the healthy group, the reverse of S05.
-5. **Phase 4 — composite X1** and hierarchical/targeted-coordinator scenarios. X1 is where the
-   zero-double-assignment invariant is actually stressed, since it is the only scenario that adds
-   node loss.
-6. **Report the CJ issues in §6 upstream** — independent of any further runs.
-
-**Open question for the team:** which figures are must-haves for the paper?
-
-| | figure | supporting data |
-|---|---|---|
-| **A** | Degradation curves: completion rate & P95 latency vs fault severity | **ready** — S01's L1 sweep (§4c.2) is a complete 7-point curve |
-| **B** | Fallback rate by fault type (the graceful-degradation headline) | **ready** for S01/S05/S09; thin until L2, L5–L8 exist |
-| **C** | Poisoned-agent tolerance threshold (fairness & conflicts) | **there is no threshold** (§4e.2). Replace with "corrupted bids, unmoved schedule", or drop |
-| **D** | Default vs fallback-disabled (value of the analytic safety net) | **ready — both radii measured** (§4.0d, §4.0d.1). The two halves disagree, which is the finding: at 25% the fallback hands 86% of the work to LLM-blind agents (fairness 0.253 vs 0.599 without it); at 100% it is the difference between 300 completed and **0 completed, 300 stuck**. Same mechanism, no way to tell the cases apart |
-| **E** | Composite "bad day", annotated with the zero-double-assignment invariant | **not yet run** — step 5 above |
-
-A sixth candidate the results argue for more strongly than C: **placement vs bid latency across
-arms** (§4f.2) — the same scheduler, three endpoints, and the positional skew disappearing as bid
-latency becomes uniform. It is the campaign's most transferable finding and needs no further runs.
