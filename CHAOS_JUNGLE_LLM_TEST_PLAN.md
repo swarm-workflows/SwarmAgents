@@ -417,6 +417,34 @@ with how expensive a bid is — S05's instant analytic bids drain in 140 s, `inj
 +60% generation takes 563 s — which is the same effect S01 quantified as ~34× amplification
 (§4c.2). Quote it as queue drain time.
 
+> **Would re-enabling the all-agents cost matrix help? No — it trades one redundancy for a much
+> worse one.** `LlmAgent` has the multi-agent version commented out directly beneath
+> `agents = [self...]`, and it *would* work: `_llm_or_analytic_cost(job, agent: AgentInfo)` takes an
+> arbitrary agent, so an LLM agent can price a job for a peer from gossiped state.
+>
+> The attraction is real — with every agent computing the same full matrix they would agree on the
+> assignment, each job would be proposed by exactly **one** agent, and the currently-dead
+> `selected_agent.agent_id != self.agent_id` deferral branch (§4.0) would start doing its job.
+> Bidders per job would fall from ~3.7 to ~1.
+>
+> The cost is prohibitive. Each iteration goes from ~10 jobs × **1** assignee to ~10 × **30**, and
+> every agent maintains its own cost cache, so the fleet-wide LLM evaluation count goes from ~1,123
+> per run toward 30 agents × 300 jobs × 30 assignees. Even with heavy cache hits that is orders of
+> magnitude more inference to remove a 3.7× redundancy.
+>
+> **The variant that does make sense** is to split the two roles: compute the full matrix with the
+> **analytic** cost — cheap, peer-computable, and exactly what `ResourceAgent` already does — to
+> designate one bidder per job, then have only that agent spend an LLM call. That buys the
+> partitioning at ~1 LLM call per job (a ~3.7× cut) for the price of some arithmetic, and it
+> removes the 25–75-vs-0–1 scale mismatch that degenerates the dominance rule (finding 11), since
+> selection and voting would then use the same scale.
+>
+> It comes with a consequence worth stating plainly: if the analytic matrix picks the winner, **the
+> LLM no longer chooses anything** — it only prices an agent already selected. Given §4f.2 measured
+> that the LLM's output barely influences placement today, this mostly makes an existing situation
+> explicit. But it is also the point at which the honest question becomes whether the LLM is
+> earning its cost at all, which is what the fallback-disabled ablation (§10) is for.
+>
 > **Do the metric fixes require re-running anything? No — verified.** All six defects fixed on
 > 2026-08-21/22 are analysis-side: two denominators, the block-aware parser, the arm-specific
 > control, and the restart/latency metrics that were never collected. None changes agent
@@ -429,7 +457,17 @@ with how expensive a bid is — S05's instant analytic bids drain in 140 s, `inj
 > seconds, and would *lose* comparability rather than gain it, since the frozen fleet and trace
 > are the thing holding the campaign together. The two code changes that *do* affect behaviour —
 > the tie-break fix (§4e.3) and the bandit epsilon fixes — landed before the gateway-arm runs and
-> touch delegation, which no flat-mesh scenario exercises.
+> touch delegation, which no flat-mesh scenario exercises. Checked rather than assumed: a campaign
+> gateway run contains **zero** `MAB`/`EpsilonGreedy`/`LinUCB` log lines, so the bandit code never
+> executes in these topologies.
+>
+> One further integrity check, because the 2026-08-22 fleet-size sweep (§4.0b) deleted and
+> regenerated `configs/`, `agent_profiles.json` and `agent_dtns.json` several times: the restored
+> `agent_profiles.json` is **byte-identical to the frozen seed-42 snapshot** (sha256 `6d0b4051…`),
+> and feasibility re-checks at median 9 of 30 — the campaign's figure, and distinguishable from the
+> prefix-30 sweep fleet's median of 8. The frozen fleet survived intact, so past results stand and
+> future runs remain comparable to them. (§2.3's `755eccc2…` hash predates this file's current
+> serialisation and should not be used as the reference.)
 >
 > **Now always reported.** §4 called conflicts and reselections *primary* metrics and nothing
 > collected them, so every table in this document was silent about them for the whole campaign —
