@@ -91,6 +91,13 @@ class LlmAgent(ResourceAgent):
 
         self.bidder: Optional[LlmBidder] = LlmBidder(self.llm_cfg, logger=self.logger)
 
+        # Ablation switch, off by default: remove the analytic safety net so a failed LLM bid
+        # means no bid at all (see _llm_or_analytic_cost). Read straight from the raw config
+        # rather than through LlmConfig, which is a bidder-transport dataclass and has no reason
+        # to know about a scheduling experiment.
+        self.llm_disable_fallback = bool((self.config.get("llm", {}) or {}).get(
+            "disable_fallback", False))
+
         # Designated-bidder mode. Off by default: it changes who bids, so turning it on changes
         # every capture and fairness figure the campaign has measured (test plan 4d) and must be
         # an explicit choice, not a silent default.
@@ -187,6 +194,25 @@ class LlmAgent(ResourceAgent):
                 self.logger.exception("Failed to save LLM bidder: %s", e)
             return cost
         except Exception as e:
+            if self.llm_disable_fallback:
+                # Ablation: the analytic safety net is removed, so a failed bid means this agent
+                # simply does not bid. An infinite cost is how SelectionEngine expresses "not a
+                # candidate", so the job goes to whichever agent still has a working LLM.
+                #
+                # This is the experiment the campaign has been circling. §4f.2 found placement is
+                # decided by *when* an agent bids, §4e found corrupting *what* it bids moves
+                # nothing, and §4.0c found cutting LLM calls costs no completion — all pointing at
+                # the LLM's output doing little. The complement is untested: how much of the
+                # system's resilience is the fallback rather than the model. Removing it converts
+                # S05's graceful degradation into hard failure and measures the difference.
+                #
+                # Note this is a no-op without a fault: the gateway arm's fault-free fallback rate
+                # is 0.0%, so there is nothing to disable unless something is breaking the LLM.
+                self.logger.warning(
+                    f"[LLM_COST_NO_BID] Job={job.job_id} Agent={agent.agent_id} "
+                    f"FallbackDisabled, not bidding, due to error: %s", e
+                )
+                return float("inf")
             self.logger.warning(
                 f"[LLM_COST_FALLBACK] Job={job.job_id} Agent={agent.agent_id} "
                 f"FallingBackToAnalyticCost due to error: %s", e
