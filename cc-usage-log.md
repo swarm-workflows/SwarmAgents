@@ -100,25 +100,36 @@ Per-session records for `SwarmAgents-chaos` (branch `chaos`). Append-only; newes
   attempt produced nothing (`--runtime` is dead code, so the wait was unbounded; a teardown then
   erased the agent logs) and fixed both the harness and the evidence-collection gap.
 - **Workflow stage**: forensics → harness fixes → testing → experiment execution → analysis → documentation
-- **Prompts**: 1 user prompt (excludes 8 stop-hook review messages and 3 background-task
-  notifications, all system-generated). The single prompt is the whole ask; everything after it was
-  the review gate iterating on my own changes.
-- **Tool calls**: ~120 (counted from the transcript, not instrumented — treat as ±10)
+- **Prompts**: 7 user prompts — retry the 100% case; "what about rest of the scenarios?"; commit;
+  commit and push; restructure the test plan; fix the numbering; bye. Excludes ~17 stop-hook review
+  messages (one of which was the review task itself failing) and 3 background-task notifications,
+  all system-generated.
+- **Tool calls**: ~185 (counted from the transcript, not instrumented — treat as ±15)
 - **Agent tasks**: 0 sub-agents spawned. The Codex stop-review gate ran its own reviews
   automatically and caught two real defects in my own changes (see below).
 - **Models used**: Opus 5 (`claude-opus-5[1m]`) throughout. Codex/GPT models via the automatic
   stop-time review gate (OpenAI credits, not counted here).
 - **Estimated cost (USD)**: not instrumented — no per-session token accounting available.
 - **Input tokens**: not instrumented. **Output tokens**: not instrumented.
-- **Files created**: 1 — `tests/test_scenario_ablation.py` (29 tests).
+- **Files created**: 2 — `tests/test_scenario_ablation.py` (39 tests) and
+  `tests/test_docs_references.py` (12 tests).
 - **Files modified**: 5 — `scenarios/helpers.py`, `scenarios/api/s05_unavailable.py`,
   `scenarios/clear_faults.py`, `CHAOS_JUNGLE_LLM_TEST_PLAN.md`, `SWARMAGENTS_FINDINGS.md`.
 - **Experiment runs**: 1 completed on the 30-agent FABRIC slice (`cj-s05-100pct-nofb`, 300 jobs,
   gateway arm, 503 on all 30 hosts, ablation armed). The first attempt is retained as
   `cj-s05-100pct-nofb-void`.
-- **Tests**: 204 → 233 passing (+29). `test_repository.py` still cannot collect (`fakeredis` not
+- **Tests**: 204 → 267 passing (+63). `test_repository.py` still cannot collect (`fakeredis` not
   installed) — pre-existing and unrelated.
-- **Commits**: 0 — all changes left uncommitted for review.
+- **Commits**: 15, all GPG-signed and pushed to `origin/chaos` (`f2e22950..af81cb5d`,
+  12 files, +3103/−710). One experiment run, one measured result, and the rest verification and
+  documentation:
+  `34c3edb8` bound runs that cannot drain · `a6f33130` **the 100% case measured** ·
+  `a8f47e9f` staleness by log content · `9d55b83a` a silent host has not passed ·
+  `e3cca83f` strict idle + memory gate · `6bb47d82` unreadable answers ·
+  `41f267e2` negative counts · `25497f1b` the stalling config bounds itself ·
+  `ad3d0f62` plan restructured into six parts · `0e2ba743` **plan renumbered 1–19** ·
+  `345e1421` three missed references + a guard · `3f5364d9`, `99c4b81a`, `74338849`, `af81cb5d`
+  four rounds hardening that guard.
 - **Key decisions / milestones**:
   1. **Figure D is complete, and its two halves disagree.** At 25% radius the analytic fallback is
      the pathology (86% of work to LLM-blind agents, fairness 0.253 vs 0.599 without it); at 100%
@@ -214,3 +225,14 @@ Per-session records for `SwarmAgents-chaos` (branch `chaos`). Append-only; newes
      failing) is the design this pair of runs argues for, and the direct test is S05 at 50% with
      the ablation on — the radius where the two behaviours should cross over.
   9. **Test plan restructured and renumbered.** Six parts with a table of contents, and sections numbered sequentially in reading order — the old labels (4.0b, 4b.1, 4d.2, 4g) were an artefact of the document growing by insertion, with two schemes colliding inside section 4. Scripted from the heading tree and verified three ways: every non-heading line survives, no label containing a letter remains, every internal link resolves. References were repointed in `SWARMAGENTS_FINDINGS.md`, `llm_agent.py` and two test docstrings; the 2026-08-21 entry above is left as written, since it is a dated record, and the mapping table at the end of the plan's Contents resolves its labels.
+  10. **What the session actually cost, honestly.** One user request produced the result; the
+      remaining ~17 rounds were the stop-time review gate finding defects in the verification code
+      I had written minutes earlier. Most were real — the mtime-vs-content staleness bug and the
+      silence-as-clean probes could both have invalidated a future run — but the last five rounds
+      hardened a markdown heading checker, which is now stricter than the document it guards. The
+      recurring defect in my own work is worth carrying forward: **four separate times, a check
+      could not fail because it was applied to data its own collector had already sorted,
+      filtered, collapsed into a set, or pattern-matched away.** Where a guard matters, mutate the
+      artefact and confirm the guard goes red; a passing check proves nothing about what it would
+      catch.
+
