@@ -191,9 +191,13 @@ job_selection:
   # comparable with the rest of the campaign. It also further reduces the LLM's influence on
   # placement, since a designated bidder faces no competing proposal.
   designate_bidder: false
-  # Bid anyway after this many consecutive deferrals, so a job whose designee never bids (stale
-  # gossip) degrades to the default behaviour instead of circulating forever.
-  designate_bidder_max_defers: 3
+  # Liveness deadline: a non-designated agent bids anyway once a job has gone unclaimed for this
+  # long, so a job whose designee never bids degrades to the default behaviour instead of
+  # stalling. This is a deadline rather than a retry count on purpose — the designated agent needs
+  # one LLM bid (4-7 s measured) plus consensus (~1 s) before it can claim anything, and a
+  # counter of a few loop iterations (~1.5 s) would fire first on every job, restoring full
+  # redundancy while adding delay. Keep it several times bid-plus-consensus.
+  designate_bidder_fallback_s: 30.0
 
 # Quantum runtime (Phase 2: data-triggered split hybrid scheduling).
 # Applies to all agents; inert unless split hybrid jobs / post-processing
