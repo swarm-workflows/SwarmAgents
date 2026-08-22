@@ -593,20 +593,38 @@ The decomposition below is therefore offered as accounting, not as evidence:
 | calls per job | **2.76×** | more agents means more agents bidding on the *same* job |
 | bid latency | **1.76×** | more concurrent clients on a shared endpoint (§2.1) |
 
-**The evidence that redundant bidding is the binding constraint is elsewhere, and is independent
-of the model:**
+**What is actually established, stated as measurements with the causal step left open.** Two
+things replace the withdrawn model fit, and both are counted from log lines without reference to
+drain time:
 
-1. **`calls_per_job` grows 2.76× with a 4.3× fleet** — measured from bid counts alone, with no
-   reference to drain time. More agents really do bid on the same job, which is the mechanism.
-2. **The analytic control (below) removes bids entirely** and throughput rises 2.6–4.4× in
-   absolute terms *and* recovers positive scaling. Nothing else about the scheduler changed, so
-   bid cost was the term suppressing it.
+1. **The redundancy is real, and it is agents rather than retries.** `calls_per_job` could rise
+   either because more agents bid on a job or because one agent re-bids on it. Counted per
+   `(job, agent)` pair, **every pair produces exactly one bid at every fleet size** — so
+   `calls_per_job` *is* distinct bidders per job: **2.17 → 3.70 → 5.98**, a 2.76× rise for a 4.3×
+   fleet, with zero re-bidding.
+2. **Bid cost and redundancy move independently, and the two arms separate them.** Per-term, 14 → 60:
 
-Those two are what support the reading that this is race-to-propose (§4f.2) surfacing as a
-throughput ceiling rather than a placement mechanism: nothing partitions the pool (§4.0), so each
-added agent is a redundant bidder rather than a new server. A *predictive* test would have to be an
-intervention — cut `calls_per_job` and see whether throughput moves as expected — which is exactly
-the rank-gate experiment in §4.0, still unrun.
+   | arm | bidders/job | cost per bid | busy fraction | **throughput** |
+   |---|---|---|---|---|
+   | LLM | 2.17 → 5.98 (**2.76×**) | 4.06 → 7.15 s (**1.76×**) | 0.61 → 0.60 (flat) | **0.86×** |
+   | analytic | 2.34 → 7.05 (**3.01×**) | 1.33 s (**flat**) | 0.56 → 0.57 (flat) | **1.45×** |
+
+   Redundancy grows *in both arms*, so it is the candidate explanation for why scaling is
+   sub-linear rather than linear. Cost per bid grows *only* on the LLM arm, which is the candidate
+   explanation for why that arm regresses instead of merely under-scaling.
+
+> **Two corrections to how this was first argued.** The analytic control was described as
+> "removing bids entirely… nothing else about the scheduler changed, so bid cost was the term
+> suppressing it". Both halves were wrong. Its bids were **not free** — each failed connection
+> attempt cost a median **1.33 s** before falling back — and redundancy was **not** held constant,
+> it scaled 3.01× there too. What the control actually varies is the *cost* of a bid while leaving
+> the *number* of bidders intact, which is a useful contrast but a different one.
+>
+> And none of this is a causal demonstration. Both terms are correlations across a 4.3× fleet
+> range, consistent with the mechanism and not proof of it. The only test that would settle it is
+> an **intervention**: cut bidders-per-job and see whether throughput moves as the accounting says
+> it should. That is the rank-gate experiment (§4.0), still unrun, and it is now the obvious next
+> step precisely because the observational evidence has gone as far as it can.
 
 **Correctness is untouched at every size:** 300/300 completed, 0 stuck, 0 restarts, 0 reselection
 lines. Whatever this costs in throughput, it costs nothing in safety.
@@ -630,15 +648,18 @@ removed:
 | 30 | 99 s | 3.03 | 16.9 | 0.799 | 300 |
 | 60 | 82 s | 3.64 | 34.2 | 0.766 | 300 |
 
-**Without inference, scaling is positive but still sub-linear: 4.3× the fleet gives 1.45×.** So
-there are two separate limits, and the sweep separates them:
+**Scaling is positive but still sub-linear: 4.3× the fleet gives 1.45×.** Note the bids here were
+not free — each failed connection cost a median **1.33 s** before the fallback — so this is a
+*cheap-bid* arm, not a no-bid arm. With that caveat the sweep separates two limits:
 
-- a **scheduler-side** limit that caps scaling at ~1.45× per 4.3× fleet even when bids are free;
-- a **redundant-inference** cost that converts that modest gain into a small *regression* (0.86×).
+- a limit that caps scaling at ~1.45× per 4.3× fleet *even with cheap bids*, and which coincides
+  with redundancy growing 3.01× on this arm too;
+- an additional LLM-only cost growth (1.76× per bid, from endpoint contention) that turns that
+  modest gain into a small *regression* (0.86×).
 
-The analytic arm is also ~3.8× faster in absolute terms (3.64 vs 0.96 jobs/s at 60 agents), which
-is the same finding S05 reached from the fault side: replacing every LLM bid with an analytic one
-drains the queue several times faster (§4d.1).
+The analytic arm is also ~3.8× faster in absolute terms (3.64 vs 0.96 jobs/s at 60 agents), the
+same effect S05 found from the fault side: replacing LLM bids with analytic ones drains the queue
+several times faster (§4d.1).
 
 **What this means for the levers in §4.0.** Narrowing who bids is now the clearly indicated
 change, because `calls_per_job` is the term that grows with the fleet and it is the term the
