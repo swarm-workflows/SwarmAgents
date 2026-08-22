@@ -8,7 +8,8 @@ the LLM plane; infrastructure faults appear only as a single composite scenario.
 **Status (2026-08-21):** **Three scenarios measured on three LLM backends.** S01 `LLMLatency` is
 complete (7-point dose-response to +60 s); S05 `LLMUnavailable` is complete on both the local and
 the gateway arm, and the gateway sweep **confirmed and deepened** its headline; S09
-`SemanticCorrupt` is done for `entity_swap` on all three arms, 3 of 4 modes unrun. **Per-scenario status, arms and
+`SemanticCorrupt` is complete — all four mutation modes on the gateway arm, plus `entity_swap` on
+all three arms. **Per-scenario status, arms and
 blast radii: [§4b.1](#4b1-scenario-index--what-has-been-run-and-where).**
 
 The result that reframes the rest: **completion never degrades under any LLM fault measured** —
@@ -296,6 +297,14 @@ interesting one: it is independent confirmation of the S09b mechanism. Uniform b
 across the fleet flattens the positional skew that no tie-break change could touch, because the
 skew was never about ordering — it was about who bids first.
 
+**Run-to-run reproducibility, measured (2026-08-22).** A fault-free control on the gateway arm
+(`cj-baseline-gw2-ctl2`) reproduced `cj-baseline-gw2` two days later at every percentile of
+per-call latency — mean 5.00 s vs 4.95 s, p50 4.77 vs 4.70, p90 6.56 vs 6.39 — with 300/300 jobs
+and 0 fallbacks both times. That ±0.1 s band at the median is what makes single-run deltas
+quotable on a shared endpoint, and it is the control that let §4e.6 attribute a latency shift to a
+semantic fault rather than to endpoint drift. **Re-measure it before any campaign that will lean
+on single runs.**
+
 **`cj-baseline-ref` is the reference** every fault scenario is measured against. `frozen2` is the
 same fleet and trace before the SWIM timeout fix and is retained only to show that fix's effect:
 suspect-timeout events **52 → 9** and reported failed agents **3 → 0**, while LLM calls (1096 vs
@@ -447,10 +456,10 @@ baseline. A delta only means something within one arm (§3).
 |---|---|---|---|---|---|
 | **[S01](#4c-s01--llmlatency-matrix-row-l1)** | `LLMLatency` | L1 | local 50/100%; cloud 100%; **gateway 100% swept 1·3·6·10·30·60 s** | **complete** | throughput degrades linearly at **~34× the injected delay**; completion, fallbacks and membership untouched to +60 s |
 | **[S05](#4d-s05--llmunavailable-503-matrix-row-l3)** | `LLMUnavailable` (503) | L3 | local 25/50/100%; cloud 100%; **gateway 25/50/100%** | **complete** | **a partial outage is far more damaging than a total one** — 8 of 30 LLM-blind agents took 93% of the workload, and fairness falls to a quarter of perfect balance (0.849 → 0.253) |
-| **[S09](#4e-s09--semanticcorrupt-matrix-rows-t2-1t2-4)** | `SemanticCorrupt(entity_swap)` | T2-1 | local 25/50/100%; cloud 100%; gateway 100% | 1 of 4 modes | bids inverted, **schedule unmoved** — the LLM's output barely influences placement |
-| S09 | `rag_poison` | T2-2 | — | wired, fault-verified, **unrun** | expect the same null — it changes content, not bid timing |
-| S09 | `inject_distractor` | T2-3 | — | wired, fault-verified, **unrun** | as above |
-| S09 | `context_truncate` | T2-4 | — | wired, fault-verified, **unrun** | as above |
+| **[S09](#4e-s09--semanticcorrupt-matrix-rows-t2-1t2-4)** | `SemanticCorrupt(entity_swap)` | T2-1 | local 25/50/100%; cloud 100%; gateway 100% | **complete** | bids inverted, **schedule unmoved** — the LLM's output barely influences placement |
+| S09 | `rag_poison` | T2-2 | gateway 100% | **complete** | same correctness null — but it costs +1.7 s per bid, so content is *not* timing-neutral |
+| S09 | `inject_distractor` | T2-3 | gateway 100% | **complete** | same null; the largest timing cost of the four (+4.2 s per bid, +63% queue) |
+| S09 | `context_truncate` | T2-4 | gateway 100% | **complete** | same null; +1.4 s per bid despite a *shorter* prompt |
 | — | `LLMTimeout` | L2 | — | not started | §5 |
 | — | `LLMRateLimit` | L4 | — | not started (observed *incidentally* as the cloud arm's 429s — §4e.4) | §5 |
 | — | `LLMResponseCorrupt` | L5 | — | not started | §5 |
@@ -1016,24 +1025,120 @@ which is how the first hash choice was caught:
 > id was a proxy for host inference speed. The observation — corrupted bids, unchanged schedule —
 > held; the explanation did not.
 
-### 4e.6 Still to run in this tier
+### 4e.6 All four modes, gateway arm (2026-08-21) — the prediction half held
 
-`rag_poison` (T2-2, injects a false-context line mid-payload — it also splits the JOB JSON),
-`inject_distractor` (T2-3, contradictory instruction appended to the system prompt),
-`context_truncate` (T2-4, the agent bids on a job it can only half see, and never sees PEERS at
-all). All three are wired and their fault semantics verified; only `entity_swap` has been run.
-**None of them changes bid timing, so §4e.2 predicts the same null result from all three** — the
-headline experiment ("SwarmAgents tolerates up to K% semantically-corrupted agents") has no
-threshold to locate.
+The tier is complete. `rag_poison` (T2-2, false-context line injected mid-payload, which also
+splits the JOB JSON), `inject_distractor` (T2-3, contradictory instruction appended to the system
+prompt) and `context_truncate` (T2-4, the agent bids on a job it can only half see and never sees
+PEERS at all), each at 100% of hosts against `cj-baseline-gw2`.
+
+This section previously carried an explicit prediction: *"none of them changes bid timing, so
+§4e.2 predicts the same null result from all three."* **The correctness half is confirmed; the
+timing half is wrong.**
+
+| mode | prompt Δ | fallback | **score mean / sd** | **bid mean** | **sched mean** | fairness | deciles | completed / stuck |
+|---|---|---|---|---|---|---|---|---|
+| *baseline* | — | 0.0% | 91.0 / 10.7 | 4.95 s | 191.1 s | 0.849 | 125/88/87 | 300 / 0 |
+| `entity_swap` | +0 | 0.0% | **13.6** / 17.9 | 5.22 s | 190.8 s | 0.809 | 121/78/101 | 300 / 0 |
+| `rag_poison` | +24 | 0.0% | 77.3 / **35.0** | **6.67 s** | **253.6 s** | 0.769 | 118/89/93 | 300 / 0 |
+| `inject_distractor` | +10 | 0.0% | 89.7 / 17.2 | **9.12 s** | **311.8 s** | 0.795 | 115/111/74 | 300 / 0 |
+| `context_truncate` | **−11** | 0.0% | 67.5 / **30.5** | **6.34 s** | **240.5 s** | 0.837 | 114/90/96 | 300 / 0 |
+
+**Confirmed — the correctness null is total, across all four mutations.** 300/300 jobs, 0 stuck,
+0 fallbacks, 0 agents lost, no idle agents, and placement unmoved: deciles stay within noise of
+the baseline's 125/88/87 and effective active agents (§4.1) range 23.1–25.5 against 25.5. Four
+independent mutations of the prompt — inverted polarity, false context, contradictory
+instruction, half the payload missing — and the schedule is the same schedule. That is what makes
+§4e.7's claim robust rather than an artefact of one mutation.
+
+**Refuted, and this one survived its control — three of the four modes cost real time.** Mean bid
+latency rises +1.39 s to +4.17 s and scheduling latency +49 s to +121 s (up to **+63%**). The
+prediction assumed a content-only fault cannot touch the clock; it can.
+
+The gateway is shared, so a mean-only claim would be worthless (§4c.3). A **fault-free control run
+in the same session** (`cj-baseline-gw2-ctl2`, 2026-08-22, ~2.5 h after the mode runs) establishes
+the endpoint's reproducibility band, and it is tight at *every* percentile:
+
+| run | n | min | p10 | p50 | mean | p90 | p99 |
+|---|---|---|---|---|---|---|---|
+| *baseline* (08-20) | 1123 | 1.46 | 3.77 | 4.70 | 4.95 | 6.39 | 8.95 |
+| **CONTROL** (08-22) | 1080 | 1.58 | 3.74 | 4.77 | **5.00** | 6.56 | 9.68 |
+| `entity_swap` (08-20) | 1116 | 1.65 | 3.96 | 4.98 | 5.22 | 6.76 | 9.61 |
+| `rag_poison` (08-21) | 1044 | 1.65 | 3.83 | 5.03 | **6.67** | **12.26** | **22.57** |
+| `inject_distractor` (08-21) | 1066 | 1.26 | **5.87** | **8.17** | **9.12** | 13.97 | 22.17 |
+| `context_truncate` (08-21) | 1117 | 0.06 | 4.32 | 6.02 | **6.34** | 8.78 | 12.39 |
+
+Two days apart the fault-free distribution reproduces to within 0.12 s at the median and 0.05 s at
+the mean. **So the endpoint is not the explanation** — the three modes' shifts are 10–80× that
+band, and `entity_swap` (+0.27 s, p90 6.76) sits inside it. This is also a useful number in its
+own right: **the campaign's run-to-run reproducibility on the gateway arm is ±0.1 s at the median**,
+which is what makes single-run deltas quotable at all.
+
+Two things the distributions show that the means hide:
+
+1. **The uncontended floor does not move.** `min` stays at 1.46–1.65 for every mode
+   (`inject_distractor`'s 1.26 is *below* baseline). This is not a flat per-call tax like S01's
+   injected delay, which lifted the floor by the full amount (§4c.2). Some calls are as fast as
+   ever; the *bulk* is slower.
+2. **The shape is mode-specific.** `rag_poison` moves only the upper half (p10 and p50 inside the
+   control band, p99 8.95 → 22.57); `inject_distractor` shifts everything above p10;
+   `context_truncate` sits between. Whatever the cause, it is not one common mechanism applied
+   uniformly.
+
+> **A mechanism proposed here has been withdrawn — the effect is real, the explanation was not.**
+> An earlier version argued the slowdown was the model deliberating over an incoherent prompt
+> ("coherent-but-wrong is cheap, incoherent is expensive"), citing score sd rising to 30–35. That
+> inference does not hold: `inject_distractor` has the *smallest* sd rise of the three (17.2
+> against a 10.7 baseline) and the *largest* latency shift, while `rag_poison` has the largest sd
+> (35.0) and no movement below p50.
+>
+> The reasoning error is worth naming, because it is subtle: **score sd measures variance in *what*
+> the model decided, not effort spent deciding it.** They are different quantities, and one was
+> used as a proxy for the other because both sounded like "confusion". A deliberation mechanism is
+> still perfectly plausible — variable extra generation would raise the bulk while leaving the
+> fastest calls untouched, which is exactly the observed shape — but it is untested.
+>
+> **The measurement that would settle it is `usage.completion_tokens` per mode**, on the production
+> scheduling prompt with each mutation applied offline. That reads generation effort directly
+> instead of inferring it. `cj_probe.py` cannot answer it as written: it sends a synthetic payload
+> with `max_tokens: 1`, which is right for verifying that a mutation *reached* the model and wrong
+> for measuring what the model then does. Not yet run.
+
+> **The next experiment this opens, now that the latency effect is controlled.** §4f.2 says bid
+> timing decides placement, and these modes move timing — so a partial-radius run should
+> redistribute work. At 100% radius it cannot, because every agent is slowed equally (exactly as
+> S01 at 100% leaves fairness flat). At a **partial** radius it should: the poisoned agents become
+> the *slow* ones, so capture should go to the **healthy** group — the reverse direction from S05,
+> where the faulted agents were the fast ones.
+>
+> Magnitude sets the expectation. `inject_distractor` at +4.17 s on a 4.95 s bid is an ~84%
+> slowdown: large, but still the *same order*, which is the regime §4f.1 showed produces no
+> capture (S01's +3 s on 15/30 gave exactly 1.00×). So the prediction is a **mild** reverse
+> capture, far short of S05's 13–17×, and a null would tighten the boundary of §4f.1's
+> regime-not-degree argument. Either outcome is informative, which is what makes it worth the run:
+> `s09_semantic.py inject_distractor 0.5 gw2`.
 
 ### 4e.7 S09 findings
 
 1. **The bids were corrupted and the schedule did not move** — placement is decided by *when* an
-   agent bids, not *what* it bids.
+   agent bids, not *what* it bids. Established across **four independent mutations** on the
+   gateway arm and three arms for `entity_swap`, so it is not an artefact of one prompt edit
+   (§4e.6).
 2. Therefore **there is no semantic tolerance threshold to find**, which is a stronger and more
    awkward result than the one the matrix set out to measure.
 3. **A more capable model is not more fragile** to its own reasoning being corrupted.
 4. Only a semantic fault could establish any of this; every Tier 1 fault perturbs timing.
+5. **A semantic fault is NOT timing-neutral** — a correction to this section's own prediction,
+   and it survived a same-session fault-free control that reproduces the baseline to ±0.1 s at the
+   median. Three of four modes slow bidding by 1.4–4.2 s and scheduling by up to 63%;
+   `entity_swap` alone is neutral. **The effect is established; its mechanism is not.** A proposed
+   "incoherent prompts make the model deliberate" story is withdrawn — it used score sd as a proxy
+   for generation effort, and the two do not co-vary (§4e.6). `completion_tokens` per mode is the
+   measurement that would settle it.
+6. **The tier's remaining experiment is a partial-radius semantic fault** — the one route by which
+   a content fault could reach placement, via the timing channel §4f.2 says decides it. Now
+   well-motivated rather than speculative, since (5) establishes that these modes really do move
+   the clock.
 
 ---
 
@@ -1238,17 +1343,23 @@ All four modes are one CJ scenario, **S09** (§4e), selected by `--mode`.
 | # | Fault (`s09_semantic.py <mode>`) | Status / hypothesis |
 |---|-------|------------|
 | T2-1 | `SemanticCorrupt(entity_swap)` | **DONE, all three arms** — poisoned agents invert their own bid polarity and **placement does not move** (§4e.1). Original hypothesis (consensus tolerates a minority of poisoned bidders) is not what was tested: there is nothing to tolerate |
-| T2-2 | `SemanticCorrupt(rag_poison)` | Wired + fault-verified, unrun. Poisoning peer-load context defeats load-aware scoring ⇒ dog-piling, fairness drops |
-| T2-3 | `SemanticCorrupt(inject_distractor)` | Wired + fault-verified, unrun. Resilience to indirect prompt injection via gossiped peer state |
-| T2-4 | `SemanticCorrupt(context_truncate)` | Wired + fault-verified, unrun. Degraded but not incorrect scheduling |
+| T2-2 | `SemanticCorrupt(rag_poison)` | **DONE** (gateway 100%) — no dog-piling and no fairness collapse; placement unmoved. Costs +1.7 s per bid |
+| T2-3 | `SemanticCorrupt(inject_distractor)` | **DONE** (gateway 100%) — resilient: indirect prompt injection moves the schedule not at all, though it is the most expensive mode in time (+4.2 s per bid) |
+| T2-4 | `SemanticCorrupt(context_truncate)` | **DONE** (gateway 100%) — degraded scoring (mean 91.0 → 67.5) and correct scheduling, exactly as hypothesised |
 
 **Headline experiment, and why it did not survive contact.** The plan was to sweep the
 poisoned-agent fraction 0→50% to find the tolerance threshold — *"SwarmAgents tolerates up to K%
 semantically-corrupted LLM agents before completion and fairness degrade."* T2-1 was swept at
 25/50/100% and **there is no threshold to locate**: the schedule is unmoved even at 100%, because
-placement is decided by bid *timing* and a semantic fault does not perturb timing (§4e.2). None
-of T2-2…T2-4 perturbs timing either, so the same null result is predicted for all three. The
-finding to report is the absence of the threshold, not its value.
+placement is decided by bid *timing*. All four modes have now been run and all four agree —
+completion, stuck jobs and placement are untouched — which is what makes the null robust rather
+than a quirk of one mutation. The finding to report is the absence of the threshold, not its
+value.
+
+One prediction in this plan was wrong and is worth keeping visible: T2-2…T2-4 were expected to be
+timing-neutral like T2-1, and they are not (§4e.6). That does not restore the threshold — a
+uniform slowdown at 100% radius redistributes nothing — but it does open a partial-radius
+experiment in which a *content* fault could reach placement through the timing channel.
 
 ### Tier 3 — Composite "bad day" (the single infra touchpoint)
 | # | Fault | Status |
@@ -1599,9 +1710,14 @@ Ordered by what each would actually settle. §4b.1 is the per-scenario status ta
    L7 is the only Tier 1 fault that degrades *content* the way Tier 2 does. L4 has been seen
    incidentally (§4e.4) but never injected. Expect L2/L6/L8 to reproduce S05 exactly — they are
    all "an exception, therefore an instant analytic bid".
-4. **Phase 2 remainder — T2-2…T2-4.** Wired and fault-verified but unrun, and §4e.6 predicts the
-   same null from all three since none perturbs bid timing. Worth running for completeness of the
-   tier rather than for discovery; one run each, no fraction sweep needed.
+4. ~~**Phase 2 remainder — T2-2…T2-4.**~~ **DONE (2026-08-21/22).** All three run at 100% on the
+   gateway arm. The correctness null holds across all four modes — that is now robust rather than
+   one mutation's quirk. Two follow-ups came out of it, in order:
+   **(a)** measure `completion_tokens` per mode to explain *why* three of the four cost 1.4–4.2 s
+   per bid, since the score-sd explanation is refuted and `cj_probe.py` cannot answer it (§4e.6);
+   **(b)** a **partial-radius** semantic run (`s09_semantic.py inject_distractor 0.5 gw2`), which
+   is the only route by which a content fault could reach placement — poisoned agents become the
+   *slow* ones, so any capture should go to the healthy group, the reverse of S05.
 5. **Phase 4 — composite X1** and hierarchical/targeted-coordinator scenarios. X1 is where the
    zero-double-assignment invariant is actually stressed, since it is the only scenario that adds
    node loss.
