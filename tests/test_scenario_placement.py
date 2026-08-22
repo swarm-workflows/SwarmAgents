@@ -22,7 +22,7 @@ These pin the four ways the log has already misled a metric:
 4. **The fleet can exceed `AGENTS`** in a dynamic-agent run, so the denominator must follow the
    log upward while never following it *down*.
 
-Bugs 1 and 2 were real, found 2026-08-21; see `CHAOS_JUNGLE_LLM_TEST_PLAN.md` 4d.2.
+Bugs 1 and 2 were real, found 2026-08-21; see `CHAOS_JUNGLE_LLM_TEST_PLAN.md` §7.2.
 """
 from __future__ import annotations
 

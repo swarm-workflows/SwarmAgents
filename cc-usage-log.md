@@ -4,6 +4,10 @@ Per-session records for `SwarmAgents-chaos` (branch `chaos`). Append-only; newes
 
 ## Session: 2026-08-21 18:14
 
+> Section labels in this entry (§4c, §4d, §4f.2, …) are the test plan's **pre-2026-08-22**
+> numbering. The entry is left as written because it is a dated record; the old→new table at
+> the end of the plan's Contents resolves them.
+
 - **Project**: SwarmAgents-chaos (`/Users/kthare10/swarm/agents/SwarmAgents-chaos`, branch `chaos`)
 - **Task summary**: Closed S05's blast radius on the FABRIC gateway arm (25% and 50%), which
   confirmed the campaign's headline partial-outage finding on a clean baseline rather than a

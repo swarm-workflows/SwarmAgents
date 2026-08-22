@@ -45,7 +45,7 @@ CLOUD_ORIGIN = os.getenv("CJ_CLOUD_ORIGIN", "https://ollama.com").rstrip("/")
 CLOUD_KEY_FILE = os.getenv("CJ_CLOUD_KEY_FILE", "/root/.ollama_cloud_key")  # root-only, never in the repo
 # gpt-oss:120b is the only cloud model measured to both honour json_schema (which LlmBidder
 # requires) and not reason by default — qwen3.5:397b answers in prose and would fall back on
-# every bid. See the test plan, section 2.1b.
+# every bid. See the test plan, §2.2.
 CLOUD_MODEL = os.getenv("CJ_CLOUD_MODEL", "gpt-oss:120b")
 # The cloud endpoint is configured through llm.base_url in the YAML, deliberately NOT through
 # OLLAMA_BASE_URL. That env var is the fault-injection channel: start_fault only sets it when
@@ -57,7 +57,7 @@ CLOUD_MODEL = os.getenv("CJ_CLOUD_MODEL", "gpt-oss:120b")
 # This MUST be switched alongside CJ_REFERENCE when changing arms. The id-bias control it
 # supplies is arm-specific and not a small difference: at n=8 the local arm's fault-free split
 # is 1.86x but the gateway arm's is 1.27x, because the bias comes from low-numbered hosts
-# inferring faster (see the test plan, 4f.2) and that disappears once inference leaves the
+# inferring faster (see the test plan, §12.2) and that disappears once inference leaves the
 # hosts. Comparing a gateway capture ratio against the local control silently reintroduces the
 # exact confound load_split() exists to remove.
 REFERENCE_RUN = os.getenv("CJ_REFERENCE_RUN") or "runs/cj-baseline-ref"
