@@ -361,3 +361,43 @@ Two smaller things in the same block, neither load-bearing:
   knowing when reading latency figures.
 - `total_agents: 5` sits in `runtime:` while every run of this campaign uses 30 agents, and
   nothing appears to read it. Stale, and misleading to anyone auditing the config.
+
+### 14. `run_test.py --runtime` is parsed and never read, so a stalled run never ends (silent)
+
+`--runtime` is declared (`run_test.py:739`, *"Seconds to keep the test running"*) and there is no
+`args.runtime` anywhere in the file. The wait is chosen instead by `--shutdown-after-seconds`:
+
+```python
+if args.shutdown_after_seconds > 0:
+    wait_with_early_exit(args)     # bounded by a deadline
+else:
+    wait_runtime(args)             # while True: poll the pool bucket
+```
+
+`wait_runtime()` exits on one of two conditions — the watched bucket falling below `--threshold`
+for `--stable-seconds`, or the bucket key going missing more than `--max-misses` times. Neither is
+a clock. **A run that cannot place jobs satisfies neither and polls forever**, no matter what
+`--runtime` says.
+
+Every campaign run passed `--runtime 3000` and none of them was ever bounded by it. It went
+unnoticed because healthy runs drain in ~11 min and exit on the drain condition, which looks
+exactly like a working timeout.
+
+It cost one experiment. The first S05 100% no-fallback attempt (test plan 4.0d.1) is the case where
+nothing *can* be placed: `runs_cj-s05-100pct-nofb-void.log` shows 332 consecutive polls of a bucket
+stuck at `size=300` over 28 minutes. It then reported `size=0`, waited out `--stable-seconds`, and
+exited cleanly — so the earlier write-up's "the run did not terminate and the harness killed it" was
+wrong about the ending. What the timestamps say instead is that a teardown ran underneath the live
+run at ~16:48: the bucket drops to 0, `swarm-multi/` is emptied on every host, and the per-agent
+configs are rewritten, all within the same minute, with no second run in the log directory. The poll
+loop then read the flushed bucket as a drained pool. Either way the outcome is the same and is the
+lesson: two failures compounded — an unbounded wait, and per-agent logs that live on the agent hosts
+until the next `cleanup()` erases them.
+
+**Fix:** read `args.runtime` — as a hard cap on `wait_runtime()`'s loop, not as a replacement for
+the drain condition, so a slow-but-progressing run still exits early on drain and a stalled one
+exits on the clock. Until then, pass `--shutdown-after-seconds N` for any run that might not drain;
+it also stops the agents and collects their logs on the way out, which is the difference between a
+measured stall and an unexplained one. The scenario harness does this via `CJ_SHUTDOWN_AFTER`, and
+`helpers.snapshot_agent_logs()` now pulls the per-agent logs in a `finally` so a killed run still
+leaves its evidence behind.

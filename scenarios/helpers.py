@@ -209,6 +209,57 @@ def cleanup() -> None:
         "docker exec redis redis-cli flushall >/dev/null")
 
 
+def set_disable_fallback(on: bool) -> int:
+    """Write `llm.disable_fallback` into every per-agent config, and prove it landed.
+
+    The figure-D ablation lives in the config the agents actually load, which under
+    `--use-config-dir` is `configs/config_swarm_multi_<id>.yml` — editing the base
+    `config_swarm_multi.yml` does nothing, because generate_configs.py is never called.
+
+    Always called, with True or False, for the same reason `stop_fault()` always runs: the flag
+    is a run-scoped mutation of a frozen fleet, and a leftover `true` from an earlier ablation is
+    invisible in every metric except the one it changes. Called with False it strips the key, so a
+    normal scenario cannot silently inherit it.
+
+    Returns the number of configs carrying the flag, and refuses to continue if that is not the
+    whole fleet (or zero, when turning it off) — a partially applied ablation would look like a
+    smaller blast radius rather than like a broken setup.
+    """
+    paths = sorted(glob(f"{REPO}/configs/config_swarm_multi_*.yml"))
+    if not paths:
+        # Fatal when arming the ablation — there is nothing to write it into, so the run would
+        # be an ordinary S05. Harmless when clearing it: no configs means nothing to clear, and
+        # clear_faults.py must not fail on a fleet that has not been generated yet.
+        if on:
+            raise SystemExit(
+                f"no per-agent configs in {REPO}/configs — restore the frozen fleet first")
+        return 0
+    for path in paths:
+        lines = [ln for ln in open(path).read().splitlines(True)
+                 if not ln.startswith("  disable_fallback:")]
+        if on:
+            # Anchored on the top-level `llm:` key, not on a sibling setting: the block's other
+            # keys move between config revisions, and a missing anchor has to fail loudly here
+            # rather than write the flag into some other section where it would be ignored.
+            try:
+                at = next(i for i, ln in enumerate(lines) if ln.rstrip("\n") == "llm:")
+            except StopIteration:
+                raise SystemExit(f"{path}: no top-level 'llm:' block to write disable_fallback into")
+            lines.insert(at + 1, "  disable_fallback: true\n")
+        open(path, "w").write("".join(lines))
+
+    applied = sum(1 for p in paths
+                  if any(ln.startswith("  disable_fallback: true")
+                         for ln in open(p).read().splitlines()))
+    want = len(paths) if on else 0
+    if applied != want:
+        raise SystemExit(f"disable_fallback={on} applied to {applied}/{len(paths)} configs, "
+                         f"expected {want}")
+    print(f"  ablation:       llm.disable_fallback={'true' if on else 'absent'} "
+          f"in {len(paths)}/{len(paths)} per-agent configs")
+    return applied
+
+
 # ---------------------------------------------------------------------------
 # Fault injection (per host, so blast radius is a host subset)
 # ---------------------------------------------------------------------------
@@ -381,6 +432,24 @@ def assert_clean(strict: bool = False) -> None:
             f"still bound to :{PROXY_PORT}.\nrun scenarios/clear_faults.py before measuring.")
     print(f"  clean check:    no leaked env vars / drivers / :{PROXY_PORT} listeners "
           f"on {len(hosts())} hosts")
+
+    # A config-side leak, which every probe above is blind to. `set_disable_fallback()` mutates
+    # the frozen fleet's per-agent configs, so a leftover `true` from a killed ablation run
+    # changes what the NEXT scenario measures while looking like a clean slice: an S01 latency
+    # run would silently convert slow bids into refusals, and a baseline would stop being a
+    # baseline. S05 writes the flag *after* this check, so the deliberate case still works and
+    # only a leak trips it.
+    leaked = [os.path.basename(p)
+              for p in sorted(glob(f"{REPO}/configs/config_swarm_multi_*.yml"))
+              if any(ln.startswith("  disable_fallback: true")
+                     for ln in open(p).read().splitlines())]
+    if leaked:
+        raise SystemExit(
+            f"llm.disable_fallback is still true in {len(leaked)} per-agent config(s) "
+            f"({', '.join(leaked[:4])}) — the figure-D ablation leaked from an earlier run, and "
+            f"every scenario reading these configs would measure it. Clear it with "
+            f"scenarios/clear_faults.py, or helpers.set_disable_fallback(False).")
+    print(f"  ablation check: llm.disable_fallback absent from every per-agent config")
     if strict:
         agents = sum(int(n) for n in _fan_out(hosts(), 'pgrep -fc "mai[n].py" || true').split()
                      if n.strip().isdigit())
@@ -423,14 +492,148 @@ def run_swarm(run_dir: str, runtime: int | None = None) -> None:
     """
     runtime = runtime if runtime is not None else int(os.getenv("CJ_RUNTIME", "3000"))
     log = f"{REPO}/runs_{os.path.basename(run_dir)}.log"
+
+    # `CJ_SHUTDOWN_AFTER` bounds the run in wall-clock time. Needed because `--runtime` does NOT:
+    # run_test.py parses it and never reads it (SwarmAgents finding 14). With it absent, run_test
+    # takes the `wait_runtime()` branch, an UNBOUNDED loop that exits only when the pool bucket
+    # drains below its threshold — so a run that cannot place jobs at all never exits on its own.
+    # `--shutdown-after-seconds` switches to the deadline branch, which stops the agents and
+    # collects their logs on the way out, instead of being killed with both still on the hosts.
+    #
+    # Only for runs expected NOT to drain. Leave it unset for everything else: a healthy run exits
+    # on the drain condition well before any deadline, and a deadline would silently truncate the
+    # slow points of a sweep into "the fault broke scheduling".
+    bound = int(os.getenv("CJ_SHUTDOWN_AFTER", "0"))
     cmd = (
         f"cd {REPO} && nohup python3.11 run_test.py --mode remote --agent-type llm "
         f"--agents {AGENTS} --agents-per-host 1 --topology {TOPOLOGY} --jobs {JOBS} "
         f"--db-host database --agent-hosts-file agent_hosts_cj.txt --use-config-dir "
         f"--jobs-per-interval 30 --stable-seconds 120 --runtime {runtime} "
-        f"--generate-plots --run-dir {run_dir} > {log} 2>&1"
+        + (f"--shutdown-after-seconds {bound} " if bound else "")
+        + f"--generate-plots --run-dir {run_dir} > {log} 2>&1"
     )
-    _sh(cmd, timeout=runtime + 900)
+    # Stamped BEFORE the run, and it is what tells this run's evidence from an earlier run's into
+    # the same run dir. Agents start ~60-90 s after this point, so every log they write is newer.
+    started = time.time()
+    try:
+        _sh(cmd, timeout=(bound or runtime) + 900)
+    finally:
+        # Whatever happened to the run — finished, hung and killed, crashed — the agent logs are
+        # the per-agent evidence and they live on the agent hosts until the next cleanup() erases
+        # them. Pull them here rather than trusting run_test to reach its own collection step.
+        snapshot_agent_logs(run_dir, since=started)
+
+
+def snapshot_agent_logs(run_dir: str, since: float) -> None:
+    """Copy each host's agent log into the run dir, and say exactly what was collected.
+
+    run_test.py collects these itself, but only if it reaches the end of its wait. The S05 100%
+    no-fallback run is what this exists for: nothing could be placed, the run sat in the poll
+    loop, and by the time it was cleaned up the logs had been deleted from the hosts — leaving no
+    evidence of the one thing the experiment was measuring, whether agents refused to bid.
+
+    `since` is the run's start time and is REQUIRED, because every weaker rule ends up publishing
+    another run's log as this one's. A log in the run dir is this run's evidence only if it was
+    written after the run began; an older one came from an EARLIER run into the same dir. That is
+    not cosmetic — collect(), load_split() and _restarts_and_conflicts() all glob the whole
+    directory, so one stale file mixes two runs into every per-agent metric with nothing on screen
+    to say so.
+
+    Three rules, and the third is the one that is easy to get wrong:
+
+      * **fresh stays.** run_test's own copy wins the race, and re-copying would only add a way to
+        replace a complete log with a partial one.
+      * **stale is set aside** as `*.log.stale` — renamed, not deleted, since it is still some
+        run's evidence — which also drops it out of the `agent-*.log` glob those readers use.
+      * **a failed refresh leaves the host EMPTY, never falling back to the file it displaced.**
+        Setting a stale file aside and then failing to fetch a replacement must report a missing
+        host, because "we could not collect this, so here is last time's" is the original bug
+        wearing a different hat. For the same reason the `mv` out of `.incoming/` is gated on scp
+        *succeeding*: a transfer that dies mid-file leaves a truncated log, and publishing that as
+        complete is the same lie by a different mechanism.
+    """
+    if not run_dir or ".." in run_dir:
+        raise SystemExit(f"refusing to snapshot into suspicious run_dir {run_dir!r}")
+    dest_root = f"{REPO}/{run_dir}"
+    all_hosts = hosts()
+
+    stale, wanted = [], []
+    for host in all_hosts:
+        dest = f"{dest_root}/{host}"
+        os.makedirs(dest, exist_ok=True)
+        keep = []
+        for path in sorted(glob(f"{dest}/agent-*.log")):
+            # A file can be removed between the glob and the stat — a concurrent cleanup, or the
+            # run dir being tidied. Treated as absent, never raised: this runs in a `finally` after
+            # a ~20 minute run, and crashing here would discard the collection step that exists to
+            # save the evidence.
+            try:
+                fresh = os.path.getmtime(path) >= since
+            except OSError:
+                continue
+            if fresh:
+                keep.append(path)
+                continue
+            try:
+                os.rename(path, f"{path}.stale")
+            except OSError:
+                continue
+            stale.append(f"{host}/{os.path.basename(path)}")
+        if not keep:
+            wanted.append(host)
+
+    if wanted:
+        parts = " ".join(
+            # `&&` before the mv, not `;`: scp exits nonzero on a dead or half-finished transfer,
+            # and an unconditional mv would publish the truncated file it left behind as this
+            # run's complete log.
+            f"(rm -rf {dest_root}/{h}/.incoming && mkdir -p {dest_root}/{h}/.incoming && "
+            f"scp -q -o ConnectTimeout=10 -o StrictHostKeyChecking=no "
+            f"{h}:{REPO}/swarm-multi/agent-*.log {dest_root}/{h}/.incoming/ 2>/dev/null && "
+            f"mv {dest_root}/{h}/.incoming/agent-*.log {dest_root}/{h}/ 2>/dev/null; "
+            f"rm -rf {dest_root}/{h}/.incoming) &"
+            for h in wanted
+        )
+        _sh(parts + " wait", timeout=600)
+
+    # Freshness, not existence, for the final accounting too. Transferred files carry the current
+    # time (scp without -p), so this is equivalent today — but it stays correct if the transfer
+    # ever preserves mtimes, and it means the reported count and the metric population are decided
+    # by the same rule rather than by two rules that happen to agree.
+    def _fresh(path: str) -> bool:
+        try:
+            return os.path.getmtime(path) >= since
+        except OSError:      # removed under us; not evidence we hold
+            return False
+
+    have = [h for h in all_hosts
+            if any(_fresh(p) for p in glob(f"{dest_root}/{h}/agent-*.log"))]
+    print(f"  agent logs:     {len(have)}/{len(all_hosts)} hosts collected under {run_dir}")
+    # Both of these are printed because silence would read as complete evidence. A run missing a
+    # host's log is not a run with a quiet host: every per-agent metric is then computed over a
+    # smaller population than the fleet it divides by.
+    if stale:
+        print(f"  !! {len(stale)} log(s) predate this run and were set aside as *.log.stale "
+              f"({', '.join(stale[:4])}) — an earlier run wrote into {run_dir}. They are excluded "
+              f"from every metric; use a unique run dir per run.")
+    missing = [h for h in all_hosts if h not in have]
+    if missing:
+        print(f"  !! no log collected from {len(missing)} host(s) ({', '.join(missing[:6])}) — "
+              f"per-agent metrics are incomplete for this run.")
+
+
+def _read_log(path: str) -> str | None:
+    """An agent log's text, or None if it is no longer there.
+
+    Every reader globs the run dir and then opens what it found, and the two steps are not atomic:
+    a concurrent cleanup, or a run dir being tidied, removes a file in between. These readers all
+    run after a ~20 minute run, so raising would discard a completed measurement over one missing
+    file. Callers count the None instead.
+    """
+    try:
+        return open(path, errors="ignore").read()
+    except OSError:
+        return None
 
 
 def _restarts_and_conflicts(run_dir: str) -> dict:
@@ -482,17 +685,27 @@ def _restarts_and_conflicts(run_dir: str) -> dict:
                     conflicts += _count(entry.get("conflicts"))
             out["restarts"] = restarts
             out["conflicts"] = conflicts
+            # Which source the `restarts` row actually came from. report() needs this to say
+            # whether the row survives an incomplete log collection: metrics.json is written from
+            # Redis and does not, the fallback below is a sum over the logs and does.
+            out["restarts_source"] = "metrics.json"
 
     marks = {"restart_log_lines": 0, "reselection_log_lines": 0}
     for p in sorted(glob(f"{REPO}/{run_dir}/**/agent-*.log", recursive=True)):
-        body = open(p, errors="ignore").read()
+        body = _read_log(p)
+        if body is None:
+            continue
         marks["restart_log_lines"] += body.count("RESTART: Job:")
         marks["reselection_log_lines"] += body.count("leaving for reselection")
     out.update(marks)
 
     # If metrics.json was missing, fall back to the logs so the metric is never simply absent.
+    # Recorded as such: on this path `restarts` IS log-derived, so an incomplete collection
+    # undercounts it exactly like every other log sum, and report() must not advertise it as
+    # independent of log collection.
     if "restarts" not in out:
         out["restarts"] = marks["restart_log_lines"]
+        out["restarts_source"] = "agent logs"
         return out
 
     # Two sources are only worth having if they are compared. Both are printed by report(), but a
@@ -630,13 +843,63 @@ def placement(run_dir: str) -> tuple[dict, int]:
 
 def collect(run_dir: str) -> dict:
     """Parse per-host agent logs and the orchestrator log into scenario metrics."""
-    m = {"llm_complete": 0, "llm_fallback": 0, "swim_failed": 0}
+    m = {"llm_complete": 0, "llm_fallback": 0, "llm_no_bid": 0, "swim_failed": 0}
     lat, scores = [], []
-    for path in sorted(glob(f"{REPO}/{run_dir}/**/agent-*.log", recursive=True)):
-        text = open(path, errors="ignore").read()
+    # Every metric below this line is a sum over the logs that are PRESENT, and a log can be
+    # absent — an unreachable host at collection time, or one whose log was deleted before it was
+    # fetched. Counting them makes the population part of the measurement instead of a footnote:
+    # 22 logs summed and reported as a 30-agent fleet understates every LLM count by a quarter,
+    # and nothing else in the table reveals it.
+    log_paths = sorted(glob(f"{REPO}/{run_dir}/**/agent-*.log", recursive=True))
+    m["agent_logs"] = len(log_paths)
+    # WHICH agents, not how many logs. A count matching the fleet proves nothing about coverage:
+    # two logs for one agent and none for another is 30 files for 30 agents, and both the missing
+    # and excess counters read zero while the sums double one agent and omit another. The readers
+    # then disagree with each other, too — collect() sums every file, while load_split() keys
+    # scores by id and lets the second file for an id overwrite the first.
+    #
+    # And WHICH agent is decided by the log's CONTENT, not its filename. A name is a label applied
+    # by whoever copied the file; the agent writes its own identity into every line
+    # ("… - agent-7 - INFO - …"). They disagree when a log is fetched into the wrong host dir or a
+    # shard is off by one, and then a filename check certifies a population that is not the one
+    # being summed. Only the body can settle it.
+    log_ids: dict[int, int] = {}
+    unattributable, mislabelled, mixed, vanished = 0, [], [], 0
+    for path in log_paths:
+        base = os.path.basename(path)
+        text = _read_log(path)
+        if text is None:
+            # Globbed and then removed — a concurrent cleanup, or a run dir being tidied
+            # underneath us. Counted, never raised.
+            vanished += 1
+            continue
+        named = re.search(r"agent-(\d+)\.log$", base)
+        # EVERY id in the body, not the first one. A log can hold lines from more than one agent —
+        # two agents started with the same log path, or a stale log appended across runs, which the
+        # runbook already warns inflates counters. Trusting the first match attributes the whole
+        # file, and all its counts, to whichever agent happened to write first.
+        wrote = sorted({int(x) for x in re.findall(r"- agent-(\d+) - ", text)})
+        if len(wrote) > 1:
+            mixed.append(f"{base} holds agents {', '.join(str(i) for i in wrote[:4])}")
+            unattributable += 1
+        elif named and wrote and wrote[0] != int(named.group(1)):
+            mislabelled.append(f"{base} written by agent-{wrote[0]}")
+            unattributable += 1
+        elif named:
+            log_ids[int(named.group(1))] = log_ids.get(int(named.group(1)), 0) + 1
+        elif wrote:
+            log_ids[wrote[0]] = log_ids.get(wrote[0], 0) + 1
+        else:
+            unattributable += 1
+
         c = text.count("LLM_COST_COMPLETE")
         m["llm_complete"] += c
         m["llm_fallback"] += text.count("LLM_COST_FALLBACK")
+        # The `llm.disable_fallback` ablation's marker: a failed call that returned +inf instead
+        # of an analytic bid. It has to be counted here, because under that flag a failed call
+        # leaves NO trace in llm_fallback — so the run reports "fallback rate 0.0%" and looks
+        # like a healthy fleet, which is exactly what a silently inert ablation also looks like.
+        m["llm_no_bid"] += text.count("LLM_COST_NO_BID")
         m["swim_failed"] += text.count("FAILED (suspect-timeout)")
         # Only LLM_COST_COMPLETE marks a real call. LLM_BID_WON also carries a
         # ReasoningTime, but logs 0.000s when the bid came from the analytic fallback,
@@ -650,6 +913,12 @@ def collect(run_dir: str) -> dict:
 
     calls = m["llm_complete"] + m["llm_fallback"]
     m["fallback_rate"] = round(m["llm_fallback"] / calls, 4) if calls else 0.0
+    # Deliberately a SEPARATE rate rather than folding no-bids into fallback_rate: every result in
+    # the campaign was measured with the old denominator, and changing it would silently move
+    # numbers that are already published. Under the ablation fallback_rate goes to 0 by
+    # construction and this is where the failed calls appear.
+    attempts = calls + m["llm_no_bid"]
+    m["no_bid_rate"] = round(m["llm_no_bid"] / attempts, 4) if attempts else 0.0
     # Latency comes from ReasoningTime, which only exists on successful LLM calls. Under a
     # full outage there are no samples — report n/a rather than 0, which would read as
     # "instant" instead of "never happened".
@@ -720,6 +989,53 @@ def collect(run_dir: str) -> dict:
         m["failed_agents"] = int(fa.group(1)) if fa else None
         inf = re.search(r"Infeasible/Failed jobs: (\d+) retired, (\d+) still", text)
         m["jobs_stuck"] = int(inf.group(2)) if inf else None
+        # The fleet the run ACTUALLY launched, from its own log ("Launched 30 initial 'llm' agents
+        # …", plus a line per dynamic batch). This is the only non-guessed configured count
+        # available: `fleet_size` above is max(AGENTS, highest placing id), so for any run smaller
+        # than the module constant — this repo has 10-, 14- and 60-agent sweep runs — it reports 30
+        # and a population check against it invents phantom missing agents. Kept SEPARATE from
+        # fleet_size, which is the published fairness denominator and must not move.
+        launched = [int(n) for n in re.findall(r"Launched (\d+) \w+ '[^']*' agents", text)]
+        if launched:
+            m["fleet_configured"] = sum(launched)
+
+    # The gap between the fleet and the logs actually read. Reported as a metric so it appears in
+    # the table next to the numbers it qualifies, rather than only in the collection step's stdout
+    # — which is a different screen, often a different day, and lost the moment anyone quotes the
+    # table on its own.
+    #
+    # Both counters are computed from the ID SETS, not from the file count. `fleet - len(logs)`
+    # would report a clean population for any run whose gaps and duplicates cancel out
+    # numerically, which is the one case where every per-agent sum is wrong in two directions at
+    # once. "0 missing, 0 extra" now means the logs are exactly agents 1..n, one each.
+    #
+    # But it can only mean that when the fleet is KNOWN, and known means READ, not defaulted. The
+    # only non-guessed source is the run's own "Launched N … agents" line; `fleet_size` is
+    # max(AGENTS, highest placing id) and would certify a 14-agent run against 30. With no such
+    # line the verdict is withheld rather than guessed, and report() says it was withheld.
+    m["agent_ids_mislabelled"] = mislabelled
+    m["agent_ids_mixed"] = mixed
+    m["agent_logs_vanished"] = vanished
+    if not m.get("fleet_configured"):
+        m["agent_population_verified"] = False
+        for key in ("agent_ids_missing", "agent_ids_unexpected", "agent_ids_duplicated",
+                    "agent_logs_missing", "agent_logs_extra"):
+            m[key] = None
+        return m
+
+    fleet = m["fleet_configured"]
+    expected = set(range(1, fleet + 1))
+    m["agent_population_verified"] = True
+    m["agent_ids_missing"] = sorted(expected - set(log_ids))
+    m["agent_ids_unexpected"] = sorted(set(log_ids) - expected)
+    m["agent_ids_duplicated"] = sorted(i for i, n in log_ids.items() if n > 1)
+    m["agent_logs_missing"] = len(m["agent_ids_missing"])
+    # Anything summed that is not one-log-per-fleet-agent: duplicate copies, ids outside the
+    # fleet, files no id can be read from, and logs whose body names a different agent than their
+    # name does. The last are excluded from log_ids rather than credited to either id — attributing
+    # a mislabelled log to its filename is what a filename-only check silently does.
+    m["agent_logs_extra"] = (sum(n - 1 for n in log_ids.values())
+                             + len(m["agent_ids_unexpected"]) + unattributable)
     return m
 
 
@@ -748,7 +1064,9 @@ def load_split(run_dir: str, n_faulted: int, reference: bool = False) -> dict:
     scores: dict[int, list[float]] = {}
     for path in sorted(glob(f"{REPO}/{run_dir}/**/agent-*.log", recursive=True)):
         aid = int(re.search(r"agent-(\d+)\.log$", path).group(1))
-        body = open(path, errors="ignore").read()
+        body = _read_log(path)
+        if body is None:
+            continue
         scores[aid] = [float(x) for x in re.findall(r"LLM_COST_COMPLETE.*?Score=([0-9.]+)", body)]
 
     def group(ids: list[int]) -> dict:
@@ -824,9 +1142,24 @@ def save_reference(metrics: dict) -> None:
 
 _KEYS = [
     ("jobs_completed", "jobs completed", "{}"),
+    # First, because it is the population every log-derived row below is summed over. A run that
+    # collected 22 of 30 logs is not a quieter fleet, it is a partly unmeasured one. Both gaps are
+    # computed from agent IDS, not from the file count — the two disagree exactly when a run is
+    # short and over-counted at once, which is the case a file-count check calls healthy.
+    ("agent_logs", "agent logs read", "{}"),
+    # The run's own launched count, which is what the population check compares against. Printed so
+    # a reader can see the check had a real fleet to check against, rather than a default.
+    ("fleet_configured", "  fleet launched", "{}"),
+    ("agent_logs_missing", "  agents with no log", "{}"),
+    ("agent_logs_extra", "  logs in excess", "{}"),
     ("llm_complete", "LLM calls OK", "{}"),
     ("llm_fallback", "LLM fallbacks", "{}"),
     ("fallback_rate", "fallback rate", "{:.1%}"),
+    # Only nonzero under `llm.disable_fallback: true`, and load-bearing exactly there: it is the
+    # only evidence that agents tried to bid and refused. Without it, a run where the flag never
+    # reached the agents is indistinguishable from one where it did.
+    ("llm_no_bid", "LLM no-bids", "{}"),
+    ("no_bid_rate", "no-bid rate", "{:.1%}"),
     ("latency_mean_s", "bid latency mean", "{}s"),
     ("latency_p95_s", "bid latency p95", "{}s"),
     ("score_mean", "LLM score mean", "{}"),
@@ -873,6 +1206,102 @@ def report(name: str, title: str, baseline: dict, fault: dict, expectations: lis
         else:
             ds = "-"
         print(f"  {label:<20}{bs:>14}{fs:>14}{ds:>16}")
+
+    # An incomplete population must be stated where the numbers are read, not just where they were
+    # collected. But the consequence is NOT uniform, and saying "treat them as lower bounds" of
+    # everything would be its own false claim: a sum over fewer logs really is a lower bound, while
+    # a mean or a rate over fewer logs is simply a different population's statistic, wrong in
+    # whichever direction the absent hosts differed. A missing slow bidder pulls the latency mean
+    # DOWN, so quoting it as a floor is exactly backwards.
+    for label, metrics in (("fault", fault), ("baseline", baseline)):
+        # An unverifiable population is its own state, and it must not read as a clean one. This
+        # fires only for runs collected by the current code that had no orchestrator log; a stored
+        # reference from before the check simply has no opinion, which is not the same as False.
+        if metrics.get("agent_population_verified") is False:
+            print(f"\n  !! {label}: the agent population could not be checked — the run's log has "
+                  f"no \"Launched N … agents\" line, so the configured fleet is unknown and there "
+                  f"is nothing to compare {metrics.get('agent_logs', 0)} log(s) against. It is NOT "
+                  f"assumed to be {AGENTS}: that constant is this campaign's fleet, not this run's. "
+                  f"Every per-agent row above may be over or under the true figure; the population "
+                  f"rows are blank rather than zero for that reason.")
+        if metrics.get("agent_ids_mixed"):
+            bad = metrics["agent_ids_mixed"]
+            print(f"\n  !! {label}: {len(bad)} log(s) containing lines from MORE THAN ONE agent "
+                  f"({'; '.join(bad[:4])}) — two agents sharing a log path, or a stale log appended "
+                  f"across runs. Excluded from the population check, since attributing the file to "
+                  f"any one of them would be a guess, but every line in it is counted in the sums "
+                  f"above.")
+        if metrics.get("agent_ids_mislabelled"):
+            bad = metrics["agent_ids_mislabelled"]
+            print(f"\n  !! {label}: {len(bad)} log(s) whose body names a different agent than "
+                  f"their filename ({'; '.join(bad[:4])}). Collected into the wrong place, or a "
+                  f"shard is off by one. They are excluded from the population check rather than "
+                  f"credited to either id, but their contents ARE in every sum above.")
+        if metrics.get("agent_logs_vanished"):
+            print(f"\n  !! {label}: {metrics['agent_logs_vanished']} log(s) disappeared between "
+                  f"being listed and being read — something is deleting this run dir while it is "
+                  f"being measured. Re-collect before trusting any per-agent row.")
+        gap = metrics.get("agent_logs_missing") or 0
+        extra = metrics.get("agent_logs_extra") or 0
+        if not gap and not extra:
+            continue
+        fleet = metrics.get("fleet_configured") or metrics.get("fleet_size", AGENTS)
+        got = metrics.get("agent_logs", 0)
+        # "agent logs", never "hosts": the count is log files, which equals agents. They coincide
+        # with hosts only at --agents-per-host 1, which is this campaign's setup but not the
+        # harness's only one.
+        print(f"\n  !! {label}: {got} agent log(s) for a fleet of {fleet}, covering "
+              f"{fleet - gap} of {fleet} agents. The per-agent rows above do not all degrade the "
+              f"same way:")
+        # Named, because the counts alone cannot be acted on and because a run can be short and
+        # over-counted at the same time — the case a file-count check reads as healthy.
+        def _ids(key: str) -> str:
+            got_ids = metrics.get(key) or []
+            return ", ".join(str(i) for i in got_ids[:8]) + ("…" if len(got_ids) > 8 else "")
+        if metrics.get("agent_ids_missing"):
+            print(f"     * no log for agent(s): {_ids('agent_ids_missing')}")
+        if metrics.get("agent_ids_duplicated"):
+            print(f"     * more than one log for agent(s): {_ids('agent_ids_duplicated')} — "
+                  f"double-counted in every sum here, and silently deduplicated in load_split()")
+        if metrics.get("agent_ids_unexpected"):
+            print(f"     * log(s) for agent(s) outside the fleet: "
+                  f"{_ids('agent_ids_unexpected')} — a stray log from a larger run")
+        if extra and not (metrics.get("agent_ids_duplicated")
+                          or metrics.get("agent_ids_unexpected")):
+            print(f"     * {extra} log file(s) whose name carries no agent id, so nothing can "
+                  f"attribute them")
+        # `restarts` has two possible sources and only one of them survives a partial collection,
+        # so which list it belongs in is decided per run, not written into the message.
+        log_sourced_restarts = metrics.get("restarts_source") == "agent logs"
+        sums = ("LLM calls OK, LLM fallbacks, LLM no-bids, SWIM false-fails, restart/reselect log "
+                "lines" + (", and `job restarts` (this run has no metrics.json, so that row is a "
+                           "log sum too)" if log_sourced_restarts else ""))
+        # Three cases, not two. A run can be short AND over-counted at the same time — a duplicate
+        # log for one agent and none for another — and then the sums are inflated by the duplicate
+        # while missing the absent agent, so they bound the truth from NEITHER side. Calling that
+        # a lower bound is the same species of false claim as calling a mean one.
+        if gap and extra:
+            verdict = ("wrong in BOTH directions (sums)", f"{sums}. Inflated by the excess log(s) "
+                       f"and short by the uncovered agent(s) — not a bound in either direction.")
+        elif gap:
+            verdict = ("lower bounds (sums)", f"{sums}. The fleet's true figure is at least this.")
+        else:
+            verdict = ("over-counted (sums)",
+                       f"{sums}. Each is inflated by whatever the excess log(s) contain.")
+        print(f"     * {verdict[0]}: {verdict[1]}")
+        print(f"     * biased in an UNKNOWN direction (rates and means): fallback rate, no-bid "
+              f"rate, bid latency mean/p95, LLM score mean/sd, and any split's score means. These "
+              f"describe the {got} logs read, not the fleet — not floors, not ceilings.")
+        independent = ("jobs completed/stuck, placement, fairness, failed agents (orchestrator "
+                       "log); scheduling-latency percentiles (all_jobs.csv)")
+        if not log_sourced_restarts:
+            independent += "; restart/conflict counts (metrics.json, written from Redis)"
+        print(f"     * independent of log collection: {independent}.")
+        if label == "fault" and "agent_logs" not in baseline:
+            print(f"     * the stored baseline records no log population of its own, so the delta "
+                  f"column compares this run's {fleet - gap}-agent coverage against a baseline "
+                  f"whose own coverage is unverified.")
+
     print("\n  expected signals:")
     for line in expectations:
         print(f"    - {line}")
