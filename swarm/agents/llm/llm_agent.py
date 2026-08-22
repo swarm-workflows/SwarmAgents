@@ -290,13 +290,18 @@ class LlmAgent(ResourceAgent):
         would price every job for every peer with the model — roughly 30x the inference to remove
         a 3.7x redundancy.
 
-        **Nothing is requeued here, deliberately.** `pending_queue.gets()` is a non-destructive
-        peek at the first N PENDING jobs, so every agent looks at the *same* window as long as
-        their queues stay in the same order. An earlier version called `move_to_end` on jobs it
-        did not own, which reordered each agent's queue independently: the windows diverged, the
-        designated agent frequently was not looking at the job designated to it, nobody bid, and
-        the liveness fallback below became the normal path instead of a safety net. Skipping a job
-        without touching the queue keeps designation and visibility aligned.
+        **A non-designated job is skipped, not requeued.** `pending_queue.gets()` is a
+        non-destructive peek at the first N PENDING jobs, so skipping leaves the job in every
+        agent's window — including the designee's, which is what lets it bid promptly. Requeueing
+        it would only delay the requeueing agent's own next look at it.
+
+        To be precise about what reordering can and cannot do, because an earlier version of this
+        comment overstated it: it **cannot** change who a job is designated to.
+        `pick_agent_per_candidate` selects per *column*, with column-wise thresholds and no
+        cross-candidate accumulation, so a job's designee depends only on its own cost column and
+        the assignee set — never on which other jobs share the window. Queue order therefore
+        affects *when* an agent considers a job, not *who* is designated to it. (`ResourceAgent`
+        already reorders unilaterally on its own infeasible path, so this is not a new hazard.)
 
         **Liveness.** Agents can still disagree while gossip is stale, and a job whose designee
         never bids must not stall forever. The fallback is a **deadline, not a counter**: a
@@ -338,8 +343,10 @@ class LlmAgent(ResourceAgent):
                 # over `self.neighbor_map`, which is per-agent live membership. An agent that has
                 # transiently dropped the one peer able to run this job concludes nobody can,
                 # while its peers designate it normally — and SWIM churn is not hypothetical here
-                # (7-9 false-fails per run, §3). Requeueing on sight would therefore desynchronise
-                # the shared window, exactly as a deferral requeue did.
+                # (7-9 false-fails per run, §3). Requeueing on a transient verdict would push the
+                # job out of this agent's window for a full rotation on the strength of a local
+                # error. It could not misdirect the designation (that is per-column, see the
+                # docstring), but it delays this agent's own next look for no reason.
                 #
                 # Not requeueing at all is the opposite failure: `gets()` returns the first N
                 # PENDING jobs, so a genuinely unschedulable job would hold a window slot forever,
