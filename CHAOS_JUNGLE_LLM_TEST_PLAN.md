@@ -18,8 +18,11 @@ the throughput, while the number of *distinct agents bidding per job* grows 2.76
 agent bids exactly once per job). A second regime with 1.33 s bids also fails to scale (1.45×).
 The two cannot be compared term by term — they differ in cost signal and in whether Snow's
 dominance rule degenerates (finding 11) — so the campaign has two independent demonstrations that
-this scheduler does not scale, and no established cause for either. The deciding intervention is
-still unrun.
+this scheduler does not scale, and no established cause for either. The deciding intervention has
+since been run once (§4.0c): designating one bidder per job **does** cut inference per placement
+(3.74 → 1.74 bidders, 1123 → 521 calls) with **no work lost** (300/300, 0 stuck, 0 restarts), and
+it did not improve throughput. Its liveness deadline was mis-tuned, though, so that run cannot say
+*why* — the cause of the scaling limit is still unestablished.
 
 The result that reframes the rest: **completion never degrades under any LLM fault measured** —
 300/300 jobs across every scenario, arm and blast radius — because placement is decided by *when*
@@ -754,78 +757,81 @@ in this campaign has scaled better than 1.45× for a 4.3× fleet** — LLM 0.86�
 so throughput work should not be sold as unlocking linear scaling. That is a statement about the
 range of observations, not an attribution of either number.
 
-### 4.0c Designated bidding, run once — the lever works and buys nothing (2026-08-22)
+### 4.0c Designated bidding, run once — one clear answer, and a confounded run (2026-08-22)
 
-The intervention §4.0b said was needed: use the cheap analytic matrix to designate one bidder per
-job, so only that agent spends an LLM call (`job_selection.designate_bidder`, off by default).
-One fault-free run, gateway arm, frozen 30-agent fleet and trace, against `cj-baseline-gw2`.
+The intervention §4.0b called for: use the cheap analytic matrix to designate one bidder per job so
+only that agent spends an LLM call (`job_selection.designate_bidder`, off by default). One
+fault-free run, gateway arm, frozen 30-agent fleet and trace, against `cj-baseline-gw2`.
 
-**It did what it was built to do, and it did not help.**
+**Read the confound first, because it limits what the rest of the table can be used for.** Of the
+per-iteration decisions to keep a job, **97.8% were deadline-forced rather than designated**
+(`forced=11092` against `mine=11344`). So the active mechanism in this run was mostly *agents
+waiting 30 s and then bidding anyway* — a rate limiter — not a partition.
+
+The deadline is mis-tuned, and my reasoning for 30 s was wrong in the same way as the counter it
+replaced: I sized it against one bid plus consensus (~5-8 s), when the timescale that matters is
+how long the **designee** takes to reach that job in its own window — about 10 jobs at 3.4 s each,
+~34 s, against a ~195 s pool wait. The deadline expires before the designee gets there, routinely.
+The counters cannot resolve this either: `mine`/`deferred`/`forced` increment **per loop iteration**,
+not per job, so they are not job counts. That is a flaw in instrumentation I added and it should be
+per-job-unique before this is run again.
 
 | | baseline | designated | |
 |---|---|---|---|
-| distinct bidders / job | 3.74 | **1.74** | **0.46×** — the intended effect |
+| distinct bidders / job | 3.74 | **1.74** | 0.46× |
 | LLM calls | 1123 | **521** | 2.16× fewer |
-| inference work (agent-seconds) | 5717 | **1876** | 3.05× less |
-| bid latency | 4.95 s | 3.43 s | less endpoint contention |
 | **jobs completed / stuck / restarts** | **300 / 0 / 0** | **300 / 0 / 0** | **unchanged** |
-| busy fraction of fleet | 0.56 | **0.17** | **3.3× less** |
-| drain | 339 s | 368 s | **0.92× throughput** |
-| load fairness | 0.849 | **0.276** | **−0.573** |
-| placement deciles | 125/88/87 | **37/114/149** | concentrated |
+| inference work (agent-seconds) | 5717 | 1876 | 3.05× less |
+| busy fraction of fleet | 0.56 | 0.17 | 3.3× less |
+| bid latency | 4.95 s | 3.43 s | |
+| drain | 339 s | 368 s | 0.92× throughput |
+| load fairness | 0.849 | 0.276 | −0.573 |
+| placement deciles | 125/88/87 | 37/114/149 | |
 | idle agents | 0 | 2 | |
 
-**Calls per job fell and completion held — both questions answered yes.** No stuck jobs, no
-restarts, no reselection lines, and `requeued`/`infeasible` were both **0**, so the liveness guards
-never had to save anything on this trace.
+**What the run establishes.** Two things, and they are the two that were asked for:
 
-**But throughput got slightly worse, and the reason invalidates how §4.0b's model was used as a
-lever-guide.** Inference work fell 3.05× and the busy fraction fell 3.3× — almost exactly
-proportionally. The model reads
-`jobs/s = parallel_agents / (calls_per_job × bid_latency)`, and using it to pick a lever assumed
-`parallel_agents` was *independent* of `calls_per_job`. It is not: **the redundant bids were also
-what kept the fleet busy.** Remove them and agents idle rather than the queue draining faster. The
-ratio barely moves, which is exactly what the drain time shows.
+1. **Calls per job fell** — 3.74 → 1.74 distinct bidders, 1123 → 521 LLM calls. Whatever produced
+   it, less inference happened per placement.
+2. **Nothing was lost** — 300/300 completed, 0 stuck, 0 restarts, 0 reselection lines, and
+   `requeued`/`infeasible` both 0, so the liveness guards never had to act.
 
-That is worth stating plainly because it is the second time this model has promised more than it
-can deliver. As an accounting identity it is still correct. As a guide to *which term to attack*
-it is misleading, because its terms are coupled — and nothing in the identity reveals that.
+A third, weaker but still direct: **cutting inference by 2.16× did not make the queue drain faster**
+(0.92×). That is a measurement of this configuration, and it is enough to say the naive hope —
+"remove redundant inference, get throughput" — did not materialise here.
 
-**Fairness is the bigger cost.** 0.849 → 0.276 is a worse collapse than any injected fault in this
-campaign except S05's partial outage, and the deciles show why: work concentrated on high-id agents
-(37/114/149 against 125/88/87) with 2 agents idle. The analytic cost model is far less diverse than
-per-agent LLM bids, so the same few agents are "best" for job after job and win everything. Per
-§4.1 the absolute number matters less than the delta, but a delta of −0.573 on a metric that no
-fault moved this far is not a rounding artefact.
-
-> **This run does not cleanly test partitioning, and the instrumentation is partly at fault.** Of
-> the per-iteration decisions to keep a job, **97.8% were deadline-forced** (`forced=11092` against
-> `mine=11344`), not designated. So most of the reduction came from agents *waiting 30 s before
-> bidding anyway* — a rate limiter — rather than from a partition.
+> **What the run does NOT establish, despite an earlier version of this section claiming it.**
 >
-> The deadline is mis-tuned, and my reasoning for 30 s was wrong in the same way as the earlier
-> counter: I sized it against one bid plus consensus (~5-8 s), but the relevant timescale is how
-> long the **designee** takes to reach that job in its own window — roughly 10 jobs at 3.4 s each,
-> ~34 s, against a pool wait of ~195 s. So the deadline expires before the designee gets there,
-> routinely.
+> - **That redundancy and parallelism are inherently coupled.** Inference work fell 3.05× and the
+>   busy fraction 3.3×, and I read that as "the redundant bids were what kept the fleet busy". But
+>   agents in this run spent most of their time *waiting out a deadline*, which is a sufficient
+>   alternative explanation for the same numbers and an artefact of the mis-tuning rather than a
+>   property of partitioning. A correctly tuned run could keep agents busy on *different* jobs and
+>   show the opposite. Withdrawn.
+> - **That the analytic cost model concentrates placement.** Fairness fell 0.849 → 0.276 with
+>   deciles 37/114/149, which I attributed to the analytic model being less diverse than per-agent
+>   LLM bids. With 97.8% of keeps forced by the deadline, placement was largely decided by which
+>   agent's window position reached the deadline first, not by analytic designation. The collapse
+>   is real and large — larger than any injected fault except S05's partial outage — but its cause
+>   is not identified. Withdrawn.
+> - **That bidder-side levers are a dead end.** That followed from the first item and falls with it.
 >
-> The counters also cannot answer this properly: `mine`/`deferred`/`forced` are incremented **per
-> loop iteration**, so a job counts once per iteration it is seen, and they cannot be read as job
-> counts. That is a flaw in instrumentation I added, and it should be per-job-unique before anyone
-> runs this again.
->
-> So the fair summary is: **a 2.16× cut in inference bought no throughput and cost 0.57 of
-> fairness, in a configuration where designation was mostly not the active mechanism.** A properly
-> tuned deadline would push bidders/job closer to 1 — and on this evidence would make throughput
-> and fairness *worse*, not better, since both track the busy fraction.
+> The pattern is worth naming because it recurs in this document: the caveat was stated and then
+> reasoned past. A confound that makes the *mechanism* ambiguous makes every downstream causal
+> claim ambiguous too, not just the ones that mention it.
 
-**What this says about the throughput problem.** The queue wait is not caused by redundant
-inference being wasteful; it is caused by the fleet having no way to work on more than one
-placement per job at a time. Cutting redundancy cuts utilisation with it. Anything that actually
-raises throughput has to add *parallelism* — more placements in flight — not merely remove work.
-That points away from bidder-side levers entirely and toward the `beta`/batching question
-(§4.0's withdrawn lever) or genuine pool sharding where distinct agents work on **distinct jobs**
-concurrently, rather than one job being contested less.
+**What a decisive run needs**, in order:
+
+1. **Per-job-unique counters**, so `designated` vs `forced` can actually be read as job counts.
+2. **A deadline sized against pool wait**, not against one bid — on this trace that means minutes,
+   not 30 s, and it should be derived rather than guessed.
+3. Then the same two questions, plus the busy fraction and fairness read together: if calls/job
+   approaches 1 *with* the busy fraction holding near 0.56, redundancy and parallelism are
+   separable and the lever is real. If the busy fraction falls again, they are coupled — and that
+   would be the finding, established rather than inferred.
+
+Until then the honest summary is: **the mechanism reduces inference per placement without losing
+work, and there is no evidence yet that it improves anything.**
 
 ### 4.1 Is Jain's fairness the right metric here? Partly — and it must be quoted differently
 
