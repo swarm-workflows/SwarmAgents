@@ -921,3 +921,30 @@ def test_the_cloud_gate_rejects_an_unreadable_local_ollama_count(monkeypatch):
     monkeypatch.setattr(helpers, "_fan_out", lambda hosts_, cmd, **k: "agent-1 200 ?\n")
     with pytest.raises(SystemExit, match="local-count-unreadable"):
         helpers._cloud_health_gate()
+
+
+def test_a_negative_count_is_refused_by_the_contract(monkeypatch):
+    """Every probe here returns a count — `wc -l`, `pgrep -c`, `grep -c`, `free -m` — and none can
+    legitimately be negative. Allowing a sign let `-1` through as a valid answer."""
+    monkeypatch.setattr(helpers, "hosts", lambda: ["agent-1"])
+    monkeypatch.setattr(helpers, "_fan_out", lambda *a, **k: "agent-1 -1\n")
+    answers, silent, bad = helpers._probe_hosts("probe")
+    assert answers == {} and silent == [] and bad == ["agent-1 -> '-1'"]
+
+
+def test_a_negative_count_cannot_cancel_a_real_agent(monkeypatch):
+    """The failure a total invites: one host reporting -1 against another's real 1 sums to 0, and
+    "0 stray agents" becomes a false certification rather than a missing one. The strict check
+    therefore decides per host, so it holds even if the contract were loosened again."""
+    monkeypatch.setattr(helpers, "hosts", lambda: ["agent-1", "agent-2"])
+    monkeypatch.setattr(helpers, "_sh", lambda *a, **k: "0")
+    # fields=3 is the clean-state probe (both hosts clean); fields=1 is the agent count, where
+    # the two answers cancel in any total.
+    def probe(cmd, fields=1, **k):
+        if fields == 3:
+            return {"agent-1": [0, 0, 0], "agent-2": [0, 0, 0]}, [], []
+        return {"agent-1": [1], "agent-2": [-1]}, [], []
+
+    monkeypatch.setattr(helpers, "_probe_hosts", probe)
+    with pytest.raises(SystemExit, match="stray agent process"):
+        helpers.assert_clean(strict=True)

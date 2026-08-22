@@ -143,7 +143,11 @@ def _probe_hosts(remote_cmd: str, fields: int = 1, timeout: int = 900,
     for host, rows in seen.items():
         if len(rows) != 1:
             bad.append(f"{host} answered {len(rows)} times")
-        elif len(rows[0]) != fields or not all(v.lstrip("-").isdigit() for v in rows[0]):
+        # `isdigit()` with no sign stripping: every probe here returns a COUNT (`wc -l`,
+        # `pgrep -c`, `grep -c`, `ss | grep -c`, `free -m`), none of which can legitimately be
+        # negative. Accepting a minus sign let `-1` through as a valid answer, and the one caller
+        # that decides on a total would then have it cancel a real count elsewhere.
+        elif len(rows[0]) != fields or not all(v.isdigit() for v in rows[0]):
             bad.append(f"{host} -> {' '.join(rows[0])[:40]!r}")
         else:
             answers[host] = [int(v) for v in rows[0]]
@@ -566,14 +570,16 @@ def assert_clean(strict: bool = False) -> None:
         # keeps agents that register into the shared Redis and stall the next run at
         # [SEL_WAIT] live != configured — the exact symptom this check exists to prevent.
         procs, quiet, bad = _probe_hosts('echo $(hostname) $(pgrep -fc "mai[n].py" || true)')
-        # Every answer is an int by construction now — the old `if f[0].isdigit()` filter meant a
-        # host answering garbage contributed 0 and the slice was certified idle.
+        # The decision is PER HOST, not on the total. A total can be cancelled — one host reporting
+        # a negative against another's real count sums to zero — and "0 stray agents" is then a
+        # false certification rather than a missing one. The sum is only reported, never trusted.
+        # (_probe_hosts also refuses a negative outright now; this holds even if that changes.)
+        busy = sorted(h for h, f in procs.items() if f[0] != 0)
         agents = sum(f[0] for f in procs.values())
         keys = int((_sh("docker exec redis redis-cli dbsize").strip() or "0").split()[-1])
-        if agents or keys or quiet or bad:
+        if busy or keys or quiet or bad:
             why = []
-            if agents:
-                busy = sorted(h for h, f in procs.items() if f[0] > 0)
+            if busy:
                 why.append(f"{agents} stray agent process(es) on {', '.join(busy[:8])}")
             if keys:
                 why.append(f"{keys} Redis key(s)")
