@@ -902,6 +902,12 @@ per-agent figure above is a sum over the whole fleet, not over whatever happened
 `collect()` now reports that population alongside the metrics and `report()` states which rows
 degrade, and in which direction, when it is incomplete. `cj-s05-25pct-nofb` and `cj-baseline-gw2`
 re-read the same way, so §4.0d's table is on the same footing.
+>
+> Log *contents* were checked against each run's own span as well, not just their copy times: all
+> 30 logs in both no-fallback runs are dated wholly inside their run's window (0 outside, 0
+> undated). That matters because a file's mtime is when it was **copied**, so a log an earlier run
+> left on a host and this run fetched would arrive looking new — the failure `cleanup()` now
+> refuses to start on, and which `.run_window` lets later runs detect at read time.
 
 **The mechanism, from the agent logs the first attempt never produced:**
 
@@ -2145,11 +2151,13 @@ ssh chaos 'sudo bash -lc "cd /root/SwarmAgents && nohup python3.11 run_test.py \
   expiry still stops the agents and collects their logs. Through the harness that is
   `CJ_SHUTDOWN_AFTER=N`; leave it unset for runs expected to drain, or a slow sweep point gets
   truncated into "the fault broke scheduling".
-- **`CJ_DISABLE_FALLBACK=1`** turns on the figure-D ablation (`llm.disable_fallback`, §4.0d) for
-  the S05 scenario. It writes the key into the *per-agent* `configs/` — the base
-  `config_swarm_multi.yml` is never read under `--use-config-dir` — and asserts 30/30 before
-  running. It is written on every S05 run, `true` or absent, so a plain S05 cannot inherit the
-  flag from an earlier ablation.
+- **`CJ_DISABLE_FALLBACK=1`** turns on the figure-D ablation (`llm.disable_fallback`, §4.0d).
+  Applied by `helpers.run_swarm()`, so **every** scenario shares one lifecycle: written into the
+  *per-agent* `configs/` immediately before run_test copies them to the hosts — the base
+  `config_swarm_multi.yml` is never read under `--use-config-dir` — asserted 30/30, and cleared in
+  a `finally`. Written on every run, `true` or absent, so no scenario can inherit it; recorded in
+  `<run>/.run_window` so a reference built under the ablation is not mistaken for a normal one;
+  and `assert_clean()` refuses to measure at all while a leaked flag is set.
 
 ### 8.4 Read the results
 ```bash

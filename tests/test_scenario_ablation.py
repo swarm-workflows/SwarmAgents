@@ -440,14 +440,15 @@ def glob_configs() -> list[str]:
     return glob(os.path.join(helpers.REPO, "configs", "config_swarm_multi_*.yml"))
 
 
-def test_a_failure_between_arming_and_the_run_still_disarms(s05, monkeypatch):
-    """`cleanup()` is a 30-host fan-out that can time out. Arming before the try block made that
-    an exit path with the ablation left in the configs, invisible to the next scenario."""
+def test_the_scenario_no_longer_owns_the_ablation_lifecycle(s05, monkeypatch):
+    """Arming moved into run_swarm() so all four scenarios share one lifecycle. The scenario must
+    not mutate the configs itself — a second writer is a second chance to leak one."""
     mod, calls = s05
-    monkeypatch.setattr(helpers, "cleanup", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("fan-out timed out")))
+    monkeypatch.setattr(helpers, "cleanup",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("fan-out timed out")))
     with pytest.raises(RuntimeError):
         mod.main()
-    assert _armed() == 0
+    assert _armed() == 0          # never armed by the scenario at all
     assert calls["stop_fault"] == 1
 
 
@@ -460,20 +461,12 @@ def test_a_failed_run_disarms_and_still_stops_the_fault(s05, monkeypatch):
     assert calls["stop_fault"] == 1
 
 
-def test_a_failing_disarm_cannot_suppress_stop_fault(s05, monkeypatch):
-    """Flat teardowns let the config restore abort before `stop_fault()`, leaking a live proxy and
-    an OLLAMA_BASE_URL — the worse leak, and one that silently faults every later run."""
+def test_a_failing_run_still_stops_the_fault(s05, monkeypatch):
+    """stop_fault() must run even when the run raises: a leaked proxy plus OLLAMA_BASE_URL is the
+    worse leak, since it silently faults every later run."""
     mod, calls = s05
-    real = helpers.set_disable_fallback
-    state = {"armed": False}
-
-    def flaky(on: bool):
-        if state["armed"] and not on:          # the disarm, in the finally
-            raise SystemExit("configs vanished mid-run")
-        state["armed"] = on
-        return real(on)
-
-    monkeypatch.setattr(helpers, "set_disable_fallback", flaky)
+    monkeypatch.setattr(helpers, "run_swarm",
+                        lambda *a, **k: (_ for _ in ()).throw(SystemExit("run died")))
     with pytest.raises(SystemExit):
         mod.main()
     assert calls["stop_fault"] == 1
@@ -682,3 +675,121 @@ def test_no_launched_line_withholds_the_verdict(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "no \"Launched N … agents\" line" in out
     assert f"NOT assumed to be {helpers.AGENTS}" in out
+
+
+def _dated(epoch: float, agent: int = 1, marker: str = "[LLM_COST_NO_BID] Job=1") -> str:
+    from datetime import datetime
+    return (f"{datetime.fromtimestamp(epoch).strftime('%Y-%m-%d %H:%M:%S')},123 - "
+            f"agent-{agent} - INFO - {marker}\n")
+
+
+def _window(tmp_path, run: str, started: float, ended: float, ablation: bool = False) -> None:
+    import json
+    (tmp_path / run).mkdir(parents=True, exist_ok=True)
+    json.dump({"started": started, "ended": ended, "disable_fallback": ablation},
+              open(tmp_path / run / ".run_window", "w"))
+
+
+def test_a_fresh_copy_of_an_old_log_is_stale_content_not_current_evidence(snap):
+    """The deepest version of this bug: mtime is the COPY time (scp without -p), so a log an
+    earlier run left on a host and this run fetched arrives looking brand new. Only its dated
+    lines disagree, so content has to decide and the copy time cannot."""
+    tmp_path, seen, _ = snap
+    d = tmp_path / "runs" / "x" / "agent-1"
+    d.mkdir(parents=True)
+    p = d / "agent-1.log"
+    p.write_text(_dated(1_000_000))          # content from long before the run
+    os.utime(p, (9_000_000, 9_000_000))      # ...but copied just now
+
+    helpers.snapshot_agent_logs("runs/x", since=8_000_000)
+
+    assert not p.exists()                     # not certified as this run's
+    assert (str(p) + ".stale") and os.path.exists(str(p) + ".stale")
+    assert "agent-1:" in seen["cmd"]          # and a real copy is attempted instead
+
+
+def test_a_log_dated_entirely_before_the_run_is_reported(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(helpers, "REPO", str(tmp_path))
+    monkeypatch.setattr(helpers, "AGENTS", 1)
+    run = "runs/old"
+    _window(tmp_path, run, started=9_000_000, ended=9_001_000)
+    (tmp_path / run / "agent-1").mkdir(parents=True)
+    (tmp_path / run / "agent-1" / "agent-1.log").write_text(_dated(1_000_000))
+    (tmp_path / "runs_old.log").write_text(
+        LAUNCHED.format(n=1) + "\n[all] Jobs per agent:\n  Agent 1: 1 jobs\n")
+
+    m = helpers.collect(run)
+    assert m["agent_logs_outside_run"] == ["agent-1.log"]
+    assert m["run_window_known"] is True
+    helpers.report("S05", "test", {"llm_complete": 1}, m, ["nothing"])
+    out = capsys.readouterr().out
+    assert "dated entirely BEFORE this run" in out
+
+
+def test_a_log_appended_across_runs_is_reported(tmp_path, monkeypatch, capsys):
+    """cleanup() is supposed to delete host logs between runs; when it silently fails, the agent
+    appends and the file holds both runs. Every count above then includes pre-run lines."""
+    monkeypatch.setattr(helpers, "REPO", str(tmp_path))
+    monkeypatch.setattr(helpers, "AGENTS", 1)
+    run = "runs/appended"
+    _window(tmp_path, run, started=9_000_000, ended=9_001_000)
+    (tmp_path / run / "agent-1").mkdir(parents=True)
+    (tmp_path / run / "agent-1" / "agent-1.log").write_text(
+        _dated(1_000_000) + _dated(9_000_500))
+    (tmp_path / "runs_appended.log").write_text(
+        LAUNCHED.format(n=1) + "\n[all] Jobs per agent:\n  Agent 1: 1 jobs\n")
+
+    m = helpers.collect(run)
+    assert m["agent_logs_predating_run"] == ["agent-1.log"]
+    assert m["llm_no_bid"] == 2                     # both lines counted, one of them not ours
+    helpers.report("S05", "test", {"llm_complete": 1}, m, ["nothing"])
+    assert "appended across runs" in capsys.readouterr().out
+
+
+def test_no_run_window_reports_unknown_rather_than_clean(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(helpers, "REPO", str(tmp_path))
+    monkeypatch.setattr(helpers, "AGENTS", 1)
+    run = "runs/nowindow"
+    (tmp_path / run / "agent-1").mkdir(parents=True)
+    (tmp_path / run / "agent-1" / "agent-1.log").write_text(_dated(9_000_500))
+    (tmp_path / "runs_nowindow.log").write_text(
+        LAUNCHED.format(n=1) + "\n[all] Jobs per agent:\n  Agent 1: 1 jobs\n")
+
+    m = helpers.collect(run)
+    assert m["run_window_known"] is False
+    # None, not [] — an empty list would read as "checked, nothing wrong".
+    for key in ("agent_logs_predating_run", "agent_logs_outside_run", "agent_logs_undated"):
+        assert m[key] is None
+    helpers.report("S05", "test", {"llm_complete": 1}, m, ["nothing"])
+    assert "no .run_window" in capsys.readouterr().out
+
+
+def test_the_ablation_state_is_recorded_as_run_provenance(tmp_path, monkeypatch):
+    """A reference built under the ablation must not be indistinguishable from a normal one."""
+    monkeypatch.setattr(helpers, "REPO", str(tmp_path))
+    monkeypatch.setattr(helpers, "AGENTS", 1)
+    run = "runs/prov"
+    _window(tmp_path, run, started=9_000_000, ended=9_001_000, ablation=True)
+    (tmp_path / run / "agent-1").mkdir(parents=True)
+    (tmp_path / run / "agent-1" / "agent-1.log").write_text(_dated(9_000_500))
+    (tmp_path / "runs_prov.log").write_text(
+        LAUNCHED.format(n=1) + "\n[all] Jobs per agent:\n  Agent 1: 1 jobs\n")
+
+    assert helpers.collect(run)["ablation_disable_fallback"] is True
+
+
+def test_cleanup_refuses_to_start_when_stale_host_logs_survive(monkeypatch, capsys):
+    """The upstream fix: if a host keeps last run's log, it will be fetched during this run with a
+    fresh copy time. Nothing downstream can detect that, so cleanup must not proceed."""
+    monkeypatch.setattr(helpers, "hosts", lambda: ["agent-1", "agent-2"])
+    monkeypatch.setattr(helpers, "_sh", lambda *a, **k: "")
+    monkeypatch.setattr(helpers, "_fan_out",
+                        lambda hosts_, cmd, **k: "agent-1 1\nagent-2 0\n" if "wc -l" in cmd else "")
+    with pytest.raises(SystemExit, match="survived cleanup"):
+        helpers.cleanup()
+    assert "retrying" in capsys.readouterr().out
+
+    # And it passes once the hosts come back clean.
+    monkeypatch.setattr(helpers, "_fan_out",
+                        lambda hosts_, cmd, **k: "agent-1 0\nagent-2 0\n" if "wc -l" in cmd else "")
+    helpers.cleanup()

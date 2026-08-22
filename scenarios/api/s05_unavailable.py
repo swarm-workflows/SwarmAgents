@@ -45,39 +45,26 @@ def main() -> int:
     tag = f"cj-s05-{int(fraction * 100)}pct{suffix}"
 
     # Figure D: `CJ_DISABLE_FALLBACK=1` removes the analytic safety net, so a faulted agent does
-    # not bid at all instead of bidding an instant analytic cost. Set unconditionally (True or
-    # False) so a plain S05 cannot inherit the flag from an earlier ablation run — it is a mutation
-    # of the frozen fleet's configs, and one that no fleet-wide metric would reveal.
+    # not bid at all instead of bidding an instant analytic cost. Read here only to choose what to
+    # claim about the results; run_swarm() applies and clears it, identically for every scenario.
     nofb = os.getenv("CJ_DISABLE_FALLBACK", "").strip().lower() in ("1", "true", "yes")
 
     print(f"\n{NAME} — {TITLE}  |  faulting {n}/{len(all_hosts)} hosts")
     h.assert_clean()
     h.health_gate()
-    # The ablation is armed INSIDE the try, because it mutates the frozen fleet from that line
-    # onward: arming it before the block leaves cleanup() — a fan-out that can time out — as a
-    # path that exits with the flag still set. Everything that can fail after the first byte is
-    # written belongs under the same teardown.
+    # No arming here: run_swarm() owns the ablation's lifecycle for every scenario, so it is
+    # written immediately before run_test copies the configs and cleared in its finally. This
+    # scenario only needs to know whether it is on, to say the right thing about the results.
     try:
-        h.set_disable_fallback(nofb)
         h.cleanup()
         h.start_fault(faulted, "unavailable")
         print(f"  running:        {h.JOBS} jobs, {h.AGENTS} agents -> runs/{tag}")
         h.run_swarm(f"runs/{tag}")
     finally:
-        # Two teardowns, nested so NEITHER can suppress the other. Flat, the config restore would
-        # be able to abort before stop_fault() and leak a proxy plus an OLLAMA_BASE_URL — the
-        # worse of the two leaks, and one that silently faults every later run.
-        #
-        # Restore first and unconditionally, not `if nofb`: the invariant worth holding is "no S05
-        # run ends with the ablation armed", and a partially-applied arm (which raises) is exactly
-        # the case a `nofb` guard would reason about correctly and still need to clean up.
-        #
-        # A SIGKILL skips both, so `assert_clean()` in the next scenario is the real backstop —
-        # it refuses to measure anything while the flag is still set.
-        try:
-            h.set_disable_fallback(False)
-        finally:
-            h.stop_fault()
+        # The ablation is disarmed by run_swarm's own finally; a SIGKILL skips both that and this,
+        # so `assert_clean()` in the next scenario stays the real backstop — it refuses to measure
+        # anything while the flag is still set.
+        h.stop_fault()
 
     fault = h.collect(f"runs/{tag}")
     if nofb:

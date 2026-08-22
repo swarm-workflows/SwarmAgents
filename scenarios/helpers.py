@@ -23,6 +23,7 @@ import shlex
 import subprocess
 import sys
 import time
+from datetime import datetime
 from glob import glob
 from typing import Iterable
 
@@ -203,10 +204,29 @@ def _cloud_health_gate() -> None:
 
 def cleanup() -> None:
     """Kill agents and stale logs everywhere, flush Redis. Leftover agents register into
-    the shared Redis and stall the next run at [SEL_WAIT] live != configured."""
-    _fan_out(hosts(), f"pkill -9 -f main[.]py; rm -f {REPO}/swarm-multi/agent-*.log")
-    _sh(f"pkill -9 -f main[.]py; rm -f {REPO}/swarm-multi/agent-*.log; "
-        "docker exec redis redis-cli flushall >/dev/null")
+    the shared Redis and stall the next run at [SEL_WAIT] live != configured.
+
+    The delete is VERIFIED, not assumed. `_fan_out` swallows per-host failure (`2>/dev/null`),
+    so a host that is briefly unreachable here keeps last run's log — and if it is reachable at
+    collection time, that log is copied into this run dir with a fresh mtime and counted as this
+    run's evidence. No freshness rule downstream can see that, because the file genuinely was
+    copied now; only refusing to start fixes it.
+    """
+    for attempt in (1, 2):
+        _fan_out(hosts(), f"pkill -9 -f main[.]py; rm -f {REPO}/swarm-multi/agent-*.log")
+        _sh(f"pkill -9 -f main[.]py; rm -f {REPO}/swarm-multi/agent-*.log; "
+            "docker exec redis redis-cli flushall >/dev/null")
+        left = [ln.split()[0] for ln in _fan_out(
+            hosts(), f"echo $(hostname) $(ls {REPO}/swarm-multi/agent-*.log 2>/dev/null | wc -l)"
+        ).splitlines() if len(ln.split()) == 2 and ln.split()[1] != "0"]
+        if not left:
+            return
+        if attempt == 2:
+            raise SystemExit(
+                f"stale agent logs survived cleanup on {len(left)} host(s): {', '.join(left[:8])}. "
+                f"They would be collected as this run's evidence with a fresh copy time, which no "
+                f"freshness check can detect. Clear them before measuring.")
+        print(f"  cleanup:        retrying, stale logs still on {len(left)} host(s)")
 
 
 def set_disable_fallback(on: bool) -> int:
@@ -512,16 +532,39 @@ def run_swarm(run_dir: str, runtime: int | None = None) -> None:
         + (f"--shutdown-after-seconds {bound} " if bound else "")
         + f"--generate-plots --run-dir {run_dir} > {log} 2>&1"
     )
+    # The figure-D ablation is armed HERE, not in a scenario, so every scenario gets the same
+    # lifecycle: written immediately before run_test copies the configs to the hosts, cleared in
+    # the finally whatever happens. It used to live in s05_unavailable.py alone, which meant only
+    # one scenario had the arm/disarm guarantee while baseline.py could quietly build a reference
+    # under a set CJ_DISABLE_FALLBACK.
+    ablation = os.getenv("CJ_DISABLE_FALLBACK", "").strip().lower() in ("1", "true", "yes")
+
     # Stamped BEFORE the run, and it is what tells this run's evidence from an earlier run's into
     # the same run dir. Agents start ~60-90 s after this point, so every log they write is newer.
     started = time.time()
     try:
+        set_disable_fallback(ablation)
         _sh(cmd, timeout=(bound or runtime) + 900)
     finally:
-        # Whatever happened to the run — finished, hung and killed, crashed — the agent logs are
-        # the per-agent evidence and they live on the agent hosts until the next cleanup() erases
-        # them. Pull them here rather than trusting run_test to reach its own collection step.
-        snapshot_agent_logs(run_dir, since=started)
+        # Provenance of the run itself, next to its evidence: the window its logs must fall in,
+        # and whether the ablation was on. Without this a run dir cannot say what produced it, and
+        # a reference built under the ablation is indistinguishable from a normal one.
+        try:
+            os.makedirs(f"{REPO}/{run_dir}", exist_ok=True)
+            json.dump({"started": started, "ended": time.time(), "disable_fallback": ablation},
+                      open(f"{REPO}/{run_dir}/.run_window", "w"))
+        except OSError as exc:
+            print(f"  !! could not write {run_dir}/.run_window ({exc}) — log content cannot be "
+                  f"checked against this run's time window")
+        # Two teardowns, and the config restore must not be able to suppress the log collection:
+        # the evidence is the only thing here that cannot be recreated.
+        try:
+            set_disable_fallback(False)
+        finally:
+            # Whatever happened to the run — finished, hung and killed, crashed — the agent logs
+            # are the per-agent evidence and they live on the agent hosts until the next cleanup()
+            # erases them. Pull them here rather than trusting run_test to reach its own step.
+            snapshot_agent_logs(run_dir, since=started)
 
 
 def snapshot_agent_logs(run_dir: str, since: float) -> None:
@@ -563,14 +606,16 @@ def snapshot_agent_logs(run_dir: str, since: float) -> None:
         os.makedirs(dest, exist_ok=True)
         keep = []
         for path in sorted(glob(f"{dest}/agent-*.log")):
-            # A file can be removed between the glob and the stat — a concurrent cleanup, or the
-            # run dir being tidied. Treated as absent, never raised: this runs in a `finally` after
-            # a ~20 minute run, and crashing here would discard the collection step that exists to
-            # save the evidence.
-            try:
-                fresh = os.path.getmtime(path) >= since
-            except OSError:
+            # CONTENT decides, with the copy time only as a fallback. mtime is when the file was
+            # scp'd (no -p), so a log an earlier run left on a host and this run fetched arrives
+            # looking brand new; its dated lines are the only thing that disagrees. A file can also
+            # be removed between the glob and the read — treated as absent, never raised, since
+            # this runs in a `finally` after a ~20 minute run.
+            body = _read_log(path)
+            if body is None:
                 continue
+            span = _log_span(body)
+            fresh = span[1] >= since if span else os.path.getmtime(path) >= since
             if fresh:
                 keep.append(path)
                 continue
@@ -578,7 +623,8 @@ def snapshot_agent_logs(run_dir: str, since: float) -> None:
                 os.rename(path, f"{path}.stale")
             except OSError:
                 continue
-            stale.append(f"{host}/{os.path.basename(path)}")
+            stale.append(f"{host}/{os.path.basename(path)}"
+                         + ("" if span else " (undated)"))
         if not keep:
             wanted.append(host)
 
@@ -601,9 +647,13 @@ def snapshot_agent_logs(run_dir: str, since: float) -> None:
     # ever preserves mtimes, and it means the reported count and the metric population are decided
     # by the same rule rather than by two rules that happen to agree.
     def _fresh(path: str) -> bool:
+        body = _read_log(path)
+        if body is None:     # removed under us; not evidence we hold
+            return False
+        span = _log_span(body)
         try:
-            return os.path.getmtime(path) >= since
-        except OSError:      # removed under us; not evidence we hold
+            return span[1] >= since if span else os.path.getmtime(path) >= since
+        except OSError:
             return False
 
     have = [h for h in all_hosts
@@ -620,6 +670,32 @@ def snapshot_agent_logs(run_dir: str, since: float) -> None:
     if missing:
         print(f"  !! no log collected from {len(missing)} host(s) ({', '.join(missing[:6])}) — "
               f"per-agent metrics are incomplete for this run.")
+
+
+_LOG_TS = re.compile(r"(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d),\d+")
+
+
+def _log_span(text: str) -> tuple[float, float] | None:
+    """(first, last) log-line timestamps as epoch seconds, or None if the log carries none.
+
+    This is the only thing that can tell a stale log from a current one. A file's mtime is its
+    COPY time — scp writes it without -p — so a log left on a host by an earlier run and fetched
+    during this one arrives looking brand new. Its contents give it away: the lines are dated.
+
+    Assumes the orchestrator and the agent hosts share a timezone, which they do on the slice
+    (both UTC). A skew would misdate every log at once and flag the whole fleet, which is loud;
+    the failure mode being avoided here is the silent one.
+    """
+    head = _LOG_TS.search(text[:8192])
+    tail = None
+    for hit in _LOG_TS.finditer(text[-8192:]):
+        tail = hit
+    if not head:
+        return None
+    fmt = "%Y-%m-%d %H:%M:%S"
+    first = datetime.strptime(head.group(1), fmt).timestamp()
+    last = datetime.strptime(tail.group(1), fmt).timestamp() if tail else first
+    return first, max(first, last)
 
 
 def _read_log(path: str) -> str | None:
@@ -850,6 +926,17 @@ def collect(run_dir: str) -> dict:
     # fetched. Counting them makes the population part of the measurement instead of a footnote:
     # 22 logs summed and reported as a 30-agent fleet understates every LLM count by a quarter,
     # and nothing else in the table reveals it.
+    # The run's own provenance, written by run_swarm: the time window its logs must fall in, and
+    # whether the ablation was armed. Absent for runs collected before this existed, and absence is
+    # reported as "unknown", never as "fine".
+    window = None
+    try:
+        window = json.load(open(f"{REPO}/{run_dir}/.run_window"))
+    except (OSError, ValueError):
+        pass
+    if window:
+        m["ablation_disable_fallback"] = bool(window.get("disable_fallback"))
+
     log_paths = sorted(glob(f"{REPO}/{run_dir}/**/agent-*.log", recursive=True))
     m["agent_logs"] = len(log_paths)
     # WHICH agents, not how many logs. A count matching the fleet proves nothing about coverage:
@@ -865,6 +952,7 @@ def collect(run_dir: str) -> dict:
     # being summed. Only the body can settle it.
     log_ids: dict[int, int] = {}
     unattributable, mislabelled, mixed, vanished = 0, [], [], 0
+    predating, outside, undated = [], [], []
     for path in log_paths:
         base = os.path.basename(path)
         text = _read_log(path)
@@ -873,6 +961,18 @@ def collect(run_dir: str) -> dict:
             # underneath us. Counted, never raised.
             vanished += 1
             continue
+        # Content against the run's window. A log copied during this run can still be an earlier
+        # run's — mtime is the copy time — and a log the fleet APPENDED to across runs holds both,
+        # inflating every count with lines that were never part of this measurement.
+        if window:
+            span = _log_span(text)
+            if span is None:
+                undated.append(base)
+            elif span[1] < float(window["started"]):
+                outside.append(base)
+            elif span[0] < float(window["started"]):
+                predating.append(base)
+
         named = re.search(r"agent-(\d+)\.log$", base)
         # EVERY id in the body, not the first one. A log can hold lines from more than one agent —
         # two agents started with the same log path, or a stale log appended across runs, which the
@@ -1016,6 +1116,12 @@ def collect(run_dir: str) -> dict:
     m["agent_ids_mislabelled"] = mislabelled
     m["agent_ids_mixed"] = mixed
     m["agent_logs_vanished"] = vanished
+    # None, not [], when there is no window to check against: an empty list would read as
+    # "checked, nothing wrong" for exactly the runs that could not be checked.
+    m["agent_logs_predating_run"] = predating if window else None
+    m["agent_logs_outside_run"] = outside if window else None
+    m["agent_logs_undated"] = undated if window else None
+    m["run_window_known"] = bool(window)
     if not m.get("fleet_configured"):
         m["agent_population_verified"] = False
         for key in ("agent_ids_missing", "agent_ids_unexpected", "agent_ids_duplicated",
@@ -1147,6 +1253,9 @@ _KEYS = [
     # computed from agent IDS, not from the file count — the two disagree exactly when a run is
     # short and over-counted at once, which is the case a file-count check calls healthy.
     ("agent_logs", "agent logs read", "{}"),
+    # Provenance of the run, not a measurement of it: whether the figure-D ablation was armed.
+    # A reference built under it would otherwise be indistinguishable from a normal one.
+    ("ablation_disable_fallback", "  fallback disabled", "{}"),
     # The run's own launched count, which is what the population check compares against. Printed so
     # a reader can see the check had a real fleet to check against, rather than a default.
     ("fleet_configured", "  fleet launched", "{}"),
@@ -1224,6 +1333,25 @@ def report(name: str, title: str, baseline: dict, fault: dict, expectations: lis
                   f"assumed to be {AGENTS}: that constant is this campaign's fleet, not this run's. "
                   f"Every per-agent row above may be over or under the true figure; the population "
                   f"rows are blank rather than zero for that reason.")
+        if metrics.get("run_window_known") is False:
+            print(f"\n  !! {label}: no .run_window in the run dir, so the logs cannot be checked "
+                  f"against the time this run actually covered. A log an earlier run left on a "
+                  f"host and this one fetched arrives with a fresh copy time and is indetectable "
+                  f"here; only its dated lines would have given it away.")
+        for key, what in (
+            ("agent_logs_outside_run",
+             "dated entirely BEFORE this run — an earlier run's log, fetched during this one and "
+             "counted in every sum above"),
+            ("agent_logs_predating_run",
+             "starting before this run and continuing into it — appended across runs, so their "
+             "pre-run lines are counted in every sum above"),
+            ("agent_logs_undated",
+             "carrying no timestamps at all, so nothing can place them in time"),
+        ):
+            bad = metrics.get(key) or []
+            if bad:
+                print(f"\n  !! {label}: {len(bad)} log(s) {what} ({', '.join(bad[:4])}). "
+                      f"Re-collect: cleanup() is supposed to make this impossible.")
         if metrics.get("agent_ids_mixed"):
             bad = metrics["agent_ids_mixed"]
             print(f"\n  !! {label}: {len(bad)} log(s) containing lines from MORE THAN ONE agent "
