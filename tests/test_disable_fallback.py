@@ -1,8 +1,8 @@
 """Tests for the fallback-disabled ablation (`LlmAgent._llm_or_analytic_cost`).
 
-`CHAOS_JUNGLE_LLM_TEST_PLAN.md` §10 figure D: the campaign has established that the LLM's *output*
-barely reaches the scheduler (§4f.2 placement follows bid timing; §4e all four semantic mutations
-move nothing; §4.0c cutting LLM calls 2.16x costs no completion). The untested complement is how
+`CHAOS_JUNGLE_LLM_TEST_PLAN.md` §15 figure D: the campaign has established that the LLM's *output*
+barely reaches the scheduler (§12.2 placement follows bid timing; §8 all four semantic mutations
+move nothing; §10 cutting LLM calls 2.16x costs no completion). The untested complement is how
 much of the system's resilience is the analytic fallback rather than the model. Disabling it turns
 S05's graceful degradation into hard failure, which is what makes the safety net measurable.
 

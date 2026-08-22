@@ -99,7 +99,7 @@ class LlmAgent(ResourceAgent):
             "disable_fallback", False))
 
         # Designated-bidder mode. Off by default: it changes who bids, so turning it on changes
-        # every capture and fairness figure the campaign has measured (test plan 4d) and must be
+        # every capture and fairness figure the campaign has measured (test plan 7) and must be
         # an explicit choice, not a silent default.
         job_cfg = self.config.get("job_selection", {}) or {}
         self.designate_bidder = bool(job_cfg.get("designate_bidder", False))
@@ -199,9 +199,9 @@ class LlmAgent(ResourceAgent):
                 # simply does not bid. An infinite cost is how SelectionEngine expresses "not a
                 # candidate", so the job goes to whichever agent still has a working LLM.
                 #
-                # This is the experiment the campaign has been circling. §4f.2 found placement is
-                # decided by *when* an agent bids, §4e found corrupting *what* it bids moves
-                # nothing, and §4.0c found cutting LLM calls costs no completion — all pointing at
+                # This is the experiment the campaign has been circling. §12.2 found placement is
+                # decided by *when* an agent bids, §8 found corrupting *what* it bids moves
+                # nothing, and §10 found cutting LLM calls costs no completion — all pointing at
                 # the LLM's output doing little. The complement is untested: how much of the
                 # system's resilience is the fallback rather than the model. Removing it converts
                 # S05's graceful degradation into hard failure and measures the difference.
@@ -301,7 +301,7 @@ class LlmAgent(ResourceAgent):
     def _designate_bidders(self, pending_jobs: list) -> list:
         """Pick one bidder per job using the ANALYTIC cost, and keep only this agent's share.
 
-        The problem (test plan §4.0b): every agent scores every feasible pending job against
+        The problem (test plan §9): every agent scores every feasible pending job against
         itself, so ~3.7 distinct agents each pay a full LLM bid for a job that is placed once.
         Nothing partitions the pool, so an added agent is a redundant bidder rather than a new
         server, and measured throughput is flat in fleet size — 4.3x the agents bought 0.86x.
@@ -376,7 +376,7 @@ class LlmAgent(ResourceAgent):
                 #
                 # Not requeueing at all is the opposite failure: `gets()` returns the first N
                 # PENDING jobs, so a genuinely unschedulable job would hold a window slot forever,
-                # and enough of them stall the run (§2.2's head-of-line blocking).
+                # and enough of them stall the run (§2.3's head-of-line blocking).
                 #
                 # Gate it on the same deadline as a deferral, which bounds both. A transient
                 # disagreement clears well inside the window and never touches the queue; a

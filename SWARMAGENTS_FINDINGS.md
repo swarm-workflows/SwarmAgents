@@ -345,7 +345,7 @@ YAML keeps the **last** occurrence, so the effective value is **45 s**, not the 
 line and `CLAUDE.md` both advertise ("Time before marking agent as stale (default: 300s)"). No
 parser warns, and both values are plausible, so reading the file top-down gives the wrong answer.
 
-Found while checking what actually governs the scheduling-latency figures (test plan 4.0). It did
+Found while checking what actually governs the scheduling-latency figures (test plan 4.1). It did
 not affect any result — `failed_agents` is 0 in every run and heartbeat, not peer expiry, is
 authoritative for reassignment — but it means a documented knob has not had its documented value
 in any run of the campaign.
@@ -383,7 +383,7 @@ Every campaign run passed `--runtime 3000` and none of them was ever bounded by 
 unnoticed because healthy runs drain in ~11 min and exit on the drain condition, which looks
 exactly like a working timeout.
 
-It cost one experiment. The first S05 100% no-fallback attempt (test plan 4.0d.1) is the case where
+It cost one experiment. The first S05 100% no-fallback attempt (test plan 11.1) is the case where
 nothing *can* be placed: `runs_cj-s05-100pct-nofb-void.log` shows 332 consecutive polls of a bucket
 stuck at `size=300` over 28 minutes. It then reported `size=0`, waited out `--stable-seconds`, and
 exited cleanly — so the earlier write-up's "the run did not terminate and the harness killed it" was
