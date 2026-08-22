@@ -473,9 +473,32 @@ guessed that and was wrong.)
 > | lever | change | expected | note |
 > |---|---|---|---|
 > | **Narrow the candidate pool** | lower `selection_threshold_pct` so fewer agents qualify to bid per job | close to linear in calls/job — 3.7 → 2 would be ~1.8× | cheapest by far, config-only, but it directly shapes who competes, so re-measure §4d fairness alongside |
-> | **Rank-gate the bidders** | let agent *a* bid on job *j* only if `tiebreak_rank(j, a)` is in the top *m* — machinery already in `swarm/utils/tiebreak.py` | calls/job → ~*m*, so *m*=2 is ~1.8× and *m*=1 is ~3.7× | no coordination and no new state, and unlike a threshold change it is cost-neutral: it changes *how many* agents compete, not *which* costs qualify. Keep *m*≥2 or the competition §4d measures disappears |
+> | **Rank-gate the bidders, within the feasible set** | let agent *a* bid on job *j* only if `tiebreak_rank(j, a)` is in the top *m* **of the agents for which *j* is feasible** | calls/job → ~*m*, so *m*=2 is ~1.8× | cost-neutral, unlike a threshold change: it changes *how many* agents compete, not *which* costs qualify. Keep *m*≥2 or the competition §4d measures disappears. **The "within the feasible set" qualifier is load-bearing — see below.** |
 > | **Cut bid latency** | faster model/endpoint | linear | already characterised in §4c and §4e.6 |
 > | ~~**Lower `beta`**~~ | ~~6 → 3~~ | **withdrawn** | consensus is 1.0 s *per job* but overlaps across jobs (`max_inflight: 16`), so it is not the serial term. An earlier version of this note proposed it as the top lever, from a coincidence between the drain rate and the selection time. |
+>
+> **A rank gate over the whole fleet would strand jobs — do not build that.** The obvious form,
+> "bid only if `tiebreak_rank(j, a)` is in the top *m* of all 30 agents", is broken: the gate is
+> blind to feasibility, and **the median job is feasible on only 9 of 30 agents** (§2.2). Gating to
+> *m*=2 out of 30 would leave a job with *no* eligible bidder roughly half the time — and a job
+> with no bidder does not fail fast. It sits PENDING until `reselection_timeout_s` (300 s in the
+> shipped config) or is retired after `max_infeasible_retries: 10`. That is precisely the
+> head-of-line blocking that per-file DTN spreading caused in §2.2, reintroduced deliberately.
+>
+> The fix is to rank **within the feasible set**, which is computable locally: `is_job_feasible`
+> takes an arbitrary `AgentInfo`, so an agent can evaluate feasibility *for its peers* from
+> gossiped capabilities. That is the asymmetry to exploit — peer **feasibility** is knowable, peer
+> **LLM cost** is not (finding 11). So the gate becomes top-*m* of
+> `{a : is_job_feasible(j, a)}`, which with ~9 feasible agents and *m*=2 cuts redundant bidding
+> without ever emptying the eligible set.
+>
+> Two safeguards it still needs. Gossip staleness can make agents briefly disagree about who is
+> feasible, so the gate should **stagger rather than exclude**: the top *m* bid immediately, the
+> rest after a short delay. A gate mistake then costs seconds instead of 300 s, and the eligible
+> set is never empty by construction. Usefully, a delay applied to non-preferred bidders is the
+> same mechanism §4f.1 already asks for against the fallback-path asymmetry — one change
+> addressing both. Second, any gate must be measured against §4d's capture numbers, since it
+> directly changes how many agents race for a job.
 >
 > **Open, and worth one cheap run each:** why effective parallelism sits at ~17 of 30 rather than
 > ~30 (loop `time.sleep(0.5)` waits and an often-empty queue are candidates), and whether drain
