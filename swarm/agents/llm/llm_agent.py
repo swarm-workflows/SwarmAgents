@@ -96,7 +96,11 @@ class LlmAgent(ResourceAgent):
         # an explicit choice, not a silent default.
         job_cfg = self.config.get("job_selection", {}) or {}
         self.designate_bidder = bool(job_cfg.get("designate_bidder", False))
-        self.designate_bidder_max_defers = int(job_cfg.get("designate_bidder_max_defers", 3))
+        # A DEADLINE, not a retry count — see _designate_bidders. Must stay well above one LLM
+        # bid (4-7 s measured) plus consensus (~1 s), or the fallback fires before the designated
+        # agent could have bid and designation buys nothing.
+        self.designate_bidder_fallback_s = float(
+            job_cfg.get("designate_bidder_fallback_s", 30.0))
 
         # ResourceAgent.__init__ has just built a selection engine over the ANALYTIC cost model.
         # Keep it before overwriting self.selector below: the cheap model is what makes
@@ -286,12 +290,24 @@ class LlmAgent(ResourceAgent):
         would price every job for every peer with the model — roughly 30x the inference to remove
         a 3.7x redundancy.
 
-        **Liveness.** Agents can disagree about the designation while gossip is stale, and a job
-        whose designee never bids would otherwise circulate indefinitely. Each agent counts how
-        often it has deferred a given job and bids anyway past `designate_bidder_max_defers`, so
-        the worst case degrades to today's behaviour for that job rather than starving it. A job
-        that is infeasible fleet-wide is requeued without counting a defer, leaving the existing
-        infeasible handling untouched.
+        **Nothing is requeued here, deliberately.** `pending_queue.gets()` is a non-destructive
+        peek at the first N PENDING jobs, so every agent looks at the *same* window as long as
+        their queues stay in the same order. An earlier version called `move_to_end` on jobs it
+        did not own, which reordered each agent's queue independently: the windows diverged, the
+        designated agent frequently was not looking at the job designated to it, nobody bid, and
+        the liveness fallback below became the normal path instead of a safety net. Skipping a job
+        without touching the queue keeps designation and visibility aligned.
+
+        **Liveness.** Agents can still disagree while gossip is stale, and a job whose designee
+        never bids must not stall forever. The fallback is a **deadline, not a counter**: a
+        non-designated agent bids anyway once the job has gone unclaimed for
+        `designate_bidder_fallback_s`. A counter cannot work here — three loop iterations is
+        ~1.5 s while the designee needs 4-7 s for its LLM bid plus ~1 s of consensus, so a
+        counter-based fallback fires before the designee could possibly have bid, on every job.
+        The deadline must stay comfortably above bid-plus-consensus for the same reason.
+
+        A job infeasible for every live agent is skipped without starting its deadline, which
+        leaves the existing infeasible handling exactly as it was.
         """
         agents_map = self.neighbor_map
         agents = [agents_map.get(aid) for aid in list(agents_map.keys())]
@@ -313,24 +329,33 @@ class LlmAgent(ResourceAgent):
                 getattr(cand, "job_id", ""), getattr(ag, "agent_id", "")),
         )
 
+        now = time.time()
         mine, deferred, forced, infeasible = [], 0, 0, 0
         for job, (agent, _cost) in zip(pending_jobs, designations):
             if agent is None:
                 infeasible += 1
-                self.queues.pending_queue.move_to_end(job)
                 continue
             if agent.agent_id == self.agent_id:
                 mine.append(job)
                 continue
-            defers = int(getattr(job, "designation_defers", 0)) + 1
-            job.designation_defers = defers
-            if defers >= self.designate_bidder_max_defers:
+            first_seen = getattr(job, "designation_deferred_at", None)
+            if first_seen is None:
+                first_seen = now
+                job.designation_deferred_at = first_seen
+            if now - first_seen >= self.designate_bidder_fallback_s:
                 forced += 1
                 mine.append(job)
             else:
                 deferred += 1
-                self.queues.pending_queue.move_to_end(job)
 
+        if forced:
+            # Not routine: it means a designated agent did not bid within the deadline. A rate
+            # anywhere near the deferred count means designation is not holding and the mode is
+            # buying nothing.
+            self.logger.info(
+                f"[DESIGNATE_FALLBACK] Agent={self.agent_id} forced={forced} "
+                f"after {self.designate_bidder_fallback_s}s unclaimed"
+            )
         if deferred or forced or infeasible:
             self.logger.info(
                 f"[DESIGNATE] Agent={self.agent_id} candidates={len(pending_jobs)} "

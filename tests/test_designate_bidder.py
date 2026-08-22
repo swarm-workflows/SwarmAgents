@@ -112,7 +112,7 @@ class _Selector:
         return [self._designate(job, assignees) for job in candidates]
 
 
-def make_agent(agent_id, peer_ids, designate, max_defers=3):
+def make_agent(agent_id, peer_ids, designate, fallback_s=30.0):
     """A bare LlmAgent with only what _designate_bidders touches."""
     a = LlmAgent.__new__(LlmAgent)
     a.agent_id = agent_id
@@ -120,7 +120,7 @@ def make_agent(agent_id, peer_ids, designate, max_defers=3):
     a.analytic_selector = _Selector(designate)
     a.queues = _Queues()
     a.selection_threshold_pct = 10.0
-    a.designate_bidder_max_defers = max_defers
+    a.designate_bidder_fallback_s = fallback_s
     a._projected_load_factor = lambda ag: 1.0
 
     class _Log:
@@ -151,7 +151,14 @@ def test_only_the_designated_agent_keeps_the_job():
     assert sorted(j for v in kept.values() for j in v) == ["j1", "j2", "j3"]
 
 
-def test_non_designated_jobs_are_requeued_not_dropped():
+def test_nothing_is_requeued():
+    """Requeueing is what broke the first version, so this is pinned.
+
+    gets() is a non-destructive peek at the first N PENDING jobs, so all agents share a window
+    only while their queues stay in the same order. move_to_end on a job this agent does not own
+    reorders its queue away from its peers', the designee stops seeing the job designated to it,
+    and the liveness fallback becomes the normal path.
+    """
     jobs = [_Job("j1"), _Job("j2")]
 
     def designate(job, assignees):
@@ -159,43 +166,60 @@ def test_non_designated_jobs_are_requeued_not_dropped():
 
     agent = make_agent(1, [1, 2], designate)
     assert agent._designate_bidders(jobs) == []
-    assert agent.queues.pending_queue.requeued == ["j1", "j2"], "must go back on the queue"
+    assert agent.queues.pending_queue.requeued == [], "must NOT reorder the shared window"
 
 
 # --- liveness: the failure mode that would cost completion ------------------------------------
 
-def test_persistent_disagreement_falls_back_to_bidding():
-    """If a designee never bids, every other agent must eventually bid anyway.
+def test_unclaimed_job_falls_back_after_the_deadline():
+    """If a designee never bids, others must eventually bid anyway — but only after a deadline.
 
-    Without this, a job whose designation is wrong under stale gossip circulates forever and the
-    run completes fewer than 300 jobs — a throughput change paid for in lost work.
+    Without this, a job whose designation is wrong under stale gossip stalls and the run
+    completes fewer than 300 jobs: a throughput change paid for in lost work.
     """
     job = _Job("orphan")
 
     def designate(j, assignees):
         return (_Agent(99), 1.0)         # an agent that is not us and never bids
 
-    agent = make_agent(1, [1, 2], designate, max_defers=3)
+    agent = make_agent(1, [1, 2], designate, fallback_s=30.0)
 
-    assert agent._designate_bidders([job]) == []          # defer 1
-    assert agent._designate_bidders([job]) == []          # defer 2
-    forced = agent._designate_bidders([job])              # defer 3 -> bid anyway
+    assert agent._designate_bidders([job]) == [], "held while inside the deadline"
+    assert agent._designate_bidders([job]) == [], "still held — a counter would have fired here"
+
+    # Age the job past the deadline instead of sleeping.
+    job.designation_deferred_at -= 31.0
+    forced = agent._designate_bidders([job])
     assert [j.job_id for j in forced] == ["orphan"]
-    assert job.designation_defers == 3
 
 
-def test_fleet_wide_infeasible_job_does_not_consume_defers():
-    """A job nobody can run is not a designation failure and must not exhaust the fallback."""
+def test_deadline_is_not_a_loop_counter():
+    """Many iterations inside the deadline must not force a bid.
+
+    This is the regression that mattered: the designee needs 4-7 s for its LLM bid plus ~1 s of
+    consensus, so a counter of a few ~0.5 s iterations fires before it could possibly claim the
+    job — restoring full redundancy on every job while adding delay.
+    """
+    job = _Job("j1")
+    agent = make_agent(1, [1, 2], lambda j, a: (_Agent(2), 1.0), fallback_s=30.0)
+
+    for _ in range(50):
+        assert agent._designate_bidders([job]) == []
+    assert agent.queues.pending_queue.requeued == []
+
+
+def test_fleet_wide_infeasible_job_does_not_start_the_deadline():
+    """A job nobody can run is not a designation failure; it must not arm the fallback."""
     job = _Job("too-big")
 
     def designate(j, assignees):
         return (None, float("inf"))
 
-    agent = make_agent(1, [1, 2], designate, max_defers=3)
+    agent = make_agent(1, [1, 2], designate)
     for _ in range(5):
         assert agent._designate_bidders([job]) == []
-    assert not hasattr(job, "designation_defers"), "infeasible must not count as a deferral"
-    assert agent.queues.pending_queue.requeued == ["too-big"] * 5
+    assert not hasattr(job, "designation_deferred_at"), "infeasible must not arm the deadline"
+    assert agent.queues.pending_queue.requeued == [], "and must not reorder the queue"
 
 
 def test_single_agent_fleet_is_a_passthrough():
