@@ -208,32 +208,65 @@ def test_deadline_is_not_a_loop_counter():
     assert agent.queues.pending_queue.requeued == []
 
 
-def test_fleet_wide_infeasible_job_is_requeued_and_does_not_arm_the_deadline():
-    """A job nobody can run must not hold a slot in the shared window.
+def test_infeasible_is_not_requeued_inside_the_deadline():
+    """An "infeasible for the whole fleet" verdict is LOCAL, so it must not reorder immediately.
 
-    Under designation, `agent is None` means infeasible for EVERY live agent, so no bid is ever
-    coming. gets() returns the first N PENDING jobs, so leaving it in place would occupy a window
-    slot permanently and enough of them would stall the run — the head-of-line blocking of §2.2.
-
-    Requeueing is safe here even though it is not for a deferral: feasibility is agent-agnostic
-    and deterministic, so every agent reaches the same verdict and moves the job back at the same
-    point, leaving the shared window aligned.
+    It is computed over self.neighbor_map — per-agent live membership. An agent that has
+    transiently dropped the one peer able to run a job concludes nobody can, while its peers
+    designate it normally, and SWIM churn makes that real (7-9 false-fails per run). Requeueing on
+    sight would desynchronise the shared window, which is the defect that made deferral requeues
+    harmful.
     """
-    job = _Job("too-big")
+    job = _Job("maybe-infeasible")
 
     def designate(j, assignees):
         return (None, float("inf"))
 
     agent = make_agent(1, [1, 2], designate)
-    for _ in range(5):
+    for _ in range(20):
         assert agent._designate_bidders([job]) == []
-    assert not hasattr(job, "designation_deferred_at"), "infeasible must not arm the deadline"
-    assert agent.queues.pending_queue.requeued == ["too-big"] * 5, "must not block the window"
-    assert not hasattr(job, "state"), "must stay PENDING: BLOCKED is never restored in this agent"
+    assert agent.queues.pending_queue.requeued == [], "a transient verdict must not reorder"
+    assert job.designation_infeasible_since is not None, "but the deadline must be armed"
+
+
+def test_persistently_infeasible_job_is_requeued_after_the_deadline():
+    """A genuinely unschedulable job must stop holding a slot in the shared window.
+
+    gets() returns the first N PENDING jobs, so leaving it in place forever is §2.2's
+    head-of-line blocking. Past the deadline every agent reaches this verdict, so they requeue
+    together and stay aligned.
+    """
+    job = _Job("unschedulable")
+    agent = make_agent(1, [1, 2], lambda j, a: (None, float("inf")), fallback_s=30.0)
+
+    assert agent._designate_bidders([job]) == []          # arms the deadline
+    job.designation_infeasible_since -= 31.0             # age past it
+    assert agent._designate_bidders([job]) == []
+    assert agent.queues.pending_queue.requeued == ["unschedulable"]
+    assert job.designation_infeasible_since is None, "window resets so it does not thrash"
+    assert not hasattr(job, "state"), "stays PENDING: BLOCKED is never restored in this agent"
+
+
+def test_becoming_feasible_clears_the_infeasible_deadline():
+    """Blips in separate episodes must not accumulate into a spurious requeue."""
+    job = _Job("flappy")
+    verdict = {"infeasible": True}
+
+    def designate(j, assignees):
+        return (None, float("inf")) if verdict["infeasible"] else (_Agent(2), 1.0)
+
+    agent = make_agent(1, [1, 2], designate)
+    agent._designate_bidders([job])
+    assert job.designation_infeasible_since is not None
+
+    verdict["infeasible"] = False                        # a peer reappears
+    agent._designate_bidders([job])
+    assert job.designation_infeasible_since is None, "marker must be cleared, not carried over"
+    assert agent.queues.pending_queue.requeued == []
 
 
 def test_infeasible_job_does_not_block_a_feasible_one_behind_it():
-    """The blocking case, end to end: an unschedulable job at the head of the window."""
+    """The blocking case: an unschedulable job ahead of one this agent owns."""
     dead, live = _Job("unschedulable"), _Job("mine")
 
     def designate(job, assignees):
@@ -243,7 +276,6 @@ def test_infeasible_job_does_not_block_a_feasible_one_behind_it():
     kept = agent._designate_bidders([dead, live])
 
     assert [j.job_id for j in kept] == ["mine"], "the feasible job must still be bid on"
-    assert agent.queues.pending_queue.requeued == ["unschedulable"]
 
 
 def test_single_agent_fleet_is_a_passthrough():
