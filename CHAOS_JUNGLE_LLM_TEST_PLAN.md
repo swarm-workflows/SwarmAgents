@@ -14,9 +14,9 @@ blast radii: [§4b.1](#4b1-scenario-index--what-has-been-run-and-where).**
 
 **A non-fault result worth reading first (§4.0b):** a 14/30/60-agent sweep on prefix-identical
 fleets shows **placement throughput does not scale with the fleet** — 4.3× the agents buys 0.86×
-the throughput, predicted to within 3% by a model whose binding term is redundant bidding. With
-inference removed entirely the same sweep gives 1.45×, so there are two limits: a sub-linear
-scheduler and a redundant-inference cost that cancels it.
+the throughput, while the number of agents bidding per job grows 2.76×. With inference removed
+entirely the same sweep gives 1.45×, so there are two limits: a sub-linear scheduler and a
+redundant-inference cost that cancels it.
 
 The result that reframes the rest: **completion never degrades under any LLM fault measured** —
 300/300 jobs across every scenario, arm and blast radius — because placement is decided by *when*
@@ -460,18 +460,25 @@ guessed that and was wrong.)
 > - **~17 of 30 agents are inside cost computation at any instant** (5717 agent-seconds of matrix
 >   time across a 338 s run; 17.5 under `inject_distractor`, 17.1 under S05 — strikingly stable).
 >
-> Those give a throughput model, `jobs/s = parallel_agents / (LLM_calls_per_job × bid_latency)`,
-> which holds on the runs we have:
+> Those give a time-accounting identity,
+> `jobs/s = parallel_agents / (LLM_calls_per_job × bid_latency)`:
 >
-> | run | calls/job | bid latency | parallel | predicted | **measured** |
+> | run | calls/job | bid latency | parallel | identity gives | **measured** |
 > |---|---|---|---|---|---|
 > | baseline | 3.74 | 4.95 s | 17.0 | 0.92 jobs/s | **0.89** |
 > | `inject_distractor` | 3.55 | 9.12 s | 17.5 | 0.54 jobs/s | **0.53** |
 > | S05 50% (mostly analytic) | 1.07 | 4.46 s | 17.1 | ~3.6 jobs/s | 2.16 |
 >
-> The two LLM-bound runs land within 3%. The analytic run is only directionally right, because
-> fallback bids are not actually free and the model ignores consensus — which is the honest
-> boundary of it.
+> **This was originally presented as the model "holding to within 3%" on the two LLM-bound runs.
+> That is withdrawn — the agreement is circular.** `parallel` is measured as
+> `matrix_time / drain` and the measured rate is `jobs / drain`, so the ratio between them reduces
+> to `matrix_time / Σ bid_latencies` — and cost-matrix computation is where the bids happen. The
+> close agreement says only that agents spend nearly all of their matrix time inside LLM calls
+> (~2% overhead), which is worth knowing but is not a prediction. See §4.0b for the arithmetic.
+>
+> The identity is still useful for **attribution**: it correctly apportions wall-clock to
+> redundant bidding. The analytic row is where it visibly breaks down, because fallback bids are
+> not free and it ignores consensus.
 >
 > **So the binding constraint is redundant inference, not consensus.** ~3.7 agents each pay a full
 > LLM bid for every job that gets placed once. Revised levers:
@@ -545,29 +552,61 @@ two in a 30-agent fleet — a seed cannot make fleets comparable. 14 rather than
 1–10 of the master cannot satisfy two capacity-heavy jobs (DTN coverage is complete even at N=8,
 so it is capacity, not connectivity), and a run that strands work measures stranding.
 
-| fleet | drain | **jobs/s** | calls/job | bid latency | parallel agents | model predicts | fairness | completed | restarts |
-|---|---|---|---|---|---|---|---|---|---|
-| 14 | 313 s | **0.96** | 2.17 | 4.06 s | 8.6 | 0.98 | 0.395 | 300 | 0 |
-| 30 | 316 s | **0.95** | 3.70 | 5.02 s | 18.1 | 0.98 | 0.826 | 300 | 0 |
-| 60 | 365 s | **0.82** | 5.98 | 7.15 s | 35.8 | 0.84 | 0.743 | 300 | 0 |
+| fleet | drain | **jobs/s** | calls/job | bid latency | parallel agents | fairness | completed | restarts |
+|---|---|---|---|---|---|---|---|---|
+| 14 | 313 s | **0.96** | 2.17 | 4.06 s | 8.6 | 0.395 | 300 | 0 |
+| 30 | 316 s | **0.95** | 3.70 | 5.02 s | 18.1 | 0.826 | 300 | 0 |
+| 60 | 365 s | **0.82** | 5.98 | 7.15 s | 35.8 | 0.743 | 300 | 0 |
 
-**4.3× the fleet buys 0.86× the throughput.** Flat would be 1.0×; linear would be 4.3×.
+**4.3× the fleet buys 0.86× the throughput.** Flat would be 1.0×; linear would be 4.3×. Every
+number above is a direct measurement; §4.0's throughput model is deliberately *not* quoted as
+corroboration, for the reason in the box below.
 
-**The §4.0 model predicts every point to within 3%** (0.98 vs 0.96, 0.98 vs 0.95, 0.84 vs 0.82),
-which is the strongest evidence yet that the bottleneck is understood rather than merely
-described. It also decomposes the result:
+> **Withdrawn: the model does not validate against these runs, and cannot.** An earlier version of
+> this section reported that §4.0's model "predicts every point to within 3%" and called it the
+> strongest evidence the bottleneck was understood. **That agreement is an algebraic identity.**
+> Substituting the terms as they are measured —
+> `parallel = matrix_time / drain`, `calls_per_job = n_bids / jobs`, `bid_latency = mean(bids)` —
+> gives
+>
+> ```
+> predicted / measured  =  matrix_time / Σ bid_latencies
+> ```
+>
+> and cost-matrix computation is *where the LLM calls happen*, so those two quantities are the
+> same clock read twice. Measured: the ratio is 1.018 / 1.026 / 1.019 at 14 / 30 / 60, and
+> predicted-over-measured is 1.021 / 1.032 / 1.024 — the same numbers. The "3%" was the fraction
+> of matrix time that is *not* LLM calls, i.e. loop overhead. The same objection applies to the
+> three-run "within 3%" claim in §4.0, which is withdrawn on the same grounds, and to the
+> decomposition ratio `parallel_ratio / cost_ratio`, which collapses to `drain₁₄ / drain₆₀` for
+> the same reason.
+>
+> What the model is good for is **attribution** — it is a correct accounting of where wall-clock
+> goes, and it says the fleet spends its time in redundant bidding. What it cannot do is
+> *predict* throughput, because throughput is one of its inputs.
+
+The decomposition below is therefore offered as accounting, not as evidence:
 
 | term | 14 → 60 | reading |
 |---|---|---|
 | parallel agents | **4.15×** | capacity scales almost perfectly with the fleet |
 | calls per job | **2.76×** | more agents means more agents bidding on the *same* job |
 | bid latency | **1.76×** | more concurrent clients on a shared endpoint (§2.1) |
-| → cost per placement | **4.86×** | outruns the 4.15× capacity gain |
 
-So the fleet grows, the work each placement costs grows slightly faster, and throughput goes
-nowhere. **This is race-to-propose (§4f.2) measured as a throughput ceiling rather than as a
-placement mechanism** — nothing partitions the pool (§4.0), so every added agent adds a redundant
-bidder rather than a new server.
+**The evidence that redundant bidding is the binding constraint is elsewhere, and is independent
+of the model:**
+
+1. **`calls_per_job` grows 2.76× with a 4.3× fleet** — measured from bid counts alone, with no
+   reference to drain time. More agents really do bid on the same job, which is the mechanism.
+2. **The analytic control (below) removes bids entirely** and throughput rises 2.6–4.4× in
+   absolute terms *and* recovers positive scaling. Nothing else about the scheduler changed, so
+   bid cost was the term suppressing it.
+
+Those two are what support the reading that this is race-to-propose (§4f.2) surfacing as a
+throughput ceiling rather than a placement mechanism: nothing partitions the pool (§4.0), so each
+added agent is a redundant bidder rather than a new server. A *predictive* test would have to be an
+intervention — cut `calls_per_job` and see whether throughput moves as expected — which is exactly
+the rank-gate experiment in §4.0, still unrun.
 
 **Correctness is untouched at every size:** 300/300 completed, 0 stuck, 0 restarts, 0 reselection
 lines. Whatever this costs in throughput, it costs nothing in safety.
