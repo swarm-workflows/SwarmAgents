@@ -411,31 +411,54 @@ across arms and faults because it depends on round-trip time to k peers, not on 
 (`tick_interval_ms` is 50 ms, so this is not tick granularity — an earlier draft of this section
 guessed that and was wrong.)
 
-> **Where the queue wait actually comes from, and how it could be addressed.** This is the largest
+> **Where the queue wait comes from — measured, after two wrong answers.** This is the largest
 > single lever on every latency figure in this document, since scheduling latency *is* pool wait.
 >
-> The fleet drains 300 jobs at **~0.89 jobs/s** at baseline (338 s) and ~2.2 jobs/s when bids are
-> analytic (139 s). With selection at 1.0 s, 0.89 jobs/s is **one placement per selection round,
-> fleet-wide** — 30 agents and `max_inflight: 16` per agent, yet an effective concurrency of ~1.
+> The agent logs already carry `[COST_MATRIX_COMPLETE] Jobs=… Agents=… TotalTime=…` per
+> selection-loop iteration, so this is measurable rather than inferable. Two things it shows
+> immediately:
 >
-> The likely cause is the same mechanism as §4f.2: **race-to-propose.** Every agent scores the
-> *same* pool and proposes the *same* job, and `try_claim_assignment`'s Redis `SET NX` lets
-> exactly one win. Thirty agents racing for one job is one placement per round, not thirty — so
-> adding agents would add contention rather than throughput. That predicts something sharply
-> testable: **drain rate should be roughly independent of fleet size.** Run 10 / 30 / 60 agents on
-> the same trace; if throughput stays near 0.9 jobs/s, the scheduler does not scale with the
-> fleet, which is a more consequential finding than any single fault result here.
+> - **`Agents=1` on every iteration.** `LlmAgent` builds its cost matrix as
+>   `agents = [self.neighbor_map.get(self.agent_id)]` — *"Scoring the jobs on itself"*, with the
+>   all-agents version commented out directly beneath. So there is **no partitioning of the
+>   pool**: every agent scores every candidate against itself and proposes whatever it can run,
+>   and contention is resolved by consensus plus the Redis `SET NX` claim.
+> - **~17 of 30 agents are inside cost computation at any instant** (5717 agent-seconds of matrix
+>   time across a 338 s run; 17.5 under `inject_distractor`, 17.1 under S05 — strikingly stable).
 >
-> Three levers, cheapest first:
+> Those give a throughput model, `jobs/s = parallel_agents / (LLM_calls_per_job × bid_latency)`,
+> which holds on the runs we have:
 >
-> | lever | change | expected | risk |
+> | run | calls/job | bid latency | parallel | predicted | **measured** |
+> |---|---|---|---|---|---|
+> | baseline | 3.74 | 4.95 s | 17.0 | 0.92 jobs/s | **0.89** |
+> | `inject_distractor` | 3.55 | 9.12 s | 17.5 | 0.54 jobs/s | **0.53** |
+> | S05 50% (mostly analytic) | 1.07 | 4.46 s | 17.1 | ~3.6 jobs/s | 2.16 |
+>
+> The two LLM-bound runs land within 3%. The analytic run is only directionally right, because
+> fallback bids are not actually free and the model ignores consensus — which is the honest
+> boundary of it.
+>
+> **So the binding constraint is redundant inference, not consensus.** ~3.7 agents each pay a full
+> LLM bid for every job that gets placed once. Revised levers:
+>
+> | lever | change | expected | note |
 > |---|---|---|---|
-> | **Lower `beta`** | 6 → 3 | selection ~1.0 s → ~0.5 s, so ~2× throughput | safety margin `(1-α)^β` goes 7e-4 → 2.7e-2 per decision; the `SET NX` claim is still the hard exactly-once backstop |
-> | **Batch the commit** | one consensus round places N jobs, not one | up to `jobs_per_proposal` (20) × | needs checking whether the engine commits per-proposal or per-job — if per-job, this is a code change, not a config one |
-> | **Partition the pool** | shard candidate jobs across agents (e.g. hash job id → agent subset) so they stop competing for the same job | breaks the 1-per-round ceiling structurally | changes selection semantics; interacts with the fairness and capture measurements throughout §4d |
+> | **Narrow the candidate pool** | lower `selection_threshold_pct` so fewer agents qualify to bid per job | close to linear in calls/job — 3.7 → 2 would be ~1.8× | cheapest by far, config-only, but it directly shapes who competes, so re-measure §4d fairness alongside |
+> | **Partition the pool** | shard candidates across agents (or restore the all-agents cost matrix so each job has one designated bidder) | breaks the 3.7× redundancy structurally | changes selection semantics; the commented-out code suggests this was once intended |
+> | **Cut bid latency** | faster model/endpoint | linear | already characterised in §4c and §4e.6 |
+> | ~~**Lower `beta`**~~ | ~~6 → 3~~ | **withdrawn** | consensus is 1.0 s *per job* but overlaps across jobs (`max_inflight: 16`), so it is not the serial term. An earlier version of this note proposed it as the top lever, from a coincidence between the drain rate and the selection time. |
 >
-> Measure before tuning: the fleet-size sweep above distinguishes "serialized by design" from
-> "some other bottleneck", and it needs no fault injection at all.
+> **Open, and worth one cheap run each:** why effective parallelism sits at ~17 of 30 rather than
+> ~30 (loop `time.sleep(0.5)` waits and an often-empty queue are candidates), and whether drain
+> rate is independent of fleet size — 10 / 30 / 60 agents on the same trace. The second is the
+> scalability question, and given there is no partitioning, throughput may well be flat in fleet
+> size.
+>
+> *Also noted while measuring:* the loop pulls ~9.9 jobs per iteration, not the
+> `jobs_per_proposal: 20` in `config_swarm_multi.yml` — the frozen fleet was generated with
+> `generate_configs.py 30 10 …`, whose second argument is that batch size, so the per-agent
+> configs carry 10. The base config's value has not been in effect for any run in this campaign.
 
 ### 4.1 Is Jain's fairness the right metric here? Partly — and it must be quoted differently
 
