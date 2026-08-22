@@ -299,6 +299,43 @@ class TestRestartAndLatencyMetrics:
         assert m["restarts"] == 5, "metrics.json is authoritative"
         assert m["restart_log_lines"] == 1, "the log count is reported separately"
 
+    def test_crosscheck_keys_are_actually_reported(self):
+        """A cross-check that is collected but never printed is not a cross-check.
+
+        Both keys were produced by collect() and omitted from _KEYS, so a report could show
+        "job restarts 0" from metrics.json while the logs held nonzero evidence, with nothing on
+        screen to reveal it. This pins the claim to the table that has to carry it.
+        """
+        reported = {key for key, _label, _fmt in helpers._KEYS}
+        for key in ("restarts", "conflicts", "restart_log_lines", "reselection_log_lines",
+                    "pool_wait_mean_s", "selection_mean_s"):
+            assert key in reported, f"{key} is collected but never printed by report()"
+
+    def test_source_disagreement_is_announced(self, tmp_path, monkeypatch, capsys):
+        """Printing two rows relies on the reader comparing them; say it out loud too."""
+        run = self._run(tmp_path, monkeypatch,
+                        metrics={"1": {"restarts": {}}},
+                        agent_log="RESTART: Job: j reset to Pending 60.0 seconds\n" * 3)
+        helpers.collect(run)
+        out = capsys.readouterr().out
+        assert "restart sources disagree" in out
+        assert "metrics.json=0" in out and "log lines=3" in out
+
+    def test_zero_metrics_with_reselection_logs_is_announced(self, tmp_path, monkeypatch, capsys):
+        """The Snow path logs reselection without going through the restart counter."""
+        run = self._run(tmp_path, monkeypatch,
+                        metrics={"1": {"restarts": {}}},
+                        agent_log="elapsed=9s — max_rounds exhausted, leaving for reselection\n")
+        helpers.collect(run)
+        out = capsys.readouterr().out
+        assert "0 restarts" in out and "reselection-related line" in out
+
+    def test_agreement_is_silent(self, tmp_path, monkeypatch, capsys):
+        """No warning when the sources agree — otherwise every clean run cries wolf."""
+        run = self._run(tmp_path, monkeypatch, metrics={"1": {"restarts": {}}}, agent_log="quiet\n")
+        helpers.collect(run)
+        assert "disagree" not in capsys.readouterr().out
+
     def test_falls_back_to_logs_when_metrics_json_absent(self, tmp_path, monkeypatch):
         run = self._run(tmp_path, monkeypatch,
                         agent_log="RESTART: Job: j reset to Pending 60.0 seconds\n" * 4)

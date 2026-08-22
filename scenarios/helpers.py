@@ -493,6 +493,22 @@ def _restarts_and_conflicts(run_dir: str) -> dict:
     # If metrics.json was missing, fall back to the logs so the metric is never simply absent.
     if "restarts" not in out:
         out["restarts"] = marks["restart_log_lines"]
+        return out
+
+    # Two sources are only worth having if they are compared. Both are printed by report(), but
+    # a reader has to notice two rows disagree; say it out loud instead. A mismatch means either
+    # Metrics under-recorded restarts or a log carries restarts the export missed, and both
+    # change what a "0 restarts" claim is worth.
+    logged = marks["restart_log_lines"] + marks["reselection_log_lines"]
+    if out["restarts"] != marks["restart_log_lines"]:
+        print(f"  !! restart sources disagree for {run_dir}: metrics.json={out['restarts']}, "
+              f"'RESTART: Job:' log lines={marks['restart_log_lines']}, "
+              f"'leaving for reselection' log lines={marks['reselection_log_lines']}. "
+              f"Trust neither until reconciled — metrics.json is what the `restarts` row reports.")
+    elif out["restarts"] == 0 and logged:
+        print(f"  !! metrics.json reports 0 restarts for {run_dir} but the logs show "
+              f"{logged} reselection-related line(s). Any latency attributed to queueing "
+              f"(see 4.0) needs re-checking.")
     return out
 
 
@@ -823,6 +839,12 @@ _KEYS = [
     # is a claim worth making explicitly, and it is the control for any latency the reader might
     # otherwise attribute to reselection.
     ("restarts", "job restarts", "{}"),
+    # The cross-check has to be PRINTED to be a cross-check. These were collected but left out
+    # of this table, so a report could show "job restarts 0" from metrics.json while the logs
+    # held nonzero evidence, with nothing on screen to reveal the disagreement — the exact
+    # failure mode the two-source design was meant to prevent.
+    ("restart_log_lines", "  restart log lines", "{}"),
+    ("reselection_log_lines", "  reselect log lines", "{}"),
     ("conflicts", "consensus conflicts", "{}"),
     ("jobs_stuck", "jobs stuck", "{}"),
 ]
