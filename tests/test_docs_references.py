@@ -41,13 +41,19 @@ REF = re.compile(r"(?:§\s?|(?:test plan|TEST_PLAN\.md)[`,]?\s+§?|section\s+)"
                  r"(\d[0-9a-z]*(?:\.[0-9a-z]+)*)(?![0-9a-z])(?!\.[0-9a-z])")
 
 
-def plan_sections() -> list[tuple[int, str]]:
-    """(heading level, label) for every labelled section, IN DOCUMENT ORDER.
+# Headings that carry no section number by design: the parts, and the contents list.
+STRUCTURAL = re.compile(r"^(?:Part [IVX]+\b|Contents$)")
 
-    Permissive on purpose: the label pattern accepts letters (`4b`, `2.1b`), because a collector
-    that only recognised well-formed labels would silently skip a malformed one and make the
-    "no letters" assertion below unfalsifiable — it would be checking a set it had already
-    filtered.
+
+def plan_headings() -> list[tuple[int, str]]:
+    """(level, title) for EVERY heading outside a code fence, in document order.
+
+    Nothing is filtered here. A collector that skips what its label pattern does not recognise
+    cannot report a heading that is unlabelled (`## Appendix`), labelled in the old scheme
+    (`## 4b.`), or labelled in a way the pattern did not anticipate (`## 4B.`, `## 7-2`) — it just
+    drops it, and every invariant below then holds over a set that excludes the problem. That is
+    the same "check data you already filtered" mistake this file has now made twice, so the
+    classification is done in the assertions, not in the collector.
     """
     out, fence = [], False
     for line in open(PLAN).read().splitlines():
@@ -56,9 +62,28 @@ def plan_sections() -> list[tuple[int, str]]:
             continue
         if fence:
             continue
-        m = re.match(r"^(#{2,6}) (\d[0-9a-z]*(?:\.[0-9a-z]+)*)\.? ", line)
-        if m:
+        m = re.match(r"^(#{1,6}) (.+?)\s*$", line)
+        if m and not m.group(2).startswith("Evaluating Chaos Jungle"):
             out.append((len(m.group(1)), m.group(2)))
+    return out
+
+
+LABEL = re.compile(r"^(\d+(?:\.\d+)*)\.? \S")
+
+
+def plan_sections() -> list[tuple[int, str]]:
+    """(level, label) for content sections — every heading that is not a part or the contents.
+
+    Raises through test_every_content_section_carries_a_wellformed_label if any of them fails to
+    parse, so this can only ever return a complete list.
+    """
+    out = []
+    for lvl, title in plan_headings():
+        if lvl == 1 or STRUCTURAL.match(title):
+            continue
+        m = LABEL.match(title)
+        if m:
+            out.append((lvl, m.group(1)))
     return out
 
 
@@ -91,9 +116,15 @@ def references(path: str) -> list[tuple[int, str]]:
     return hits
 
 
-def test_no_section_label_contains_a_letter():
-    """`4b`, `2.1b`, `4.0d` were the old scheme. Falsifiable now that the collector accepts them."""
-    assert not [l for l in plan_labels() if re.search(r"[a-z]", l)]
+def test_every_content_section_carries_a_wellformed_label():
+    """The check that makes the rest meaningful: every heading under a part must carry a purely
+    numeric label. This is what catches the old scheme (`4b`, `2.1b`), a case the pattern did not
+    anticipate (`4B.`, `7-2`), and — the one a label-shaped pattern can never catch — a section
+    with no number at all, which simply would not have been collected."""
+    unlabelled = [(lvl, title) for lvl, title in plan_headings()
+                  if lvl > 1 and not STRUCTURAL.match(title) and not LABEL.match(title)]
+    assert not unlabelled, ("headings under a part with no well-formed numeric label:\n  "
+                            + "\n  ".join(f"{'#' * l} {t}" for l, t in unlabelled))
 
 
 def test_labels_ascend_in_document_order():
