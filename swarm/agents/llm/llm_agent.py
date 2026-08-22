@@ -330,28 +330,45 @@ class LlmAgent(ResourceAgent):
         )
 
         now = time.time()
-        mine, deferred, forced, infeasible = [], 0, 0, 0
+        mine, deferred, forced, infeasible, requeued = [], 0, 0, 0, 0
         for job, (agent, _cost) in zip(pending_jobs, designations):
             if agent is None:
                 infeasible += 1
-                # Nobody in the fleet can run this job, so no bid is ever coming. Leaving it in
-                # place would hold a slot in the shared window permanently — `gets()` returns the
-                # first N PENDING jobs — and enough of them would stall the run outright, which is
-                # the head-of-line blocking §2.2 already cost a run once.
+                # "Infeasible for the whole fleet" is a LOCAL verdict, not a fact: it is computed
+                # over `self.neighbor_map`, which is per-agent live membership. An agent that has
+                # transiently dropped the one peer able to run this job concludes nobody can,
+                # while its peers designate it normally — and SWIM churn is not hypothetical here
+                # (7-9 false-fails per run, §3). Requeueing on sight would therefore desynchronise
+                # the shared window, exactly as a deferral requeue did.
                 #
-                # Requeueing here does NOT desynchronise the window, which is why it is safe when
-                # a designation deferral is not: feasibility is agent-agnostic and deterministic,
-                # so every agent reaches the same verdict on the same job and moves it back at the
-                # same point. A designation depends on live load, so agents disagree and their
-                # queues would drift apart.
+                # Not requeueing at all is the opposite failure: `gets()` returns the first N
+                # PENDING jobs, so a genuinely unschedulable job would hold a window slot forever,
+                # and enough of them stall the run (§2.2's head-of-line blocking).
                 #
-                # State is deliberately left PENDING rather than BLOCKED: the BLOCKED path is
-                # restored by `_restore_infeasible_jobs`, which only `ResourceAgent.selection_main`
-                # calls — this override never does, so a BLOCKED job here would never come back.
-                # Cycling a genuinely unschedulable job is a pre-existing gap in this agent (it is
-                # never retired via `max_infeasible_retries`), but it no longer blocks the rest.
-                self.queues.pending_queue.move_to_end(job)
+                # Gate it on the same deadline as a deferral, which bounds both. A transient
+                # disagreement clears well inside the window and never touches the queue; a
+                # persistently unschedulable job is requeued after it, and since every agent then
+                # reaches that verdict they requeue together and stay aligned.
+                #
+                # State stays PENDING, not BLOCKED: the BLOCKED path is restored by
+                # `_restore_infeasible_jobs`, which only `ResourceAgent.selection_main` calls, and
+                # this override never does — a BLOCKED job here would never come back. Cycling an
+                # unschedulable job is a pre-existing gap in this agent (never retired via
+                # `max_infeasible_retries`), but it no longer holds up anything else.
+                since = getattr(job, "designation_infeasible_since", None)
+                if since is None:
+                    job.designation_infeasible_since = now
+                elif now - since >= self.designate_bidder_fallback_s:
+                    job.designation_infeasible_since = None   # fresh window if it returns
+                    requeued += 1
+                    self.queues.pending_queue.move_to_end(job)
                 continue
+
+            # Feasible for someone. Clear any infeasible marker so blips in separate episodes
+            # cannot accumulate into a spurious requeue.
+            if getattr(job, "designation_infeasible_since", None) is not None:
+                job.designation_infeasible_since = None
+
             if agent.agent_id == self.agent_id:
                 mine.append(job)
                 continue
@@ -377,7 +394,7 @@ class LlmAgent(ResourceAgent):
             self.logger.info(
                 f"[DESIGNATE] Agent={self.agent_id} candidates={len(pending_jobs)} "
                 f"mine={len(mine)} deferred={deferred} forced={forced} "
-                f"infeasible={infeasible} peers={len(agents)}"
+                f"infeasible={infeasible} requeued={requeued} peers={len(agents)}"
             )
         return mine
 
