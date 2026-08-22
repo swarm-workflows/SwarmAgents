@@ -12,6 +12,12 @@ the gateway arm, and the gateway sweep **confirmed and deepened** its headline; 
 all three arms. **Per-scenario status, arms and
 blast radii: [§4b.1](#4b1-scenario-index--what-has-been-run-and-where).**
 
+**A non-fault result worth reading first (§4.0b):** a 14/30/60-agent sweep on prefix-identical
+fleets shows **placement throughput does not scale with the fleet** — 4.3× the agents buys 0.86×
+the throughput, predicted to within 3% by a model whose binding term is redundant bidding. With
+inference removed entirely the same sweep gives 1.45×, so there are two limits: a sub-linear
+scheduler and a redundant-inference cost that cancels it.
+
 The result that reframes the rest: **completion never degrades under any LLM fault measured** —
 300/300 jobs across every scenario, arm and blast radius — because placement is decided by *when*
 an agent bids, not *what* it bids ([§4f.2](#4f2-one-mechanism-behind-three-scenarios-race-to-propose)).
@@ -515,16 +521,92 @@ guessed that and was wrong.)
 > addressing both. Second, any gate must be measured against §4d's capture numbers, since it
 > directly changes how many agents race for a job.
 >
-> **Open, and worth one cheap run each:** why effective parallelism sits at ~17 of 30 rather than
-> ~30 (loop `time.sleep(0.5)` waits and an often-empty queue are candidates), and whether drain
-> rate is independent of fleet size — 10 / 30 / 60 agents on the same trace. The second is the
-> scalability question, and given there is no partitioning, throughput may well be flat in fleet
-> size.
+> **Both open questions are now answered — see §4.0b.** Drain rate *is* flat in fleet size
+> (4.3× the fleet buys 0.86×), and effective parallelism is not a fixed ceiling of ~17 but a
+> constant 60% of whatever the fleet size is. So parallelism scales and the cost per placement
+> scales slightly faster, which is why throughput does not move.
 >
 > *Also noted while measuring:* the loop pulls ~9.9 jobs per iteration, not the
 > `jobs_per_proposal: 20` in `config_swarm_multi.yml` — the frozen fleet was generated with
 > `generate_configs.py 30 10 …`, whose second argument is that batch size, so the per-agent
 > configs carry 10. The base config's value has not been in effect for any run in this campaign.
+
+### 4.0b Fleet-size sweep — throughput does not scale with the fleet (2026-08-22)
+
+The falsifiable prediction from §4.0, run. **It holds: adding agents does not add placement
+throughput, and on the LLM arm it slightly reduces it.**
+
+14 / 30 / 60 agents, gateway arm, the same frozen 300-job Pegasus trace, `jobs_per_proposal: 10`
+throughout. All three fleets are **strict prefixes of one 60-agent master**, so agent *i* has
+identical capacities and DTNs at every size and the only variable is how many agents exist. That
+took building: `generate_configs` allocates capacity flavours as *percentages of fleet size*
+(`generate_configs.py:129`), so `--seed 42` gives agent 3 sixteen cores in a 10-agent fleet and
+two in a 30-agent fleet — a seed cannot make fleets comparable. 14 rather than 10 because agents
+1–10 of the master cannot satisfy two capacity-heavy jobs (DTN coverage is complete even at N=8,
+so it is capacity, not connectivity), and a run that strands work measures stranding.
+
+| fleet | drain | **jobs/s** | calls/job | bid latency | parallel agents | model predicts | fairness | completed | restarts |
+|---|---|---|---|---|---|---|---|---|---|
+| 14 | 313 s | **0.96** | 2.17 | 4.06 s | 8.6 | 0.98 | 0.395 | 300 | 0 |
+| 30 | 316 s | **0.95** | 3.70 | 5.02 s | 18.1 | 0.98 | 0.826 | 300 | 0 |
+| 60 | 365 s | **0.82** | 5.98 | 7.15 s | 35.8 | 0.84 | 0.743 | 300 | 0 |
+
+**4.3× the fleet buys 0.86× the throughput.** Flat would be 1.0×; linear would be 4.3×.
+
+**The §4.0 model predicts every point to within 3%** (0.98 vs 0.96, 0.98 vs 0.95, 0.84 vs 0.82),
+which is the strongest evidence yet that the bottleneck is understood rather than merely
+described. It also decomposes the result:
+
+| term | 14 → 60 | reading |
+|---|---|---|
+| parallel agents | **4.15×** | capacity scales almost perfectly with the fleet |
+| calls per job | **2.76×** | more agents means more agents bidding on the *same* job |
+| bid latency | **1.76×** | more concurrent clients on a shared endpoint (§2.1) |
+| → cost per placement | **4.86×** | outruns the 4.15× capacity gain |
+
+So the fleet grows, the work each placement costs grows slightly faster, and throughput goes
+nowhere. **This is race-to-propose (§4f.2) measured as a throughput ceiling rather than as a
+placement mechanism** — nothing partitions the pool (§4.0), so every added agent adds a redundant
+bidder rather than a new server.
+
+**Correctness is untouched at every size:** 300/300 completed, 0 stuck, 0 restarts, 0 reselection
+lines. Whatever this costs in throughput, it costs nothing in safety.
+
+**An open question from §4.0 is answered.** "Why is parallelism ~17 of 30?" — it is not a fixed
+ceiling of 17, it is a constant *fraction*: 8.6/14, 18.1/30, 35.8/60 are all **0.60**. Agents are
+inside cost computation ~60% of the time at every fleet size, and the residual 40% is loop sleeps,
+queue waits and consensus. Parallelism therefore scales fine; the problem is entirely on the cost
+side.
+
+#### The analytic control, obtained by accident
+
+A misconfigured earlier attempt pointed all three fleets at a stopped local Ollama, so every bid
+failed and every agent used the analytic cost — 703 fallbacks, 0 LLM completions. It is preserved
+(`runs/fleet{14,30,60}-gw`) because it is a clean control for the same sweep with inference
+removed:
+
+| fleet | drain | jobs/s | parallel | fairness | completed |
+|---|---|---|---|---|---|
+| 14 | 120 s | 2.51 | 7.8 | 0.408 | 300 |
+| 30 | 99 s | 3.03 | 16.9 | 0.799 | 300 |
+| 60 | 82 s | 3.64 | 34.2 | 0.766 | 300 |
+
+**Without inference, scaling is positive but still sub-linear: 4.3× the fleet gives 1.45×.** So
+there are two separate limits, and the sweep separates them:
+
+- a **scheduler-side** limit that caps scaling at ~1.45× per 4.3× fleet even when bids are free;
+- a **redundant-inference** cost that converts that modest gain into a small *regression* (0.86×).
+
+The analytic arm is also ~3.8× faster in absolute terms (3.64 vs 0.96 jobs/s at 60 agents), which
+is the same finding S05 reached from the fault side: replacing every LLM bid with an analytic one
+drains the queue several times faster (§4d.1).
+
+**What this means for the levers in §4.0.** Narrowing who bids is now the clearly indicated
+change, because `calls_per_job` is the term that grows with the fleet and it is the term the
+lever targets. It also means the ceiling is *not* something a faster endpoint fixes: bid latency
+itself degrades 1.76× as the fleet grows, so a faster model buys a constant factor and leaves the
+scaling shape intact. And the analytic control bounds the prize — even free bids only bought
+1.45×, so throughput work should not be sold as unlocking linear scaling.
 
 ### 4.1 Is Jain's fairness the right metric here? Partly — and it must be quoted differently
 
@@ -1893,8 +1975,9 @@ Ordered by what each would actually settle. §4b.1 is the per-scenario status ta
 4. ~~**Phase 2 remainder — T2-2…T2-4.**~~ **DONE (2026-08-21/22).** All three run at 100% on the
    gateway arm. The correctness null holds across all four modes — that is now robust rather than
    one mutation's quirk. Two follow-ups came out of it, in order:
-   **(a)** measure `completion_tokens` per mode to explain *why* three of the four cost 1.4–4.2 s
-   per bid, since the score-sd explanation is refuted and `cj_probe.py` cannot answer it (§4e.6);
+   **(a)** ~~measure `completion_tokens` per mode~~ **DONE** — the riddles distractor makes the
+   model emit **+60%** more output and `rag_poison` +32%, ordering exactly with their latency
+   shifts, while `entity_swap` is +5% and neutral (§4e.6);
    **(b)** a **partial-radius** semantic run (`s09_semantic.py inject_distractor 0.5 gw2`), which
    is the only route by which a content fault could reach placement — poisoned agents become the
    *slow* ones, so any capture should go to the healthy group, the reverse of S05.
