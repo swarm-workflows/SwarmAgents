@@ -1,6 +1,6 @@
 """Tests for designated-bidder mode (`LlmAgent._designate_bidders`).
 
-The throughput problem it addresses is measured in `CHAOS_JUNGLE_LLM_TEST_PLAN.md` §4.0b: every
+The throughput problem it addresses is measured in `CHAOS_JUNGLE_LLM_TEST_PLAN.md` §9: every
 agent scores every feasible pending job against itself, so ~3.7 distinct agents each pay a full
 LLM bid for a job placed once, and throughput is flat in fleet size.
 
@@ -238,7 +238,7 @@ def test_infeasible_is_not_requeued_inside_the_deadline():
 def test_persistently_infeasible_job_is_requeued_after_the_deadline():
     """A genuinely unschedulable job must stop holding a slot in the shared window.
 
-    gets() returns the first N PENDING jobs, so leaving it in place forever is §2.2's
+    gets() returns the first N PENDING jobs, so leaving it in place forever is §2.3's
     head-of-line blocking. Past the deadline every agent reaches this verdict, so they requeue
     together and stay aligned.
     """
