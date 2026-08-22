@@ -155,17 +155,21 @@ def health_gate(min_available_mb: int = MIN_AVAILABLE_MB) -> None:
     if ok != len(hosts()):
         raise SystemExit(f"health gate failed: only {ok}/{len(hosts())} hosts can infer\n{out}")
 
-    mem = _fan_out(hosts(), "echo $(hostname) $(free -m | awk '/Mem:/{print $7}')")
-    starved = []
-    for line in mem.splitlines():
-        parts = line.split()
-        if len(parts) == 2 and parts[1].isdigit() and int(parts[1]) < min_available_mb:
-            starved.append((parts[0], int(parts[1])))
-    if starved:
-        detail = ", ".join(f"{h}={mb}MB" for h, mb in sorted(starved, key=lambda x: x[1]))
+    mem, quiet = _probe_hosts("echo $(hostname) $(free -m | awk '/Mem:/{print $7}')")
+    starved = [(h, int(f[0])) for h, f in mem.items()
+               if f[0].isdigit() and int(f[0]) < min_available_mb]
+    # A host that did not report its memory has not been cleared by this gate. That is the
+    # failure this gate was written for: a starved host answers a single inference probe in 0.4 s,
+    # places zero jobs for a whole run, and looks healthy in every other check (4f.3).
+    if starved or quiet:
+        why = []
+        if starved:
+            why.append(f"{len(starved)} host(s) under {min_available_mb}MB available — "
+                       + ", ".join(f"{h}={mb}MB" for h, mb in sorted(starved, key=lambda x: x[1])))
+        if quiet:
+            why.append(f"{len(quiet)} host(s) did not report memory ({', '.join(quiet[:8])})")
         raise SystemExit(
-            f"health gate failed: {len(starved)} host(s) under {min_available_mb}MB "
-            f"available — {detail}\n"
+            f"health gate failed: {'; '.join(why)}\n"
             f"Restart Ollama there to release llama-server ('systemctl restart ollama', or kill "
             f"'ollama serve' and restart it on hosts where it is not a systemd unit).")
     print(f"  health gate:    {ok}/{len(hosts())} hosts inferring, all >= {min_available_mb}MB free")
@@ -516,13 +520,26 @@ def assert_clean(strict: bool = False) -> None:
             f"scenarios/clear_faults.py, or helpers.set_disable_fallback(False).")
     print(f"  ablation check: llm.disable_fallback absent from every per-agent config")
     if strict:
-        agents = sum(int(n) for n in _fan_out(hosts(), 'pgrep -fc "mai[n].py" || true').split()
-                     if n.strip().isdigit())
+        # Same rule as above, and it was missing here: this branch summed a fan-out with no
+        # hostnames, so a host that never answered contributed 0 stray agents and the slice was
+        # certified idle. clear_faults.py's "slice idle" is that certification, and a missed host
+        # keeps agents that register into the shared Redis and stall the next run at
+        # [SEL_WAIT] live != configured — the exact symptom this check exists to prevent.
+        procs, quiet = _probe_hosts('echo $(hostname) $(pgrep -fc "mai[n].py" || true)')
+        agents = sum(int(f[0]) for f in procs.values() if f[0].isdigit())
         keys = int((_sh("docker exec redis redis-cli dbsize").strip() or "0").split()[-1])
-        if agents or keys:
-            raise SystemExit(f"slice not idle: {agents} stray agent process(es), "
-                             f"{keys} Redis key(s). Run scenarios/clear_faults.py.")
-        print("  idle check:     0 stray agents, 0 Redis keys")
+        if agents or keys or quiet:
+            why = []
+            if agents:
+                busy = sorted(h for h, f in procs.items() if f[0].isdigit() and int(f[0]) > 0)
+                why.append(f"{agents} stray agent process(es) on {', '.join(busy[:8])}")
+            if keys:
+                why.append(f"{keys} Redis key(s)")
+            if quiet:
+                why.append(f"{len(quiet)} host(s) did not answer ({', '.join(quiet[:8])}), so "
+                           f"their agents are unaccounted for")
+            raise SystemExit(f"slice not idle: {'; '.join(why)}. Run scenarios/clear_faults.py.")
+        print(f"  idle check:     0 stray agents across {len(procs)} hosts, 0 Redis keys")
 
 
 def stop_fault() -> None:

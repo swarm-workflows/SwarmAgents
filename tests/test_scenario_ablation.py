@@ -834,3 +834,35 @@ def test_the_cloud_gate_fails_a_host_that_never_answered(monkeypatch):
     monkeypatch.setattr(helpers, "_fan_out", lambda hosts_, cmd, **k: "agent-1 200 0\n")
     with pytest.raises(SystemExit, match="no-answer"):
         helpers._cloud_health_gate()
+
+
+def test_the_strict_idle_check_does_not_certify_a_silent_host_as_idle(monkeypatch):
+    """`clear_faults.py`'s "slice idle" is this certification. It summed a fan-out with no
+    hostnames, so an unreachable host contributed 0 stray agents — and its surviving agents
+    register into the shared Redis and stall the next run at [SEL_WAIT] live != configured."""
+    monkeypatch.setattr(helpers, "hosts", lambda: ["agent-1", "agent-2"])
+    monkeypatch.setattr(helpers, "_sh", lambda *a, **k: "0")
+
+    def only_agent_1(hosts_, cmd, **k):
+        return "agent-1 0 0 0\n" if "OLLAMA_BASE_URL" in cmd else "agent-1 0\n"
+
+    monkeypatch.setattr(helpers, "_fan_out", only_agent_1)
+    with pytest.raises(SystemExit, match="did not answer"):
+        helpers.assert_clean(strict=True)
+
+    # Both answering, both idle -> passes.
+    monkeypatch.setattr(helpers, "_fan_out", lambda hosts_, cmd, **k: (
+        "agent-1 0 0 0\nagent-2 0 0 0\n" if "OLLAMA_BASE_URL" in cmd
+        else "agent-1 0\nagent-2 0\n"))
+    helpers.assert_clean(strict=True)
+
+
+def test_a_host_that_never_reported_memory_has_not_passed_the_gate(monkeypatch):
+    """The gate exists because a starved host answers one inference probe in 0.4 s, then places
+    zero jobs for an entire run (4f.3). An unprobed host is exactly that host, unmeasured."""
+    monkeypatch.setattr(helpers, "hosts", lambda: ["agent-1", "agent-2"])
+    monkeypatch.setattr(helpers, "ARM", "local")
+    monkeypatch.setattr(helpers, "_fan_out", lambda hosts_, cmd, **k: (
+        " OK\n OK\n" if "fixmodels" in cmd else "agent-1 4096\n"))
+    with pytest.raises(SystemExit, match="did not report memory"):
+        helpers.health_gate()
