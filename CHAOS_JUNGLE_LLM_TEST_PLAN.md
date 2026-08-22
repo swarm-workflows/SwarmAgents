@@ -859,10 +859,12 @@ and completion is untouched. Capture goes 16.9× → **0.0×**; fairness more th
 within-group unevenness rather than concentration.
 
 **This is the first experiment in the campaign where removing a resilience mechanism improved a
-metric**, and it reframes what the fallback does. §4d called the partial outage a gray failure the
-system survives; the fallback is not what lets it survive — completion is 300/300 either way — it
-is what decides *who does the work*, and it decides wrongly. What looked like graceful degradation
-is a mechanism that preferentially routes work to agents that cannot reason.
+metric**, and at this radius it reframes what the fallback does. §4d called the partial outage a
+gray failure the system survives; at 25% the fallback is not what lets it survive — completion is
+300/300 either way — it is what decides *who does the work*, and it decides wrongly. What looked
+like graceful degradation is a mechanism that preferentially routes work to agents that cannot
+reason. **That statement is radius-scoped, and 4.0d.1 below is why it has to be**: at 100% the same
+mechanism is the whole difference between 300 completed and 0.
 
 **What the fallback does buy is speed, and only speed.** The with-fallback run drains in 102.6 s
 against 200.2 s without, because instant analytic bids place jobs faster than 4-7 s LLM bids can.
@@ -870,23 +872,81 @@ That is a real ~2× throughput advantage — bought by handing 86% of the worklo
 Whether that trade is worth taking is a design decision, but it should be made knowingly, and the
 "safety net" framing hides it.
 
-> **The 100% case did not produce data and is unresolved.** With every agent's LLM returning 503
-> and no fallback, nothing can be proposed, and the run did not terminate: `run_test.py` was still
-> polling bucket state after `runtime + 900 s`, the harness killed it, and no agent logs were
-> collected (`runs/cj-s05-100pct-nofb` is empty). So the expected result — a total outage becoming
-> a hang rather than a degradation — is *consistent with* what was observed but is **not
-> evidenced**: without agent logs there is no proof that agents attempted and refused to bid, as
-> opposed to failing earlier for some other reason.
->
-> `--runtime` is a hard cap on the early-exit poll loop, so the overrun was in a different phase
-> (job distribution, judging by the last log lines) — worth identifying before a retry, since a
-> second run would otherwise fail the same way. A retry also needs the agent logs pulled from the
-> hosts *before* cleanup, because `helpers.cleanup()` deletes them.
+#### 4.0d.1 The 100% case, measured on the retry (2026-08-22) — a total stall
 
-**Where this leaves figure D.** The partial-radius half is measured and is the more interesting
-half: the safety net costs correctness of placement to buy throughput. The total-outage half — the
-claim that the fallback is what prevents a hang — remains the intuitive expectation and is
-currently unmeasured.
+`s05_unavailable.py 1.0 nofb`, gateway arm, same frozen fleet and trace, `CJ_DISABLE_FALLBACK=1`,
+503 proxies on 30/30 hosts, run bounded at 1200 s of scheduling:
+
+| metric | fault-free gateway baseline | 100% outage, fallback OFF |
+|---|---|---|
+| jobs completed | 300 | **0** |
+| jobs stuck | 0 | **300** |
+| LLM calls OK | 1123 | **0** |
+| LLM fallbacks | 0 | 0 |
+| **LLM refusals** (`LLM_COST_NO_BID`) | — | **2180 of 2181 attempts** |
+| failed agents / restarts / conflicts | 0 / 0 / 0 | **0 / 0 / 0** |
+| SWIM false-fails | 7 | 1 |
+| load fairness / sched latency | 0.849 / 191.1 s | **neither exists — nothing was placed** |
+
+**The fleet stayed healthy and simply never scheduled.** No agent failed, nothing restarted, no
+consensus conflict, and **all 37** early-exit polls, 18:27:47 to 18:45:47, reported `0/300 jobs
+terminal` — not one of them anything else. This is not a crash and not a degradation: it is a live,
+quiet, fully-connected 30-agent fleet with 300 jobs in the pool and no mechanism left that can
+propose one.
+
+Artifacts: `runs/cj-s05-100pct-nofb` and `runs/cj-s05-100pct-nofb-void` (the first attempt,
+retained with no data — see finding 14). **Log population: exactly agents 1-30, one log each** —
+no gaps, no duplicates, no ids outside the fleet, checked by identity rather than by file count
+(30 files for a 30-agent fleet is also what one duplicate plus one hole looks like). So every
+per-agent figure above is a sum over the whole fleet, not over whatever happened to be collected.
+`collect()` now reports that population alongside the metrics and `report()` states which rows
+degrade, and in which direction, when it is incomplete. `cj-s05-25pct-nofb` and `cj-baseline-gw2`
+re-read the same way, so §4.0d's table is on the same footing.
+
+**The mechanism, from the agent logs the first attempt never produced:**
+
+```
+18:25:52  [LLM_COST_START]  Job=eht-m87_… Agent=1 GatheringPeerContext=yes Peers=29
+18:25:54  [LLM_SCORE_ERROR] 503 {'message': 'Service Unavailable (chaos-jungle)', …}
+18:25:54  [LLM_COST_NO_BID] Job=eht-m87_… FallbackDisabled, not bidding
+```
+
+That sequence is the thing that was previously assumed: agents *do* attempt, the injected fault is
+what they hit, and the refusal is the ablation's, not a startup failure or a crash. It repeats for
+the whole run — the attempting agents' first refusal lands at 18:25:5x and their last at 18:45:3x.
+
+**Three caveats, because the headline number is easy to over-read:**
+
+- **"no-bid rate 100%" means every call that happened was refused, not that all 30 agents
+  refused.** The 2180 refusals come from **14 of 30 agents**; the other 16 made no LLM call at all,
+  logging 2387 cost-matrix passes each at `TotalTime=0.000s`. With nothing ever placed the 10-job
+  window never rotates, so the set of agents that ever get a candidate to score is frozen too.
+  There is no mechanism by which those 16 would have behaved differently — the proxy is up on all
+  30 hosts and 503s by construction — but they were never observed refusing, and the fault probe
+  confirms 503 on one host, not thirty.
+- **The refusal *count* is a harness artefact.** Retries are paced by the selection engine's 60 s
+  cost-cache TTL (`cache_ttl_s=60.0`), and observed rates ranged from one per ~58 s (20 refusals)
+  to one per ~6 s (200). So 2180 is not comparable with the 25% run's 352 as a rate of anything.
+- **"Never terminates" is measured as "no progress for 20 minutes".** The run was deliberately
+  bounded (`--shutdown-after-seconds 1200`); a stall is not proven for all time, only that a live
+  fleet made zero progress over twice the fault-free run's full duration.
+
+**Where this leaves figure D — both halves are now measured, and they disagree.**
+
+| blast radius | with fallback | without fallback | what the fallback is |
+|---|---|---|---|
+| 25% (8 of 30) | 300 done, 86% of work to LLM-blind agents, fairness 0.253 | 300 done, 0% to them, fairness 0.599 | **the pathology** — it decides who works, and wrongly |
+| 100% (30 of 30) | 300 done (§4d, pure analytic scheduler) | **0 done, 300 stuck** | **the safety net** — the only thing that schedules at all |
+
+So the honest statement is narrower than the one this section made before the retry: the analytic
+fallback is *load-bearing* — at total outage it is the difference between a working scheduler and a
+stalled one — **and** it is actively harmful at partial radius, where it hands most of the work to
+the agents that cannot reason. The mechanism has no way to tell the two situations apart, because
+it is a per-call exception handler with no view of how many peers are also failing. That, rather
+than "the safety net is a myth", is the defensible finding: **the fallback is the right behaviour
+for the case it cannot detect, and the wrong behaviour for the case it usually faces.** A radius-
+aware version — fall back only when enough peers are also failing — is the design this pair of
+runs argues for, and it is not what the code does today.
 
 ### 4.1 Is Jain's fairness the right metric here? Partly — and it must be quoted differently
 
@@ -1965,6 +2025,7 @@ term was inert, the fleet differed between runs, or the LLM was never consulted.
 | 11 | **Open** | Under Snow, peers vote with the **analytic** cost — an LLM agent's bid is never consulted |
 | 12 | **Open** | Hierarchical per-agent summaries are all labelled `[no_restarts]`, so a run's own blocks are indistinguishable |
 | 13 | **Open** | `peer_expiry_seconds` is defined twice in the shipped config — the documented 300 s is silently 45 s |
+| 14 | **Open** | `run_test.py --runtime` is parsed and **never read**; without `--shutdown-after-seconds` the run waits in an unbounded poll loop, so a run that cannot place jobs never exits |
 
 ## 8. Runbook
 
@@ -2068,9 +2129,27 @@ ssh chaos 'sudo bash -lc "cd /root/SwarmAgents && nohup python3.11 run_test.py \
 - **`--use-config-dir` is what makes runs comparable** — it reuses the frozen fleet and staged
   `jobs/` instead of regenerating a fresh random fleet and re-converting. Redis is still flushed.
 - Use a **unique `--run-dir` per run**; together with §8.1 this guarantees clean per-run counters.
+  Reusing one is now caught rather than silently averaged: `collect()`, `load_split()` and the
+  restart cross-check all glob the whole run dir, so a log left by an earlier run into the same dir
+  would be counted as this run's. `helpers.snapshot_agent_logs()` compares each collected log
+  against the run's start time and sets anything older aside as `*.log.stale`, with a warning —
+  and warns again for any host it could collect nothing from, since a missing log silently shrinks
+  the population every per-agent metric divides by.
 - Pass `--agent-hosts-file agent_hosts_cj.txt` — **not** `agent_hosts.txt`. run_test deletes the
   literal `agent_hosts.txt` during cleanup and then crashes trying to read it.
 - Hierarchical arm: `--topology hierarchical --hierarchical-level1-agent-type llm --groups G --group-size S`.
+- **`--runtime` does nothing.** It is parsed and never read (finding 14). With it alone, run_test
+  takes the `wait_runtime()` branch — an unbounded loop that exits only when the job pool drains —
+  so a run that *cannot* place jobs polls forever. For those runs pass
+  **`--shutdown-after-seconds N`**, the only flag that actually bounds the wait, and which on
+  expiry still stops the agents and collects their logs. Through the harness that is
+  `CJ_SHUTDOWN_AFTER=N`; leave it unset for runs expected to drain, or a slow sweep point gets
+  truncated into "the fault broke scheduling".
+- **`CJ_DISABLE_FALLBACK=1`** turns on the figure-D ablation (`llm.disable_fallback`, §4.0d) for
+  the S05 scenario. It writes the key into the *per-agent* `configs/` — the base
+  `config_swarm_multi.yml` is never read under `--use-config-dir` — and asserts 30/30 before
+  running. It is written on every S05 run, `true` or absent, so a plain S05 cannot inherit the
+  flag from an earlier ablation.
 
 ### 8.4 Read the results
 ```bash
@@ -2273,7 +2352,7 @@ Ordered by what each would actually settle. §4b.1 is the per-scenario status ta
 | **A** | Degradation curves: completion rate & P95 latency vs fault severity | **ready** — S01's L1 sweep (§4c.2) is a complete 7-point curve |
 | **B** | Fallback rate by fault type (the graceful-degradation headline) | **ready** for S01/S05/S09; thin until L2, L5–L8 exist |
 | **C** | Poisoned-agent tolerance threshold (fairness & conflicts) | **there is no threshold** (§4e.2). Replace with "corrupted bids, unmoved schedule", or drop |
-| **D** | Default vs fallback-disabled (value of the analytic safety net) | **partial radius measured** (§4.0d) — and it inverts the expected story: the fallback does not preserve completion, it decides *who* does the work, and decides wrongly. Total-outage half still unmeasured |
+| **D** | Default vs fallback-disabled (value of the analytic safety net) | **ready — both radii measured** (§4.0d, §4.0d.1). The two halves disagree, which is the finding: at 25% the fallback hands 86% of the work to LLM-blind agents (fairness 0.253 vs 0.599 without it); at 100% it is the difference between 300 completed and **0 completed, 300 stuck**. Same mechanism, no way to tell the cases apart |
 | **E** | Composite "bad day", annotated with the zero-double-assignment invariant | **not yet run** — step 5 above |
 
 A sixth candidate the results argue for more strongly than C: **placement vs bid latency across

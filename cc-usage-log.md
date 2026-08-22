@@ -85,3 +85,127 @@ Per-session records for `SwarmAgents-chaos` (branch `chaos`). Append-only; newes
 8. **Recommended next**: the fallback-disabled ablation (paper figure D). §4f.2 established that
    the LLM's *output* barely reaches the scheduler while its *timing* dominates, so removing the
    cheap path that wins every race is the direct test of the analytic safety net's value.
+
+## Session: 2026-08-22 18:50
+
+- **Project**: SwarmAgents-chaos (`/Users/kthare10/swarm/agents/SwarmAgents-chaos`, branch `chaos`)
+- **Task summary**: Retried the S05 100% no-fallback case (paper figure D's missing half) and got
+  data this time: a total LLM outage with the analytic fallback removed is a **complete
+  scheduling stall** — 0 of 300 jobs placed, 300 stuck, 2180 of 2181 bid attempts refused, and a
+  fleet that stayed entirely healthy while never scheduling anything. Diagnosed why the first
+  attempt produced nothing (`--runtime` is dead code, so the wait was unbounded; a teardown then
+  erased the agent logs) and fixed both the harness and the evidence-collection gap.
+- **Workflow stage**: forensics → harness fixes → testing → experiment execution → analysis → documentation
+- **Prompts**: 1 user prompt (excludes 8 stop-hook review messages and 3 background-task
+  notifications, all system-generated). The single prompt is the whole ask; everything after it was
+  the review gate iterating on my own changes.
+- **Tool calls**: ~120 (counted from the transcript, not instrumented — treat as ±10)
+- **Agent tasks**: 0 sub-agents spawned. The Codex stop-review gate ran its own reviews
+  automatically and caught two real defects in my own changes (see below).
+- **Models used**: Opus 5 (`claude-opus-5[1m]`) throughout. Codex/GPT models via the automatic
+  stop-time review gate (OpenAI credits, not counted here).
+- **Estimated cost (USD)**: not instrumented — no per-session token accounting available.
+- **Input tokens**: not instrumented. **Output tokens**: not instrumented.
+- **Files created**: 1 — `tests/test_scenario_ablation.py` (29 tests).
+- **Files modified**: 5 — `scenarios/helpers.py`, `scenarios/api/s05_unavailable.py`,
+  `scenarios/clear_faults.py`, `CHAOS_JUNGLE_LLM_TEST_PLAN.md`, `SWARMAGENTS_FINDINGS.md`.
+- **Experiment runs**: 1 completed on the 30-agent FABRIC slice (`cj-s05-100pct-nofb`, 300 jobs,
+  gateway arm, 503 on all 30 hosts, ablation armed). The first attempt is retained as
+  `cj-s05-100pct-nofb-void`.
+- **Tests**: 204 → 233 passing (+29). `test_repository.py` still cannot collect (`fakeredis` not
+  installed) — pre-existing and unrelated.
+- **Commits**: 0 — all changes left uncommitted for review.
+- **Key decisions / milestones**:
+  1. **Figure D is complete, and its two halves disagree.** At 25% radius the analytic fallback is
+     the pathology (86% of work to LLM-blind agents, fairness 0.253 vs 0.599 without it); at 100%
+     it is the only thing that schedules at all (300 done vs 0 done / 300 stuck). Same per-call
+     exception handler, no view of how many peers are also failing, so it cannot tell the two
+     situations apart. Corrected the previous section's overreach ("the fallback is not what lets
+     the system survive"), which is true only at partial radius.
+  2. **New finding 14**: `run_test.py --runtime` is parsed and never read. Without
+     `--shutdown-after-seconds` the run takes an unbounded poll loop that exits only when the job
+     pool drains — so a run that cannot place a single job never ends. Every campaign run passed
+     `--runtime 3000` and none was ever bounded by it; healthy runs exit on the drain condition,
+     which looks exactly like a working timeout.
+  3. **Corrected the record on the first attempt.** It did not hang until killed — it exited
+     cleanly after a teardown flushed Redis underneath it at ~16:48, which the poll loop read as a
+     drained pool. Same minute: agent logs deleted fleet-wide and the per-agent configs rewritten.
+     The old write-up's account of the ending was wrong; the timestamps are in the retained
+     `runs_cj-s05-100pct-nofb-void.log`.
+  4. **Harness: three gaps closed.** `CJ_SHUTDOWN_AFTER` bounds runs that are expected not to
+     drain; `snapshot_agent_logs()` pulls per-agent logs in a `finally` so a killed run still
+     leaves evidence; `collect()` now counts `LLM_COST_NO_BID` and reports `no_bid_rate`, because
+     under the ablation `fallback_rate` is 0 by construction and an inert ablation is otherwise
+     indistinguishable from a healthy fleet.
+  5. **Four defects in my own changes, all caught by the Codex review gate** — every one of them a
+     guard that keyed off the wrong thing, which is worth noting given the whole campaign is about
+     silent metric corruption. (c) The log snapshot skipped a host whose log was already in the run
+     dir — presence, not freshness — so re-running a scenario into an existing run dir would have
+     republished the *previous* run's logs as this run's evidence, mixing two runs into every
+     per-agent metric silently. (d) The first fix still had two fallbacks to stale data: without a
+     timestamp it left an unverifiable log in place, and the `mv` out of `.incoming/` was
+     unconditional, so a half-finished transfer published a truncated log as complete. Final rule:
+     `since` is required, stale files are displaced to `*.log.stale`, the move is gated on scp
+     succeeding, a failed refresh reports a **missing** host rather than restoring what it
+     displaced, and the reported count and the metric population are decided by the same freshness
+     test. (e) Downstream of all that, `collect()` still summed whatever logs were present and
+     `report()` printed the result as a fleet total — 22 of 30 logs would understate every LLM
+     count by a quarter and manufacture a one-sided "regression" against a complete stored
+     baseline. The log population is now a reported metric (`agent logs read` / `logs missing`) and
+     `report()` qualifies the rows it affects. (f) That warning's first draft then over-claimed in
+     the opposite direction — "treat them as lower bounds" is true of sums but false of rates and
+     means, which over fewer logs are just another population's statistics (a missing slow bidder
+     pulls the latency mean *down*, so quoting it as a floor is backwards). Now split three ways:
+     lower bounds (counts), biased-unknown-direction (rates/means), and independent of log
+     collection (orchestrator log / all_jobs.csv / metrics.json, the last verified as written from
+     Redis rather than from the agent logs). Plus a line when the stored baseline records no log
+     population, so the delta is not silently compared against an assumed-complete 30. (g) That
+     rewrite still carried two false claims of its own: it advertised the restart/conflict counts
+     as independent of log collection, when `_restarts_and_conflicts()` *falls back to counting log
+     lines* whenever metrics.json is absent — so `restarts_source` is now recorded per run and the
+     row is placed in whichever clause is true for that run; and `max(0, fleet - logs)` reported
+     "0 missing" for a run holding MORE agent logs than configured agents, so every sum silently
+     included an agent outside the fleet. Excess is now its own metric and its own warning. (h) And
+     the counters themselves were still count-based: 30 files for a 30 agent fleet is also what one
+     duplicate plus one hole looks like, so both read zero while every sum double-counted one agent
+     and omitted another (and `load_split()` silently kept one of the duplicates). Now checked by
+     ID — `agent_ids_missing` / `_duplicated` / `_unexpected`, named in the warning — and the sums
+     verdict has a third case for short-and-over-counted-at-once, where they bound the truth from
+     neither side. All three relevant runs (100%, 25%, gateway baseline) re-read as exactly agents
+     1-30 with one log each and `restarts_source: metrics.json`, so the published figures were
+     never affected. (i) The ID check itself then had two holes: it read identity from the
+     *filename*, which is a label applied by whoever copied the file rather than what the agent
+     wrote into every line, so a log fetched into the wrong dir certified a population that was not
+     the one being summed; and with no orchestrator log `fleet_size` fell back to the module's
+     AGENTS=30, which would validate a 10- or 60-agent run (this repo has both) against 30. Now
+     identity comes from the log body, a name/body disagreement is reported and credited to
+     neither id, and an unknown fleet withholds the verdict (blank rows, explicit notice) instead
+     of rendering as clean. Also fixed three unguarded `open()` calls on globbed logs — a file
+     removed between listing and reading crashed a report that had just cost a 20-minute run;
+     all log reads now go through one guarded helper and count the loss. (j) Two attribution holes
+     survived that: identity took the *first* `- agent-N -` line in the body, so a log holding two
+     agents (two agents sharing a log path, or a stale log appended across runs — a hazard the
+     runbook already documents) was attributed entirely to whoever wrote first; and the "known"
+     fleet was still `fleet_size` = max(AGENTS, highest placing id), which certifies a 14-agent run
+     against 30. Now every id in a body is read and a multi-agent log is credited to nobody, and the
+     check compares against `fleet_configured`, parsed from the run's own "Launched N … agents"
+     line, withholding the verdict when that line is absent. Verified on real data: `fleet14-gw`
+     reads `fleet_configured: 14` against `fleet_size: 30` and now validates cleanly where the old
+     check would have invented 16 missing agents. (a) The ablation
+     mutates the *frozen fleet's* configs and only S05 reset it, so a leak would have silently
+     changed what the next baseline or S01 run measured — fixed by restoring in a `finally`, and
+     by making `assert_clean()` (which every scenario calls) refuse a leaked flag. (b) The
+     teardown still missed failure paths: arming happened before the `try`, leaving `cleanup()` as
+     an exit path with the flag set, and the two teardowns were flat so a raising config-restore
+     could suppress `stop_fault()` and leak a live proxy. Now armed inside the try, teardowns
+     nested so neither can suppress the other.
+  6. **Honest caveats recorded** rather than smoothed over: "no-bid rate 100%" means every call
+     that happened was refused, not that all 30 agents refused (14 did; the other 16 never got a
+     candidate to score, because with nothing placed the job window never rotates); the refusal
+     *count* is paced by the selection cache's 60 s TTL and is not a comparable rate; and "never
+     terminates" is measured as "no progress for 20 minutes", not proven for all time.
+  7. **Slice left idle and the frozen fleet restored** — configs verified byte-identical to
+     `/root/frozen30_before_nofb.tgz`, 0 Redis keys, 0 stray agents, 0 proxies on 30 hosts.
+  8. **Recommended next**: a radius-aware fallback (fall back only when enough peers are also
+     failing) is the design this pair of runs argues for, and the direct test is S05 at 50% with
+     the ablation on — the radius where the two behaviours should cross over.
