@@ -100,13 +100,13 @@ Per-session records for `SwarmAgents-chaos` (branch `chaos`). Append-only; newes
   attempt produced nothing (`--runtime` is dead code, so the wait was unbounded; a teardown then
   erased the agent logs) and fixed both the harness and the evidence-collection gap.
 - **Workflow stage**: forensics → harness fixes → testing → experiment execution → analysis → documentation
-- **Prompts**: 7 user prompts — retry the 100% case; "what about rest of the scenarios?"; commit;
-  commit and push; restructure the test plan; fix the numbering; bye. Excludes ~17 stop-hook review
-  messages (one of which was the review task itself failing) and 3 background-task notifications,
-  all system-generated.
-- **Tool calls**: ~185 (counted from the transcript, not instrumented — treat as ±15)
+- **Prompts**: 8 user prompts — retry the 100% case; "what about rest of the scenarios?"; commit;
+  commit and push; restructure the test plan; fix the numbering; bye; log session usage. Excludes
+  ~17 stop-hook review messages (one of which was the review task itself failing) and 3
+  background-task notifications, all system-generated.
+- **Tool calls**: ~190 (counted from the transcript, not instrumented — treat as ±15)
 - **Agent tasks**: 0 sub-agents spawned. The Codex stop-review gate ran its own reviews
-  automatically and caught two real defects in my own changes (see below).
+  automatically and caught nine real defects in my own changes across ~17 rounds (see below).
 - **Models used**: Opus 5 (`claude-opus-5[1m]`) throughout. Codex/GPT models via the automatic
   stop-time review gate (OpenAI credits, not counted here).
 - **Estimated cost (USD)**: not instrumented — no per-session token accounting available.
@@ -120,8 +120,8 @@ Per-session records for `SwarmAgents-chaos` (branch `chaos`). Append-only; newes
   `cj-s05-100pct-nofb-void`.
 - **Tests**: 204 → 267 passing (+63). `test_repository.py` still cannot collect (`fakeredis` not
   installed) — pre-existing and unrelated.
-- **Commits**: 15, all GPG-signed and pushed to `origin/chaos` (`f2e22950..af81cb5d`,
-  12 files, +3103/−710). One experiment run, one measured result, and the rest verification and
+- **Commits**: 16, all GPG-signed and pushed to `origin/chaos` (`f2e22950..f9779e58`,
+  13 files, +3132/−717, the last being this log entry). One experiment run, one measured result, and the rest verification and
   documentation:
   `34c3edb8` bound runs that cannot drain · `a6f33130` **the 100% case measured** ·
   `a8f47e9f` staleness by log content · `9d55b83a` a silent host has not passed ·
