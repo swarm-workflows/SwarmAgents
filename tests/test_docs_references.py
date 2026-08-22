@@ -15,6 +15,7 @@ parses the labels the plan actually defines and checks every reference in the re
 """
 from __future__ import annotations
 
+import collections
 import os
 import re
 
@@ -198,13 +199,28 @@ def test_the_detector_catches_the_forms_that_slipped_through(form):
     assert all(label not in plan_labels() for label in found)
 
 
-def test_the_structural_headings_are_exactly_the_expected_ones():
-    """The exemption list is the checker's one blind spot by construction, so it is pinned to
-    exact (level, title) pairs. As a pattern (`^Part [IVX]+`) it exempted any heading starting that
-    way at any depth — a stray `## Part IX — scratch` would have been waved through."""
-    found = {(lvl, t) for lvl, t in plan_headings() if not LABEL.match(t)}
-    assert found == STRUCTURAL, (f"unexpected structural headings: {sorted(found - STRUCTURAL)}; "
-                                 f"missing: {sorted(STRUCTURAL - found)}")
+def test_the_structural_headings_are_exactly_the_expected_ones_once_each():
+    """The exemption list is the checker's one blind spot by construction, so it is pinned to exact
+    (level, title) pairs — as a pattern (`^Part [IVX]+`) it exempted any heading starting that way
+    at any depth.
+
+    Counted, not set-compared. A set says which structural headings exist and cannot say how many
+    times: a duplicated `# Part V` or a second copy of the document title collapses into the same
+    set and passes, which is the fourth time in this file a check has been applied to data that had
+    already discarded the thing being checked for.
+    """
+    found = collections.Counter((lvl, t) for lvl, t in plan_headings() if not LABEL.match(t))
+    expected = collections.Counter(STRUCTURAL)
+    assert found == expected, (
+        f"unexpected or repeated: {sorted((found - expected).elements())}; "
+        f"missing: {sorted((expected - found).elements())}")
+
+
+def test_no_section_label_is_used_twice():
+    """Two `### 7.2` headings mean two sections claim one number, so every reference to it is
+    ambiguous and the contents list has two identical links."""
+    dupes = [l for l, n in collections.Counter(l for _, l in plan_sections()).items() if n > 1]
+    assert not dupes, f"labels used more than once: {sorted(dupes)}"
 
 
 def test_the_document_has_no_headings_that_do_not_render_as_headings():
