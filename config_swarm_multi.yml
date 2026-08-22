@@ -267,6 +267,17 @@ llm:
   temperature: 0.1
   timeout_seconds: 6
   use_for_selection: true     # use LLM to break ties across candidates
+  # Ablation for paper figure D. false = a failed LLM bid falls back to the analytic cost, which
+  # is what every campaign result was measured with. true = a failed bid means NO bid (infinite
+  # cost), so the agent drops out of the running for that job.
+  #
+  # Inert without a fault: the gateway arm's fault-free fallback rate is 0.0%, so there is nothing
+  # to disable unless something is breaking the LLM. The informative experiment is this flag
+  # combined with S05 — it converts graceful degradation into hard failure and so measures what the
+  # safety net is actually worth. See test plan 4e/4f.2/4.0c for why that question is open: the
+  # LLM's output has been shown to have little influence on placement, and this tests the
+  # complement.
+  disable_fallback: false
   prompts:
     cost: |-
       You are a distributed scheduler in a mesh topology with peer agents.

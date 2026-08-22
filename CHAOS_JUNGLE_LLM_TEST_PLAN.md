@@ -833,6 +833,61 @@ A third, weaker but still direct: **cutting inference by 2.16× did not make the
 Until then the honest summary is: **the mechanism reduces inference per placement without losing
 work, and there is no evidence yet that it improves anything.**
 
+### 4.0d Figure D — the fallback is not a safety net at partial radius, it is the pathology (2026-08-22)
+
+`llm.disable_fallback: true` removes the analytic safety net: a failed LLM bid returns `+inf`, so
+the agent simply does not bid. Inert without a fault (fault-free fallback rate is 0.0%), so the
+experiment is the flag **combined with S05**. Gateway arm, frozen fleet and trace.
+
+**S05 at 25%, three configurations at the same blast radius:**
+
+| | no fault | fallback **ON** | fallback **OFF** |
+|---|---|---|---|
+| jobs completed / stuck | 300 / 0 | 300 / 0 | **300 / 0** |
+| fallback rate | 0.0% | 44.2% | **0.0%** |
+| LLM calls OK | 1123 | 507 | 974 |
+| **the 8 faulted agents get** | — | **258 of 300** (86%) | **0 of 300** |
+| capture ratio (control 1.27×) | — | **16.9×** | **0.0×** |
+| load fairness | 0.849 | **0.253** | **0.599** |
+| sched latency mean | 191.1 s | 102.6 s | 200.2 s |
+
+**Removing the safety net removes the pathology.** With the fallback, 8 LLM-blind agents take 86%
+of the workload because a 503 becomes an instant analytic bid that out-races real reasoning
+(§4d.2). Without it those agents drop out entirely — **0 jobs** — the healthy 22 absorb all 300,
+and completion is untouched. Capture goes 16.9× → **0.0×**; fairness more than doubles, 0.253 →
+0.599, against a ceiling of 0.733 for 22 of 30 agents carrying everything, so the residual is
+within-group unevenness rather than concentration.
+
+**This is the first experiment in the campaign where removing a resilience mechanism improved a
+metric**, and it reframes what the fallback does. §4d called the partial outage a gray failure the
+system survives; the fallback is not what lets it survive — completion is 300/300 either way — it
+is what decides *who does the work*, and it decides wrongly. What looked like graceful degradation
+is a mechanism that preferentially routes work to agents that cannot reason.
+
+**What the fallback does buy is speed, and only speed.** The with-fallback run drains in 102.6 s
+against 200.2 s without, because instant analytic bids place jobs faster than 4-7 s LLM bids can.
+That is a real ~2× throughput advantage — bought by handing 86% of the workload to broken agents.
+Whether that trade is worth taking is a design decision, but it should be made knowingly, and the
+"safety net" framing hides it.
+
+> **The 100% case did not produce data and is unresolved.** With every agent's LLM returning 503
+> and no fallback, nothing can be proposed, and the run did not terminate: `run_test.py` was still
+> polling bucket state after `runtime + 900 s`, the harness killed it, and no agent logs were
+> collected (`runs/cj-s05-100pct-nofb` is empty). So the expected result — a total outage becoming
+> a hang rather than a degradation — is *consistent with* what was observed but is **not
+> evidenced**: without agent logs there is no proof that agents attempted and refused to bid, as
+> opposed to failing earlier for some other reason.
+>
+> `--runtime` is a hard cap on the early-exit poll loop, so the overrun was in a different phase
+> (job distribution, judging by the last log lines) — worth identifying before a retry, since a
+> second run would otherwise fail the same way. A retry also needs the agent logs pulled from the
+> hosts *before* cleanup, because `helpers.cleanup()` deletes them.
+
+**Where this leaves figure D.** The partial-radius half is measured and is the more interesting
+half: the safety net costs correctness of placement to buy throughput. The total-outage half — the
+claim that the fallback is what prevents a hang — remains the intuitive expectation and is
+currently unmeasured.
+
 ### 4.1 Is Jain's fairness the right metric here? Partly — and it must be quoted differently
 
 Load fairness carries a lot of the S05 story, so it is worth stating what it does and does not
@@ -2218,7 +2273,7 @@ Ordered by what each would actually settle. §4b.1 is the per-scenario status ta
 | **A** | Degradation curves: completion rate & P95 latency vs fault severity | **ready** — S01's L1 sweep (§4c.2) is a complete 7-point curve |
 | **B** | Fallback rate by fault type (the graceful-degradation headline) | **ready** for S01/S05/S09; thin until L2, L5–L8 exist |
 | **C** | Poisoned-agent tolerance threshold (fairness & conflicts) | **there is no threshold** (§4e.2). Replace with "corrupted bids, unmoved schedule", or drop |
-| **D** | Default vs fallback-disabled (value of the analytic safety net) | **not yet run** — step 2 above |
+| **D** | Default vs fallback-disabled (value of the analytic safety net) | **partial radius measured** (§4.0d) — and it inverts the expected story: the fallback does not preserve completion, it decides *who* does the work, and decides wrongly. Total-outage half still unmeasured |
 | **E** | Composite "bad day", annotated with the zero-double-assignment invariant | **not yet run** — step 5 above |
 
 A sixth candidate the results argue for more strongly than C: **placement vs bid latency across
