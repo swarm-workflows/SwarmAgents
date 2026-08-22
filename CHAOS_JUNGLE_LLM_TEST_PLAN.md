@@ -15,10 +15,10 @@ blast radii: [§4b.1](#4b1-scenario-index--what-has-been-run-and-where).**
 **A non-fault result worth reading first (§4.0b):** a 14/30/60-agent sweep on prefix-identical
 fleets shows **placement throughput does not scale with the fleet** — 4.3× the agents buys 0.86×
 the throughput, while the number of *distinct agents bidding per job* grows 2.76× (measured; each
-agent bids exactly once per job). The same sweep with much cheaper bids gives 1.45×. Redundancy
-grows in both arms and bid cost in only one, consistent with the first capping scaling and the
-second turning it negative — a reading the sweep supports but does not prove, since the deciding
-intervention is still unrun.
+agent bids exactly once per job). The same sweep with 1.33 s bids instead of 4–7 s ones still gives only
+1.45×, so **the ceiling is not created by LLM cost**. Attributing the remaining gap is not
+possible from these runs — the two arms also differ in cost signal and in whether Snow's dominance
+rule degenerates (finding 11) — and the deciding intervention is still unrun.
 
 The result that reframes the rest: **completion never degrades under any LLM fault measured** —
 300/300 jobs across every scenario, arm and blast radius — because placement is decided by *when*
@@ -604,18 +604,43 @@ drain time:
    `(job, agent)` pair, **every pair produces exactly one bid at every fleet size** — so
    `calls_per_job` *is* distinct bidders per job: **2.17 → 3.70 → 5.98**, a 2.76× rise for a 4.3×
    fleet, with zero re-bidding.
-2. **Bid cost and redundancy move independently, and the two arms separate them.** Per-term, 14 → 60:
+2. **Sub-linear scaling survives in a second, much cheaper regime.** Per-term, 14 → 60:
 
    | arm | bidders/job | cost per bid | busy fraction | **throughput** |
    |---|---|---|---|---|
    | LLM | 2.17 → 5.98 (**2.76×**) | 4.06 → 7.15 s (**1.76×**) | 0.61 → 0.60 (flat) | **0.86×** |
-   | analytic | 2.34 → 7.05 (**3.01×**) | 1.33 s (**flat**) | 0.56 → 0.57 (flat) | **1.45×** |
+   | cheap-bid | 2.34 → 7.05 (**3.01×**) | 1.33 s (**flat**) | 0.56 → 0.57 (flat) | **1.45×** |
 
-   Redundancy grows *in both arms*, so it is the candidate explanation for why scaling is
-   sub-linear rather than linear. Cost per bid grows *only* on the LLM arm, which is the candidate
-   explanation for why that arm regresses instead of merely under-scaling.
+   Redundancy grows in both, and neither reaches even half of linear. That is the useful content:
+   **the ceiling is not created by LLM cost**, because it is still there when a bid costs 1.33 s
+   instead of 7 s.
 
-> **Two corrections to how this was first argued.** The analytic control was described as
+> **The second arm is NOT a one-variable control, and was wrongly described as one.** It was
+> introduced as varying "the cost of a bid while leaving the number of bidders intact". It differs
+> in at least five ways, and one of them changes consensus itself:
+>
+> | | LLM arm | cheap-bid arm |
+> |---|---|---|
+> | cost per bid | 4.06–7.15 s of real inference | 1.33 s of *failed connection* |
+> | cost signal | `100 − score`, range 25–75 | analytic utilisation, range 0–1 |
+> | **dominance rule** | proposer advertises 25–75, **peers price 0–1** → degenerates (finding 11) | both sides 0–1 → behaves normally |
+> | bidders/job | 2.17 → 5.98 | 2.34 → 7.05 (not identical, and scales differently) |
+> | work per bid | parse a score, cache it | throw, then compute the analytic cost anyway |
+>
+> The dominance-rule row is the serious one: under Snow a peer compares its own 0–1 analytic cost
+> against an advertised 25–75 LLM cost and concludes it dominates essentially always, so the two
+> arms are not running the same consensus. A throughput difference between them cannot be
+> attributed to bid cost alone.
+>
+> So this arm bounds rather than isolates: it shows the sub-linear ceiling is not an artefact of
+> expensive inference. It cannot apportion the remainder. A closer control would be
+> `--agent-type resource`, which is analytic by design — no failure path, consistent cost scale on
+> both sides, dominance rule intact — and that is worth one run. Even it changes the cost signal,
+> which is why the only genuinely one-variable test remains the rank gate: same agents, same
+> costs, same consensus, fewer bidders.
+
+> **Two corrections to how this was first argued.** The second arm (then called "the analytic
+> control") was described as
 > "removing bids entirely… nothing else about the scheduler changed, so bid cost was the term
 > suppressing it". Both halves were wrong. Its bids were **not free** — each failed connection
 > attempt cost a median **1.33 s** before falling back — and redundancy was **not** held constant,
@@ -637,7 +662,7 @@ inside cost computation ~60% of the time at every fleet size, and the residual 4
 queue waits and consensus. Parallelism therefore scales fine; the problem is entirely on the cost
 side.
 
-#### The analytic control, obtained by accident
+#### A second, cheap-bid regime — obtained by accident, and not a control
 
 A misconfigured earlier attempt pointed all three fleets at a stopped local Ollama, so every bid
 failed and every agent used the analytic cost — 703 fallbacks, 0 LLM completions. It is preserved
@@ -650,17 +675,19 @@ removed:
 | 30 | 99 s | 3.03 | 16.9 | 0.799 | 300 |
 | 60 | 82 s | 3.64 | 34.2 | 0.766 | 300 |
 
-**Scaling is positive but still sub-linear: 4.3× the fleet gives 1.45×.** Note the bids here were
-not free — each failed connection cost a median **1.33 s** before the fallback — so this is a
-*cheap-bid* arm, not a no-bid arm. With that caveat the sweep separates two limits:
+**Scaling is positive but still sub-linear: 4.3× the fleet gives 1.45×.** The bids here were not
+free — each failed connection cost a median **1.33 s** before the fallback — so this is a
+*cheap-bid* arm, not a no-bid arm. Read against the LLM arm it gives one solid conclusion and one
+open question:
 
-- a limit that caps scaling at ~1.45× per 4.3× fleet *even with cheap bids*, and which coincides
-  with redundancy growing 3.01× on this arm too;
-- an additional LLM-only cost growth (1.76× per bid, from endpoint contention) that turns that
-  modest gain into a small *regression* (0.86×).
+- a ceiling of ~1.45× per 4.3× fleet that is present *even with 1.33 s bids*, so it is not created
+  by inference cost;
+- an additional LLM-arm gap down to 0.86×, which coincides with per-bid cost growing 1.76× — but
+  see the caveat above: these two arms also differ in cost signal and in whether the Snow dominance
+  rule degenerates, so the gap cannot be assigned to bid cost alone.
 
-The analytic arm is also ~3.8× faster in absolute terms (3.64 vs 0.96 jobs/s at 60 agents), the
-same effect S05 found from the fault side: replacing LLM bids with analytic ones drains the queue
+This arm is also ~3.8× faster in absolute terms (3.64 vs 0.96 jobs/s at 60 agents), the same
+effect S05 found from the fault side: replacing LLM bids with analytic ones drains the queue
 several times faster (§4d.1).
 
 **What this means for the levers in §4.0.** Narrowing who bids is the best-supported change,
@@ -668,8 +695,8 @@ because bidders-per-job is measurably the term that grows with the fleet, and it
 arms. That is an argument for *testing* the lever, not evidence that it will work — the experiment
 is what would establish the causal link. It also means the ceiling is *not* something a faster endpoint fixes: bid latency
 itself degrades 1.76× as the fleet grows, so a faster model buys a constant factor and leaves the
-scaling shape intact. And the analytic control bounds the prize — even free bids only bought
-1.45×, so throughput work should not be sold as unlocking linear scaling.
+scaling shape intact. And the cheap-bid arm bounds the prize — even at 1.33 s per bid the fleet
+only scaled 1.45×, so throughput work should not be sold as unlocking linear scaling.
 
 ### 4.1 Is Jain's fairness the right metric here? Partly — and it must be quoted differently
 
