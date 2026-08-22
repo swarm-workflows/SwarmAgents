@@ -125,7 +125,9 @@ def test_assert_clean_refuses_a_leaked_ablation(fake_repo, monkeypatch):
     the fault. Only the *config* check can see it."""
     fake_repo(3)
     monkeypatch.setattr(helpers, "hosts", lambda: ["agent-1"])
-    monkeypatch.setattr(helpers, "_fan_out", lambda *a, **k: "0 0 0\n")
+    # The probe reports its own hostname first, so a silent host is distinguishable from a clean
+    # one — see test_a_silent_host_is_not_a_clean_host.
+    monkeypatch.setattr(helpers, "_fan_out", lambda *a, **k: "agent-1 0 0 0\n")
 
     helpers.assert_clean()  # clean fleet, flag absent -> passes
 
@@ -785,7 +787,7 @@ def test_cleanup_refuses_to_start_when_stale_host_logs_survive(monkeypatch, caps
     monkeypatch.setattr(helpers, "_sh", lambda *a, **k: "")
     monkeypatch.setattr(helpers, "_fan_out",
                         lambda hosts_, cmd, **k: "agent-1 1\nagent-2 0\n" if "wc -l" in cmd else "")
-    with pytest.raises(SystemExit, match="survived cleanup"):
+    with pytest.raises(SystemExit, match="stale agent logs still present"):
         helpers.cleanup()
     assert "retrying" in capsys.readouterr().out
 
@@ -793,3 +795,42 @@ def test_cleanup_refuses_to_start_when_stale_host_logs_survive(monkeypatch, caps
     monkeypatch.setattr(helpers, "_fan_out",
                         lambda hosts_, cmd, **k: "agent-1 0\nagent-2 0\n" if "wc -l" in cmd else "")
     helpers.cleanup()
+
+
+def test_a_silent_host_is_not_a_clean_host(monkeypatch):
+    """`_fan_out` discards stderr, so an unreachable host returns no line — and every check
+    written as "no bad lines means fine" passed it. It is the worst host to pass: the one whose
+    `rm -f` may have failed, and which rejoins in time to contaminate the run."""
+    monkeypatch.setattr(helpers, "hosts", lambda: ["agent-1", "agent-2"])
+    monkeypatch.setattr(helpers, "_sh", lambda *a, **k: "")
+
+    # agent-2 says nothing at all. Everything that answered is clean.
+    monkeypatch.setattr(helpers, "_fan_out", lambda hosts_, cmd, **k: "agent-1 0 0 0\n")
+    with pytest.raises(SystemExit, match="did not answer"):
+        helpers.assert_clean()
+
+    monkeypatch.setattr(helpers, "_fan_out",
+                        lambda hosts_, cmd, **k: "agent-1 0\n" if "wc -l" in cmd else "")
+    with pytest.raises(SystemExit, match="did not answer the check"):
+        helpers.cleanup()
+
+
+def test_an_unverified_teardown_is_reported_as_loudly_as_a_dirty_one(monkeypatch, capsys):
+    """stop_fault warns rather than raises — it runs in a finally — but an unverified host must
+    not be silently counted as torn down: that is how a fault leaks into the next scenario."""
+    monkeypatch.setattr(helpers, "hosts", lambda: ["agent-1", "agent-2"])
+    monkeypatch.setattr(helpers, "_fan_out", lambda hosts_, cmd, **k: "agent-1 0 0 0\n")
+    monkeypatch.setattr(helpers.time, "sleep", lambda *_: None)
+    helpers.stop_fault()
+    out = capsys.readouterr().out
+    assert "teardown UNVERIFIED on 1 host(s)" in out and "agent-2" in out
+
+
+def test_the_cloud_gate_fails_a_host_that_never_answered(monkeypatch):
+    """A host that skipped the gate has not passed it — an unprobed host runs an agent that falls
+    back to the analytic model for the entire run, which is the exact thing the gate exists for."""
+    monkeypatch.setattr(helpers, "hosts", lambda: ["agent-1", "agent-2"])
+    monkeypatch.setattr(helpers, "ARM", "cloud")
+    monkeypatch.setattr(helpers, "_fan_out", lambda hosts_, cmd, **k: "agent-1 200 0\n")
+    with pytest.raises(SystemExit, match="no-answer"):
+        helpers._cloud_health_gate()

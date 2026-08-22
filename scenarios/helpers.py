@@ -106,6 +106,26 @@ def _fan_out(host_list: Iterable[str], remote_cmd: str, timeout: int = 900,
     return _sh(parts + " wait", timeout=timeout)
 
 
+def _probe_hosts(remote_cmd: str, timeout: int = 900,
+                 host_list: Iterable[str] | None = None) -> tuple[dict, list]:
+    """Run a per-host probe that echoes `$(hostname) <fields…>`; return answers and the SILENT.
+
+    `_fan_out` discards stderr and returns only what came back, so an unreachable host contributes
+    no line at all — and every check written as "no bad lines means fine" passes it. That is
+    backwards. An unreachable host is the one most likely to still be holding whatever is being
+    checked for, and the one that will rejoin in time to contaminate the run: it is the exact host
+    whose `rm -f` may have silently failed. Silence is a third outcome, not a clean one, and every
+    caller here has to decide what to do with it.
+    """
+    wanted = list(host_list) if host_list is not None else hosts()
+    answers = {}
+    for line in _fan_out(wanted, remote_cmd, timeout=timeout).splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            answers[parts[0]] = parts[1:]
+    return answers, [h for h in wanted if h not in answers]
+
+
 # ---------------------------------------------------------------------------
 # Fleet preparation
 # ---------------------------------------------------------------------------
@@ -179,17 +199,23 @@ def _cloud_health_gate() -> None:
     # will hit the same ceiling, and every 429 there becomes a fallback.
     all_hosts = hosts()
     batch = int(os.getenv("CJ_CLOUD_PROBE_BATCH", "4"))
-    bad, serving = [], []
+    bad, serving, answered = [], [], set()
     for i in range(0, len(all_hosts), batch):
         for line in _fan_out(all_hosts[i:i + batch], probe, timeout=600).splitlines():
             parts = line.split()
             if len(parts) != 3:
                 continue
             host, code, local = parts
+            answered.add(host)
             if code != "200":
                 bad.append(f"{host}={code}")
             if local.isdigit() and int(local) > 0:
                 serving.append(host)
+    # A host that never answered has not passed the gate — it has skipped it. The whole point of
+    # the gate is that an unprobed host runs an agent that falls back for the entire run.
+    quiet = [h for h in all_hosts if h not in answered]
+    if quiet:
+        bad.extend(f"{h}=no-answer" for h in quiet)
     if bad:
         raise SystemExit(
             f"cloud health gate failed on {len(bad)} host(s): {', '.join(bad[:8])}\n"
@@ -216,17 +242,26 @@ def cleanup() -> None:
         _fan_out(hosts(), f"pkill -9 -f main[.]py; rm -f {REPO}/swarm-multi/agent-*.log")
         _sh(f"pkill -9 -f main[.]py; rm -f {REPO}/swarm-multi/agent-*.log; "
             "docker exec redis redis-cli flushall >/dev/null")
-        left = [ln.split()[0] for ln in _fan_out(
-            hosts(), f"echo $(hostname) $(ls {REPO}/swarm-multi/agent-*.log 2>/dev/null | wc -l)"
-        ).splitlines() if len(ln.split()) == 2 and ln.split()[1] != "0"]
-        if not left:
+        answers, silent = _probe_hosts(
+            f"echo $(hostname) $(ls {REPO}/swarm-multi/agent-*.log 2>/dev/null | wc -l)")
+        left = [h for h, fields in answers.items() if fields[0] != "0"]
+        if not left and not silent:
             return
         if attempt == 2:
+            detail = []
+            if left:
+                detail.append(f"stale agent logs still present on {len(left)}: "
+                              f"{', '.join(sorted(left)[:8])}")
+            if silent:
+                detail.append(f"{len(silent)} host(s) did not answer the check "
+                              f"({', '.join(silent[:8])})")
             raise SystemExit(
-                f"stale agent logs survived cleanup on {len(left)} host(s): {', '.join(left[:8])}. "
-                f"They would be collected as this run's evidence with a fresh copy time, which no "
-                f"freshness check can detect. Clear them before measuring.")
-        print(f"  cleanup:        retrying, stale logs still on {len(left)} host(s)")
+                "; ".join(detail) + ". A leftover log is collected into this run with a fresh copy "
+                "time, which no freshness check downstream can detect — and an unreachable host is "
+                "the most likely to be holding one, so silence cannot be read as clean. Clear the "
+                "hosts before measuring.")
+        print(f"  cleanup:        retrying — {len(left)} host(s) still holding logs, "
+              f"{len(silent)} silent")
 
 
 def set_disable_fallback(on: bool) -> int:
@@ -431,7 +466,9 @@ def _assert_semantics(fault: str, obs: dict, params: dict) -> None:
 
 def _state_probe() -> str:
     """env-var count, our driver count, and whether PROXY_PORT is still bound."""
-    return (f"echo $(grep -c OLLAMA_BASE_URL /root/.profile) "
+    # $(hostname) first: without it a returned line cannot be attributed, and a host that never
+    # answered cannot be distinguished from one that answered "clean".
+    return (f"echo $(hostname) $(grep -c OLLAMA_BASE_URL /root/.profile) "
             f"$(pgrep -fc '{_PROXY_PAT}' || true) "
             f"$(ss -lnt 2>/dev/null | grep -c ':{PROXY_PORT} ' || true)")
 
@@ -444,14 +481,22 @@ def assert_clean(strict: bool = False) -> None:
     cleanup() at the start of a run, which means a scenario tidies up after its predecessor
     but never after itself — so the slice is left dirty whenever a batch ends.
     """
-    out = _fan_out(hosts(), _state_probe())
-    dirty = [ln for ln in out.splitlines() if ln.strip() and ln.split() != ["0", "0", "0"]]
-    if dirty:
-        raise SystemExit(
-            f"fleet is dirty on {len(dirty)} host(s) — leaked env var, driver, or a proxy "
-            f"still bound to :{PROXY_PORT}.\nrun scenarios/clear_faults.py before measuring.")
-    print(f"  clean check:    no leaked env vars / drivers / :{PROXY_PORT} listeners "
-          f"on {len(hosts())} hosts")
+    answers, silent = _probe_hosts(_state_probe())
+    dirty = [h for h, fields in answers.items() if fields[:3] != ["0", "0", "0"]]
+    if dirty or silent:
+        why = []
+        if dirty:
+            why.append(f"dirty on {len(dirty)} host(s) ({', '.join(sorted(dirty)[:8])}) — leaked "
+                       f"env var, driver, or a proxy still bound to :{PROXY_PORT}")
+        # A host that did not answer is NOT a clean host. It may be running the previous
+        # scenario's proxy, and it will rejoin in time to serve this run's bids.
+        if silent:
+            why.append(f"{len(silent)} host(s) did not answer the probe "
+                       f"({', '.join(silent[:8])}), so their state is unknown")
+        raise SystemExit(f"fleet is {'; '.join(why)}.\n"
+                         f"run scenarios/clear_faults.py before measuring.")
+    print(f"  clean check:    no leaked env vars / drivers / :{PROXY_PORT} listeners, "
+          f"all {len(hosts())} hosts answering")
 
     # A config-side leak, which every probe above is blind to. `set_disable_fallback()` mutates
     # the frozen fleet's per-agent configs, so a leftover `true` from a killed ablation run
@@ -491,10 +536,16 @@ def stop_fault() -> None:
                       f"pkill -f '{_PROXY_PAT}'; pkill -f '{_CJ_PROXY_PAT}'; "
                       f"fuser -k {PROXY_PORT}/tcp 2>/dev/null")
     time.sleep(3)
-    out = _fan_out(hosts(), _state_probe())
-    dirty = [ln for ln in out.splitlines() if ln.strip() and ln.split() != ["0", "0", "0"]]
+    answers, silent = _probe_hosts(_state_probe())
+    dirty = [h for h, fields in answers.items() if fields[:3] != ["0", "0", "0"]]
     if dirty:
-        print(f"  !! teardown incomplete on {len(dirty)} host(s) — next run will be invalid")
+        print(f"  !! teardown incomplete on {len(dirty)} host(s) "
+              f"({', '.join(sorted(dirty)[:8])}) — next run will be invalid")
+    # Reported separately and just as loudly: an unverified teardown is what leaks a fault into
+    # the next scenario, and the host that cannot be reached now is the likely leaker.
+    if silent:
+        print(f"  !! teardown UNVERIFIED on {len(silent)} host(s) ({', '.join(silent[:8])}) — "
+              f"they did not answer; assume the fault may still be live there")
 
 
 # ---------------------------------------------------------------------------
