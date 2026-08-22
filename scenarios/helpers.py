@@ -433,6 +433,69 @@ def run_swarm(run_dir: str, runtime: int | None = None) -> None:
     _sh(cmd, timeout=runtime + 900)
 
 
+def _restarts_and_conflicts(run_dir: str) -> dict:
+    """Job restarts and consensus conflicts, from the run's own metrics.json.
+
+    Section 4 lists both as *primary* metrics and nothing collected them, so every result table in
+    the campaign was silent about them. That silence is not the same as a zero, and the difference
+    matters: a scheduling latency of 140-560 s invites the reading "jobs are being reselected",
+    and only a measured restart count can refute it.
+
+    Two independent sources, because each can be absent:
+      * `<run>/metrics.json` — the Metrics export, `{agent_id: {restarts: {...}, conflicts: {...}}}`.
+        Values may be counts or per-job collections, so both are handled.
+      * the agent logs — `RESTART: Job:` is emitted by `print()` in resource_agent (not the
+        logger, so it only lands here because run_test redirects stdout into the log), and
+        `leaving for reselection` by the Snow engine when a decision exhausts max_rounds. These
+        are the *actual* strings in the source; a plausible-looking guess at a marker is how an
+        earlier version of this check concluded "zero" without evidence.
+
+    The log markers are a cross-check on metrics.json, not a substitute: they are reported under
+    separate keys so a disagreement is visible rather than averaged away.
+    """
+    out: dict = {}
+
+    def _count(container) -> int:
+        n = 0
+        for v in (container or {}).values():
+            if isinstance(v, bool):
+                n += int(v)
+            elif isinstance(v, (int, float)):
+                n += int(v)
+            elif isinstance(v, (list, tuple, set, dict)):
+                n += len(v)
+            else:
+                n += 1
+        return n
+
+    path = f"{REPO}/{run_dir}/metrics.json"
+    if os.path.isfile(path):
+        try:
+            data = json.load(open(path))
+        except ValueError:
+            data = None
+        if isinstance(data, dict):
+            restarts = conflicts = 0
+            for entry in data.values():
+                if isinstance(entry, dict):
+                    restarts += _count(entry.get("restarts"))
+                    conflicts += _count(entry.get("conflicts"))
+            out["restarts"] = restarts
+            out["conflicts"] = conflicts
+
+    marks = {"restart_log_lines": 0, "reselection_log_lines": 0}
+    for p in sorted(glob(f"{REPO}/{run_dir}/**/agent-*.log", recursive=True)):
+        body = open(p, errors="ignore").read()
+        marks["restart_log_lines"] += body.count("RESTART: Job:")
+        marks["reselection_log_lines"] += body.count("leaving for reselection")
+    out.update(marks)
+
+    # If metrics.json was missing, fall back to the logs so the metric is never simply absent.
+    if "restarts" not in out:
+        out["restarts"] = marks["restart_log_lines"]
+    return out
+
+
 def _orchestrator_log(run_dir: str) -> str:
     """Orchestrator logs written by hand use underscores where run dirs use hyphens."""
     base = os.path.basename(run_dir)
@@ -582,13 +645,32 @@ def collect(run_dir: str) -> dict:
     # all_jobs.csv rather than the plotting step's stdout, which not every run has.
     jobs_csv = f"{REPO}/{run_dir}/all_jobs.csv"
     if os.path.isfile(jobs_csv):
+        sl, wait, sel = [], [], []
         with open(jobs_csv, newline="") as fh:
-            sl = [float(r["scheduling_latency"]) for r in csv.DictReader(fh)
-                  if r.get("scheduling_latency")]
+            for r in csv.DictReader(fh):
+                if r.get("scheduling_latency"):
+                    sl.append(float(r["scheduling_latency"]))
+                # Split the latency into the two phases it is actually made of. Measured
+                # 2026-08-22: selection is ~1.0 s flat while the pool wait is 78-311 s, and
+                # scheduling_latency is exactly their sum. Without the split, a 140-560 s figure
+                # reads as slow consensus or a reselection restart when it is neither — it is a
+                # job queueing behind the other 299, all of which arrive within ~9 s.
+                try:
+                    sub = float(r["submitted_at"])
+                    started = float(r["selection_started_at"])
+                    assigned = float(r["assigned_at"])
+                except (TypeError, ValueError, KeyError):
+                    continue
+                wait.append(started - sub)
+                sel.append(assigned - started)
         if sl:
             sl.sort()
             m["sched_latency_mean_s"] = round(sum(sl) / len(sl), 1)
             m["sched_latency_p95_s"] = round(sl[int(len(sl) * 0.95)], 1)
+        if wait:
+            m["pool_wait_mean_s"] = round(sum(wait) / len(wait), 1)
+        if sel:
+            m["selection_mean_s"] = round(sum(sel) / len(sel), 1)
 
     run_log = _orchestrator_log(run_dir)
     if run_log:
@@ -610,6 +692,7 @@ def collect(run_dir: str) -> dict:
         if placed and sum(placed):
             total = sum(placed)
             m["jains_fairness"] = round(total * total / (fleet * sum(x * x for x in placed)), 3)
+        m.update(_restarts_and_conflicts(run_dir))
         fa = re.search(r"Total failed agents: (\d+)", text)
         m["failed_agents"] = int(fa.group(1)) if fa else None
         inf = re.search(r"Infeasible/Failed jobs: (\d+) retired, (\d+) still", text)
@@ -727,9 +810,20 @@ _KEYS = [
     ("score_sd", "LLM score sd", "{}"),
     ("sched_latency_mean_s", "sched latency mean", "{}s"),
     ("sched_latency_p95_s", "sched latency p95", "{}s"),
+    # sched latency is pool wait + selection, and the two are wildly different sizes: selection
+    # is ~1 s while the wait is 78-311 s. Reporting only the total invites reading a long latency
+    # as slow consensus or a reselection restart, when it is a job queueing for its turn.
+    ("pool_wait_mean_s", "  of which pool wait", "{}s"),
+    ("selection_mean_s", "  of which selection", "{}s"),
     ("jains_fairness", "load fairness", "{}"),
     ("swim_failed", "SWIM false-fails", "{}"),
     ("failed_agents", "failed agents", "{}"),
+    # Section 4 lists these as PRIMARY metrics, but nothing captured them until 2026-08-22, so no
+    # result table in the campaign reported them. Always print them, even at zero: "0 restarts"
+    # is a claim worth making explicitly, and it is the control for any latency the reader might
+    # otherwise attribute to reselection.
+    ("restarts", "job restarts", "{}"),
+    ("conflicts", "consensus conflicts", "{}"),
     ("jobs_stuck", "jobs stuck", "{}"),
 ]
 

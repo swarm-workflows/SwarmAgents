@@ -335,7 +335,9 @@ computes the delta; our workload is one full SwarmAgents run.
 **Primary (scheduling health)**
 - Job **completion rate** and failed/orphaned count
 - **Makespan**, P50/P95 job latency
-- **Consensus conflicts** and reselections/restarts
+- **Consensus conflicts** and reselections/restarts — captured since 2026-08-22 and printed on
+  every run even at zero; see [§4.0](#40-what-scheduling-latency-actually-measures--and-why-it-is-not-reselection-2026-08-22),
+  which is also where scheduling latency is decomposed into pool wait vs selection
 - **Load fairness** (Jain's index) — **secondary in practice; see [§4.1](#41-is-jains-fairness-the-right-metric-here-partly--and-it-must-be-quoted-differently)** for why it is close to a restatement of the blast radius under S05
 - **Fallback rate** — `[LLM_COST_FALLBACK]` vs `[LLM_COST_COMPLETE]`; *the* key LLM-resilience signal
 
@@ -346,6 +348,63 @@ computes the delta; our workload is one full SwarmAgents run.
 
 **Correctness invariant (must hold under every fault):** **zero double-assignments** — enforced by
 Redis `SET NX` in the Snow engine. Safety must never degrade, only performance.
+
+### 4.0 What "scheduling latency" actually measures — and why it is not reselection (2026-08-22)
+
+Every result table quotes a scheduling latency of 78–563 s, which looks alarming next to a 60 s
+`reselection_timeout_s`: the natural reading is that jobs are timing out and being restarted. They
+are not, and the check is worth recording because the metric invites that reading.
+
+`all_jobs.csv` carries the phase timestamps, so the total can be split rather than guessed at:
+
+```
+submitted_at ---A: pool wait---> selection_started_at ---B: selection---> assigned_at
+```
+
+| run | A pool wait | **B selection** | total | max | `latency == A+B`? |
+|---|---|---|---|---|---|
+| `cj-baseline-gw2` | 190.1 s | **1.0 s** | 191.1 s | 338.6 | exact (mean \|diff\| 0.000) |
+| `cj-s05-50pct-gw2` | 77.6 s | **1.0 s** | 78.6 s | 140.2 | exact |
+| `cj-s09-injectdistractor` | 310.8 s | **1.0 s** | 311.8 s | 562.8 | exact |
+| `cj-baseline-cloud` | 234.8 s | **1.0 s** | 235.8 s | — | exact |
+
+**Selection itself costs 1.0 s, flat** — p50 1.0, max 1.8–2.8, identical on the local, cloud and
+gateway arms. Everything else is a job waiting in the pool for its turn. Three independent reasons
+it is queueing and not reselection:
+
+1. **Zero restarts, measured.** 0 from `metrics.json` *and* 0 from both real log markers, across
+   every run. The markers matter: `RESTART: Job:` is emitted by a **`print()`** in
+   `resource_agent.py:827` (not the logger — it reaches the agent log only because `run_test`
+   redirects stdout into it), and the Snow engine's separate path logs
+   `leaving for reselection` when a decision exhausts `max_rounds`. An earlier version of this
+   check grepped for *plausible-looking* markers and reported "zero" without evidence; these are
+   the strings in the source.
+2. **All 300 jobs arrive within 9.2 s.** The trace is not staggered — the pool fills almost at
+   once and then drains, so waiting is the expected condition, not a symptom.
+3. **mean ≈ max/2 in every run** (190≈338/2, 78≈140/2, 311≈563/2). That is the arithmetic
+   signature of a queue draining at a constant rate. A reselection timeout would instead cluster
+   pool waits just past multiples of 60 s; the observed distribution is smooth across those
+   buckets (baseline: 37/36/70/52/64/41).
+
+**So "sched latency" is a throughput measure, not a consensus or reliability measure.** It moves
+with how expensive a bid is — S05's instant analytic bids drain in 140 s, `inject_distractor`'s
++60% generation takes 563 s — which is the same effect S01 quantified as ~34× amplification
+(§4c.2). Quote it as queue drain time.
+
+> **Now always reported.** §4 called conflicts and reselections *primary* metrics and nothing
+> collected them, so every table in this document was silent about them for the whole campaign —
+> and silence is not a zero. `helpers.collect()` now emits `restarts`, `conflicts`,
+> `restart_log_lines`, `reselection_log_lines`, `pool_wait_mean_s` and `selection_mean_s` on every
+> run, printed even when zero, because the zero is exactly what refutes the reselection reading.
+> The log counts are reported under their own keys as a cross-check on `metrics.json` rather than
+> merged into it, so a disagreement between the two sources stays visible.
+
+> **Open question worth a look, unrelated to any fault.** The fleet drains ~0.9 jobs/s at baseline
+> and ~2.2 jobs/s when bids are analytic, with 30 agents available and selection costing 1.0 s.
+> A flat 1.0 s that does not vary across three arms and four fault types looks like a tick or
+> sleep granularity rather than measured work (`consensus.snow.tick_interval_ms`; note also that
+> `Job.execute()` sleeps a flat 1 s — finding 9). Whether placement is more serialized than it
+> needs to be is untested; `max_inflight` ships at 16, so it is not a hard cap of one.
 
 ### 4.1 Is Jain's fairness the right metric here? Partly — and it must be quoted differently
 

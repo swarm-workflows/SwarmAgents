@@ -26,6 +26,7 @@ Bugs 1 and 2 were real, found 2026-08-21; see `CHAOS_JUNGLE_LLM_TEST_PLAN.md` 4d
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 
@@ -226,6 +227,109 @@ def test_empty_block_is_handled(fake_repo):
     """A header with no agent lines under it must not crash or invent placements."""
     run = fake_repo("hollow", "\n[all] Jobs per agent:\nTotal failed agents: 0\n")
     assert helpers.placement(run) == ({}, helpers.AGENTS)
+
+
+class TestRestartAndLatencyMetrics:
+    """Section 4 calls restarts and conflicts primary metrics; nothing captured them until
+    2026-08-22, so every result table was silent about them — and silence is not a zero.
+    A 140-560 s scheduling latency invites "jobs are being reselected", and only a measured
+    restart count refutes it.
+    """
+
+    def _run(self, tmp_path, monkeypatch, *, metrics=None, jobs_csv=None, agent_log=None):
+        monkeypatch.setattr(helpers, "REPO", str(tmp_path))
+        d = tmp_path / "runs" / "r"
+        d.mkdir(parents=True, exist_ok=True)
+        (tmp_path / "runs_r.log").write_text(block("all", {1: 300}))
+        if metrics is not None:
+            (d / "metrics.json").write_text(json.dumps(metrics))
+        if jobs_csv is not None:
+            (d / "all_jobs.csv").write_text(jobs_csv)
+        if agent_log is not None:
+            (d / "agent-1.log").write_text(agent_log)
+        return "runs/r"
+
+    def test_restarts_and_conflicts_read_from_metrics_json(self, tmp_path, monkeypatch):
+        metrics = {
+            "1": {"restarts": {"job-1": 2, "job-2": 1}, "conflicts": {"job-9": 3}},
+            "2": {"restarts": {}, "conflicts": {"job-7": 1, "job-8": 1}},
+        }
+        run = self._run(tmp_path, monkeypatch, metrics=metrics)
+        m = helpers.collect(run)
+        assert m["restarts"] == 3
+        assert m["conflicts"] == 5
+
+    def test_zero_is_reported_not_omitted(self, tmp_path, monkeypatch):
+        """An explicit 0 is the whole point — it is the control for a long latency."""
+        run = self._run(tmp_path, monkeypatch,
+                        metrics={"1": {"restarts": {}, "conflicts": {}}})
+        m = helpers.collect(run)
+        assert m["restarts"] == 0 and m["conflicts"] == 0
+        assert "restarts" in m and "conflicts" in m
+
+    def test_per_job_collections_are_counted_by_length(self, tmp_path, monkeypatch):
+        """Values may be counts or per-job lists depending on what Metrics recorded."""
+        metrics = {"1": {"restarts": {"job-1": ["t1", "t2", "t3"]}, "conflicts": {"j": 2}}}
+        run = self._run(tmp_path, monkeypatch, metrics=metrics)
+        m = helpers.collect(run)
+        assert m["restarts"] == 3 and m["conflicts"] == 2
+
+    def test_log_markers_are_the_real_strings(self, tmp_path, monkeypatch):
+        """These must match resource_agent.py and gossip_engine.py verbatim.
+
+        `RESTART: Job:` comes from a print() (not the logger), and only reaches the agent log
+        because run_test redirects stdout into it. Guessing at a marker instead of reading the
+        source is how an earlier check concluded 'zero restarts' with no evidence.
+        """
+        log = ("RESTART: Job: job-4 reset to Pending 60.0 seconds\n"
+               "some other line\n"
+               "elapsed=3.0s — max_rounds exhausted, leaving for reselection\n"
+               "RESTART: Job: job-9 reset to Pending 60.0 seconds\n")
+        run = self._run(tmp_path, monkeypatch, metrics={"1": {}}, agent_log=log)
+        m = helpers.collect(run)
+        assert m["restart_log_lines"] == 2
+        assert m["reselection_log_lines"] == 1
+
+    def test_logs_are_a_crosscheck_not_a_substitute(self, tmp_path, monkeypatch):
+        """metrics.json wins for `restarts`; a disagreement stays visible under its own key."""
+        run = self._run(tmp_path, monkeypatch,
+                        metrics={"1": {"restarts": {"j": 5}}},
+                        agent_log="RESTART: Job: j reset to Pending 60.0 seconds\n")
+        m = helpers.collect(run)
+        assert m["restarts"] == 5, "metrics.json is authoritative"
+        assert m["restart_log_lines"] == 1, "the log count is reported separately"
+
+    def test_falls_back_to_logs_when_metrics_json_absent(self, tmp_path, monkeypatch):
+        run = self._run(tmp_path, monkeypatch,
+                        agent_log="RESTART: Job: j reset to Pending 60.0 seconds\n" * 4)
+        m = helpers.collect(run)
+        assert m["restarts"] == 4, "the metric must never be simply absent"
+
+    def test_latency_splits_into_pool_wait_and_selection(self, tmp_path, monkeypatch):
+        """The split is what stops a long latency being read as slow consensus or a restart.
+
+        Measured on the real runs: selection ~1.0 s flat, pool wait 78-311 s.
+        """
+        rows = ["job_id,submitted_at,selection_started_at,assigned_at,scheduling_latency"]
+        for i in range(10):
+            sub, started, assigned = 100.0, 100.0 + 50 + i, 100.0 + 51 + i
+            rows.append(f"j{i},{sub},{started},{assigned},{assigned - sub}")
+        run = self._run(tmp_path, monkeypatch, metrics={"1": {}},
+                        jobs_csv="\n".join(rows) + "\n")
+        m = helpers.collect(run)
+
+        assert m["selection_mean_s"] == 1.0, "selection is the small term"
+        assert m["pool_wait_mean_s"] == pytest.approx(54.5, abs=0.1)
+        # The total must reconcile with its parts, or the split is worse than not having it.
+        assert m["sched_latency_mean_s"] == pytest.approx(
+            m["pool_wait_mean_s"] + m["selection_mean_s"], abs=0.1)
+
+    def test_missing_phase_columns_do_not_break_collect(self, tmp_path, monkeypatch):
+        run = self._run(tmp_path, monkeypatch, metrics={"1": {}},
+                        jobs_csv="job_id,scheduling_latency\nj1,12.0\n")
+        m = helpers.collect(run)
+        assert m["sched_latency_mean_s"] == 12.0
+        assert "pool_wait_mean_s" not in m
 
 
 def test_underscore_log_name_is_found(fake_repo):
