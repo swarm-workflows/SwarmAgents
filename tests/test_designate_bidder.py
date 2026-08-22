@@ -21,10 +21,14 @@ import types
 import numpy as np
 import pytest
 
-from swarm.utils.tiebreak import tiebreak_rank
-
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
+
+# Imported AFTER the sys.path insert above, not with the third-party imports: `swarm` is only
+# importable once the repo root is on the path. Placing it higher happens to work when pytest is
+# run from the repo root (cwd is on sys.path) and raises ModuleNotFoundError at COLLECTION time
+# from anywhere else — which aborts the whole session, not just this file.
+from swarm.utils.tiebreak import tiebreak_rank  # noqa: E402
 
 
 def _stub_pydantic_ai() -> None:
