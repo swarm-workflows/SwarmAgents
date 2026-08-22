@@ -41,19 +41,29 @@ REF = re.compile(r"(?:§\s?|(?:test plan|TEST_PLAN\.md)[`,]?\s+§?|section\s+)"
                  r"(\d[0-9a-z]*(?:\.[0-9a-z]+)*)(?![0-9a-z])(?!\.[0-9a-z])")
 
 
-def plan_labels() -> set[str]:
-    """Every section label the plan defines, from its headings, outside code fences."""
-    labels, fence = set(), False
+def plan_sections() -> list[tuple[int, str]]:
+    """(heading level, label) for every labelled section, IN DOCUMENT ORDER.
+
+    Permissive on purpose: the label pattern accepts letters (`4b`, `2.1b`), because a collector
+    that only recognised well-formed labels would silently skip a malformed one and make the
+    "no letters" assertion below unfalsifiable — it would be checking a set it had already
+    filtered.
+    """
+    out, fence = [], False
     for line in open(PLAN).read().splitlines():
         if line.lstrip().startswith("```"):
             fence = not fence
             continue
         if fence:
             continue
-        m = re.match(r"^#{2,6} (\d+(?:\.\d+)*)\.? ", line)
+        m = re.match(r"^(#{2,6}) (\d[0-9a-z]*(?:\.[0-9a-z]+)*)\.? ", line)
         if m:
-            labels.add(m.group(1))
-    return labels
+            out.append((len(m.group(1)), m.group(2)))
+    return out
+
+
+def plan_labels() -> set[str]:
+    return {label for _, label in plan_sections()}
 
 
 def scanned_files() -> list[str]:
@@ -81,13 +91,47 @@ def references(path: str) -> list[tuple[int, str]]:
     return hits
 
 
-def test_the_plan_defines_a_contiguous_ascending_section_numbering():
-    """The point of the renumbering: labels run 1..N in order, with no letters and no gaps at the
-    top level. A gap means a section was dropped or a label was mistyped."""
+def test_no_section_label_contains_a_letter():
+    """`4b`, `2.1b`, `4.0d` were the old scheme. Falsifiable now that the collector accepts them."""
+    assert not [l for l in plan_labels() if re.search(r"[a-z]", l)]
+
+
+def test_labels_ascend_in_document_order():
+    """The actual claim of "sequential in reading order", and the one a set-based check cannot
+    make: §12 must not appear before §7. Sorting the labels before comparing them — which is what
+    the first version of this test did — proves only that they sort, which is vacuous."""
+    labels = [label for _, label in plan_sections()]
+    keyed = [tuple(int(p) for p in l.split(".")) for l in labels]
+    out_of_order = [(labels[i - 1], labels[i]) for i in range(1, len(keyed))
+                    if keyed[i] <= keyed[i - 1]]
+    assert not out_of_order, f"labels not ascending in document order: {out_of_order}"
+
+
+def test_numbering_is_contiguous_at_every_depth():
+    """A gap means a section was dropped or mistyped: §7.1, §7.2, §7.4 is a missing §7.3, and a
+    top level of 1..19 missing 13 is a section that fell out of a reorganisation."""
     labels = plan_labels()
-    tops = sorted({int(l.split(".")[0]) for l in labels})
-    assert tops == list(range(1, max(tops) + 1)), f"gap in top-level numbering: {tops}"
-    assert not [l for l in labels if re.search(r"[a-z]", l)]
+    children: dict[tuple, list[int]] = {}
+    for label in labels:
+        parts = tuple(int(p) for p in label.split("."))
+        children.setdefault(parts[:-1], []).append(parts[-1])
+    for parent, kids in sorted(children.items()):
+        expected = list(range(1, len(kids) + 1))
+        got = sorted(kids)
+        where = "top level" if not parent else "§" + ".".join(str(p) for p in parent)
+        assert got == expected, f"{where}: expected {expected}, got {got}"
+        # ...and a subsection cannot exist without the section it belongs to.
+        if parent:
+            assert ".".join(str(p) for p in parent) in labels, f"{where} is referenced but missing"
+
+
+def test_heading_depth_matches_label_depth():
+    """§7.2 must be a level deeper than §7. A mismatch renders the contents list wrong even when
+    every label is correct, which is how the pre-restructure document read as a flat wall."""
+    base = min(lvl for lvl, label in plan_sections() if "." not in label)
+    wrong = [(lvl, label) for lvl, label in plan_sections()
+             if lvl != base + label.count(".")]
+    assert not wrong, f"heading level does not match label depth: {wrong}"
 
 
 def test_every_reference_to_the_test_plan_resolves():
