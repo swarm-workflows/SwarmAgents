@@ -377,13 +377,25 @@ submitted_at ---A: pool wait---> selection_started_at ---B: selection---> assign
 gateway arms. Everything else is a job waiting in the pool for its turn. Three independent reasons
 it is queueing and not reselection:
 
-1. **Zero restarts, measured.** 0 from `metrics.json` *and* 0 from both real log markers, across
-   every run. The markers matter: `RESTART: Job:` is emitted by a **`print()`** in
-   `resource_agent.py:827` (not the logger — it reaches the agent log only because `run_test`
-   redirects stdout into it), and the Snow engine's separate path logs
-   `leaving for reselection` when a decision exhausts `max_rounds`. An earlier version of this
+1. **Restarts are zero; reselection is zero in all but two runs.** Swept across all 37 run
+   directories: `RESTART: Job:` never fires anywhere — the restart-counter path was never taken —
+   and `leaving for reselection` fires only in **`cj-baseline-swim60` (48 events)** and
+   **`cj-s09-entityswap-25pct` (2 events)**. Everything else, including every gateway-arm run and
+   every point of the S01 sweep, is clean on both.
+
+   The two exceptions make sense and neither disturbs a finding. `swim60` ran with the pre-fix
+   `suspect_timeout_s: 20` and logged 52 SWIM false-fails (§3): suspected peers answer fewer
+   k-sample queries, so rounds fail the α-threshold and exhaust `max_rounds`. It is superseded and
+   not cited as a result. The 2 events in the S09 local 25% run are 2 abandoned decisions out of
+   300 jobs, far too few to move that run's placement — which is the claim it supports — but they
+   are noted here rather than rounded to zero.
+
+   The markers matter: `RESTART: Job:` is emitted by a **`print()`** in `resource_agent.py:827`
+   (not the logger — it reaches the agent log only because `run_test` redirects stdout into it),
+   and the Snow path logs `leaving for reselection` on `max_rounds` exhaustion *without touching
+   the restart counter*, so no value of `restarts` accounts for it. An earlier version of this
    check grepped for *plausible-looking* markers and reported "zero" without evidence; these are
-   the strings in the source.
+   the strings in the source, and running them over every run is what turned up the two above.
 2. **All 300 jobs arrive within 9.2 s.** The trace is not staggered — the pool fills almost at
    once and then drains, so waiting is the expected condition, not a symptom.
 3. **mean ≈ max/2 in every run** (190≈338/2, 78≈140/2, 311≈563/2). That is the arithmetic
@@ -396,6 +408,20 @@ with how expensive a bid is — S05's instant analytic bids drain in 140 s, `inj
 +60% generation takes 563 s — which is the same effect S01 quantified as ~34× amplification
 (§4c.2). Quote it as queue drain time.
 
+> **Do the metric fixes require re-running anything? No — verified.** All six defects fixed on
+> 2026-08-21/22 are analysis-side: two denominators, the block-aware parser, the arm-specific
+> control, and the restart/latency metrics that were never collected. None changes agent
+> behaviour, so the corrected numbers are recoverable from artefacts already on disk. Checked run
+> by run: **35 of 37 run directories carry everything the fixed code reads** (`metrics.json`,
+> `all_jobs.csv`, 30 agent logs, the orchestrator log) and re-analyse cleanly. The two gaps are
+> `cj-baseline-pinned`, an abandoned CPU-pinning run with no artefacts (§2.3), and nothing cited.
+>
+> Re-running the campaign would cost ~6 h of slice time to reproduce numbers we can recompute in
+> seconds, and would *lose* comparability rather than gain it, since the frozen fleet and trace
+> are the thing holding the campaign together. The two code changes that *do* affect behaviour —
+> the tie-break fix (§4e.3) and the bandit epsilon fixes — landed before the gateway-arm runs and
+> touch delegation, which no flat-mesh scenario exercises.
+>
 > **Now always reported.** §4 called conflicts and reselections *primary* metrics and nothing
 > collected them, so every table in this document was silent about them for the whole campaign —
 > and silence is not a zero. `helpers.collect()` now emits `restarts`, `conflicts`,
@@ -420,7 +446,9 @@ guessed that and was wrong.)
 >
 > - **`Agents=1` on every iteration.** `LlmAgent` builds its cost matrix as
 >   `agents = [self.neighbor_map.get(self.agent_id)]` — *"Scoring the jobs on itself"*, with the
->   all-agents version commented out directly beneath. So there is **no partitioning of the
+>   all-agents version commented out directly beneath. Restoring that commented-out
+>   version is **not** the fix: an LLM agent has no way to price a job *for a peer* (finding 11),
+>   so an all-agents matrix would mean 30 LLM calls per job per agent rather than one. So there is **no partitioning of the
 >   pool**: every agent scores every candidate against itself and proposes whatever it can run,
 >   and contention is resolved by consensus plus the Redis `SET NX` claim.
 > - **~17 of 30 agents are inside cost computation at any instant** (5717 agent-seconds of matrix
@@ -445,7 +473,7 @@ guessed that and was wrong.)
 > | lever | change | expected | note |
 > |---|---|---|---|
 > | **Narrow the candidate pool** | lower `selection_threshold_pct` so fewer agents qualify to bid per job | close to linear in calls/job — 3.7 → 2 would be ~1.8× | cheapest by far, config-only, but it directly shapes who competes, so re-measure §4d fairness alongside |
-> | **Partition the pool** | shard candidates across agents (or restore the all-agents cost matrix so each job has one designated bidder) | breaks the 3.7× redundancy structurally | changes selection semantics; the commented-out code suggests this was once intended |
+> | **Rank-gate the bidders** | let agent *a* bid on job *j* only if `tiebreak_rank(j, a)` is in the top *m* — machinery already in `swarm/utils/tiebreak.py` | calls/job → ~*m*, so *m*=2 is ~1.8× and *m*=1 is ~3.7× | no coordination and no new state, and unlike a threshold change it is cost-neutral: it changes *how many* agents compete, not *which* costs qualify. Keep *m*≥2 or the competition §4d measures disappears |
 > | **Cut bid latency** | faster model/endpoint | linear | already characterised in §4c and §4e.6 |
 > | ~~**Lower `beta`**~~ | ~~6 → 3~~ | **withdrawn** | consensus is 1.0 s *per job* but overlaps across jobs (`max_inflight: 16`), so it is not the serial term. An earlier version of this note proposed it as the top lever, from a coincidence between the drain rate and the selection time. |
 >
