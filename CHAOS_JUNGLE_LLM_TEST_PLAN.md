@@ -2150,7 +2150,10 @@ ssh chaos 'sudo bash -lc "cd /root/SwarmAgents && nohup python3.11 run_test.py \
   **`--shutdown-after-seconds N`**, the only flag that actually bounds the wait, and which on
   expiry still stops the agents and collects their logs. Through the harness that is
   `CJ_SHUTDOWN_AFTER=N`; leave it unset for runs expected to drain, or a slow sweep point gets
-  truncated into "the fault broke scheduling".
+  truncated into "the fault broke scheduling". **The one configuration measured not to drain —
+  100% radius with `CJ_DISABLE_FALLBACK=1` — bounds itself**: the scenario declares it and the
+  harness applies 1200 s, because a var the operator must remember is one that gets forgotten, and
+  forgetting it here hangs the run rather than degrading it. `CJ_SHUTDOWN_AFTER` still overrides.
 - **`CJ_DISABLE_FALLBACK=1`** turns on the figure-D ablation (`llm.disable_fallback`, §4.0d).
   Applied by `helpers.run_swarm()`, so **every** scenario shares one lifecycle: written into the
   *per-agent* `configs/` immediately before run_test copies them to the hosts — the base

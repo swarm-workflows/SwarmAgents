@@ -948,3 +948,51 @@ def test_a_negative_count_cannot_cancel_a_real_agent(monkeypatch):
     monkeypatch.setattr(helpers, "_probe_hosts", probe)
     with pytest.raises(SystemExit, match="stray agent process"):
         helpers.assert_clean(strict=True)
+
+
+def test_the_known_stalling_configuration_bounds_itself(monkeypatch, capsys, tmp_path):
+    """100% radius with the fallback disabled places nothing, so run_test's drain condition is
+    never met. Relying on the operator to remember CJ_SHUTDOWN_AFTER is what lost the first
+    attempt at this experiment; the scenario knows its own configuration, so it declares the bound.
+    """
+    monkeypatch.setattr(helpers, "REPO", str(tmp_path))
+    monkeypatch.delenv("CJ_SHUTDOWN_AFTER", raising=False)
+    monkeypatch.delenv("CJ_DISABLE_FALLBACK", raising=False)
+    monkeypatch.setattr(helpers, "hosts", lambda: ["agent-1"])
+    monkeypatch.setattr(helpers, "set_disable_fallback", lambda on: 0)
+    monkeypatch.setattr(helpers, "snapshot_agent_logs", lambda *a, **k: None)
+    seen = {}
+    monkeypatch.setattr(helpers, "_sh", lambda cmd, timeout=900: seen.setdefault("cmd", cmd) or "")
+
+    helpers.run_swarm("runs/stalled", bound_if_stalled=1200)
+    assert "--shutdown-after-seconds 1200" in seen["cmd"]
+    assert "known not to drain" in capsys.readouterr().out
+
+    # An explicit override still wins — an operator choosing a bound is not second-guessed.
+    seen.clear()
+    monkeypatch.setenv("CJ_SHUTDOWN_AFTER", "600")
+    helpers.run_swarm("runs/stalled", bound_if_stalled=1200)
+    assert "--shutdown-after-seconds 600" in seen["cmd"]
+
+    # And a run with no stall declaration stays unbounded, so a slow sweep point is not truncated.
+    seen.clear()
+    monkeypatch.delenv("CJ_SHUTDOWN_AFTER")
+    helpers.run_swarm("runs/normal")
+    assert "--shutdown-after-seconds" not in seen["cmd"]
+
+
+def test_s05_declares_the_stall_only_at_full_radius_with_the_ablation(s05, monkeypatch):
+    """25% with the ablation drained in 200 s (4.0d), so bounding it would be wrong; 100% did not
+    place a single job. The declaration has to track both the radius and the flag."""
+    mod, _ = s05
+    calls = []
+    monkeypatch.setattr(helpers, "run_swarm",
+                        lambda run_dir, **k: calls.append(k.get("bound_if_stalled")))
+    monkeypatch.setattr(sys, "argv", ["s05", "1.0", "nofb"])      # CJ_DISABLE_FALLBACK=1 in s05
+    mod.main()
+    monkeypatch.setattr(sys, "argv", ["s05", "0.25", "nofb"])
+    mod.main()
+    monkeypatch.delenv("CJ_DISABLE_FALLBACK")
+    monkeypatch.setattr(sys, "argv", ["s05", "1.0"])
+    mod.main()
+    assert calls == [1200, None, None]

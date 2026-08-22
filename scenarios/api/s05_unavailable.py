@@ -59,7 +59,12 @@ def main() -> int:
         h.cleanup()
         h.start_fault(faulted, "unavailable")
         print(f"  running:        {h.JOBS} jobs, {h.AGENTS} agents -> runs/{tag}")
-        h.run_swarm(f"runs/{tag}")
+        # A total outage with no fallback places nothing at all — measured, not assumed (4.0d.1) —
+        # so run_test's drain condition is never satisfied and its poll loop never exits. Declared
+        # here because this scenario is what knows the combination; 1200 s is what the measured run
+        # used, which is twice a fault-free run's full duration and left no doubt about the result.
+        stalls = nofb and n >= len(all_hosts)
+        h.run_swarm(f"runs/{tag}", bound_if_stalled=1200 if stalls else None)
     finally:
         # The ablation is disarmed by run_swarm's own finally; a SIGKILL skips both that and this,
         # so `assert_clean()` in the next scenario stays the real backstop — it refuses to measure

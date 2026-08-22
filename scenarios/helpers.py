@@ -621,7 +621,8 @@ def stop_fault() -> None:
 # Run + measure
 # ---------------------------------------------------------------------------
 
-def run_swarm(run_dir: str, runtime: int | None = None) -> None:
+def run_swarm(run_dir: str, runtime: int | None = None,
+              bound_if_stalled: int | None = None) -> None:
     """Launch the fleet. `CJ_RUNTIME` raises the cap for scenarios that are meant to be slow.
 
     The default 3000 s comfortably fits a fault-free run (~11 min). A large injected delay does
@@ -643,7 +644,20 @@ def run_swarm(run_dir: str, runtime: int | None = None) -> None:
     # Only for runs expected NOT to drain. Leave it unset for everything else: a healthy run exits
     # on the drain condition well before any deadline, and a deadline would silently truncate the
     # slow points of a sweep into "the fault broke scheduling".
+    #
+    # `bound_if_stalled` is for the configurations we have MEASURED cannot drain — at 100% blast
+    # radius with the fallback disabled, no agent can bid, so nothing is ever placed (4.0d.1). An
+    # env var the operator has to remember is a var that gets forgotten, and forgetting it here
+    # does not degrade the run, it hangs it: that is exactly how the first attempt at this
+    # experiment was lost. The scenario knows its own configuration, so it declares the bound and
+    # the harness applies it; CJ_SHUTDOWN_AFTER still wins when set, because an operator
+    # overriding deliberately should not be second-guessed.
     bound = int(os.getenv("CJ_SHUTDOWN_AFTER", "0"))
+    if not bound and bound_if_stalled:
+        bound = int(bound_if_stalled)
+        print(f"  bounded run:    --shutdown-after-seconds {bound} applied automatically — this "
+              f"configuration is known not to drain, and run_test's poll loop would never exit "
+              f"(finding 14). Set CJ_SHUTDOWN_AFTER to override.")
     cmd = (
         f"cd {REPO} && nohup python3.11 run_test.py --mode remote --agent-type llm "
         f"--agents {AGENTS} --agents-per-host 1 --topology {TOPOLOGY} --jobs {JOBS} "
