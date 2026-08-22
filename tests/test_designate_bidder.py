@@ -296,6 +296,54 @@ def test_empty_neighbor_map_is_a_passthrough():
     assert agent._designate_bidders(jobs) is jobs
 
 
+# --- the invariant that makes queue order safe ------------------------------------------------
+
+def test_designation_is_independent_of_window_composition():
+    """A job's designee must not depend on which other jobs share its window.
+
+    This is the property that makes unilateral queue reordering harmless:
+    pick_agent_per_candidate selects per column with column-wise thresholds and no
+    cross-candidate accumulation, so queue order changes *when* an agent considers a job, never
+    *who* is designated to it. If this ever becomes false — a global assignment, or per-agent load
+    accumulated across a batch — then reordering would misdirect designations and the skip/requeue
+    reasoning in _designate_bidders has to be revisited.
+    """
+    owner = {"a": 1, "b": 2, "c": 3}
+
+    def designate(job, assignees):
+        return (_Agent(owner[job.job_id]), 1.0)
+
+    # Same job, three different windows and orderings; the verdict for "a" must not move.
+    windows = [
+        [_Job("a")],
+        [_Job("b"), _Job("a"), _Job("c")],
+        [_Job("c"), _Job("b"), _Job("a")],
+    ]
+    for jobs in windows:
+        agent = make_agent(1, [1, 2, 3], designate)
+        kept = [j.job_id for j in agent._designate_bidders(jobs)]
+        assert kept == ["a"], f"agent 1 must keep only 'a', got {kept}"
+
+
+def test_requeue_does_not_change_a_designation():
+    """Even after this agent reorders its own queue, the designation is unchanged."""
+    job = _Job("unschedulable")
+    verdict = {"infeasible": True}
+
+    def designate(j, assignees):
+        return (None, float("inf")) if verdict["infeasible"] else (_Agent(2), 1.0)
+
+    agent = make_agent(1, [1, 2], designate, fallback_s=30.0)
+    agent._designate_bidders([job])
+    job.designation_infeasible_since -= 31.0
+    agent._designate_bidders([job])
+    assert agent.queues.pending_queue.requeued == ["unschedulable"], "it did reorder"
+
+    # ...and the job, once feasible again, still goes to its designee and not to us.
+    verdict["infeasible"] = False
+    assert agent._designate_bidders([job]) == [], "still designated to agent 2, not claimed here"
+
+
 # --- it must use the analytic engine, never the LLM one ---------------------------------------
 
 def test_designation_uses_the_analytic_selector_only():
