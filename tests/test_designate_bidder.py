@@ -21,6 +21,8 @@ import types
 import numpy as np
 import pytest
 
+from swarm.utils.tiebreak import tiebreak_rank
+
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 
@@ -297,51 +299,98 @@ def test_empty_neighbor_map_is_a_passthrough():
 
 
 # --- the invariant that makes queue order safe ------------------------------------------------
+#
+# These test the REAL selection engine, not the stub. The stub used elsewhere in this file is a
+# hardcoded lookup by job id, so it satisfies column-independence by construction and could never
+# fail — testing it would be circular. The invariant lives in
+# SelectionEngine.pick_agent_per_candidate, so that is what is exercised here, with real matrices.
 
-def test_designation_is_independent_of_window_composition():
-    """A job's designee must not depend on which other jobs share its window.
+def _engine():
+    from swarm.selection.engine import SelectionEngine
+    return SelectionEngine(
+        feasible=lambda job, agent: True,
+        cost=lambda job, agent: 0.0,
+        candidate_key=lambda job: job.job_id,
+        assignee_key=lambda ag: ag.agent_id,
+        cache_enabled=False,
+    )
 
-    This is the property that makes unilateral queue reordering harmless:
-    pick_agent_per_candidate selects per column with column-wise thresholds and no
-    cross-candidate accumulation, so queue order changes *when* an agent considers a job, never
-    *who* is designated to it. If this ever becomes false — a global assignment, or per-agent load
-    accumulated across a batch — then reordering would misdirect designations and the skip/requeue
-    reasoning in _designate_bidders has to be revisited.
+
+# cost[assignee][candidate]: c1 -> a2 (3.0), c2 -> a2 (2.0), c3 -> a1 (1.0)
+_COSTS = np.array([
+    [5.0, 9.0, 1.0],
+    [3.0, 2.0, 8.0],
+    [7.0, 4.0, 6.0],
+])
+
+
+def test_selection_is_column_independent_when_a_candidate_is_alone():
+    """A candidate's chosen assignee must not depend on which other candidates are present.
+
+    This is the property that makes unilateral queue reordering harmless in
+    _designate_bidders: queue order changes WHICH jobs share a window, so if selection coupled
+    candidates together, reordering could misdirect designations.
     """
-    owner = {"a": 1, "b": 2, "c": 3}
+    eng = _engine()
+    assignees = [_Agent(1), _Agent(2), _Agent(3)]
+    cands = [_Job("c1"), _Job("c2"), _Job("c3")]
 
-    def designate(job, assignees):
-        return (_Agent(owner[job.job_id]), 1.0)
+    full = eng.pick_agent_per_candidate(
+        assignees=assignees, candidates=cands, cost_matrix=_COSTS, objective="min")
+    assert [a.agent_id for a, _ in full] == [2, 2, 1], "precondition: the expected winners"
 
-    # Same job, three different windows and orderings; the verdict for "a" must not move.
-    windows = [
-        [_Job("a")],
-        [_Job("b"), _Job("a"), _Job("c")],
-        [_Job("c"), _Job("b"), _Job("a")],
-    ]
-    for jobs in windows:
-        agent = make_agent(1, [1, 2, 3], designate)
-        kept = [j.job_id for j in agent._designate_bidders(jobs)]
-        assert kept == ["a"], f"agent 1 must keep only 'a', got {kept}"
+    for i, job in enumerate(cands):
+        alone = eng.pick_agent_per_candidate(
+            assignees=assignees, candidates=[job],
+            cost_matrix=_COSTS[:, [i]], objective="min")
+        assert alone[0][0].agent_id == full[i][0].agent_id, (
+            f"{job.job_id} changed assignee when considered alone")
 
 
-def test_requeue_does_not_change_a_designation():
-    """Even after this agent reorders its own queue, the designation is unchanged."""
-    job = _Job("unschedulable")
-    verdict = {"infeasible": True}
+def test_selection_is_invariant_to_candidate_order():
+    eng = _engine()
+    assignees = [_Agent(1), _Agent(2), _Agent(3)]
+    cands = [_Job("c1"), _Job("c2"), _Job("c3")]
+    full = eng.pick_agent_per_candidate(
+        assignees=assignees, candidates=cands, cost_matrix=_COSTS, objective="min")
 
-    def designate(j, assignees):
-        return (None, float("inf")) if verdict["infeasible"] else (_Agent(2), 1.0)
+    for order in ([2, 0, 1], [1, 2, 0], [2, 1, 0]):
+        shuffled = eng.pick_agent_per_candidate(
+            assignees=assignees,
+            candidates=[cands[i] for i in order],
+            cost_matrix=_COSTS[:, order],
+            objective="min",
+        )
+        for pos, src in enumerate(order):
+            assert shuffled[pos][0].agent_id == full[src][0].agent_id, (
+                f"{cands[src].job_id} changed assignee under reordering {order}")
 
-    agent = make_agent(1, [1, 2], designate, fallback_s=30.0)
-    agent._designate_bidders([job])
-    job.designation_infeasible_since -= 31.0
-    agent._designate_bidders([job])
-    assert agent.queues.pending_queue.requeued == ["unschedulable"], "it did reorder"
 
-    # ...and the job, once feasible again, still goes to its designee and not to us.
-    verdict["infeasible"] = False
-    assert agent._designate_bidders([job]) == [], "still designated to agent 2, not claimed here"
+def test_column_independence_holds_with_threshold_and_tiebreak():
+    """The two options _designate_bidders actually passes must not couple candidates either."""
+    eng = _engine()
+    assignees = [_Agent(1), _Agent(2), _Agent(3)]
+    # Deliberate exact ties, which is where a tie-break could leak cross-candidate state.
+    costs = np.array([
+        [4.0, 1.0, 7.0],
+        [4.0, 1.0, 2.0],
+        [9.0, 1.0, 2.0],
+    ])
+    cands = [_Job("t1"), _Job("t2"), _Job("t3")]
+    kwargs = dict(
+        objective="min",
+        threshold_pct=10.0,
+        tie_break_key=lambda ag, s, cand: tiebreak_rank(
+            getattr(cand, "job_id", ""), getattr(ag, "agent_id", "")),
+    )
+
+    full = eng.pick_agent_per_candidate(
+        assignees=assignees, candidates=cands, cost_matrix=costs, **kwargs)
+    for i, job in enumerate(cands):
+        alone = eng.pick_agent_per_candidate(
+            assignees=assignees, candidates=[job], cost_matrix=costs[:, [i]], **kwargs)
+        assert alone[0][0].agent_id == full[i][0].agent_id, (
+            f"{job.job_id} moved with threshold+tiebreak — selection is coupled across candidates")
 
 
 # --- it must use the analytic engine, never the LLM one ---------------------------------------
