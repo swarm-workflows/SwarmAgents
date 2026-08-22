@@ -41,8 +41,14 @@ REF = re.compile(r"(?:§\s?|(?:test plan|TEST_PLAN\.md)[`,]?\s+§?|section\s+)"
                  r"(\d[0-9a-z]*(?:\.[0-9a-z]+)*)(?![0-9a-z])(?!\.[0-9a-z])")
 
 
-# Headings that carry no section number by design: the parts, and the contents list.
-STRUCTURAL = re.compile(r"^(?:Part [IVX]+\b|Contents$)")
+# The ONLY headings allowed to carry no section number, listed exactly rather than by pattern.
+# `Part [IVX]+` as a pattern exempted any heading starting that way at any depth, so a stray
+# `## Part IX — scratch` would have been waved through as structural.
+TITLE = "Evaluating Chaos Jungle on SwarmAgents' LLM Scheduling Agents"
+PARTS = ["Part I — Setup and method", "Part II — Scenario results",
+         "Part III — Studies and ablations", "Part IV — What is left to do",
+         "Part V — Findings", "Part VI — Operations"]
+STRUCTURAL = {(1, TITLE), (2, "Contents")} | {(1, p) for p in PARTS}
 
 
 def plan_headings() -> list[tuple[int, str]]:
@@ -63,7 +69,7 @@ def plan_headings() -> list[tuple[int, str]]:
         if fence:
             continue
         m = re.match(r"^(#{1,6}) (.+?)\s*$", line)
-        if m and not m.group(2).startswith("Evaluating Chaos Jungle"):
+        if m:
             out.append((len(m.group(1)), m.group(2)))
     return out
 
@@ -79,7 +85,7 @@ def plan_sections() -> list[tuple[int, str]]:
     """
     out = []
     for lvl, title in plan_headings():
-        if lvl == 1 or STRUCTURAL.match(title):
+        if (lvl, title) in STRUCTURAL:
             continue
         m = LABEL.match(title)
         if m:
@@ -122,7 +128,7 @@ def test_every_content_section_carries_a_wellformed_label():
     anticipate (`4B.`, `7-2`), and — the one a label-shaped pattern can never catch — a section
     with no number at all, which simply would not have been collected."""
     unlabelled = [(lvl, title) for lvl, title in plan_headings()
-                  if lvl > 1 and not STRUCTURAL.match(title) and not LABEL.match(title)]
+                  if (lvl, title) not in STRUCTURAL and not LABEL.match(title)]
     assert not unlabelled, ("headings under a part with no well-formed numeric label:\n  "
                             + "\n  ".join(f"{'#' * l} {t}" for l, t in unlabelled))
 
@@ -190,3 +196,37 @@ def test_the_detector_catches_the_forms_that_slipped_through(form):
     assert found, f"reference form not recognised: {form!r}"
     # None of these old labels exist any more, so each must be reported as dangling.
     assert all(label not in plan_labels() for label in found)
+
+
+def test_the_structural_headings_are_exactly_the_expected_ones():
+    """The exemption list is the checker's one blind spot by construction, so it is pinned to
+    exact (level, title) pairs. As a pattern (`^Part [IVX]+`) it exempted any heading starting that
+    way at any depth — a stray `## Part IX — scratch` would have been waved through."""
+    found = {(lvl, t) for lvl, t in plan_headings() if not LABEL.match(t)}
+    assert found == STRUCTURAL, (f"unexpected structural headings: {sorted(found - STRUCTURAL)}; "
+                                 f"missing: {sorted(STRUCTURAL - found)}")
+
+
+def test_the_document_has_no_headings_that_do_not_render_as_headings():
+    """Forms that LOOK like a heading, render as body text, and are invisible to every structural
+    check above: `##7.2` (no space after the hashes) and `####### x` (too deep). Also the setext
+    form, where a line of dashes directly under text silently promotes that text to a heading —
+    which matters here because the document uses `---` as a rule throughout.
+    """
+    lines = open(PLAN).read().splitlines()
+    fence, bad = False, []
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith("```"):
+            fence = not fence
+            continue
+        if fence:
+            continue
+        if re.match(r"^#+[^ #]", line):
+            bad.append(f"{i + 1}: no space after hashes — {line[:60]!r}")
+        if re.match(r"^#{7,} ", line):
+            bad.append(f"{i + 1}: more than six hashes — {line[:60]!r}")
+        prev = lines[i - 1] if i else ""
+        if (re.match(r"^(=+|-{3,})\s*$", line) and prev.strip()
+                and not prev.lstrip().startswith(("|", "#", "`", "-", "*", ">"))):
+            bad.append(f"{i + 1}: setext underline promotes the line above — {prev[:50]!r}")
+    assert not bad, "heading-like lines that are not headings:\n  " + "\n  ".join(bad)
