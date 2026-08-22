@@ -866,3 +866,58 @@ def test_a_host_that_never_reported_memory_has_not_passed_the_gate(monkeypatch):
         " OK\n OK\n" if "fixmodels" in cmd else "agent-1 4096\n"))
     with pytest.raises(SystemExit, match="did not report memory"):
         helpers.health_gate()
+
+
+def test_an_unreadable_answer_is_not_a_clean_answer(monkeypatch):
+    """The third outcome. A probe whose command substitution failed returns a short or non-numeric
+    line, and a caller reading values with `if x.isdigit()` skips it — so "0 stray agents" and
+    "enough memory" were both reachable by a host that answered nothing meaningful."""
+    monkeypatch.setattr(helpers, "hosts", lambda: ["agent-1", "agent-2"])
+    monkeypatch.setattr(helpers, "_sh", lambda *a, **k: "0")
+
+    # agent-2 answers, but with an error string where the count should be.
+    garbage = lambda hosts_, cmd, **k: (
+        "agent-1 0 0 0\nagent-2 x y z\n" if "OLLAMA_BASE_URL" in cmd
+        else "agent-1 0\nagent-2 oops\n")
+    monkeypatch.setattr(helpers, "_fan_out", garbage)
+
+    with pytest.raises(SystemExit, match="unreadable answer"):
+        helpers.assert_clean()
+    with pytest.raises(SystemExit, match="unreadable answer"):
+        helpers.assert_clean(strict=True)
+    with pytest.raises(SystemExit, match="unreadable answer"):
+        helpers.cleanup()
+
+    monkeypatch.setattr(helpers, "ARM", "local")
+    monkeypatch.setattr(helpers, "_fan_out", lambda hosts_, cmd, **k: (
+        " OK\n OK\n" if "fixmodels" in cmd else "agent-1 4096\nagent-2 not-a-number\n"))
+    with pytest.raises(SystemExit, match="unreadable answer"):
+        helpers.health_gate()
+
+
+def test_the_probe_contract_is_enforced_in_one_place(monkeypatch):
+    """Field count, numeric values, unknown hosts and duplicate answers are all decided by
+    _probe_hosts, so no caller can accidentally accept a shape it did not ask for."""
+    monkeypatch.setattr(helpers, "hosts", lambda: ["agent-1", "agent-2", "agent-3"])
+    monkeypatch.setattr(helpers, "_fan_out", lambda *a, **k: (
+        "agent-1 0 0 0\n"            # good
+        "agent-2 0 0\n"              # wrong field count
+        "agent-2 0 0 0\n"            # ...and a second answer for the same host
+        "elsewhere 0 0 0\n"))        # not one of ours
+    answers, silent, bad = helpers._probe_hosts("probe", fields=3)
+    assert answers == {"agent-1": [0, 0, 0]}
+    assert silent == ["agent-3"]                    # never heard from
+    # agent-2's second, well-formed line does NOT rescue it: whatever produced the malformed one
+    # was running when the good one was written too.
+    assert "agent-2 answered 2 times" in bad
+    assert any("not a known host" in b for b in bad)
+
+
+def test_the_cloud_gate_rejects_an_unreadable_local_ollama_count(monkeypatch):
+    """"Not running" is the answer that lets a host mix the 3B arm into a gateway run, so an
+    unreadable count cannot default to it."""
+    monkeypatch.setattr(helpers, "hosts", lambda: ["agent-1"])
+    monkeypatch.setattr(helpers, "ARM", "cloud")
+    monkeypatch.setattr(helpers, "_fan_out", lambda hosts_, cmd, **k: "agent-1 200 ?\n")
+    with pytest.raises(SystemExit, match="local-count-unreadable"):
+        helpers._cloud_health_gate()

@@ -106,24 +106,48 @@ def _fan_out(host_list: Iterable[str], remote_cmd: str, timeout: int = 900,
     return _sh(parts + " wait", timeout=timeout)
 
 
-def _probe_hosts(remote_cmd: str, timeout: int = 900,
-                 host_list: Iterable[str] | None = None) -> tuple[dict, list]:
-    """Run a per-host probe that echoes `$(hostname) <fields…>`; return answers and the SILENT.
+def _probe_hosts(remote_cmd: str, fields: int = 1, timeout: int = 900,
+                 host_list: Iterable[str] | None = None) -> tuple[dict, list, list]:
+    """Run a per-host probe that echoes `$(hostname) <n integers>`; return answers, SILENT, BAD.
 
-    `_fan_out` discards stderr and returns only what came back, so an unreachable host contributes
-    no line at all — and every check written as "no bad lines means fine" passes it. That is
-    backwards. An unreachable host is the one most likely to still be holding whatever is being
-    checked for, and the one that will rejoin in time to contaminate the run: it is the exact host
-    whose `rm -f` may have silently failed. Silence is a third outcome, not a clean one, and every
-    caller here has to decide what to do with it.
+    Three outcomes, not two, and the third is why this parses strictly. `_fan_out` discards stderr
+    and returns only what came back, so an unreachable host contributes no line — and any check
+    written as "no bad lines means fine" passes it. An unreachable host is the one most likely to
+    still be holding whatever is being checked for.
+
+    A MALFORMED answer is just as dangerous and less obvious. A probe whose command substitution
+    failed returns a short line or a non-numeric field, and a caller that reads values with
+    `if x.isdigit()` silently skips it — so "0 stray agents" and "enough memory" were both
+    reachable by a host that answered nothing meaningful. Parsing lives here, once, so a caller
+    cannot accidentally treat unparseable as fine: answers are ints or they are not answers.
     """
     wanted = list(host_list) if host_list is not None else hosts()
-    answers = {}
+    # Collected per host FIRST, then judged. Judging line by line let a host that emitted one
+    # unreadable line and one good one be accepted on the good one — a later answer cannot cancel
+    # an earlier malformed one, because whatever produced the garbage was also running when the
+    # good line was written. Exactly one well-formed answer per host is the only way through.
+    seen: dict[str, list[list[str]]] = {}
+    bad: list[str] = []
     for line in _fan_out(wanted, remote_cmd, timeout=timeout).splitlines():
         parts = line.split()
-        if len(parts) >= 2:
-            answers[parts[0]] = parts[1:]
-    return answers, [h for h in wanted if h not in answers]
+        if not parts:
+            continue
+        if parts[0] not in wanted:
+            # A stray stdout line. Named rather than dropped: if its first token ever did collide
+            # with a hostname it would masquerade as that host's answer.
+            bad.append(f"{line.strip()[:60]!r} (not a known host)")
+            continue
+        seen.setdefault(parts[0], []).append(parts[1:])
+
+    answers: dict[str, list[int]] = {}
+    for host, rows in seen.items():
+        if len(rows) != 1:
+            bad.append(f"{host} answered {len(rows)} times")
+        elif len(rows[0]) != fields or not all(v.lstrip("-").isdigit() for v in rows[0]):
+            bad.append(f"{host} -> {' '.join(rows[0])[:40]!r}")
+        else:
+            answers[host] = [int(v) for v in rows[0]]
+    return answers, [h for h in wanted if h not in seen], bad
 
 
 # ---------------------------------------------------------------------------
@@ -155,19 +179,21 @@ def health_gate(min_available_mb: int = MIN_AVAILABLE_MB) -> None:
     if ok != len(hosts()):
         raise SystemExit(f"health gate failed: only {ok}/{len(hosts())} hosts can infer\n{out}")
 
-    mem, quiet = _probe_hosts("echo $(hostname) $(free -m | awk '/Mem:/{print $7}')")
-    starved = [(h, int(f[0])) for h, f in mem.items()
-               if f[0].isdigit() and int(f[0]) < min_available_mb]
-    # A host that did not report its memory has not been cleared by this gate. That is the
-    # failure this gate was written for: a starved host answers a single inference probe in 0.4 s,
-    # places zero jobs for a whole run, and looks healthy in every other check (4f.3).
-    if starved or quiet:
+    mem, quiet, bad = _probe_hosts("echo $(hostname) $(free -m | awk '/Mem:/{print $7}')")
+    starved = [(h, f[0]) for h, f in mem.items() if f[0] < min_available_mb]
+    # A host that did not report its memory, or reported something unparseable, has not been
+    # cleared by this gate. That is the failure this gate was written for: a starved host answers a
+    # single inference probe in 0.4 s, places zero jobs for a whole run, and looks healthy in every
+    # other check (4f.3).
+    if starved or quiet or bad:
         why = []
         if starved:
             why.append(f"{len(starved)} host(s) under {min_available_mb}MB available — "
                        + ", ".join(f"{h}={mb}MB" for h, mb in sorted(starved, key=lambda x: x[1])))
         if quiet:
             why.append(f"{len(quiet)} host(s) did not report memory ({', '.join(quiet[:8])})")
+        if bad:
+            why.append(f"{len(bad)} unreadable answer(s): {'; '.join(bad[:4])}")
         raise SystemExit(
             f"health gate failed: {'; '.join(why)}\n"
             f"Restart Ollama there to release llama-server ('systemctl restart ollama', or kill "
@@ -207,13 +233,22 @@ def _cloud_health_gate() -> None:
     for i in range(0, len(all_hosts), batch):
         for line in _fan_out(all_hosts[i:i + batch], probe, timeout=600).splitlines():
             parts = line.split()
-            if len(parts) != 3:
+            # A short or garbled line used to be skipped, which left the host looking unprobed and
+            # then — before `answered` existed — silently healthy. Now it is a named failure: the
+            # probe either produced a hostname, an HTTP code and a process count, or it failed.
+            if len(parts) != 3 or parts[0] not in all_hosts:
+                if line.strip():
+                    bad.append(f"unreadable: {line.strip()[:40]!r}")
                 continue
             host, code, local = parts
             answered.add(host)
             if code != "200":
                 bad.append(f"{host}={code}")
-            if local.isdigit() and int(local) > 0:
+            if not local.isdigit():
+                # Cannot tell whether local Ollama is running, and "not running" is the answer
+                # that lets a host mix the 3B arm into a gateway run.
+                bad.append(f"{host}=local-count-unreadable")
+            elif int(local) > 0:
                 serving.append(host)
     # A host that never answered has not passed the gate — it has skipped it. The whole point of
     # the gate is that an unprobed host runs an agent that falls back for the entire run.
@@ -246,10 +281,10 @@ def cleanup() -> None:
         _fan_out(hosts(), f"pkill -9 -f main[.]py; rm -f {REPO}/swarm-multi/agent-*.log")
         _sh(f"pkill -9 -f main[.]py; rm -f {REPO}/swarm-multi/agent-*.log; "
             "docker exec redis redis-cli flushall >/dev/null")
-        answers, silent = _probe_hosts(
+        answers, silent, bad = _probe_hosts(
             f"echo $(hostname) $(ls {REPO}/swarm-multi/agent-*.log 2>/dev/null | wc -l)")
-        left = [h for h, fields in answers.items() if fields[0] != "0"]
-        if not left and not silent:
+        left = [h for h, fields in answers.items() if fields[0] != 0]
+        if not left and not silent and not bad:
             return
         if attempt == 2:
             detail = []
@@ -259,13 +294,15 @@ def cleanup() -> None:
             if silent:
                 detail.append(f"{len(silent)} host(s) did not answer the check "
                               f"({', '.join(silent[:8])})")
+            if bad:
+                detail.append(f"{len(bad)} unreadable answer(s): {'; '.join(bad[:4])}")
             raise SystemExit(
                 "; ".join(detail) + ". A leftover log is collected into this run with a fresh copy "
                 "time, which no freshness check downstream can detect — and an unreachable host is "
                 "the most likely to be holding one, so silence cannot be read as clean. Clear the "
                 "hosts before measuring.")
         print(f"  cleanup:        retrying — {len(left)} host(s) still holding logs, "
-              f"{len(silent)} silent")
+              f"{len(silent)} silent, {len(bad)} unreadable")
 
 
 def set_disable_fallback(on: bool) -> int:
@@ -485,18 +522,21 @@ def assert_clean(strict: bool = False) -> None:
     cleanup() at the start of a run, which means a scenario tidies up after its predecessor
     but never after itself — so the slice is left dirty whenever a batch ends.
     """
-    answers, silent = _probe_hosts(_state_probe())
-    dirty = [h for h, fields in answers.items() if fields[:3] != ["0", "0", "0"]]
-    if dirty or silent:
+    answers, silent, bad = _probe_hosts(_state_probe(), fields=3)
+    dirty = [h for h, fields in answers.items() if any(fields)]
+    if dirty or silent or bad:
         why = []
         if dirty:
             why.append(f"dirty on {len(dirty)} host(s) ({', '.join(sorted(dirty)[:8])}) — leaked "
                        f"env var, driver, or a proxy still bound to :{PROXY_PORT}")
-        # A host that did not answer is NOT a clean host. It may be running the previous
-        # scenario's proxy, and it will rejoin in time to serve this run's bids.
+        # A host that did not answer is NOT a clean host, and neither is one whose answer cannot be
+        # read. Either may be running the previous scenario's proxy, which will serve this run's
+        # bids on the same port.
         if silent:
             why.append(f"{len(silent)} host(s) did not answer the probe "
                        f"({', '.join(silent[:8])}), so their state is unknown")
+        if bad:
+            why.append(f"{len(bad)} unreadable answer(s): {'; '.join(bad[:4])}")
         raise SystemExit(f"fleet is {'; '.join(why)}.\n"
                          f"run scenarios/clear_faults.py before measuring.")
     print(f"  clean check:    no leaked env vars / drivers / :{PROXY_PORT} listeners, "
@@ -525,19 +565,23 @@ def assert_clean(strict: bool = False) -> None:
         # certified idle. clear_faults.py's "slice idle" is that certification, and a missed host
         # keeps agents that register into the shared Redis and stall the next run at
         # [SEL_WAIT] live != configured — the exact symptom this check exists to prevent.
-        procs, quiet = _probe_hosts('echo $(hostname) $(pgrep -fc "mai[n].py" || true)')
-        agents = sum(int(f[0]) for f in procs.values() if f[0].isdigit())
+        procs, quiet, bad = _probe_hosts('echo $(hostname) $(pgrep -fc "mai[n].py" || true)')
+        # Every answer is an int by construction now — the old `if f[0].isdigit()` filter meant a
+        # host answering garbage contributed 0 and the slice was certified idle.
+        agents = sum(f[0] for f in procs.values())
         keys = int((_sh("docker exec redis redis-cli dbsize").strip() or "0").split()[-1])
-        if agents or keys or quiet:
+        if agents or keys or quiet or bad:
             why = []
             if agents:
-                busy = sorted(h for h, f in procs.items() if f[0].isdigit() and int(f[0]) > 0)
+                busy = sorted(h for h, f in procs.items() if f[0] > 0)
                 why.append(f"{agents} stray agent process(es) on {', '.join(busy[:8])}")
             if keys:
                 why.append(f"{keys} Redis key(s)")
             if quiet:
                 why.append(f"{len(quiet)} host(s) did not answer ({', '.join(quiet[:8])}), so "
                            f"their agents are unaccounted for")
+            if bad:
+                why.append(f"{len(bad)} unreadable answer(s): {'; '.join(bad[:4])}")
             raise SystemExit(f"slice not idle: {'; '.join(why)}. Run scenarios/clear_faults.py.")
         print(f"  idle check:     0 stray agents across {len(procs)} hosts, 0 Redis keys")
 
@@ -553,16 +597,18 @@ def stop_fault() -> None:
                       f"pkill -f '{_PROXY_PAT}'; pkill -f '{_CJ_PROXY_PAT}'; "
                       f"fuser -k {PROXY_PORT}/tcp 2>/dev/null")
     time.sleep(3)
-    answers, silent = _probe_hosts(_state_probe())
-    dirty = [h for h, fields in answers.items() if fields[:3] != ["0", "0", "0"]]
+    answers, silent, bad = _probe_hosts(_state_probe(), fields=3)
+    dirty = [h for h, fields in answers.items() if any(fields)]
     if dirty:
         print(f"  !! teardown incomplete on {len(dirty)} host(s) "
               f"({', '.join(sorted(dirty)[:8])}) — next run will be invalid")
     # Reported separately and just as loudly: an unverified teardown is what leaks a fault into
-    # the next scenario, and the host that cannot be reached now is the likely leaker.
-    if silent:
-        print(f"  !! teardown UNVERIFIED on {len(silent)} host(s) ({', '.join(silent[:8])}) — "
-              f"they did not answer; assume the fault may still be live there")
+    # the next scenario, and the host that cannot be reached — or whose answer cannot be read — is
+    # the likely leaker.
+    if silent or bad:
+        print(f"  !! teardown UNVERIFIED on {len(silent) + len(bad)} host(s) "
+              f"({', '.join((silent + bad)[:8])}) — no readable answer; assume the fault may "
+              f"still be live there")
 
 
 # ---------------------------------------------------------------------------
