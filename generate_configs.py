@@ -920,6 +920,11 @@ if __name__ == "__main__":
     parser.add_argument("--hybrid-fraction", type=float, default=0.0,
                         help="Fraction (0.0-1.0) of generated jobs with a hybrid classical<->quantum loop")
 
+    parser.add_argument("--skip-jobs", action="store_true",
+                        help="Generate agent configs only; do not synthesize jobs/. Used when the "
+                             "job pool comes from elsewhere (e.g. Pegasus profiles converted after "
+                             "the fleet's DTN assignments are known).")
+
     parser.add_argument("--seed", type=int, default=None,
                         help="Seed the RNG so agent capacities, flavors and DTN assignments are "
                              "reproducible. Required to compare runs against each other.")
@@ -968,8 +973,8 @@ if __name__ == "__main__":
     generator.generate_configs(flavor_percentages=flavor_percentages, agent_hosts=agent_hosts,
                                agent_sites=agent_sites)
 
-    # Create jobs if not present
-    if not os.path.exists("jobs"):
+    # Create jobs if not present (and not deferred to another producer)
+    if not args.skip_jobs and not os.path.exists("jobs"):
         jg = JobGenerator(job_count=args.job_cnt, agent_profile_path='agent_profiles.json',
                           quantum_fraction=args.quantum_fraction,
                           hybrid_fraction=args.hybrid_fraction)

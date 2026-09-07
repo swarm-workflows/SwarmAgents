@@ -46,7 +46,7 @@ Notes:
 - Use --shutdown-after-seconds for time-based test termination (bypasses bucket monitoring).
 """
 from __future__ import annotations
-import argparse, os, re, subprocess, sys, time, math, shlex, csv
+import argparse, os, re, subprocess, sys, time, math, shlex, csv, json
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -135,20 +135,53 @@ def scp_to(host: str, src: str, dst: str) -> None:
 # ------------------------------
 # Pegasus job conversion
 # ------------------------------
-# Must match generate_configs.AgentConfigGenerator.generate_global_dtn_pool(total_count=10):
-# job data-node sites that share no names with the agent DTN pool make the connectivity
-# term unsatisfiable, so it drops out of the cost model entirely.
-AGENT_DTN_POOL = [f"dtn{i}" for i in range(1, 11)]
+# Written by generate_configs.py (--dtns) in the working directory: agent_id -> [{"name": ...}].
+AGENT_DTNS_FILE = "agent_dtns.json"
+
+
+def agent_dtn_pool(path: str = AGENT_DTNS_FILE) -> list[str]:
+    """DTN names held by at least one agent, sorted; [] if none are assigned.
+
+    generate_configs.assign_agent_dtns gives each agent 1-4 random picks from a 10-name pool, so
+    a small fleet routinely leaves some pool names with no holder. Feasibility requires an agent
+    to hold every DTN a job references, so a job hashed onto an unheld name can never run.
+    Derive the pool from what was actually assigned, not from the pool it was drawn from.
+    """
+    p = Path(path)
+    if not p.exists():
+        return []
+    with open(p) as f:
+        assigned = json.load(f)
+    names = set()
+    for dtns in assigned.values():
+        for d in dtns or []:
+            name = d.get("name") if isinstance(d, dict) else d
+            if name:
+                names.add(str(name))
+    return sorted(names)
 
 
 def convert_pegasus_jobs(args) -> dict:
-    """Convert Pegasus profiles into SwarmAgents job files in jobs/."""
+    """Convert Pegasus profiles into SwarmAgents job files in jobs/.
+
+    Must run AFTER generate_configs(): the job DTN pool is the set the generated fleet holds.
+    """
     from pegasus_to_swarm_converter import convert_pegasus_profiles
 
+    held = agent_dtn_pool()
     if args.pegasus_dtn_names:
         dtn_names = [n.strip() for n in args.pegasus_dtn_names.split(",") if n.strip()]
+        unheld = sorted(set(dtn_names) - set(held))
+        if unheld:
+            log(f"WARNING: --pegasus-dtn-names includes DTNs no agent holds: {','.join(unheld)}; "
+                f"jobs hashed onto them cannot be scheduled (fleet holds: {','.join(held) or 'none'})")
+    elif held:
+        dtn_names = held
     else:
-        dtn_names = AGENT_DTN_POOL
+        # No agent has any DTN (e.g. hierarchical runs, which do not pass --dtns), so any DTN
+        # requirement would be unsatisfiable. "local" is excluded from required DTNs by
+        # ResourceAgent.is_job_feasible, which makes the jobs data-location-free.
+        dtn_names = ["local"]
 
     log(f"Converting Pegasus profiles: {args.pegasus_profiles} ({args.pegasus_input_type}) "
         f"[data-nodes={args.pegasus_data_nodes}, dtns={','.join(dtn_names)}] …")
@@ -265,6 +298,8 @@ def generate_configs(args, agent_hosts_list: list[str]) -> Path:
         gen_args += ["--agent-sites-file", str(args.agent_sites_file)]
     if getattr(args, "seed", None) is not None:
         gen_args += ["--seed", str(args.seed)]
+    if getattr(args, "pegasus_profiles", None):
+        gen_args.append("--skip-jobs")   # jobs/ comes from convert_pegasus_jobs(), run after this
     if getattr(args, "quantum_agents_pct", 0.0) > 0:
         gen_args += ["--quantum-agents-pct", str(args.quantum_agents_pct)]
     if getattr(args, "quantum_fraction", 0.0) > 0:
@@ -794,9 +829,9 @@ def parse_args() -> argparse.Namespace:
                     help="Granularity of job data_in/data_out nodes (default: per-file, keeps every "
                          "file and its size)")
     ap.add_argument("--pegasus-dtn-names", type=str, default=None,
-                    help="Comma-separated DTN pool to spread job files across. Defaults to the same "
-                         "dtn1..dtn10 pool generate_configs.py gives agents, so the connectivity "
-                         "cost term actually matches.")
+                    help="Comma-separated DTN pool to spread job files across. Defaults to the DTNs "
+                         "the generated fleet actually holds (agent_dtns.json), so every job lands "
+                         "on a DTN some agent has and the connectivity cost term matches.")
 
     # Output
     ap.add_argument("--run-dir", default="run_out")
@@ -836,10 +871,6 @@ def main() -> None:
     # Generate configs for ALL agents (initial + dynamic) up front
     cleanup_between_runs(args)
     if not args.use_config_dir:
-        # Convert Pegasus profiles if requested (writes to jobs/)
-        if args.pegasus_profiles:
-            convert_pegasus_jobs(args)
-
         if args.mode == "remote" and not host_list:
             raise SystemExit("Remote mode requires --agent-hosts or --agent-hosts-file")
         # Compute per-host count for writing agent_hosts.txt (if needed)
@@ -858,6 +889,11 @@ def main() -> None:
         args.agents = total_agents
         generate_configs(args, host_list if args.mode == "remote" else ["localhost"])
         args.agents = original_agents  # Restore to initial agent count
+
+        # Convert Pegasus profiles if requested (writes to jobs/). After generate_configs so the
+        # job DTN pool is the set of DTNs the fleet actually holds (see convert_pegasus_jobs).
+        if args.pegasus_profiles:
+            convert_pegasus_jobs(args)
 
     # Start initial agents
     if args.mode == "local":
