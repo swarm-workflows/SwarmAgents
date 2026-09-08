@@ -61,7 +61,9 @@ analytical cost model implemented by `ResourceAgent.compute_job_cost`.
 from __future__ import annotations
 
 import json
+import threading
 import time
+from collections import OrderedDict
 from typing import Any, Dict, Optional
 
 from swarm.agents.llm.llm_bidder import LlmBidder
@@ -74,6 +76,7 @@ from swarm.models.agent_info import AgentInfo
 from swarm.models.object import ObjectState
 from swarm.selection.engine import SelectionEngine
 from swarm.selection.penalties import apply_multiplicative_penalty
+from swarm.agents.cost_scale import CostScale, to_canonical
 from swarm.utils.tiebreak import tiebreak_rank
 from swarm.utils.utils import generate_id
 
@@ -90,6 +93,8 @@ class LlmAgent(ResourceAgent):
         self.llm_cfg = LlmConfig.from_dict(self.config.get("llm", {}))
 
         self.bidder: Optional[LlmBidder] = LlmBidder(self.llm_cfg, logger=self.logger)
+
+        self._init_cost_cache()
 
         # Ablation switch, off by default: remove the analytic safety net so a failed LLM bid
         # means no bid at all (see _llm_or_analytic_cost). Read straight from the raw config
@@ -167,6 +172,11 @@ class LlmAgent(ResourceAgent):
             job.reasoning_time = bid.reasoning_time
             score = float(bid.score)
             cost = 100.0 - max(0.0, min(100.0, score))
+            # Only cache a verdict about THIS agent: the cache answers "what do I cost for this
+            # job", and a peer's cost is a different question (and not peer-computable for the
+            # LLM plane anyway).
+            if getattr(agent, "agent_id", None) == self.agent_id:
+                self._remember_cost(job.job_id, cost, CostScale.LLM)
 
             # Log successful LLM cost computation
             self.logger.info(
@@ -221,6 +231,12 @@ class LlmAgent(ResourceAgent):
             self.logger.info(
                 f"[ANALYTIC_COST] Job={job.job_id} Agent={agent.agent_id} Cost={analytical_cost:.2f}"
             )
+            # Remember the SCALE as analytic, not LLM. A fallback bid is an analytic cost
+            # (~0..1); advertising it on the LLM's 0..100 scale would make a broken agent the
+            # cheapest host in the fleet. Canonicalising it as analytic removes that, which is
+            # a second capture channel alongside the fallback's speed (chaos S05).
+            if getattr(agent, "agent_id", None) == self.agent_id:
+                self._remember_cost(job.job_id, float(analytical_cost), CostScale.ANALYTIC)
             return analytical_cost
 
     # ------------------------------------------------------------------------------------------
@@ -297,6 +313,98 @@ class LlmAgent(ResourceAgent):
                 'topology': 'unknown',
                 'child_agents': {},
             }
+
+    # ---------- Verdict cache: the LLM's opinion on the consensus path -----------------------
+    COST_SCALE = CostScale.LLM
+
+    def _init_cost_cache(self) -> None:
+        """Set up the verdict cache. Called from `__init__`; a bid must never run without it.
+
+        How the LLM's opinion reaches consensus (chaos finding 11). An inbound Snow query is
+        answered on the single consumer thread, which must never block — so it cannot call the
+        model. Without a cache the only non-blocking answer was the ANALYTIC cost, which is what
+        `_HostAdapter.my_cost_for_job` used to return: an LlmAgent priced a job with the LLM when
+        proposing and analytically when voting, so under `consensus.protocol: snow` (the shipped
+        default) the LLM's verdict entered the protocol only through whoever initiated the round
+        and was out-voted by every peer that had the job locally.
+
+        `_cost_cache[job_id] = (native_cost, scale, ts)`. The scale is stored per entry, not per
+        agent, because a fallback bid really is an analytic cost and must be canonicalised as
+        one — advertising a 0.5 fallback on the LLM's 0..100 scale would make a broken agent look
+        like the cheapest host in the fleet.
+        """
+        llm_cfg = (getattr(self, "config", None) or {}).get("llm", {}) or {}
+        self._cost_cache: "OrderedDict[str, tuple]" = OrderedDict()
+        self._cost_cache_lock = threading.Lock()
+        self._cost_cache_ttl_s = float(llm_cfg.get("cost_cache_ttl_s", 300.0))
+        self._cost_cache_max = int(llm_cfg.get("cost_cache_max", 8192))
+        # What to answer a query with when this agent has no LLM verdict for the job.
+        #   "yield"    — say nothing (cost None); the engine yields to the initiator. Default:
+        #                answering with a different decision plane than the one we propose with
+        #                is exactly the bug above.
+        #   "analytic" — answer with the analytic cost, canonicalised as analytic. Kept as an
+        #                ablation arm so the cost of yielding can be measured, not assumed.
+        self.llm_snow_cost_fallback = str(llm_cfg.get("snow_cost_fallback", "yield")).lower()
+        # Counters for E4/E8: how often the LLM's verdict actually reached a peer's vote.
+        self.llm_wire_cost_hits = 0
+        self.llm_wire_cost_misses = 0
+
+    def _remember_cost(self, job_id: str, native_cost: float, scale: str) -> None:
+        """Record this agent's own cost for a job, with the plane that produced it."""
+        if not job_id:
+            return
+        with self._cost_cache_lock:
+            self._cost_cache[job_id] = (float(native_cost), scale, time.time())
+            self._cost_cache.move_to_end(job_id)
+            while len(self._cost_cache) > self._cost_cache_max:
+                self._cost_cache.popitem(last=False)
+
+    def proposal_cost(self, job: Job, native_cost: float) -> float:
+        """Canonical cost to advertise, using the plane that actually produced this bid.
+
+        Not `self.COST_SCALE` unconditionally: when the LLM bid failed, `native_cost` is an
+        analytic number and must be canonicalised as one.
+        """
+        scale = self.COST_SCALE
+        with self._cost_cache_lock:
+            entry = self._cost_cache.get(getattr(job, "job_id", None))
+        if entry is not None:
+            cached_cost, cached_scale, _ = entry
+            # Only trust the recorded scale if it is describing this same value; a mismatch
+            # means the cache moved on and the safe reading is the agent's own plane.
+            if abs(float(cached_cost) - float(native_cost)) < 1e-9:
+                scale = cached_scale
+        return round(to_canonical(native_cost, scale, self.analytic_cost_half), 2)
+
+    def native_cost_for_job(self, object_id: str):
+        """Answer an inbound consensus query from the LLM verdict, never by calling the model.
+
+        This runs on the single inbound consumer thread: an LLM call here would stall every
+        other peer's queries behind one 4-7s inference. A cached verdict is the only way the
+        LLM's opinion can reach a vote at all.
+
+        A miss returns None ("no opinion"), so the engine yields to the initiator rather than
+        answering with the analytic model — answering with a *different* decision plane than the
+        one this agent proposes with is the bug this method exists to fix. Set
+        `llm.snow_cost_fallback: analytic` to measure the alternative.
+        """
+        entry = None
+        if object_id:
+            with self._cost_cache_lock:
+                entry = self._cost_cache.get(object_id)
+        if entry is not None:
+            native, scale, ts = entry
+            if self._cost_cache_ttl_s <= 0 or (time.time() - ts) <= self._cost_cache_ttl_s:
+                self.llm_wire_cost_hits += 1
+                return float(native), scale
+            # Stale: a verdict about a job whose state has moved on is worse than no verdict.
+            with self._cost_cache_lock:
+                self._cost_cache.pop(object_id, None)
+
+        self.llm_wire_cost_misses += 1
+        if self.llm_snow_cost_fallback == "analytic":
+            return super().native_cost_for_job(object_id)
+        return None
 
     def _designate_bidders(self, pending_jobs: list) -> list:
         """Pick one bidder per job using the ANALYTIC cost, and keep only this agent's share.
@@ -509,9 +617,11 @@ class LlmAgent(ResourceAgent):
                             p_id=generate_id(),
                             object_id=job.job_id,
                             agent_id=self.agent_id,
+                            # Canonical wire cost (see swarm/agents/cost_scale.py), so a peer
+                            # comparing this against its own bid is comparing like with like.
                             # Real cost, not `cost + self.agent_id` — see the same change in
                             # ResourceAgent. Exact ties are broken by tiebreak_rank now.
-                            cost=round(cost, 2)
+                            cost=self.proposal_cost(job, cost)
                         )
                         proposals.append(proposal)
                         job.state = ObjectState.PRE_PREPARE

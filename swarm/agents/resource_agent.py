@@ -64,6 +64,7 @@ from swarm.quantum.split import build_post_process_job, experiment_id_for, split
 from swarm.rl.context import snapshots_from_children
 from swarm.rl.mab_manager import MABManager
 
+from swarm.agents.cost_scale import ANALYTIC_HALF, CostScale, to_canonical
 from swarm.utils.tiebreak import tiebreak_rank
 from swarm.utils.utils import generate_id, job_capacities
 
@@ -160,15 +161,12 @@ class _HostAdapter(ConsensusHost):
         # throughput (queue pinned at 20k, responses stale, every decision abandoning at
         # max_rounds). A peer that doesn't know the job locally yields to the initiator's
         # preferred candidate — the engine already treats cost=None exactly that way.
-        obj = self.agent.queues.pending_queue.get(object_id)
-        if obj is None:
-            return None
-        try:
-            info = self.agent.last_agent_info or self.agent._generate_agent_info()
-            return float(self.agent._cost_job_on_agent(obj, info))
-        except Exception as exc:
-            self.agent.logger.debug(f"my_cost_for_job({object_id}) failed: {exc}")
-            return None
+        #
+        # Delegated to the agent so a subclass can answer from its OWN decision plane.
+        # It used to inline the analytic cost here, which meant an LlmAgent priced a job
+        # analytically when answering a query and with the LLM when proposing — the LLM's
+        # verdict never entered the protocol at all (chaos finding 11).
+        return self.agent.wire_cost_for_job(object_id)
 
     def try_claim_assignment(self, object_id: str, agent_id: int) -> int:
         return self.agent.repository.try_claim_assignment(
@@ -398,6 +396,9 @@ class ResourceAgent(Agent):
         self.quantum_penalty_factor = job_cfg.get("quantum_penalty_factor", 1.0)
         # % above min cost allowed in candidate selection (lower = stricter, higher = more agents considered)
         self.selection_threshold_pct = job_cfg.get("selection_threshold_pct", 10.0)
+        # Analytic cost mapped to the midpoint of the canonical wire scale; see
+        # swarm/agents/cost_scale.py. Only affects what peers compare, never selection.
+        self.analytic_cost_half = float(job_cfg.get("analytic_cost_half", ANALYTIC_HALF))
 
         self.selector = SelectionEngine(
             feasible=lambda job, agent: self.is_job_feasible(job, agent),
@@ -1559,6 +1560,15 @@ class ResourceAgent(Agent):
                     f"bcast_dropped={getattr(t, 'bcast_sends_dropped', 0)}")
             if isinstance(self.engine, GossipConsensusEngine):
                 parts.append(f"snow_sends_dropped={self.engine.sends_dropped}")
+            # How often this agent could answer a peer's consensus query from its own decision
+            # plane rather than abstaining. On the LLM plane a low rate means the fleet is
+            # deciding with few real LLM-vs-LLM comparisons, which is what E4 needs to report.
+            hits = getattr(self, "llm_wire_cost_hits", None)
+            if hits is not None:
+                misses = getattr(self, "llm_wire_cost_misses", 0)
+                total = hits + misses
+                parts.append(f"wire_cost_hit_rate={(hits / total if total else 0.0):.2f} "
+                             f"({hits}/{total})")
             self.logger.info("[STATS] " + " ".join(parts))
         except Exception as exc:
             self.logger.debug(f"stats logging failed: {exc}")
@@ -2065,12 +2075,14 @@ class ResourceAgent(Agent):
                             p_id=generate_id(),
                             object_id=job.job_id,
                             agent_id=self.agent_id,
-                            # Advertise the real cost. This used to be `cost + self.agent_id`,
+                            # Advertise the real cost, on the canonical wire scale so peers
+                            # running a different decision plane can compare it (see
+                            # swarm/agents/cost_scale.py). This used to be `cost + self.agent_id`,
                             # which made every proposal cost unique and so served as a tie-break
                             # — but a raw id is a ±N swing on a 0-100 scale for an N-agent fleet,
                             # larger than most genuine cost differences and always favouring low
                             # ids. Peers now break exact ties on tiebreak_rank instead.
-                            cost=round(cost, 2)
+                            cost=self.proposal_cost(job, cost)
                         )
                         proposals.append(proposal)
                         job.state = ObjectState.PRE_PREPARE
@@ -2648,6 +2660,44 @@ class ResourceAgent(Agent):
     def _cost_job_on_agent(self, job: Job, agent: AgentInfo) -> float:
         return self.compute_job_cost(job=job, total=agent.capacities, dtns=agent.dtns,
                                      backend=agent.quantum_backend, site=agent.site)
+
+    # ---------- Cost that crosses the wire ----------------------------------------------
+    # Native costs are decision-plane specific and are NOT comparable between planes; see
+    # swarm/agents/cost_scale.py. Selection keeps native units (a relative threshold makes a
+    # non-linear transform there a behaviour change); anything peers will compare is canonical.
+    COST_SCALE: str = CostScale.ANALYTIC
+
+    def native_cost_for_job(self, object_id: str):
+        """`(native_cost, scale)` for this agent on this job, or None if it cannot say.
+
+        Must not block: this is called from the inbound consensus consumer thread. None means
+        "no opinion", which the engines already treat as yielding to the initiator.
+        """
+        obj = self.queues.pending_queue.get(object_id)
+        if obj is None:
+            return None
+        try:
+            info = self.last_agent_info or self._generate_agent_info()
+            # ANALYTIC explicitly, not `self.COST_SCALE`: this method computes the analytic
+            # cost, so that is the scale it must report even when a subclass's own plane is
+            # something else. A subclass calling up to it for a fallback would otherwise get
+            # its own label on someone else's number.
+            return float(self._cost_job_on_agent(obj, info)), CostScale.ANALYTIC
+        except Exception as exc:
+            self.logger.debug(f"native_cost_for_job({object_id}) failed: {exc}")
+            return None
+
+    def wire_cost_for_job(self, object_id: str):
+        """This agent's own cost for a job on the canonical scale, or None if it cannot say."""
+        got = self.native_cost_for_job(object_id)
+        if got is None:
+            return None
+        native, scale = got
+        return to_canonical(native, scale, self.analytic_cost_half)
+
+    def proposal_cost(self, job: Job, native_cost: float) -> float:
+        """Canonical cost to advertise for a proposal this agent is making."""
+        return round(to_canonical(native_cost, self.COST_SCALE, self.analytic_cost_half), 2)
 
     @staticmethod
     def _projected_load_factor(agent: AgentInfo) -> float:

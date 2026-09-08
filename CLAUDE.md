@@ -141,6 +141,8 @@ Consensus and selection engines are **decoupled** from agents via adapter classe
 - `runtime.reselection_timeout_s` — Job timeout before reselection (default: 60s)
 - `mab.algorithm` — "epsilon_greedy" or "ucb1" for hierarchical delegation
 - `llm.provider` — "openai" or "none"; `llm.model` for model selection
+- `llm.cost_cache_ttl_s` / `cost_cache_max` / `snow_cost_fallback` — How an LLM agent answers an inbound consensus query. It cannot call the model there (the inbound consumer thread must not block), so it answers from the last verdict it computed for that job. Before this, it answered with the analytic cost, so the LLM priced jobs when proposing and the analytic model priced them when voting. `snow_cost_fallback: yield` (default) abstains on a cache miss; `analytic` is the ablation arm
+- `job_selection.analytic_cost_half` — Analytic cost mapped to the midpoint of the canonical 0-100 wire scale (`swarm/agents/cost_scale.py`). Costs advertised to peers are canonical so an analytic agent and an LLM agent are comparable; native costs, and therefore selection and `selection_threshold_pct`, are untouched
 - `consensus.protocol` — "pbft" (default) or "snow"; Snow tuning under `consensus.snow.{k,alpha,beta,max_rounds,round_timeout_ms,tick_interval_ms}`
 - `failure_detection.protocol` — "heartbeat" (default) or "swim" (runs alongside heartbeat)
 - `gossip.enabled` / `gossip.fanout` / `gossip.period_ms` / `gossip.state_ttl_s` — Epidemic state dissemination

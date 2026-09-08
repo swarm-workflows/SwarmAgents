@@ -193,6 +193,12 @@ job_selection:
   quantum_penalty_factor: 1.0         # Multiplier for quantum backend quality penalty (error rate + calibration downtime)
   selection_threshold_pct: 10.0       # % above min cost allowed in candidate selection (lower = stricter, higher = more agents considered)
 
+  # Analytic cost that maps to the midpoint of the canonical 0-100 wire scale
+  # (swarm/agents/cost_scale.py). Costs advertised to peers are canonical so that an analytic
+  # agent and an LLM agent are comparable at all; native costs, and therefore selection and
+  # selection_threshold_pct, are untouched. 1.0 is "fully utilised, no penalties".
+  analytic_cost_half: 1.0
+
   # Designated-bidder mode (LLM agents only). Default false = every agent bids on every job it
   # can run, which is what the campaign measured: ~3.7 distinct agents pay a full LLM bid per
   # job placed once, and throughput is flat in fleet size (test plan 4.0b).
@@ -294,6 +300,20 @@ llm:
   # LLM's output has been shown to have little influence on placement, and this tests the
   # complement.
   disable_fallback: false
+
+  # How the LLM's verdict reaches consensus (chaos finding 11). An inbound Snow query is
+  # answered on the single consumer thread and must never block, so it cannot call the model;
+  # the agent answers from the last verdict it computed for that job instead. Without this the
+  # only non-blocking answer was the ANALYTIC cost, so an LLM agent priced a job with the model
+  # when proposing and analytically when voting, and the LLM's opinion never entered the protocol.
+  cost_cache_ttl_s: 300.0     # a verdict older than this is dropped rather than voted with
+  cost_cache_max: 8192        # bounded; oldest verdict evicted first
+  # What to answer with when there is no verdict for the job:
+  #   yield    — abstain (the engine yields to the initiator). Default: answering with a
+  #              different decision plane than the one we propose with is the bug above.
+  #   analytic — answer with the analytic cost, canonicalised as analytic. Ablation arm, so the
+  #              cost of abstaining can be measured rather than assumed.
+  snow_cost_fallback: yield
   prompts:
     cost: |-
       You are a distributed scheduler in a mesh topology with peer agents.

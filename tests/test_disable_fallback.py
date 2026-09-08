@@ -88,6 +88,10 @@ def make_agent(disable_fallback: bool):
     a.agent_id = 7
     a.bidder = _Bidder()
     a.llm_disable_fallback = disable_fallback
+    # Same initializer the real __init__ uses, so the stub cannot drift from the agent: the
+    # bid path records its verdict in this cache (P0-5) and would AttributeError without it.
+    a.config = {}
+    a._init_cost_cache()
     a.analytic_calls = []
     a.logged = []
 
