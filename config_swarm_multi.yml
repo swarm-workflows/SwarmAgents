@@ -327,6 +327,26 @@ llm:
                               # resolution raise score_scale.
   tie_break_ref_cost: 11.85   # analytic cost at which that term is half its range; the measured
                               # median over 400 Pegasus jobs x the 5 shipped flavours
+
+  # Bid pacing (P0-7). Placement is decided by WHEN an agent bids, not what it bids: slowing 15
+  # of 30 agents by +3s on a ~10s bid changed placement not at all (and no trend out to +60s),
+  # while taking the LLM away from 8 of 30 gave those agents 280 of 300 jobs — 38.5x the healthy
+  # rate — because a failed bid skips inference and returns in ~0s. The pathology is not that
+  # broken agents are fast, it is that the fallback path is orders of magnitude cheaper than the
+  # path it stands in for, so failing is rewarded with the work.
+  #   none            - what the campaign measured (default).
+  #   fallback_parity - hold a fallback bid until it has taken as long as a real one.
+  #   uniform         - hold EVERY bid to the same target, so arrival time carries no
+  #                     information about the agent. The direct test of race-to-propose: if
+  #                     placement still ignores cost with the race removed, the LLM's output is
+  #                     inert for reasons unrelated to timing.
+  # The wait tops a bid up to the target rather than adding to it, so a slow bid waits not at all.
+  bid_pacing: none
+  bid_pacing_target_s: 0.0    # 0 = derive from this agent's own observed bid latencies, which
+                              # self-calibrates across arms (gateway vs local Ollama) and models
+  bid_pacing_quantile: 0.5    # which quantile to pace to when deriving it. Use ~0.9 for
+                              # `uniform`, or half the fleet finishes early and keeps racing
+  bid_pacing_max_s: 30.0      # ceiling on any single wait, so a slow outlier cannot stall the loop
   prompts:
     cost: |-
       You are a distributed scheduler in a mesh topology with peer agents.

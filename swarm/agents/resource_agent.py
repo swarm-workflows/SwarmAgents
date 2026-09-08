@@ -1574,6 +1574,12 @@ class ResourceAgent(Agent):
                 if d["count"]:
                     parts.append(f"bids={d['count']} distinct={d['distinct']} "
                                  f"modal_share={d['modal_share']:.2f}")
+            pacing = getattr(self, "bid_pacing_stats", None)
+            if callable(pacing):
+                pc = pacing()
+                if pc["mode"] != "none":
+                    parts.append(f"pacing={pc['mode']} target={pc['target']}s "
+                                 f"waits={pc['waits']} held={pc['seconds']}s")
             self.logger.info("[STATS] " + " ".join(parts))
         except Exception as exc:
             self.logger.debug(f"stats logging failed: {exc}")

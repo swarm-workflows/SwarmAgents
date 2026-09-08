@@ -63,7 +63,7 @@ from __future__ import annotations
 import json
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from typing import Any, Dict, Optional
 
 from swarm.agents.llm.llm_bidder import LlmBidder
@@ -149,6 +149,7 @@ class LlmAgent(ResourceAgent):
         Now includes peer context to enable load-aware scoring decisions.
         On any error, fall back to the analytic model.
         """
+        bid_started_at = time.time()
         try:
             payload_job = job.to_dict(compact=True)
             payload_agent = agent.to_dict() if hasattr(agent, "to_dict") else json.loads(agent.to_json())
@@ -170,6 +171,10 @@ class LlmAgent(ResourceAgent):
             )
 
             job.reasoning_time = bid.reasoning_time
+            self._record_bid_latency(bid.reasoning_time)
+            if self.bid_pacing == self.PACING_UNIFORM:
+                # Hold a fast bid too, so arrival time says nothing about which agent bid.
+                self._pace_bid(bid_started_at, f"success job={job.job_id}")
             score = float(bid.score)
             cost = self._score_to_cost(score, job, agent)
             # Only cache a verdict about THIS agent: the cache answers "what do I cost for this
@@ -238,6 +243,13 @@ class LlmAgent(ResourceAgent):
             # E4 to measure, not a units error to correct away.
             if getattr(agent, "agent_id", None) == self.agent_id:
                 self._remember_cost(job.job_id, float(analytical_cost), CostScale.ANALYTIC)
+            # Hold the fallback until it has cost what a real bid costs. Without this an agent
+            # whose LLM is down bids in ~0s and out-races the healthy majority still reasoning:
+            # 8 LLM-blind agents took 280 of 300 jobs, 38.5x the healthy rate. Note this happens
+            # AFTER the analytic cost is computed and cached, so a peer querying us mid-wait
+            # still gets a usable answer — the wait delays only our own proposal.
+            if self.bid_pacing in (self.PACING_FALLBACK, self.PACING_UNIFORM):
+                self._pace_bid(bid_started_at, f"fallback job={job.job_id}")
             return analytical_cost
 
     # ------------------------------------------------------------------------------------------
@@ -328,6 +340,111 @@ class LlmAgent(ResourceAgent):
         """
         self._init_cost_cache()
         self._init_elicitation()
+        self._init_bid_pacing()
+
+    # ---------- Bid pacing (P0-7) ------------------------------------------------------------
+    #: Modes for `llm.bid_pacing`.
+    PACING_NONE = "none"
+    PACING_FALLBACK = "fallback_parity"
+    PACING_UNIFORM = "uniform"
+
+    def _init_bid_pacing(self) -> None:
+        """Set up how long a bid is held before it is allowed to count.
+
+        The campaign's sharpest result is that placement is decided by **when** an agent bids,
+        not what it bids. Two measurements pin it. Slowing 15 of 30 agents by +3s on a ~10s bid
+        changed placement not at all (capture ratio 1.00x, and no trend out to +60s). Taking the
+        LLM away from 8 of 30 gave those agents **280 of 300 jobs** — 38.5x the healthy rate —
+        because a failed bid skips inference and returns in ~0s.
+
+        The difference is regime, not degree: a 30% slowdown leaves both groups racing on the
+        same timescale, while a fallback bid is two orders of magnitude faster and wins outright.
+        So the pathology is not that broken agents are fast, it is that **the fallback path is
+        far cheaper than the path it stands in for**, which rewards failure with the work.
+
+        Three modes, defaulting to the measured baseline:
+
+        * `none` — what the campaign measured.
+        * `fallback_parity` — a fallback bid is held until it has taken as long as a real bid,
+          so failing stops being an advantage. Targets the S05 pathology directly.
+        * `uniform` — *every* bid is held to the same target, so bid arrival time carries no
+          information about the agent at all. This is the direct test of the race-to-propose
+          finding: if placement still fails to track cost with the race removed, the LLM's
+          output is inert for reasons that have nothing to do with timing.
+
+        The wait tops a bid **up to** the target rather than adding to it, so a bid that already
+        took longer waits not at all — and a timeout failure, which has already burned
+        `timeout_seconds`, is treated the same as an instant 503.
+
+        Two things are deliberately NOT paced. A cache hit in `SelectionEngine` never reaches
+        this code, because a reused cost is not a bid. And the `disable_fallback` path, which
+        returns an infinite cost, is left instant: an agent that is not a candidate gains nothing
+        by being quick about saying so.
+        """
+        llm_cfg = (getattr(self, "config", None) or {}).get("llm", {}) or {}
+        mode = str(llm_cfg.get("bid_pacing", self.PACING_NONE)).strip().lower()
+        valid = {self.PACING_NONE, self.PACING_FALLBACK, self.PACING_UNIFORM}
+        if mode not in valid:
+            raise ValueError(
+                f"llm.bid_pacing must be one of {sorted(valid)}, got {mode!r}")
+        self.bid_pacing = mode
+        # 0 = derive the target from this agent's own observed bid latencies, which
+        # self-calibrates across arms (a gateway bid and a local-Ollama bid differ several-fold)
+        # and across models, so one config works for every cell of E4.
+        self.bid_pacing_target_s = float(llm_cfg.get("bid_pacing_target_s", 0.0) or 0.0)
+        # Which quantile of observed latency to pace to when deriving it. 0.5 equalises a
+        # fallback against a typical bid; `uniform` wants something higher (0.9), or half the
+        # fleet still finishes ahead of the target and keeps racing.
+        self.bid_pacing_quantile = float(llm_cfg.get("bid_pacing_quantile", 0.5))
+        # Hard ceiling on any single wait. Without it a pathological target — one slow outlier
+        # in a short window — would stall the whole selection loop.
+        self.bid_pacing_max_s = float(llm_cfg.get("bid_pacing_max_s", 30.0))
+        self._bid_latencies: "deque[float]" = deque(maxlen=256)
+        self.bid_pacing_waits = 0
+        self.bid_pacing_seconds = 0.0
+
+    def _record_bid_latency(self, seconds: float) -> None:
+        """Remember how long a *successful* bid took; failures are what we pace against."""
+        if seconds and seconds > 0:
+            self._bid_latencies.append(float(seconds))
+
+    def _pace_target_s(self) -> float:
+        """Seconds a bid should take, or 0 when there is nothing to pace to yet."""
+        if self.bid_pacing_target_s > 0:
+            return self.bid_pacing_target_s
+        if not self._bid_latencies:
+            # No successful bid observed yet, so there is no "what a real bid costs" to match.
+            # Waiting on a guess would be worse than not waiting.
+            return 0.0
+        ordered = sorted(self._bid_latencies)
+        q = min(max(self.bid_pacing_quantile, 0.0), 1.0)
+        return ordered[min(len(ordered) - 1, int(q * len(ordered)))]
+
+    def _pace_bid(self, started_at: float, reason: str) -> None:
+        """Hold this bid until it has taken `_pace_target_s()` seconds in total."""
+        target = self._pace_target_s()
+        if target <= 0:
+            return
+        remaining = min(target - (time.time() - started_at), self.bid_pacing_max_s)
+        if remaining <= 0:
+            return
+        self.bid_pacing_waits += 1
+        self.bid_pacing_seconds += remaining
+        self.logger.debug("[BID_PACING] %s: holding %.3fs (target %.3fs)",
+                          reason, remaining, target)
+        # Sliced so shutdown is not delayed by up to bid_pacing_max_s per outstanding bid.
+        deadline = time.time() + remaining
+        while not getattr(self, "shutdown", False):
+            left = deadline - time.time()
+            if left <= 0:
+                break
+            time.sleep(min(0.25, left))
+
+    def bid_pacing_stats(self) -> dict:
+        """`{mode, waits, seconds, target}` for the [STATS] line and E4."""
+        return {"mode": self.bid_pacing, "waits": self.bid_pacing_waits,
+                "seconds": round(self.bid_pacing_seconds, 2),
+                "target": round(self._pace_target_s(), 3)}
 
     # ---------- Elicitation (P0-6) -----------------------------------------------------------
     def _init_elicitation(self) -> None:
