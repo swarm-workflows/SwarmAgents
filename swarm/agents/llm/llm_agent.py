@@ -376,6 +376,11 @@ class LlmAgent(ResourceAgent):
         took longer waits not at all — and a timeout failure, which has already burned
         `timeout_seconds`, is treated the same as an instant 503.
 
+        The target must not come from successful bids alone. The agent this exists to slow down
+        is the one whose LLM never succeeds, so it would never learn a target and would never
+        pace — leaving the S05 population exactly as fast as before. `bid_pacing_bootstrap_s`
+        (default `llm.timeout_seconds`) covers that case and the cold-start window.
+
         Two things are deliberately NOT paced. A cache hit in `SelectionEngine` never reaches
         this code, because a reused cost is not a bid. And the `disable_fallback` path, which
         returns an infinite cost, is left instant: an agent that is not a candidate gains nothing
@@ -396,9 +401,26 @@ class LlmAgent(ResourceAgent):
         # fallback against a typical bid; `uniform` wants something higher (0.9), or half the
         # fleet still finishes ahead of the target and keeps racing.
         self.bid_pacing_quantile = float(llm_cfg.get("bid_pacing_quantile", 0.5))
+        # Quantiles over one or two samples are noise, so the derived target only takes over
+        # once there are enough of them.
+        self.bid_pacing_min_samples = int(llm_cfg.get("bid_pacing_min_samples", 8))
+        # Target used before that — and, crucially, FOREVER on an agent whose LLM never
+        # succeeds. Deriving the target only from successful bids seemed obviously right and is
+        # exactly backwards: the agent this feature exists to slow down is the one that never
+        # completes a bid, so it would never learn a target and would never pace. That is the
+        # whole S05 population (LLMUnavailable for the entire run).
+        #
+        # `llm.timeout_seconds` is the default because, now that the timeout is enforced
+        # (P0-7's sibling fix), it is an upper bound on how long a *successful* bid can take.
+        # Pacing to it therefore guarantees a fallback never arrives before a real bid could
+        # have — a provable parity bound rather than an estimate, and conservative by design.
+        self.bid_pacing_bootstrap_s = float(llm_cfg.get("bid_pacing_bootstrap_s", 0.0) or 0.0)
+        if self.bid_pacing_bootstrap_s <= 0:
+            self.bid_pacing_bootstrap_s = float(llm_cfg.get("timeout_seconds", 0) or 0)
         # Hard ceiling on any single wait. Without it a pathological target — one slow outlier
         # in a short window — would stall the whole selection loop.
         self.bid_pacing_max_s = float(llm_cfg.get("bid_pacing_max_s", 30.0))
+        self._pacing_target_warned = False
         self._bid_latencies: "deque[float]" = deque(maxlen=256)
         self.bid_pacing_waits = 0
         self.bid_pacing_seconds = 0.0
@@ -409,16 +431,26 @@ class LlmAgent(ResourceAgent):
             self._bid_latencies.append(float(seconds))
 
     def _pace_target_s(self) -> float:
-        """Seconds a bid should take, or 0 when there is nothing to pace to yet."""
+        """Seconds a bid should take. 0 means "cannot say", and pacing is then a no-op."""
         if self.bid_pacing_target_s > 0:
             return self.bid_pacing_target_s
-        if not self._bid_latencies:
-            # No successful bid observed yet, so there is no "what a real bid costs" to match.
-            # Waiting on a guess would be worse than not waiting.
-            return 0.0
-        ordered = sorted(self._bid_latencies)
-        q = min(max(self.bid_pacing_quantile, 0.0), 1.0)
-        return ordered[min(len(ordered) - 1, int(q * len(ordered)))]
+        if len(self._bid_latencies) >= self.bid_pacing_min_samples:
+            ordered = sorted(self._bid_latencies)
+            q = min(max(self.bid_pacing_quantile, 0.0), 1.0)
+            return ordered[min(len(ordered) - 1, int(q * len(ordered)))]
+        # Too few (or zero) successful bids to derive a target — including the case this whole
+        # feature is for, an agent whose LLM is down for the entire run. Fall back to the
+        # bootstrap rather than to no pacing at all.
+        if self.bid_pacing_bootstrap_s > 0:
+            return self.bid_pacing_bootstrap_s
+        if not self._pacing_target_warned:
+            self._pacing_target_warned = True
+            self.logger.warning(
+                "[BID_PACING] mode=%s but no target can be derived: no successful bids, no "
+                "llm.bid_pacing_target_s, and no llm.timeout_seconds to bootstrap from. Pacing "
+                "is INERT — an agent whose LLM is failing will still out-race healthy peers. "
+                "Set llm.bid_pacing_target_s.", self.bid_pacing)
+        return 0.0
 
     def _pace_bid(self, started_at: float, reason: str) -> None:
         """Hold this bid until it has taken `_pace_target_s()` seconds in total."""

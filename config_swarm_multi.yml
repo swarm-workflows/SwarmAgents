@@ -346,6 +346,15 @@ llm:
                               # self-calibrates across arms (gateway vs local Ollama) and models
   bid_pacing_quantile: 0.5    # which quantile to pace to when deriving it. Use ~0.9 for
                               # `uniform`, or half the fleet finishes early and keeps racing
+  bid_pacing_min_samples: 8   # successful bids needed before the derived target takes over;
+                              # a quantile over one or two samples is noise
+  bid_pacing_bootstrap_s: 0.0 # target used until then — and FOREVER on an agent whose LLM never
+                              # succeeds, which is precisely the population this feature exists
+                              # to slow down. Deriving only from successful bids would leave the
+                              # always-503 agents of S05 unpaced. 0 = use llm.timeout_seconds,
+                              # which (now that the timeout is enforced) is an upper bound on how
+                              # long a successful bid can take, so pacing to it guarantees a
+                              # fallback never arrives before a real bid could have
   bid_pacing_max_s: 30.0      # ceiling on any single wait, so a slow outlier cannot stall the loop
   prompts:
     cost: |-

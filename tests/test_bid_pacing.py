@@ -19,6 +19,7 @@ of the race-to-propose finding.
 import os
 import sys
 import time
+from collections import deque
 
 import pytest
 
@@ -36,10 +37,14 @@ class _Log:
         return lambda *a, **k: None
 
 
-def make_agent(mode="none", target=0.0, quantile=0.5, max_s=30.0):
+def make_agent(mode="none", target=0.0, quantile=0.5, max_s=30.0,
+               min_samples=8, bootstrap=0.0, timeout_s=0.0):
     a = LlmAgent.__new__(LlmAgent)
     a.config = {"llm": {"bid_pacing": mode, "bid_pacing_target_s": target,
-                        "bid_pacing_quantile": quantile, "bid_pacing_max_s": max_s}}
+                        "bid_pacing_quantile": quantile, "bid_pacing_max_s": max_s,
+                        "bid_pacing_min_samples": min_samples,
+                        "bid_pacing_bootstrap_s": bootstrap,
+                        "timeout_seconds": timeout_s}}
     a._init_llm_state()
     a.shutdown = False
     a.logger = _Log()
@@ -71,27 +76,32 @@ class TestTargetSelection:
     def test_the_target_is_derived_from_observed_latencies(self):
         """Self-calibrating: a gateway bid and a local-Ollama bid differ several-fold, so one
         config has to work for every cell of E4."""
-        a = make_agent(mode="fallback_parity")
+        a = make_agent(mode="fallback_parity", min_samples=5)
         for v in (4.0, 5.0, 6.0, 7.0, 20.0):
             a._record_bid_latency(v)
         assert a._pace_target_s() == pytest.approx(6.0)          # median
 
     def test_a_higher_quantile_paces_to_a_slower_bid(self):
         """`uniform` needs this: at the median, half the fleet still finishes early and races."""
-        a = make_agent(mode="uniform", quantile=0.9)
+        a = make_agent(mode="uniform", quantile=0.9, min_samples=5)
         for v in (4.0, 5.0, 6.0, 7.0, 20.0):
             a._record_bid_latency(v)
         assert a._pace_target_s() == pytest.approx(20.0)
 
-    def test_no_observed_bid_means_no_target(self):
-        """Waiting on a guess is worse than not waiting: there is no 'what a real bid costs' yet."""
-        assert make_agent(mode="fallback_parity")._pace_target_s() == 0.0
+    def test_a_quantile_over_too_few_samples_is_not_used(self):
+        """One or two observations are noise, not a distribution."""
+        a = make_agent(mode="fallback_parity", min_samples=8, bootstrap=6.0)
+        a._record_bid_latency(0.2)
+        assert a._pace_target_s() == pytest.approx(6.0), "bootstrap holds until there are enough"
+        for _ in range(8):
+            a._record_bid_latency(9.0)
+        assert a._pace_target_s() == pytest.approx(9.0)
 
     def test_only_successful_bids_are_recorded(self):
         a = make_agent(mode="fallback_parity")
         for bad in (0.0, None, -1.0):
             a._record_bid_latency(bad)
-        assert a._pace_target_s() == 0.0
+        assert len(a._bid_latencies) == 0
 
     def test_the_latency_window_is_bounded(self):
         a = make_agent(mode="fallback_parity")
@@ -102,6 +112,49 @@ class TestTargetSelection:
     def test_an_unknown_mode_is_refused_at_construction(self):
         with pytest.raises(ValueError, match="bid_pacing"):
             make_agent(mode="sometimes")
+
+
+class TestTheAlwaysFailingAgent:
+    """The population P0-7 exists for, and the one a naive derivation misses entirely.
+
+    In S05 the faulted agents have `LLMUnavailable` for the WHOLE run: they never complete a
+    bid, so a target derived only from successful bids never exists, and pacing silently does
+    nothing on exactly the agents it is meant to slow down. That is not a corner case — it is
+    100% of the faulted population and the entire measured 38.5x capture.
+    """
+
+    def test_it_paces_from_the_bootstrap_with_no_successful_bid_ever(self):
+        a = make_agent(mode="fallback_parity", bootstrap=6.0)
+        assert a._bid_latencies == deque(), "precondition: the LLM has never succeeded"
+        assert a._pace_target_s() == pytest.approx(6.0)
+
+    def test_the_bootstrap_defaults_to_the_enforced_timeout(self):
+        """With the timeout enforced, it is an upper bound on a successful bid, so pacing to it
+        guarantees a fallback cannot arrive before a real bid could have."""
+        a = make_agent(mode="fallback_parity", timeout_s=6.0)
+        assert a._pace_target_s() == pytest.approx(6.0)
+
+    def test_an_explicit_bootstrap_beats_the_timeout(self):
+        a = make_agent(mode="fallback_parity", bootstrap=12.0, timeout_s=6.0)
+        assert a._pace_target_s() == pytest.approx(12.0)
+
+    def test_a_broken_agent_is_actually_held_with_the_shipped_style_config(self, clock):
+        """No explicit target anywhere — only `timeout_seconds`, as the shipped config has."""
+        a = make_agent(mode="fallback_parity", timeout_s=6.0)
+        a._pace_bid(started_at=clock["now"], reason="fallback")
+        assert clock["slept"] == pytest.approx(6.0), \
+            "an always-503 agent must still be slowed, or P0-7 does nothing in S05"
+
+    def test_with_no_target_available_at_all_it_warns_once(self):
+        """Pacing on but inert is the dangerous state: it looks configured and does nothing."""
+        a = make_agent(mode="fallback_parity")          # no target, no bootstrap, no timeout
+        warned = []
+        a.logger = type("L", (), {"__getattr__": lambda s, n: (
+            (lambda *x, **k: warned.append(x)) if n == "warning" else (lambda *x, **k: None))})()
+        assert a._pace_target_s() == 0.0
+        assert a._pace_target_s() == 0.0
+        assert len(warned) == 1, "warn once, not on every bid"
+        assert "INERT" in str(warned[0])
 
 
 class TestPacing:
