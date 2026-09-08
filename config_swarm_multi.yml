@@ -261,6 +261,9 @@ quantum:
 # every delegation is recorded as `trivial`. Coordinators log `[DELEGATION] ... can never
 # choose` in that state. Measuring delegation needs a coordinator exclusively parenting several
 # groups, which the generator cannot express yet - see docs/FGCS_EVAL_PLAN.md.
+# top_k must also stay BELOW the number of groups a coordinator leads: at top_k >= that count
+# every candidate is delegated to whatever the ranking says, so the policy is inert for a second
+# reason. The same warning covers it.
 # Note the call runs on the coordinator's scheduling thread, so every later job it holds
 # queues behind it; `llm.timeout_seconds` is the bound until P0-3 adds a cache and a budget.
 delegation:

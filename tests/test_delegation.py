@@ -513,15 +513,16 @@ class _Topo:
         self.group = 0
 
 
-def _reach_agent(children, led=None, policy="llm", mab_enabled=False):
+def _reach_agent(children, led=None, policy="llm", mab_enabled=False, top_k=0, mab_top_k=1):
     """*children* is what the topology ASSIGNS; *led* is what this agent actively leads.
     They differ under co-parenting, which is the whole point of the guard."""
     a = LlmAgent.__new__(LlmAgent)
-    a.config = {"delegation": {"policy": policy}}
+    a.config = {"delegation": {"policy": policy, "top_k": top_k}}
     a._init_llm_state()
     a.logger = _WarnLog()
     a.topology = _Topo(children)
     a.mab_enabled = mab_enabled
+    a.mab_top_k = mab_top_k
     a.mab_manager = None
     a._get_active_child_groups = lambda: (
         list(children or []) if led is None else list(led))
@@ -568,6 +569,26 @@ def test_the_guard_is_not_latched_by_the_empty_startup_view():
     led[:] = [4]                      # heartbeats arrive; a lower-ID co-parent takes group 0
     a._warn_if_delegation_cannot_choose()
     assert len(a.logger.warnings) == 1, "the corrected view must still be reported"
+
+
+def test_a_fan_out_that_covers_every_candidate_is_reported_too():
+    """The same inertness reached through config instead of topology: with `top_k >= len(
+    candidates)` every candidate is delegated to however the policy ranks them, so the bandit
+    returns them all and the LLM path short-circuits. Two led groups look healthy until you
+    notice the fan-out is also two."""
+    a = _reach_agent([0, 4], led=[0, 4], top_k=2)
+    a._warn_if_delegation_cannot_choose()
+    assert len(a.logger.warnings) == 1
+    assert "fan-out of 2 covering all 2" in a.logger.warnings[0]
+
+    # Same shape via the bandit's own key, which is what `delegation.top_k: 0` defers to.
+    b = _reach_agent([0, 4], led=[0, 4], policy="bandit", mab_enabled=True, mab_top_k=2)
+    b._warn_if_delegation_cannot_choose()
+    assert len(b.logger.warnings) == 1
+
+    ok = _reach_agent([0, 4], led=[0, 4], top_k=1)
+    ok._warn_if_delegation_cannot_choose()
+    assert ok.logger.warnings == []
 
 
 def test_the_warning_covers_the_bandit_too():

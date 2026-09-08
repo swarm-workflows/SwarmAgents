@@ -582,6 +582,11 @@ class ResourceAgent(Agent):
         delegation short-circuits without calling the model. Nothing else shows it — the run
         completes and the numbers look plausible.
 
+        A fan-out covering every candidate is the same inertness reached through config rather
+        than topology: `top_k >= len(candidates)` means every candidate is delegated to no
+        matter how the policy ranks them, so `select_groups` returns them all and the LLM path
+        short-circuits. Both cases are warned about.
+
         Re-checked on every heartbeat rather than latched: at startup `neighbor_map` is empty,
         every co-parent believes it leads everything, and a once-only check would record that
         first optimistic reading and never correct it. Leadership also moves at runtime when a
@@ -594,7 +599,28 @@ class ResourceAgent(Agent):
             return
 
         active = self._get_active_child_groups()
-        if len(active) > 1:
+        # Fan-out, resolved the way the active policy resolves it (LlmAgent honours
+        # `delegation.top_k` before falling back to `mab.top_k`).
+        resolver = getattr(self, "_delegation_top_k", None)
+        top_k = resolver() if callable(resolver) else int(self.mab_top_k)
+
+        if len(active) <= 1:
+            cause = (
+                f"actively leads {len(active)} of its {len(self.topology.children)} assigned "
+                f"child group(s) (leads {active} of {self.topology.children}), so it never has "
+                f"more than one candidate. Note --co-parents does NOT fix this: leadership "
+                f"goes to the lowest-ID live co-parent, so raising it concentrates groups on "
+                f"one coordinator instead of giving each a choice")
+        elif top_k >= len(active):
+            # Every candidate is delegated to regardless of the ranking, so the policy is
+            # asked for an opinion that cannot change the outcome. Same silent inertness as
+            # the one-candidate case, reached through config instead of topology.
+            cause = (
+                f"has a fan-out of {top_k} covering all {len(active)} of its candidate groups "
+                f"{active}, so every candidate is delegated to whatever the policy says. Lower "
+                f"delegation.top_k (or mab.top_k) below the number of groups this coordinator "
+                f"leads")
+        else:
             # Cleared, not latched: losing leadership later must warn again.
             self._delegation_reach_warned_at = None
             return
@@ -605,14 +631,10 @@ class ResourceAgent(Agent):
             return
         self._delegation_reach_warned_at = now
         self.logger.warning(
-            "[DELEGATION] %s is configured but this coordinator actively leads %d of its %d "
-            "assigned child group(s) (leads %s of %s), so it never has more than one candidate "
-            "and the policy can never choose; every delegation is recorded as trivial. Note "
-            "--co-parents does NOT fix this: leadership goes to the lowest-ID live co-parent, "
-            "so raising it concentrates groups on one coordinator instead of giving each a "
-            "choice.",
+            "[DELEGATION] %s is configured but this coordinator %s; the policy can never "
+            "choose and every delegation is recorded as trivial.",
             f"delegation.policy={policy}" if policy != "bandit" else "the delegation bandit",
-            len(active), len(self.topology.children), active, self.topology.children)
+            cause)
 
     def _build_group_snapshots(self):
         """Current per-child-group load view for contextual MAB selection.

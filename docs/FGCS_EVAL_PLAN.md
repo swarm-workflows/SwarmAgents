@@ -174,7 +174,13 @@ on this topology, and every LLM-delegation cell in E1/E4 would come back empty f
 otherwise looks healthy. It survived the contextual-bandit deployment validation because
 nothing in the agent code makes the topology visible.
 
-Landed now: coordinators log `[DELEGATION] ... can never choose` while the condition holds
+A second, independent way to reach the same inertness: a **fan-out that covers every
+candidate**. With `delegation.top_k` (or `mab.top_k`) at or above the number of groups a
+coordinator leads, every candidate is delegated to no matter how the policy ranks them —
+`select_groups` returns them all and the LLM path short-circuits. Config rather than topology,
+but it looks identical in the results, so any delegation cell must check both.
+
+Landed now: coordinators log `[DELEGATION] ... can never choose` for either cause while it holds
 (re-checked every heartbeat, since at startup an empty `neighbor_map` makes every co-parent believe
 it leads everything), and `tests/test_delegation.py` pins the leadership distribution
 end-to-end against generated configs so this cannot silently drift back.
