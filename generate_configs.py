@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Tuple
 import yaml
 
 from job_generator import JobGenerator
+from swarm.utils.yaml_strict import safe_load as yaml_safe_load_strict
 
 INSTANCE_FLAVORS = [
     {"name": "small",      "core": 2,  "ram": 8,   "disk": 100,  "gpu": 0},
@@ -65,8 +66,20 @@ class SwarmConfigGenerator:
         initial_group_size: Optional[int] = None,
         co_parent_count: int = 1,
         quantum_agents_pct: float = 0.0,
+        master_fleet_size: Optional[int] = None,
     ):
         self.num_agents = num_agents
+        # Fleet size the per-agent draws are made FOR, which may exceed the fleet being written.
+        # Flavours are allocated as percentages of fleet size, so with master=None agent 3 gets a
+        # 16-core flavour in a 10-agent fleet and a 2-core one in a 30-agent fleet even under the
+        # same seed — the scale ladder would then compare different fleets, not one fleet at
+        # different sizes. Setting master to the largest rung makes every smaller fleet a strict
+        # prefix of it: agent i is identical at every size.
+        self.master_fleet_size = int(master_fleet_size or num_agents)
+        if self.master_fleet_size < num_agents:
+            raise ValueError(
+                f"master_fleet_size ({self.master_fleet_size}) cannot be smaller than "
+                f"num_agents ({num_agents})")
         self.jobs_per_proposal = jobs_per_proposal
         self.base_config_path = base_config_path
         self.output_dir = output_dir
@@ -107,11 +120,15 @@ class SwarmConfigGenerator:
         """
         if self.quantum_agents_pct <= 0:
             return {}
-        count = max(1, round(self.quantum_agents_pct * self.num_agents))
-        chosen = random.sample(range(1, self.num_agents + 1), min(count, self.num_agents))
+        # Drawn over the master fleet and filtered, for the same prefix-stability reason as
+        # flavours: agent i either has a backend at every fleet size or at none.
+        master = self.master_fleet_size
+        count = max(1, round(self.quantum_agents_pct * master))
+        chosen = random.sample(range(1, master + 1), min(count, master))
         return {
             agent_id: copy.deepcopy(QUANTUM_BACKEND_CATALOG[i % len(QUANTUM_BACKEND_CATALOG)])
             for i, agent_id in enumerate(sorted(chosen))
+            if agent_id <= self.num_agents
         }
 
     # -----------------------------
@@ -126,7 +143,8 @@ class SwarmConfigGenerator:
         if abs(total - 1.0) > 1e-6:
             raise ValueError("Flavor percentages must sum to 1.0")
 
-        total_agents = self.num_agents
+        # Allocate over the MASTER fleet, then keep this fleet's prefix — see master_fleet_size.
+        total_agents = self.master_fleet_size
         raw_counts = [p * total_agents for p in percentages]
         counts = [int(x) for x in raw_counts]
         assigned = sum(counts)
@@ -143,14 +161,14 @@ class SwarmConfigGenerator:
             agent_flavors.extend([INSTANCE_FLAVORS[idx]] * cnt)
 
         random.shuffle(agent_flavors)
-        return agent_flavors
+        return agent_flavors[:self.num_agents]
 
     # -----------------------------
     # Base config
     # -----------------------------
     def load_base_config(self):
         with open(self.base_config_path, "r") as file:
-            return yaml.safe_load(file)
+            return yaml_safe_load_strict(file)
 
     # -----------------------------
     # Defaults for ring (legacy)
@@ -386,10 +404,21 @@ class SwarmConfigGenerator:
     # DTN helpers
     # -----------------------------
     def _load_agent_dtns(self, path: str) -> Dict[str, List[dict]]:
+        """Reuse a previous run's DTN assignment if one is lying around.
+
+        This is a REPRODUCIBILITY TRAP and the warning is the point: reusing the file takes a
+        different code path (`adjust_scores` rather than `assign_agent_dtns`) which consumes the
+        RNG differently, so `--seed N` from a dirty directory does not reproduce `--seed N` from
+        a clean one. A reproducibility check run without deleting this file disagrees with
+        itself. `run_test.py` deletes it before every generation.
+        """
         if path and os.path.exists(path):
             with open(path, "r") as f:
                 data = json.load(f)
-                return {str(k): v for k, v in data.items()}
+            print(f"WARNING: reusing existing {path} ({len(data)} agents). DTN assignments are "
+                  f"NOT being drawn fresh, and --seed will not reproduce a clean-state run. "
+                  f"Delete {path} (and agent_profiles.json) first if that is not intended.")
+            return {str(k): v for k, v in data.items()}
         return {}
 
     @staticmethod
@@ -920,6 +949,14 @@ if __name__ == "__main__":
     parser.add_argument("--hybrid-fraction", type=float, default=0.0,
                         help="Fraction (0.0-1.0) of generated jobs with a hybrid classical<->quantum loop")
 
+    parser.add_argument("--master-fleet-size", type=int, default=None,
+                        help="Draw per-agent flavours and quantum backends for a fleet of this "
+                             "size, then write only the first <num_agents> of them. Set it to the "
+                             "largest rung of a scale ladder (e.g. 270) so every smaller fleet is "
+                             "a strict prefix and agent i is identical at every size. Without it, "
+                             "flavours are percentages of the fleet being generated, so the same "
+                             "seed gives agent i a different machine at each size.")
+
     parser.add_argument("--skip-jobs", action="store_true",
                         help="Generate agent configs only; do not synthesize jobs/. Used when the "
                              "job pool comes from elsewhere (e.g. Pegasus profiles converted after "
@@ -969,6 +1006,7 @@ if __name__ == "__main__":
         initial_group_size=args.initial_group_size,
         co_parent_count=args.co_parents,
         quantum_agents_pct=args.quantum_agents_pct,
+        master_fleet_size=args.master_fleet_size,
     )
     generator.generate_configs(flavor_percentages=flavor_percentages, agent_hosts=agent_hosts,
                                agent_sites=agent_sites)

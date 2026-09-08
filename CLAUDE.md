@@ -50,6 +50,11 @@ python run_test.py --mode remote --agents 40 --agents-per-host 1 --topology ring
 ### Job Pipeline
 ```bash
 python generate_configs.py <num_agents> <jobs_per_proposal> <base_config> <output_dir> <topology> <database> <job_cnt>
+# Reproducible, comparable fleets: --seed pins the draw, --master-fleet-size makes every smaller
+# fleet a strict prefix of the largest rung (flavours are percentages of fleet size, so without it
+# the same seed gives agent i a different machine at each size). Generate from a clean state —
+# an existing agent_dtns.json is reused through a different RNG path and warns when it is.
+python generate_configs.py 30 10 ./config_swarm_multi.yml configs mesh localhost 600 --dtns --seed 42 --master-fleet-size 270
 python job_generator.py --job-count 100 --agent-profile-path agent_profiles.json --output-dir jobs/
 python job_distributor.py --redis-host localhost --jobs-dir jobs/ --jobs-per-interval 10
 ```
@@ -131,7 +136,8 @@ Consensus and selection engines are **decoupled** from agents via adapter classe
 - `job_selection.cost_weights` — CPU/RAM/Disk/GPU weights (should sum to ~1.0)
 - `job_selection.selection_threshold_pct` — % above min cost for candidate pool (lower = stricter)
 - `runtime.jobs_per_proposal` — Batch size for job proposals
-- `runtime.peer_expiry_seconds` — Time before marking agent as stale (default: 300s)
+- `runtime.peer_expiry_seconds` — Staleness filter for peers read from Redis; 300s. Not the failure detector (heartbeat/SWIM are). The shipped config used to define this key twice, so the effective value was silently 45s; config files are now loaded through `swarm/utils/yaml_strict.py`, which raises on a duplicate key
+- `runtime.wall_time_scale` / `wall_time_min_s` / `wall_time_max_s` — Job execution simulation: the simulated sleep is `clamp(wall_time * scale, min, max)`, shipped as scale 1.0 with a 120s cap. `Job.execute()` previously slept a flat 1s for every job, which made makespan, throughput and utilisation meaningless. `scale: 0` restores that legacy behaviour and logs a warning; do not report makespan from such a run
 - `runtime.reselection_timeout_s` — Job timeout before reselection (default: 60s)
 - `mab.algorithm` — "epsilon_greedy" or "ucb1" for hierarchical delegation
 - `llm.provider` — "openai" or "none"; `llm.model` for model selection

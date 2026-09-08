@@ -33,21 +33,25 @@ as a fallback.
 
 ### 0.2 Pre-campaign fixes — silent bugs that would corrupt paper numbers
 
-All confirmed present on `swarm-multi-deploy` on 2026-09-08. Found by the Chaos Jungle campaign
-(`origin/chaos:SWARMAGENTS_FINDINGS.md`); five of its fixes were cherry-picked on 2026-09-07 (Ollama
-provider, structured output, DTN pool alignment, `--seed`, one-DTN-per-job), and the DTN pool is now
-derived from the generated fleet. Still open:
+Found by the Chaos Jungle campaign (`origin/chaos:SWARMAGENTS_FINDINGS.md`); five of its fixes were
+cherry-picked on 2026-09-07 (Ollama provider, structured output, DTN pool alignment, `--seed`,
+one-DTN-per-job), and the DTN pool is now derived from the generated fleet.
 
-| # | Bug | Why it matters to *this* plan | Fix |
+**All eight below are FIXED as of 2026-09-08** (P0-0 in §4), with regression tests in
+`tests/test_precampaign_fixes.py`. The table is kept because each row explains a number the
+campaign would otherwise have reported wrongly, and because the "Fix" column is what a reader of
+the paper's threats-to-validity section will want.
+
+| # | Bug | Why it matters to *this* plan | Fix as landed |
 |---|---|---|---|
-| F-13 | `config_swarm_multi.yml` sets `runtime.peer_expiry_seconds` twice (300, then 45); YAML keeps **45 s** | A documented knob has never had its documented value; E2b/E6 churn timing depends on it | Delete one line; add a duplicate-key lint to the config loader |
-| F-9 | `Job.execute()` sleeps a flat 1 s regardless of `wall_time` | **Makespan, throughput and utilisation are primary metrics in E1/E4/E7 and are currently meaningless** — every job takes one second. Pegasus wall times span seconds to hours | Restore `sleep(wall_time * scale)` with a campaign-wide `scale`, or drop makespan/utilisation from §7 and say so |
-| F-14 | `run_test.py --runtime` is parsed and never read; a run that cannot place jobs polls forever | Unattended campaign: one stalled cell blocks the queue for the night | Read `args.runtime` as a hard cap on `wait_runtime()`; meanwhile always pass `--shutdown-after-seconds` |
-| F-6 | `cleanup_between_runs` deletes `agent_hosts.txt`, then `generate_configs.py` reads `--agent-hosts-file agent_hosts.txt` | This is the documented remote invocation for the slice; it crashes | Skip the delete when the flag names that file, or rewrite it from memory first |
-| F-7 | `llm.timeout_seconds` is parsed and never enforced (bids of 15–19 s observed under a 6 s setting) | E4 sweeps inference latency and E8 injects it; a timeout that never fires silently changes what "fallback" means | Pass the deadline to the model call; let the existing `except` path fall back |
-| — | `generate_configs` allocates capacity flavours as *percentages of fleet size*, so agent *i* differs between Hier-30 and Hier-270 even with the same seed | The scale ladder compares different fleets, not the same fleet at different sizes | Generate one 270-agent master and take prefixes (the chaos §9 sweep did exactly this), or state it as a limitation |
-| — | `generate_configs` silently reuses an existing `agent_dtns.json`, consuming randomness differently | A "reproducibility check" that does not start clean disagrees with itself | Campaign driver deletes `configs/`, `agent_profiles.json`, `agent_dtns.json` before every generation; `--seed` mandatory |
-| F-12 | Hierarchical per-agent summaries are all labelled `[no_restarts]` | Analysis-only, but hierarchical logs cannot be read unambiguously | Label by level |
+| F-13 | `config_swarm_multi.yml` sets `runtime.peer_expiry_seconds` twice (300, then 45); YAML keeps **45 s** | A documented knob has never had its documented value; E2b/E6 churn timing depends on it | ✅ Duplicate removed, **300 s** kept (it is a staleness filter, not the failure detector). `swarm/utils/yaml_strict.py` now raises on any duplicate key, naming both lines; used by the agent and by `generate_configs`. The property's code default also said 20 in one place and 300 in another — unified on 300 |
+| F-9 | `Job.execute()` sleeps a flat 1 s regardless of `wall_time` | **Makespan, throughput and utilisation are primary metrics in E1/E4/E7 and were meaningless** — every job took one second | ✅ `runtime.wall_time_{scale,min_s,max_s}`; simulated sleep is `clamp(wall_time * scale, min, max)`, applied to the quantum path too. Shipped **scale 1.0, cap 120 s**: the 25k-job Pegasus base set is p50 2.0 s / p90 10.7 s / p99 40.4 s / max 1992.7 s, so real durations replay faithfully and the cap bounds the ~1% tail that would otherwise own the makespan. **State the cap wherever makespan is reported.** `scale: 0` restores the flat 1 s and logs a warning that makespan is not meaningful |
+| F-14 | `run_test.py --runtime` is parsed and never read; a run that cannot place jobs polls forever | Unattended campaign: one stalled cell blocks the queue for the night | ✅ `wait_runtime()` now honours it as a hard cap and logs that the run ended on the clock, not on drain. **Default changed 90 → 0 (no cap)**: enforcing the old default would have truncated every run that omits the flag. With no cap and no `--shutdown-after-seconds`, the runner warns at start. **The campaign driver must pass one** |
+| F-6 | `cleanup_between_runs` deletes `agent_hosts.txt`, then `generate_configs.py` reads `--agent-hosts-file agent_hosts.txt` | This is the documented remote invocation for the slice; it crashes | ✅ The delete is skipped when the resolved `--agent-hosts-file` is that path; a generated hosts file is still cleaned |
+| F-7 | `llm.timeout_seconds` is parsed and never enforced (bids of 15–19 s observed under a 6 s setting) | E4 sweeps inference latency and E8 injects it; a timeout that never fires silently changes what "fallback" means | ✅ Passed as `ModelSettings(timeout=…)`; on breach the call raises and the existing except-path falls back (or abstains under `disable_fallback`). 0 disables. **Note for E4/E8: the shipped 6 s is below the measured 4–7 s bid latency, so it will fire — set it per arm deliberately** |
+| — | `generate_configs` allocates capacity flavours as *percentages of fleet size*, so agent *i* differs between Hier-30 and Hier-270 even with the same seed | The scale ladder compares different fleets, not the same fleet at different sizes | ✅ `--master-fleet-size N` (forwarded by `run_test.py`) draws flavours and quantum backends for the master fleet and writes this fleet's prefix. Verified end to end: at seed 42 a 10-agent and a 30-agent fleet share byte-identical capacities and DTNs for agents 1–10 with the flag, and **7 of 10 differ without it**. **Every ladder run must pass `--master-fleet-size 270`** |
+| — | `generate_configs` silently reuses an existing `agent_dtns.json`, consuming randomness differently | A "reproducibility check" that does not start clean disagrees with itself | ✅ Reuse now prints a warning naming the file and saying `--seed` will not reproduce a clean run. `cleanup_between_runs` deletes `agent_profiles.json` and `agent_dtns.json` unconditionally (commented as load-bearing). `--seed` is still the campaign driver's job to pass |
+| F-12 | Hierarchical per-agent summaries are all labelled `[no_restarts]` | Analysis-only, but hierarchical logs cannot be read unambiguously | ✅ Labelled from meaning (`[level0]`/`[level1]`/`[level2]`, and `[level1,no_restarts]` when both apply) rather than from the truthiness of a filename suffix |
 
 ### 0.3 The chaos results change C2 and E4 — and add an experiment
 
@@ -225,7 +229,7 @@ that previously existed only at 30 agents, plus a SWARM+ (PBFT + analytic) re-ba
 
 | ID | Work | Where | Est. |
 |---|---|---|---|
-| **P0-0** | **Pre-campaign fixes** — the §0.2 list: duplicate `peer_expiry_seconds`, flat 1 s job sleep (restore `wall_time * scale`), `--runtime` never read, `agent_hosts.txt` delete-then-read, `llm.timeout_seconds` unenforced, prefix-stable fleets across the scale ladder, clean-state generation in the driver. | `config_swarm_multi.yml`, `swarm/models/job.py`, `run_test.py`, `llm_bidder.py`, `generate_configs.py` | 2 d |
+| **P0-0** ✅ | **Pre-campaign fixes (done 2026-09-08)** — the §0.2 list: duplicate `peer_expiry_seconds`, flat 1 s job sleep (restore `wall_time * scale`), `--runtime` never read, `agent_hosts.txt` delete-then-read, `llm.timeout_seconds` unenforced, prefix-stable fleets across the scale ladder, clean-state generation in the driver. | `config_swarm_multi.yml`, `swarm/models/job.py`, `run_test.py`, `llm_bidder.py`, `generate_configs.py` | 2 d |
 | **P0-5** | **LLM cost reaches the Snow query path** (chaos finding 11). `_HostAdapter.my_cost_for_job` returns the analytic cost, so peers out-vote the LLM and compare 0–1 against 25–75. Cache the last LLM verdict per (job, agent) for the inbound path — never call the model on the consumer thread — and normalise both costs onto one scale before any comparison. **Blocking for every LLM × Snow/Hybrid cell in E1.** | `resource_agent.py` `_HostAdapter`, `llm_agent.py`, `gossip_engine.py` | 2 d |
 | **P0-6** | **Bid elicitation.** Replace the 0–100 absolute rating (59–92% of bids tie) with a rank or pairwise judgement over the candidate window, or a finer scale with the analytic cost breaking ties. Emit tie rate and distinct-value count per run. Keep the old prompt selectable as the E4 control arm. | `llm_bidder.py`, `config_swarm_multi.yml` prompts | 2 d |
 | **P0-7** | **Fallback parity.** A fallback bid must not be ~100× cheaper than an LLM bid: apply the bid deadline uniformly, or delay fallback proposals to the LLM's p50. `llm.disable_fallback` remains the ablation arm. | `llm_agent.py` `_llm_or_analytic_cost` | 1 d |
@@ -479,7 +483,7 @@ from `SWARM-2slice.ipynb` + `db_node_setup/` and tag the frozen revision).
 
 | Wk | Dates | Milestone | Gate |
 |---|---|---|---|
-| 1 | Sep 8–14 | **Pre-campaign fixes (§0.2)** — the silent bugs that would invalidate numbers — plus **P0-5** (Snow sees the LLM cost). Hier-30 smoke on the slice through `collect.py`. Confirm GPU node status. | Smoke green; §0.2 list closed |
+| 1 | Sep 8–14 | ~~**Pre-campaign fixes (§0.2)**~~ **DONE 2026-09-08** (P0-0). Now: **P0-5** (Snow sees the LLM cost). Hier-30 smoke on the slice through `collect.py`, with `--master-fleet-size 270` and a `--runtime` cap. Confirm GPU node status and the slice lease horizon. | Smoke green; P0-5 merged |
 | 2–4 | Sep 15–Oct 5 | P0-1 LLM group delegation, P0-4 instrumentation, P0-6 bid elicitation, P0-7 fallback parity. vLLM up on the GPU node, latency characterized. **Start E5 and the E3a analysis now** (no mechanism code needed). | LLM delegation works at Hier-30 |
 | 5 | Oct 6–12 | P0-2 bandit×LLM composition, P0-3 cache + inference budget, P1-1 oracle. Pilot one cell each of E1/E2/E4/E8 end-to-end; verify every §7 metric lands in the tidy CSV. | **Code freeze Oct 12** — tag it |
 | 6–11 | Oct 13–Nov 23 | Main campaign, unattended, interleaved config order: **E0 (gate) →** E1 → E2 → E4 → E7 → E8. Nightly result pull + incremental figures. **Start writing architecture + related work from Oct 20.** | E1 + E2 complete by Nov 9 |
@@ -514,8 +518,11 @@ reviews return (mid-2027 at the earliest). Do not plan the campaign around it.
 
 ## 11. Immediate next actions (week of Sep 8)
 
-1. **Close the §0.2 pre-campaign fix list** — every item is a silent corruption of a paper metric.
-2. **P0-5 first**: make the LLM cost visible to the Snow query path (finding 11). Every LLM × Snow
+1. ~~**Close the §0.2 pre-campaign fix list**~~ **DONE 2026-09-08** — all eight fixed, with
+   regression tests in `tests/test_precampaign_fixes.py`. Two carry a standing obligation on every
+   campaign run: pass `--master-fleet-size 270` (else the ladder compares different fleets) and a
+   `--runtime` cap or `--shutdown-after-seconds` (else a stalled cell polls all night).
+2. **P0-5 next**: make the LLM cost visible to the Snow query path (finding 11). Every LLM × Snow
    cell in E1 — the paper's core — is meaningless until this lands.
 3. Confirm the **GPU node** status and the **slice lease horizon**.
 4. Hier-30 smoke from `SWARM-2slice.ipynb`, piped through `evaluation/collect.py`.

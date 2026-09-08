@@ -519,7 +519,7 @@ def plot_scheduling_latency_and_jobs(run_dir: str,
         run_dir: Output directory containing job CSVs
         agent_count: Number of agents
         exclude_job_ids: Set of job IDs to exclude (e.g., restarted jobs)
-        label_suffix: Suffix for output filenames (e.g., '_no_restarts')
+        label_suffix: Suffix for output filenames (e.g., '_no_restarts', '_level1')
         level: Hierarchy level to plot (0, 1, etc.). If None, uses level0_jobs.csv
         save_csv: If True, export scheduling data to CSV files
         skip_plots: If True, skip plot generation
@@ -623,12 +623,22 @@ def plot_scheduling_latency_and_jobs(run_dir: str,
     plt.savefig(os.path.join(run_dir, f"scheduling_latency_histogram{label_suffix}.png"), bbox_inches="tight")
     plt.close()
 
-    # Print summary
-    print(f"[{('no_restarts' if label_suffix else 'all')}] "
-          f"Mean scheduling latency: {df['scheduling_latency'].mean():.4f} s")
-    print(f"[{('no_restarts' if label_suffix else 'all')}] "
-          f"Max scheduling latency: {df['scheduling_latency'].max():.4f} s")
-    print(f"\n[{('no_restarts' if label_suffix else 'all')}] Jobs per agent:")
+    # Print summary.
+    # The label used to be `'no_restarts' if label_suffix else 'all'`, i.e. derived from the
+    # truthiness of a filename suffix. That is right on the flat path, where the suffix is ""
+    # or "_no_restarts", and wrong on the hierarchical one, where it is "_level0"/"_level1"/
+    # "_level2" — all truthy — so a hierarchical run printed three blocks describing three
+    # different populations, each labelled "[no_restarts]", and no reader or tool could tell
+    # them apart. Label from the actual meaning instead.
+    if level is not None and label_suffix.startswith("_level"):
+        tag = f"level{level}"
+        if exclude_job_ids:
+            tag += ",no_restarts"
+    else:
+        tag = "no_restarts" if exclude_job_ids else "all"
+    print(f"[{tag}] Mean scheduling latency: {df['scheduling_latency'].mean():.4f} s")
+    print(f"[{tag}] Max scheduling latency: {df['scheduling_latency'].max():.4f} s")
+    print(f"\n[{tag}] Jobs per agent:")
     for agent_id, count in jobs_per_agent.items():
         print(f"  Agent {int(agent_id)}: {int(count)} jobs")
 

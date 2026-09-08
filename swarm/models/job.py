@@ -451,6 +451,52 @@ class Job(Object):
             self.mark_completed()
 
     # ---------- Exec simulation ----------
+    # Execution-simulation policy, process-wide, set once at agent startup from
+    # `runtime.wall_time_*` (see `configure_execution_simulation`). It is class state rather
+    # than per-job config because a Job is reconstructed from Redis on every read and has no
+    # route to the agent's config.
+    #
+    # These used to not exist: `execute()` slept a flat 1 s for every job with a wall_time,
+    # with the real sleep commented out. Since the Pegasus traces carry true durations
+    # (p50 ~2 s, p99 ~40 s, max ~33 min), that made every job the same length and so made
+    # makespan, throughput and utilisation meaningless while looking perfectly healthy.
+    _WALL_TIME_SCALE: float = 1.0          # multiplier on the job's real wall_time
+    _WALL_TIME_MIN_S: float = 0.0          # floor applied after scaling (0 = none)
+    _WALL_TIME_MAX_S: float = 120.0        # cap applied after scaling (tail control)
+
+    @classmethod
+    def configure_execution_simulation(cls, scale: float = 1.0,
+                                       min_s: float = 0.0,
+                                       max_s: float = 120.0) -> None:
+        """Set the process-wide execution-simulation policy. Call once, at agent startup.
+
+        `scale <= 0` selects the legacy behaviour — a flat 1 s for any job with a non-zero
+        wall_time — which is retained only so an old result can be reproduced. Any run using it
+        must not report makespan or utilisation.
+        """
+        cls._WALL_TIME_SCALE = float(scale)
+        cls._WALL_TIME_MIN_S = float(min_s)
+        cls._WALL_TIME_MAX_S = float(max_s)
+
+    @classmethod
+    def simulated_execution_seconds(cls, wall_time: Optional[float]) -> float:
+        """Seconds `execute()` will sleep for a job of this wall_time, under current policy.
+
+        Exposed separately so a driver can price a workload (total simulated work, longest job)
+        before launching a run, and so the policy is testable without sleeping.
+        """
+        wt = float(wall_time or 0.0)
+        if wt <= 0:
+            return 0.0
+        if cls._WALL_TIME_SCALE <= 0:
+            return 1.0                      # legacy flat simulation
+        sim = wt * cls._WALL_TIME_SCALE
+        if cls._WALL_TIME_MIN_S > 0:
+            sim = max(sim, cls._WALL_TIME_MIN_S)
+        if cls._WALL_TIME_MAX_S > 0:
+            sim = min(sim, cls._WALL_TIME_MAX_S)
+        return sim
+
     def execute(self):
         try:
             self.logger.info("Starting execution for job: %s", self.job_id)
@@ -464,10 +510,12 @@ class Job(Object):
                 self._execute_quantum()
             else:
                 wt = self.wall_time or 0.0
-                self.logger.info("Sleeping for %s seconds to simulate job execution", wt)
-                if wt > 0:
-                    #time.sleep(wt)
-                    time.sleep(1)
+                sim = self.simulated_execution_seconds(wt)
+                self.logger.info(
+                    "Sleeping for %.3fs to simulate job execution (wall_time=%s, scale=%s)",
+                    sim, wt, self._WALL_TIME_SCALE)
+                if sim > 0:
+                    time.sleep(sim)
 
             # TODO: staged-out transfers using self.data_out if data_transfer
 
@@ -496,8 +544,10 @@ class Job(Object):
           hybrid   : `iterations` rounds of circuit execution; each round's
                      measurement data satisfies the shot predicate and triggers
                      the classical update step (e.g. variational parameter update)
-        Total simulated sleep stays ~1s to match classical job simulation;
-        the phase breakdown is recorded in quantum_time / logs.
+        Total simulated sleep matches what a classical job of the same wall_time would take
+        (`simulated_execution_seconds`), split across the phases; the breakdown is recorded in
+        quantum_time / logs. Under the legacy flat policy that budget is 1 s, which is what this
+        method always used to assume.
         """
         spec = self._quantum
         shots = spec.required_shots()
@@ -508,8 +558,9 @@ class Job(Object):
             "Job %s (%s): %d iteration(s) x %d shots on %d qubits (depth=%d)",
             self.job_id, self.job_class, iterations, shots, spec.qubits, spec.circuit_depth)
 
-        # Split the 1s simulation budget across classical and quantum phases
-        step_sleep = 1.0 / (iterations * 2 + 1)
+        # Split the simulation budget across classical and quantum phases
+        budget = self.simulated_execution_seconds(wt) or 1.0
+        step_sleep = budget / (iterations * 2 + 1)
         q_time = 0.0
 
         time.sleep(step_sleep)  # classical prep: compile circuit, prepare state

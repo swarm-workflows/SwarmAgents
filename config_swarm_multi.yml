@@ -43,13 +43,29 @@ runtime:
   ready_queue_threshold: 100.00
   max_time_load_zero: 300
   restart_job_selection: 30
+  # Staleness filter for peers newly read from Redis; NOT the failure detector (heartbeat and
+  # SWIM are authoritative for that). This key was defined twice in this block — 300 here and 45
+  # eight lines down — so YAML kept 45 and every run of the campaign used a value the file and
+  # CLAUDE.md both denied. Duplicate keys now raise (swarm/utils/yaml_strict.py).
   peer_expiry_seconds: 300
   empty_timeout_seconds: 300
-  reselection_timeout_s: 300
-  peer_expiry_seconds: 45
+  reselection_timeout_s: 300          # NOTE: the code default when this key is absent is 60
   results_dir: swarm-multi
   shutdown_mode: manual
-  total_agents: 5
+  total_agents: 5                     # placeholder; generate_configs.py overwrites per fleet
+
+  # Job execution simulation. The simulated sleep is
+  #   clamp(wall_time * wall_time_scale, wall_time_min_s, wall_time_max_s).
+  # `execute()` used to sleep a flat 1s for every job, with the real sleep commented out, so
+  # every job took the same time no matter its duration and makespan / throughput /
+  # utilisation measured nothing. The Pegasus traces carry true wall times (p50 ~2s, p90 ~11s,
+  # p99 ~40s, max ~33min over the 25k-job base set), so scale 1.0 replays them faithfully and
+  # the 120s cap bounds the ~1% tail that would otherwise dominate a run's makespan — state
+  # the cap wherever makespan is reported.
+  # wall_time_scale: 0.0 restores the legacy flat 1s; a run using it must not report makespan.
+  wall_time_scale: 1.0
+  wall_time_min_s: 0.0
+  wall_time_max_s: 120.0
   jobs_per_proposal: 20
   executor_workers: 10
   failure_threshold_seconds: 60        # Time before declaring agent as failed

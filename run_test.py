@@ -298,6 +298,8 @@ def generate_configs(args, agent_hosts_list: list[str]) -> Path:
         gen_args += ["--agent-sites-file", str(args.agent_sites_file)]
     if getattr(args, "seed", None) is not None:
         gen_args += ["--seed", str(args.seed)]
+    if getattr(args, "master_fleet_size", None):
+        gen_args += ["--master-fleet-size", str(args.master_fleet_size)]
     if getattr(args, "pegasus_profiles", None):
         gen_args.append("--skip-jobs")   # jobs/ comes from convert_pegasus_jobs(), run after this
     if getattr(args, "quantum_agents_pct", 0.0) > 0:
@@ -318,8 +320,19 @@ def cleanup_between_runs(args) -> None:
     log("Cleanup between runs …")
     run_blocking(cmd, check=False)
     if not args.use_config_dir:
-        cmds = [["rm", "-rf", "agent_hosts.txt"], ["rm", "-rf", "agent_profiles.json"],
-                ["rm", "-rf", "agent_dtns.json"]]
+        # Deleting agent_profiles.json / agent_dtns.json is deliberate and load-bearing:
+        # generate_configs.py REUSES an existing agent_dtns.json through a different code path
+        # that consumes randomness differently, so a --seed run that starts dirty is not
+        # reproducible. Never make these conditional.
+        cmds = [["rm", "-rf", "agent_profiles.json"], ["rm", "-rf", "agent_dtns.json"]]
+        # ... but agent_hosts.txt is an INPUT when --agent-hosts-file names it. Deleting it here
+        # and then passing the same path to generate_configs.py is a FileNotFoundError, and that
+        # is the documented remote invocation for the slice.
+        hosts_arg = getattr(args, "agent_hosts_file", None)
+        if not hosts_arg or Path(hosts_arg).resolve() != Path("agent_hosts.txt").resolve():
+            cmds.insert(0, ["rm", "-rf", "agent_hosts.txt"])
+        else:
+            log(f"Keeping {hosts_arg} (it is this run's --agent-hosts-file input)")
         # Only delete jobs/ when NOT using Pegasus profiles (Pegasus will overwrite it)
         if not getattr(args, 'pegasus_profiles', None):
             cmds.append(["rm", "-rf", "jobs"])
@@ -584,9 +597,27 @@ def check_all_jobs_infeasible(args, bucket: int) -> bool:
     return all_infeasible
 
 def wait_runtime(args) -> None:
+    # `--runtime` is a HARD CAP on this loop, not a replacement for the drain condition: a
+    # slow-but-progressing run still exits early when the bucket drains, and a stalled one exits
+    # on the clock. It used to be parsed and never read, so the only exits were "bucket drained"
+    # and "bucket key missing" — neither of which a run that cannot place any job ever reaches.
+    # One campaign run polled a bucket stuck at 300 for 28 minutes and was only ended by a
+    # teardown running underneath it.
+    runtime_cap = int(getattr(args, "runtime", 0) or 0)
+    deadline = (time.time() + runtime_cap) if runtime_cap > 0 else None
+    if deadline is not None:
+        log(f"wait_runtime: drain condition, or hard cap of {runtime_cap}s, whichever first")
+    else:
+        log("WARNING: no --runtime cap and no --shutdown-after-seconds; a run that cannot place "
+            "jobs will poll forever. Pass one of them for unattended runs.")
+
     low_since = None
     consecutive_misses = 0
     while True:
+        if deadline is not None and time.time() >= deadline:
+            log(f"Runtime cap of {runtime_cap}s reached before the pool drained → stopping. "
+                f"This run did NOT finish on the drain condition; treat its results as a stall.")
+            break
         out = run_once(["python3.11", "dump_db.py", "--host", args.db_host, "--type", "redis", "--key", "state"])
         size = parse_bucket_set_count(out, args.watch_bucket)
         if size is None:
@@ -771,7 +802,13 @@ def parse_args() -> argparse.Namespace:
     # Test control
     ap.add_argument("--job-interval", type=float, default=0.5, help="Seconds between job bursts")
     ap.add_argument("--jobs-per-interval", type=int, default=20)
-    ap.add_argument("--runtime", type=int, default=90, help="Seconds to keep the test running")
+    # Default 0, not 90: this value is now ENFORCED as a hard cap on wait_runtime(), and it was
+    # silently ignored before. Defaulting to the old 90 would have truncated every run that does
+    # not pass the flag, so opting in is explicit.
+    ap.add_argument("--runtime", type=int, default=0,
+                    help="Hard cap in seconds on waiting for the pool to drain (0 = no cap). "
+                         "The run still exits early on the drain condition; this only bounds a "
+                         "run that cannot place jobs. Strongly recommended for unattended runs.")
     ap.add_argument("--grace-seconds", type=int, default=30)
     ap.add_argument("--watch-bucket", type=int, default=1)
     ap.add_argument("--threshold", type=int, default=5)
@@ -837,6 +874,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--run-dir", default="run_out")
     ap.add_argument("--seed", type=int, default=None,
                     help="Seed agent-profile generation so fleets are reproducible across runs")
+    ap.add_argument("--master-fleet-size", type=int, default=None,
+                    help="Generate per-agent flavours/backends for a fleet of this size and use "
+                         "the first --agents of them. Set it to the largest rung of the scale "
+                         "ladder (e.g. 270) so agent i is the same machine at every size; "
+                         "without it, flavours scale with fleet size and the ladder compares "
+                         "different fleets.")
     ap.add_argument("--log-dir", default="logs")
 
     return ap.parse_args()

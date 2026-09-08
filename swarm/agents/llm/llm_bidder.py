@@ -95,6 +95,7 @@ class LlmBidder:
         :param peer_context: Optional peer information for load-aware scoring
         :return: Bid with score, explanation, and reasoning time
         """
+        timeout_s = float(getattr(self.cfg, "timeout_seconds", 0) or 0)
         try:
             # Log LLM scoring start
             job_id = job.get('job_id', job.get('id', 'unknown'))
@@ -134,6 +135,13 @@ class LlmBidder:
                 output_type=self.output_type,
                 model_settings=ModelSettings(
                     temperature=(self.cfg.temperature if hasattr(self.cfg, "temperature") else 0.0),
+                    # `llm.timeout_seconds` was parsed into LlmConfig and then used nowhere, so
+                    # the key promised a bounded bid and delivered none: bids of 14.9s and 19.2s
+                    # were observed under `timeout_seconds: 6`, and one misconfiguration blocked
+                    # a single call for 20 minutes. On breach the request raises and the caller's
+                    # existing except-path falls back (or, with llm.disable_fallback, abstains) —
+                    # which is the resilience behaviour the agent already advertises. 0 disables.
+                    **({"timeout": float(timeout_s)} if timeout_s and timeout_s > 0 else {}),
                 ),
             )
             bid = res.output

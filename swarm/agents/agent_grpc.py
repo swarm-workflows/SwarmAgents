@@ -45,6 +45,7 @@ from swarm.models.agent_info import AgentInfo
 from swarm.utils.thread_safe_dict import ThreadSafeDict
 from swarm.topology.topology import Topology, TopologyType
 from swarm.utils.iterable_queue import IterableQueue
+from swarm.utils.yaml_strict import safe_load as yaml_safe_load_strict
 
 
 class Agent(Observer):
@@ -62,7 +63,10 @@ class Agent(Observer):
 
 
         with open(config_file, 'r') as f:
-            self.config = yaml.safe_load(f)
+            # Strict: a duplicate key raises rather than silently keeping the last value.
+            # `runtime.peer_expiry_seconds` was defined twice in the shipped config for the whole
+            # campaign, so the documented 300 s was really 45 s and nothing said so.
+            self.config = yaml_safe_load_strict(f)
 
         self.queues = AgentQueues()
         self.grpc_config = self.config.get("grpc", {})
@@ -77,6 +81,8 @@ class Agent(Observer):
                                               decode_responses=True)
         self.repository = Repository(redis_client=self.redis_client)
 
+        self._configure_job_execution_simulation()
+
         self.condition = threading.Condition()
         self.shutdown = False
         self.shutdown_path = "./shutdown"
@@ -89,6 +95,31 @@ class Agent(Observer):
             "inbound": threading.Thread(target=self._do_inbound, daemon=True),
         }
         self.last_non_empty_time = time.time()
+
+    def _configure_job_execution_simulation(self) -> None:
+        """Apply `runtime.wall_time_*` to the process-wide job execution simulation.
+
+        Warns when the legacy flat-1 s policy is selected, because a run under it cannot report
+        makespan, throughput or utilisation honestly — every job takes the same time regardless
+        of its real duration.
+        """
+        from swarm.models.job import Job
+
+        scale = float(self.runtime_config.get("wall_time_scale", 1.0))
+        Job.configure_execution_simulation(
+            scale=scale,
+            min_s=float(self.runtime_config.get("wall_time_min_s", 0.0)),
+            max_s=float(self.runtime_config.get("wall_time_max_s", 120.0)),
+        )
+        if scale <= 0:
+            self.logger.warning(
+                "[EXEC_SIM] runtime.wall_time_scale=%s — every job will simulate a flat 1s "
+                "regardless of its wall_time. Makespan, throughput and utilisation from this "
+                "run are NOT meaningful.", scale)
+        else:
+            self.logger.info(
+                "[EXEC_SIM] wall_time_scale=%s min=%ss max=%ss", scale,
+                Job._WALL_TIME_MIN_S, Job._WALL_TIME_MAX_S)
 
     @property
     def live_agent_count(self) -> int:

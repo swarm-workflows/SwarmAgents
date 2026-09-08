@@ -493,7 +493,9 @@ class ResourceAgent(Agent):
 
     @property
     def peer_expiry_seconds(self) -> int:
-        return self.runtime_config.get("peer_expiry_seconds", 20)
+        # 300 to agree with `_agent_key_ttl_s` and the documented default; this property used to
+        # say 20, so the same key had two different code defaults in one file.
+        return self.runtime_config.get("peer_expiry_seconds", 300)
 
     @property
     def reselection_timeout_s(self) -> float:
