@@ -367,6 +367,71 @@ class TestSplitPathsUseTheBudget:
         self._producer_job(20.0, 4).execute_producer(_Layer())
         assert sum(slept) == pytest.approx(10.0), "scale must reach the split path too"
 
+    @staticmethod
+    def _consumer_job(wall_time, total):
+        job = Job()
+        job.from_dict({
+            "id": "sp-1-c", "wall_time": wall_time,
+            "capacities": {"core": 1, "ram": 1, "disk": 1, "gpu": 0},
+            "data_predicate": {"experiment_id": "exp-sp-1", "min_snapshots": 1,
+                               "total_snapshots": total},
+        })
+        return job
+
+    class _FeedLayer:
+        """Serves `n` snapshot batches immediately, then nothing."""
+
+        def __init__(self, n):
+            self.n = n
+
+        def read_from(self, exp, last_id="0-0", block_ms=0):
+            served = int(str(last_id).split("-")[0])
+            if served >= self.n:
+                return []
+            return [(f"{served + 1}-0", {"shots": 8})]
+
+    @pytest.mark.parametrize("total", [1, 2, 4, 8])
+    def test_consumer_spends_its_whole_budget(self, monkeypatch, total):
+        """It divided by total+1 while sleeping only `total` times, so a one-snapshot
+        post-processing job ran at half its wall_time and a four-snapshot one at 80%."""
+        import swarm.models.job as job_mod
+        slept = []
+        monkeypatch.setattr(job_mod.time, "sleep", lambda s: slept.append(s))
+        Job.configure_execution_simulation(scale=1.0, max_s=0)
+
+        self._consumer_job(20.0, total).execute_consumer(self._FeedLayer(total), timeout_s=5.0)
+        assert len(slept) == total, "one classical update per snapshot batch"
+        assert sum(slept) == pytest.approx(20.0), slept
+
+    def test_consumer_budget_tracks_the_policy(self, monkeypatch):
+        import swarm.models.job as job_mod
+        slept = []
+        monkeypatch.setattr(job_mod.time, "sleep", lambda s: slept.append(s))
+        Job.configure_execution_simulation(scale=0.25, max_s=0)
+
+        self._consumer_job(20.0, 4).execute_consumer(self._FeedLayer(4), timeout_s=5.0)
+        assert sum(slept) == pytest.approx(5.0)
+
+    def test_producer_and_consumer_of_one_split_agree_on_their_budgets(self, monkeypatch):
+        """Both halves must price the same wall_time the same way, or a split job and a whole
+        job of equal duration contribute differently to makespan."""
+        import swarm.models.job as job_mod
+        Job.configure_execution_simulation(scale=1.0, max_s=0)
+
+        class _Layer:
+            def announce_producer(self, *a, **k): pass
+            def publish(self, *a, **k): return 1
+
+        prod = []
+        monkeypatch.setattr(job_mod.time, "sleep", lambda s: prod.append(s))
+        self._producer_job(12.0, 3).execute_producer(_Layer())
+
+        cons = []
+        monkeypatch.setattr(job_mod.time, "sleep", lambda s: cons.append(s))
+        self._consumer_job(12.0, 3).execute_consumer(self._FeedLayer(3), timeout_s=5.0)
+
+        assert sum(prod) == pytest.approx(sum(cons)) == pytest.approx(12.0)
+
     def test_neither_split_path_hardcodes_a_one_second_total(self):
         src = open(os.path.join(REPO, "swarm/models/job.py")).read()
         prod = src[src.index("def execute_producer"):src.index("def execute_consumer")]

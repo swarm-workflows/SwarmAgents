@@ -656,8 +656,13 @@ class Job(Object):
             # Per-batch classical update, drawn from this job's own budget rather than a
             # hardcoded 1s total. Responsiveness to the stream comes from the blocking read
             # below, not from keeping this small, so there is no fixed cap any more.
+            #
+            # Divide by `total`, NOT `total + 1`: unlike the producer, which has a prep phase and
+            # so sleeps iterations+1 times, the consumer sleeps exactly once per batch. Dividing
+            # by total+1 spent only total/(total+1) of the budget — 80% for a four-snapshot job
+            # and half for a one-snapshot post-processing job, which is the common case.
             budget = self.simulated_execution_seconds(self.wall_time) or 1.0
-            step_sleep = budget / (total + 1)
+            step_sleep = budget / max(1, total)
             last_data_at = time.time()
 
             while processed < total:
