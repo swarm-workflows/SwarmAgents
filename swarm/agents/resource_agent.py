@@ -64,7 +64,7 @@ from swarm.quantum.split import build_post_process_job, experiment_id_for, split
 from swarm.rl.context import snapshots_from_children
 from swarm.rl.mab_manager import MABManager
 
-from swarm.agents.cost_scale import ANALYTIC_HALF, CostScale, to_canonical
+from swarm.agents.cost_scale import ANALYTIC_HALF, LLM_HALF, CostScale, to_canonical
 from swarm.utils.tiebreak import tiebreak_rank
 from swarm.utils.utils import generate_id, job_capacities
 
@@ -399,6 +399,7 @@ class ResourceAgent(Agent):
         # Analytic cost mapped to the midpoint of the canonical wire scale; see
         # swarm/agents/cost_scale.py. Only affects what peers compare, never selection.
         self.analytic_cost_half = float(job_cfg.get("analytic_cost_half", ANALYTIC_HALF))
+        self.llm_cost_half = float(job_cfg.get("llm_cost_half", LLM_HALF))
 
         self.selector = SelectionEngine(
             feasible=lambda job, agent: self.is_job_feasible(job, agent),
@@ -2693,11 +2694,17 @@ class ResourceAgent(Agent):
         if got is None:
             return None
         native, scale = got
-        return to_canonical(native, scale, self.analytic_cost_half)
+        return self.to_wire(native, scale)
+
+    def to_wire(self, native_cost: float, scale: str) -> float:
+        """Canonicalise a native cost from `scale` using this agent's configured references."""
+        return to_canonical(native_cost, scale,
+                            analytic_half=self.analytic_cost_half,
+                            llm_half=self.llm_cost_half)
 
     def proposal_cost(self, job: Job, native_cost: float) -> float:
         """Canonical cost to advertise for a proposal this agent is making."""
-        return round(to_canonical(native_cost, self.COST_SCALE, self.analytic_cost_half), 2)
+        return round(self.to_wire(native_cost, self.COST_SCALE), 2)
 
     @staticmethod
     def _projected_load_factor(agent: AgentInfo) -> float:

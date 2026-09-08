@@ -198,6 +198,7 @@ job_selection:
   # agent and an LLM agent are comparable at all; native costs, and therefore selection and
   # selection_threshold_pct, are untouched. 1.0 is "fully utilised, no penalties".
   analytic_cost_half: 1.0
+  llm_cost_half: 50.0                 # LLM cost (100 - score) mapped to the same midpoint
 
   # Designated-bidder mode (LLM agents only). Default false = every agent bids on every job it
   # can run, which is what the campaign measured: ~3.7 distinct agents pay a full LLM bid per

@@ -364,17 +364,20 @@ class LlmAgent(ResourceAgent):
 
         Not `self.COST_SCALE` unconditionally: when the LLM bid failed, `native_cost` is an
         analytic number and must be canonicalised as one.
+
+        The scale is taken from the cache entry for this job by ID ALONE. An earlier version also
+        required the cached value to equal `native_cost`, which never held: selection applies a
+        multiplicative load penalty (up to ~2x) between the bid and this call, so every fallback
+        fell through to the LLM scale and a 0.5 analytic cost was advertised as 0.5 — the
+        "broken agent looks cheapest" bug this method exists to prevent, reintroduced. The
+        penalty scales a cost, it does not change which plane produced it.
         """
         scale = self.COST_SCALE
         with self._cost_cache_lock:
             entry = self._cost_cache.get(getattr(job, "job_id", None))
         if entry is not None:
-            cached_cost, cached_scale, _ = entry
-            # Only trust the recorded scale if it is describing this same value; a mismatch
-            # means the cache moved on and the safe reading is the agent's own plane.
-            if abs(float(cached_cost) - float(native_cost)) < 1e-9:
-                scale = cached_scale
-        return round(to_canonical(native_cost, scale, self.analytic_cost_half), 2)
+            scale = entry[1]
+        return round(self.to_wire(native_cost, scale), 2)
 
     def native_cost_for_job(self, object_id: str):
         """Answer an inbound consensus query from the LLM verdict, never by calling the model.
