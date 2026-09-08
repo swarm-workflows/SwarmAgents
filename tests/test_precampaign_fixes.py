@@ -288,3 +288,91 @@ def test_label_rule_still_lives_in_the_plotting_module():
     src = open(os.path.join(REPO, "plotting/single_run.py")).read()
     assert 'tag = f"level{level}"' in src
     assert 'tag = "no_restarts" if exclude_job_ids else "all"' in src
+
+
+class TestBatchRunnerForwarding:
+    """The batch runner is how the campaign gets its repeats — it must not undo the fixes."""
+
+    @staticmethod
+    def _help():
+        out = subprocess.run([sys.executable, "batch_tests_v2.py", "--help"],
+                             cwd=REPO, capture_output=True, text=True, timeout=120)
+        assert out.returncode == 0, out.stderr
+        return out.stdout
+
+    def test_runtime_default_is_no_cap(self):
+        """It defaulted to 30 and always forwarded it. Once run_test enforces the cap, that
+        stops every batch run after 30s — long before a 500-job run drains."""
+        src = open(os.path.join(REPO, "batch_tests_v2.py")).read()
+        assert '"--runtime", type=int, default=0' in src
+        assert "0 = no cap" in self._help()
+
+    def test_forwards_the_fleet_reproducibility_flags(self):
+        help_text = self._help()
+        assert "--seed" in help_text
+        assert "--master-fleet-size" in help_text
+        src = open(os.path.join(REPO, "batch_tests_v2.py")).read()
+        build = src[src.index("# Build run_test.py command"):src.index("if args.use_config_dir:")]
+        assert '"--seed"' in build, "a seed that is never forwarded does not pin anything"
+        assert '"--master-fleet-size"' in build
+
+
+class TestSplitPathsUseTheBudget:
+    """The split-hybrid paths hardcoded a ~1s total, bypassing the wall-time policy."""
+
+    @pytest.fixture(autouse=True)
+    def restore_policy(self):
+        saved = (Job._WALL_TIME_SCALE, Job._WALL_TIME_MIN_S, Job._WALL_TIME_MAX_S)
+        yield
+        Job.configure_execution_simulation(*saved)
+
+    @staticmethod
+    def _producer_job(wall_time, iterations):
+        job = Job()
+        job.from_dict({
+            "id": "sp-1", "wall_time": wall_time,
+            "capacities": {"core": 1, "ram": 1, "disk": 1, "gpu": 0, "qubits": 4},
+            "quantum": {"qubits": 4, "circuit_depth": 2, "shots": 8,
+                        "hybrid": True, "iterations": iterations},
+        })
+        return job
+
+    def test_producer_sleeps_for_its_own_wall_time(self, monkeypatch):
+        """Recorded rather than timed, so the assertion is exact and never flaky."""
+        import swarm.models.job as job_mod
+        slept = []
+        monkeypatch.setattr(job_mod.time, "sleep", lambda s: slept.append(s))
+        Job.configure_execution_simulation(scale=1.0, max_s=0)
+
+        class _Layer:
+            def announce_producer(self, *a, **k): pass
+            def publish(self, *a, **k): return 1
+
+        iterations = 4
+        self._producer_job(20.0, iterations).execute_producer(_Layer())
+        # budget/(iterations+1) per step, one prep step plus one per iteration
+        assert sum(slept) == pytest.approx(20.0), slept
+        assert len(slept) == iterations + 1
+
+    def test_producer_budget_tracks_the_policy(self, monkeypatch):
+        import swarm.models.job as job_mod
+        slept = []
+        monkeypatch.setattr(job_mod.time, "sleep", lambda s: slept.append(s))
+        Job.configure_execution_simulation(scale=0.5, max_s=0)
+
+        class _Layer:
+            def announce_producer(self, *a, **k): pass
+            def publish(self, *a, **k): return 1
+
+        self._producer_job(20.0, 4).execute_producer(_Layer())
+        assert sum(slept) == pytest.approx(10.0), "scale must reach the split path too"
+
+    def test_neither_split_path_hardcodes_a_one_second_total(self):
+        src = open(os.path.join(REPO, "swarm/models/job.py")).read()
+        prod = src[src.index("def execute_producer"):src.index("def execute_consumer")]
+        cons = src[src.index("def execute_consumer"):src.index("# ---------- Introspection")]
+        assert "1.0 / (iterations + 1)" not in prod
+        assert "min(0.2, 1.0 / (total + 1))" not in cons
+        for body in (prod, cons):
+            assert "simulated_execution_seconds" in body
+

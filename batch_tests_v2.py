@@ -102,7 +102,13 @@ def main():
 
     # Additional v2 options
     ap.add_argument("--jobs-per-proposal", type=int, default=10)
-    ap.add_argument("--runtime", type=int, default=30, help="Seconds to keep the test running (v2)")
+    # Default 0, not 30: run_test.py now ENFORCES --runtime as a hard cap on waiting for the pool
+    # to drain (it used to be parsed and ignored). Forwarding the old 30 would have stopped every
+    # batch run after 30 seconds, long before a 500-job run drains.
+    ap.add_argument("--runtime", type=int, default=0,
+                    help="Hard cap in seconds on waiting for the pool to drain (0 = no cap). "
+                         "Runs still exit early on the drain condition; this only bounds a run "
+                         "that cannot place jobs. Set it for unattended batches.")
     ap.add_argument("--job-interval", type=float, default=0.5, help="Seconds between job bursts (v2)")
 
     # Dynamic agent addition (v2)
@@ -122,6 +128,17 @@ def main():
     # Co-parent support for hierarchical topology
     ap.add_argument("--co-parents", type=int, default=1,
                     help="Number of co-parents per child group in hierarchical topology (default: 1)")
+
+    # Fleet reproducibility (v2) — both are required for a comparable scale ladder; see
+    # docs/FGCS_EVAL_PLAN.md section 0.2.
+    ap.add_argument("--seed", type=int, default=None,
+                    help="Seed agent-profile generation. The same seed is used for every repeat, "
+                         "so repeats share one fleet and differ only in scheduling nondeterminism.")
+    ap.add_argument("--master-fleet-size", type=int, default=None,
+                    help="Generate per-agent flavours/backends for a fleet of this size and use "
+                         "the first --agents of them, so every rung of a scale ladder is a strict "
+                         "prefix of the largest. Without it, flavours are percentages of fleet "
+                         "size and the same seed gives agent i a different machine at each size.")
 
     # Job generation (v2)
     ap.add_argument("--fit-all", action="store_true",
@@ -214,6 +231,10 @@ def main():
             "--config-dir", args.config_dir,
         ]
 
+        if args.seed is not None:
+            cmd += ["--seed", str(args.seed)]
+        if args.master_fleet_size:
+            cmd += ["--master-fleet-size", str(args.master_fleet_size)]
         if args.use_config_dir:
             cmd.append("--use-config-dir")
         if args.topology == "hierarchical":

@@ -599,7 +599,11 @@ class Job(Object):
             self.mark_started()
 
             layer.announce_producer(exp, site)
-            step_sleep = 1.0 / (iterations + 1)
+            # Same budget as any other job of this wall_time — this path used to hardcode a 1s
+            # total, so a split job ignored its duration even after the classical path stopped
+            # doing so, and a workload mixing split and whole jobs had two execution models.
+            budget = self.simulated_execution_seconds(self.wall_time) or 1.0
+            step_sleep = budget / (iterations + 1)
             q_start = time.time()
             time.sleep(step_sleep)  # compile + state-prep
             for i in range(1, iterations + 1):
@@ -649,7 +653,11 @@ class Job(Object):
             processed = int(self._state_data.get("snapshots_processed", 0))
             partial = float(self._state_data.get("partial_result", 0.0))
             last_id = self._state_data.get("last_stream_id", "0-0")
-            step_sleep = min(0.2, 1.0 / (total + 1))
+            # Per-batch classical update, drawn from this job's own budget rather than a
+            # hardcoded 1s total. Responsiveness to the stream comes from the blocking read
+            # below, not from keeping this small, so there is no fixed cap any more.
+            budget = self.simulated_execution_seconds(self.wall_time) or 1.0
+            step_sleep = budget / (total + 1)
             last_data_at = time.time()
 
             while processed < total:
