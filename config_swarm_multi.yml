@@ -261,9 +261,9 @@ mab:
     per_job_type_failure_rates: {} # Per-job-type overrides, e.g. {"compute": 0.2}
 llm:
   enabled: true
-  provider: ollama            # "openai" (FABRIC gateway), "ollama" (per-host), or "none"
-  model: "qwen2.5:3b"        # any text model that returns JSON
-  base_url: "http://127.0.0.1:11434/v1"   # OLLAMA_BASE_URL env overrides this (chaos proxy injection)
+  provider: openai            # "openai" (FABRIC gateway), "ollama" (per-host), or "none"
+  model: "gpt-4o-mini"       # any text model that returns JSON
+  base_url: ""                # ollama only, e.g. "http://127.0.0.1:11434/v1"; OLLAMA_BASE_URL env overrides
   temperature: 0.1
   timeout_seconds: 6
   use_for_selection: true     # use LLM to break ties across candidates
