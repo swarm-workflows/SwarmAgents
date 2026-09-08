@@ -146,6 +146,57 @@ its own budget row (§5); §8–§11 rewritten for the journal. Unchanged: the t
 no-reuse rule (§2), E0–E3 and E5–E7 as designed, the metrics protocol (§7) and the pre-mortem (§6).
 Budget: ~366 → ~458 runs, ~124 → ~153 testbed-hours before reruns.
 
+
+### 0.6 BLOCKER found 2026-09-08: no coordinator has a delegation decision to make
+
+`scheduling_main` filters delegation candidates through `_get_active_child_groups()` — the
+groups a coordinator **actively leads**, not the ones assigned to it. A group is led by its
+lowest-ID *live* co-parent (`_is_leader_for_group`), so with a healthy fleet leadership
+concentrates instead of spreading. Measured on a generated Hier-30 fleet (5 Level-1
+coordinators, all alive), groups actively led per coordinator:
+
+| `--co-parents` | assigned each | **actively led** | coordinators with a choice |
+|---|---|---|---|
+| 1 (default) | 1 | `[1, 1, 1, 1, 1]` | **0 of 5** |
+| 2 | 2 | `[0, 1, 1, 1, 2]` | 1 of 5 |
+| 3 | 3 | `[0, 0, 1, 1, 3]` | 1 of 5 |
+| 5 | 5 | `[0, 0, 0, 0, 5]` | 1 of 5, other four idle |
+
+A Level-2 super-coordinator does not help: its `children` is the single Level-1 group it
+manages. So **co-parenting is a failover mechanism, not a fan-out one** — raising K does not
+give more coordinators a routing decision, it gives one coordinator all of them and turns the
+rest into standbys, which would also skew the load and fairness figures.
+
+With one candidate there is no decision: the bandit returns its only arm and the LLM delegator
+short-circuits without calling the model. **This predates P0-1 and applies to the bandit arms
+identically** — it means E2 (learned delegation quality) as specified has never been runnable
+on this topology, and every LLM-delegation cell in E1/E4 would come back empty from a run that
+otherwise looks healthy. It survived the contextual-bandit deployment validation because
+nothing in the agent code makes the topology visible.
+
+Landed now: coordinators log `[DELEGATION] ... can never choose` while the condition holds
+(re-checked every heartbeat, since at startup an empty `neighbor_map` makes every co-parent believe
+it leads everything), and `tests/test_delegation.py` pins the leadership distribution
+end-to-end against generated configs so this cannot silently drift back.
+
+**Open decision — needed before E2 and any LLM-delegation cell.** The generator ties Level-1
+coordinators 1:1 to child groups (`parent_id = level_1_base + group`), so there is no way to
+express "one coordinator exclusively parents G groups". The options:
+
+1. **Add a fan-out parameter** to `generate_configs.py` — `--groups-per-coordinator G`, giving
+   `num_groups / G` Level-1 coordinators each exclusively parenting G groups. Cleanest, and it
+   makes the delegation branching factor an experimental variable in its own right (a natural
+   x-axis for E2). Changes the topology the paper describes, so it is a plan decision.
+2. **Make Level-2 super-coordinators the delegating LLM agents** and give them several Level-1
+   groups. Closer to the existing structure, but needs a 3-level hierarchy in every delegation
+   cell and `--hierarchical-level1-agent-type` currently types only Level 1.
+3. **Drop E2 and the delegation half of C1**, and scope the LLM plane to bidding only. Honest,
+   but it removes the paper's systems contribution.
+
+Recommendation: (1), with G as an E2 axis. Until it is decided, P0-1 is code-complete and
+untestable end to end, and P0-2/P0-3 should wait — they compose delegation policies that
+currently have nothing to compose over.
+
 ---
 
 ## 1. The thesis (this determines every experiment)
@@ -547,16 +598,10 @@ reviews return (mid-2027 at the earliest). Do not plan the campaign around it.
    `--runtime` cap or `--shutdown-after-seconds` (else a stalled cell polls all night).
    `batch_tests_v2.py` forwards both flags and its own `--runtime` default moved 30 → 0, since
    enforcing the cap would otherwise have stopped every batch run after 30 s.
-   **A third obligation, found reviewing P0-1: every delegation cell must pass `--co-parents 2`
-   (or more).** The shipped hierarchical topology gives each Level-1 coordinator exactly one
-   child group — verified on a generated Hier-30 fleet: 5 LLM coordinators, one child group
-   each, none with more — and a Level-2 super-coordinator's `children` is the single Level-1
-   group it manages. With one candidate there is no routing decision, so **the bandit and the
-   LLM delegator are both inert**: E2's learned-delegation figures and every LLM-delegation
-   cell in E1/E4 would come back empty from a run that otherwise looks healthy. Coordinators
-   now log a one-time `[DELEGATION] ... can never choose` warning in that configuration; the
-   topology fact is pinned by an end-to-end test in `tests/test_delegation.py`. This predates
-   P0-1 and applies to the bandit arms just as much.
+   **A third item, found reviewing P0-1, is a BLOCKER rather than an obligation — see §0.6.**
+   No coordinator in the shipped hierarchical topology ever has more than one child group to
+   choose between, so the bandit and the LLM delegator are both inert and E2 cannot be run as
+   specified.
 2. ~~**P0-5**~~ **DONE 2026-09-08.** One obligation follows: E4/E8 must report the new
    `wire_cost_hit_rate` from the `[STATS]` line. It is the fraction of peer votes that used a real
    LLM verdict rather than abstaining, so it bounds how much of any LLM × Snow result is actually

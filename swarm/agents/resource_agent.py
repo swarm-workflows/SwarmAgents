@@ -558,39 +558,61 @@ class ResourceAgent(Agent):
             f"MAB initialised for agent {self.agent_id} with child groups {child_groups}"
         )
 
+    #: Seconds between repeats of the delegation-reachability warning while it still applies.
+    _DELEGATION_REACH_WARN_S = 300
+
     def _warn_if_delegation_cannot_choose(self) -> None:
-        """Say so, once, when a delegation policy is configured but has nothing to choose from.
+        """Warn while a delegation policy is configured but has nothing to choose between.
 
-        The shipped hierarchical topology gives each Level-1 coordinator **exactly one** child
-        group (`--co-parents` defaults to 1, and a Level-2 super-coordinator's `children` is the
-        single Level-1 group it manages). With one candidate there is no routing decision to
-        make, so the bandit returns the only arm and LLM delegation short-circuits without
-        calling the model — verified on a generated Hier-30 fleet: 5 LLM coordinators, 1 child
-        group each, 0 with more.
+        Judged on the groups this coordinator **actively leads**, not the ones assigned to it.
+        `scheduling_main` filters candidates through `_get_active_child_groups()`, and under
+        co-parenting those differ sharply: every group is led by its lowest-ID live co-parent,
+        so with all coordinators up, leadership concentrates rather than spreads. Measured on a
+        generated Hier-30 fleet (5 coordinators, all alive), groups actively led per coordinator:
 
-        That is a property of the topology, not of either policy, and it is invisible from the
-        outside: the run completes, the numbers look plausible, and `delegation.policy: llm`
-        reports zero calls because there was never a choice. Run with `--co-parents 2` (or more)
-        so coordinators share child groups and the delegation policy has candidates to rank.
+            --co-parents 1 -> [1, 1, 1, 1, 1]      0 of 5 have a choice
+            --co-parents 2 -> [0, 1, 1, 1, 2]      1 of 5
+            --co-parents 5 -> [0, 0, 0, 0, 5]      1 of 5, the rest idle
+
+        So co-parenting is a *failover* mechanism, not a fan-out one, and raising K does not
+        give more coordinators a routing decision — it gives one coordinator all of them. A
+        check against `topology.children` would have called K=2 healthy for all five.
+
+        With one candidate there is no decision: the bandit returns its only arm and LLM
+        delegation short-circuits without calling the model. Nothing else shows it — the run
+        completes and the numbers look plausible.
+
+        Re-checked on every heartbeat rather than latched: at startup `neighbor_map` is empty,
+        every co-parent believes it leads everything, and a once-only check would record that
+        first optimistic reading and never correct it. Leadership also moves at runtime when a
+        co-parent dies, in either direction.
         """
-        if getattr(self, "_delegation_reach_warned", False):
-            return
-        children = self.topology.children
-        if children is None:
+        if self.topology.children is None:
             return  # not a coordinator; nothing to delegate
         policy = getattr(self, "delegation_policy", "bandit")
         if not (self.mab_enabled or policy != "bandit"):
             return
-        if len(children) > 1:
-            self._delegation_reach_warned = True
+
+        active = self._get_active_child_groups()
+        if len(active) > 1:
+            # Cleared, not latched: losing leadership later must warn again.
+            self._delegation_reach_warned_at = None
             return
-        self._delegation_reach_warned = True
+
+        now = time.time()
+        last = getattr(self, "_delegation_reach_warned_at", None)
+        if last is not None and now - last < self._DELEGATION_REACH_WARN_S:
+            return
+        self._delegation_reach_warned_at = now
         self.logger.warning(
-            "[DELEGATION] %s is configured but this coordinator leads %d child group(s) (%s), "
-            "so there is never more than one candidate and the policy can never choose. Every "
-            "delegation will be recorded as trivial. Re-run with --co-parents 2 or more.",
+            "[DELEGATION] %s is configured but this coordinator actively leads %d of its %d "
+            "assigned child group(s) (leads %s of %s), so it never has more than one candidate "
+            "and the policy can never choose; every delegation is recorded as trivial. Note "
+            "--co-parents does NOT fix this: leadership goes to the lowest-ID live co-parent, "
+            "so raising it concentrates groups on one coordinator instead of giving each a "
+            "choice.",
             f"delegation.policy={policy}" if policy != "bandit" else "the delegation bandit",
-            len(children), children)
+            len(active), len(self.topology.children), active, self.topology.children)
 
     def _build_group_snapshots(self):
         """Current per-child-group load view for contextual MAB selection.

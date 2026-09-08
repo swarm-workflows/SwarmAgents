@@ -513,7 +513,9 @@ class _Topo:
         self.group = 0
 
 
-def _reach_agent(children, policy="llm", mab_enabled=False):
+def _reach_agent(children, led=None, policy="llm", mab_enabled=False):
+    """*children* is what the topology ASSIGNS; *led* is what this agent actively leads.
+    They differ under co-parenting, which is the whole point of the guard."""
     a = LlmAgent.__new__(LlmAgent)
     a.config = {"delegation": {"policy": policy}}
     a._init_llm_state()
@@ -521,6 +523,8 @@ def _reach_agent(children, policy="llm", mab_enabled=False):
     a.topology = _Topo(children)
     a.mab_enabled = mab_enabled
     a.mab_manager = None
+    a._get_active_child_groups = lambda: (
+        list(children or []) if led is None else list(led))
     return a
 
 
@@ -530,10 +534,40 @@ def test_a_coordinator_with_one_child_group_says_so():
     a = _reach_agent([0])
     a._warn_if_delegation_cannot_choose()
     assert len(a.logger.warnings) == 1
-    w = a.logger.warnings[0]
-    assert "can never choose" in w and "--co-parents" in w
+    assert "can never choose" in a.logger.warnings[0]
     a._warn_if_delegation_cannot_choose()
-    assert len(a.logger.warnings) == 1, "warn once, not once per heartbeat"
+    assert len(a.logger.warnings) == 1, "do not repeat it on every heartbeat"
+
+
+def test_the_guard_judges_led_groups_not_assigned_ones():
+    """Two assigned groups is not two candidates. `scheduling_main` filters through
+    `_get_active_child_groups()`, and every group goes to its lowest-ID live co-parent — so at
+    `--co-parents 2` the measured leadership is [0, 1, 1, 1, 2] across five coordinators. A
+    check against `topology.children` calls all five healthy and misses four."""
+    standby = _reach_agent([0, 4], led=[])
+    standby._warn_if_delegation_cannot_choose()
+    assert len(standby.logger.warnings) == 1
+
+    one_of_two = _reach_agent([0, 1], led=[1])
+    one_of_two._warn_if_delegation_cannot_choose()
+    assert len(one_of_two.logger.warnings) == 1
+    assert "leads 1 of its 2 assigned" in one_of_two.logger.warnings[0]
+
+    leader = _reach_agent([0, 4], led=[0, 4])
+    leader._warn_if_delegation_cannot_choose()
+    assert leader.logger.warnings == []
+
+
+def test_the_guard_is_not_latched_by_the_empty_startup_view():
+    """Before any heartbeat arrives every co-parent believes it leads all its groups. A
+    once-only check would record that optimistic first reading and never correct itself."""
+    led = [0, 4]
+    a = _reach_agent([0, 4], led=led)
+    a._warn_if_delegation_cannot_choose()
+    assert a.logger.warnings == []
+    led[:] = [4]                      # heartbeats arrive; a lower-ID co-parent takes group 0
+    a._warn_if_delegation_cannot_choose()
+    assert len(a.logger.warnings) == 1, "the corrected view must still be reported"
 
 
 def test_the_warning_covers_the_bandit_too():
@@ -559,40 +593,75 @@ def test_no_warning_for_a_leaf_or_an_unconfigured_coordinator():
     assert plain.logger.warnings == []
 
 
-def test_shipped_hierarchical_topology_gives_a_coordinator_one_child_group(tmp_path):
-    """End-to-end on generated configs, because this is the fact the whole feature depends on
-    and it is not visible from the agent code.
-
-    `--co-parents` defaults to 1, so each Level-1 coordinator leads exactly one child group and
-    a Level-2 super-coordinator's `children` is the single Level-1 group it manages. Every
-    delegation is then trivial and neither the bandit nor the LLM ever chooses anything. Any
-    campaign cell that means to measure delegation must pass `--co-parents 2` or more.
-    """
+def _generated_coordinators(out_dir, *extra):
+    """Run the real generator and return `{agent_id: (agent_type, children, co_parent_groups)}`
+    for every Level-1 coordinator."""
     from swarm.utils.yaml_strict import safe_load
 
-    def coordinators(out_dir, *extra):
-        cmd = [sys.executable, "generate_configs.py", "30", "10", "./config_swarm_multi.yml",
-               str(out_dir), "hierarchical", "localhost", "100", "--seed", "42", "--skip-jobs",
-               *extra]
-        proc = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True)
-        assert proc.returncode == 0, proc.stderr[-2000:]
-        found = []
-        for name in sorted(os.listdir(out_dir)):
-            if not name.endswith(".yml"):
-                continue
-            cfg = safe_load(open(os.path.join(out_dir, name)))
-            topo = cfg.get("topology") or {}
-            if (topo.get("level") or 0) >= 1:
-                found.append((cfg.get("agent_type"), topo.get("children") or []))
-        return found
+    cmd = [sys.executable, "generate_configs.py", "30", "10", "./config_swarm_multi.yml",
+           str(out_dir), "hierarchical", "localhost", "100", "--seed", "42", "--skip-jobs",
+           *extra]
+    proc = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    found = {}
+    for name in sorted(os.listdir(out_dir)):
+        if not name.endswith(".yml"):
+            continue
+        cfg = safe_load(open(os.path.join(out_dir, name)))
+        topo = cfg.get("topology") or {}
+        if (topo.get("level") or 0) == 1:
+            agent_id = int(name.rsplit("_", 1)[1].split(".")[0])
+            found[agent_id] = (cfg.get("agent_type"), topo.get("children") or [],
+                               topo.get("co_parent_groups") or {})
+    return found
 
-    default = coordinators(tmp_path / "default")
-    assert default, "Hier-30 must produce coordinators at all"
-    assert all(t == "llm" for t, _ in default), "Level-1 coordinators are the LLM agents"
-    assert all(len(c) == 1 for _, c in default), \
-        "if this ever passes, the shipped topology changed and the co-parents requirement " \
-        "documented for LLM delegation should be revisited"
 
-    shared = coordinators(tmp_path / "shared", "--co-parents", "2")
-    assert all(len(c) == 2 for _, c in shared), \
-        "--co-parents 2 is what gives a delegation policy something to choose between"
+def _led_counts(coords):
+    """Groups each coordinator actively leads with the whole fleet alive, by the rule in
+    `_is_leader_for_group`: the lowest-ID live co-parent leads."""
+    counts = []
+    for agent_id, (_type, children, cpg) in sorted(coords.items()):
+        led = 0
+        for g in children:
+            co_parents = cpg.get(g) or cpg.get(str(g)) or []
+            if not co_parents or min(co_parents) == agent_id:
+                led += 1
+        counts.append(led)
+    return sorted(counts)
+
+
+def test_shipped_topology_gives_no_coordinator_a_routing_choice(tmp_path):
+    """End-to-end on generated configs: the fact the whole feature depends on, invisible from
+    the agent code.
+
+    `--co-parents` defaults to 1, so each Level-1 coordinator leads exactly one child group
+    (and a Level-2 super-coordinator's `children` is the single Level-1 group it manages).
+    Every delegation is then trivial and neither the bandit nor the LLM chooses anything.
+    """
+    coords = _generated_coordinators(tmp_path / "default")
+    assert coords, "Hier-30 must produce coordinators at all"
+    assert all(t == "llm" for t, _c, _m in coords.values()), \
+        "Level-1 coordinators are the LLM agents"
+    assert _led_counts(coords) == [1, 1, 1, 1, 1]
+
+
+def test_co_parents_concentrates_leadership_instead_of_spreading_choice(tmp_path):
+    """`--co-parents 2` is NOT the fix it looks like, and this test exists to stop that claim
+    coming back. Every group is led by its lowest-ID live co-parent, so with the fleet healthy
+    the *assigned* groups are even while the *led* groups are not: at K=2 one coordinator of
+    five has two candidates, three have one, and one is an idle standby. Raising K makes it
+    worse — at K=5 a single coordinator leads all five groups and the other four do nothing,
+    which would skew every load and fairness figure as well.
+
+    Co-parenting is failover, not fan-out. Measuring delegation on this topology needs a
+    coordinator that exclusively parents several groups, which the generator cannot express.
+    """
+    k2 = _generated_coordinators(tmp_path / "k2", "--co-parents", "2")
+    assert all(len(c) == 2 for _t, c, _m in k2.values()), "K=2 assigns two groups to each"
+    assert _led_counts(k2) == [0, 1, 1, 1, 2], \
+        "assignment is even; leadership is not — this is why the guard checks led groups"
+    assert sum(1 for n in _led_counts(k2) if n > 1) == 1
+
+    k5 = _generated_coordinators(tmp_path / "k5", "--co-parents", "5")
+    assert _led_counts(k5) == [0, 0, 0, 0, 5], \
+        "raising K concentrates every group on the lowest-ID coordinator"

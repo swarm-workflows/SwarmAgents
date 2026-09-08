@@ -251,11 +251,16 @@ quantum:
 #             inference: the ranking could not change the outcome. Decisions are audited to
 #             `llm_score:delegate:*`. Watch `fallbacks` and `filled` in the [STATS] line -
 #             a run dominated by either is not measuring the model.
-# REQUIRES coordinators with MORE THAN ONE child group. The shipped hierarchical topology gives
-# each Level-1 coordinator exactly one (--co-parents defaults to 1), and with one candidate
-# there is no routing decision to make - neither this nor the bandit ever chooses, and every
-# delegation is recorded as `trivial`. Run with `--co-parents 2` or more. A coordinator in that
-# state logs a one-time `[DELEGATION] ... can never choose` warning.
+# REQUIRES a coordinator that ACTIVELY LEADS more than one child group - and the shipped
+# hierarchical topology cannot currently produce one. Each Level-1 coordinator is assigned
+# exactly one group (--co-parents defaults to 1), and --co-parents does NOT fix it: every group
+# is led by its lowest-ID live co-parent, so leadership concentrates instead of spreading.
+# Measured on Hier-30 (5 coordinators, all alive), groups actively led:
+#     K=1 -> [1,1,1,1,1]   K=2 -> [0,1,1,1,2]   K=5 -> [0,0,0,0,5]
+# With one candidate there is no routing decision: neither this nor the bandit ever chooses and
+# every delegation is recorded as `trivial`. Coordinators log `[DELEGATION] ... can never
+# choose` in that state. Measuring delegation needs a coordinator exclusively parenting several
+# groups, which the generator cannot express yet - see docs/FGCS_EVAL_PLAN.md.
 # Note the call runs on the coordinator's scheduling thread, so every later job it holds
 # queues behind it; `llm.timeout_seconds` is the bound until P0-3 adds a cache and a budget.
 delegation:
