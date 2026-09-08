@@ -416,7 +416,13 @@ class LlmAgent(ResourceAgent):
         # have — a provable parity bound rather than an estimate, and conservative by design.
         self.bid_pacing_bootstrap_s = float(llm_cfg.get("bid_pacing_bootstrap_s", 0.0) or 0.0)
         if self.bid_pacing_bootstrap_s <= 0:
-            self.bid_pacing_bootstrap_s = float(llm_cfg.get("timeout_seconds", 0) or 0)
+            # Through LlmConfig, NOT `llm_cfg.get("timeout_seconds", 0)`. The bidder builds its
+            # deadline from LlmConfig, which defaults the key to 6s — so reading the raw dict
+            # with a different default meant that omitting the key gave the bidder a 6s bound
+            # and pacing a 0s one, leaving it inert on exactly the config most likely to be in
+            # use. One key, one default, one place it is resolved.
+            self.bid_pacing_bootstrap_s = float(
+                LlmConfig.from_dict(llm_cfg).timeout_seconds or 0)
         # Hard ceiling on any single wait. Without it a pathological target — one slow outlier
         # in a short window — would stall the whole selection loop.
         self.bid_pacing_max_s = float(llm_cfg.get("bid_pacing_max_s", 30.0))
@@ -447,9 +453,9 @@ class LlmAgent(ResourceAgent):
             self._pacing_target_warned = True
             self.logger.warning(
                 "[BID_PACING] mode=%s but no target can be derived: no successful bids, no "
-                "llm.bid_pacing_target_s, and no llm.timeout_seconds to bootstrap from. Pacing "
-                "is INERT — an agent whose LLM is failing will still out-race healthy peers. "
-                "Set llm.bid_pacing_target_s.", self.bid_pacing)
+                "llm.bid_pacing_target_s, and llm.timeout_seconds is 0 so there is nothing to "
+                "bootstrap from. Pacing is INERT — an agent whose LLM is failing will still "
+                "out-race healthy peers. Set llm.bid_pacing_target_s.", self.bid_pacing)
         return 0.0
 
     def _pace_bid(self, started_at: float, reason: str) -> None:

@@ -37,14 +37,21 @@ class _Log:
         return lambda *a, **k: None
 
 
+_OMIT = object()
+
+
 def make_agent(mode="none", target=0.0, quantile=0.5, max_s=30.0,
                min_samples=8, bootstrap=0.0, timeout_s=0.0):
+    """`timeout_s=_OMIT` leaves the key out of the config entirely, which is the shape a config
+    that never mentions it has — and the shape that used to leave pacing inert."""
     a = LlmAgent.__new__(LlmAgent)
-    a.config = {"llm": {"bid_pacing": mode, "bid_pacing_target_s": target,
-                        "bid_pacing_quantile": quantile, "bid_pacing_max_s": max_s,
-                        "bid_pacing_min_samples": min_samples,
-                        "bid_pacing_bootstrap_s": bootstrap,
-                        "timeout_seconds": timeout_s}}
+    llm = {"bid_pacing": mode, "bid_pacing_target_s": target,
+           "bid_pacing_quantile": quantile, "bid_pacing_max_s": max_s,
+           "bid_pacing_min_samples": min_samples,
+           "bid_pacing_bootstrap_s": bootstrap}
+    if timeout_s is not _OMIT:
+        llm["timeout_seconds"] = timeout_s
+    a.config = {"llm": llm}
     a._init_llm_state()
     a.shutdown = False
     a.logger = _Log()
@@ -144,6 +151,32 @@ class TestTheAlwaysFailingAgent:
         a._pace_bid(started_at=clock["now"], reason="fallback")
         assert clock["slept"] == pytest.approx(6.0), \
             "an always-503 agent must still be slowed, or P0-7 does nothing in S05"
+
+    def test_an_omitted_timeout_key_still_bootstraps(self):
+        """The key resolves through LlmConfig, which defaults it to 6s — the same value the
+        bidder enforces. Reading the raw dict with a default of 0 meant that omitting the key
+        gave the bidder a 6s bound and pacing a 0s one, so pacing was inert on the config most
+        likely to be in use."""
+        a = make_agent(mode="fallback_parity", timeout_s=_OMIT)
+        assert "timeout_seconds" not in a.config["llm"], "precondition: the key is absent"
+        assert a._pace_target_s() == pytest.approx(6.0)
+
+    def test_the_bootstrap_matches_the_deadline_the_bidder_enforces(self):
+        """One key, one default. Two defaults for one setting is how this broke, and how
+        runtime.peer_expiry_seconds broke before it."""
+        from swarm.agents.llm.llm_config import LlmConfig
+        for cfg in ({}, {"timeout_seconds": 9}, {"timeout_seconds": 0}):
+            a = LlmAgent.__new__(LlmAgent)
+            a.config = {"llm": dict(cfg, bid_pacing="fallback_parity")}
+            a._init_llm_state()
+            assert a.bid_pacing_bootstrap_s == pytest.approx(
+                float(LlmConfig.from_dict(cfg).timeout_seconds)), cfg
+
+    def test_an_explicitly_zeroed_timeout_really_means_no_bound(self):
+        """Setting it to 0 disables the bid deadline, so there genuinely is nothing to pace to."""
+        a = make_agent(mode="fallback_parity", timeout_s=0.0)
+        a.logger = type("L", (), {"__getattr__": lambda s, n: lambda *x, **k: None})()
+        assert a._pace_target_s() == 0.0
 
     def test_with_no_target_available_at_all_it_warns_once(self):
         """Pacing on but inert is the dangerous state: it looks configured and does nothing."""
