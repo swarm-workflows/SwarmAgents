@@ -547,6 +547,16 @@ reviews return (mid-2027 at the earliest). Do not plan the campaign around it.
    `--runtime` cap or `--shutdown-after-seconds` (else a stalled cell polls all night).
    `batch_tests_v2.py` forwards both flags and its own `--runtime` default moved 30 → 0, since
    enforcing the cap would otherwise have stopped every batch run after 30 s.
+   **A third obligation, found reviewing P0-1: every delegation cell must pass `--co-parents 2`
+   (or more).** The shipped hierarchical topology gives each Level-1 coordinator exactly one
+   child group — verified on a generated Hier-30 fleet: 5 LLM coordinators, one child group
+   each, none with more — and a Level-2 super-coordinator's `children` is the single Level-1
+   group it manages. With one candidate there is no routing decision, so **the bandit and the
+   LLM delegator are both inert**: E2's learned-delegation figures and every LLM-delegation
+   cell in E1/E4 would come back empty from a run that otherwise looks healthy. Coordinators
+   now log a one-time `[DELEGATION] ... can never choose` warning in that configuration; the
+   topology fact is pinned by an end-to-end test in `tests/test_delegation.py`. This predates
+   P0-1 and applies to the bandit arms just as much.
 2. ~~**P0-5**~~ **DONE 2026-09-08.** One obligation follows: E4/E8 must report the new
    `wire_cost_hit_rate` from the `[STATS]` line. It is the fraction of peer votes that used a real
    LLM verdict rather than abstaining, so it bounds how much of any LLM × Snow result is actually

@@ -558,6 +558,40 @@ class ResourceAgent(Agent):
             f"MAB initialised for agent {self.agent_id} with child groups {child_groups}"
         )
 
+    def _warn_if_delegation_cannot_choose(self) -> None:
+        """Say so, once, when a delegation policy is configured but has nothing to choose from.
+
+        The shipped hierarchical topology gives each Level-1 coordinator **exactly one** child
+        group (`--co-parents` defaults to 1, and a Level-2 super-coordinator's `children` is the
+        single Level-1 group it manages). With one candidate there is no routing decision to
+        make, so the bandit returns the only arm and LLM delegation short-circuits without
+        calling the model — verified on a generated Hier-30 fleet: 5 LLM coordinators, 1 child
+        group each, 0 with more.
+
+        That is a property of the topology, not of either policy, and it is invisible from the
+        outside: the run completes, the numbers look plausible, and `delegation.policy: llm`
+        reports zero calls because there was never a choice. Run with `--co-parents 2` (or more)
+        so coordinators share child groups and the delegation policy has candidates to rank.
+        """
+        if getattr(self, "_delegation_reach_warned", False):
+            return
+        children = self.topology.children
+        if children is None:
+            return  # not a coordinator; nothing to delegate
+        policy = getattr(self, "delegation_policy", "bandit")
+        if not (self.mab_enabled or policy != "bandit"):
+            return
+        if len(children) > 1:
+            self._delegation_reach_warned = True
+            return
+        self._delegation_reach_warned = True
+        self.logger.warning(
+            "[DELEGATION] %s is configured but this coordinator leads %d child group(s) (%s), "
+            "so there is never more than one candidate and the policy can never choose. Every "
+            "delegation will be recorded as trivial. Re-run with --co-parents 2 or more.",
+            f"delegation.policy={policy}" if policy != "bandit" else "the delegation bandit",
+            len(children), children)
+
     def _build_group_snapshots(self):
         """Current per-child-group load view for contextual MAB selection.
 
@@ -1488,6 +1522,7 @@ class ResourceAgent(Agent):
         current_time = int(time.time())
         self._refresh_children(int(current_time))
         self._init_mab()
+        self._warn_if_delegation_cannot_choose()
 
         # Detect and handle agent failures
         failed_agents = self._detect_failed_agents(current_time)

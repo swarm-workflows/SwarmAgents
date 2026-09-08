@@ -13,6 +13,7 @@ With shared parenting (K>1), each child group is assigned K co-parents from the 
 - **Deterministic leader election**: Each co-parent independently determines the leader by checking which co-parents have fresh heartbeats. The lowest live agent ID wins. No distributed locks or extra Redis keys needed.
 - **Backward compatible**: K=1 (the default) produces identical behavior to the existing 1:1 parent-child scheme.
 - **Reduced orphan probability**: The probability of a group being orphaned drops from p to p^K (where p is the single-agent failure probability).
+- **It is also what gives a delegation policy something to decide.** With K=1 a Level-1 coordinator leads exactly one child group, so `capable_groups` always has one entry: the MAB returns its only arm and `delegation.policy: llm` short-circuits without calling the model. Failure tolerance is the reason this feature was built, but K≥2 is a *precondition* for measuring learned or LLM-based delegation at all — a coordinator in the K=1 state logs a one-time `[DELEGATION] ... can never choose` warning.
 
 ## Quick Start
 

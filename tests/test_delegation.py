@@ -16,11 +16,13 @@ What these tests hold to:
   actually applied to the call.
 """
 import os
+import subprocess
 import sys
 
 import pytest
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO)
 
 from swarm.agents.llm.llm_agent import LlmAgent  # noqa: E402
 from swarm.agents.llm.llm_config import LlmConfig  # noqa: E402
@@ -487,3 +489,110 @@ def test_response_schema_is_cached_per_candidate_set():
     assert d.agent.output_type is first
     d.rank(job={"id": "j"}, groups={1: {}, 2: {}, 3: {}})
     assert d.agent.output_type is not first
+
+
+# --------------------------------------------------------------------------------------------
+# Can the policy ever fire? The shipped hierarchical topology says no.
+# --------------------------------------------------------------------------------------------
+
+class _WarnLog:
+    def __init__(self):
+        self.warnings = []
+
+    def warning(self, msg, *args):
+        self.warnings.append(msg % args if args else msg)
+
+    def __getattr__(self, _name):
+        return lambda *a, **k: None
+
+
+class _Topo:
+    def __init__(self, children):
+        self.children = children
+        self.level = 1
+        self.group = 0
+
+
+def _reach_agent(children, policy="llm", mab_enabled=False):
+    a = LlmAgent.__new__(LlmAgent)
+    a.config = {"delegation": {"policy": policy}}
+    a._init_llm_state()
+    a.logger = _WarnLog()
+    a.topology = _Topo(children)
+    a.mab_enabled = mab_enabled
+    a.mab_manager = None
+    return a
+
+
+def test_a_coordinator_with_one_child_group_says_so():
+    """The failure this guards is silent: the run completes, the numbers look plausible, and
+    `policy: llm` reports zero calls because there was never a choice to make."""
+    a = _reach_agent([0])
+    a._warn_if_delegation_cannot_choose()
+    assert len(a.logger.warnings) == 1
+    w = a.logger.warnings[0]
+    assert "can never choose" in w and "--co-parents" in w
+    a._warn_if_delegation_cannot_choose()
+    assert len(a.logger.warnings) == 1, "warn once, not once per heartbeat"
+
+
+def test_the_warning_covers_the_bandit_too():
+    """Not an LLM problem — one candidate leaves the bandit with one arm just the same."""
+    a = _reach_agent([0], policy="bandit", mab_enabled=True)
+    a._warn_if_delegation_cannot_choose()
+    assert len(a.logger.warnings) == 1
+
+
+def test_no_warning_when_there_is_an_actual_choice():
+    a = _reach_agent([0, 4])
+    a._warn_if_delegation_cannot_choose()
+    assert a.logger.warnings == []
+
+
+def test_no_warning_for_a_leaf_or_an_unconfigured_coordinator():
+    leaf = _reach_agent(None)
+    leaf._warn_if_delegation_cannot_choose()
+    assert leaf.logger.warnings == []
+
+    plain = _reach_agent([0], policy="bandit", mab_enabled=False)
+    plain._warn_if_delegation_cannot_choose()
+    assert plain.logger.warnings == []
+
+
+def test_shipped_hierarchical_topology_gives_a_coordinator_one_child_group(tmp_path):
+    """End-to-end on generated configs, because this is the fact the whole feature depends on
+    and it is not visible from the agent code.
+
+    `--co-parents` defaults to 1, so each Level-1 coordinator leads exactly one child group and
+    a Level-2 super-coordinator's `children` is the single Level-1 group it manages. Every
+    delegation is then trivial and neither the bandit nor the LLM ever chooses anything. Any
+    campaign cell that means to measure delegation must pass `--co-parents 2` or more.
+    """
+    from swarm.utils.yaml_strict import safe_load
+
+    def coordinators(out_dir, *extra):
+        cmd = [sys.executable, "generate_configs.py", "30", "10", "./config_swarm_multi.yml",
+               str(out_dir), "hierarchical", "localhost", "100", "--seed", "42", "--skip-jobs",
+               *extra]
+        proc = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr[-2000:]
+        found = []
+        for name in sorted(os.listdir(out_dir)):
+            if not name.endswith(".yml"):
+                continue
+            cfg = safe_load(open(os.path.join(out_dir, name)))
+            topo = cfg.get("topology") or {}
+            if (topo.get("level") or 0) >= 1:
+                found.append((cfg.get("agent_type"), topo.get("children") or []))
+        return found
+
+    default = coordinators(tmp_path / "default")
+    assert default, "Hier-30 must produce coordinators at all"
+    assert all(t == "llm" for t, _ in default), "Level-1 coordinators are the LLM agents"
+    assert all(len(c) == 1 for _, c in default), \
+        "if this ever passes, the shipped topology changed and the co-parents requirement " \
+        "documented for LLM delegation should be revisited"
+
+    shared = coordinators(tmp_path / "shared", "--co-parents", "2")
+    assert all(len(c) == 2 for _, c in shared), \
+        "--co-parents 2 is what gives a delegation policy something to choose between"

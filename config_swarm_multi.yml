@@ -251,6 +251,11 @@ quantum:
 #             inference: the ranking could not change the outcome. Decisions are audited to
 #             `llm_score:delegate:*`. Watch `fallbacks` and `filled` in the [STATS] line -
 #             a run dominated by either is not measuring the model.
+# REQUIRES coordinators with MORE THAN ONE child group. The shipped hierarchical topology gives
+# each Level-1 coordinator exactly one (--co-parents defaults to 1), and with one candidate
+# there is no routing decision to make - neither this nor the bandit ever chooses, and every
+# delegation is recorded as `trivial`. Run with `--co-parents 2` or more. A coordinator in that
+# state logs a one-time `[DELEGATION] ... can never choose` warning.
 # Note the call runs on the coordinator's scheduling thread, so every later job it holds
 # queues behind it; `llm.timeout_seconds` is the bound until P0-3 adds a cache and a budget.
 delegation:
