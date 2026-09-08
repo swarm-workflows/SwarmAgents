@@ -11,7 +11,7 @@ import os
 import time
 from typing import Dict, Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, create_model
 from pydantic_ai import Agent as PydanticAgent, ModelSettings, NativeOutput
 
 # Models
@@ -23,10 +23,28 @@ from swarm.agents.llm.llm_config import LlmConfig
 
 
 class Bid(BaseModel):
-    """Structured score from the LLM."""
+    """Structured score from the LLM, on the 0..100 default scale."""
     score: float = Field(ge=0.0, le=100.0)
     explanation: str = ""
     reasoning_time: float | None = None   # seconds
+
+
+def bid_model_for_scale(scale: int) -> type[BaseModel]:
+    """Build the `Bid` schema for a 0..`scale` rating.
+
+    The bound is in the schema, not just the prompt, because Ollama's `NativeOutput` mode drives
+    the model from the JSON schema — a prompt that says 0-1000 while the schema says 0-100 gets
+    silently clamped answers. Returns the plain `Bid` for the default scale so the common path
+    keeps a stable, importable type.
+    """
+    if int(scale) == 100:
+        return Bid
+    return create_model(
+        f"Bid{int(scale)}",
+        score=(float, Field(ge=0.0, le=float(scale))),
+        explanation=(str, ""),
+        reasoning_time=(Optional[float], None),
+    )
 
 
 class ScoringDeps(BaseModel):
@@ -69,18 +87,34 @@ class LlmBidder:
                 f"Unsupported provider: {cfg.provider!r}. Use 'openai', 'gemini'/'gemma', or 'ollama'."
             )
 
+        # Rating range asked for. 100 keeps the schema and prompt the campaign measured.
+        self.score_scale = int(getattr(cfg, "score_scale", 100) or 100)
+        if self.score_scale < 2:
+            raise ValueError(f"llm.score_scale must be >= 2, got {self.score_scale}")
+        bid_model = bid_model_for_scale(self.score_scale)
+
         # Small local models emit malformed tool-call args; Ollama's json_schema mode is reliable.
-        self.output_type = NativeOutput(Bid) if provider == "ollama" else Bid
+        self.output_type = NativeOutput(bid_model) if provider == "ollama" else bid_model
 
         system_prompt = (cfg.prompts or {}).get("cost") or (
             "You are a scheduler. Given a JSON job and an agent's resource state, "
-            "return a JSON with fields: score (0..100, higher is better) and "
+            "return a JSON with fields: score (0..{scale}, higher is better) and "
             "explanation (short string). Respond strictly in JSON."
         )
+        # The prompt states the range, so a configured prompt written for 0-100 stays truthful
+        # when the scale changes. `{scale}` is the only placeholder; a prompt without it is used
+        # verbatim, and a stray brace must not blow up startup.
+        try:
+            system_prompt = system_prompt.format(scale=self.score_scale)
+        except (KeyError, IndexError, ValueError):
+            if self.logger:
+                self.logger.warning(
+                    "[LLM_BIDDER] prompt has braces that are not '{scale}'; using it verbatim. "
+                    "It may still advertise the wrong rating range.")
         self.logger.info(f"[LLM_BIDDER] System Prompt: {system_prompt}")
 
         # Build the agent with a structured result type.
-        self.agent: PydanticAgent[Bid] = PydanticAgent[Bid](
+        self.agent: PydanticAgent = PydanticAgent(
             model=model,
             system_prompt=system_prompt,
         )

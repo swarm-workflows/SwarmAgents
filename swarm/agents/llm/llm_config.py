@@ -8,6 +8,11 @@ class LlmConfig:
     provider: str = "none"          # e.g., "openai", "vertex", "ollama", "none"
     model: str = ""
     base_url: str = ""              # overridden by the provider's *_BASE_URL env var
+    # Elicitation (P0-6). The campaign measured 59% of qwen2.5:3b bids at the identical value
+    # 75.00 and 92% of gpt-oss-20b bids on just two values: asking for a 0-100 rating gets
+    # answers in round steps, so the cost signal is mostly ties and cannot order agents.
+    # `score_scale` is the range the model is asked for; the cost is normalised back to 0..100.
+    score_scale: int = 100
     temperature: float = 0.0
     timeout_seconds: int = 6
     use_for_selection: bool = True
@@ -20,6 +25,7 @@ class LlmConfig:
             provider=str(d.get("provider", "none")),
             model=str(d.get("model", "")),
             base_url=str(d.get("base_url", "")),
+            score_scale=int(d.get("score_scale", 100) or 100),
             temperature=float(d.get("temperature", 0.0)),
             timeout_seconds=int(d.get("timeout_seconds", 6)),
             use_for_selection=bool(d.get("use_for_selection", True)),

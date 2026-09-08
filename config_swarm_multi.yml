@@ -309,10 +309,24 @@ llm:
   #   analytic — answer with the analytic cost, canonicalised as analytic. Ablation arm, so the
   #              cost of abstaining can be measured rather than assumed.
   snow_cost_fallback: yield
+
+  # Elicitation (P0-6). The measured problem with the LLM plane is that its output barely
+  # varies: 59% of qwen2.5:3b bids were the identical 75.00, and gpt-oss-20b put 92% of bids on
+  # two values. A 0-100 rating is answered in round steps, so most agents tie and the bid cannot
+  # order them — one reason inverting the model's reasoning changed no placements. A larger
+  # model made it worse, so the lever is how the bid is asked for, not which model answers.
+  # Both arms below default to the measured baseline; E4 crosses them.
+  score_scale: 100            # range the model is asked for; the cost is normalised to 0-100
+                              # either way. 1000 gives it room to discriminate.
+  tie_break_with_analytic: false   # when two bids still tie, order them by the analytic cost.
+                              # The term is capped at half of ONE rating step, so it can only
+                              # separate exact ties and can never reorder distinct ratings.
+  tie_break_ref_cost: 11.85   # analytic cost at which that term is half its range; the measured
+                              # median over 400 Pegasus jobs x the 5 shipped flavours
   prompts:
     cost: |-
       You are a distributed scheduler in a mesh topology with peer agents.
-      Score this job for THIS agent (higher = better fit, 0-100).
+      Score this job for THIS agent (higher = better fit, 0-{scale}).
 
       Key factors to consider:
       1. Resource headroom: Prefer agents with spare capacity
@@ -324,5 +338,8 @@ llm:
       When PEER CONTEXT is provided, use it to make load-aware decisions.
       Compare this agent's load against peer loads to promote balanced distribution.
 
-      Return JSON: {"score": <0-100>, "explanation": "<concise reason>"}
+      Use the FULL range and avoid round numbers: two agents that differ at all should get
+      different scores. A rating you would round to the nearest 5 is not discriminating.
+
+      Return JSON: {{"score": <0-{scale}>, "explanation": "<concise reason>"}}
       Explanation should be max 1 sentence focusing on the key decision factor.

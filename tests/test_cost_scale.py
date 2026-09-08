@@ -215,8 +215,16 @@ class TestBothPlanesShareOneRange:
         assert "* 100)" in body, "the analytic cost must stay on the 0..100 range"
 
     def test_the_llm_plane_is_a_0_100_complement(self):
-        src = open(os.path.join(REPO, "swarm/agents/llm/llm_agent.py")).read()
-        assert "cost = 100.0 - max(0.0, min(100.0, score))" in src
+        """Whatever range the model is asked for, the cost it becomes is 0..100 — that is what
+        keeps it comparable with the analytic plane. See `_score_to_cost` and test_elicitation."""
+        from swarm.agents.llm.llm_agent import LlmAgent
+        a = LlmAgent.__new__(LlmAgent)
+        for scale in (100, 1000):
+            a.config = {"llm": {"score_scale": scale}}
+            a._init_llm_state()
+            assert a._score_to_cost(0, None, None) == pytest.approx(NOMINAL_MAX)
+            assert a._score_to_cost(scale, None, None) == pytest.approx(0.0)
+            assert a._score_to_cost(scale * 0.25, None, None) == pytest.approx(75.0)
 
     def test_measured_analytic_costs_overlap_the_llm_range(self):
         """Measured over 400 real Pegasus jobs x the 5 shipped flavours (see cost_scale.py).

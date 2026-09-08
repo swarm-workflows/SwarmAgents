@@ -1566,6 +1566,14 @@ class ResourceAgent(Agent):
                 total = hits + misses
                 parts.append(f"wire_cost_hit_rate={(hits / total if total else 0.0):.2f} "
                              f"({hits}/{total})")
+            # Bid spread. A plane whose bids nearly all tie cannot be ordering agents, whatever
+            # else a run shows — 59%/92% modal share is what made the LLM's output near-inert.
+            dist = getattr(self, "bid_distribution", None)
+            if callable(dist):
+                d = dist()
+                if d["count"]:
+                    parts.append(f"bids={d['count']} distinct={d['distinct']} "
+                                 f"modal_share={d['modal_share']:.2f}")
             self.logger.info("[STATS] " + " ".join(parts))
         except Exception as exc:
             self.logger.debug(f"stats logging failed: {exc}")

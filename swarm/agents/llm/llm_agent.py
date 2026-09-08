@@ -94,7 +94,7 @@ class LlmAgent(ResourceAgent):
 
         self.bidder: Optional[LlmBidder] = LlmBidder(self.llm_cfg, logger=self.logger)
 
-        self._init_cost_cache()
+        self._init_llm_state()
 
         # Ablation switch, off by default: remove the analytic safety net so a failed LLM bid
         # means no bid at all (see _llm_or_analytic_cost). Read straight from the raw config
@@ -171,7 +171,7 @@ class LlmAgent(ResourceAgent):
 
             job.reasoning_time = bid.reasoning_time
             score = float(bid.score)
-            cost = 100.0 - max(0.0, min(100.0, score))
+            cost = self._score_to_cost(score, job, agent)
             # Only cache a verdict about THIS agent: the cache answers "what do I cost for this
             # job", and a peer's cost is a different question (and not peer-computable for the
             # LLM plane anyway).
@@ -317,6 +317,88 @@ class LlmAgent(ResourceAgent):
 
     # ---------- Verdict cache: the LLM's opinion on the consensus path -----------------------
     COST_SCALE = CostScale.LLM
+
+    def _init_llm_state(self) -> None:
+        """Every piece of LLM state that a bid depends on, in one call.
+
+        Construction goes through here so nothing can be half-initialised. It is also the single
+        hook for tests that build an agent with `__new__` to skip Redis and gRPC: two separate
+        initialisers had already broken those stubs twice, each time only when a bid path
+        happened to touch the missing attribute. Add new LLM state here, not in `__init__`.
+        """
+        self._init_cost_cache()
+        self._init_elicitation()
+
+    # ---------- Elicitation (P0-6) -----------------------------------------------------------
+    def _init_elicitation(self) -> None:
+        """Set up how a model rating becomes a cost.
+
+        The campaign's central problem with the LLM plane is that its output barely varies:
+        **59% of qwen2.5:3b bids were the identical value 75.00**, and gpt-oss-20b put **92% of
+        bids on two values**. Asking for a 0-100 rating gets answers in round steps, so most
+        agents tie and the bid cannot order them — which is one reason inverting the model's
+        reasoning changed no placements. A bigger model made it worse, not better, so the lever
+        is the elicitation, not the model.
+
+        Two arms, both off by default so the measured baseline is what ships:
+
+        * `llm.score_scale` — the range the model is asked for. A finer range gives it room to
+          discriminate. The cost is normalised back to 0..100 either way.
+        * `llm.tie_break_with_analytic` — when two bids are still equal, order them by the
+          analytic cost. The term is deliberately **sub-granular**: at most half of one rating
+          step, so it can separate exact ties and can never reorder distinct ratings. That bound
+          is what makes it safe, and `tests/test_elicitation.py` pins it.
+        """
+        llm_cfg = (getattr(self, "config", None) or {}).get("llm", {}) or {}
+        self.llm_score_scale = int(llm_cfg.get("score_scale", 100) or 100)
+        self.llm_tie_break_with_analytic = bool(llm_cfg.get("tie_break_with_analytic", False))
+        # Analytic cost at which the tie-break term reaches half its (already tiny) range.
+        # 11.85 is the measured median analytic cost over 400 real Pegasus jobs x the five
+        # shipped flavours, so the term spreads ties across the part of the range they occupy.
+        self.llm_tie_break_ref = float(llm_cfg.get("tie_break_ref_cost", 11.85))
+        # Bid distribution, for E4/T5: a plane whose bids nearly all tie cannot be influencing
+        # placement, whatever else a run shows.
+        self._bid_scores: "OrderedDict[float, int]" = OrderedDict()
+        self._bid_count = 0
+
+    def _score_to_cost(self, score: float, job: Job, agent: AgentInfo) -> float:
+        """Convert a model rating into a 0..100 cost (lower is better)."""
+        scale = float(self.llm_score_scale)
+        score = max(0.0, min(scale, float(score)))
+        cost = 100.0 * (1.0 - score / scale)
+        self._record_bid_score(score)
+        if not self.llm_tie_break_with_analytic:
+            return cost
+        # One rating step is `100/scale` cost units; stay strictly inside half of it so two
+        # distinct ratings can never swap order no matter what the analytic model says.
+        step = 100.0 / scale
+        try:
+            analytic = float(self._cost_job_on_agent(job, agent))
+        except Exception:
+            return cost
+        if analytic < 0 or analytic != analytic:          # negative or NaN — no opinion
+            return cost
+        fraction = analytic / (analytic + self.llm_tie_break_ref)   # in [0, 1)
+        return cost + 0.5 * step * fraction
+
+    def _record_bid_score(self, score: float) -> None:
+        """Track the bid distribution so tie rate and distinct-value count are reportable."""
+        key = round(float(score), 4)
+        self._bid_count += 1
+        self._bid_scores[key] = self._bid_scores.get(key, 0) + 1
+        # Bounded: a degenerate plane has a handful of distinct values, and a healthy one does
+        # not need every value retained to show that it is healthy.
+        if len(self._bid_scores) > 4096:
+            self._bid_scores.popitem(last=False)
+
+    def bid_distribution(self) -> dict:
+        """`{count, distinct, modal_share}` for the bids this agent has made."""
+        if not self._bid_count:
+            return {"count": 0, "distinct": 0, "modal_share": 0.0}
+        modal = max(self._bid_scores.values())
+        return {"count": self._bid_count,
+                "distinct": len(self._bid_scores),
+                "modal_share": modal / self._bid_count}
 
     def _init_cost_cache(self) -> None:
         """Set up the verdict cache. Called from `__init__`; a bid must never run without it.
