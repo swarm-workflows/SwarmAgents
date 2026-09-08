@@ -47,6 +47,29 @@ def bid_model_for_scale(scale: int) -> type[BaseModel]:
     )
 
 
+def build_model(cfg: LlmConfig):
+    """Resolve `cfg.provider`/`cfg.model` to a pydantic-ai model object.
+
+    Shared by `LlmBidder` and `LlmDelegator` so the two LLM call sites cannot drift on which
+    providers exist or on how the base URL and API key are resolved.
+    """
+    provider = (cfg.provider or "").strip().lower()
+    model_name = (cfg.model or "gpt-4o-mini").strip()
+
+    if provider == "openai":
+        return OpenAIChatModel(model_name)  # uses OpenAIProvider via env OPENAI_API_KEY
+    if provider in {"gemini", "gemma", "google"}:
+        return GoogleModel(model_name)  # uses Google credentials envs
+    if provider == "ollama":
+        # Env wins over config so a proxy can be interposed without rewriting per-agent configs.
+        base_url = os.getenv("OLLAMA_BASE_URL") or cfg.base_url or "http://localhost:11434/v1"
+        api_key = os.getenv("OLLAMA_API_KEY") or "ollama"  # local Ollama ignores it, client requires non-empty
+        return OpenAIChatModel(model_name, provider=OllamaProvider(base_url=base_url, api_key=api_key))
+    raise ValueError(
+        f"Unsupported provider: {cfg.provider!r}. Use 'openai', 'gemini'/'gemma', or 'ollama'."
+    )
+
+
 class ScoringDeps(BaseModel):
     job: Dict[str, Any]
     agent: Dict[str, Any]
@@ -69,23 +92,9 @@ class LlmBidder:
         self.cfg = cfg
         self.logger = logger
 
+        # Provider resolution is shared with LlmDelegator (see build_model).
         provider = (cfg.provider or "").strip().lower()
-        model_name = (cfg.model or "gpt-4o-mini").strip()
-
-        # ---------- Resolve provider/model ----------
-        if provider == "openai":
-            model = OpenAIChatModel(model_name)  # uses OpenAIProvider via env OPENAI_API_KEY
-        elif provider in {"gemini", "gemma", "google"}:
-            model = GoogleModel(model_name)  # uses Google credentials envs
-        elif provider == "ollama":
-            # Env wins over config so a proxy can be interposed without rewriting per-agent configs.
-            base_url = os.getenv("OLLAMA_BASE_URL") or cfg.base_url or "http://localhost:11434/v1"
-            api_key = os.getenv("OLLAMA_API_KEY") or "ollama"  # local Ollama ignores it, client requires non-empty
-            model = OpenAIChatModel(model_name, provider=OllamaProvider(base_url=base_url, api_key=api_key))
-        else:
-            raise ValueError(
-                f"Unsupported provider: {cfg.provider!r}. Use 'openai', 'gemini'/'gemma', or 'ollama'."
-            )
+        model = build_model(cfg)
 
         # Rating range asked for. 100 keeps the schema and prompt the campaign measured.
         self.score_scale = int(getattr(cfg, "score_scale", 100) or 100)

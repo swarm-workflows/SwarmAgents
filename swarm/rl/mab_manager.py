@@ -222,6 +222,48 @@ class MABManager:
             )
         return snapshots
 
+    def snapshots_for(self, group_ids: List[int]) -> Dict[int, GroupSnapshot]:
+        """Merged per-group view: the agent's live load data plus this manager's own
+        failure/timeout history. Public because the bandit is not the only delegation policy —
+        the LLM delegator (P0-1) needs the *same* group summary the bandit would have seen, or
+        the two arms of E4 are not comparing the same information."""
+        with self._lock:
+            return self._build_snapshots(list(group_ids))
+
+    def record_external_selection(self, job, groups: List[int],
+                                  snapshots: Optional[Dict[int, GroupSnapshot]] = None) -> None:
+        """Record a selection made by something other than this policy, so its outcome still
+        lands on the right arm with the right context.
+
+        With ``delegation.policy: llm`` the coordinator delegates without calling
+        ``select_groups``, but the delegation monitor still reports outcomes to
+        ``report_outcome`` — the arm counters move either way. Without this the contextual
+        model would be updated with ``context=None`` (silently skipped) while the arm's pull
+        and reward counts kept climbing, so the bandit's own statistics would describe a run it
+        did not steer. Recording the context keeps those statistics honest and is what P0-2's
+        ``bandit_gated_llm`` mode will reward against."""
+        if not groups:
+            return
+        job_id = getattr(job, "job_id", None)
+        if job_id is None or not self.contextual:
+            return
+        now = time.time()
+        with self._lock:
+            self._sweep_pending(now)
+            # Prefer the caller's snapshots: they are the state the *decision* was made on. An
+            # LLM call takes seconds, so rebuilding here would record the world as it looked
+            # after the choice, and the model would be trained on a context nobody acted from.
+            snaps = snapshots if snapshots is not None else self._build_snapshots(list(groups))
+            contexts = self.extractor.build(job, list(groups), snaps)
+            entries = self._pending.setdefault(job_id, {})
+            for g in groups:
+                self.policy.ensure_arm(g)
+                entries[g] = _PendingSelection(
+                    context=contexts.get(g),
+                    job_type=getattr(job, "job_type", None),
+                    selected_at=now,
+                )
+
     def _sweep_pending(self, now: float):
         """Drop pending selections whose reward never arrived (lost jobs,
         lost leadership) so the map cannot grow without bound."""

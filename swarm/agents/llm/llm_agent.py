@@ -67,8 +67,10 @@ from collections import OrderedDict, deque
 from typing import Any, Dict, Optional
 
 from swarm.agents.llm.llm_bidder import LlmBidder
+from swarm.agents.llm.llm_delegator import LlmDelegator
 from swarm.agents.llm.llm_config import LlmConfig
 from swarm.agents.resource_agent import ResourceAgent
+from swarm.rl.context import GroupSnapshot
 from swarm.consensus.messages.proposal_info import ProposalInfo
 from swarm.database.repository import Repository
 from swarm.models.job import Job
@@ -95,6 +97,27 @@ class LlmAgent(ResourceAgent):
         self.bidder: Optional[LlmBidder] = LlmBidder(self.llm_cfg, logger=self.logger)
 
         self._init_llm_state()
+
+        if self._delegation_policy_warning:
+            self.logger.warning("[LLM_DELEGATE] %s", self._delegation_policy_warning)
+
+        # Built here rather than in `_init_llm_state` because it opens a provider connection:
+        # the __new__-based test stubs call `_init_llm_state` directly and must stay offline.
+        # A coordinator that cannot build a delegator falls back to the bandit rather than
+        # failing to start — delegation must not be a single point of failure for the subtree.
+        if self.delegation_policy == self.DELEGATE_LLM:
+            try:
+                self.delegator = LlmDelegator(self.llm_cfg, logger=self.logger)
+            except Exception as e:
+                # Do NOT rewrite the policy to `bandit`: the stats would then describe a bandit
+                # run and nothing would say the configured decision plane never ran. Failure
+                # here is a permanent config problem (an unsupported `llm.provider`, say) —
+                # `build_model` opens no connection — so there is nothing to retry per job.
+                self.delegation_disabled_reason = f"{type(e).__name__}: {e}"
+                self.logger.error(
+                    "[LLM_DELEGATE] delegation.policy=llm but the delegator could not be "
+                    "built (%s); every job will fall back to the bandit at the configured "
+                    "fan-out. This run is NOT an LLM-delegation run.", e)
 
         # Ablation switch, off by default: remove the analytic safety net so a failed LLM bid
         # means no bid at all (see _llm_or_analytic_cost). Read straight from the raw config
@@ -341,6 +364,229 @@ class LlmAgent(ResourceAgent):
         self._init_cost_cache()
         self._init_elicitation()
         self._init_bid_pacing()
+        self._init_delegation()
+
+    # ---------- Group delegation (P0-1) ------------------------------------------------------
+    #: Values for `delegation.policy`.
+    DELEGATE_BANDIT = "bandit"
+    DELEGATE_LLM = "llm"
+
+    def _init_delegation(self) -> None:
+        """Read who decides where a job goes. Config only — no provider connection here.
+
+        Until this existed, "LLM coordinator" meant "coordinator whose *bid* was LLM-scored".
+        The coordinator's actual decision — which child group gets the job — was made by the
+        bandit or by nobody (delegate to all). That is the gap between an LLM-*assisted*
+        scheduler and an LLM *decision plane*, and closing it is what E1/E4 measure.
+
+        `delegation.policy`:
+
+        * `bandit` (default) — exactly the pre-existing behaviour: the bandit if `mab.enabled`,
+          otherwise every capable group. The measured baseline is what ships.
+        * `llm` — the model ranks the capable groups and the top `delegation.top_k` are used.
+          Any failure (provider error, timeout, unusable answer) falls back to `bandit` for
+          that job, so a coordinator whose LLM is down degrades to the old behaviour instead of
+          stalling its subtree.
+
+        `delegation.top_k` defaults to 0, meaning "follow `mab.top_k`" — resolved at the call
+        site so there is one default for the fan-out, not two that can disagree. Note the
+        consequence when `mab.enabled` is false: `mab.top_k` is 1, so switching to `llm` also
+        switches delegation from all-capable-groups to a single group. That is the point of the
+        policy (a ranking that picks everything is not a decision), but it means `llm` and the
+        no-bandit default are not a controlled comparison — compare `llm` against `bandit` with
+        the bandit on, or set `delegation.top_k` to match.
+        """
+        cfg = (getattr(self, "config", None) or {}).get("delegation", {}) or {}
+        policy = str(cfg.get("policy", self.DELEGATE_BANDIT) or self.DELEGATE_BANDIT).strip().lower()
+        if policy not in (self.DELEGATE_BANDIT, self.DELEGATE_LLM):
+            # No logger yet on the __new__ test path, and an unknown policy must not be fatal.
+            self._delegation_policy_warning = (
+                f"unknown delegation.policy {policy!r}; using {self.DELEGATE_BANDIT}")
+            policy = self.DELEGATE_BANDIT
+        else:
+            self._delegation_policy_warning = None
+        self.delegation_policy = policy
+        self.delegation_top_k = int(cfg.get("top_k", 0) or 0)
+        self.delegator: Optional[LlmDelegator] = None
+        # Set when `policy: llm` is configured but no delegator could be built. The policy field
+        # keeps saying `llm` — it records what the run was CONFIGURED to do, and a run whose
+        # delegator never existed must not report itself as a bandit run. `self.delegator is
+        # None` is the runtime test; this is why.
+        self.delegation_disabled_reason: Optional[str] = None
+        # E4 accounting, all per-coordinator: how many delegations the model actually decided,
+        # how many fell back, and what the decisions cost in wall-clock.
+        self.delegation_attempts = 0   # calls that reached the model, however they ended
+        self.delegation_calls = 0      # ...of those, the ones that decided something
+        self.delegation_fallbacks = 0
+        self.delegation_empty = 0
+        self.delegation_trivial = 0
+        self.delegation_filled = 0     # group slots the caller filled, not the model
+        self.delegation_seconds = 0.0
+
+    def _delegation_top_k(self) -> int:
+        """Fan-out for a delegation decision; `delegation.top_k` 0 means follow `mab.top_k`."""
+        if self.delegation_top_k > 0:
+            return self.delegation_top_k
+        return int(self.mab_top_k)
+
+    def _delegation_snapshots(self, group_ids: list) -> dict:
+        """`{group_id: GroupSnapshot}` for the candidate groups.
+
+        Deliberately the *same* view the contextual bandit gets — the manager's failure and
+        timeout history merged into the agent's live load data — so `delegation.policy: bandit`
+        and `llm` differ in the decision rule and not in the information. Without the bandit
+        there is no failure history to merge, only live load.
+        """
+        if self.mab_enabled and self.mab_manager:
+            return self.mab_manager.snapshots_for(group_ids)
+        base = self._build_group_snapshots() or {}
+        return {g: base.get(g, GroupSnapshot()) for g in group_ids}
+
+    def _group_summaries(self, job, group_ids: list, snapshots: Optional[dict] = None) -> dict:
+        """The per-group state the model reasons over.
+
+        Every field is always present, so the prompt shape does not change with configuration
+        — a group with no history reads as 0.0, not as a missing key.
+        """
+        snaps = snapshots if snapshots is not None else self._delegation_snapshots(group_ids)
+        job_type = getattr(job, "job_type", None)
+        summaries = {}
+        for g in group_ids:
+            snap = snaps.get(g) or GroupSnapshot()
+            summaries[int(g)] = {
+                "children": snap.active_children,
+                "cpu_headroom": round(float(snap.cpu_headroom), 3),
+                "ram_headroom": round(float(snap.ram_headroom), 3),
+                "gpu_headroom": round(float(snap.gpu_headroom), 3),
+                "inflight": snap.inflight,
+                "failure_rate": round(float(snap.failure_rate), 3),
+                "type_failure_rate": round(float(
+                    snap.type_failure_rates.get(job_type, snap.failure_rate)), 3),
+                "timeout_rate": round(float(snap.timeout_rate), 3),
+            }
+        return summaries
+
+    def _select_child_groups(self, job, capable_groups: list) -> list:
+        """Let the LLM choose the child group, falling back to the bandit on anything unusual.
+
+        Runs on the coordinator's scheduling thread, so the call is bounded by
+        `llm.timeout_seconds` (enforced in `LlmDelegator.rank`) — every job this coordinator
+        holds queues behind it. Unlike bidding, delegation is not a race: one coordinator owns
+        the decision for its job, so a fast fallback cannot out-run a slow peer and no pacing
+        (P0-7) applies here.
+        """
+        if self.delegation_policy != self.DELEGATE_LLM:
+            return super()._select_child_groups(job, capable_groups)
+
+        # Every fallback below passes `top_k`. The configured fan-out is a load and fairness
+        # variable, so it must survive a failed decision unchanged — and `mab.top_k` is not it
+        # when `delegation.top_k` was set.
+        top_k = self._delegation_top_k()
+        if self.delegator is None:
+            return super()._select_child_groups(job, capable_groups, top_k)
+
+        if len(capable_groups) <= 1 or top_k >= len(capable_groups):
+            # Every candidate is delegated to either way — there is no decision to buy, so do
+            # not spend an inference on one. Keeps the bandit's own bookkeeping intact too.
+            self.delegation_trivial += 1
+            return super()._select_child_groups(job, capable_groups, top_k)
+
+        # Taken once, before the call: the same state is shown to the model, written to the
+        # audit record, and (below) recorded as the bandit's selection-time context.
+        snaps = self._delegation_snapshots(capable_groups)
+        summaries = self._group_summaries(job, capable_groups, snaps)
+        self.delegation_attempts += 1
+        started_at = time.perf_counter()
+        try:
+            ranking, rationale, elapsed = self.delegator.rank(
+                job=job.to_dict(compact=True), groups=summaries)
+        except Exception as e:
+            # A timeout is the *expensive* failure — it burned the full `llm.timeout_seconds`
+            # before raising. Charging it nothing would make `mean_s` cheapest exactly when a
+            # run is drowning in fallbacks, which is the opposite of what E4 is measuring.
+            self.delegation_seconds += time.perf_counter() - started_at
+            self.delegation_fallbacks += 1
+            self.logger.warning(
+                "[LLM_DELEGATE_FALLBACK] Job=%s Groups=%s falling back to %s: %s",
+                job.job_id, capable_groups, self.DELEGATE_BANDIT, e)
+            return super()._select_child_groups(job, capable_groups, top_k)
+
+        self.delegation_seconds += elapsed
+        if not ranking:
+            # Structured output succeeded but named no group we offered. Treated as a failed
+            # decision, not as "rank them as they came": a silent pass-through would make an
+            # inert model look like a working one in the E4 numbers.
+            self.delegation_empty += 1
+            self.logger.warning(
+                "[LLM_DELEGATE_EMPTY] Job=%s Groups=%s returned no usable group in %.3fs; "
+                "falling back to %s", job.job_id, capable_groups, elapsed, self.DELEGATE_BANDIT)
+            return super()._select_child_groups(job, capable_groups, top_k)
+
+        self.delegation_calls += 1
+        # A short answer is still a decision — the model named a best group. Fill the tail with
+        # the remaining candidates in their existing order so `top_k` is always satisfiable.
+        named = set(ranking)
+        ranked = ranking + [g for g in capable_groups if g not in named]
+        selected = ranked[:top_k]
+
+        # Only the groups the MODEL named are credited to it. A short ranking with a large
+        # top_k gets its tail filled from the candidate order, and counting those as LLM-routed
+        # would attribute a placement the model never made — the E2/E4 delegation figures are
+        # built from exactly this counter.
+        for g in selected:
+            if g in named:
+                self.metrics.llm_delegations[g] = self.metrics.llm_delegations.get(g, 0) + 1
+            else:
+                self.delegation_filled += 1
+
+        # The delegation monitor reports this job's outcome to the bandit whether or not the
+        # bandit chose. Hand it the selection-time context so its arm statistics describe what
+        # actually happened (and so P0-2 has the reward path it needs).
+        if self.mab_enabled and self.mab_manager:
+            self.mab_manager.record_external_selection(job, selected, snapshots=snaps)
+
+        self.logger.info(
+            "[LLM_DELEGATE] Job=%s Candidates=%s Ranking=%s Selected=%s Time=%.3fs "
+            "Rationale=\"%s\"", job.job_id, capable_groups, ranking, selected, elapsed, rationale)
+
+        try:
+            self.repository.save({
+                "id": job.job_id,
+                "agent_id": self.agent_id,
+                "candidates": list(capable_groups),
+                "ranking": ranking,
+                "selected": selected,
+                "groups": {str(k): v for k, v in summaries.items()},
+                "rationale": rationale,
+                "reasoning_time": elapsed,
+                "ts": time.time(),
+            },
+                key=f"llm_score:delegate:A-{self.agent_id}:{Repository.KEY_JOB}:{job.job_id}",
+                level=self.topology.level, group=self.topology.group)
+        except Exception as e:
+            self.logger.exception("Failed to save LLM delegation record: %s", e)
+
+        return selected
+
+    def delegation_stats(self) -> dict:
+        """Delegation accounting for the [STATS] line, `metrics.json` and E4.
+
+        `mean_s` averages over every call that reached the model — decided, unusable, and
+        raised alike. An empty answer still cost a full inference and a timeout cost the whole
+        `llm.timeout_seconds`, so charging only the successes would make reasoning look
+        cheapest in the runs where it is doing the least.
+
+        `policy` is what was CONFIGURED, not what ran; `disabled` says when the two differ.
+        """
+        attempts = self.delegation_attempts
+        stats = {"policy": self.delegation_policy, "attempts": attempts,
+                 "calls": self.delegation_calls, "fallbacks": self.delegation_fallbacks,
+                 "empty": self.delegation_empty, "trivial": self.delegation_trivial,
+                 "filled": self.delegation_filled,
+                 "mean_s": round(self.delegation_seconds / attempts, 3) if attempts else 0.0}
+        if self.delegation_disabled_reason:
+            stats["disabled"] = self.delegation_disabled_reason
+        return stats
 
     # ---------- Bid pacing (P0-7) ------------------------------------------------------------
     #: Modes for `llm.bid_pacing`.

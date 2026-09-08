@@ -10,6 +10,26 @@ In hierarchical topology:
 
 With this implementation, Level 1 agents can be automatically configured as LLM agents while Level 0 agents remain as resource agents.
 
+## What "an LLM agent at Level 1" actually decides
+
+Two separate things, and they are configured separately:
+
+- **The bid.** `llm.*` makes the coordinator price a job with the model instead of the analytic
+  cost model. This is on by default for an LLM agent and has always been what "LLM agent" meant.
+- **The delegation.** `delegation.policy` decides which *child group* the coordinator hands a job
+  to. This is the choice the hierarchy exists to make, and until P0-1 the model never made it —
+  the bandit did (`mab.enabled`), or nobody did (the job went to every capable group). Set
+  `delegation.policy: llm` to put the model in that seat; it ranks the capable groups from their
+  live state and the top `delegation.top_k` (0 = follow `mab.top_k`) are used.
+
+A coordinator can run either, both, or neither. `delegation.policy: bandit` is the default, so
+adding `llm:` config alone changes bidding and nothing about routing. Delegation decisions are
+written to `llm_score:delegate:*` in Redis with the group state the model was shown and its
+one-line rationale, and counted in `metrics.json` under `llm_delegations` and
+`llm_delegation_stats`. Any failure — provider error, `llm.timeout_seconds` breach, an answer
+naming no group that was offered — falls back to the bandit for that job, so watch the
+`fallbacks` count in the `[STATS]` line before concluding anything about how the model routes.
+
 ## How It Works
 
 The system now supports per-agent type configuration through the following mechanism:

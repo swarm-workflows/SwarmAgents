@@ -238,6 +238,25 @@ quantum:
 #  error_rate: 0.001
 #  calibration_downtime_pct: 0.0
 #  simulator: true
+# Who decides which child group a coordinator hands a job to (P0-1). Feasibility, the DTN
+# check and the liveness gate run first; this picks among what survives.
+#   bandit  - the bandit if mab.enabled, else every capable group. The pre-existing behaviour
+#             and the measured baseline, so it is the default.
+#   llm     - the model ranks the capable groups from their live state (capacity headroom,
+#             inflight, recent failure/timeout rates) and the top `top_k` are used. Any
+#             failure - provider error, `llm.timeout_seconds` breach, an answer naming no
+#             group we offered - falls back to `bandit` for that job, AT THE SAME top_k: a
+#             fallback must not change the fan-out, or failing is rewarded with the subtree.
+#             A single candidate, or a top_k that already covers every candidate, spends no
+#             inference: the ranking could not change the outcome. Decisions are audited to
+#             `llm_score:delegate:*`. Watch `fallbacks` and `filled` in the [STATS] line -
+#             a run dominated by either is not measuring the model.
+# Note the call runs on the coordinator's scheduling thread, so every later job it holds
+# queues behind it; `llm.timeout_seconds` is the bound until P0-3 adds a cache and a budget.
+delegation:
+  policy: "bandit"                 # "bandit" (default) or "llm"
+  top_k: 0                         # Groups per job; 0 = follow mab.top_k (one default, one place)
+
 mab:
   enabled: false                   # Enable Multi-Armed Bandit for hierarchical delegation
   algorithm: "epsilon_greedy"      # "epsilon_greedy" or "ucb1"

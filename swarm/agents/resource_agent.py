@@ -1580,6 +1580,19 @@ class ResourceAgent(Agent):
                 if pc["mode"] != "none":
                     parts.append(f"pacing={pc['mode']} target={pc['target']}s "
                                  f"waits={pc['waits']} held={pc['seconds']}s")
+            # Delegation decisions the model actually made, and how often it could not. A
+            # coordinator whose fallback count dominates is running the bandit under an LLM
+            # label, which would otherwise only show up in post-hoc analysis.
+            deleg = getattr(self, "delegation_stats", None)
+            if callable(deleg):
+                dg = deleg()
+                if dg["policy"] != "bandit":
+                    parts.append(f"delegate={dg['policy']} calls={dg['calls']}/{dg['attempts']} "
+                                 f"fallbacks={dg['fallbacks']} empty={dg['empty']} "
+                                 f"trivial={dg['trivial']} filled={dg['filled']} "
+                                 f"mean={dg['mean_s']}s")
+                    if dg.get("disabled"):
+                        parts.append(f"delegate_DISABLED=\"{dg['disabled']}\"")
             self.logger.info("[STATS] " + " ".join(parts))
         except Exception as exc:
             self.logger.debug(f"stats logging failed: {exc}")
@@ -2159,6 +2172,17 @@ class ResourceAgent(Agent):
                 str(k): v for k, v in self.metrics.mab_rewards.items()
             }
             self.mab_manager.save_state()
+        # LLM group delegation (P0-1). Exported outside the MAB block: `delegation.policy: llm`
+        # is usable with the bandit off, and that arm is precisely the one E4 needs counted.
+        if self.metrics.llm_delegations:
+            agent_metrics["llm_delegations"] = self.metrics.llm_delegations
+        deleg_stats = getattr(self, "delegation_stats", None)
+        if callable(deleg_stats):
+            dg = deleg_stats()
+            # Only when this agent was actually configured to delegate with the model, or did.
+            # A default run's metrics payload keeps exactly the keys it always had.
+            if dg["policy"] != "bandit" or dg["attempts"] or dg["trivial"]:
+                agent_metrics["llm_delegation_stats"] = dg
         self.repository.save(obj=agent_metrics, key=f"{Repository.KEY_METRICS}:{self.agent_id}")
         self.logger.info("Results saved")
 
@@ -2352,6 +2376,43 @@ class ResourceAgent(Agent):
 
         return capable_groups
 
+    def _select_child_groups(self, job, capable_groups: list, top_k: int = None) -> list:
+        """Choose which of *capable_groups* this job is delegated to.
+
+        The delegation decision point. Feasibility, the liveness gate and the fallbacks have
+        already run, so every group here can and should be able to take the job — what is left
+        is a *policy* choice. `LlmAgent` overrides this to put the LLM in that seat (P0-1);
+        keeping it as one method is what makes bandit and LLM delegation directly comparable
+        for E4, since both see exactly the same candidate list.
+
+        Default (*top_k* None): the bandit if one is configured, otherwise every capable group
+        — the pre-MAB behaviour, unchanged.
+
+        *top_k* is passed by another policy falling back to this one, and it means "whatever
+        you decide, hand the job to this many groups". Fan-out is a load and fairness variable
+        in its own right, so a policy that fails must not quietly change it: without this, a
+        coordinator running `delegation.policy: llm` with `top_k: 1` and no bandit delegated to
+        *every* capable group the moment its LLM erred — failing would once again have been
+        rewarded, this time with fan-out instead of speed.
+        """
+        k = self.mab_top_k if top_k is None else int(top_k)
+        if self.mab_enabled and self.mab_manager:
+            selected_groups = self.mab_manager.select_groups(
+                capable_groups, job, top_k=k
+            )
+            for g in selected_groups:
+                self.metrics.mab_selections[g] = \
+                    self.metrics.mab_selections.get(g, 0) + 1
+            return selected_groups
+        if top_k is None:
+            return capable_groups
+        # No bandit and no model: nothing here ranks groups, so choose at random rather than
+        # by list order. `capable_groups[:k]` would send every job of a sustained LLM outage
+        # to the lowest group id, and that hot spot would read as a placement effect in E4.
+        if k >= len(capable_groups):
+            return list(capable_groups)
+        return random.sample(list(capable_groups), max(k, 0))
+
     def scheduling_main(self):
         """
         Main job scheduling loop. If this agent has children, forward the job to them.
@@ -2405,16 +2466,7 @@ class ResourceAgent(Agent):
                                 f"{job_id}; delegating ungated"
                             )
 
-                        # MAB-guided selection: pick top_k groups instead of all
-                        if self.mab_enabled and self.mab_manager:
-                            selected_groups = self.mab_manager.select_groups(
-                                capable_groups, job, top_k=self.mab_top_k
-                            )
-                            for g in selected_groups:
-                                self.metrics.mab_selections[g] = \
-                                    self.metrics.mab_selections.get(g, 0) + 1
-                        else:
-                            selected_groups = capable_groups
+                        selected_groups = self._select_child_groups(job, capable_groups)
 
                         self.queues.selected_queue.remove(job_id)
                         job.level = self.topology.level - 1

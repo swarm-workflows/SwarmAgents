@@ -43,6 +43,11 @@ class Metrics:
         self.delegation_reassignments = {}
         self.mab_rewards = {}      # group_id -> list of (timestamp, reward)
         self.mab_selections = {}   # group_id -> selection count
+        # LLM group delegation (P0-1): group_id -> count of jobs the *model* routed there.
+        # Separate from mab_selections so a run cannot report bandit selections it never made
+        # — under `delegation.policy: llm` the bandit still receives outcomes, so a shared
+        # counter would read as if it had been choosing.
+        self.llm_delegations = {}
         self.infeasible_retired = []  # job_ids retired after max infeasible retries
         self.agent_recoveries = []   # dicts with agent_id, recovered_at
 
