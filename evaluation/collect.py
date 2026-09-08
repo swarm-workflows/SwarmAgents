@@ -3,7 +3,7 @@
 
 Walks one or more run-tree roots, finds every leaf run directory (identified by
 ``all_jobs.csv``), derives the experiment factors from the directory path, computes the
-metric set from ``docs/CCGRID_EVAL_PLAN.md`` section 7, and writes:
+metric set from ``docs/FGCS_EVAL_PLAN.md`` section 7, and writes:
 
 * ``runs_wide.csv``   -- one row per run, one column per metric
 * ``runs_tidy.csv``   -- one row per (run, metric); convenient for seaborn/ggplot
