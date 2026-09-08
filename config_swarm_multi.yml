@@ -193,12 +193,6 @@ job_selection:
   quantum_penalty_factor: 1.0         # Multiplier for quantum backend quality penalty (error rate + calibration downtime)
   selection_threshold_pct: 10.0       # % above min cost allowed in candidate selection (lower = stricter, higher = more agents considered)
 
-  # Analytic cost that maps to the midpoint of the canonical 0-100 wire scale
-  # (swarm/agents/cost_scale.py). Costs advertised to peers are canonical so that an analytic
-  # agent and an LLM agent are comparable at all; native costs, and therefore selection and
-  # selection_threshold_pct, are untouched. 1.0 is "fully utilised, no penalties".
-  analytic_cost_half: 1.0
-  llm_cost_half: 50.0                 # LLM cost (100 - score) mapped to the same midpoint
 
   # Designated-bidder mode (LLM agents only). Default false = every agent bids on every job it
   # can run, which is what the campaign measured: ~3.7 distinct agents pay a full LLM bid per

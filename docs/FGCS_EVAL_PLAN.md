@@ -66,16 +66,26 @@ arrival time, and the LLM's output is close to inert.** Evidence, all measured:
 - **59% of qwen2.5:3b bids were the identical score 75.00**; gpt-oss-20b put **92% on two values**.
   A 0–100 rating is a degenerate cost signal at any model size. (The id-based tie-break that this
   exposed is fixed — `swarm/utils/tiebreak.py` — but the ties remain.)
-- ~~**Finding 11**~~ **FIXED 2026-09-08 (P0-5).** Under `consensus.protocol: snow` (the shipped
-  default) peers answered queries with `_cost_job_on_agent`, the *analytic* cost; the LLM cost
-  entered only through the initiator, and the two are on different scales (0–1 vs 25–75), so the
-  dominance rule degenerated. Every LLM × Snow cell in E1 would have measured the analytic model
-  with LLM latency attached. **A third consequence surfaced while fixing it, and is new:** a
-  *failed* LLM bid falls back to the analytic model, so advertised raw it read as ~0.5 against
-  healthy peers' 25–75 — a broken agent looked like the cheapest host in the fleet. The campaign
-  attributed S05's capture entirely to the fallback being fast; **scale was an independent second
-  channel**, and it is now removed. E8 should report capture with and without it, since the
-  measured 16.9× capture ratio conflates the two.
+- ~~**Finding 11, first half**~~ **FIXED 2026-09-08 (P0-5).** Under `consensus.protocol: snow`
+  (the shipped default) peers answered queries with `_cost_job_on_agent`, the *analytic* cost, so
+  the LLM's verdict entered only through the initiator. Every LLM × Snow cell in E1 would have
+  measured the analytic model with LLM latency attached. Peers now answer from a cached LLM
+  verdict, or abstain.
+- **Finding 11's second half is WRONG, and the correction matters for the paper.** It states the
+  two costs are on different scales — "analytic roughly 0–1 ... LLM 25–75". `compute_job_cost`
+  ends in `* 100`, so both planes emit 0–100. Measured over 400 real Pegasus jobs × the five
+  shipped flavours: analytic p10 2.59, p25 5.41, **p50 11.85**, p75 28.40, p90 71.85, 1.6% above
+  100 — squarely overlapping the LLM's 25 (score 75) and 5 (score 95). A canonical rescaling
+  built on the 0–1 claim was written and then removed the same day: on the real distribution it
+  sent a median analytic cost to 92.2 and made every analytic agent look worthless, an inversion
+  far worse than the problem. Costs are compared raw; `tests/test_cost_scale.py` pins the 0–100
+  assumption so a change to either model fails a test.
+- **What survives of it is smaller and is an E4 measurement, not a bug.** The two models
+  *calibrate* differently: a fallback analytic bid has median 11.85 against a typical LLM bid of
+  25, so an agent whose LLM is down bids ~2× lower on average. That is a difference between two
+  models' opinions, not a units error, and correcting it would be putting a thumb on the scale.
+  E4 should report the bid distribution per plane; E8's capture ratio has this mixed into it
+  alongside the fallback's speed advantage.
 - Throughput is flat in fleet size on the LLM arm (14→60 agents: 0.96→0.82 jobs/s) because every
   agent bids on every job (3.7 bidders/job). Designated bidding halves the LLM calls but its first
   run was 97.8% deadline-forced (deadline mis-tuned; counters per-iteration, not per-job).
@@ -83,8 +93,9 @@ arrival time, and the LLM's output is close to inert.** Evidence, all measured:
 **Consequences for the plan:**
 
 1. **Add P0-5 — LLM cost reaches the Snow query path** (cache the last LLM verdict per job for
-   `my_cost_for_job`; never call the model on the inbound thread) **and normalise the two cost
-   scales**. Blocking for E1's core cells. Do this before anything else in §4.
+   `my_cost_for_job`; never call the model on the inbound thread). Blocking for E1's core cells.
+   Do this before anything else in §4. *(The "normalise the two cost scales" clause originally
+   here was dropped: the scales were already the same. See the correction above.)*
 2. **Add P0-6 — bid elicitation.** Ask for a rank or pairwise judgement over the candidate window,
    or a finer scale with the analytic cost breaking ties, so the LLM produces a continuous signal.
    Report tie rate and distinct-value count per model in E4 (T5).
@@ -235,7 +246,7 @@ that previously existed only at 30 agents, plus a SWARM+ (PBFT + analytic) re-ba
 | ID | Work | Where | Est. |
 |---|---|---|---|
 | **P0-0** ✅ | **Pre-campaign fixes (done 2026-09-08)** — the §0.2 list: duplicate `peer_expiry_seconds`, flat 1 s job sleep (restore `wall_time * scale`), `--runtime` never read, `agent_hosts.txt` delete-then-read, `llm.timeout_seconds` unenforced, prefix-stable fleets across the scale ladder, clean-state generation in the driver. | `config_swarm_multi.yml`, `swarm/models/job.py`, `run_test.py`, `llm_bidder.py`, `generate_configs.py` | 2 d |
-| **P0-5** ✅ | **LLM cost reaches the Snow query path (done 2026-09-08).** Chaos finding 11. `_HostAdapter.my_cost_for_job` returns the analytic cost, so peers out-vote the LLM and compare 0–1 against 25–75. Cache the last LLM verdict per (job, agent) for the inbound path — never call the model on the consumer thread — and normalise both costs onto one scale before any comparison. **Blocking for every LLM × Snow/Hybrid cell in E1.** **As landed:** `_HostAdapter.my_cost_for_job` delegates to an overridable `wire_cost_for_job`; `LlmAgent` answers from a bounded, TTL'd verdict cache written on every bid (never calling the model on the inbound thread), and abstains on a miss rather than answering with a different plane (`llm.snow_cost_fallback: analytic` is the ablation arm). Scales are unified by `swarm/agents/cost_scale.py`: native costs stay inside selection, everything on the wire is canonical 0-100. Tests in `tests/test_cost_scale.py`, including the contrast driven through the real Snow engine. | `resource_agent.py` `_HostAdapter`, `llm_agent.py`, `cost_scale.py` | 2 d |
+| **P0-5** ✅ | **LLM cost reaches the Snow query path (done 2026-09-08).** Chaos finding 11. `_HostAdapter.my_cost_for_job` returns the analytic cost, so peers out-vote the LLM and compare 0–1 against 25–75. Cache the last LLM verdict per (job, agent) for the inbound path — never call the model on the consumer thread — and normalise both costs onto one scale before any comparison. **Blocking for every LLM × Snow/Hybrid cell in E1.** **As landed:** `_HostAdapter.my_cost_for_job` delegates to an overridable `wire_cost_for_job`; `LlmAgent` answers from a bounded, TTL'd verdict cache written on every bid (never calling the model on the inbound thread), and abstains on a miss rather than answering with a different plane (`llm.snow_cost_fallback: analytic` is the ablation arm). **No rescaling**: measurement showed both planes already emit 0-100, so the "normalise the two scales" half of this item was not needed and the attempt at it was harmful — see §0.3. `swarm/agents/cost_scale.py` now only tags which plane produced a cost, for instrumentation, and records the measurement. Tests in `tests/test_cost_scale.py`. | `resource_agent.py` `_HostAdapter`, `llm_agent.py`, `cost_scale.py` | 2 d |
 | **P0-6** | **Bid elicitation.** Replace the 0–100 absolute rating (59–92% of bids tie) with a rank or pairwise judgement over the candidate window, or a finer scale with the analytic cost breaking ties. Emit tie rate and distinct-value count per run. Keep the old prompt selectable as the E4 control arm. | `llm_bidder.py`, `config_swarm_multi.yml` prompts | 2 d |
 | **P0-7** | **Fallback parity.** A fallback bid must not be ~100× cheaper than an LLM bid: apply the bid deadline uniformly, or delay fallback proposals to the LLM's p50. `llm.disable_fallback` remains the ablation arm. | `llm_agent.py` `_llm_or_analytic_cost` | 1 d |
 | **P0-8** | **Fix `designate_bidder`** before any 270-agent LLM cell: per-job (not per-iteration) counters; deadline sized to the designee's window, not to one bid. Otherwise LLM-plane throughput is flat in fleet size (3.7 bidders/job). | `llm_agent.py` `_designate_bidders` | 1 d |

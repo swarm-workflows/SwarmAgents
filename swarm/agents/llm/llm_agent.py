@@ -76,7 +76,7 @@ from swarm.models.agent_info import AgentInfo
 from swarm.models.object import ObjectState
 from swarm.selection.engine import SelectionEngine
 from swarm.selection.penalties import apply_multiplicative_penalty
-from swarm.agents.cost_scale import CostScale, to_canonical
+from swarm.agents.cost_scale import CostScale
 from swarm.utils.tiebreak import tiebreak_rank
 from swarm.utils.utils import generate_id
 
@@ -231,10 +231,11 @@ class LlmAgent(ResourceAgent):
             self.logger.info(
                 f"[ANALYTIC_COST] Job={job.job_id} Agent={agent.agent_id} Cost={analytical_cost:.2f}"
             )
-            # Remember the SCALE as analytic, not LLM. A fallback bid is an analytic cost
-            # (~0..1); advertising it on the LLM's 0..100 scale would make a broken agent the
-            # cheapest host in the fleet. Canonicalising it as analytic removes that, which is
-            # a second capture channel alongside the fallback's speed (chaos S05).
+            # Tag the verdict as analytic so instrumentation can tell a fallback from a real
+            # bid. Both planes emit 0..100, so nothing is converted — but the two models do
+            # CALIBRATE differently (analytic median 11.85 against a typical LLM bid of 25), so
+            # a fallback bid is systematically a little cheaper. That is a real, ~2x effect for
+            # E4 to measure, not a units error to correct away.
             if getattr(agent, "agent_id", None) == self.agent_id:
                 self._remember_cost(job.job_id, float(analytical_cost), CostScale.ANALYTIC)
             return analytical_cost
@@ -328,10 +329,12 @@ class LlmAgent(ResourceAgent):
         default) the LLM's verdict entered the protocol only through whoever initiated the round
         and was out-voted by every peer that had the job locally.
 
-        `_cost_cache[job_id] = (native_cost, scale, ts)`. The scale is stored per entry, not per
-        agent, because a fallback bid really is an analytic cost and must be canonicalised as
-        one — advertising a 0.5 fallback on the LLM's 0..100 scale would make a broken agent look
-        like the cheapest host in the fleet.
+        `_cost_cache[job_id] = (native_cost, scale, ts)`. The scale is recorded per entry so
+        instrumentation can separate a real LLM verdict from an analytic fallback; it converts
+        nothing, because both planes already emit 0..100 — `compute_job_cost` ends in `* 100`
+        and the LLM plane returns `100 - score`. See `swarm/agents/cost_scale.py` for the
+        measured distributions and for why the per-plane rescaling that briefly lived there was
+        worse than the mismatch it was meant to fix.
         """
         llm_cfg = (getattr(self, "config", None) or {}).get("llm", {}) or {}
         self._cost_cache: "OrderedDict[str, tuple]" = OrderedDict()
@@ -358,26 +361,6 @@ class LlmAgent(ResourceAgent):
             self._cost_cache.move_to_end(job_id)
             while len(self._cost_cache) > self._cost_cache_max:
                 self._cost_cache.popitem(last=False)
-
-    def proposal_cost(self, job: Job, native_cost: float) -> float:
-        """Canonical cost to advertise, using the plane that actually produced this bid.
-
-        Not `self.COST_SCALE` unconditionally: when the LLM bid failed, `native_cost` is an
-        analytic number and must be canonicalised as one.
-
-        The scale is taken from the cache entry for this job by ID ALONE. An earlier version also
-        required the cached value to equal `native_cost`, which never held: selection applies a
-        multiplicative load penalty (up to ~2x) between the bid and this call, so every fallback
-        fell through to the LLM scale and a 0.5 analytic cost was advertised as 0.5 — the
-        "broken agent looks cheapest" bug this method exists to prevent, reintroduced. The
-        penalty scales a cost, it does not change which plane produced it.
-        """
-        scale = self.COST_SCALE
-        with self._cost_cache_lock:
-            entry = self._cost_cache.get(getattr(job, "job_id", None))
-        if entry is not None:
-            scale = entry[1]
-        return round(self.to_wire(native_cost, scale), 2)
 
     def native_cost_for_job(self, object_id: str):
         """Answer an inbound consensus query from the LLM verdict, never by calling the model.
@@ -620,8 +603,6 @@ class LlmAgent(ResourceAgent):
                             p_id=generate_id(),
                             object_id=job.job_id,
                             agent_id=self.agent_id,
-                            # Canonical wire cost (see swarm/agents/cost_scale.py), so a peer
-                            # comparing this against its own bid is comparing like with like.
                             # Real cost, not `cost + self.agent_id` — see the same change in
                             # ResourceAgent. Exact ties are broken by tiebreak_rank now.
                             cost=self.proposal_cost(job, cost)

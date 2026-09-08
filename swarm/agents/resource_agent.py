@@ -64,7 +64,7 @@ from swarm.quantum.split import build_post_process_job, experiment_id_for, split
 from swarm.rl.context import snapshots_from_children
 from swarm.rl.mab_manager import MABManager
 
-from swarm.agents.cost_scale import ANALYTIC_HALF, LLM_HALF, CostScale, to_canonical
+from swarm.agents.cost_scale import CostScale
 from swarm.utils.tiebreak import tiebreak_rank
 from swarm.utils.utils import generate_id, job_capacities
 
@@ -396,10 +396,6 @@ class ResourceAgent(Agent):
         self.quantum_penalty_factor = job_cfg.get("quantum_penalty_factor", 1.0)
         # % above min cost allowed in candidate selection (lower = stricter, higher = more agents considered)
         self.selection_threshold_pct = job_cfg.get("selection_threshold_pct", 10.0)
-        # Analytic cost mapped to the midpoint of the canonical wire scale; see
-        # swarm/agents/cost_scale.py. Only affects what peers compare, never selection.
-        self.analytic_cost_half = float(job_cfg.get("analytic_cost_half", ANALYTIC_HALF))
-        self.llm_cost_half = float(job_cfg.get("llm_cost_half", LLM_HALF))
 
         self.selector = SelectionEngine(
             feasible=lambda job, agent: self.is_job_feasible(job, agent),
@@ -2076,9 +2072,7 @@ class ResourceAgent(Agent):
                             p_id=generate_id(),
                             object_id=job.job_id,
                             agent_id=self.agent_id,
-                            # Advertise the real cost, on the canonical wire scale so peers
-                            # running a different decision plane can compare it (see
-                            # swarm/agents/cost_scale.py). This used to be `cost + self.agent_id`,
+                            # Advertise the real cost. This used to be `cost + self.agent_id`,
                             # which made every proposal cost unique and so served as a tie-break
                             # — but a raw id is a ±N swing on a 0-100 scale for an N-agent fleet,
                             # larger than most genuine cost differences and always favouring low
@@ -2663,9 +2657,8 @@ class ResourceAgent(Agent):
                                      backend=agent.quantum_backend, site=agent.site)
 
     # ---------- Cost that crosses the wire ----------------------------------------------
-    # Native costs are decision-plane specific and are NOT comparable between planes; see
-    # swarm/agents/cost_scale.py. Selection keeps native units (a relative threshold makes a
-    # non-linear transform there a behaviour change); anything peers will compare is canonical.
+    # Both planes emit 0..100 and are compared raw; `COST_SCALE` only tags which plane a cost
+    # came from, for instrumentation. See swarm/agents/cost_scale.py for the measurement.
     COST_SCALE: str = CostScale.ANALYTIC
 
     def native_cost_for_job(self, object_id: str):
@@ -2689,22 +2682,22 @@ class ResourceAgent(Agent):
             return None
 
     def wire_cost_for_job(self, object_id: str):
-        """This agent's own cost for a job on the canonical scale, or None if it cannot say."""
+        """This agent's own cost for a job as advertised to peers, or None if it cannot say."""
         got = self.native_cost_for_job(object_id)
         if got is None:
             return None
-        native, scale = got
-        return self.to_wire(native, scale)
-
-    def to_wire(self, native_cost: float, scale: str) -> float:
-        """Canonicalise a native cost from `scale` using this agent's configured references."""
-        return to_canonical(native_cost, scale,
-                            analytic_half=self.analytic_cost_half,
-                            llm_half=self.llm_cost_half)
+        native, _scale = got
+        return native
 
     def proposal_cost(self, job: Job, native_cost: float) -> float:
-        """Canonical cost to advertise for a proposal this agent is making."""
-        return round(self.to_wire(native_cost, self.COST_SCALE), 2)
+        """Cost to advertise for a proposal this agent is making.
+
+        No conversion: both decision planes already emit 0..100 (`compute_job_cost` ends in
+        `* 100`; the LLM plane returns `100 - score`), so peers can compare the raw values.
+        See `swarm/agents/cost_scale.py` for the measurement behind that, and for why the
+        per-plane rescaling that used to happen here was worse than the problem it addressed.
+        """
+        return round(float(native_cost), 2)
 
     @staticmethod
     def _projected_load_factor(agent: AgentInfo) -> float:

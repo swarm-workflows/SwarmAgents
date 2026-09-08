@@ -1,16 +1,15 @@
-"""P0-5: the LLM's verdict must reach consensus, on a scale peers can compare.
+"""P0-5: the LLM's verdict must reach consensus.
 
-Two defects, one symptom (chaos finding 11):
+`_HostAdapter.my_cost_for_job` computed the ANALYTIC cost and `LlmAgent` did not override it, so
+an LLM agent priced a job with the model when proposing and analytically when voting. Under
+`consensus.protocol: snow` — the shipped default — the LLM's opinion entered the protocol only
+through whoever initiated the round (chaos finding 11).
 
-1. `_HostAdapter.my_cost_for_job` computed the ANALYTIC cost, and `LlmAgent` did not override
-   it. So an LLM agent priced a job with the model when proposing and analytically when voting:
-   under `consensus.protocol: snow` — the shipped default — the LLM's opinion entered the
-   protocol only through whoever initiated the round.
-2. The two planes are not on the same scale (analytic ~0..1, LLM 25..75), so a peer comparing
-   its 0.5 against an initiator's 45 "dominated" every time and the rule degenerated.
-
-The same mismatch also made a *failed* LLM bid — which falls back to the analytic model — look
-like the cheapest host in the fleet, a capture channel independent of the fallback's speed.
+Finding 11 also claims the two costs are "not on the same scale ... analytic roughly 0-1 ...
+LLM 25-75". `TestBothPlanesShareOneRange` refutes that and pins the refutation: the analytic
+model ends in `* 100`, so both planes emit 0..100 and are compared raw. A rescaling built on
+the 0-1 claim shipped briefly and was far worse than the mismatch it addressed — it sent a
+median analytic cost of 11.85 to 92.2 — so the assumption is now a test rather than a comment.
 """
 import os
 import sys
@@ -22,109 +21,9 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from swarm.agents.cost_scale import (ANALYTIC_HALF, CANONICAL_MAX,  # noqa: E402
-                                     LLM_HALF, CostScale, to_canonical)
-from swarm.utils.tiebreak import tiebreak_rank  # noqa: E402
+from swarm.agents.cost_scale import CostScale, NOMINAL_MAX  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-
-class TestCanonicalScale:
-    @pytest.mark.parametrize("scale", [CostScale.ANALYTIC, CostScale.LLM])
-    def test_both_planes_are_bounded(self, scale):
-        for c in (0.0, 0.01, 1.0, 10.0, 1e6):
-            assert 0.0 <= to_canonical(c, scale) <= CANONICAL_MAX
-
-    def test_each_plane_reference_cost_lands_on_the_midpoint(self):
-        """The calibration: whatever each plane calls middling maps to the same canonical 50."""
-        assert to_canonical(ANALYTIC_HALF, CostScale.ANALYTIC) == pytest.approx(50.0)
-        assert to_canonical(LLM_HALF, CostScale.LLM) == pytest.approx(50.0)
-        assert to_canonical(2.0, CostScale.ANALYTIC, analytic_half=2.0) == pytest.approx(50.0)
-        assert to_canonical(30.0, CostScale.LLM, llm_half=30.0) == pytest.approx(50.0)
-
-    def test_equivalent_costs_on_the_two_planes_agree(self):
-        """Half of each plane's reference is the same canonical cost, which is the property
-        that makes an analytic agent and an LLM agent comparable at all."""
-        assert to_canonical(ANALYTIC_HALF / 2, CostScale.ANALYTIC) == pytest.approx(
-            to_canonical(LLM_HALF / 2, CostScale.LLM))
-
-    def test_a_penalised_llm_cost_keeps_its_ordering(self):
-        """Selection multiplies by a load factor up to ~2x BEFORE canonicalising, so LLM costs
-        arrive above 100. Clamping there mapped every loaded agent to the same value."""
-        loaded = [to_canonical(c * 2.0, CostScale.LLM) for c in (25.0, 50.0, 75.0, 90.0)]
-        assert loaded == sorted(loaded)
-        assert len(set(loaded)) == 4, "loaded agents must stay distinguishable"
-        assert max(loaded) < CANONICAL_MAX
-
-    @pytest.mark.parametrize("scale", [CostScale.ANALYTIC, CostScale.LLM])
-    def test_strictly_increasing_so_no_within_plane_reordering(self, scale):
-        """The whole safety argument: canonicalising must not change who wins within a plane."""
-        native = [0.0, 0.001, 0.01, 0.1, 0.5, 0.9, 1.0, 1.5, 3.0, 17.0, 99.0, 150.0, 1e4]
-        out = [to_canonical(c, scale) for c in native]
-        assert out == sorted(out)
-        assert len(set(out)) == len(out), "distinct costs must stay distinct"
-
-    def test_infinity_is_the_worst_possible_cost(self):
-        """SelectionEngine uses +inf for 'not a candidate'; it must not wrap to cheap."""
-        assert to_canonical(float("inf"), CostScale.ANALYTIC) == CANONICAL_MAX
-        assert to_canonical(float("inf"), CostScale.LLM) == CANONICAL_MAX
-
-    def test_negative_costs_clamp_to_zero(self):
-        assert to_canonical(-5.0, CostScale.ANALYTIC) == 0.0
-        assert to_canonical(-5.0, CostScale.LLM) == 0.0
-
-    def test_nan_is_refused(self):
-        with pytest.raises(ValueError):
-            to_canonical(float("nan"), CostScale.ANALYTIC)
-
-    def test_unknown_scale_is_refused(self):
-        with pytest.raises(ValueError):
-            to_canonical(1.0, "vibes")
-
-
-class TestScaleMismatchWasTheBug:
-    """Pins the degeneracy, so nobody 'simplifies' the canonical scale back out."""
-
-    ANALYTIC_IDLE = 0.5      # a lightly loaded agent, analytic model
-    LLM_GOOD_BID = 25.0      # score 75 — the modal LLM bid in the campaign
-    LLM_GREAT_BID = 5.0      # score 95 — the modal gateway bid
-
-    @staticmethod
-    def _dominates(job_id, cost_a, agent_a, cost_b, agent_b):
-        """The Snow dominance rule, as gossip_engine applies it."""
-        if cost_a != cost_b:
-            return cost_a < cost_b
-        return tiebreak_rank(job_id, agent_a) < tiebreak_rank(job_id, agent_b)
-
-    def test_raw_costs_let_any_analytic_peer_beat_every_llm_bid(self):
-        """Before the fix: a peer's analytic 0.5 beat even a near-perfect LLM bid."""
-        assert self._dominates("j1", self.ANALYTIC_IDLE, 2, self.LLM_GOOD_BID, 1)
-        assert self._dominates("j1", self.ANALYTIC_IDLE, 2, self.LLM_GREAT_BID, 1)
-
-    def test_canonical_costs_make_the_comparison_meaningful(self):
-        """After: a strong LLM bid can beat a half-utilised analytic peer, and a nearly idle
-        peer still beats a mediocre bid. Either way the comparison reflects the costs."""
-        peer = to_canonical(self.ANALYTIC_IDLE, CostScale.ANALYTIC)   # 33.3
-        great = to_canonical(self.LLM_GREAT_BID, CostScale.LLM)       # 9.1
-        good = to_canonical(self.LLM_GOOD_BID, CostScale.LLM)         # 33.3
-        assert self._dominates("j1", great, 1, peer, 2), "a great bid must be able to win"
-        idle = to_canonical(0.05, CostScale.ANALYTIC)                 # 4.8 — nearly idle peer
-        assert self._dominates("j1", idle, 2, good, 1), "a genuinely idle peer still wins"
-
-    def test_a_failed_llm_bid_no_longer_looks_like_the_best_host(self):
-        """The second, unmeasured capture channel: an agent whose LLM is down falls back to the
-        analytic model. Advertised raw, its 0.5 beat every healthy peer's real bid."""
-        broken_raw = self.ANALYTIC_IDLE
-        healthy_raw = self.LLM_GOOD_BID
-        assert self._dominates("j1", broken_raw, 9, healthy_raw, 1), "the old behaviour"
-
-        broken = to_canonical(self.ANALYTIC_IDLE, CostScale.ANALYTIC)   # 33.3
-        healthy = to_canonical(self.LLM_GREAT_BID, CostScale.LLM)       # 9.1
-        assert self._dominates("j1", healthy, 1, broken, 9), \
-            "a good bid must beat a fallback bid from an equally-loaded agent"
-        # And the equally-middling case is now a genuine tie on cost rather than a walkover.
-        assert to_canonical(self.ANALYTIC_IDLE, CostScale.ANALYTIC) == pytest.approx(
-            to_canonical(self.LLM_GOOD_BID, CostScale.LLM))
 
 
 class _FakeCache:
@@ -277,94 +176,74 @@ class TestThroughTheRealSnowEngine:
         ans = eng._answer_query("q1", "j1", q_preferred=1, q_cost=25.0)
         assert ans["preferred_agent"] == 2, "pins the pre-fix behaviour"
 
-    def test_canonical_costs_let_a_good_llm_bid_stand(self):
-        """After canonicalisation the peer answers 33.3 and a score-95 bid (9.1) wins."""
-        peer = to_canonical(0.5, CostScale.ANALYTIC)                         # 33.3
-        bid = to_canonical(5.0, CostScale.LLM)                               # 9.1
-        eng = self._engine(my_cost=peer)
-        ans = eng._answer_query("q1", "j1", q_preferred=1, q_cost=bid)
+    def test_a_dearer_peer_lets_the_initiator_keep_the_job(self):
+        """Both planes emit 0..100, so this is a like-for-like comparison: the peer's analytic
+        cost sits at the 75th percentile of what that model produces, above a good LLM bid."""
+        eng = self._engine(my_cost=28.40)          # analytic p75
+        ans = eng._answer_query("q1", "j1", q_preferred=1, q_cost=5.0)   # LLM score 95
         assert ans["preferred_agent"] == 1
-        assert ans["cost"] == pytest.approx(bid)
+        assert ans["cost"] == pytest.approx(5.0)
 
     def test_a_genuinely_cheaper_peer_still_wins(self):
         """The fix must not simply hand every round to the initiator."""
-        eng = self._engine(my_cost=to_canonical(0.05, CostScale.ANALYTIC))   # 4.8
-        ans = eng._answer_query("q1", "j1", q_preferred=1,
-                                q_cost=to_canonical(25.0, CostScale.LLM))    # 33.3
+        eng = self._engine(my_cost=5.41)           # analytic p25
+        ans = eng._answer_query("q1", "j1", q_preferred=1, q_cost=25.0)  # LLM score 75
         assert ans["preferred_agent"] == 2
 
     def test_two_llm_agents_compare_directly(self):
         """The comparison the campaign has never actually made: bid against bid."""
-        eng = self._engine(my_cost=to_canonical(5.0, CostScale.LLM))         # score 95 -> 9.1
-        ans = eng._answer_query("q1", "j1", q_preferred=1,
-                                q_cost=to_canonical(25.0, CostScale.LLM))    # score 75 -> 33.3
+        eng = self._engine(my_cost=5.0)                                  # score 95
+        ans = eng._answer_query("q1", "j1", q_preferred=1, q_cost=25.0)  # score 75
         assert ans["preferred_agent"] == 2
-        assert ans["cost"] == pytest.approx(to_canonical(5.0, CostScale.LLM))
+        assert ans["cost"] == pytest.approx(5.0)
+
+    def test_a_loaded_agent_above_the_nominal_max_still_loses_properly(self):
+        """Post-penalty costs exceed 100; without clamping they still order correctly."""
+        eng = self._engine(my_cost=150.0)
+        ans = eng._answer_query("q1", "j1", q_preferred=1, q_cost=120.0)
+        assert ans["preferred_agent"] == 1
 
 
-class TestProposalCostUsesTheProducingPlane:
-    """The advertised cost must be canonicalised on the plane that produced the bid.
+class TestBothPlanesShareOneRange:
+    """The assumption that lets costs be compared raw. If either model's range moves, this
+    fails — which is the point: finding 11's "analytic is 0-1" was never checked."""
 
-    Selection multiplies the native cost by a live load factor (up to ~2x) between the bid and
-    the proposal, so the value reaching `proposal_cost` never equals the cached one. An earlier
-    version required them to be equal before trusting the cached scale; every fallback therefore
-    fell through to the LLM plane and a 0.5 analytic cost was advertised as 0.5 — the exact
-    "broken agent looks cheapest" bug the canonical scale exists to remove.
-    """
+    def test_the_analytic_model_scales_to_0_100(self):
+        """`compute_job_cost` ends in `* 100`. Drop that and the planes really do diverge."""
+        src = open(os.path.join(REPO, "swarm/agents/resource_agent.py")).read()
+        body = src[src.index("def compute_job_cost"):src.index("def selection_main")]
+        assert "* 100)" in body, "the analytic cost must stay on the 0..100 range"
 
-    @pytest.fixture
-    def agent(self):
-        from swarm.agents.llm.llm_agent import LlmAgent
-        obj = _FakeCache(maxsize=64)
-        for name in ("_remember_cost", "proposal_cost", "to_wire"):
-            setattr(obj, name, getattr(LlmAgent, name).__get__(obj))
-        obj.COST_SCALE = LlmAgent.COST_SCALE
-        obj.analytic_cost_half = ANALYTIC_HALF
-        obj.llm_cost_half = LLM_HALF
-        return obj
+    def test_the_llm_plane_is_a_0_100_complement(self):
+        src = open(os.path.join(REPO, "swarm/agents/llm/llm_agent.py")).read()
+        assert "cost = 100.0 - max(0.0, min(100.0, score))" in src
 
-    class _Job:
-        def __init__(self, job_id):
-            self.job_id = job_id
+    def test_measured_analytic_costs_overlap_the_llm_range(self):
+        """Measured over 400 real Pegasus jobs x the 5 shipped flavours (see cost_scale.py).
+        Kept as fixed quantiles so a change to weights or penalties surfaces here."""
+        measured = {"p10": 2.59, "p25": 5.41, "p50": 11.85, "p75": 28.40, "p90": 71.85}
+        llm_typical = (5.0, 25.0)          # scores 95 and 75, the two modal bids
+        assert measured["p25"] <= llm_typical[1] <= measured["p75"], \
+            "a typical LLM bid must sit inside the analytic interquartile range"
+        assert all(0.0 <= v <= NOMINAL_MAX for v in measured.values())
 
-    LOAD_FACTOR = 1.35        # 1 + (50/100)**1.5, an agent at 50% projected load
+    def test_nothing_rescales_a_cost_on_the_way_to_the_wire(self):
+        """The rescaling is gone; a reintroduced one must be a deliberate, reviewed change."""
+        from swarm.agents import cost_scale
+        assert not hasattr(cost_scale, "to_canonical")
+        for path in ("swarm/agents/resource_agent.py", "swarm/agents/llm/llm_agent.py"):
+            assert "to_canonical" not in open(os.path.join(REPO, path)).read(), path
 
-    def test_a_penalised_fallback_is_canonicalised_as_analytic(self, agent):
-        agent._remember_cost("j1", 0.5, CostScale.ANALYTIC)
-        advertised = agent.proposal_cost(self._Job("j1"), 0.5 * self.LOAD_FACTOR)
-        assert advertised == pytest.approx(
-            to_canonical(0.5 * self.LOAD_FACTOR, CostScale.ANALYTIC), abs=0.01)
-        assert advertised > 30.0, "a raw ~0.68 here is the bug: it beats every real bid"
+    def test_costs_above_the_nominal_max_are_not_clamped(self):
+        """1.6% of analytic costs exceed 100, and the load penalty (up to ~2x) pushes either
+        plane past it. Clamping would map every loaded agent to the same value."""
+        from swarm.agents.resource_agent import ResourceAgent
+        agent = ResourceAgent.__new__(ResourceAgent)
+        assert agent.proposal_cost(None, 150.0) == 150.0
+        assert agent.proposal_cost(None, 959.25) == 959.25
+        assert agent.proposal_cost(None, 11.857) == 11.86, "rounded to 2dp, not transformed"
 
-    def test_a_penalised_llm_bid_is_canonicalised_as_llm(self, agent):
-        agent._remember_cost("j1", 25.0, CostScale.LLM)
-        advertised = agent.proposal_cost(self._Job("j1"), 25.0 * self.LOAD_FACTOR)
-        assert advertised == pytest.approx(
-            to_canonical(25.0 * self.LOAD_FACTOR, CostScale.LLM), abs=0.01)
-
-    def test_a_broken_agent_no_longer_undercuts_a_healthy_one(self, agent):
-        """Both agents equally loaded; one's LLM is down. The healthy bid must win."""
-        agent._remember_cost("broken", 0.5, CostScale.ANALYTIC)     # fallback
-        agent._remember_cost("healthy", 25.0, CostScale.LLM)        # real bid
-        broken = agent.proposal_cost(self._Job("broken"), 0.5 * self.LOAD_FACTOR)
-        healthy = agent.proposal_cost(self._Job("healthy"), 25.0 * self.LOAD_FACTOR)
-        assert healthy == pytest.approx(broken, abs=0.01), \
-            "an idle fallback and a middling bid are genuinely comparable now"
-        agent._remember_cost("healthy", 5.0, CostScale.LLM)
-        better = agent.proposal_cost(self._Job("healthy"), 5.0 * self.LOAD_FACTOR)
-        assert better < broken, "a strong bid must beat a fallback from an equal agent"
-
-    def test_with_no_cached_verdict_it_uses_the_agents_own_plane(self, agent):
-        advertised = agent.proposal_cost(self._Job("unknown"), 25.0)
-        assert advertised == pytest.approx(to_canonical(25.0, CostScale.LLM), abs=0.01)
-
-    def test_the_scale_survives_any_penalty_factor(self, agent):
-        """Behavioural guard on the regression: whatever selection multiplied by, an analytic
-        fallback stays on the analytic plane. A value-equality gate fails every one of these."""
-        agent._remember_cost("j1", 0.5, CostScale.ANALYTIC)
-        for factor in (1.0, 1.01, 1.35, 1.9, 2.0):
-            advertised = agent.proposal_cost(self._Job("j1"), 0.5 * factor)
-            assert advertised == pytest.approx(
-                to_canonical(0.5 * factor, CostScale.ANALYTIC), abs=0.01), factor
-            assert advertised > 30.0, f"raw analytic value leaked at factor {factor}"
+    def test_the_scale_tag_survives_for_instrumentation(self):
+        """The tag still distinguishes a real LLM verdict from an analytic fallback."""
+        assert CostScale.ANALYTIC != CostScale.LLM
 

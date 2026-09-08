@@ -1,30 +1,49 @@
-"""One cost scale for everything that crosses the wire.
+"""Which decision plane produced a cost — and why no rescaling happens between them.
 
-Agents run different decision planes, and their costs are not on the same scale:
+`CostScale` tags a cost with the plane that produced it. `LlmAgent` records the tag alongside
+each verdict so instrumentation can separate a real LLM bid from an analytic fallback; nothing
+transforms a cost on the way to the wire.
 
-* the **analytic** model returns a weighted utilisation plus penalties — roughly 0..1 for an
-  idle agent, a few units under load;
-* the **LLM** plane returns ``100 - score`` for a 0..100 score, so 25..75 in practice.
+Why no transform
+----------------
+`docs/SWARMAGENTS_FINDINGS.md` finding 11 reports two problems with LLM costs under Snow:
 
-Both used to be advertised raw. A peer answering a Snow query therefore compared its own 0.5
-against an LLM initiator's 45, concluded it dominated, and voted for itself — every time,
-regardless of which agent was actually the better host. The dominance rule degenerated, and the
-reasoning the fleet spent seconds per bid producing lost to a model it was meant to replace
-(chaos finding 11).
+1. peers answered a query with the **analytic** cost while proposing with the **LLM** cost, so
+   the LLM's verdict never entered the protocol; and
+2. "the two costs are not on the same scale. The analytic cost is roughly 0-1 (weighted
+   utilisations plus penalties); the LLM cost is `100 - score`, so 25-75."
 
-The same mismatch has a second edge that nobody has measured. When an LLM bid fails, the agent
-falls back to the analytic model; advertised raw, that fallback bid is ~0.5 against healthy peers'
-25..75, so a *broken* agent looks like the best host in the fleet. The campaign attributed that
-capture entirely to the fallback being fast (S05: a 503 becomes an instant bid that out-races real
-reasoning). Scale is an independent second channel, and it is removed here.
+**The first is real and is fixed** (see `LlmAgent.native_cost_for_job`). **The second is not.**
+`ResourceAgent.compute_job_cost` ends in `* 100`, so the analytic cost is already on the same
+0..100 range as the LLM's. Measured over 2000 (job, flavour) pairs — 400 real Pegasus jobs
+against the five shipped instance flavours, `analytic_cost_half`-free:
 
-So: **native units stay inside selection, and everything that leaves an agent is canonical.**
-Selection is untouched on purpose — `selection_threshold_pct` is a *relative* window ("within
-+10% of best"), so pushing a non-linear transform into the selector would change which candidates
-fall inside it and silently move every analytic result.
+===========  ======  ======  ======  ======  ======  ======
+statistic    p10     p25     p50     p75     p90     max
+===========  ======  ======  ======  ======  ======  ======
+cost          2.59    5.41   11.85   28.40   71.85  959.25
+===========  ======  ======  ======  ======  ======  ======
 
-`to_canonical` is strictly increasing on each scale, so it reorders nothing within a decision
-plane; it only makes two planes commensurable.
+against an LLM plane whose costs are `100 - score`, concentrated at 25 (score 75) and 5
+(score 95). Comparable units, overlapping ranges. 1.6% of analytic costs exceed 100, and a
+multiplicative load penalty (up to ~2x) can push either plane above it, which is harmless —
+dominance is a relative comparison and needs no upper bound.
+
+An earlier version of this module mapped each plane through `100*c/(c+half)` with `half` at 1.0
+for the analytic plane. On the real distribution that sent a median analytic cost of 11.85 to
+92.2 and made every analytic agent look nearly worthless — an inversion far worse than the one
+it was meant to remove. Any per-plane rescaling has that hazard, because it is a claim about the
+two distributions that has to be re-earned whenever either model changes. Comparing the raw
+costs makes no such claim.
+
+What is left, and is a real (smaller) effect: the two models *calibrate* differently. A fallback
+analytic bid has a median of 11.85 while a typical LLM bid is 25, so an agent whose LLM is down
+does bid lower on average — roughly 2x, not the 50x finding 11 implies. That is a difference in
+how two models rate the same job, not a units error, and rescaling it away would be putting a
+thumb on the scale. It belongs in E4 as a measurement: report bid distributions per plane.
+
+`tests/test_cost_scale.py` pins the assumption that keeps this true — that both planes emit
+0..100 — so a change to either model fails a test instead of silently reintroducing the mismatch.
 """
 from __future__ import annotations
 
@@ -32,63 +51,13 @@ from typing import Final
 
 
 class CostScale:
-    """The decision plane a native cost came from."""
+    """The decision plane a cost came from. A tag for instrumentation, not a conversion."""
 
     ANALYTIC: Final[str] = "analytic"
     LLM: Final[str] = "llm"
 
 
-#: Top of the canonical range.
-CANONICAL_MAX: Final[float] = 100.0
-
-#: Native cost that maps to the canonical midpoint, per plane. This is the whole calibration:
-#: each plane names the cost it considers middling, and the same curve does the rest.
-#:
-#: * analytic — 1.0 is "fully utilised, no penalties", the natural middle of what that model
-#:   produces (it is unbounded above, so it needs a reference rather than a rescale).
-#: * llm — 50 is the midpoint of the 0..100 the plane is asked for (``100 - score``).
-ANALYTIC_HALF: Final[float] = 1.0
-LLM_HALF: Final[float] = 50.0
-
-
-def _half_for(scale: str, analytic_half: float, llm_half: float) -> float:
-    if scale == CostScale.ANALYTIC:
-        half = analytic_half if analytic_half and analytic_half > 0 else ANALYTIC_HALF
-    elif scale == CostScale.LLM:
-        half = llm_half if llm_half and llm_half > 0 else LLM_HALF
-    else:
-        raise ValueError(f"unknown cost scale {scale!r}")
-    return float(half)
-
-
-def to_canonical(cost: float, scale: str,
-                 analytic_half: float = ANALYTIC_HALF,
-                 llm_half: float = LLM_HALF) -> float:
-    """Map a native cost onto the canonical 0..`CANONICAL_MAX` wire scale. Lower is better.
-
-    One curve for both planes — ``CANONICAL_MAX * c / (c + half)`` — differing only in the
-    native cost each calls middling. So a plane's reference cost always lands on 50, and half
-    of it lands on 33.3, which is what makes the two commensurable rather than merely bounded.
-
-    Strictly increasing in `cost` on every plane and over the whole non-negative range, so the
-    ordering of two costs from the *same* plane is preserved exactly and only cross-plane
-    comparisons change.
-
-    The LLM branch is a squash rather than a pass-through for a reason that is easy to miss:
-    the cost reaching this function is the cost *after* selection's multiplicative load penalty
-    (up to ~2x), so an LLM bid of 75 arrives as 150. Clamping at `CANONICAL_MAX` mapped every
-    loaded agent to the same 100 and destroyed exactly the ordering this scale exists to keep.
-
-    :param cost: native cost, as the agent's own decision plane produced it.
-    :param scale: which plane produced it — a `CostScale` value.
-    :param analytic_half: analytic cost mapped to the midpoint.
-    :param llm_half: LLM cost mapped to the midpoint.
-    """
-    c = float(cost)
-    if c != c:                                  # NaN — no opinion is safer than a wrong one
-        raise ValueError("cost is NaN")
-    half = _half_for(scale, analytic_half, llm_half)
-    if c == float("inf"):
-        return CANONICAL_MAX
-    c = max(0.0, c)
-    return CANONICAL_MAX * c / (c + half)
+#: Nominal top of the range both planes emit. Costs may exceed it (a long analytic tail, or
+#: either plane after the multiplicative load penalty) and are NOT clamped: dominance is a
+#: relative comparison, and clamping would map every loaded agent to the same value.
+NOMINAL_MAX: Final[float] = 100.0
