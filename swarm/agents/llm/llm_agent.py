@@ -344,10 +344,12 @@ class LlmAgent(ResourceAgent):
 
         * `llm.score_scale` — the range the model is asked for. A finer range gives it room to
           discriminate. The cost is normalised back to 0..100 either way.
-        * `llm.tie_break_with_analytic` — when two bids are still equal, order them by the
-          analytic cost. The term is deliberately **sub-granular**: at most half of one rating
-          step, so it can separate exact ties and can never reorder distinct ratings. That bound
-          is what makes it safe, and `tests/test_elicitation.py` pins it.
+        * `llm.tie_break_with_analytic` — when two bids land on the same rating, order them by
+          the analytic cost. Ratings are quantised to the grid the model was asked for and the
+          term is capped at half a grid step, so it can only separate agents that gave the same
+          rating and can never move one past a neighbouring rating. Both halves matter: the cap
+          alone is not enough, because `Bid.score` is a float and two scores 0.1 apart would
+          otherwise be reversible. `tests/test_elicitation.py` pins it.
         """
         llm_cfg = (getattr(self, "config", None) or {}).get("llm", {}) or {}
         self.llm_score_scale = int(llm_cfg.get("score_scale", 100) or 100)
@@ -365,19 +367,34 @@ class LlmAgent(ResourceAgent):
         """Convert a model rating into a 0..100 cost (lower is better)."""
         scale = float(self.llm_score_scale)
         score = max(0.0, min(scale, float(score)))
-        cost = 100.0 * (1.0 - score / scale)
         self._record_bid_score(score)
         if not self.llm_tie_break_with_analytic:
-            return cost
-        # One rating step is `100/scale` cost units; stay strictly inside half of it so two
-        # distinct ratings can never swap order no matter what the analytic model says.
+            # Baseline: the exact conversion every campaign number was measured with.
+            return 100.0 * (1.0 - score / scale)
+
+        # QUANTISE to the rating grid first. `Bid.score` is a float, so without this the
+        # guarantee below is false: two scores 0.1 apart on a 0-100 scale differ by 0.1 in cost,
+        # which a tie-break term of up to 0.5 can reverse — a worse rating overtaking a better
+        # one, which is the opposite of what this arm is for. Rounding to the grid the model was
+        # asked for makes "distinct ratings" mean "distinct grid points", which are a full step
+        # apart, so the bound below is exact rather than approximate.
+        #
+        # What this deliberately discards is sub-grid precision. That is the arm's own premise:
+        # a model asked for 0-100 answers in round steps (59% of measured bids were 75.00), so
+        # sub-integer digits are noise. Ask for a finer grid with `score_scale` instead — that is
+        # what that knob is for. Quantisation applies ONLY on this branch, so the default path is
+        # byte-identical to the baseline.
         step = 100.0 / scale
+        cost = 100.0 * (1.0 - round(score) / scale)
+
         try:
             analytic = float(self._cost_job_on_agent(job, agent))
         except Exception:
             return cost
         if analytic < 0 or analytic != analytic:          # negative or NaN — no opinion
             return cost
+        # Strictly inside half a step, so it can only order agents that landed on the SAME grid
+        # point and can never move one past a neighbouring point.
         fraction = analytic / (analytic + self.llm_tie_break_ref)   # in [0, 1)
         return cost + 0.5 * step * fraction
 

@@ -134,6 +134,43 @@ class TestAnalyticTieBreak:
         worse = extreme._score_to_cost(scale * 0.75, _Job(), _Agent("b"))
         assert better < worse, f"scale={scale} analytic={analytic} step={step}"
 
+    @pytest.mark.parametrize("scale", [100, 1000])
+    def test_distinct_grid_points_are_never_reordered(self, scale):
+        """The exact invariant, swept over fractional scores with the analytic costs stacked
+        the wrong way. `Bid.score` is a float, so a model may answer 75.1; capping the term at
+        half a step is not enough on its own, because two scores 0.1 apart differ by only 0.1
+        in cost. Quantising to the rating grid is what closes it: whenever two scores land on
+        different grid points the higher one wins outright, however bad its analytic cost."""
+        handicapped = make_agent(score_scale=scale, tie_break=True, analytic=1e9)
+        favoured = make_agent(score_scale=scale, tie_break=True, analytic=0.0)
+        base = scale * 0.75
+        scores = [base + i * 0.1 for i in range(40)]
+        compared = 0
+        for a in scores:
+            for b in scores:
+                if a <= b or round(a) == round(b):
+                    continue                     # same grid point: tied by design, see below
+                compared += 1
+                assert handicapped._score_to_cost(a, _Job(), _Agent()) < \
+                    favoured._score_to_cost(b, _Job(), _Agent("b")), \
+                    f"scale={scale}: rating {a} lost to {b}"
+        assert compared > 0, "the sweep must actually cross grid points"
+
+    def test_scores_inside_one_grid_cell_are_treated_as_tied(self):
+        """The deliberate trade: sub-grid precision is discarded so the guarantee is exact.
+        Ask for a finer grid with score_scale instead."""
+        idle = make_agent(score_scale=100, tie_break=True, analytic=2.59)
+        busy = make_agent(score_scale=100, tie_break=True, analytic=71.85)
+        # 75.1 and 75.4 both round to 75, so the analytic cost decides — and it decides sanely.
+        assert idle._score_to_cost(75.4, _Job(), _Agent()) < \
+            busy._score_to_cost(75.1, _Job(), _Agent("b"))
+
+    def test_quantisation_only_happens_on_the_tie_break_branch(self):
+        """The default path must stay byte-identical to what the campaign measured."""
+        a = make_agent(tie_break=False)
+        assert a._score_to_cost(75.4, _Job(), _Agent()) == pytest.approx(24.6)
+        assert a._score_to_cost(75.6, _Job(), _Agent()) == pytest.approx(24.4)
+
     def test_the_term_is_bounded_by_half_a_step(self):
         base = make_agent(score_scale=100, tie_break=False)._score_to_cost(75.0, _Job(), _Agent())
         for analytic in (0.0, 1.0, 11.85, 100.0, 1e9):

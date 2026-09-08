@@ -318,9 +318,13 @@ llm:
   # Both arms below default to the measured baseline; E4 crosses them.
   score_scale: 100            # range the model is asked for; the cost is normalised to 0-100
                               # either way. 1000 gives it room to discriminate.
-  tie_break_with_analytic: false   # when two bids still tie, order them by the analytic cost.
-                              # The term is capped at half of ONE rating step, so it can only
-                              # separate exact ties and can never reorder distinct ratings.
+  tie_break_with_analytic: false   # when two bids give the same rating, order them by the
+                              # analytic cost. The rating is quantised to the grid above and the
+                              # term capped at half a grid step, so it can only separate agents
+                              # that rated the same and can never move one past a neighbouring
+                              # rating. Scores are floats, so the cap alone would not be enough.
+                              # Sub-grid precision is discarded on this branch; for finer
+                              # resolution raise score_scale.
   tie_break_ref_cost: 11.85   # analytic cost at which that term is half its range; the measured
                               # median over 400 Pegasus jobs x the 5 shipped flavours
   prompts:
