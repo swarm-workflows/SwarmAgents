@@ -69,20 +69,7 @@ class Agent(Observer):
             self.config = yaml_safe_load_strict(f)
 
         self.queues = AgentQueues()
-        # stop() is reached from two directions — the SIGTERM handler in main.py and the
-        # periodic thread's own shutdown condition — and the stop script touches the shutdown
-        # flag and signals in the same breath, so both commonly fire. on_shutdown persists
-        # metrics, so running it twice concurrently let an earlier snapshot land on top of a
-        # later one; this makes the teardown path run once.
-        self._stop_lock = threading.Lock()
-        self._stopped = False
-        # Set once teardown has actually finished. A second caller waits on this rather than
-        # returning straight away: the SIGTERM handler os._exit()s the process the moment
-        # stop() returns, and the stop script touches the shutdown flag and signals in the same
-        # breath — so the periodic thread is usually already inside save_results when the
-        # signal lands, and returning early killed the process mid-write.
-        self._stop_complete = threading.Event()
-        self._stop_thread_ident = None
+        self._init_stop_state()
         self.grpc_config = self.config.get("grpc", {})
         self.log_config = self.config.get("logging", {})
         self.runtime_config = self.config.get("runtime", {})
@@ -200,6 +187,31 @@ class Agent(Observer):
             self.logger.error(traceback.format_exc())
             self.stop()
 
+    def _init_stop_state(self):
+        """Set up the teardown guard. Kept as one method so a test double cannot drift from
+        it: a stub that built its own `threading.Lock()` here tested the stub's lock and
+        reported the shipped self-deadlock as fixed.
+
+        stop() is reached from two directions — the SIGTERM handler in main.py and the
+        periodic thread's own shutdown condition — and the stop script touches the shutdown
+        flag and signals in the same breath, so both commonly fire. on_shutdown persists
+        metrics, so running it twice concurrently let an earlier snapshot land on top of a
+        later one.
+        """
+        # RLock, not Lock: a signal handler runs on whichever thread the signal is delivered
+        # to, so SIGTERM landing while that same thread is inside stop()'s critical section
+        # would block on a lock it already holds — a self-deadlock reached BEFORE the
+        # re-entry check could catch it, ending in SIGKILL with no metrics saved.
+        self._stop_lock = threading.RLock()
+        self._stopped = False
+        # Set once teardown has actually finished. A second caller waits on this rather than
+        # returning straight away: the SIGTERM handler os._exit()s the process the moment
+        # stop() returns, and the stop script touches the shutdown flag and signals in the
+        # same breath — so the periodic thread is usually already inside save_results when the
+        # signal lands, and returning early killed the process mid-write.
+        self._stop_complete = threading.Event()
+        self._stop_thread_ident = None
+
     def stop(self, wait_timeout: float = 60.0) -> bool:
         """Run teardown once, and do not return until it has finished.
 
@@ -215,8 +227,12 @@ class Agent(Observer):
         with self._stop_lock:
             first = not self._stopped
             if first:
-                self._stopped = True
+                # Ident BEFORE the flag, and the order is load-bearing: a signal arriving on
+                # this thread between the two would otherwise see `_stopped` set with no
+                # matching ident, and wait out the full timeout on an event only the thread it
+                # just interrupted can set.
                 self._stop_thread_ident = threading.get_ident()
+                self._stopped = True
         if not first:
             if self._stop_thread_ident == threading.get_ident():
                 # Re-entered from inside teardown itself; waiting here would deadlock on an

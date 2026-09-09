@@ -241,12 +241,12 @@ class _StopStub:
 
     from swarm.agents.agent_grpc import Agent as _Agent
     stop = _Agent.stop
+    # The shipped initialiser, not a hand-rolled copy: this stub previously built its own
+    # threading.Lock() and so reported the self-deadlock RLock fixes as already fixed.
+    _init_stop_state = _Agent._init_stop_state
 
     def __init__(self):
-        self._stop_lock = threading.Lock()
-        self._stopped = False
-        self._stop_complete = threading.Event()
-        self._stop_thread_ident = None
+        self._init_stop_state()
         self.logger = logging.getLogger("stop-stub")
         self.shutdown = False
         self.condition = threading.Condition()
@@ -363,6 +363,48 @@ class TestStopIsOnceOnly:
         for t in threads:
             t.join()
         assert stub.calls == 1
+
+
+class TestStopSurvivesASignalInItsOwnCriticalSection:
+    """A signal handler runs on the thread the signal is delivered to. If that thread is
+    inside stop()'s critical section, a non-reentrant lock deadlocks there — before the
+    re-entry check can catch it — and the process dies by SIGKILL with nothing saved."""
+
+    def test_stop_does_not_block_on_a_lock_this_thread_holds(self):
+        stub = _StopStub()
+        outcome = []
+
+        def _reentrant_call():
+            # Standing in for the signal handler: the lock is held by THIS thread already.
+            with stub._stop_lock:
+                outcome.append(stub.stop(wait_timeout=1.0))
+
+        t = threading.Thread(target=_reentrant_call, daemon=True)
+        t.start()
+        t.join(timeout=5)
+        assert not t.is_alive(), "stop() self-deadlocked on a lock its own thread held"
+        assert outcome, "stop() never returned"
+
+    def test_the_ident_is_published_before_the_flag(self):
+        """Between the two stores, a same-thread caller must still recognise itself: seeing
+        the flag without the ident sends it into the full wait_timeout on an event only the
+        thread it interrupted can set."""
+        stub = _StopStub()
+        seen = []
+
+        # The invariant: anyone who observes _stopped set also observes an ident, never None.
+        def _watch():
+            while not stub._stopped:
+                time.sleep(0)
+            seen.append(stub._stop_thread_ident)
+
+        w = threading.Thread(target=_watch, daemon=True)
+        w.start()
+        stub.stop()
+        w.join(timeout=5)
+        assert seen and seen[0] is not None, (
+            "a thread saw _stopped set while _stop_thread_ident was still None"
+        )
 
 
 class TestSigtermReturnStatus:
