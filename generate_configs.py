@@ -80,6 +80,7 @@ class SwarmConfigGenerator:
         groups_per_coordinator: int = 1,
         quantum_agents_pct: float = 0.0,
         master_fleet_size: Optional[int] = None,
+        delegation_policy: Optional[str] = None,
     ):
         self.num_agents = num_agents
         # Fleet size the per-agent draws are made FOR, which may exceed the fleet being written.
@@ -124,6 +125,15 @@ class SwarmConfigGenerator:
 
         # fraction of agents that own a quantum backend (0.0 = classical only)
         self.quantum_agents_pct = quantum_agents_pct
+
+        # Which plane picks the child group a coordinator delegates to (E4's arms). Applied to
+        # the base config every per-agent file is copied from. Before this flag the arm was
+        # switched by hand-editing config_swarm_multi.yml on the controller, so nothing in a
+        # run directory recorded which arm produced it, and the two arms of a comparison could
+        # differ by an edit nobody wrote down.
+        if delegation_policy:
+            self.base_config.setdefault("delegation", {})["policy"] = delegation_policy
+            print(f"delegation.policy = {delegation_policy} (from --delegation-policy)")
 
         # legacy ring helper (used when no grouping flags provided for ring)
         self.rings_default = self._create_default_rings()
@@ -1052,6 +1062,11 @@ if __name__ == "__main__":
                              "Level-0 agents, so the fleet size is unchanged. Two-level "
                              "hierarchies only.")
 
+    parser.add_argument("--delegation-policy", choices=["bandit", "llm"], default=None,
+                        help="Override delegation.policy in the generated configs (default: "
+                             "whatever the base config says). Requires "
+                             "--groups-per-coordinator > 1 to have any effect.")
+
     parser.add_argument("--fit-all", action="store_true",
                         help="Size every job to fit ALL agents (min capacities). "
                              "Enables any agent to take over jobs from failed agents.")
@@ -1123,6 +1138,7 @@ if __name__ == "__main__":
         initial_group_size=args.initial_group_size,
         co_parent_count=args.co_parents,
         groups_per_coordinator=args.groups_per_coordinator,
+        delegation_policy=args.delegation_policy,
         quantum_agents_pct=args.quantum_agents_pct,
         master_fleet_size=args.master_fleet_size,
     )

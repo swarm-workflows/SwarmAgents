@@ -291,6 +291,8 @@ def generate_configs(args, agent_hosts_list: list[str]) -> Path:
             gen_args += ["--co-parents", str(args.co_parents)]
         if getattr(args, 'groups_per_coordinator', 1) > 1:
             gen_args += ["--groups-per-coordinator", str(args.groups_per_coordinator)]
+    if getattr(args, "delegation_policy", None):
+        gen_args += ["--delegation-policy", args.delegation_policy]
     # Pass initial group size for dynamic agent addition
     if hasattr(args, 'initial_group_size') and args.initial_group_size is not None:
         gen_args += ["--initial-group-size", str(args.initial_group_size)]
@@ -963,6 +965,11 @@ def parse_args() -> argparse.Namespace:
                          "has a single candidate, so the MAB and delegation.policy=llm are both "
                          "inert. Freed coordinator slots become Level-0 agents, so the fleet size "
                          "is unchanged. Two-level hierarchies only.")
+    ap.add_argument("--delegation-policy", choices=["bandit", "llm"], default=None,
+                    help="Which plane picks the child group a coordinator delegates to "
+                         "(E4's arms). Overrides delegation.policy in the generated configs; "
+                         "default is whatever the base config says. Recorded in run_meta.json, "
+                         "so an arm is no longer selected by an unrecorded hand edit.")
 
     # Job generation
     ap.add_argument("--fit-all", action="store_true",
@@ -1075,6 +1082,8 @@ def main() -> None:
             "dynamic_agents": args.dynamic_agents,
             "topology": args.topology,
             "jobs": args.jobs,
+            "delegation_policy": getattr(args, "delegation_policy", None),
+            "groups_per_coordinator": getattr(args, "groups_per_coordinator", 1),
             "argv": sys.argv,
         }, f, indent=2)
 

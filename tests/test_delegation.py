@@ -669,6 +669,31 @@ def _generated_coordinators(out_dir, *extra, agents=30):
     return found
 
 
+def test_delegation_policy_flag_reaches_every_generated_config(tmp_path):
+    """The arm has to be selectable from the command line and recorded.
+
+    Before --delegation-policy, switching E4's arms meant hand-editing
+    config_swarm_multi.yml on the controller: nothing in a run directory said which arm
+    produced it, and the configs a run copies are overwritten by the next run's.
+    """
+    from swarm.utils.yaml_strict import safe_load
+
+    for policy in ("bandit", "llm"):
+        out_dir = tmp_path / policy
+        out_dir.mkdir()
+        proc = subprocess.run(
+            [sys.executable, "generate_configs.py", "30", "10", "./config_swarm_multi.yml",
+             str(out_dir), "hierarchical", "localhost", "100", "--seed", "42", "--skip-jobs",
+             "--groups-per-coordinator", "2", "--delegation-policy", policy],
+            cwd=REPO, capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr[-2000:]
+        written = [n for n in sorted(os.listdir(out_dir)) if n.endswith(".yml")]
+        assert written, "generator wrote no configs"
+        for name in written:
+            cfg = safe_load(open(os.path.join(out_dir, name)))
+            assert cfg["delegation"]["policy"] == policy, name
+
+
 def _led_counts(coords):
     """Groups each coordinator actively leads with the whole fleet alive, by the rule in
     `_is_leader_for_group`: the lowest-ID live co-parent leads."""

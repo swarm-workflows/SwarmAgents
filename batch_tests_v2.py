@@ -155,6 +155,10 @@ def main():
     ap.add_argument("--shutdown-after-seconds", type=int, default=0,
                     help="Shutdown test after N seconds (0 = use default wait_runtime behavior)")
 
+    ap.add_argument("--delegation-policy", choices=["bandit", "llm"], default=None,
+                    help="Delegation arm for every run in the batch (passthrough); default is "
+                         "whatever the base config says")
+
     # Teardown / measurement integrity (passthrough to run_test.py)
     ap.add_argument("--shutdown-drain-timeout", type=int, default=0,
                     help="Seconds to wait for each agent to exit before SIGKILL (0 = default)")
@@ -259,6 +263,8 @@ def main():
                 cmd += ["--co-parents", str(args.co_parents)]
             if getattr(args, 'groups_per_coordinator', 1) > 1:
                 cmd += ["--groups-per-coordinator", str(args.groups_per_coordinator)]
+        if args.delegation_policy:
+            cmd += ["--delegation-policy", args.delegation_policy]
         if args.groups is not None:
             cmd += ["--groups", str(args.groups)]
         if args.group_size is not None:
