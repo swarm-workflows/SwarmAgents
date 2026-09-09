@@ -40,10 +40,15 @@ python run_test.py --mode remote --agents 30 --agents-per-host 5 --topology ring
 - `ssh swarm` connects to the **database node** (runs Redis and orchestrates the run). This is the only host reached from the laptop; every other node in the topology is reached *from* it.
 - On that node, become root with `sudo su -` before doing anything else: the code lives at `/root/SwarmAgents` and the passwordless SSH keys to the agent nodes belong to root, so neither is reachable as the login user.
 - As root, the database node has **passwordless SSH to every other node in the topology**, which host the agent processes. All hostnames are pre-resolved in `/etc/hosts`, so use them directly — no IPs needed. The current slice is **`agent-1` … `agent-92`** (contiguous, verified 2026-09-09), each with a paired `agent-N-mon` monitoring host on a separate subnet. Earlier revisions of this file said `agent-40`; check `/etc/hosts` rather than trusting a written range.
-- Agent ids map to sites in **contiguous blocks sharing a subnet**, so a site outage removes a solid id range: `agent-10`–`agent-18` is PSC, `agent-68`–`agent-74` is AMST. **Sweep reachability before sizing a run** — on 2026-09-09 both were down (AMST in FABRIC maintenance), leaving 76 of 92, below the ~90 VMs every scale rung above Hier-30 needs:
+- Agent ids map to sites in **contiguous blocks sharing a subnet**, so a site outage removes a solid id range: `agent-10`–`agent-18` is PSC, `agent-68`–`agent-74` is AMST. **Sweep reachability before sizing a run.** As of 2026-09-09 18:40 UTC, AMST is back and PSC is still down: **83 of 92 up**, which is still short of the ~90 VMs every rung above Hier-30 needs (90 at 1/VM, 180 at 2/VM, 270 at 3/VM) — PSC's 9 nodes are the whole remaining gap.
   ```bash
-  seq 1 92 | xargs -P 40 -I{} bash -c 'ssh -o BatchMode=yes -o ConnectTimeout=6 agent-{} hostname >/dev/null 2>&1 || echo DOWN agent-{}'
+  seq 1 92 | xargs -P 40 -I{} bash -c '
+    out=$(ssh -o BatchMode=yes -o ConnectTimeout=6 -o StrictHostKeyChecking=accept-new agent-{} hostname 2>&1)
+    if [ $? -eq 0 ]; then echo "UP agent-{}";
+    elif echo "$out" | grep -qi "host key"; then echo "KEY agent-{}";
+    else echo "DOWN agent-{}"; fi'
   ```
+  **`StrictHostKeyChecking=accept-new` is not optional here.** A host that returns from a rebuild has a new host key, and plain `ssh` under `BatchMode` then fails with "Host key verification failed" — indistinguishable from a timeout in a pass/fail sweep. That is exactly how AMST was recorded as down while all 7 nodes were up and answering. `accept-new` trusts a first key but still refuses a *changed* one, so a genuinely swapped host reports `KEY` instead of passing silently (which `=no` would do). `run_test.py` and `stop_agents_v2.sh` pass `StrictHostKeyChecking=no` on every hop, so runs themselves were never affected — only the sweep.
 - `agent_hosts.txt` lists all agent hostnames, one per line. It is **deleted by `cleanup_between_runs`** unless it is the resolved `--agent-hosts-file`, so it will often be absent on the database node and must be regenerated before a remote run.
 - Remote-mode tests are launched from this node with `--db-host database`, e.g.:
 ```bash
