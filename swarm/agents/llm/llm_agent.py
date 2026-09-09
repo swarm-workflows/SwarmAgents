@@ -98,8 +98,8 @@ class LlmAgent(ResourceAgent):
 
         self._init_llm_state()
 
-        if self._delegation_policy_warning:
-            self.logger.warning("[LLM_DELEGATE] %s", self._delegation_policy_warning)
+        for warning in self._delegation_warnings:
+            self.logger.warning("[LLM_DELEGATE] %s", warning)
 
         # Built here rather than in `_init_llm_state` because it opens a provider connection:
         # the __new__-based test stubs call `_init_llm_state` directly and must stay offline.
@@ -397,19 +397,23 @@ class LlmAgent(ResourceAgent):
         the bandit on, or set `delegation.top_k` to match.
         """
         cfg = (getattr(self, "config", None) or {}).get("delegation", {}) or {}
+        # A list, not a slot: a misconfigured section can be wrong in more than one way at
+        # once, and `policy: magic` + `top_k: 5` used to report only the second — a diagnostic
+        # quietly overwriting the more serious diagnostic behind it. Deferred rather than
+        # logged here because the __new__ test path has no logger yet.
+        self._delegation_warnings: list = []
         policy = str(cfg.get("policy", self.DELEGATE_BANDIT) or self.DELEGATE_BANDIT).strip().lower()
         if policy not in (self.DELEGATE_BANDIT, self.DELEGATE_LLM):
-            # No logger yet on the __new__ test path, and an unknown policy must not be fatal.
-            self._delegation_policy_warning = (
+            # An unknown policy must not be fatal, but it must not be silent either: the run
+            # would otherwise be a bandit run that its config says is something else.
+            self._delegation_warnings.append(
                 f"unknown delegation.policy {policy!r}; using {self.DELEGATE_BANDIT}")
             policy = self.DELEGATE_BANDIT
-        else:
-            self._delegation_policy_warning = None
         self.delegation_policy = policy
         self.delegation_top_k = int(cfg.get("top_k", 0) or 0)
         if policy != self.DELEGATE_LLM and self.delegation_top_k > 0:
             # Parsed and then never consulted — the shape of half the bugs in §0.2. Say so.
-            self._delegation_policy_warning = (
+            self._delegation_warnings.append(
                 f"delegation.top_k={self.delegation_top_k} is ignored under "
                 f"delegation.policy={policy}; the bandit path uses mab.top_k")
         self.delegator: Optional[LlmDelegator] = None

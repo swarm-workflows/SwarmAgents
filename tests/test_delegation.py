@@ -139,10 +139,26 @@ def test_default_policy_still_defers_to_the_bandit():
     assert not a.metrics.llm_delegations
 
 
+def test_two_problems_in_one_section_are_both_reported():
+    """`policy: magic` downgrades to bandit, which in turn makes `top_k` dead config. Both are
+    true and the operator needs both — a single warning slot reported only the second, so the
+    louder problem (a policy name that silently is not what the config says) was the one that
+    got overwritten."""
+    a = make_agent(delegation={"policy": "magic", "top_k": 5})
+    assert len(a._delegation_warnings) == 2
+    assert any("magic" in w for w in a._delegation_warnings)
+    assert any("ignored under" in w for w in a._delegation_warnings)
+
+
+def test_a_clean_section_warns_about_nothing():
+    assert make_agent(delegation={"policy": "llm", "top_k": 2})._delegation_warnings == []
+    assert make_agent()._delegation_warnings == []
+
+
 def test_unknown_policy_warns_and_falls_back():
     a = make_agent(delegation={"policy": "magic"})
     assert a.delegation_policy == a.DELEGATE_BANDIT
-    assert a._delegation_policy_warning and "magic" in a._delegation_policy_warning
+    assert any("magic" in w for w in a._delegation_warnings)
     assert a._select_child_groups(_Job(), [1, 2]) == [1, 2]
 
 
@@ -325,7 +341,7 @@ def test_delegation_top_k_is_ignored_by_the_bandit_path_and_says_so():
     a = make_agent(delegation={"policy": "bandit", "top_k": 5},
                    mab={"top_k": 1, "groups": [1, 2, 3]})
     assert a._effective_delegation_top_k() == 1
-    assert "ignored under" in a._delegation_policy_warning
+    assert any("ignored under" in w for w in a._delegation_warnings)
 
     # ...and the reverse: the LLM knob would have hidden a genuinely inert bandit fan-out.
     b = make_agent(delegation={"policy": "bandit", "top_k": 1},
