@@ -76,6 +76,13 @@ class Agent(Observer):
         # later one; this makes the teardown path run once.
         self._stop_lock = threading.Lock()
         self._stopped = False
+        # Set once teardown has actually finished. A second caller waits on this rather than
+        # returning straight away: the SIGTERM handler os._exit()s the process the moment
+        # stop() returns, and the stop script touches the shutdown flag and signals in the same
+        # breath — so the periodic thread is usually already inside save_results when the
+        # signal lands, and returning early killed the process mid-write.
+        self._stop_complete = threading.Event()
+        self._stop_thread_ident = None
         self.grpc_config = self.config.get("grpc", {})
         self.log_config = self.config.get("logging", {})
         self.runtime_config = self.config.get("runtime", {})
@@ -193,12 +200,35 @@ class Agent(Observer):
             self.logger.error(traceback.format_exc())
             self.stop()
 
-    def stop(self):
+    def stop(self, wait_timeout: float = 60.0) -> bool:
+        """Run teardown once, and do not return until it has finished.
+
+        `wait_timeout` bounds how long a second caller waits for the first caller's teardown;
+        it exists for the SIGTERM handler, which exits the process as soon as this returns.
+
+        Returns False only when called re-entrantly **on the thread already running
+        teardown** — a signal delivered to that very thread, say. The caller must not exit the
+        process in that case: the teardown it interrupted has not finished, and unwinding to it
+        is the only way it ever will. True otherwise, including when the wait timed out (the
+        stop script's SIGKILL is close behind at that point, so exiting is no worse).
+        """
         with self._stop_lock:
-            if self._stopped:
-                self.logger.debug("stop() already ran; ignoring re-entry")
-                return
-            self._stopped = True
+            first = not self._stopped
+            if first:
+                self._stopped = True
+                self._stop_thread_ident = threading.get_ident()
+        if not first:
+            if self._stop_thread_ident == threading.get_ident():
+                # Re-entered from inside teardown itself; waiting here would deadlock on an
+                # event only this thread can set.
+                self.logger.debug("stop() re-entered on the teardown thread; ignoring")
+                return False
+            self.logger.debug("stop() already running elsewhere; waiting for it to finish")
+            if not self._stop_complete.wait(timeout=max(0.0, wait_timeout)):
+                self.logger.warning(
+                    f"[SHUTDOWN] teardown still running after {wait_timeout:.0f}s; "
+                    f"proceeding without it — metrics for this agent may be incomplete")
+            return True
         try:
             self.shutdown = True
             self.queues.message_event.set()
@@ -211,6 +241,11 @@ class Agent(Observer):
         except Exception as e:
             self.logger.error(f"Exception occurred in shutdown: {e}")
             self.logger.error(traceback.format_exc())
+        finally:
+            # Released even on the exception path: a waiter must never be left blocked by a
+            # teardown that failed.
+            self._stop_complete.set()
+        return True
 
     def on_shutdown(self):
         pass

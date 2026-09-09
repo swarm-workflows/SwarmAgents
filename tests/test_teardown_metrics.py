@@ -236,6 +236,30 @@ class TestHostsFileForStop:
             run_test._hosts_file_for_stop(_args(tmp_path), [])
 
 
+class _StopStub:
+    """Minimal host for Agent.stop(), which only touches the events, queues and transport."""
+
+    from swarm.agents.agent_grpc import Agent as _Agent
+    stop = _Agent.stop
+
+    def __init__(self):
+        self._stop_lock = threading.Lock()
+        self._stopped = False
+        self._stop_complete = threading.Event()
+        self._stop_thread_ident = None
+        self.logger = logging.getLogger("stop-stub")
+        self.shutdown = False
+        self.condition = threading.Condition()
+        self.queues = type("Q", (), {
+            "message_event": threading.Event(), "pending_event": threading.Event(),
+            "selected_event": threading.Event()})()
+        self.transport = type("T", (), {"stop": lambda self_: None})()
+        self.calls = 0
+
+    def on_shutdown(self):
+        self.calls += 1
+
+
 class TestStopIsOnceOnly:
     """stop() is reached from the SIGTERM handler and from the periodic thread's own
     shutdown condition, and the stop script touches the flag file and signals in one breath,
@@ -243,50 +267,91 @@ class TestStopIsOnceOnly:
     post-drain one."""
 
     def test_second_call_is_a_no_op(self):
-        from swarm.agents.agent_grpc import Agent
-
-        class _Stub:
-            stop = Agent.stop
-
-            def __init__(self):
-                self._stop_lock = threading.Lock()
-                self._stopped = False
-                self.logger = logging.getLogger("stop-stub")
-                self.shutdown = False
-                self.condition = threading.Condition()
-                self.queues = type("Q", (), {
-                    "message_event": threading.Event(), "pending_event": threading.Event(),
-                    "selected_event": threading.Event()})()
-                self.transport = type("T", (), {"stop": lambda self_: None})()
-                self.calls = 0
-
-            def on_shutdown(self):
-                self.calls += 1
-
-        stub = _Stub()
+        stub = _StopStub()
         stub.stop()
         stub.stop()
         stub.stop()
         assert stub.calls == 1
 
-    def test_concurrent_callers_only_run_teardown_once(self):
+    def test_a_second_caller_waits_for_the_in_progress_teardown(self):
+        """The sequence that loses metrics: the stop script touches the shutdown flag and
+        SIGTERMs in one breath, so the periodic thread is already inside save_results when the
+        handler runs. The handler os._exit()s the moment stop() returns, so stop() must not
+        return while that save is still in flight."""
         from swarm.agents.agent_grpc import Agent
 
-        class _Stub:
-            stop = Agent.stop
+        saved = []
+        entered = threading.Event()
 
-            def __init__(self):
-                self._stop_lock = threading.Lock()
-                self._stopped = False
-                self.logger = logging.getLogger("stop-stub")
-                self.shutdown = False
-                self.condition = threading.Condition()
-                self.queues = type("Q", (), {
-                    "message_event": threading.Event(), "pending_event": threading.Event(),
-                    "selected_event": threading.Event()})()
-                self.transport = type("T", (), {"stop": lambda self_: None})()
-                self.calls = 0
+        class _Stub(_StopStub):
+            def on_shutdown(self):
+                entered.set()
+                time.sleep(0.4)   # stands in for the Redis write
+                saved.append("metrics")
 
+        stub = _Stub()
+        threading.Thread(target=stub.stop, name="periodic").start()
+        assert entered.wait(timeout=2), "teardown never started"
+        # The signal handler's call, on another thread, as the real one is
+        stub.stop(wait_timeout=5.0)
+        assert saved == ["metrics"], "stop() returned before the in-flight save finished"
+
+    def test_the_wait_is_bounded_when_teardown_hangs(self):
+        release = threading.Event()
+        entered = threading.Event()
+
+        class _Stub(_StopStub):
+            def on_shutdown(self):
+                entered.set()
+                release.wait()
+
+        stub = _Stub()
+        threading.Thread(target=stub.stop, daemon=True).start()
+        assert entered.wait(timeout=2)
+        try:
+            started = time.monotonic()
+            stub.stop(wait_timeout=0.5)
+            elapsed = time.monotonic() - started
+            assert 0.4 <= elapsed < 5.0, f"waited {elapsed:.2f}s, expected to give up at 0.5s"
+        finally:
+            release.set()
+
+    def test_reentry_on_the_teardown_thread_does_not_deadlock(self):
+        """A stop() reached from inside on_shutdown must not wait on an event only it can
+        set — and must report False, so a signal handler does not exit the process out from
+        under the teardown it just interrupted."""
+        results = []
+
+        class _Stub(_StopStub):
+            def on_shutdown(self):
+                results.append(self.stop(wait_timeout=30.0))  # would hang if it waited
+                self.calls += 1
+
+        stub = _Stub()
+        done = threading.Event()
+
+        def _run():
+            stub.stop()
+            done.set()
+
+        threading.Thread(target=_run, daemon=True).start()
+        assert done.wait(timeout=5), "re-entrant stop() deadlocked"
+        assert stub.calls == 1
+        assert results == [False], "same-thread re-entry must report that teardown is unfinished"
+
+    def test_a_failed_teardown_still_releases_waiters(self):
+        class _Stub(_StopStub):
+            def on_shutdown(self):
+                raise RuntimeError("redis is gone")
+
+        stub = _Stub()
+        stub.stop()
+        started = time.monotonic()
+        stub.stop(wait_timeout=5.0)
+        assert time.monotonic() - started < 1.0, "a failed teardown left waiters blocked"
+
+    def test_concurrent_callers_only_run_teardown_once(self):
+        class _Stub(_StopStub):
             def on_shutdown(self):
                 time.sleep(0.05)  # widen the window the old code raced in
                 self.calls += 1
@@ -298,6 +363,39 @@ class TestStopIsOnceOnly:
         for t in threads:
             t.join()
         assert stub.calls == 1
+
+
+class TestSigtermReturnStatus:
+    def test_a_completed_or_timed_out_stop_reports_true(self):
+        """Only same-thread re-entry may report False; a timeout must not stop the handler
+        from exiting, because the stop script's SIGKILL is seconds away."""
+        stub = _StopStub()
+        assert stub.stop() is True
+
+        release, entered = threading.Event(), threading.Event()
+
+        class _Hanging(_StopStub):
+            def on_shutdown(self):
+                entered.set()
+                release.wait()
+
+        hung = _Hanging()
+        threading.Thread(target=hung.stop, daemon=True).start()
+        assert entered.wait(timeout=2)
+        try:
+            assert hung.stop(wait_timeout=0.3) is True
+        finally:
+            release.set()
+
+    def test_the_handler_refuses_to_exit_on_an_unfinished_teardown(self):
+        source = open(os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "main.py")).read()
+        start = source.index("def _sigterm_handler")
+        handler = source[start:source.index("signal.signal(signal.SIGTERM", start)]
+        assert "if not agent.stop(" in handler
+        assert handler.index("return") < handler.index("os._exit(0)"), (
+            "the early return has to precede the exit, or it exits regardless"
+        )
 
 
 class TestSigtermDoesNotWaitOnJobThreads:

@@ -95,7 +95,15 @@ if __name__ == '__main__':
 
     # Handle SIGTERM gracefully: save metrics to Redis before exiting
     def _sigterm_handler(signum, frame):
-        agent.stop()
+        # Bounded by the 45s the stop script waits before SIGKILL. stop() returns only once
+        # teardown has finished, because os._exit below is immediate: the stop script touches
+        # the shutdown flag and signals in the same breath, so the periodic thread is usually
+        # already inside save_results when this runs, and exiting here would cut off the very
+        # write this ordering exists to guarantee.
+        if not agent.stop(wait_timeout=40.0):
+            # This signal interrupted a teardown already running on this very thread; exiting
+            # here would truncate the save it is in the middle of. Unwind and let it finish.
+            return
         # os._exit, not sys.exit: the job ThreadPoolExecutor's workers are non-daemon, and
         # interpreter shutdown joins them, so sys.exit here still blocked until every running
         # job finished its simulated wall time (up to runtime.wall_time_max_s). That is exactly
