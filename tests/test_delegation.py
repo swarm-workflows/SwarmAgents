@@ -759,6 +759,7 @@ def test_fan_out_is_refused_on_three_level_hierarchies(tmp_path):
          str(out), "hierarchical", "localhost", "100", "--seed", "42", "--skip-jobs",
          "--groups-per-coordinator", "2"],
         cwd=REPO, capture_output=True, text=True)
+    assert proc.returncode != 0, "a refused topology must not report success"
     assert "only supported for two-level" in proc.stdout + proc.stderr
     assert not [n for n in os.listdir(out) if n.endswith(".yml")]
 
@@ -825,5 +826,51 @@ def test_a_fleet_size_with_no_preset_is_refused_not_truncated(tmp_path):
          str(out), "hierarchical", "localhost", "100", "--seed", "42", "--skip-jobs"],
         cwd=REPO, capture_output=True, text=True)
     combined = proc.stdout + proc.stderr
+    assert proc.returncode != 0, "a refused topology must not report success"
     assert "would need" in combined and "silently dropping" in combined
     assert not [n for n in os.listdir(out) if n.endswith(".yml")]
+
+
+def test_every_refused_topology_exits_non_zero(tmp_path):
+    """`run_test.py` and `batch_tests_v2.py` invoke the generator with `check=True`. Printing a
+    refusal and returning 0 told the driver the configs were ready, so an overnight campaign
+    cell would launch agents against an empty config directory — or against the previous
+    cell's leftovers, quietly producing a run of the wrong shape."""
+    cases = [
+        (["20"], "below the hierarchical minimum"),
+        (["95"], "a size with no preset"),
+        (["300"], "a size off the supported list"),
+        (["100", "--groups-per-coordinator", "2"], "fan-out on a three-level hierarchy"),
+    ]
+    for i, (extra, why) in enumerate(cases):
+        out = tmp_path / f"refused{i}"
+        out.mkdir()
+        agents, rest = extra[0], extra[1:]
+        proc = subprocess.run(
+            [sys.executable, "generate_configs.py", agents, "10", "./config_swarm_multi.yml",
+             str(out), "hierarchical", "localhost", "100", "--seed", "42", "--skip-jobs", *rest],
+            cwd=REPO, capture_output=True, text=True)
+        assert proc.returncode != 0, f"{why}: exited 0"
+        assert not [n for n in os.listdir(out) if n.endswith(".yml")], f"{why}: wrote configs"
+
+
+def test_a_buildable_topology_still_exits_zero(tmp_path):
+    """The other half: refusing must not become the default answer."""
+    for agents in ("30", "90", "270"):
+        out = tmp_path / f"ok{agents}"
+        proc = subprocess.run(
+            [sys.executable, "generate_configs.py", agents, "10", "./config_swarm_multi.yml",
+             str(out), "hierarchical", "localhost", "100", "--seed", "42", "--skip-jobs",
+             "--groups-per-coordinator", "3"],
+            cwd=REPO, capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stdout[-1500:] + proc.stderr[-1500:]
+        assert len([n for n in os.listdir(out) if n.endswith(".yml")]) == int(agents)
+
+
+def test_a_fan_out_larger_than_the_group_count_clamps(tmp_path):
+    """Asking for more groups per coordinator than exist is not an error — one coordinator
+    parents them all. It is clamped so the topology and the log line agree; before, Hier-30
+    with G=99 announced "1 coordinator x 99 groups" for a fleet with five."""
+    coords = _generated_coordinators(
+        tmp_path / "clamped", "--groups-per-coordinator", "99")
+    assert _led_counts(coords) == [5]

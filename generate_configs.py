@@ -4,12 +4,23 @@ import json
 import math
 import os
 import random
+import sys
 from typing import Dict, List, Optional, Tuple
 
 import yaml
 
 from job_generator import JobGenerator
 from swarm.utils.yaml_strict import safe_load as yaml_safe_load_strict
+
+
+class TopologyError(Exception):
+    """A topology that cannot be built as requested.
+
+    Raised rather than printed-and-returned: `run_test.py` and `batch_tests_v2.py` invoke this
+    script with `check=True`, so exiting 0 after refusing to write anything told the campaign
+    driver the configs were ready. It then launched agents against an empty config directory —
+    or, worse, against a previous cell's leftovers.
+    """
 
 INSTANCE_FLAVORS = [
     {"name": "small",      "core": 2,  "ram": 8,   "disk": 100,  "gpu": 0},
@@ -528,8 +539,9 @@ class SwarmConfigGenerator:
 
         elif self.topology == "hierarchical":
             if self.num_agents < 30:
-                print("Minimum number of agents for hierarchical topology is 30")
-                return
+                raise TopologyError(
+                    f"Minimum number of agents for hierarchical topology is 30 "
+                    f"(got {self.num_agents})")
             agent_topo = {}
 
             # Determine hierarchy structure based on agent count
@@ -625,9 +637,9 @@ class SwarmConfigGenerator:
                 level_2_base = 991
 
             else:
-                print(f"Hierarchical topology currently supports 30, 60, 90, 100, 110, 120, 250, 270, 990, "
-                      f"or 1000 agents (got {self.num_agents})")
-                return
+                raise TopologyError(
+                    f"Hierarchical topology currently supports 30, 60, 90, 100, 110, 120, 250, "
+                    f"270, 990, or 1000 agents (got {self.num_agents})")
 
             # How many child groups one coordinator exclusively parents. G=1 is the shipped
             # 1:1 mapping and takes the original code path untouched. G>1 is what gives a
@@ -636,13 +648,17 @@ class SwarmConfigGenerator:
             # short-circuits, and --co-parents does not help (leadership goes to the lowest-ID
             # live co-parent, concentrating groups on one coordinator rather than spreading a
             # choice to each). See docs/FGCS_EVAL_PLAN.md section 0.6.
-            G = max(1, int(self.groups_per_coordinator))
+            # Clamped to the groups that exist: asking for more per coordinator than there are
+            # simply means one coordinator parents them all, and reporting the requested number
+            # instead of the real one made the log line say "1 coordinator x 99 groups" for a
+            # fleet with 5.
+            G = max(1, min(int(self.groups_per_coordinator), num_groups))
             if G > 1 and num_super_groups > 0:
-                print(f"--groups-per-coordinator {G} is only supported for two-level "
-                      f"hierarchies (30, 60, 110, 120, 250 agents); {self.num_agents} agents "
-                      f"builds a three-level hierarchy, whose super-groups are sized in "
-                      f"Level-1 agents and would need restructuring too.")
-                return
+                raise TopologyError(
+                    f"--groups-per-coordinator {G} is only supported for two-level hierarchies "
+                    f"(30, 60, 90, 110, 120, 250, 270 agents); {self.num_agents} agents builds "
+                    f"a three-level hierarchy, whose super-groups are sized in Level-1 agents "
+                    f"and would need restructuring too.")
             num_coords = math.ceil(num_groups / G)
 
             # Coordinator slots freed by the larger fan-out go back to Level 0, so the fleet
@@ -653,9 +669,9 @@ class SwarmConfigGenerator:
             if G > 1:
                 level_0_total = self.num_agents - num_coords
                 if level_0_total < num_groups:
-                    print(f"--groups-per-coordinator {G} leaves {level_0_total} Level-0 agents "
-                          f"for {num_groups} groups; not enough to fill them.")
-                    return
+                    raise TopologyError(
+                        f"--groups-per-coordinator {G} leaves {level_0_total} Level-0 agents "
+                        f"for {num_groups} groups; not enough to fill them.")
                 base, remainder = divmod(level_0_total, num_groups)
                 group_sizes = [base + (1 if i < remainder else 0) for i in range(num_groups)]
                 level_1_base = level_0_total + 1
@@ -805,15 +821,15 @@ class SwarmConfigGenerator:
             # nothing says so. Refuse instead.
             if len(agent_topo) != self.num_agents:
                 supported = "30, 60, 90, 100, 110, 120, 250, 270, 990, 1000"
-                print(f"Hierarchical topology for {self.num_agents} agents would need "
-                      f"{len(agent_topo)} agents ({num_groups} groups of {group_sizes[0]}"
-                      f"{'-' + str(group_sizes[-1]) if len(set(group_sizes)) > 1 else ''} plus "
-                      f"{num_coords} coordinator(s)"
-                      f"{' plus ' + str(num_super_groups) + ' super-coordinators' if num_super_groups > 0 else ''}"
-                      f"). Only ids 1..{self.num_agents} would be written, silently dropping "
-                      f"the rest — a fleet with no coordinators if the drop reaches Level 1. "
-                      f"Use one of the supported sizes: {supported}.")
-                return
+                raise TopologyError(
+                    f"Hierarchical topology for {self.num_agents} agents would need "
+                    f"{len(agent_topo)} agents ({num_groups} groups of {group_sizes[0]}"
+                    f"{'-' + str(group_sizes[-1]) if len(set(group_sizes)) > 1 else ''} plus "
+                    f"{num_coords} coordinator(s)"
+                    f"{' plus ' + str(num_super_groups) + ' super-coordinators' if num_super_groups > 0 else ''}"
+                    f"). Only ids 1..{self.num_agents} would be written, silently dropping the "
+                    f"rest — a fleet with no coordinators if the drop reaches Level 1. Use one "
+                    f"of the supported sizes: {supported}.")
 
         else:
             # default to full mesh (backward compatible)
@@ -1110,8 +1126,14 @@ if __name__ == "__main__":
         quantum_agents_pct=args.quantum_agents_pct,
         master_fleet_size=args.master_fleet_size,
     )
-    generator.generate_configs(flavor_percentages=flavor_percentages, agent_hosts=agent_hosts,
-                               agent_sites=agent_sites)
+    try:
+        generator.generate_configs(flavor_percentages=flavor_percentages, agent_hosts=agent_hosts,
+                                   agent_sites=agent_sites)
+    except TopologyError as e:
+        # Non-zero, so a driver running with check=True stops here instead of launching agents
+        # against an empty (or stale) config directory.
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
 
     # Create jobs if not present (and not deferred to another producer)
     if not args.skip_jobs and not os.path.exists("jobs"):
