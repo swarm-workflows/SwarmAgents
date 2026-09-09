@@ -109,6 +109,14 @@ _wait_gone '${AGENT_PATTERN}' ${DRAIN_TIMEOUT}"
         hosts+=("$host")
     done < "$HOSTS_FILE"
 
+    if [[ "${#hosts[@]}" -eq 0 ]]; then
+        # An empty hosts file would otherwise sweep nothing and report success, which is the
+        # silent no-op this script exists to stop being.
+        echo "ERROR: hosts file ${HOSTS_FILE} lists no hosts; no agents were stopped" >&2
+        rm -rf "$status_dir"
+        return 1
+    fi
+
     echo "[stop] Stopping agents on ${#hosts[@]} host(s), waiting up to ${DRAIN_TIMEOUT}s each …"
     for host in "${hosts[@]}"; do
         (
