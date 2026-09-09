@@ -28,6 +28,7 @@ import pandas as pd
 from plotting.data import (
     load_metrics_from_redis,
     load_metrics_from_file,
+    set_expected_run_id,
     load_jobs_from_csv,
     load_jobs_from_redis,
 )
@@ -576,6 +577,11 @@ def parse_args():
     parser.add_argument("--from-csv", action="store_true", help="Load from CSV/JSON files instead of Redis")
     parser.add_argument("--compare", nargs="+", metavar="RUN_DIR", help="Compare multiple run directories")
     parser.add_argument("--no-plots", action="store_true", help="Print summary only, no plots")
+    parser.add_argument("--metrics-run-id", type=str, default=None,
+                        help="Only read metrics payloads stamped with this run id (see "
+                             "<run-dir>/run_meta.json). Without it, metrics left in Redis by an "
+                             "agent that outlived an earlier run are read as this run's — and "
+                             "MAB/delegation counters are exactly what that corrupted.")
     parser.add_argument("--dump", type=str,
                         help="Offline mode: plot from a full Redis dump JSON "
                              "(see evaluation/scenario_a/extract_scenario_a.py)")
@@ -590,6 +596,8 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    set_expected_run_id(args.metrics_run_id)
 
     # Offline dump mode (contextual bandit evaluation)
     if args.dump:

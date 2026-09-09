@@ -46,13 +46,21 @@ Notes:
 - Use --shutdown-after-seconds for time-based test termination (bypasses bucket monitoring).
 """
 from __future__ import annotations
-import argparse, os, re, subprocess, sys, time, math, shlex, csv, json, uuid
+import argparse, os, re, subprocess, sys, threading, time, math, shlex, csv, json, uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import List
 
 LINE_RE = re.compile(r"^state:\d+:\d+:(\d+):\s*\{([^}]*)\}\s*$")
+
+# Set once teardown begins, so the dynamic-agent trigger thread (a daemon that is never
+# joined) cannot launch agents after the stop sweep has already run.
+_TEARDOWN = threading.Event()
+
+# The base config every per-agent file is generated from. Named once: the same path resolved
+# in two places is how `runtime.peer_expiry_seconds` came to have two different defaults.
+BASE_CONFIG = "./config_swarm_multi.yml"
 
 def log(msg: str) -> None:
     print(f"[{datetime.now():%H:%M:%S}] {msg}", flush=True)
@@ -273,7 +281,7 @@ def generate_configs(args, agent_hosts_list: list[str]) -> Path:
     gen_args = [
         "python3.11", "generate_configs.py",
         str(args.agents), str(args.jobs_per_proposal),
-        "./config_swarm_multi.yml", str(cfg_dir),
+        BASE_CONFIG, str(cfg_dir),
         args.topology, args.db_host, str(args.jobs),
         "--agent-hosts-file", str(hosts_file),
         "--agents-per-host", str(args.agents_per_host) if args.mode == "remote" else str(args.agents),
@@ -728,6 +736,28 @@ def wait_with_early_exit(args) -> None:
     log("Shutdown timer expired, stopping test")
 
 
+def _effective_delegation_policy(args) -> str | None:
+    """The policy this run will actually use, for run_meta.json.
+
+    Recording only the flag would write `null` for every run that takes the arm from the base
+    config, which is how the arm was selected until --delegation-policy existed.
+    """
+    if getattr(args, "delegation_policy", None):
+        return args.delegation_policy
+    # Otherwise it comes from whatever the agents will actually read: the pre-existing config
+    # directory under --use-config-dir, else the base config the generator copies from.
+    candidates = [BASE_CONFIG]
+    if getattr(args, "use_config_dir", False):
+        cfg_dir = Path(getattr(args, "config_dir", "configs"))
+        candidates = sorted(cfg_dir.glob("*.yml"))[:1] or candidates
+    try:
+        from swarm.utils.yaml_strict import safe_load
+        with open(candidates[0]) as f:
+            return ((safe_load(f) or {}).get("delegation") or {}).get("policy")
+    except Exception:
+        return None
+
+
 def _hosts_file_for_stop(args, host_list: list[str] | None) -> str:
     """Path to a hosts file the stop script can read, writing one if needed.
 
@@ -835,12 +865,21 @@ def report_metrics_completeness(args, expected_ids: set[int], run_id: str,
     """Log and record which agents reported metrics. True when the run is measurable."""
     missing, foreign = wait_for_metrics(args, expected_ids, run_id)
     allowed = max(0, args.allow_missing_metrics)
+    declared = {int(x) for x in str(args.expect_silent_agents or "").replace(" ", "").split(",")
+                if x}
     if foreign:
         log(f"NOTE: {len(foreign)} metrics payload(s) in Redis belong to another run and will "
             f"be ignored: " + ", ".join(f"agent {a} (run_id={r})" for a, r in sorted(foreign.items())))
     if not missing:
+        if declared:
+            # Their metrics being present means the kill did not take — the fault the run was
+            # measuring never happened, which is a worse outcome than a missing payload.
+            log(f"WARNING: --expect-silent-agents named {sorted(declared)} but every agent "
+                f"reported metrics; the intended kills did not take effect")
         log(f"Metrics complete: all {len(expected_ids)} agents reported for run_id={run_id}")
         return True
+
+    unexpected = missing - declared if declared else set()
 
     shortfall = {
         "run_id": run_id,
@@ -848,19 +887,35 @@ def report_metrics_completeness(args, expected_ids: set[int], run_id: str,
         "missing_agents": sorted(missing),
         "foreign_payloads": {str(a): r for a, r in sorted(foreign.items())},
         "allow_missing_metrics": allowed,
+        "expect_silent_agents": sorted(declared),
+        "unexpectedly_silent": sorted(unexpected),
         "stopped_cleanly": stopped_cleanly,
         "waited_seconds": args.metrics_wait_seconds,
     }
     with open(os.path.join(args.run_dir, "metrics_shortfall.json"), "w") as f:
         json.dump(shortfall, f, indent=2)
 
+    # With ids declared, the count is not the question: the right agents have to be the
+    # silent ones. A failure test that kills 3 and 5 but finds 7 and 9 silent measured a
+    # different fault than the one it reported.
+    if declared:
+        accounted = not unexpected
+        if accounted:
+            log(f"Metrics complete apart from the {len(missing)} agent(s) declared silent "
+                f"({sorted(missing)}) for run_id={run_id}")
+            return True
+        log(f"ERROR: {sorted(unexpected)} reported no metrics but were not declared silent "
+            f"(declared: {sorted(declared)}). Wrote {args.run_dir}/metrics_shortfall.json.")
+        return False
+
     level = "WARNING" if len(missing) <= allowed else "ERROR"
     log(f"{level}: {len(missing)} of {len(expected_ids)} agents never wrote metrics for this run "
         f"(missing: {sorted(missing)}). Wrote {args.run_dir}/metrics_shortfall.json.")
     if len(missing) > allowed:
         log("ERROR: per-agent metrics (load, utilisation, fairness, MAB and delegation counts) "
-            "are incomplete, so this run is not measurable. Pass --allow-missing-metrics N if "
-            "N agents were killed with SIGKILL and are expected to be silent.")
+            "are incomplete, so this run is not measurable. Declare the agents a failure test "
+            "SIGKILLs with --expect-silent-agents 3,7 (or, less precisely, "
+            "--allow-missing-metrics N).")
         return False
     return True
 
@@ -1003,7 +1058,14 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--allow-missing-metrics", type=int, default=0,
                     help="Number of agents allowed to report no metrics without failing the run. "
                          "Set it to the number of agents killed with SIGKILL in a failure "
-                         "injection test; those cannot flush metrics by design.")
+                         "injection test; those cannot flush metrics by design. Prefer "
+                         "--expect-silent-agents, which also checks WHICH agents were silent.")
+    ap.add_argument("--expect-silent-agents", default="",
+                    help="Comma-separated agent ids expected to report no metrics (SIGKILLed by "
+                         "a failure injection test). Stricter than --allow-missing-metrics: a "
+                         "run still fails if some OTHER agent was the silent one, which a bare "
+                         "count cannot distinguish. SIGTERM-killed agents still flush metrics, "
+                         "so they do not belong here.")
 
     # Pegasus job integration
     ap.add_argument("--pegasus-profiles", default=None,
@@ -1054,6 +1116,15 @@ def main() -> None:
     # outlived an earlier run can no longer be reported as this run's numbers.
     # Exported (not passed): local agents are spawned as children and inherit it, and the
     # remote starter re-exports it over ssh.
+    if args.delegation_policy and args.use_config_dir:
+        # --use-config-dir skips generate_configs entirely, so the override would never reach a
+        # config file while run_meta.json still recorded it — a run labelled with an arm it did
+        # not run is worse than one with no label.
+        raise SystemExit(
+            "--delegation-policy has no effect with --use-config-dir (the configs are used as "
+            "they are on disk). Drop --use-config-dir to generate configs for this arm, or set "
+            "delegation.policy in the config directory yourself and drop --delegation-policy.")
+
     run_id = f"{Path(args.run_dir).name}-{datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}"
     os.environ["SWARM_RUN_ID"] = run_id
     log(f"run_id={run_id}")
@@ -1069,7 +1140,13 @@ def main() -> None:
     # is killed after the flush writes its (old) metrics into the fresh keyspace, which is
     # exactly how smoke-g2-llm's metrics.json came to hold 15 agents from smoke-g2-bandit.
     log("Reaping agents left over from any previous run …")
-    stop_agents(args, host_list)
+    if not stop_agents(args, host_list):
+        raise SystemExit(
+            "Refusing to start: agents from a previous run could not be confirmed stopped. "
+            "They would keep writing jobs, agent records and MAB state into the keyspace this "
+            "run is about to flush — unlike metrics, none of that is stamped with a run id, so "
+            "the contamination would be invisible. Fix the unreachable host(s) or stop them by "
+            "hand, then re-run.")
 
     with open(os.path.join(args.run_dir, "run_meta.json"), "w") as f:
         json.dump({
@@ -1082,7 +1159,7 @@ def main() -> None:
             "dynamic_agents": args.dynamic_agents,
             "topology": args.topology,
             "jobs": args.jobs,
-            "delegation_policy": getattr(args, "delegation_policy", None),
+            "delegation_policy": _effective_delegation_policy(args),
             "groups_per_coordinator": getattr(args, "groups_per_coordinator", 1),
             "argv": sys.argv,
         }, f, indent=2)
@@ -1127,7 +1204,6 @@ def main() -> None:
         start_agents_remote(args, host_list)
 
     # Start job production in background thread to avoid blocking dynamic trigger detection
-    import threading
     job_thread = threading.Thread(target=lambda: produce_jobs(args), daemon=True, name="JobDistributor")
     job_thread.start()
     log("Job distribution started in background thread")
@@ -1137,6 +1213,11 @@ def main() -> None:
         # Start a thread to wait for the trigger and add agents
         def dynamic_addition():
             wait_for_dynamic_trigger(args)
+            if _TEARDOWN.is_set():
+                # The metrics wait keeps this process alive well past the stop sweep, so a
+                # trigger that fires late would start agents nobody will ever stop.
+                log("Dynamic trigger fired after teardown began; not adding agents")
+                return
             add_dynamic_agents(args, host_list)
 
         dynamic_thread = threading.Thread(target=dynamic_addition, daemon=True, name="DynamicAgentAdder")
@@ -1149,6 +1230,7 @@ def main() -> None:
         wait_with_early_exit(args)
     else:
         wait_runtime(args)
+    _TEARDOWN.set()
     stopped_cleanly = stop_agents(args, host_list)
 
     # Every agent id we launched is expected to report; plotting happens after they all have.

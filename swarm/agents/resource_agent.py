@@ -19,6 +19,7 @@
 # SOFTWARE.
 #
 # Author: Komal Thareja(kthare10@renci.org)
+import copy
 import os
 import random
 import threading
@@ -287,6 +288,10 @@ class _GossipAdapter:
 class ResourceAgent(Agent):
     def __init__(self, agent_id: int, config_file: str, debug: bool = False):
         super().__init__(agent_id, config_file, debug)
+        # Teardown saves metrics twice (before and after the executor drain). Serialising the
+        # two saves keeps the pre-drain payload from landing on top of the post-drain one when
+        # stop() is entered from both the SIGTERM handler and the periodic thread.
+        self._save_results_lock = threading.RLock()
         consensus_cfg = self.config.get("consensus", {})
         protocol = (consensus_cfg.get("protocol") or "pbft").lower()
         host = _HostAdapter(self)
@@ -2245,7 +2250,19 @@ class ResourceAgent(Agent):
         self.logger.info(f"Agent: {self} stopped with restarts: {self.metrics.restarts}!")
 
     def save_results(self):
+        """Persist this agent's metrics payload to Redis.
+
+        Every container here is snapshotted with deepcopy first. The pre-drain call in
+        on_shutdown runs while job threads are still appending to `metrics.load`, incrementing
+        `metrics.restarts` and mutating `engine.conflicts`; serialising those live would either
+        raise ("dictionary changed size during iteration") or, worse, write a valid JSON
+        document whose sections came from different instants.
+        """
         self.logger.info("Saving Results")
+        with self._save_results_lock:
+            self._save_results_locked()
+
+    def _save_results_locked(self):
         agent_metrics = {
             "id": self.agent_id,
             # Which run this payload belongs to. An agent that outlives its run writes its
@@ -2254,30 +2271,30 @@ class ResourceAgent(Agent):
             # instead of silently reporting run N's numbers as run N+1's.
             "run_id": os.environ.get("SWARM_RUN_ID"),
             "saved_at": time.time(),
-            "restarts": self.metrics.restarts,
-            "conflicts": self.engine.conflicts,
-            "idle_time": self.metrics.idle_time,
-            "load_trace": self.metrics.load,
-            "agent_failures": self.metrics.agent_failures,
-            "reassignments": self.metrics.reassignments,
-            "delegation_reassignments": self.metrics.delegation_reassignments,
-            "quorum_changes": self.metrics.quorum_changes,
+            "restarts": copy.deepcopy(self.metrics.restarts),
+            "conflicts": copy.deepcopy(self.engine.conflicts),
+            "idle_time": copy.deepcopy(self.metrics.idle_time),
+            "load_trace": copy.deepcopy(self.metrics.load),
+            "agent_failures": copy.deepcopy(self.metrics.agent_failures),
+            "reassignments": copy.deepcopy(self.metrics.reassignments),
+            "delegation_reassignments": copy.deepcopy(self.metrics.delegation_reassignments),
+            "quorum_changes": copy.deepcopy(self.metrics.quorum_changes),
             "failed_agents": self.failed_agents.to_dict(),
             "failed_agents_count": len(self.failed_agents),
             "final_quorum": self.calculate_quorum(),
             "infeasible_retired": getattr(self.metrics, 'infeasible_retired', []),
         }
         if self.mab_enabled and self.mab_manager:
-            agent_metrics["mab_stats"] = self.mab_manager.get_stats()
-            agent_metrics["mab_selections"] = self.metrics.mab_selections
+            agent_metrics["mab_stats"] = copy.deepcopy(self.mab_manager.get_stats())
+            agent_metrics["mab_selections"] = copy.deepcopy(self.metrics.mab_selections)
             agent_metrics["mab_rewards"] = {
-                str(k): v for k, v in self.metrics.mab_rewards.items()
+                str(k): copy.deepcopy(v) for k, v in list(self.metrics.mab_rewards.items())
             }
             self.mab_manager.save_state()
         # LLM group delegation (P0-1). Exported outside the MAB block: `delegation.policy: llm`
         # is usable with the bandit off, and that arm is precisely the one E4 needs counted.
         if self.metrics.llm_delegations:
-            agent_metrics["llm_delegations"] = self.metrics.llm_delegations
+            agent_metrics["llm_delegations"] = copy.deepcopy(self.metrics.llm_delegations)
         deleg_stats = getattr(self, "delegation_stats", None)
         if callable(deleg_stats):
             dg = deleg_stats()

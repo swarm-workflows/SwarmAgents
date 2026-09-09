@@ -21,6 +21,11 @@ REMOTE_REPO_DIR="/root/SwarmAgents"
 DRAIN_TIMEOUT=45
 
 AGENT_PATTERN='python3\.11 .*main\.py'
+# GNU timeout bounds each remote stop. Absent (a stock macOS controller), the ssh keepalive
+# options below are the only bound; do not fail the sweep over a missing wrapper.
+if command -v timeout >/dev/null 2>&1; then TIMEOUT_CMD=timeout
+elif command -v gtimeout >/dev/null 2>&1; then TIMEOUT_CMD=gtimeout
+else TIMEOUT_CMD=""; fi
 DISTRIBUTOR_PATTERN='python3\.11 .*job_distributor\.py'
 
 while [[ $# -gt 0 ]]; do
@@ -120,8 +125,14 @@ _wait_gone '${AGENT_PATTERN}' ${DRAIN_TIMEOUT}"
     echo "[stop] Stopping agents on ${#hosts[@]} host(s), waiting up to ${DRAIN_TIMEOUT}s each …"
     for host in "${hosts[@]}"; do
         (
-            if ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes \
-                   -o ConnectTimeout=10 "$host" "bash -s" <<< "$remote_cmd" 2>&1; then
+            # ConnectTimeout alone only bounds the handshake: a connection that stalls after
+            # it is established would block the `wait` below forever, hanging a whole campaign
+            # on one sick host. ServerAlive* bounds a dead peer, and `timeout` bounds
+            # everything else (the drain wait plus slack).
+            if ${TIMEOUT_CMD:+$TIMEOUT_CMD $(( DRAIN_TIMEOUT + 30 ))} \
+               ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes \
+                   -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 \
+                   "$host" "bash -s" <<< "$remote_cmd" 2>&1; then
                 echo ok > "${status_dir}/${host}"
             else
                 echo "[stop] WARN: could not confirm agents stopped on ${host}"

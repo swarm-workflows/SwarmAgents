@@ -69,6 +69,13 @@ class Agent(Observer):
             self.config = yaml_safe_load_strict(f)
 
         self.queues = AgentQueues()
+        # stop() is reached from two directions — the SIGTERM handler in main.py and the
+        # periodic thread's own shutdown condition — and the stop script touches the shutdown
+        # flag and signals in the same breath, so both commonly fire. on_shutdown persists
+        # metrics, so running it twice concurrently let an earlier snapshot land on top of a
+        # later one; this makes the teardown path run once.
+        self._stop_lock = threading.Lock()
+        self._stopped = False
         self.grpc_config = self.config.get("grpc", {})
         self.log_config = self.config.get("logging", {})
         self.runtime_config = self.config.get("runtime", {})
@@ -187,6 +194,11 @@ class Agent(Observer):
             self.stop()
 
     def stop(self):
+        with self._stop_lock:
+            if self._stopped:
+                self.logger.debug("stop() already ran; ignoring re-entry")
+                return
+            self._stopped = True
         try:
             self.shutdown = True
             self.queues.message_event.set()

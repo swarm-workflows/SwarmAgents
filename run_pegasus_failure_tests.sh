@@ -98,6 +98,13 @@ echo "=============================================="
 # ---- Build run_test.py command ----
 build_cmd() {
     local run_dir="$1"
+    # Agent ids this run kills with SIGKILL, if any. A SIGKILLed agent cannot flush its
+    # metrics, and run_test.py now fails a run whose per-agent metrics are incomplete — so a
+    # failure run has to declare its casualties or it exits 3 for doing exactly what it was
+    # asked to do. Declaring the ids (rather than a count) also catches the case where the
+    # kill hit a different agent than intended: in remote mode kill_agents_by_id pkills every
+    # main.py on the target host, so with AGENTS_PER_HOST > 1 more agents die than are named.
+    local silent_ids="${2:-}"
     local cmd="python3.11 run_test.py"
     cmd+=" --mode ${MODE}"
     cmd+=" --agent-type resource"
@@ -117,6 +124,9 @@ build_cmd() {
     cmd+=" --log-dir ${run_dir}/logs"
     cmd+=" --config-dir ${CONFIG_DIR}"
     cmd+=" --use-config-dir"
+    if [[ -n "${silent_ids}" ]]; then
+        cmd+=" --expect-silent-agents ${silent_ids}"
+    fi
 
     if [[ "${MODE}" == "remote" ]]; then
         cmd+=" --agents-per-host ${AGENTS_PER_HOST}"
@@ -233,7 +243,7 @@ for i in $(seq 1 ${RUNS}); do
     sleep 3
 
     # Start test in background
-    cmd=$(build_cmd "${run_dir}")
+    cmd=$(build_cmd "${run_dir}" "${KILL_AGENT_IDS}")
     cd "${BASE_DIR}"
     eval "${cmd}" > "${run_dir}/logs/run_test.stdout.log" 2>&1 &
     TEST_PID=$!

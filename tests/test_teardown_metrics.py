@@ -122,9 +122,9 @@ class TestShutdownOrder:
 class TestMetricsPayloadIsStamped:
     def test_resource_and_colmena_agents_both_stamp_run_id(self):
         import inspect
-        for cls_source in (inspect.getsource(ResourceAgent.save_results),):
-            assert '"run_id": os.environ.get("SWARM_RUN_ID")' in cls_source
-            assert '"saved_at"' in cls_source
+        payload = inspect.getsource(ResourceAgent._save_results_locked)
+        assert '"run_id": os.environ.get("SWARM_RUN_ID")' in payload
+        assert '"saved_at"' in payload
         colmena = open(os.path.join(os.path.dirname(os.path.dirname(
             os.path.abspath(__file__))), "swarm/agents/colmena_agent.py")).read()
         assert '"run_id": os.environ.get("SWARM_RUN_ID")' in colmena, (
@@ -156,7 +156,8 @@ class TestRunIdFilter:
 
 def _args(tmp_path, **over):
     base = dict(run_dir=str(tmp_path), db_host="localhost", metrics_wait_seconds=0,
-                allow_missing_metrics=0, mode="local", agent_hosts_file=None, agent_hosts=None)
+                allow_missing_metrics=0, expect_silent_agents="", mode="local",
+                agent_hosts_file=None, agent_hosts=None)
     base.update(over)
     return argparse.Namespace(**base)
 
@@ -189,6 +190,30 @@ class TestMetricsCompletenessGate:
             _args(tmp_path, allow_missing_metrics=1), {1, 2, 3}, "now", True) is False
 
 
+class TestDeclaredSilentAgents:
+    """A count cannot tell the intended casualties from the accidental ones."""
+
+    def test_declared_ids_account_for_the_shortfall(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(run_test, "_metrics_in_redis", lambda a, r: ({1, 4}, {}))
+        assert run_test.report_metrics_completeness(
+            _args(tmp_path, expect_silent_agents="2,3"), {1, 2, 3, 4}, "now", True) is True
+
+    def test_a_different_agent_being_silent_still_fails(self, tmp_path, monkeypatch):
+        """Same count as declared, wrong agents: the fault measured was not the one intended."""
+        monkeypatch.setattr(run_test, "_metrics_in_redis", lambda a, r: ({2, 3}, {}))
+        assert run_test.report_metrics_completeness(
+            _args(tmp_path, expect_silent_agents="2,3"), {1, 2, 3, 4}, "now", True) is False
+        shortfall = json.loads((tmp_path / "metrics_shortfall.json").read_text())
+        assert shortfall["unexpectedly_silent"] == [1, 4]
+        assert shortfall["expect_silent_agents"] == [2, 3]
+
+    def test_kills_that_did_not_take_are_called_out(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setattr(run_test, "_metrics_in_redis", lambda a, r: ({1, 2, 3}, {}))
+        assert run_test.report_metrics_completeness(
+            _args(tmp_path, expect_silent_agents="2"), {1, 2, 3}, "now", True) is True
+        assert "did not take effect" in capsys.readouterr().out
+
+
 class TestHostsFileForStop:
     def test_prefers_the_declared_hosts_file(self, tmp_path):
         declared = tmp_path / "given_hosts.txt"
@@ -209,3 +234,80 @@ class TestHostsFileForStop:
         monkeypatch.chdir(tmp_path)
         with pytest.raises(SystemExit):
             run_test._hosts_file_for_stop(_args(tmp_path), [])
+
+
+class TestStopIsOnceOnly:
+    """stop() is reached from the SIGTERM handler and from the periodic thread's own
+    shutdown condition, and the stop script touches the flag file and signals in one breath,
+    so both fire. Running the teardown twice let the pre-drain payload land after the
+    post-drain one."""
+
+    def test_second_call_is_a_no_op(self):
+        from swarm.agents.agent_grpc import Agent
+
+        class _Stub:
+            stop = Agent.stop
+
+            def __init__(self):
+                self._stop_lock = threading.Lock()
+                self._stopped = False
+                self.logger = logging.getLogger("stop-stub")
+                self.shutdown = False
+                self.condition = threading.Condition()
+                self.queues = type("Q", (), {
+                    "message_event": threading.Event(), "pending_event": threading.Event(),
+                    "selected_event": threading.Event()})()
+                self.transport = type("T", (), {"stop": lambda self_: None})()
+                self.calls = 0
+
+            def on_shutdown(self):
+                self.calls += 1
+
+        stub = _Stub()
+        stub.stop()
+        stub.stop()
+        stub.stop()
+        assert stub.calls == 1
+
+    def test_concurrent_callers_only_run_teardown_once(self):
+        from swarm.agents.agent_grpc import Agent
+
+        class _Stub:
+            stop = Agent.stop
+
+            def __init__(self):
+                self._stop_lock = threading.Lock()
+                self._stopped = False
+                self.logger = logging.getLogger("stop-stub")
+                self.shutdown = False
+                self.condition = threading.Condition()
+                self.queues = type("Q", (), {
+                    "message_event": threading.Event(), "pending_event": threading.Event(),
+                    "selected_event": threading.Event()})()
+                self.transport = type("T", (), {"stop": lambda self_: None})()
+                self.calls = 0
+
+            def on_shutdown(self):
+                time.sleep(0.05)  # widen the window the old code raced in
+                self.calls += 1
+
+        stub = _Stub()
+        threads = [threading.Thread(target=stub.stop) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert stub.calls == 1
+
+
+class TestSigtermDoesNotWaitOnJobThreads:
+    def test_handler_exits_the_process_rather_than_joining_workers(self):
+        """ThreadPoolExecutor workers are non-daemon, so interpreter shutdown joins them and
+        sys.exit() waited out the full simulated wall time — defeating the bounded drain."""
+        source = open(os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "main.py")).read()
+        start = source.index("def _sigterm_handler")
+        handler = source[start:source.index("signal.signal(signal.SIGTERM", start)]
+        assert "os._exit(0)" in handler
+        assert "logging.shutdown()" in handler, "os._exit skips the log flush atexit would do"
+        assert "sys.exit(0)" not in handler
