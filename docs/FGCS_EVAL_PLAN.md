@@ -620,7 +620,7 @@ from `SWARM-2slice.ipynb` + `db_node_setup/` and tag the frozen revision).
 |---|---|---|---|
 | 1 | Sep 8–14 | ~~**Pre-campaign fixes (§0.2)**~~ and ~~**P0-5**~~ **both DONE 2026-09-08.** Now: Hier-30 smoke on the slice through `collect.py`, with `--master-fleet-size 270` and a `--runtime` cap, checking `wire_cost_hit_rate` on an LLM cell. Confirm GPU node status and the slice lease horizon. | Smoke green |
 | 2–4 | Sep 15–Oct 5 | ~~P0-1 LLM group delegation~~ (done Sep 8), P0-4 instrumentation, ~~P0-6 bid elicitation~~, ~~P0-7 fallback parity~~ (both done Sep 8), P0-8 designated bidder. vLLM up on the GPU node, latency characterized. **No experiment starts here** — E5 needs P0-4's instrumentation and the full ladder (weeks 12–13), E3a needs E1 data (weeks 6–11). Code and bring-up only. | LLM delegation works at Hier-30 |
-| 5 | Oct 6–12 | P0-2 bandit×LLM composition, P0-3 cache + inference budget, P1-1 oracle. Pilot one cell each of E1/E2/E4/E8 end-to-end; verify every §7 metric lands in the tidy CSV. | **Code freeze Oct 12** — tag it |
+| 5 | Oct 6–12 | P0-2 bandit×LLM composition, P0-3 cache + inference budget, P1-1 oracle. Pilot one cell each of E1/E2/E4/E8 end-to-end **at Hier-30** (the pipeline is what is being proved, not the scale — and Hier-90 may still be VM-blocked, §10); verify every §7 metric lands in the tidy CSV. Delegation cells need `--groups-per-coordinator 2`+ (§0.6). | **Code freeze Oct 12** — tag it |
 | 6–11 | Oct 13–Nov 23 | Main campaign, unattended, interleaved config order: **E0 (gate) →** E1 → E2 → E4 → E7 → E8. Nightly result pull + incremental figures. **E3a analysis rides on the E1 pull** — it is re-analysis of those runs by RTT bin, so it needs no separate cells but does need AMST up. **Start writing architecture + related work from Oct 20.** | E1 + E2 complete by Nov 9 |
 | 12–13 | Nov 24–Dec 7 | E3b, E5, E6, hosted-LLM validation subset. Rerun high-variance cells. | **Data freeze Dec 7.** Figures final |
 | 14–18 | Dec 8–Jan 11 | Full draft (holidays inside this window — plan for it). Evaluation written against real numbers; related work with positioning table; threats-to-validity section (journal reviewers expect one). | **Complete draft Jan 11, 2027** |
@@ -642,9 +642,13 @@ definition:
   **every run in the campaign**, so it costs no dedicated cells and accumulates as the campaign
   runs; only the partition test is a scheduled activity, and that needs a fleet.
 
-What genuinely parallelizes in weeks 2–5 is **code, not experiments**: P0-4, P0-8, P0-2, P0-3, the
-P1-1 oracle, and vLLM bring-up on the GPU node — none need the ladder, which matters while the VM
-pool is short (§10). Writing starts Oct 20, seven weeks before the data freeze.
+What genuinely parallelizes in **weeks 2–4** is code, not experiments: P0-4, P0-8 and vLLM
+bring-up on the GPU node (P0-2, P0-3 and the P1-1 oracle are week 5 in the table above, and pulling
+them earlier is fine if P0-4 lands early) — none of it needs the ladder, which matters while the VM pool is short
+(§10). **Week 5 is deliberately not code-only**: it lands P0-2 and P0-3 and then pilots one cell
+each of E1/E2/E4/E8 end-to-end, which is the code-freeze gate — the point is to prove the pipeline
+before the campaign, so run those pilots at **Hier-30** while the pool is short rather than
+deferring them. Writing starts Oct 20, seven weeks before the data freeze.
 
 **If a conference fallback is wanted at all,** it has to be one whose deadline falls *after* FGCS
 reviews return (mid-2027 at the earliest). Do not plan the campaign around it.
