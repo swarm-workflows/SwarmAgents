@@ -19,6 +19,7 @@ from swarm.models.job import Job, ObjectState
 from plotting.data import (
     load_metrics_from_repo,
     load_metrics_from_file,
+    set_expected_run_id,
     save_metrics,
     save_agents,
     save_jobs,
@@ -2458,11 +2459,18 @@ def parse_args():
     parser.add_argument("--skip-plots", action="store_true", help="Skip plot generation (useful with --save-csv)")
     parser.add_argument("--from-csv", action="store_true", help="Generate plots from existing CSV files without connecting to Redis")
     parser.add_argument("--failed-agents", type=str, default=None, help="Comma-separated list of agent IDs that actually failed (e.g., '1,3,5'). Only these will be counted in failure metrics. Useful to exclude intentionally shut down agents.")
+    parser.add_argument("--metrics-run-id", type=str, default=None,
+                        help="Only read metrics payloads stamped with this run id (run_test.py "
+                             "passes the id it launched the agents with). Without it, metrics "
+                             "left in Redis by an agent that outlived an earlier run are read "
+                             "as this run's.")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+
+    set_expected_run_id(args.metrics_run_id)
 
     failed_agent_list = args.failed_agents.split(',') if args.failed_agents else []
     print ("Failed agents: {}".format(failed_agent_list))

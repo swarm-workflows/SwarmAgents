@@ -155,6 +155,16 @@ def main():
     ap.add_argument("--shutdown-after-seconds", type=int, default=0,
                     help="Shutdown test after N seconds (0 = use default wait_runtime behavior)")
 
+    # Teardown / measurement integrity (passthrough to run_test.py)
+    ap.add_argument("--shutdown-drain-timeout", type=int, default=0,
+                    help="Seconds to wait for each agent to exit before SIGKILL (0 = default)")
+    ap.add_argument("--metrics-wait-seconds", type=int, default=0,
+                    help="Seconds to wait for all agents to write this run's metrics before "
+                         "plotting (0 = run_test.py default)")
+    ap.add_argument("--allow-missing-metrics", type=int, default=0,
+                    help="Agents allowed to report no metrics without failing a run; set to the "
+                         "number killed with SIGKILL in a failure injection campaign")
+
     # Config / starter
     ap.add_argument("--starter", default="./swarm-multi-start.sh",
                     help="Path to swarm-multi-start.sh (v2)")
@@ -284,6 +294,13 @@ def main():
         # Shutdown timer parameter
         if args.shutdown_after_seconds > 0:
             cmd += ["--shutdown-after-seconds", str(args.shutdown_after_seconds)]
+
+        if args.shutdown_drain_timeout > 0:
+            cmd += ["--shutdown-drain-timeout", str(args.shutdown_drain_timeout)]
+        if args.metrics_wait_seconds > 0:
+            cmd += ["--metrics-wait-seconds", str(args.metrics_wait_seconds)]
+        if args.allow_missing_metrics > 0:
+            cmd += ["--allow-missing-metrics", str(args.allow_missing_metrics)]
 
         # Job generation: fit-all mode
         if args.fit_all:

@@ -271,7 +271,25 @@ def run_metrics(run_dir: Path, expected_jobs: int | None) -> dict[str, Any]:
     n_unique = int(len(jobs))
     n_completed = int(is_complete.sum())
 
+    # Per-agent metrics (load, utilisation, fairness, MAB and delegation counts) come from
+    # metrics.json, which run_test.py only fills once every agent has reported for THIS run.
+    # A shortfall file means some agents never did, so any per-agent aggregate from this cell
+    # is computed over a subset — recorded as a column rather than left for a reader to notice.
+    shortfall_path = run_dir / "metrics_shortfall.json"
+    metrics_complete = not shortfall_path.exists()
+    missing_agents = 0
+    if not metrics_complete:
+        try:
+            missing_agents = len(json.loads(shortfall_path.read_text()).get("missing_agents", []))
+        except (OSError, ValueError):
+            missing_agents = -1  # present but unreadable
+        print(f"  WARNING: {run_dir.name} has metrics_shortfall.json "
+              f"({missing_agents} agents silent) -- per-agent aggregates are partial",
+              file=sys.stderr)
+
     metrics: dict[str, Any] = {
+        "metrics_complete": metrics_complete,
+        "agents_missing_metrics": missing_agents,
         "job_records": int(len(raw)),
         "jobs_seen": n_unique,
         "jobs_completed": n_completed,

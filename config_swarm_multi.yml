@@ -66,6 +66,14 @@ runtime:
   wall_time_scale: 1.0
   wall_time_min_s: 0.0
   wall_time_max_s: 120.0
+
+  # Teardown's budget for jobs still executing when the agent is asked to stop. Metrics are
+  # saved BEFORE this drain, so the only thing a short value costs is the last few job
+  # completions in the final payload — which is why it does not scale with wall_time_max_s.
+  # It used to be an unbounded `executor.shutdown(wait=True)` ahead of the metrics save, so an
+  # agent holding a 120s job wrote its metrics long after the runner had read Redis and plotted:
+  # both smoke-g2-* runs reported a single agent out of thirty.
+  shutdown_drain_timeout_s: 20.0
   jobs_per_proposal: 20
   executor_workers: 10
   failure_threshold_seconds: 60        # Time before declaring agent as failed

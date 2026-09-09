@@ -500,6 +500,16 @@ class ResourceAgent(Agent):
         return self.runtime_config.get("reselection_timeout_s", 60.00)
 
     @property
+    def shutdown_drain_timeout_s(self) -> float:
+        """Teardown's budget for jobs already running, in seconds.
+
+        Only bounds how long teardown waits; metrics are saved before the drain either way.
+        The only cost of a short value is that the last few job completions miss the final
+        payload, so it deliberately does not scale with runtime.wall_time_max_s.
+        """
+        return float(self.runtime_config.get("shutdown_drain_timeout_s", 20.0))
+
+    @property
     def delegation_timeout_s(self) -> float:
         """
         Time threshold for monitoring delegated jobs at child level.
@@ -2238,6 +2248,12 @@ class ResourceAgent(Agent):
         self.logger.info("Saving Results")
         agent_metrics = {
             "id": self.agent_id,
+            # Which run this payload belongs to. An agent that outlives its run writes its
+            # metrics whenever it is finally killed, which can land after the next run has
+            # already flushed Redis — so run_id is what lets the collector tell the two apart
+            # instead of silently reporting run N's numbers as run N+1's.
+            "run_id": os.environ.get("SWARM_RUN_ID"),
+            "saved_at": time.time(),
             "restarts": self.metrics.restarts,
             "conflicts": self.engine.conflicts,
             "idle_time": self.metrics.idle_time,
@@ -2801,8 +2817,49 @@ class ResourceAgent(Agent):
             except Exception as exc:
                 self.logger.debug(f"snow engine stop raised: {exc}")
 
-        self.executor.shutdown(wait=True)
-        self.save_results()
+        # Metrics are written BEFORE the executor drain, not after. A job now simulates its
+        # real wall time (up to runtime.wall_time_max_s), so `shutdown(wait=True)` can hold
+        # teardown for minutes while the runner is already reading metrics out of Redis — which
+        # is how smoke-g2-bandit and smoke-g2-llm each produced a metrics.json holding one agent
+        # out of thirty. Saving first makes the payload independent of the drain; the second save
+        # upgrades it with whatever the drain finished in time to add.
+        self._save_results_safely("pre-drain")
+        self._drain_executor(self.shutdown_drain_timeout_s)
+        self._save_results_safely("post-drain")
+
+    def _drain_executor(self, timeout_s: float) -> None:
+        """Stop the job executor, waiting at most `timeout_s` for jobs already running.
+
+        Queued-but-unstarted jobs are cancelled: at teardown each would only start a fresh
+        simulated wall-time sleep, and nothing is left to consume the result.
+        """
+        drained = threading.Event()
+
+        def _shutdown():
+            try:
+                self.executor.shutdown(wait=True, cancel_futures=True)
+            finally:
+                drained.set()
+
+        threading.Thread(target=_shutdown, name="ExecutorDrain", daemon=True).start()
+        if not drained.wait(timeout=max(0.0, timeout_s)):
+            self.logger.warning(
+                f"[SHUTDOWN] job executor still draining after {timeout_s:.1f}s "
+                f"(runtime.shutdown_drain_timeout_s); metrics are saved without it"
+            )
+
+    def _save_results_safely(self, stage: str) -> None:
+        """`save_results` must never abort teardown.
+
+        The pre-drain save runs while job threads may still be mutating the metrics
+        containers, so a serialization race is possible; losing that save is recoverable
+        (the post-drain one follows), leaving the agent alive is not.
+        """
+        try:
+            self.save_results()
+        except Exception as exc:
+            self.logger.error(f"[SHUTDOWN] {stage} save_results failed: {exc}")
+            self.logger.error(traceback.format_exc())
 
     def _cost_job_on_agent(self, job: Job, agent: AgentInfo) -> float:
         return self.compute_job_cost(job=job, total=agent.capacities, dtns=agent.dtns,

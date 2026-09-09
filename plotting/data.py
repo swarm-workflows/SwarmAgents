@@ -13,6 +13,53 @@ from swarm.database.repository import Repository
 from swarm.models.job import Job, ObjectState
 
 
+# ---------------------------------------------------------------------------
+# Run identity
+#
+# Agents write `metrics:<id>` to Redis at teardown, and an agent that outlives its run writes
+# whenever it is finally killed — which can be after the next run has flushed Redis. Those
+# leftovers are keyed by agent id, so they do not collide loudly; they just show up as that
+# agent's numbers. smoke-g2-llm's metrics.json was 15/16 leftovers from smoke-g2-bandit.
+#
+# The expected run id is process-global rather than a parameter because the loaders are called
+# from ~10 places in the plotting package, and a filter that one call site forgets to pass is
+# worse than no filter: it reports contaminated numbers on some plots and clean ones on others.
+# ---------------------------------------------------------------------------
+_EXPECTED_RUN_ID: str | None = None
+
+
+def set_expected_run_id(run_id: str | None) -> None:
+    """Restrict every subsequent Redis metrics load to payloads stamped with `run_id`."""
+    global _EXPECTED_RUN_ID
+    _EXPECTED_RUN_ID = run_id or None
+
+
+def expected_run_id() -> str | None:
+    return _EXPECTED_RUN_ID
+
+
+def _filter_by_run_id(metrics_by_agent: dict[int, dict]) -> dict[int, dict]:
+    """Drop payloads that belong to another run, reporting each one dropped."""
+    if not _EXPECTED_RUN_ID:
+        return metrics_by_agent
+    kept, dropped = {}, []
+    for agent_id, entry in metrics_by_agent.items():
+        if entry.get("run_id") == _EXPECTED_RUN_ID:
+            kept[agent_id] = entry
+        else:
+            dropped.append((agent_id, entry.get("run_id"), entry.get("saved_at")))
+    if dropped:
+        print(f"WARNING: dropped {len(dropped)} metrics payload(s) from another run "
+              f"(expected run_id={_EXPECTED_RUN_ID}):", file=sys.stderr)
+        for agent_id, run_id, saved_at in sorted(dropped):
+            stamp = ""
+            if saved_at:
+                from datetime import datetime as _dt
+                stamp = f", saved_at={_dt.fromtimestamp(saved_at):%Y-%m-%d %H:%M:%S}"
+            print(f"  agent {agent_id}: run_id={run_id!r}{stamp}", file=sys.stderr)
+    return kept
+
+
 def load_metrics_from_repo(repo: Repository) -> dict[int, dict]:
     """
     Load metrics objects from Redis and normalize their shape.
@@ -61,7 +108,7 @@ def load_metrics_from_repo(repo: Repository) -> dict[int, dict]:
         entry.setdefault("load_trace", [])
         metrics_by_agent[int(agent_id)] = entry
 
-    return metrics_by_agent
+    return _filter_by_run_id(metrics_by_agent)
 
 
 def load_metrics_from_file(path: str) -> dict[int, dict]:
@@ -157,7 +204,7 @@ def load_metrics_from_redis(db_host: str, db_port: int = 6379) -> dict[int, dict
     except Exception as e:
         print(f"Error loading from Redis: {e}")
 
-    return metrics_by_agent
+    return _filter_by_run_id(metrics_by_agent)
 
 
 def save_metrics(metrics: dict[int, dict], path: str):

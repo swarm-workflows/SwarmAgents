@@ -46,7 +46,7 @@ Notes:
 - Use --shutdown-after-seconds for time-based test termination (bypasses bucket monitoring).
 """
 from __future__ import annotations
-import argparse, os, re, subprocess, sys, time, math, shlex, csv, json
+import argparse, os, re, subprocess, sys, time, math, shlex, csv, json, uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -448,9 +448,14 @@ def start_agents_remote(args, agent_hosts_list: list[str], agent_count: int = No
         # Add start-offset for this host's agent range (0-based offset from 1-based start_idx)
         forwarded += ["--start-offset", str(start_idx - 1)]
 
+        # The run id has to cross the ssh boundary explicitly: a remote agent is not a child
+        # of this process, so it inherits nothing, and an unstamped payload is indistinguishable
+        # from an older run's leftover.
+        run_id = os.environ.get("SWARM_RUN_ID", "")
         start_cmd = (
             #f"source ~/.bash_profile && "
             f"source ~/.profile && "
+            f"export SWARM_RUN_ID={shlex.quote(run_id)} && "
             f"cd {shlex.quote(args.remote_repo_dir)} && "
             f"nohup bash {shlex.quote(starter)} "
             f"{shlex.quote(args.agent_type)} {count} {shlex.quote(args.topology)} {args.jobs} "
@@ -721,26 +726,141 @@ def wait_with_early_exit(args) -> None:
     log("Shutdown timer expired, stopping test")
 
 
-def stop_agents(args) -> None:
+def _hosts_file_for_stop(args, host_list: list[str] | None) -> str:
+    """Path to a hosts file the stop script can read, writing one if needed.
+
+    `agent_hosts.txt` is deleted by cleanup_between_runs unless it is this run's
+    --agent-hosts-file, so falling back to that name gave the stop script a missing file,
+    which it reports on stderr and run_blocking(check=False) then swallows: the agents were
+    never stopped and nobody said so. The in-memory host list is the reliable source.
+    """
+    hosts_file = getattr(args, "agent_hosts_file", None)
+    if hosts_file and Path(hosts_file).exists():
+        return hosts_file
+    hosts = list(host_list or [])
+    if not hosts and getattr(args, "agent_hosts", None):
+        hosts = [h.strip() for h in args.agent_hosts.split(",") if h.strip()]
+    if not hosts and Path("agent_hosts.txt").exists():
+        return "agent_hosts.txt"
+    if not hosts:
+        raise SystemExit("Cannot stop remote agents: no host list available "
+                         "(pass --agent-hosts-file or --agent-hosts)")
+    hosts_file = os.path.join(args.run_dir, "_agent_hosts.txt")
+    with open(hosts_file, "w") as hf:
+        for h in hosts:
+            hf.write(h + "\n")
+    return hosts_file
+
+
+def stop_agents(args, host_list: list[str] | None = None) -> bool:
+    """Stop every agent and report whether the stop was confirmed on all hosts.
+
+    The return value matters: an unconfirmed stop means processes may still be running and
+    still writing to Redis, which is how one run's metrics ended up reported as the next
+    run's before payloads carried a run id.
+    """
     log("Stopping agents …")
     stop_cmd = ["bash", "stop_agents_v2.sh", "--mode", args.mode]
     if args.mode == "remote":
-        # Determine hosts file path
-        hosts_file = getattr(args, 'agent_hosts_file', None)
-        if not hosts_file:
-            # Write a temporary hosts file from --agent-hosts if provided
-            if getattr(args, 'agent_hosts', None):
-                hosts_file = os.path.join(args.run_dir, '_agent_hosts.txt')
-                with open(hosts_file, 'w') as hf:
-                    for h in args.agent_hosts.split(','):
-                        h = h.strip()
-                        if h:
-                            hf.write(h + '\n')
-            else:
-                hosts_file = "agent_hosts.txt"
-        stop_cmd += ["--agent-hosts-file", hosts_file,
+        stop_cmd += ["--agent-hosts-file", _hosts_file_for_stop(args, host_list),
                       "--remote-repo-dir", args.remote_repo_dir]
-    run_blocking(stop_cmd, check=False)
+    if args.shutdown_drain_timeout > 0:
+        stop_cmd += ["--drain-timeout", str(args.shutdown_drain_timeout)]
+    proc = run_blocking(stop_cmd, check=False)
+    if proc.returncode != 0:
+        log(f"WARNING: stop_agents_v2.sh exited {proc.returncode}; at least one agent was not "
+            f"confirmed stopped. Surviving agents cannot corrupt this run's metrics (they are "
+            f"filtered by run id) but they do keep consuming the fleet.")
+        return False
+    return True
+
+
+# ------------------------------
+# Metrics completeness
+# ------------------------------
+def _metrics_in_redis(args, run_id: str) -> tuple[set[int], dict[int, str]]:
+    """(agent ids with a payload for `run_id`, {agent id: other run id}) from Redis."""
+    import redis as _redis
+    mine: set[int] = set()
+    foreign: dict[int, str] = {}
+    try:
+        r = _redis.StrictRedis(host=args.db_host, port=6379, decode_responses=True)
+        for key in r.scan_iter("metrics:*"):
+            raw = r.get(key)
+            if not raw:
+                continue
+            try:
+                entry = json.loads(raw)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(entry, dict) or entry.get("id") is None:
+                continue
+            agent_id = int(entry["id"])
+            if entry.get("run_id") == run_id:
+                mine.add(agent_id)
+            else:
+                foreign[agent_id] = str(entry.get("run_id"))
+    except Exception as exc:
+        log(f"WARNING: could not read metrics from Redis: {exc}")
+    return mine, foreign
+
+
+def wait_for_metrics(args, expected_ids: set[int], run_id: str) -> tuple[set[int], dict[int, str]]:
+    """Block until every expected agent has written this run's metrics, or the deadline passes.
+
+    Plotting reads metrics out of Redis, so doing this before plotting is what makes
+    metrics.json a record of THIS run. Agents save metrics at the start of teardown rather
+    than after draining their job threads, so in the normal case this returns on the first
+    poll; the wait covers a slow host or a straggler that had to be SIGKILLed.
+    """
+    deadline = time.time() + max(0, args.metrics_wait_seconds)
+    last_report = 0.0
+    while True:
+        have, foreign = _metrics_in_redis(args, run_id)
+        missing = expected_ids - have
+        if not missing or time.time() >= deadline:
+            return missing, foreign
+        now = time.time()
+        if now - last_report >= 10:
+            log(f"Waiting for metrics: {len(have)}/{len(expected_ids)} agents reported, "
+                f"{int(deadline - now)}s left")
+            last_report = now
+        time.sleep(2)
+
+
+def report_metrics_completeness(args, expected_ids: set[int], run_id: str,
+                                stopped_cleanly: bool) -> bool:
+    """Log and record which agents reported metrics. True when the run is measurable."""
+    missing, foreign = wait_for_metrics(args, expected_ids, run_id)
+    allowed = max(0, args.allow_missing_metrics)
+    if foreign:
+        log(f"NOTE: {len(foreign)} metrics payload(s) in Redis belong to another run and will "
+            f"be ignored: " + ", ".join(f"agent {a} (run_id={r})" for a, r in sorted(foreign.items())))
+    if not missing:
+        log(f"Metrics complete: all {len(expected_ids)} agents reported for run_id={run_id}")
+        return True
+
+    shortfall = {
+        "run_id": run_id,
+        "expected_agents": sorted(expected_ids),
+        "missing_agents": sorted(missing),
+        "foreign_payloads": {str(a): r for a, r in sorted(foreign.items())},
+        "allow_missing_metrics": allowed,
+        "stopped_cleanly": stopped_cleanly,
+        "waited_seconds": args.metrics_wait_seconds,
+    }
+    with open(os.path.join(args.run_dir, "metrics_shortfall.json"), "w") as f:
+        json.dump(shortfall, f, indent=2)
+
+    level = "WARNING" if len(missing) <= allowed else "ERROR"
+    log(f"{level}: {len(missing)} of {len(expected_ids)} agents never wrote metrics for this run "
+        f"(missing: {sorted(missing)}). Wrote {args.run_dir}/metrics_shortfall.json.")
+    if len(missing) > allowed:
+        log("ERROR: per-agent metrics (load, utilisation, fairness, MAB and delegation counts) "
+            "are incomplete, so this run is not measurable. Pass --allow-missing-metrics N if "
+            "N agents were killed with SIGKILL and are expected to be silent.")
+        return False
+    return True
 
 def collect_logs(args) -> None:
     '''
@@ -753,7 +873,7 @@ def collect_logs(args) -> None:
             p.rename(Path(args.log_dir) / p.name)
     '''
 
-def parse_and_report(args) -> None:
+def parse_and_report(args, run_id: str | None = None) -> None:
     plot_cmd = [
         "python3.11", "plot_latency_jobs.py",
         "--output_dir", args.run_dir,
@@ -761,6 +881,8 @@ def parse_and_report(args) -> None:
         "--db_host", args.db_host,
         #"--save-csv",
     ]
+    if run_id:
+        plot_cmd += ["--metrics-run-id", run_id]
     #if not getattr(args, 'generate_plots', False):
     #    plot_cmd.append("--skip-plots")
     if args.topology == "hierarchical":
@@ -864,6 +986,18 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--shutdown-after-seconds", type=int, default=0,
                     help="Shutdown test after N seconds (0 = use default wait_runtime behavior)")
 
+    # Teardown / measurement integrity
+    ap.add_argument("--shutdown-drain-timeout", type=int, default=0,
+                    help="Seconds the stop script waits for each agent to exit before SIGKILL "
+                         "(0 = the stop script's own default)")
+    ap.add_argument("--metrics-wait-seconds", type=int, default=120,
+                    help="How long to wait after stopping the agents for all of them to write "
+                         "this run's metrics to Redis before plotting (default: 120)")
+    ap.add_argument("--allow-missing-metrics", type=int, default=0,
+                    help="Number of agents allowed to report no metrics without failing the run. "
+                         "Set it to the number of agents killed with SIGKILL in a failure "
+                         "injection test; those cannot flush metrics by design.")
+
     # Pegasus job integration
     ap.add_argument("--pegasus-profiles", default=None,
                     help="Path to Pegasus profiles file (text/export) or Redis host. "
@@ -908,12 +1042,41 @@ def main() -> None:
     args = parse_args()
     Path(args.run_dir).mkdir(parents=True, exist_ok=True)
 
+    # Identity for this run. Agents stamp it on the metrics they write to Redis and the
+    # plotting step only reads payloads carrying it, so a payload written by an agent that
+    # outlived an earlier run can no longer be reported as this run's numbers.
+    # Exported (not passed): local agents are spawned as children and inherit it, and the
+    # remote starter re-exports it over ssh.
+    run_id = f"{Path(args.run_dir).name}-{datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}"
+    os.environ["SWARM_RUN_ID"] = run_id
+    log(f"run_id={run_id}")
+
     # Build host list up front
     host_list = read_hosts(args) if args.mode == "remote" else []
 
     # Preflight checks for remote mode
     if args.mode == "remote" and host_list:
         preflight_check(args, host_list)
+
+    # Reap anything still running from a previous run BEFORE Redis is flushed. An agent that
+    # is killed after the flush writes its (old) metrics into the fresh keyspace, which is
+    # exactly how smoke-g2-llm's metrics.json came to hold 15 agents from smoke-g2-bandit.
+    log("Reaping agents left over from any previous run …")
+    stop_agents(args, host_list)
+
+    with open(os.path.join(args.run_dir, "run_meta.json"), "w") as f:
+        json.dump({
+            "run_id": run_id,
+            "started_at": time.time(),
+            "started_at_iso": datetime.now().isoformat(),
+            "mode": args.mode,
+            "agent_type": args.agent_type,
+            "agents": args.agents,
+            "dynamic_agents": args.dynamic_agents,
+            "topology": args.topology,
+            "jobs": args.jobs,
+            "argv": sys.argv,
+        }, f, indent=2)
 
     # Calculate total agents (initial + dynamic)
     total_agents = args.agents + args.dynamic_agents
@@ -977,14 +1140,23 @@ def main() -> None:
         wait_with_early_exit(args)
     else:
         wait_runtime(args)
-    stop_agents(args)
+    stopped_cleanly = stop_agents(args, host_list)
+
+    # Every agent id we launched is expected to report; plotting happens after they all have.
+    measurable = report_metrics_completeness(
+        args, set(range(1, total_agents + 1)), run_id, stopped_cleanly)
+
     if args.mode == "remote" and host_list:
         collect_remote_logs(args, host_list)
     collect_logs(args)
 
     # Update args.agents to total for reporting
     args.agents = total_agents
-    parse_and_report(args)
+    parse_and_report(args, run_id)
+    if not measurable:
+        log("Done, but this run's metrics are incomplete — exiting non-zero so a batch driver "
+            "does not average it in as a good cell.")
+        sys.exit(3)
     log("Done.")
     sys.exit(0)
 

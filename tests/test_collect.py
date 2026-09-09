@@ -125,6 +125,22 @@ class TestRunMetrics(unittest.TestCase):
             self.assertEqual(metrics["sched_latency_mean"], 9.0)  # reported column
             self.assertEqual(metrics["job_latency_mean"], 20.0)   # completed - submitted
 
+    def test_a_metrics_shortfall_is_carried_into_the_row(self):
+        """A cell whose agents did not all report has partial per-agent aggregates; the
+        collector must say so rather than let it average in as a good cell."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir = write_run(root, "run01", "1,100,100.1,100.2,100.3,105,0,3,0.1,0.2\n")
+            metrics = run_metrics(run_dir, expected_jobs=1)
+            self.assertTrue(metrics["metrics_complete"])
+            self.assertEqual(metrics["agents_missing_metrics"], 0)
+
+            (run_dir / "metrics_shortfall.json").write_text(
+                '{"run_id": "x", "missing_agents": [2, 3, 4]}')
+            metrics = run_metrics(run_dir, expected_jobs=1)
+            self.assertFalse(metrics["metrics_complete"])
+            self.assertEqual(metrics["agents_missing_metrics"], 3)
+
     def test_reselection_multiplier_counts_repeat_records(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = write_run(Path(tmp), "hier-30/run01",

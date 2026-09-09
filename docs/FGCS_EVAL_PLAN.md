@@ -249,6 +249,63 @@ requested agent count, rather than truncating it — that is the general form of
 
 With `--groups-per-coordinator 3`: Hier-90 becomes 3 coordinators × 3 groups, Hier-270 becomes 9
 × 3 — every coordinator with a genuine choice, verified end to end.
+
+### 0.8 `metrics.json` did not describe the run that produced it (found and FIXED 2026-09-09)
+
+The first two runs on the slice with a coordinator that actually has a choice — `smoke-g2-bandit`
+and `smoke-g2-llm`, Hier-30 with `--groups-per-coordinator 2`, ~400 jobs each — **validated P0-1
+and invalidated their own metrics.** From the coordinator logs, the LLM delegation plane works on
+real hardware: agent-28 `calls=57/57 fallbacks=0 trivial=0 mean=2.626s`, agent-29 `calls=60/61
+fallbacks=0 trivial=0 mean=2.689s`, one provider timeout in ~118 calls at `timeout_seconds: 6`.
+Agent-30 leads 1 of its 1 group (30 agents = 5 groups, split 2/2/1) and emitted the §0.6
+`can never choose` warning as designed, delegating 40 jobs as `trivial`. The LLM arm also *shows*
+P0-3's synchronous-call limit as throughput: **315 jobs completed vs the bandit arm's 398**, with
+43 still pending, at ~2.6 s of blocking inference per delegation.
+
+Both runs' `metrics.json` were unusable, for two independent reasons:
+
+- **`smoke-g2-bandit`: 1 agent of 30.** `on_shutdown` called `executor.shutdown(wait=True)`
+  *before* `save_results`, and since P0-0 made a job sleep its real wall time (capped at 120 s),
+  a SIGTERM'd agent sat in the drain while `run_test.py` — which returns from `stop_agents` as
+  soon as `pkill` is sent — collected logs and ran the plotting step that reads metrics out of
+  Redis. Only the one idle agent had flushed. This was latent before P0-0: flat 1 s sleeps
+  usually won the race.
+- **`smoke-g2-llm`: 15 of its 16 payloads belonged to the previous run.** Those bandit-run agents
+  were never stopped at all (`stop_agents_v2.sh` reports an unreachable host or a missing hosts
+  file on stderr, and `run_blocking(check=False)` swallows it), ran on for 19 minutes, and were
+  killed by the *next* run's startup — writing their metrics **after** that run had flushed
+  Redis. Payloads are keyed by agent id, so run N's numbers silently became run N+1's.
+
+Everything downstream of per-agent metrics was affected: load traces, utilisation, Jain fairness,
+`mab_selections`/`mab_rewards`, and the `llm_delegations` counters E4 needs. Job-level metrics
+(`all_jobs.csv`, so makespan/throughput/latency in `evaluation/collect.py`) were not.
+
+Fixed on five fronts, all defaults:
+
+1. **Save before draining.** `on_shutdown` saves metrics, drains for at most
+   `runtime.shutdown_drain_timeout_s` (20 s, cancelling queued jobs), then saves again. The
+   payload no longer depends on the drain finishing.
+2. **Run identity.** `run_test.py` mints a `run_id`, exports it as `SWARM_RUN_ID` (inherited by
+   local children, re-exported over ssh for remote agents) and records it in
+   `<run-dir>/run_meta.json`; agents stamp it on every metrics payload; the plotting step is
+   passed `--metrics-run-id` and drops foreign payloads with a warning naming each one.
+3. **A stop is not done until the processes are gone.** `stop_agents_v2.sh` waits for each agent
+   to exit (`--drain-timeout`, 45 s) before SIGKILL, fans out across hosts in parallel rather
+   than serially (45 s × 92 hosts of teardown otherwise), and exits non-zero if any host cannot
+   confirm. `run_test.py` reports that, and derives the hosts file from its in-memory host list
+   rather than the `agent_hosts.txt` that `cleanup_between_runs` may have deleted.
+4. **Reap before flushing.** Leftover agents are stopped at startup *before* Redis is cleared,
+   so a straggler's late write cannot land in the new keyspace.
+5. **A run that cannot be measured fails.** After stopping, the runner waits up to
+   `--metrics-wait-seconds` (120) for every launched agent id to report this `run_id`, then
+   writes `<run-dir>/metrics_shortfall.json` and **exits 3**; `collect.py` carries
+   `metrics_complete` / `agents_missing_metrics` so a partial cell cannot average in unnoticed.
+   A SIGKILL-based failure test declares its silent agents with `--allow-missing-metrics N`.
+
+Regression tests: `tests/test_teardown_metrics.py` (bounded drain, cancelled queue, save-order,
+run-id filter incl. the unfiltered default, the completeness gate and its allowance, hosts-file
+fallback) and one case in `tests/test_collect.py`. **The smoke pair must be re-run**; no number
+from either is citable.
 ---
 
 ## 1. The thesis (this determines every experiment)

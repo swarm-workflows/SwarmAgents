@@ -558,6 +558,10 @@ class ColmenaAgent(Agent):
         self.logger.info("Saving Results")
         agent_metrics = {
             "id": self.agent_id,
+            # Stamped for the same reason as in ResourceAgent.save_results: the collector
+            # filters by run_id, so an unstamped payload reads as another run's leftover.
+            "run_id": os.environ.get("SWARM_RUN_ID"),
+            "saved_at": time.time(),
             "restarts": self.metrics.restarts,
             "conflicts": self.engine.conflicts,
             "idle_time": self.metrics.idle_time,
