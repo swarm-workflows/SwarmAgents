@@ -128,6 +128,12 @@ def main():
     # Co-parent support for hierarchical topology
     ap.add_argument("--co-parents", type=int, default=1,
                     help="Number of co-parents per child group in hierarchical topology (default: 1)")
+    ap.add_argument("--groups-per-coordinator", type=int, default=1,
+                    help="Child groups each Level-1 coordinator exclusively parents (default: 1). "
+                         "Above 1 is required for any delegation measurement: at 1 a coordinator "
+                         "has a single candidate, so the MAB and delegation.policy=llm are both "
+                         "inert. Freed coordinator slots become Level-0 agents, so the fleet size "
+                         "is unchanged. Two-level hierarchies only.")
 
     # Fleet reproducibility (v2) — both are required for a comparable scale ladder; see
     # docs/FGCS_EVAL_PLAN.md section 0.2.
@@ -241,6 +247,8 @@ def main():
             cmd += ["--hierarchical-level1-agent-type", args.hierarchical_level1_agent_type]
             if hasattr(args, 'co_parents') and args.co_parents > 1:
                 cmd += ["--co-parents", str(args.co_parents)]
+            if getattr(args, 'groups_per_coordinator', 1) > 1:
+                cmd += ["--groups-per-coordinator", str(args.groups_per_coordinator)]
         if args.groups is not None:
             cmd += ["--groups", str(args.groups)]
         if args.group_size is not None:

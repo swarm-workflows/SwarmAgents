@@ -55,6 +55,14 @@ python generate_configs.py <num_agents> <jobs_per_proposal> <base_config> <outpu
 # the same seed gives agent i a different machine at each size). Generate from a clean state —
 # an existing agent_dtns.json is reused through a different RNG path and warns when it is.
 python generate_configs.py 30 10 ./config_swarm_multi.yml configs mesh localhost 600 --dtns --seed 42 --master-fleet-size 270
+# Hierarchical only: --groups-per-coordinator G gives each Level-1 coordinator G child groups
+# exclusively (default 1). Required for ANY delegation measurement — at 1 a coordinator has a
+# single candidate, so the MAB and delegation.policy=llm are both inert. Freed coordinator slots
+# become Level-0 agents, so the fleet size is unchanged; two-level hierarchies only.
+python generate_configs.py 90 10 ./config_swarm_multi.yml configs hierarchical localhost 600 --seed 42 --groups-per-coordinator 3
+# Supported hierarchical fleet sizes: 30, 60, 90, 100, 110, 120, 250, 270, 990, 1000. Anything
+# else is refused — a size whose topology does not total the request used to have the overflow
+# silently dropped, which for Hier-90 meant a fleet with no coordinators at all.
 python job_generator.py --job-count 100 --agent-profile-path agent_profiles.json --output-dir jobs/
 python job_distributor.py --redis-host localhost --jobs-dir jobs/ --jobs-per-interval 10
 ```

@@ -1,6 +1,7 @@
 import argparse
 import copy
 import json
+import math
 import os
 import random
 from typing import Dict, List, Optional, Tuple
@@ -65,6 +66,7 @@ class SwarmConfigGenerator:
         agent_type: str = "resource",
         initial_group_size: Optional[int] = None,
         co_parent_count: int = 1,
+        groups_per_coordinator: int = 1,
         quantum_agents_pct: float = 0.0,
         master_fleet_size: Optional[int] = None,
     ):
@@ -101,6 +103,10 @@ class SwarmConfigGenerator:
 
         # initial group size for dynamic agent addition (if different from num_agents)
         self.initial_group_size = initial_group_size
+
+        # How many child groups one Level-1 coordinator exclusively parents. 1 is the shipped
+        # 1:1 mapping, under which no coordinator has a routing decision to make.
+        self.groups_per_coordinator = max(1, int(groups_per_coordinator or 1))
 
         # co-parent count for hierarchical topology shared parenting
         self.co_parent_count = co_parent_count
@@ -541,6 +547,17 @@ class SwarmConfigGenerator:
                 num_super_groups = 0  # No Level 2
                 level_1_base = 51
 
+            elif self.num_agents == 90:
+                # Two-level: 81 Level-0 (9 groups of 9) + 9 Level-1 = 90.
+                # The evaluation plan has named Hier-90 since it was written (E2's "9 groups"),
+                # but there was no preset for it: 90 fell into the `<= 110` branch below, which
+                # builds a 110-agent hierarchy and then had ids 91-110 dropped when configs were
+                # written — a fleet of 90 leaves with no coordinators at all.
+                num_groups = 9
+                group_size = 9
+                num_super_groups = 0  # No Level 2
+                level_1_base = 82
+
             elif self.num_agents == 100:
                 # Three-level: Level-0 80 - 16 groups of 5
                 # Level-1: 16 (81-96) - 4 groups of 4
@@ -574,6 +591,15 @@ class SwarmConfigGenerator:
                 num_super_groups = 0  # No Level 2
                 level_1_base = 226
 
+            elif self.num_agents == 270:
+                # Two-level: 243 Level-0 (27 groups of 9) + 27 Level-1 = 270.
+                # The top rung of the plan's 30 / 90 / 270 ladder: same group size as Hier-90
+                # with 3x the groups, so scale moves the group COUNT and not the group shape.
+                num_groups = 27
+                group_size = 9
+                num_super_groups = 0  # No Level 2
+                level_1_base = 244
+
             elif self.num_agents == 990:
                 # Three-level: Level-0 880 - 88 groups of 10
                 # Level-1: 88 (881-968) - 22 super-groups of 4
@@ -599,12 +625,54 @@ class SwarmConfigGenerator:
                 level_2_base = 991
 
             else:
-                print(f"Hierarchical topology currently supports 30, 60, 100, 110, 120, 250, 990, or 1000 agents (got {self.num_agents})")
+                print(f"Hierarchical topology currently supports 30, 60, 90, 100, 110, 120, 250, 270, 990, "
+                      f"or 1000 agents (got {self.num_agents})")
                 return
+
+            # How many child groups one coordinator exclusively parents. G=1 is the shipped
+            # 1:1 mapping and takes the original code path untouched. G>1 is what gives a
+            # coordinator a delegation decision to make at all: with one group there is no
+            # routing choice, so the bandit returns its only arm and LLM delegation
+            # short-circuits, and --co-parents does not help (leadership goes to the lowest-ID
+            # live co-parent, concentrating groups on one coordinator rather than spreading a
+            # choice to each). See docs/FGCS_EVAL_PLAN.md section 0.6.
+            G = max(1, int(self.groups_per_coordinator))
+            if G > 1 and num_super_groups > 0:
+                print(f"--groups-per-coordinator {G} is only supported for two-level "
+                      f"hierarchies (30, 60, 110, 120, 250 agents); {self.num_agents} agents "
+                      f"builds a three-level hierarchy, whose super-groups are sized in "
+                      f"Level-1 agents and would need restructuring too.")
+                return
+            num_coords = math.ceil(num_groups / G)
+
+            # Coordinator slots freed by the larger fan-out go back to Level 0, so the fleet
+            # still has exactly num_agents agents and run_test's 1..N id range stays valid.
+            # Groups then differ in size by at most one; each agent reports its own group's
+            # size. At G=1 this is skipped entirely, so the presets are reproduced byte for
+            # byte rather than recomputed.
+            if G > 1:
+                level_0_total = self.num_agents - num_coords
+                if level_0_total < num_groups:
+                    print(f"--groups-per-coordinator {G} leaves {level_0_total} Level-0 agents "
+                          f"for {num_groups} groups; not enough to fill them.")
+                    return
+                base, remainder = divmod(level_0_total, num_groups)
+                group_sizes = [base + (1 if i < remainder else 0) for i in range(num_groups)]
+                level_1_base = level_0_total + 1
+                print(f"Hierarchical fan-out: {num_coords} coordinator(s) x {G} group(s) each, "
+                      f"{level_0_total} Level-0 agents in groups of {sorted(set(group_sizes))}")
+            else:
+                group_sizes = [group_size] * num_groups
+
+            group_starts = []
+            _next = 1
+            for size in group_sizes:
+                group_starts.append(_next)
+                _next += size
 
             # Build co-parent assignment map (circular round-robin)
             K = self.co_parent_count
-            level_1_agents = [level_1_base + g for g in range(num_groups)]
+            level_1_agents = [level_1_base + c for c in range(num_coords)]
 
             if num_super_groups > 0:
                 # Three-level: apply circular assignment within each super-group
@@ -620,19 +688,23 @@ class SwarmConfigGenerator:
                             parents.append(sg_agents[parent_idx])
                         co_parent_map[group] = sorted(parents)
             else:
-                # Two-level: circular assignment across all Level-1 agents
+                # Two-level: circular assignment across all Level-1 agents, starting from the
+                # coordinator that owns the group. At G=1 `group // G == group`, so this is the
+                # original assignment; at G>1 a coordinator's own G groups list it first and
+                # the extra co-parents walk outward from there.
                 co_parent_map = {}
                 for group in range(num_groups):
+                    owner_idx = group // G
                     parents = []
-                    for k in range(K):
-                        parent_idx = (group + k) % len(level_1_agents)
+                    for k in range(min(K, len(level_1_agents))):
+                        parent_idx = (owner_idx + k) % len(level_1_agents)
                         parents.append(level_1_agents[parent_idx])
-                    co_parent_map[group] = sorted(parents)
+                    co_parent_map[group] = sorted(set(parents))
 
             # Level 0 (leaf/worker agents)
             for group in range(num_groups):
-                start = group * group_size + 1
-                end = start + group_size
+                start = group_starts[group]
+                end = start + group_sizes[group]
 
                 # Primary parent is lowest-ID co-parent (backward compat)
                 parent_id = co_parent_map[group][0]
@@ -648,7 +720,7 @@ class SwarmConfigGenerator:
                         "children": None,
                         "group": group,
                         "level": 0,
-                        "group_size": group_size,
+                        "group_size": group_sizes[group],
                         "group_count": num_groups,
                         "super_group": super_group
                     }
@@ -656,9 +728,13 @@ class SwarmConfigGenerator:
                         topo_entry["co_parents"] = co_parent_map[group]
                     agent_topo[agent_id] = topo_entry
 
-            # Level 1 (group coordinators)
-            for group in range(num_groups):
-                parent_id = level_1_base + group
+            # Level 1 (group coordinators). Iterates COORDINATORS, not groups: with
+            # --groups-per-coordinator G there are ceil(num_groups / G) of them, and each one
+            # exclusively parents groups [c*G, (c+1)*G). At G=1 the two are the same thing and
+            # `group` below is the coordinator's own single group, as before.
+            for coord_idx in range(num_coords):
+                group = coord_idx * G          # this coordinator's first (primary) group
+                parent_id = level_1_base + coord_idx
 
                 if num_super_groups > 0:
                     # Three-level hierarchy: Level-1 coordinators form groups within super-groups
@@ -671,7 +747,7 @@ class SwarmConfigGenerator:
                     level_1_parent = level_2_base + super_group
                 else:
                     # Two-level hierarchy: Level-1 coordinators form flat mesh
-                    peers = [level_1_base + i for i in range(num_groups) if i != group]
+                    peers = [level_1_base + i for i in range(num_coords) if i != coord_idx]
                     level_1_parent = None
 
                 # Level-1 group metadata should reflect the super-group (not the child group id)
@@ -679,7 +755,7 @@ class SwarmConfigGenerator:
                 l1_group = super_group if num_super_groups > 0 else 0
                 l1_group_count = num_super_groups if num_super_groups > 0 else 1
                 # Level 1 group_size should be the number of Level 1 coordinators in the peer group
-                l1_group_size = groups_per_super_group if num_super_groups > 0 else num_groups
+                l1_group_size = groups_per_super_group if num_super_groups > 0 else num_coords
 
                 # Determine which groups this agent co-parents
                 my_groups = {g: co_parent_map[g] for g in range(num_groups) if parent_id in co_parent_map[g]}
@@ -720,6 +796,24 @@ class SwarmConfigGenerator:
                         "group_count": 1,
                         "super_group": super_group
                     }
+
+            # The presets above hardcode a fleet size each, and the `<= 110` branch accepts a
+            # RANGE while building a 110-agent hierarchy. Ask for 90 and the topology places
+            # coordinators at ids 101-110, but only ids 1..N get config files written — so a
+            # Hier-90 run came out as 90 leaf agents, ZERO coordinators, and every `parent`
+            # pointing at an agent that does not exist. No delegation happens at all, and
+            # nothing says so. Refuse instead.
+            if len(agent_topo) != self.num_agents:
+                supported = "30, 60, 90, 100, 110, 120, 250, 270, 990, 1000"
+                print(f"Hierarchical topology for {self.num_agents} agents would need "
+                      f"{len(agent_topo)} agents ({num_groups} groups of {group_sizes[0]}"
+                      f"{'-' + str(group_sizes[-1]) if len(set(group_sizes)) > 1 else ''} plus "
+                      f"{num_coords} coordinator(s)"
+                      f"{' plus ' + str(num_super_groups) + ' super-coordinators' if num_super_groups > 0 else ''}"
+                      f"). Only ids 1..{self.num_agents} would be written, silently dropping "
+                      f"the rest — a fleet with no coordinators if the drop reaches Level 1. "
+                      f"Use one of the supported sizes: {supported}.")
+                return
 
         else:
             # default to full mesh (backward compatible)
@@ -934,6 +1028,13 @@ if __name__ == "__main__":
 
     parser.add_argument("--co-parents", type=int, default=1,
                         help="Number of co-parents per child group in hierarchical topology (default: 1)")
+    parser.add_argument("--groups-per-coordinator", type=int, default=1,
+                        help="Child groups each Level-1 coordinator exclusively parents "
+                             "(default: 1). Above 1 is what gives a coordinator a delegation "
+                             "decision: at 1 there is a single candidate, so both the MAB and "
+                             "delegation.policy=llm are inert. Freed coordinator slots become "
+                             "Level-0 agents, so the fleet size is unchanged. Two-level "
+                             "hierarchies only.")
 
     parser.add_argument("--fit-all", action="store_true",
                         help="Size every job to fit ALL agents (min capacities). "
@@ -1005,6 +1106,7 @@ if __name__ == "__main__":
         agent_type=args.agent_type,
         initial_group_size=args.initial_group_size,
         co_parent_count=args.co_parents,
+        groups_per_coordinator=args.groups_per_coordinator,
         quantum_agents_pct=args.quantum_agents_pct,
         master_fleet_size=args.master_fleet_size,
     )

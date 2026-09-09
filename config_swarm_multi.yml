@@ -259,8 +259,9 @@ quantum:
 #     K=1 -> [1,1,1,1,1]   K=2 -> [0,1,1,1,2]   K=5 -> [0,0,0,0,5]
 # With one candidate there is no routing decision: neither this nor the bandit ever chooses and
 # every delegation is recorded as `trivial`. Coordinators log `[DELEGATION] ... can never
-# choose` in that state. Measuring delegation needs a coordinator exclusively parenting several
-# groups, which the generator cannot express yet - see docs/FGCS_EVAL_PLAN.md.
+# choose` in that state. Use `generate_configs.py --groups-per-coordinator G` (forwarded by
+# run_test.py and batch_tests_v2.py) to give each coordinator G groups exclusively: at Hier-90
+# with G=3 that is 3 coordinators leading 3 groups each, all with a real choice.
 # The fan-out must also stay BELOW the number of groups a coordinator leads: at or above that
 # count every candidate is delegated to whatever the ranking says, so the policy is inert for a
 # second reason. The same warning covers it. Which key sets the fan-out depends on the policy -

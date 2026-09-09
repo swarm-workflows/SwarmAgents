@@ -646,12 +646,12 @@ def test_no_warning_for_a_leaf_or_an_unconfigured_coordinator():
     assert plain.logger.warnings == []
 
 
-def _generated_coordinators(out_dir, *extra):
+def _generated_coordinators(out_dir, *extra, agents=30):
     """Run the real generator and return `{agent_id: (agent_type, children, co_parent_groups)}`
     for every Level-1 coordinator."""
     from swarm.utils.yaml_strict import safe_load
 
-    cmd = [sys.executable, "generate_configs.py", "30", "10", "./config_swarm_multi.yml",
+    cmd = [sys.executable, "generate_configs.py", str(agents), "10", "./config_swarm_multi.yml",
            str(out_dir), "hierarchical", "localhost", "100", "--seed", "42", "--skip-jobs",
            *extra]
     proc = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True)
@@ -698,6 +698,71 @@ def test_shipped_topology_gives_no_coordinator_a_routing_choice(tmp_path):
     assert _led_counts(coords) == [1, 1, 1, 1, 1]
 
 
+def test_groups_per_coordinator_gives_coordinators_a_real_choice(tmp_path):
+    """The fix for the blocker in section 0.6 of the plan: one coordinator exclusively parents
+    G groups, so `_get_active_child_groups()` returns G candidates and the delegation policy
+    finally has something to decide. Unlike `--co-parents`, the choice is spread across
+    coordinators rather than concentrated on the lowest-ID one, and no coordinator is idled.
+
+    Coordinator slots freed by the larger fan-out become Level-0 agents, so the fleet is still
+    exactly the size that was asked for — `run_test.py` launches ids 1..N and would otherwise
+    start agents with no config.
+    """
+    for fan_out, expected_led in ((2, [1, 2, 2]), (3, [2, 3]), (5, [5])):
+        coords = _generated_coordinators(
+            tmp_path / f"g{fan_out}", "--groups-per-coordinator", str(fan_out))
+        assert _led_counts(coords) == expected_led, f"G={fan_out}"
+        assert all(t == "llm" for t, _c, _m in coords.values())
+        assert sum(1 for n in _led_counts(coords) if n > 1) >= 1, \
+            f"G={fan_out} must leave at least one coordinator with a routing decision"
+
+
+def test_fan_out_keeps_the_fleet_the_size_it_was_asked_for(tmp_path):
+    """`run_test.py` starts agent ids 1..N, so a topology that quietly drops agents would
+    launch processes with no config file."""
+    from swarm.utils.yaml_strict import safe_load
+
+    for fan_out in (1, 2, 3, 5):
+        out = tmp_path / f"size{fan_out}"
+        extra = () if fan_out == 1 else ("--groups-per-coordinator", str(fan_out))
+        _generated_coordinators(out, *extra)
+        ids = sorted(int(n.rsplit("_", 1)[1].split(".")[0])
+                     for n in os.listdir(out) if n.endswith(".yml"))
+        assert ids == list(range(1, 31)), f"G={fan_out} produced ids {ids[:3]}..{ids[-3:]}"
+        # Every Level-0 agent still belongs to a group, and sizes differ by at most one.
+        sizes = {}
+        for name in os.listdir(out):
+            if not name.endswith(".yml"):
+                continue
+            topo = safe_load(open(os.path.join(out, name))).get("topology") or {}
+            if (topo.get("level") or 0) == 0:
+                sizes[topo["group"]] = sizes.get(topo["group"], 0) + 1
+        assert max(sizes.values()) - min(sizes.values()) <= 1, f"G={fan_out}: {sizes}"
+
+
+def test_fan_out_leaves_the_default_topology_untouched(tmp_path):
+    """G=1 must take the original code path, not a recomputation that happens to agree — the
+    scale ladder and every prior run depend on the shipped presets."""
+    baseline = _generated_coordinators(tmp_path / "baseline")
+    explicit = _generated_coordinators(tmp_path / "explicit", "--groups-per-coordinator", "1")
+    assert baseline == explicit
+    assert _led_counts(baseline) == [1, 1, 1, 1, 1]
+
+
+def test_fan_out_is_refused_on_three_level_hierarchies(tmp_path):
+    """A three-level hierarchy sizes its super-groups in Level-1 agents, so changing how many
+    there are would need restructuring too. Refuse loudly rather than emit a broken topology."""
+    out = tmp_path / "three_level"
+    out.mkdir()
+    proc = subprocess.run(
+        [sys.executable, "generate_configs.py", "100", "10", "./config_swarm_multi.yml",
+         str(out), "hierarchical", "localhost", "100", "--seed", "42", "--skip-jobs",
+         "--groups-per-coordinator", "2"],
+        cwd=REPO, capture_output=True, text=True)
+    assert "only supported for two-level" in proc.stdout + proc.stderr
+    assert not [n for n in os.listdir(out) if n.endswith(".yml")]
+
+
 def test_co_parents_concentrates_leadership_instead_of_spreading_choice(tmp_path):
     """`--co-parents 2` is NOT the fix it looks like, and this test exists to stop that claim
     coming back. Every group is led by its lowest-ID live co-parent, so with the fleet healthy
@@ -718,3 +783,47 @@ def test_co_parents_concentrates_leadership_instead_of_spreading_choice(tmp_path
     k5 = _generated_coordinators(tmp_path / "k5", "--co-parents", "5")
     assert _led_counts(k5) == [0, 0, 0, 0, 5], \
         "raising K concentrates every group on the lowest-ID coordinator"
+
+
+def test_the_plans_fleet_sizes_build_a_hierarchy(tmp_path):
+    """Hier-90 and Hier-270 are named all through the evaluation plan and neither was a
+    supported preset. `--agents 270` errored; `--agents 90` fell into the `<= 110` branch,
+    built a 110-agent topology with coordinators at ids 101-110, and then wrote only ids 1..90
+    — 90 leaf agents, zero coordinators, every `parent` dangling, no delegation at all, and
+    nothing in the output saying so. The ladder scales the group count, not the group shape."""
+    from swarm.utils.yaml_strict import safe_load
+
+    for agents, expected_groups in ((30, 5), (90, 9), (270, 27)):
+        out = tmp_path / f"h{agents}"
+        coords = _generated_coordinators(out, agents=agents)
+        assert len(coords) == expected_groups, f"Hier-{agents}"
+        assert all(t == "llm" for t, _c, _m in coords.values())
+        ids = sorted(int(n.rsplit("_", 1)[1].split(".")[0])
+                     for n in os.listdir(out) if n.endswith(".yml"))
+        assert ids == list(range(1, agents + 1)), f"Hier-{agents} must be exactly that size"
+        levels = [((safe_load(open(os.path.join(out, n))).get("topology") or {}).get("level"))
+                  for n in os.listdir(out) if n.endswith(".yml")]
+        assert levels.count(1) == expected_groups, f"Hier-{agents} lost its coordinators"
+
+
+def test_the_ladder_gives_every_coordinator_a_choice_at_g3(tmp_path):
+    """The point of the exercise: at G=3 the two upper rungs put three groups under every
+    coordinator, so no cell is silently measuring a policy that cannot choose."""
+    for agents, expected in ((90, [3, 3, 3]), (270, [3] * 9)):
+        coords = _generated_coordinators(
+            tmp_path / f"g3_{agents}", "--groups-per-coordinator", "3", agents=agents)
+        assert _led_counts(coords) == expected, f"Hier-{agents}"
+
+
+def test_a_fleet_size_with_no_preset_is_refused_not_truncated(tmp_path):
+    """The general form of the Hier-90 bug: any hierarchical size whose topology does not total
+    the requested agent count used to have the overflow silently dropped."""
+    out = tmp_path / "unsupported"
+    out.mkdir()
+    proc = subprocess.run(
+        [sys.executable, "generate_configs.py", "95", "10", "./config_swarm_multi.yml",
+         str(out), "hierarchical", "localhost", "100", "--seed", "42", "--skip-jobs"],
+        cwd=REPO, capture_output=True, text=True)
+    combined = proc.stdout + proc.stderr
+    assert "would need" in combined and "silently dropping" in combined
+    assert not [n for n in os.listdir(out) if n.endswith(".yml")]

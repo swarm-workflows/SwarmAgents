@@ -147,7 +147,7 @@ no-reuse rule (§2), E0–E3 and E5–E7 as designed, the metrics protocol (§7)
 Budget: ~366 → ~458 runs, ~124 → ~153 testbed-hours before reruns.
 
 
-### 0.6 BLOCKER found 2026-09-08: no coordinator has a delegation decision to make
+### 0.6 No coordinator had a delegation decision to make (found and FIXED 2026-09-08)
 
 `scheduling_main` filters delegation candidates through `_get_active_child_groups()` — the
 groups a coordinator **actively leads**, not the ones assigned to it. A group is led by its
@@ -185,24 +185,70 @@ Landed now: coordinators log `[DELEGATION] ... can never choose` for either caus
 it leads everything), and `tests/test_delegation.py` pins the leadership distribution
 end-to-end against generated configs so this cannot silently drift back.
 
-**Open decision — needed before E2 and any LLM-delegation cell.** The generator ties Level-1
-coordinators 1:1 to child groups (`parent_id = level_1_base + group`), so there is no way to
-express "one coordinator exclusively parents G groups". The options:
+**Resolved 2026-09-08 by `--groups-per-coordinator G`** (option 1 of the three considered;
+the alternatives were making Level-2 super-coordinators the delegating agents, which needs a
+3-level hierarchy in every delegation cell, and dropping E2 outright). The generator tied
+Level-1 coordinators 1:1 to child groups (`parent_id = level_1_base + group`); it now builds
+`ceil(num_groups / G)` coordinators, each **exclusively** parenting G groups, so leadership is
+spread rather than concentrated and no coordinator is idled. Measured on Hier-30 (groups
+actively led per coordinator, whole fleet alive):
 
-1. **Add a fan-out parameter** to `generate_configs.py` — `--groups-per-coordinator G`, giving
-   `num_groups / G` Level-1 coordinators each exclusively parenting G groups. Cleanest, and it
-   makes the delegation branching factor an experimental variable in its own right (a natural
-   x-axis for E2). Changes the topology the paper describes, so it is a plan decision.
-2. **Make Level-2 super-coordinators the delegating LLM agents** and give them several Level-1
-   groups. Closer to the existing structure, but needs a 3-level hierarchy in every delegation
-   cell and `--hierarchical-level1-agent-type` currently types only Level 1.
-3. **Drop E2 and the delegation half of C1**, and scope the LLM plane to bidding only. Honest,
-   but it removes the paper's systems contribution.
+| `--groups-per-coordinator` | coordinators | actively led | with a choice |
+|---|---|---|---|
+| 1 (default) | 5 | `[1, 1, 1, 1, 1]` | 0 of 5 |
+| 2 | 3 | `[1, 2, 2]` | 2 of 3 |
+| 3 | 2 | `[2, 3]` | 2 of 2 |
+| 5 | 1 | `[5]` | 1 of 1 |
 
-Recommendation: (1), with G as an E2 axis. Until it is decided, P0-1 is code-complete and
-untestable end to end, and P0-2/P0-3 should wait — they compose delegation policies that
-currently have nothing to compose over.
+Compare the `--co-parents` table above: that one concentrates, this one spreads. The two
+compose (G=2 with K=2 gives `[3, 2, 0]` — a genuine choice for two coordinators plus one warm
+standby), so failover can still be exercised inside a delegation cell.
 
+Design points worth keeping. Coordinator slots freed by the larger fan-out become **Level-0
+agents**, so the fleet is still exactly `--agents` in size and `run_test.py`'s 1..N id range
+stays valid; group sizes then differ by at most one and each agent reports its own. G=1 takes
+the original code path untouched — verified byte-identical against pre-change output for
+Hier-30 — so the presets and everything measured on them are unaffected. Three-level presets
+(100, 990, 1000) refuse the flag: their super-groups are sized in Level-1 agents and would need
+restructuring too. Forwarded by `run_test.py` and `batch_tests_v2.py`; the topology facts are
+pinned by `tests/test_delegation.py`.
+
+**G is now an E2 axis, not merely a fix.** The delegation branching factor is the natural
+x-axis for learned-delegation quality: at G=1 there is nothing to learn, and the question worth
+answering is how bandit and LLM delegation compare as the number of candidate groups grows.
+Suggested sweep G ∈ {2, 3, 5} at Hier-30 — which also moves the coordinator count 3 → 2 → 1, so
+it trades delegation breadth against coordinator parallelism and both must be reported.
+
+**Standing obligation:** every delegation cell (all of E2, the LLM-delegation cells of E1/E4)
+must pass `--groups-per-coordinator ≥ 2`. Without it the cell measures nothing, and the
+coordinators now say so in their logs.
+
+
+### 0.7 The plan's fleet sizes did not exist in the generator (found and FIXED 2026-09-08)
+
+Hier-90 and Hier-270 are named throughout this plan — E2, E3b, E4, E7, E8 and the E1 factorial —
+and **neither was a supported preset**. `--agents 270` errored out. `--agents 90` was worse: it
+fell into the generator's `<= 110` branch, which builds a *110-agent* hierarchy with coordinators
+at ids 101–110, and only ids 1..N ever get config files written. A Hier-90 run therefore produced
+**90 leaf agents, zero coordinators**, every `parent` pointing at an agent that does not exist,
+and no delegation of any kind — with nothing in the output saying so.
+
+Fixed by adding the two presets the plan always assumed, chosen so the ladder scales the group
+*count* and not the group *shape*:
+
+| fleet | groups | group size | coordinators | ids |
+|---|---|---|---|---|
+| Hier-30 | 5 | 5 | 5 | 26–30 |
+| **Hier-90** | **9** | **9** | **9** | **82–90** |
+| **Hier-270** | **27** | **9** | **27** | **244–270** |
+
+Hier-90's 9 groups are exactly what E2's "Scenario A generalized to 9 groups" always meant. The
+generator also now refuses *any* hierarchical fleet size whose topology does not total the
+requested agent count, rather than truncating it — that is the general form of the bug, and the
+`<= 110` range branch is not the only way to hit it.
+
+With `--groups-per-coordinator 3`: Hier-90 becomes 3 coordinators × 3 groups, Hier-270 becomes 9
+× 3 — every coordinator with a genuine choice, verified end to end.
 ---
 
 ## 1. The thesis (this determines every experiment)
@@ -381,7 +427,14 @@ informative cells (drop PBFT×LLM at 270 to a single confirming run, since the c
 - Repeats: 5 (10 for the two headline cells).
 
 ### E2 — Learned delegation quality (C1)
-Hier-90, `{static-greedy, epsilon-greedy, UCB1, LinUCB, LinTS, oracle}` under the context-dependent
+**Hier-90 with `--groups-per-coordinator 3`** — 9 groups of 9, three coordinators leading three
+groups each, so every coordinator has a real routing decision (§0.6). Hier-90 only became a
+buildable fleet on 2026-09-08: see §0.7. At G=1 there is one candidate group and nothing to
+learn, so every arm below would score identically; **G is the second axis of this experiment**,
+sweep G ∈ {3, 9} (3 coordinators, then 1) and report the coordinator count alongside it, since
+raising G trades delegation breadth against coordinator parallelism.
+
+Arms: `{static-greedy, epsilon-greedy, UCB1, LinUCB, LinTS, oracle}` under the context-dependent
 failure profile (Scenario A generalized to 9 groups). Then the two stressors, now at scale:
 - **E2a non-stationarity:** mid-run failure-parity flip, `discount ∈ {1.0, 0.98}` (scale up Scenario B).
 - **E2b churn:** group outage + rejoin, with the liveness-gating and decayed-timeout fixes on/off
@@ -604,10 +657,10 @@ reviews return (mid-2027 at the earliest). Do not plan the campaign around it.
    `--runtime` cap or `--shutdown-after-seconds` (else a stalled cell polls all night).
    `batch_tests_v2.py` forwards both flags and its own `--runtime` default moved 30 → 0, since
    enforcing the cap would otherwise have stopped every batch run after 30 s.
-   **A third item, found reviewing P0-1, is a BLOCKER rather than an obligation — see §0.6.**
-   No coordinator in the shipped hierarchical topology ever has more than one child group to
-   choose between, so the bandit and the LLM delegator are both inert and E2 cannot be run as
-   specified.
+   **A third obligation, found reviewing P0-1 and fixed the same day (§0.6): every delegation
+   cell must pass `--groups-per-coordinator 2` or more.** At the default of 1 no coordinator
+   has more than one child group to choose between, so the bandit and the LLM delegator are
+   both inert and E2 measures nothing.
 2. ~~**P0-5**~~ **DONE 2026-09-08.** One obligation follows: E4/E8 must report the new
    `wire_cost_hit_rate` from the `[STATS]` line. It is the fraction of peer votes that used a real
    LLM verdict rather than abstaining, so it bounds how much of any LLM × Snow result is actually
