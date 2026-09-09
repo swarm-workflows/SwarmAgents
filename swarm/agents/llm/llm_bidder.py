@@ -18,6 +18,7 @@ from pydantic_ai import Agent as PydanticAgent, ModelSettings, NativeOutput
 from pydantic_ai.models.google import GoogleModel
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.ollama import OllamaProvider
+from pydantic_ai.providers.openai import OpenAIProvider
 
 from swarm.agents.llm.llm_config import LlmConfig
 
@@ -57,7 +58,16 @@ def build_model(cfg: LlmConfig):
     model_name = (cfg.model or "gpt-4o-mini").strip()
 
     if provider == "openai":
-        return OpenAIChatModel(model_name)  # uses OpenAIProvider via env OPENAI_API_KEY
+        # `llm.base_url` was parsed into LlmConfig and then read only by the ollama branch, so a
+        # config naming an OpenAI-COMPATIBLE gateway (the FABRIC one at
+        # https://ai.fabric-testbed.net/v1, say) silently talked to api.openai.com instead —
+        # the key promising one endpoint and delivering another. Same shape as the unenforced
+        # `timeout_seconds` in §0.2. Env still wins, so a proxy can be interposed per host.
+        base_url = os.getenv("OPENAI_BASE_URL") or cfg.base_url or ""
+        if base_url:
+            return OpenAIChatModel(model_name, provider=OpenAIProvider(
+                base_url=base_url, api_key=os.getenv("OPENAI_API_KEY") or ""))
+        return OpenAIChatModel(model_name)  # stock OpenAI, via env OPENAI_API_KEY
     if provider in {"gemini", "gemma", "google"}:
         return GoogleModel(model_name)  # uses Google credentials envs
     if provider == "ollama":

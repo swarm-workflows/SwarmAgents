@@ -7,7 +7,9 @@ class LlmConfig:
     enabled: bool = False
     provider: str = "none"          # e.g., "openai", "vertex", "ollama", "none"
     model: str = ""
-    base_url: str = ""              # overridden by the provider's *_BASE_URL env var
+    # Honoured for BOTH `openai` (any OpenAI-compatible gateway) and `ollama`; the
+    # provider's *_BASE_URL env var wins over it. Empty means the provider default.
+    base_url: str = ""
     # Elicitation (P0-6). The campaign measured 59% of qwen2.5:3b bids at the identical value
     # 75.00 and 92% of gpt-oss-20b bids on just two values: asking for a 0-100 rating gets
     # answers in round steps, so the cost signal is mostly ties and cannot order agents.

@@ -874,3 +874,27 @@ def test_a_fan_out_larger_than_the_group_count_clamps(tmp_path):
     coords = _generated_coordinators(
         tmp_path / "clamped", "--groups-per-coordinator", "99")
     assert _led_counts(coords) == [5]
+
+
+def test_openai_provider_honours_a_configured_base_url(monkeypatch):
+    """`llm.base_url` was parsed into LlmConfig and read only by the ollama branch, so a config
+    naming an OpenAI-compatible gateway silently talked to api.openai.com. That is live for this
+    campaign: the FABRIC endpoint at https://ai.fabric-testbed.net/v1 is the only one routable
+    from the slice, and a run pointed at it by config alone would have gone somewhere else."""
+    from swarm.agents.llm.llm_bidder import build_model
+
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    gateway = build_model(LlmConfig.from_dict(
+        {"provider": "openai", "model": "gpt-oss-20b",
+         "base_url": "https://ai.fabric-testbed.net/v1"}))
+    assert "ai.fabric-testbed.net" in str(gateway.client.base_url)
+
+    stock = build_model(LlmConfig.from_dict({"provider": "openai", "model": "gpt-4o-mini"}))
+    assert "api.openai.com" in str(stock.client.base_url), "default must be unchanged"
+
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://env-wins.example/v1")
+    env = build_model(LlmConfig.from_dict(
+        {"provider": "openai", "model": "m", "base_url": "https://config.example/v1"}))
+    assert "env-wins.example" in str(env.client.base_url), "env must win over config"
