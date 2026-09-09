@@ -569,6 +569,22 @@ class SwarmConfigGenerator:
                 num_super_groups = 0  # No Level 2
                 level_1_base = 51
 
+            elif self.num_agents == 80:
+                # Two-level: 72 Level-0 (8 groups of 9) + 8 Level-1 = 80.
+                # Stands in for Hier-90 while a site is out. The FABRIC slice is 92 VMs and PSC
+                # (agent-10..18) has been down since 2026-09-09, leaving 83 — and every rung
+                # above Hier-30 was sized for ~90 hosts, so Hier-90 at one agent per VM cannot
+                # start at all. 80 keeps group_size 9, the same group SHAPE as Hier-90 and
+                # Hier-270, so the ladder still scales the group COUNT (8 / 27 instead of
+                # 9 / 27) and every message still crosses the real WAN at 1 agent/VM, which is
+                # what the alternative (Hier-90 packed 2-per-VM) gives up. With
+                # --groups-per-coordinator 2 it is 4 coordinators x 2 groups, so delegation
+                # stays measurable.
+                num_groups = 8
+                group_size = 9
+                num_super_groups = 0  # No Level 2
+                level_1_base = 73
+
             elif self.num_agents == 90:
                 # Two-level: 81 Level-0 (9 groups of 9) + 9 Level-1 = 90.
                 # The evaluation plan has named Hier-90 since it was written (E2's "9 groups"),
@@ -830,7 +846,7 @@ class SwarmConfigGenerator:
             # pointing at an agent that does not exist. No delegation happens at all, and
             # nothing says so. Refuse instead.
             if len(agent_topo) != self.num_agents:
-                supported = "30, 60, 90, 100, 110, 120, 250, 270, 990, 1000"
+                supported = "30, 60, 80, 90, 100, 110, 120, 250, 270, 990, 1000"
                 raise TopologyError(
                     f"Hierarchical topology for {self.num_agents} agents would need "
                     f"{len(agent_topo)} agents ({num_groups} groups of {group_sizes[0]}"

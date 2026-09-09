@@ -669,6 +669,45 @@ def _generated_coordinators(out_dir, *extra, agents=30):
     return found
 
 
+def test_hier80_is_a_shape_preserving_stand_in_for_hier90(tmp_path):
+    """Hier-80 exists because the slice lost a site: every rung above Hier-30 was sized for
+    ~90 hosts and PSC (agent-10..18) is down, leaving 83, so Hier-90 at one agent per VM
+    cannot start. 80 has to keep group_size 9 — the same group SHAPE as Hier-90 and Hier-270 —
+    or the ladder stops measuring group count and starts measuring group size."""
+    from swarm.utils.yaml_strict import safe_load
+
+    out_dir = tmp_path / "h80"
+    out_dir.mkdir()
+    proc = subprocess.run(
+        [sys.executable, "generate_configs.py", "80", "10", "./config_swarm_multi.yml",
+         str(out_dir), "hierarchical", "localhost", "100", "--seed", "42", "--skip-jobs"],
+        cwd=REPO, capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr[-2000:]
+
+    levels, group_sizes = {}, {}
+    for name in sorted(os.listdir(out_dir)):
+        if not name.endswith(".yml"):
+            continue
+        topo = safe_load(open(os.path.join(out_dir, name))).get("topology") or {}
+        level = topo.get("level") or 0
+        levels[level] = levels.get(level, 0) + 1
+        if level == 0:
+            g = topo.get("group")
+            group_sizes[g] = group_sizes.get(g, 0) + 1
+
+    assert levels == {0: 72, 1: 8}, levels          # 8 groups of 9, plus 8 coordinators
+    assert len(group_sizes) == 8
+    assert set(group_sizes.values()) == {9}, group_sizes
+
+
+def test_hier80_gives_each_coordinator_a_real_choice(tmp_path):
+    """With --groups-per-coordinator 2 the fleet size is unchanged and every coordinator leads
+    exactly two groups, so both delegation planes have something to decide."""
+    coords = _generated_coordinators(
+        tmp_path / "h80g2", "--groups-per-coordinator", "2", agents=80)
+    assert _led_counts(coords) == [2, 2, 2, 2], coords
+
+
 def test_delegation_policy_flag_reaches_every_generated_config(tmp_path):
     """The arm has to be selectable from the command line and recorded.
 

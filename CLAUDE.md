@@ -64,12 +64,22 @@ python generate_configs.py <num_agents> <jobs_per_proposal> <base_config> <outpu
 # the same seed gives agent i a different machine at each size). Generate from a clean state —
 # an existing agent_dtns.json is reused through a different RNG path and warns when it is.
 python generate_configs.py 30 10 ./config_swarm_multi.yml configs mesh localhost 600 --dtns --seed 42 --master-fleet-size 270
+# make_agent_hosts.py builds the hosts file for a remote run. Placement is the ORDER of this
+# file (agents are assigned to hosts in contiguous blocks), and agent ids map to sites in
+# contiguous blocks, so numeric order clusters each hierarchical group at one site: measured on
+# the live slice, 65/79 adjacent pairs same-site sequentially vs 0/79 interleaved. Default is
+# interleaved; --order sequential is for a deliberate site-outage test. It also probes with
+# StrictHostKeyChecking=accept-new, so a node returning from a rebuild is not misread as down.
+python make_agent_hosts.py --count 80 --out agent_hosts.txt --sites-out agent_sites.txt
 # Hierarchical only: --groups-per-coordinator G gives each Level-1 coordinator G child groups
 # exclusively (default 1). Required for ANY delegation measurement — at 1 a coordinator has a
 # single candidate, so the MAB and delegation.policy=llm are both inert. Freed coordinator slots
 # become Level-0 agents, so the fleet size is unchanged; two-level hierarchies only.
 python generate_configs.py 90 10 ./config_swarm_multi.yml configs hierarchical localhost 600 --seed 42 --groups-per-coordinator 3
-# Supported hierarchical fleet sizes: 30, 60, 90, 100, 110, 120, 250, 270, 990, 1000. Anything
+# Supported hierarchical fleet sizes: 30, 60, 80, 90, 100, 110, 120, 250, 270, 990, 1000.
+# Hier-80 (8 groups of 9 + 8 coordinators) is the stand-in for Hier-90 while PSC is down: it
+# keeps group_size 9, the same group shape as Hier-90/270, and fits 83 VMs at 1 agent/VM.
+# Anything
 # else is refused — a size whose topology does not total the request used to have the overflow
 # silently dropped, which for Hier-90 meant a fleet with no coordinators at all.
 python job_generator.py --job-count 100 --agent-profile-path agent_profiles.json --output-dir jobs/
