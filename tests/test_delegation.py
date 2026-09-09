@@ -313,8 +313,24 @@ def test_top_k_zero_follows_mab_top_k():
     a = make_agent(delegation={"policy": "llm"},
                    mab={"top_k": 2, "groups": [1, 2, 3]}, ranking=[3, 1, 2])
     _snapshots(a, [1, 2, 3])
-    assert a._delegation_top_k() == 2
+    assert a._effective_delegation_top_k() == 2
     assert a._select_child_groups(_Job(), [1, 2, 3]) == [3, 1]
+
+
+def test_delegation_top_k_is_ignored_by_the_bandit_path_and_says_so():
+    """`delegation.top_k` is an LLM-policy knob. Under `policy: bandit` the base implementation
+    runs and never reads it, so the guard must resolve `mab.top_k` — resolving the LLM knob
+    would warn about a healthy bandit run and, with the numbers the other way round, stay quiet
+    about an inert one. A key that is parsed and then ignored gets said out loud."""
+    a = make_agent(delegation={"policy": "bandit", "top_k": 5},
+                   mab={"top_k": 1, "groups": [1, 2, 3]})
+    assert a._effective_delegation_top_k() == 1
+    assert "ignored under" in a._delegation_policy_warning
+
+    # ...and the reverse: the LLM knob would have hidden a genuinely inert bandit fan-out.
+    b = make_agent(delegation={"policy": "bandit", "top_k": 1},
+                   mab={"top_k": 3, "groups": [1, 2, 3]})
+    assert b._effective_delegation_top_k() == 3
 
 
 # --------------------------------------------------------------------------------------------

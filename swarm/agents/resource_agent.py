@@ -558,6 +558,16 @@ class ResourceAgent(Agent):
             f"MAB initialised for agent {self.agent_id} with child groups {child_groups}"
         )
 
+    def _effective_delegation_top_k(self) -> int:
+        """How many child groups this agent will actually delegate one job to.
+
+        Must be the number `_select_child_groups` really uses, because the reachability guard
+        compares the candidate count against it. On the bandit path that is always `mab.top_k`
+        — `delegation.top_k` is an LLM-policy knob that this path never consults, so reading it
+        here would warn about healthy bandit runs and miss inert ones at the same time.
+        """
+        return int(self.mab_top_k)
+
     #: Seconds between repeats of the delegation-reachability warning while it still applies.
     _DELEGATION_REACH_WARN_S = 300
 
@@ -599,10 +609,7 @@ class ResourceAgent(Agent):
             return
 
         active = self._get_active_child_groups()
-        # Fan-out, resolved the way the active policy resolves it (LlmAgent honours
-        # `delegation.top_k` before falling back to `mab.top_k`).
-        resolver = getattr(self, "_delegation_top_k", None)
-        top_k = resolver() if callable(resolver) else int(self.mab_top_k)
+        top_k = self._effective_delegation_top_k()
 
         if len(active) <= 1:
             cause = (

@@ -407,6 +407,11 @@ class LlmAgent(ResourceAgent):
             self._delegation_policy_warning = None
         self.delegation_policy = policy
         self.delegation_top_k = int(cfg.get("top_k", 0) or 0)
+        if policy != self.DELEGATE_LLM and self.delegation_top_k > 0:
+            # Parsed and then never consulted — the shape of half the bugs in §0.2. Say so.
+            self._delegation_policy_warning = (
+                f"delegation.top_k={self.delegation_top_k} is ignored under "
+                f"delegation.policy={policy}; the bandit path uses mab.top_k")
         self.delegator: Optional[LlmDelegator] = None
         # Set when `policy: llm` is configured but no delegator could be built. The policy field
         # keeps saying `llm` — it records what the run was CONFIGURED to do, and a run whose
@@ -423,8 +428,18 @@ class LlmAgent(ResourceAgent):
         self.delegation_filled = 0     # group slots the caller filled, not the model
         self.delegation_seconds = 0.0
 
-    def _delegation_top_k(self) -> int:
-        """Fan-out for a delegation decision; `delegation.top_k` 0 means follow `mab.top_k`."""
+    def _effective_delegation_top_k(self) -> int:
+        """Fan-out actually used, which depends on which policy is in force.
+
+        Under `policy: llm` every path — the decision, the trivial short-circuit and all four
+        fallbacks — passes `delegation.top_k`, with 0 meaning "follow `mab.top_k`". Under
+        `policy: bandit` this agent delegates through the base implementation, which never
+        looks at `delegation.top_k`; returning it here would describe a fan-out that no code
+        applies, so the reachability guard would warn about healthy bandit runs and miss inert
+        ones. One resolver for the decision and the guard, so the two cannot disagree.
+        """
+        if self.delegation_policy != self.DELEGATE_LLM:
+            return super()._effective_delegation_top_k()
         if self.delegation_top_k > 0:
             return self.delegation_top_k
         return int(self.mab_top_k)
@@ -481,7 +496,7 @@ class LlmAgent(ResourceAgent):
         # Every fallback below passes `top_k`. The configured fan-out is a load and fairness
         # variable, so it must survive a failed decision unchanged — and `mab.top_k` is not it
         # when `delegation.top_k` was set.
-        top_k = self._delegation_top_k()
+        top_k = self._effective_delegation_top_k()
         if self.delegator is None:
             return super()._select_child_groups(job, capable_groups, top_k)
 
