@@ -453,7 +453,9 @@ failure profile (Scenario A generalized to 9 groups). Then the two stressors, no
   eScience impairment table with the new engines. Directly rebuts the eScience reviewer who observed
   that completion collapsed at 25–50 ms delay under PBFT — show Snow/hybrid holds.
 - Repeats: 5 per impairment level; 3 for the observed binning (it's per-run analysis, so E1 runs
-  can be re-analyzed for free — do E3a as analysis over E1 data first).
+  can be re-analyzed for free — do E3a as analysis over E1 data before spending any run on E3b).
+  "First" here means *before E3b*, not early in the calendar: E3a cannot start until the E1 cells
+  exist (weeks 6–11), and it needs AMST up to have a transatlantic bin at all (§9, §10).
 
 ### E4 — Cost of reasoning (C2, the honest-accounting section)
 Hier-90, Hybrid engine. Two orthogonal sweeps, now separable because the GPU decouples them:
@@ -617,16 +619,32 @@ from `SWARM-2slice.ipynb` + `db_node_setup/` and tag the frozen revision).
 | Wk | Dates | Milestone | Gate |
 |---|---|---|---|
 | 1 | Sep 8–14 | ~~**Pre-campaign fixes (§0.2)**~~ and ~~**P0-5**~~ **both DONE 2026-09-08.** Now: Hier-30 smoke on the slice through `collect.py`, with `--master-fleet-size 270` and a `--runtime` cap, checking `wire_cost_hit_rate` on an LLM cell. Confirm GPU node status and the slice lease horizon. | Smoke green |
-| 2–4 | Sep 15–Oct 5 | ~~P0-1 LLM group delegation~~ (done Sep 8), P0-4 instrumentation, ~~P0-6 bid elicitation~~, ~~P0-7 fallback parity~~ (both done Sep 8), P0-8 designated bidder. vLLM up on the GPU node, latency characterized. **Start E5 and the E3a analysis now** (no mechanism code needed). | LLM delegation works at Hier-30 |
+| 2–4 | Sep 15–Oct 5 | ~~P0-1 LLM group delegation~~ (done Sep 8), P0-4 instrumentation, ~~P0-6 bid elicitation~~, ~~P0-7 fallback parity~~ (both done Sep 8), P0-8 designated bidder. vLLM up on the GPU node, latency characterized. **No experiment starts here** — E5 needs P0-4's instrumentation and the full ladder (weeks 12–13), E3a needs E1 data (weeks 6–11). Code and bring-up only. | LLM delegation works at Hier-30 |
 | 5 | Oct 6–12 | P0-2 bandit×LLM composition, P0-3 cache + inference budget, P1-1 oracle. Pilot one cell each of E1/E2/E4/E8 end-to-end; verify every §7 metric lands in the tidy CSV. | **Code freeze Oct 12** — tag it |
-| 6–11 | Oct 13–Nov 23 | Main campaign, unattended, interleaved config order: **E0 (gate) →** E1 → E2 → E4 → E7 → E8. Nightly result pull + incremental figures. **Start writing architecture + related work from Oct 20.** | E1 + E2 complete by Nov 9 |
+| 6–11 | Oct 13–Nov 23 | Main campaign, unattended, interleaved config order: **E0 (gate) →** E1 → E2 → E4 → E7 → E8. Nightly result pull + incremental figures. **E3a analysis rides on the E1 pull** — it is re-analysis of those runs by RTT bin, so it needs no separate cells but does need AMST up. **Start writing architecture + related work from Oct 20.** | E1 + E2 complete by Nov 9 |
 | 12–13 | Nov 24–Dec 7 | E3b, E5, E6, hosted-LLM validation subset. Rerun high-variance cells. | **Data freeze Dec 7.** Figures final |
 | 14–18 | Dec 8–Jan 11 | Full draft (holidays inside this window — plan for it). Evaluation written against real numbers; related work with positioning table; threats-to-validity section (journal reviewers expect one). | **Complete draft Jan 11, 2027** |
 | 19–20 | Jan 12–25 | Internal review (Hamza/Anirban), §6 pre-mortem pass, reproducibility appendix (configs, seeds, `collect.py` outputs). | Reviewed draft Jan 25 |
 | 21 | Jan 26–31 | Polish, cover letter, submit. | **Submit to FGCS by Jan 31, 2027** |
 
-**Parallelization:** E5, E6 and the E3a analysis need no mechanism code — run them during weeks 2–5
-while P0 lands. Writing starts Oct 20, seven weeks before the data freeze.
+**Parallelization — corrected 2026-09-09.** This paragraph used to say E5, E6 and E3a "need no
+mechanism code — run them during weeks 2–5". Each clause was wrong, and it also contradicted the
+table above, which schedules E5 and E6 in weeks 12–13. Checked against each experiment's own
+definition:
+
+- **E5 cannot start early.** It is *instrumented* message counts, bytes and Redis op rate **across
+  the ladder** — that instrumentation **is P0-4**, which has not landed, and "across the ladder"
+  means the 90/180/270 rungs. Gated on P0-4 *and* the full VM pool; stays in weeks 12–13.
+- **E3a cannot start early.** It re-analyzes **E1 data**, which does not exist until weeks 6–11,
+  and it bins by site RTT with **AMST as the transatlantic bin** — the site in maintenance (§10).
+  Moved to weeks 6–11, gated on AMST returning.
+- **E6 is not early work either, but it is free.** Its double-assignment audit aggregates over
+  **every run in the campaign**, so it costs no dedicated cells and accumulates as the campaign
+  runs; only the partition test is a scheduled activity, and that needs a fleet.
+
+What genuinely parallelizes in weeks 2–5 is **code, not experiments**: P0-4, P0-8, P0-2, P0-3, the
+P1-1 oracle, and vLLM bring-up on the GPU node — none need the ladder, which matters while the VM
+pool is short (§10). Writing starts Oct 20, seven weeks before the data freeze.
 
 **If a conference fallback is wanted at all,** it has to be one whose deadline falls *after* FGCS
 reviews return (mid-2027 at the earliest). Do not plan the campaign around it.
@@ -638,6 +656,7 @@ reviews return (mid-2027 at the earliest). Do not plan the campaign around it.
 | Risk | Mitigation / fallback |
 |---|---|
 | LLM delegation (P0-1) doesn't beat analytic on quality | This is a *result*, not a failure — E4 is framed as honest accounting. Fallback thesis shifts weight to "expensive decision planes break BFT; here's the envelope where reasoning pays." |
+| **Site outages shrink the VM pool below the ladder** | Measured 2026-09-09: **76 of 92 agent VMs reachable**, with PSC (`agent-10`–`agent-18`, 9 VMs) and AMST (`agent-68`–`agent-74`, 7 VMs, in FABRIC maintenance) both down. Note what this costs: every rung above 30 needs **~90 VMs** — 90 at 1/VM, 180 at 2/VM, 270 at 3/VM — so at 76 VMs **only the Hier-30 rung runs as specified**. Hier-90, Mesh-180 and Hier-270 are all blocked, and since 76 + 9 (PSC) = 85, recovering one site is not enough: 14 of the 16 must return. Agent ids map to sites in contiguous blocks, so a sweep of `agent-1..92` names the affected site immediately — do it before sizing any cell. Fallback while sites recover: the Hier-30 sweeps, and **code** work that needs no fleet — P0-4 instrumentation, P0-8, P0-2/P0-3, and building the P1-1 oracle and the `collect.py` analysis paths. **E3a is not fill-in work** — being "analysis" made it look like it was, and §9 said so until this was caught: it re-analyzes *E1 data* at Hier-90/270, which is exactly what is blocked, and its headline transatlantic RTT bin **is AMST**, the site in maintenance. So this outage does not merely shrink the pool, it removes the bin that makes E3 "a figure no prior SWARM paper could produce"; E3a cannot be completed at all until AMST returns, whatever the VM count. Packing 180 agents onto 60 VMs at 3/VM would "fit" but is **not** the Mesh-180 cell — agents/VM sets the contention profile, so a substituted density is a different experiment and must not be reported as that rung. |
 | **GPU node not granted / preempted** | Highest-probability schedule risk — request in week 1 and confirm before the campaign. Fallback: CPU-served 7–8B on a dedicated VM, which caps the model-capability sweep in E4 but leaves E1/E2/E3 fully intact (a slow LLM is still a valid expensive-decision plane — arguably a more dramatic one). |
 | Inference throughput bottlenecks the 270-agent runs | With vLLM on GPU this should not bind: coordinators only (~27 LLM agents), batched. Plus cache + inference budget (P0-3). If it still binds, cap LLM runs at Hier-90 and report 270 as PBFT/Snow-only, with any projection clearly labeled as such. |
 | Journal review cycle demands new runs months later | Tag the frozen code revision; keep the slice reproducible from the notebook; archive every run tree plus `agent_profiles.json`/`agent_dtns.json`/seeds so any cell can be re-run identically. |

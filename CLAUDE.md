@@ -37,10 +37,14 @@ python run_test.py --mode remote --agents 30 --agents-per-host 5 --topology ring
 ```
 
 **Remote test setup (deployment environment):**
-- `ssh swarm` connects to the **database node** (runs Redis and orchestrates the run).
-- On that node, switch to the **root** user; the code lives at `/root/SwarmAgents`.
-- The database node is configured for **passwordless SSH to `agent-1` … `agent-40`**, which host the agent processes. All hostnames (`database`, `agent-1` … `agent-40`) are pre-resolved in `/etc/hosts`, so use them directly — no IPs needed.
-- `agent_hosts.txt` simply lists all agent hostnames, one per line (`agent-1` … `agent-40`).
+- `ssh swarm` connects to the **database node** (runs Redis and orchestrates the run). This is the only host reached from the laptop; every other node in the topology is reached *from* it.
+- On that node, become root with `sudo su -` before doing anything else: the code lives at `/root/SwarmAgents` and the passwordless SSH keys to the agent nodes belong to root, so neither is reachable as the login user.
+- As root, the database node has **passwordless SSH to every other node in the topology**, which host the agent processes. All hostnames are pre-resolved in `/etc/hosts`, so use them directly — no IPs needed. The current slice is **`agent-1` … `agent-92`** (contiguous, verified 2026-09-09), each with a paired `agent-N-mon` monitoring host on a separate subnet. Earlier revisions of this file said `agent-40`; check `/etc/hosts` rather than trusting a written range.
+- Agent ids map to sites in **contiguous blocks sharing a subnet**, so a site outage removes a solid id range: `agent-10`–`agent-18` is PSC, `agent-68`–`agent-74` is AMST. **Sweep reachability before sizing a run** — on 2026-09-09 both were down (AMST in FABRIC maintenance), leaving 76 of 92, below the ~90 VMs every scale rung above Hier-30 needs:
+  ```bash
+  seq 1 92 | xargs -P 40 -I{} bash -c 'ssh -o BatchMode=yes -o ConnectTimeout=6 agent-{} hostname >/dev/null 2>&1 || echo DOWN agent-{}'
+  ```
+- `agent_hosts.txt` lists all agent hostnames, one per line. It is **deleted by `cleanup_between_runs`** unless it is the resolved `--agent-hosts-file`, so it will often be absent on the database node and must be regenerated before a remote run.
 - Remote-mode tests are launched from this node with `--db-host database`, e.g.:
 ```bash
 python run_test.py --mode remote --agents 40 --agents-per-host 1 --topology ring --jobs 1000 \
