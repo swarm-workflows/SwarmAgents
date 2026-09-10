@@ -207,6 +207,7 @@ Consensus and selection engines are **decoupled** from agents via adapter classe
 ## Additional Documentation
 
 - `docs/ARCHITECTURE.md` — System architecture, five-layer design, and adapter patterns
+- `docs/CCGRID27_PAPER_PLAN.md` — **CCGrid 2027 conference paper** (abstract 24 Nov 2026, paper 8 Dec 2026, 10 pages incl. references, double-blind): contextual-bandit delegation (C1) + Snow consensus (C3). Claims, page/figure budget, which cells it draws from the master matrix, and the 10 Nov gate that decides its framing. `docs/FGCS_EVAL_PLAN.md` stays the master for substrate rules, P0 work, metrics and the experiment matrix
 - `docs/ROADMAP.md` — Identified improvements and feature roadmap
 - `docs/CO_PARENT_USAGE.md` — Multi-parent shared parenting for hierarchical topology
 - `docs/HIERARCHICAL_LLM_AGENTS.md` — LLM agents as Level 1 coordinators

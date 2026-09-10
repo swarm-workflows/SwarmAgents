@@ -308,6 +308,48 @@ fallback) and one case in `tests/test_collect.py`. **The smoke pair must be re-r
 from either is citable.
 ---
 
+### 0.9 The work splits into two papers (decided 2026-09-10)
+
+C1 (bandit delegation) and C3 (Snow consensus) go to **CCGrid 2027** — abstract 24 Nov 2026,
+paper 8 Dec 2026, 10 pages including references, double-blind. C2 (LLM coordinators) and the
+quantum-hybrid strand stay here for **FGCS, 31 Jan 2027**. The conference plan is
+`docs/CCGRID27_PAPER_PLAN.md`; **this document stays the master** for substrate rules, P0 code
+work, metric definitions and the experiment matrix, and the conference paper draws cells from
+it rather than redefining them.
+
+Why the split falls here, and why Snow goes with the bandit rather than staying:
+
+- Both are **code-complete and deployment-validated**; the LLM plane still has P0-3 (no
+  wall-clock deadline on an inference call) and P0-8 open. The split is along what can be
+  measured at the 12 Oct freeze.
+- The strongest single result either half has is **joint**: the Hier-250 PBFT collapse
+  (3.5-4.2% completion) removed by swapping the coordinator tier to Snow. A bandit-only paper
+  is a component study; a Snow-only paper is an engineering swap with a message-count table.
+- CCGrid's 10 pages, which §0.4 rejected as too tight for the full story, is right-sized for
+  two claims. Its deadline also **precedes** the journal's, so the two do not collide.
+
+**What the split costs, stated plainly: the interaction result stays with the journal.** §1's
+novel claim is that *expensive* decision-making changes which consensus protocol you should
+run, and the LLM is what makes a decision plane expensive — a LinUCB update is microseconds.
+The conference paper therefore cannot carry that claim. It gets a smaller, still-real one: Snow
+finalizes faster, so a coordinator's `GroupSnapshot` context is younger when it decides, so
+bandit regret should fall under Snow at equal scale. **That effect may be null**, and the
+campaign has a gate on 10 Nov to find out (`CCGRID27_PAPER_PLAN.md` §5).
+
+Two consequences for this plan:
+
+1. **P0-4 must instrument context age at decision time.** Without it the interaction cannot be
+   measured for either paper, and it is the one metric neither paper's figure list can source
+   from existing instrumentation.
+2. **The journal's §1 thesis is unchanged and still needs C1 and C3 as supporting material.**
+   FGCS gets the full three-claim composite; it cites the conference paper for the C1/C3
+   mechanisms and re-uses the same campaign runs rather than re-measuring
+   (`swarm-no-cross-substrate-result-reuse`). Under both venues' overlap policies the journal
+   must *extend*, so its contribution is C2 plus the composite interaction — not a longer
+   retelling of C1 and C3.
+
+---
+
 ## 1. The thesis (this determines every experiment)
 
 Three features do not make a paper. The unifying claim:
@@ -419,7 +461,7 @@ that previously existed only at 30 agents, plus a SWARM+ (PBFT + analytic) re-ba
 | **P0-1** ✅ | **LLM group delegation (done 2026-09-08).** At a coordinator, prompt over child-group summaries and return a ranked group choice + rationale. **As landed:** `delegation.policy` (`bandit` default = the pre-existing behaviour, `llm` = the model decides), with the decision point extracted into one overridable `ResourceAgent._select_child_groups` so both policies see the identical candidate list — the arms of E4 differ in the decision *rule*, not in what they were told. The summary the model gets is the **same `GroupSnapshot`** the contextual bandit gets, via a new public `MABManager.snapshots_for`, so headroom, inflight and the failure/timeout history are common to both. Candidate ids go in the **JSON schema** as a `Literal`, not just the prompt — the `score_scale` lesson again, since Ollama's `NativeOutput` generates from the schema and would happily answer `[0,1,2]` for groups 3, 7, 11 — and the answer is sanitised anyway (unknown ids dropped, de-duplicated, short rankings completed from the candidate order). Every failure path falls back to `bandit` **for that job**: provider error, `llm.timeout_seconds` breach, a ranking naming no group we offered, or a delegator that could not even be built. A decision that cannot change the outcome (one candidate, or `top_k ≥ len(candidates)`) spends no inference and is counted as `trivial`. Under `llm` the bandit still receives outcomes from the delegation monitor, so `MABManager.record_external_selection` hands it the **decision-time** context (not a rebuild after a multi-second call) — otherwise its arm counters would climb while the contextual model silently skipped every update, describing a run it did not steer. Delegation is **not** paced (P0-7): one coordinator owns its job, so a fast fallback out-races nobody. Audited to `llm_score:delegate:*`; `metrics.json` gets `llm_delegations` + `llm_delegation_stats`, kept apart from `mab_selections`; `[STATS]` reports calls/fallbacks/empty/trivial/mean latency. Two review findings worth recording because both are the campaign's recurring failure shape — *the fallback path is cheaper than the path it stands in for*: a failed decision originally widened the fan-out to every capable group (failing rewarded with the whole subtree, the fan-out analogue of §12.2's race-to-propose), and a timed-out call was charged nothing, which would have made `mean_s` cheapest in precisely the fallback-heavy runs E4 exists to price. Both fixed; the fallback now keeps the configured fan-out and picks at random when nothing ranks. **Two open limits, both P0-3's:** the call is synchronous on the coordinator's scheduling thread, so its delegation rate is capped at 1/latency; and `llm.timeout_seconds` is per-request, so provider and output-validation retries can stack several into one decision — there is no wall-clock deadline. Tests in `tests/test_delegation.py`. | `swarm/agents/llm/llm_delegator.py`, `resource_agent.py` `_select_child_groups`, `mab_manager.py`, `config_swarm_multi.yml` | 3–4 d |
 | **P0-2** | **Bandit×LLM composition.** Config `delegation.policy` already exists (P0-1) with `bandit` and `llm`; this adds the third mode `bandit_gated_llm` — bandit narrows `capable_groups` → top-m, LLM ranks those m, and the LLM's pick is the arm the bandit is rewarded on. The reward path is in place: `record_external_selection` already lands an LLM-routed outcome on the right arm with its selection-time context. One key, one place — do **not** add a second switch. | `mab_manager.py`, `resource_agent.scheduling_main` | 3 d |
 | **P0-3** | **Decision cache + inference budget.** Cache LLM verdicts keyed by (job-type signature, coarse group-state bucket) with TTL; hard cap on in-flight inference per coordinator, fall back to bandit/analytic when exceeded. Emit hit rate + fallback counts. | `llm_delegator.py`, `llm_bidder.py` | 2–3 d |
-| **P0-4** | **Instrumentation:** per-agent consensus message counts & bytes, rounds-to-finalize, LLM calls/tokens/latency/fallbacks, delegation decisions with chosen-vs-oracle labels. Export via `metrics.json` **and** node_exporter textfile collector so Grafana captures it. | `swarm/utils/metrics.py`, `gossip_engine.py`, `engine.py` | 2 d |
+| **P0-4** | **Instrumentation:** per-agent consensus message counts & bytes, rounds-to-finalize, LLM calls/tokens/latency/fallbacks, delegation decisions with chosen-vs-oracle labels. **Plus `GroupSnapshot` age at decision time** (added 2026-09-10): the conference paper's only interaction claim is that Snow's faster finalization leaves a coordinator deciding on younger context, and no existing counter can source it — without this the claim cannot be tested by either paper, so it is not optional. Export via `metrics.json` **and** node_exporter textfile collector so Grafana captures it. | `swarm/utils/metrics.py`, `gossip_engine.py`, `engine.py`, `mab_manager.py` | 2 d |
 | **P1-1** | **Oracle / offline-optimal delegator** for regret: replays each job against known per-group failure profiles and capacity. Analysis-time only. | `evaluation/oracle.py` | 2 d |
 | **P1-2** | Analysis harness: one script that walks a run tree → tidy CSV (config × run × metric), so every figure is regenerable. | `evaluation/collect.py` | 2 d |
 | **P1-3** | Site-aware config generation for 17 sites (`--agent-sites-file`) so Snow's `local_sample_frac` is meaningful and figures can be grouped by site. | `generate_configs.py` (§Part C of `CONSENSUS_SCALING_PLAN.md` — partially done) | 1 d |
@@ -450,18 +492,50 @@ count. Plan:
 
 ## 5. Experiment matrix
 
+**Paper ownership (added 2026-09-10, §0.9).** One campaign, two papers, and every cell belongs
+to at least one of them:
+
+| Experiment | CCGrid (C1/C3) | FGCS (C2 + composite) |
+|---|---|---|
+| E0 substrate re-baseline | shared | shared |
+| E1 consensus x decision plane | `{analytic, bandit}` columns | `{LLM, bandit-gated-LLM}` columns + the full crossing |
+| E2 delegation quality | **owns it** | cites it |
+| E3a per-RTT-bin (analysis over E1) | shared | shared |
+| E3b netem overlay | — | owns it |
+| E4 cost of reasoning | — | **owns it** |
+| E5 coordination overhead | shared | shared |
+| E6 safety and correctness | shared | shared |
+| E7 external baselines | **required** (see §6) | shared |
+| E8 decision-plane resilience | — | **owns it** |
+
+Cells marked shared are run **once**, on the frozen revision, and appear in both papers with
+the conference paper cited. Nothing is re-measured between submissions.
+
 Common workload: Pegasus-derived jobs, ~20 jobs/agent, generated by duplicating the 547-job base
 (`duplicate_jobs.py`). Agent counts must divide evenly by agents-per-host (`run_test.py` floors
 `hosts = agents // per_host`).
 
-**Scale ladder on ~90 VMs:**
+**Scale ladder on 83 VMs** (revised 2026-09-10: PSC `agent-10`–`18` is down indefinitely, so
+the fleet is 83 of 92 and every rung below was sized for ~90 hosts):
 
-| Agents | Agents/VM | Jobs | Notes |
-|---|---|---|---|
-| 30 | 1 (30 VMs) | 600 | Matches eScience Hier-30; cheap, use for sweeps |
-| 90 | 1 | 1800 | Primary operating point — 1 agent/VM, 17 sites, cleanest |
-| 180 | 2 | 3600 | Flat-PBFT livelock regime |
-| 270 | 3 | 5400 | Reproduces the LLM Hier-250 collapse point |
+| Agents | Agents/VM | Hosts | Jobs | Notes |
+|---|---|---|---|---|
+| 30 | 1 | 30 | 600 | Matches eScience Hier-30; cheap, use for sweeps |
+| **80** | 1 | 80 | 1600 | **Primary operating point, replacing Hier-90.** 8 groups of 9 + 8 coordinators keeps group *shape* identical to Hier-90/270, so the ladder still scales group count. Hier-90 at 1 agent/VM cannot start on 83 hosts at all |
+| 180 | 3 | 60 | 3600 | Flat-PBFT livelock regime. Was 2/VM on 90 hosts |
+| 270 | 4 | 68 | 5400 | The collapse point. Was 3/VM on 90 hosts |
+
+Two placement rules, both load-bearing and both newly enforced:
+
+- **Report agents-per-VM per rung in every results table.** Co-locating agents turns
+  inter-agent messages into loopback, which flatters exactly the coordination cost C3 measures.
+  A ladder that mixes 1/VM and 4/VM without saying so is not a scaling curve.
+- **Generate the hosts file with `make_agent_hosts.py` (site-interleaved, the default).**
+  Placement follows the order of `agent_hosts.txt` and agent ids map to sites in contiguous
+  blocks, so the numeric ordering used by every run before 2026-09-10 left **65 of 79 adjacent
+  agents at the same site** — a hierarchical group's consensus traffic never crossed the WAN.
+  Interleaved is 0 of 79. Every WAN claim in either paper must come from interleaved runs;
+  `--order sequential` is for a deliberate site-outage scenario only.
 
 ### E0 — Substrate re-baseline (runs first; everything else is compared against it)
 SWARM+ as published (PBFT + analytic cost model) at Hier-30 / Hier-90 / Hier-270 and Mesh-180 on the
@@ -666,90 +740,103 @@ in-paper (§0.5) rather than tech-report material.
 
 ---
 
-## 9. Schedule — journal target, self-imposed gates (revised 2026-09-08)
+## 9. Schedule — two deadlines, one campaign (revised 2026-09-10 for the split, §0.9)
 
-The conference deadline is gone; the binding clocks are now the **slice lease**, the **code freeze**,
-and reviewer turnaround (FGCS typically returns first reviews in months, so a major revision that
-needs new runs must be answerable from a slice that still exists — keep the deployment reproducible
-from `SWARM-2slice.ipynb` + `db_node_setup/` and tag the frozen revision).
+The conference deadline is **back and it is the near clock**: CCGrid abstract 24 Nov 2026, paper
+8 Dec 2026, then FGCS 31 Jan 2027. The campaign is reordered around that, because the cells the
+conference needs are a subset of the cells the journal needs, and the subset has to finish
+first. Also still binding: the **code freeze**, the **slice lease**, and the fact that FGCS
+reviews return in months, so keep the deployment reproducible from `SWARM-2slice.ipynb` +
+`db_node_setup/` and tag the frozen revision.
+
+**Conference cells** (`{analytic, bandit}` only): E0, E1′, E2, E3a, E5, E6, E7.
+**Journal-only cells:** E1's LLM columns, E3b, E4, E8. Nothing is re-measured between the two.
 
 | Wk | Dates | Milestone | Gate |
 |---|---|---|---|
-| 1 | Sep 8–14 | ~~**Pre-campaign fixes (§0.2)**~~ and ~~**P0-5**~~ **both DONE 2026-09-08.** Now: Hier-30 smoke on the slice through `collect.py`, with `--master-fleet-size 270` and a `--runtime` cap, checking `wire_cost_hit_rate` on an LLM cell. Confirm GPU node status and the slice lease horizon. | Smoke green |
-| 2–4 | Sep 15–Oct 5 | ~~P0-1 LLM group delegation~~ (done Sep 8), P0-4 instrumentation, ~~P0-6 bid elicitation~~, ~~P0-7 fallback parity~~ (both done Sep 8), P0-8 designated bidder. vLLM up on the GPU node, latency characterized. **No experiment starts here** — E5 needs P0-4's instrumentation and the full ladder (weeks 12–13), E3a needs E1 data (weeks 6–11). Code and bring-up only. | LLM delegation works at Hier-30 |
-| 5 | Oct 6–12 | P0-2 bandit×LLM composition, P0-3 cache + inference budget, P1-1 oracle. Pilot one cell each of E1/E2/E4/E8 end-to-end **at Hier-30** (the pipeline is what is being proved, not the scale — and Hier-90 may still be VM-blocked, §10); verify every §7 metric lands in the tidy CSV. Delegation cells need `--groups-per-coordinator 2`+ (§0.6). | **Code freeze Oct 12** — tag it |
-| 6–11 | Oct 13–Nov 23 | Main campaign, unattended, interleaved config order: **E0 (gate) →** E1 → E2 → E4 → E7 → E8. Nightly result pull + incremental figures. **E3a analysis rides on the E1 pull** — it is re-analysis of those runs by RTT bin, so it needs no separate cells but does need AMST up. **Start writing architecture + related work from Oct 20.** | E1 + E2 complete by Nov 9 |
-| 12–13 | Nov 24–Dec 7 | E3b, E5, E6, hosted-LLM validation subset. Rerun high-variance cells. | **Data freeze Dec 7.** Figures final |
-| 14–18 | Dec 8–Jan 11 | Full draft (holidays inside this window — plan for it). Evaluation written against real numbers; related work with positioning table; threats-to-validity section (journal reviewers expect one). | **Complete draft Jan 11, 2027** |
-| 19–20 | Jan 12–25 | Internal review (Hamza/Anirban), §6 pre-mortem pass, reproducibility appendix (configs, seeds, `collect.py` outputs). | Reviewed draft Jan 25 |
-| 21 | Jan 26–31 | Polish, cover letter, submit. | **Submit to FGCS by Jan 31, 2027** |
+| 1 | Sep 8–14 | ~~Pre-campaign fixes (§0.2)~~, ~~P0-5~~, ~~P0-1~~ done Sep 8. ~~Metrics attribution (§0.8)~~ and ~~Hier-30 smoke on the slice~~ done Sep 9-10; the smoke pair is `runs/smoke-g3-*`, both arms 30/30 agents reporting. Confirm GPU node status and slice lease horizon. | Smoke green ✅ |
+| 2–4 | Sep 15–Oct 5 | **P0-4 instrumentation including `GroupSnapshot` age at decision time** — F6 cannot be produced without it, so this is now the single most schedule-critical code item. P0-8 designated bidder. vLLM bring-up moves *after* the conference (E4 is journal-only), freeing this window. | Context age lands in the tidy CSV |
+| 5 | Oct 6–12 | P1-1 oracle (E2's regret axis — conference-critical). P0-2/P0-3 slip to the journal window with E4. Pilot one cell each of **E1′ and E2** end-to-end at Hier-30 with `--groups-per-coordinator 2` and interleaved placement; verify every §7 metric lands. | **Code freeze Oct 12** — tag it |
+| 6–8 | Oct 13–Nov 2 | **Conference campaign:** E0 (gate) → E1′ → E2, on the frozen revision, interleaved hosts file, Hier-30 / Hier-80 at 1 agent/VM and Mesh-180 / Hier-270 dense. E6 accumulates for free. **Start writing §III design from Oct 20.** | E0 reference established |
+| 9 | Nov 3–9 | E5 (needs P0-4 + the ladder), E7 external baselines, E3a re-analysis of the E1′ pull by RTT bin. | E1′ + E2 + E5 + E7 complete |
+| **10** | **Nov 10** | **Staleness gate.** Is bandit regret lower under Snow at equal scale, against context age (F6)? Yes → the paper is two mechanisms **plus an interaction**. No → two mechanisms plus a scale story, F6 becomes a §VI table. **The title and abstract differ between these.** | Answer recorded, not deferred |
+| 10–11 | Nov 10–23 | All six figures drafted from real data. Results and intro written to the gate's answer. Rerun high-variance cells. | Figures final Nov 23 |
+| **11** | **Nov 24** | **CCGrid abstract due (AoE).** | Submitted |
+| 12–13 | Nov 25–Dec 7 | Full conference draft, internal review (Hamza/Anirban), §6 pre-mortem pass, double-blind check (eScience'26 cited third-person, artifact URL anonymized). | Reviewed draft Dec 5 |
+| **13** | **Dec 8** | **Submit to CCGrid 2027.** | Submitted |
+| 14–17 | Dec 9–Jan 4 | **Journal campaign:** E1's LLM columns, E4, E8, E3b — same frozen revision, same slice. vLLM/GPU bring-up happens here. P0-2, P0-3, P0-8 land before these cells run. Holidays are inside this window; plan for it. | Journal data freeze Jan 4 |
+| 18–20 | Jan 5–25 | Journal draft. **C1 and C3 sections are the conference paper's material** — the incremental writing is C2, the composite interaction, and the threats section. Reproducibility appendix. | Complete draft Jan 25 |
+| 21 | Jan 26–31 | Polish, cover letter (state the CCGrid relationship explicitly), submit. | **Submit to FGCS by Jan 31, 2027** |
 
-**Parallelization — corrected 2026-09-09.** This paragraph used to say E5, E6 and E3a "need no
-mechanism code — run them during weeks 2–5". Each clause was wrong, and it also contradicted the
-table above, which schedules E5 and E6 in weeks 12–13. Checked against each experiment's own
-definition:
+**What the split costs in schedule terms.** The journal's measurement window shrinks from
+weeks 6–13 to weeks 14–17 — four weeks with the holidays inside — and its draft window from
+five weeks to three. That is only survivable because the conference paper writes C1 and C3
+first; if the conference draft slips past 8 Dec, the journal loses the same days twice. **The
+8 Dec date is the one to defend.**
 
-- **E5 cannot start early.** It is *instrumented* message counts, bytes and Redis op rate **across
-  the ladder** — that instrumentation **is P0-4**, which has not landed, and "across the ladder"
-  means the 90/180/270 rungs. Gated on P0-4 *and* the full VM pool; stays in weeks 12–13.
-- **E3a cannot start early.** It re-analyzes **E1 data**, which does not exist until weeks 6–11,
-  and it bins by site RTT with **AMST as the transatlantic bin** — the site in maintenance (§10).
-  Moved to weeks 6–11, gated on AMST returning.
-- **E6 is not early work either, but it is free.** Its double-assignment audit aggregates over
-  **every run in the campaign**, so it costs no dedicated cells and accumulates as the campaign
-  runs; only the partition test is a scheduled activity, and that needs a fleet.
+**Parallelization (corrected 2026-09-09, re-checked 2026-09-10).** What parallelizes in
+weeks 2–5 is code, not experiments:
 
-What genuinely parallelizes in **weeks 2–4** is code, not experiments: P0-4, P0-8 and vLLM
-bring-up on the GPU node (P0-2, P0-3 and the P1-1 oracle are week 5 in the table above, and pulling
-them earlier is fine if P0-4 lands early) — none of it needs the ladder, which matters while the VM pool is short
-(§10). **Week 5 is deliberately not code-only**: it lands P0-2 and P0-3 and then pilots one cell
-each of E1/E2/E4/E8 end-to-end, which is the code-freeze gate — the point is to prove the pipeline
-before the campaign, so run those pilots at **Hier-30** while the pool is short rather than
-deferring them. Writing starts Oct 20, seven weeks before the data freeze.
-
-**If a conference fallback is wanted at all,** it has to be one whose deadline falls *after* FGCS
-reviews return (mid-2027 at the earliest). Do not plan the campaign around it.
-
----
+- **E5 moved earlier, to week 9.** It is instrumented message counts across the ladder, so it
+  is gated on P0-4 and on the ladder existing — both true by Oct 13. It is a *conference*
+  figure (F2, the mechanism behind F1), so it can no longer sit in December.
+- **E3a still cannot start early**: it re-analyzes E1′ data, which does not exist until week 8.
+  It needs AMST for a transatlantic bin — **AMST returned 2026-09-09**, so that risk is closed;
+  PSC is the outage now, and PSC is not an RTT bin the plan depends on.
+- **E6 is free**: its double-assignment audit aggregates over every run in the campaign.
+- **vLLM and P0-2/P0-3/P0-8 are no longer on the critical path**, because everything they serve
+  is journal-only. That is the single biggest schedule dividend of the split.
 
 ## 10. Risks and fallbacks
 
 | Risk | Mitigation / fallback |
 |---|---|
 | LLM delegation (P0-1) doesn't beat analytic on quality | This is a *result*, not a failure — E4 is framed as honest accounting. Fallback thesis shifts weight to "expensive decision planes break BFT; here's the envelope where reasoning pays." |
-| **Site outages shrink the VM pool below the ladder** | Measured 2026-09-09: **76 of 92 agent VMs reachable**, with PSC (`agent-10`–`agent-18`, 9 VMs) and AMST (`agent-68`–`agent-74`, 7 VMs, in FABRIC maintenance) both down. Note what this costs: every rung above 30 needs **~90 VMs** — 90 at 1/VM, 180 at 2/VM, 270 at 3/VM — so at 76 VMs **only the Hier-30 rung runs as specified**. Hier-90, Mesh-180 and Hier-270 are all blocked, and since 76 + 9 (PSC) = 85, recovering one site is not enough: 14 of the 16 must return. Agent ids map to sites in contiguous blocks, so a sweep of `agent-1..92` names the affected site immediately — do it before sizing any cell. Fallback while sites recover: the Hier-30 sweeps, and **code** work that needs no fleet — P0-4 instrumentation, P0-8, P0-2/P0-3, and building the P1-1 oracle and the `collect.py` analysis paths. **E3a is not fill-in work** — being "analysis" made it look like it was, and §9 said so until this was caught: it re-analyzes *E1 data* at Hier-90/270, which is exactly what is blocked, and its headline transatlantic RTT bin **is AMST**, the site in maintenance. So this outage does not merely shrink the pool, it removes the bin that makes E3 "a figure no prior SWARM paper could produce"; E3a cannot be completed at all until AMST returns, whatever the VM count. Packing 180 agents onto 60 VMs at 3/VM would "fit" but is **not** the Mesh-180 cell — agents/VM sets the contention profile, so a substituted density is a different experiment and must not be reported as that rung. |
+| **Site outages shrink the VM pool below the ladder** | **Updated 2026-09-10. AMST returned; PSC (`agent-10`–`18`, 9 VMs) is out indefinitely, leaving 83 of 92.** The ladder was re-sized rather than waited on (§5): **Hier-80 replaces Hier-90** — 8 groups of 9 plus 8 coordinators, the same group shape, fitting 80 hosts at 1 agent/VM with 3 spare — and Mesh-180 / Hier-270 pack denser (3/VM on 60 hosts, 4/VM on 68). Agents-per-VM is reported per rung, because a substituted density is a different experiment: co-location turns inter-agent messages into loopback, flattering exactly the coordination cost C3 measures. Sweep before sizing any cell with `make_agent_hosts.py`, **not** a bare `ssh` loop: a node returning from a rebuild has a new host key, and plain ssh under `BatchMode` fails it indistinguishably from a timeout — that is how AMST was recorded as down for a day while all 7 nodes were up and answering, which would have written a whole site out of the fleet. **E3a's risk is closed**: its transatlantic bin is AMST, which is back. PSC is not a bin the plan depends on. |
 | **GPU node not granted / preempted** | Highest-probability schedule risk — request in week 1 and confirm before the campaign. Fallback: CPU-served 7–8B on a dedicated VM, which caps the model-capability sweep in E4 but leaves E1/E2/E3 fully intact (a slow LLM is still a valid expensive-decision plane — arguably a more dramatic one). |
 | Inference throughput bottlenecks the 270-agent runs | With vLLM on GPU this should not bind: coordinators only (~27 LLM agents), batched. Plus cache + inference budget (P0-3). If it still binds, cap LLM runs at Hier-90 and report 270 as PBFT/Snow-only, with any projection clearly labeled as such. |
 | Journal review cycle demands new runs months later | Tag the frozen code revision; keep the slice reproducible from the notebook; archive every run tree plus `agent_profiles.json`/`agent_dtns.json`/seeds so any cell can be re-run identically. |
+| **Two deadlines seven weeks apart** | The journal's measurement window is now weeks 14–17 (Dec 9 – Jan 4, holidays inside) and its draft window three weeks. Survivable only because the conference paper writes C1 and C3 first, so a conference slip costs the same days twice — **defend 8 Dec**. If the conference draft is not reviewed-ready by Dec 5, the correct move is to cut a conference figure (F6 first, F5 second), not to slip. If CCGrid is missed outright, do **not** chase HPDC on 5 Feb: it is ~15% acceptance, its abstract lands 5 days after the FGCS deadline, and the simulated-execution framing needs work that window does not contain. Fold C1/C3 back into the journal and submit one paper. |
 | Slice lease expires mid-campaign or before revisions | Check the lease horizon now and renew ahead of the campaign; it is the only hard external clock left. |
 | Slice instability / site outages mid-campaign (17 sites is a lot of failure surface) | Run configurations in interleaved order (not blocked by config) so partial data is still balanced; keep a 30-agent single-site fallback config; log per-run site health from the monitor VM. |
 | ~120 h of testbed time doesn't fit | Cut order: E7 second scale point → E3b impairment levels (keep +50 ms and 1% loss) → E5 repeats → E1 non-headline cells. Never cut E7 entirely (§6). |
-| Paper reads as three stapled features | Enforce §1: every experiment section opens by naming which claim (C1/C2/C3) it tests. If reviewers still split it, the natural fallback split is [Snow + bandit systems paper] and [LLM decision plane paper] — but do not plan for the split up front. |
+| Paper reads as three stapled features | **This happened, and the split is now the plan, not the fallback (§0.9, decided 2026-09-10).** C1+C3 go to CCGrid 8 Dec, C2 and the composite interaction stay here. The row below it was right: the natural seam is [Snow + bandit systems paper] and [LLM decision plane paper]. What the old advice — "do not plan for the split up front" — got wrong is that planning for it *earlier* would have removed vLLM, P0-2, P0-3 and P0-8 from the critical path months ago. Each remaining experiment section still opens by naming the claim it tests. |
 | LLM plane's output turns out inert for placement even after P0-5/6/7 (§0.3) | Then C2 is reframed, not abandoned: the paper reports *why* (race-to-propose, degenerate scores) with E8 as the evidence, and the cost/latency envelope stands on its own. This is a publishable negative result in a journal. |
 
 ---
 
-## 11. Immediate next actions (week of Sep 8)
+## 11. Immediate next actions (week of Sep 10, reordered for the CCGrid clock)
 
-1. ~~**Close the §0.2 pre-campaign fix list**~~ **DONE 2026-09-08** — all eight fixed, with
-   regression tests in `tests/test_precampaign_fixes.py`. Two carry a standing obligation on every
-   campaign run: pass `--master-fleet-size 270` (else the ladder compares different fleets) and a
-   `--runtime` cap or `--shutdown-after-seconds` (else a stalled cell polls all night).
-   `batch_tests_v2.py` forwards both flags and its own `--runtime` default moved 30 → 0, since
-   enforcing the cap would otherwise have stopped every batch run after 30 s.
-   **A third obligation, found reviewing P0-1 and fixed the same day (§0.6): every delegation
-   cell must pass `--groups-per-coordinator 2` or more.** At the default of 1 no coordinator
-   has more than one child group to choose between, so the bandit and the LLM delegator are
-   both inert and E2 measures nothing.
-2. ~~**P0-5**~~ **DONE 2026-09-08.** One obligation follows: E4/E8 must report the new
-   `wire_cost_hit_rate` from the `[STATS]` line. It is the fraction of peer votes that used a real
-   LLM verdict rather than abstaining, so it bounds how much of any LLM × Snow result is actually
-   attributable to the model. A low rate is itself a finding.
-3. Confirm the **GPU node** status and the **slice lease horizon**.
-4. Hier-30 smoke from `SWARM-2slice.ipynb`, piped through `evaluation/collect.py`.
-5. Decide on E8 (fault-injection section) and, if yes, merge `scenarios/` from `origin/chaos`.
-6. ~~Start P0-1 (LLM group delegation)~~ — **done 2026-09-08.** Next on the critical path: P0-4
-   (instrumentation) and P0-8, then P0-2/P0-3 on top of `delegation.policy`. **Before any LLM
-   delegation cell, measure the scheduling-thread cost**: at Hier-30 a coordinator delegating
-   serially at ~1 LLM call/job caps its subtree's delegation rate at 1/latency, so if E1 shows
-   LLM-plane throughput flat in fleet size, this — not the consensus protocol — may be why.
+The split (§0.9) changes what is on the critical path. In order:
+
+1. **P0-4 instrumentation, including `GroupSnapshot` age at decision time.** Now the single most
+   schedule-critical code item: F6 — the conference paper's only interaction claim — cannot be
+   produced without it, and the 10 Nov gate that decides how the paper is framed depends on it.
+   Nothing else in the code work blocks a conference figure.
+2. **P1-1 oracle** (`evaluation/oracle.py`). E2's regret axis is a conference figure (F4) and
+   regret needs the oracle. Was scheduled week 5; it is conference-critical now.
+3. **Confirm the slice lease horizon.** Still the only hard external clock. The **GPU node
+   dropped off the critical path** — everything it serves (E4, the model-capability sweep) is
+   journal-only — so confirm it, but do not wait on it.
+4. **Decide E8** (fault-injection) and, if yes, merge `scenarios/` from `origin/chaos`. Journal
+   scope now, so this can wait until December — but the decision should not.
+5. **Generate every campaign hosts file with `make_agent_hosts.py`** (interleaved, the default)
+   and keep `agent_sites.txt` beside it. Every WAN claim in either paper depends on it, and
+   every run before 2026-09-10 was the clustered case.
+6. **Before any LLM delegation cell** (journal window), measure the scheduling-thread cost: a
+   coordinator delegating serially at ~1 LLM call/job caps its subtree's delegation rate at
+   1/latency. Measured on the slice 2026-09-09 at Hier-30: 2.6-2.9 s mean per decision, and the
+   LLM arm completed 349 of 400 jobs against the bandit arm's 367. If E1 shows LLM-plane
+   throughput flat in fleet size, this — not the consensus protocol — may be why.
+
+**Standing obligations on every campaign run** (unchanged, all three now enforced or tested):
+`--master-fleet-size 270` (else the ladder compares different fleets), a `--runtime` cap or
+`--shutdown-after-seconds` (else a stalled cell polls all night), and
+`--groups-per-coordinator 2` or more on any delegation cell (else no coordinator has a choice
+and E2 measures nothing, §0.6). Add a fourth: **`--delegation-policy` on every E2 cell**, so the
+arm is recorded in `run_meta.json` rather than depending on an unrecorded edit to the
+controller's config.
+
+Done and no longer listed: the §0.2 pre-campaign fixes, P0-5, P0-1, the metrics-attribution
+fix (§0.8), and the Hier-30 smoke — `runs/smoke-g3-bandit` and `runs/smoke-g3-llm`, both arms
+30/30 agents reporting, on the frozen-candidate revision.
