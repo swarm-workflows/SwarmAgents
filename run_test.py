@@ -1212,6 +1212,13 @@ def main() -> None:
             "started_at_iso": datetime.now().isoformat(),
             "mode": args.mode,
             "agent_type": args.agent_type,
+            # Recorded because "this agent has no LLM block" is otherwise ambiguous after the
+            # fact: in a mixed-role run the coordinators are analytic BY DESIGN, and without
+            # this the collector cannot tell them from agents whose instrumentation is simply
+            # missing — so it either blocks a verdict on a supported run or draws one over a
+            # fleet it did not measure.
+            "hierarchical_level1_agent_type": getattr(
+                args, "hierarchical_level1_agent_type", None),
             "agents": args.agents,
             "dynamic_agents": args.dynamic_agents,
             "topology": args.topology,

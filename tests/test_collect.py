@@ -701,3 +701,83 @@ class TestAgentCoverage(unittest.TestCase):
             self.assertAlmostEqual(metrics["llm_failure_agent_coverage"], 1.0,
                                    msg="all three agents that used the LLM plane reported")
             self.assertTrue(metrics["llm_plane_dead"])
+
+
+class TestMixedRoleRuns(unittest.TestCase):
+    """A run may legitimately put the two agent types at different levels.
+
+    `--agent-type llm --hierarchical-level1-agent-type resource` gives LLM workers under
+    analytic coordinators; the reverse gives analytic workers under LLM coordinators. Treating
+    every agent as LLM because the run declared `agent_type: llm` rejects the first outright —
+    27 of 30 reporting is 0.90 coverage and a deliberately analytic coordinator tier looks like
+    a hole in the measurement.
+    """
+
+    ROWS = "j1,1,1,2,2,9,0,1,0.1,0.5\n"
+
+    def _run(self, root: Path, agents: dict, meta: dict, levels: list) -> Path:
+        import json
+        run_dir = write_run(root, "hier-30/run01", self.ROWS)
+        (run_dir / "metrics.json").write_text(json.dumps(agents))
+        (run_dir / "run_meta.json").write_text(json.dumps(meta))
+        (run_dir / "all_agents.csv").write_text(json.dumps(levels))
+        return run_dir
+
+    @staticmethod
+    def _llm_agent(calls=35, failures=0):
+        return {"instrumentation": {"llm": {"bid": {
+            "calls": calls, "failures": failures,
+            "input_tokens": 0, "output_tokens": 0}}}}
+
+    def _fleet(self, llm_levels: set):
+        """27 workers at level 0, 3 coordinators at level 1."""
+        agents, levels = {}, []
+        for i in range(1, 31):
+            level = 0 if i <= 27 else 1
+            levels.append({"agent_id": i, "level": level})
+            agents[str(i)] = self._llm_agent() if level in llm_levels else {
+                "instrumentation": {}}
+        return agents, levels
+
+    def test_llm_workers_under_analytic_coordinators_are_fully_covered(self):
+        agents, levels = self._fleet(llm_levels={0})
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._run(Path(tmp), agents,
+                                {"agent_type": "llm", "topology": "hierarchical",
+                                 "hierarchical_level1_agent_type": "resource"}, levels)
+            metrics = run_metrics(run_dir, expected_jobs=1)
+            self.assertAlmostEqual(metrics["llm_failure_agent_coverage"], 1.0,
+                                   msg="the analytic coordinators are not holes")
+            self.assertFalse(metrics["llm_plane_dead"])
+
+    def test_analytic_workers_under_llm_coordinators_are_fully_covered(self):
+        agents, levels = self._fleet(llm_levels={1})
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._run(Path(tmp), agents,
+                                {"agent_type": "resource", "topology": "hierarchical",
+                                 "hierarchical_level1_agent_type": "llm"}, levels)
+            metrics = run_metrics(run_dir, expected_jobs=1)
+            self.assertAlmostEqual(metrics["llm_failure_agent_coverage"], 1.0)
+
+    def test_a_silent_worker_in_an_llm_tier_is_still_a_hole(self):
+        """The gate must keep working for the case it was built for."""
+        agents, levels = self._fleet(llm_levels={0})
+        for i in range(1, 15):                      # half the LLM workers report nothing
+            agents[str(i)] = {"instrumentation": {}}
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._run(Path(tmp), agents,
+                                {"agent_type": "llm", "topology": "hierarchical",
+                                 "hierarchical_level1_agent_type": "resource"}, levels)
+            metrics = run_metrics(run_dir, expected_jobs=1)
+            self.assertLess(metrics["llm_failure_agent_coverage"], 0.9)
+            self.assertTrue(metrics["llm_plane_unchecked"])
+
+    def test_a_run_predating_the_level1_field_falls_back_to_what_was_observed(self):
+        """Guessing either way is wrong: 'llm' rejects a supported run, 'resource' hides
+        unmeasured agents. Fall back to observed activity and say nothing about the rest."""
+        agents, levels = self._fleet(llm_levels={0})
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._run(Path(tmp), agents,
+                                {"agent_type": "llm", "topology": "hierarchical"}, levels)
+            metrics = run_metrics(run_dir, expected_jobs=1)
+            self.assertAlmostEqual(metrics["llm_failure_agent_coverage"], 1.0)

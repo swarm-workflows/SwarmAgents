@@ -286,6 +286,18 @@ def read_agent_metrics(run_dir: Path) -> dict[str, dict]:
     return {str(k): v for k, v in payload.items() if isinstance(v, dict)}
 
 
+def read_agent_levels(run_dir: Path) -> dict[str, int]:
+    """`{agent_id: level}` from all_agents.csv (JSON despite the name), or {}."""
+    try:
+        payload = json.loads((run_dir / "all_agents.csv").read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(payload, list):
+        return {}
+    return {str(a.get("agent_id")): int(a.get("level") or 0)
+            for a in payload if isinstance(a, dict) and a.get("agent_id") is not None}
+
+
 def read_run_meta(run_dir: Path) -> dict:
     """`run_meta.json`, or {} — it carries the declared agent type, which is what says whether
     an agent with no LLM block was analytic by design or simply unmeasured."""
@@ -296,7 +308,52 @@ def read_run_meta(run_dir: Path) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
-def instrumentation_metrics(agents: dict[str, dict], meta: dict | None = None) -> dict[str, Any]:
+def expected_llm_agent_ids(agents: dict[str, dict], meta: dict | None,
+                           levels: dict[str, int], observed: set[str]) -> set[str] | None:
+    """Ids of the agents that ran the LLM plane, or None if unknowable.
+
+    The union of what the config DECLARED and what was OBSERVED. Observed matters because an
+    agent that bid ran the LLM plane whatever the run was labelled — that is how a hierarchical
+    run with LLM coordinators over analytic workers is handled, since its declared type names
+    neither. Declared matters because an agent that reported nothing cannot be observed at all,
+    and those are exactly the unmeasured ones the coverage gate exists to catch.
+
+    Per level, because the roles differ by level: `--agent-type` sets the leaves and
+    `--hierarchical-level1-agent-type` sets the coordinators, and a run with LLM workers under
+    analytic coordinators (or the reverse) is supported. Treating every agent as LLM because
+    the run declared `agent_type: llm` rejects such a run outright — 27 of 30 agents reporting
+    is 0.90 coverage, and a coordinator tier that is analytic on purpose looks like a hole.
+
+    None when the run predates `hierarchical_level1_agent_type` in run_meta.json and is
+    hierarchical, because the coordinators' role is then genuinely unknown; the caller falls
+    back to observed activity rather than guessing in either direction.
+    """
+    meta = meta or {}
+    leaf_type = meta.get("agent_type")
+    if leaf_type is None:
+        return None
+    hierarchical = (meta.get("topology") == "hierarchical")
+    if not hierarchical:
+        return (set(map(str, agents)) if leaf_type == "llm" else set()) | observed
+
+    coord_type = meta.get("hierarchical_level1_agent_type")
+    if coord_type is None or not levels:
+        # Pre-dates the field, so the coordinators' role is genuinely unknown. Fall back to
+        # what was observed rather than guessing: guessing "llm" rejects a supported run and
+        # guessing "resource" hides unmeasured agents.
+        return None
+    declared = set()
+    for agent_id in agents:
+        level = levels.get(str(agent_id))
+        if level is None:
+            return None          # cannot attribute this agent to a role; do not guess
+        if (leaf_type if level == 0 else coord_type) == "llm":
+            declared.add(str(agent_id))
+    return declared | observed
+
+
+def instrumentation_metrics(agents: dict[str, dict], meta: dict | None = None,
+                            levels: dict[str, int] | None = None) -> dict[str, Any]:
     """P0-4 columns: message cost, finalization, delegation context age, LLM token cost.
 
     Per-agent counters are **summed**, not averaged: the quantity the message-complexity
@@ -323,18 +380,28 @@ def instrumentation_metrics(agents: dict[str, dict], meta: dict | None = None) -
     # instrumentation at all, because such an agent contributes nothing to either side of the
     # ratio. A mixed-revision fleet where a third of the agents carry the new blocks reads as
     # 1.00 call coverage while two thirds of the bidding was never measured.
+    levels = levels or {}
     agents_with_llm = agents_with_failure_counter = 0
+    reported_failure_ids: set[str] = set()
+    observed_llm_ids: set[str] = set()
     finalize_s: list[float] = []
     rounds: list[float] = []
 
-    for payload in agents.values():
+    # Keyed on the MAP KEY, which is the agent id `read_agent_metrics` indexed by, not on
+    # `payload["id"]`. The two normally agree, but the key is the one the rest of this
+    # function counts with, and an id field that disagrees with it would silently shrink every
+    # coverage intersection.
+    for agent_id, payload in agents.items():
+        agent_id = str(agent_id)
         instr = payload.get("instrumentation") or {}
         llm_block = instr.get("llm") if isinstance(instr.get("llm"), dict) else {}
         if llm_block:
             agents_with_llm += 1
+            observed_llm_ids.add(agent_id)
             if any(isinstance(v, dict) and ("failures" in v or "bid_failures" in v)
                    for v in llm_block.values()):
                 agents_with_failure_counter += 1
+                reported_failure_ids.add(agent_id)
         messages = instr.get("messages")
         if isinstance(messages, dict):
             have_messages = True
@@ -483,13 +550,21 @@ def instrumentation_metrics(agents: dict[str, dict], meta: dict | None = None) -
     # slice is wrong in both directions and the two errors are symmetric: a counter that
     # happens to sit on a few healthy agents hides a fleet-wide outage, and one that sits on a
     # single broken agent condemns a fleet that was 29 of 30 fine.
-    # How many agents that ran the LLM plane actually reported a failure counter. When the
-    # run declares `agent_type: llm` every reporting agent ran it, so an agent with no LLM
-    # block is unmeasured rather than simply analytic — which is exactly the mixed-revision
-    # case call coverage cannot see.
-    declared_llm = (meta or {}).get("agent_type") == "llm"
-    expected_llm_agents = len(agents) if declared_llm else agents_with_llm
-    agent_coverage = (agents_with_failure_counter / expected_llm_agents
+    # How many agents that ran the LLM plane actually reported a failure counter. Which
+    # agents those are is a PER-LEVEL question: `--agent-type llm
+    # --hierarchical-level1-agent-type resource` is a supported mixed-role run whose
+    # coordinators are analytic by design, and counting them as unmeasured blocks a verdict
+    # on a run that is perfectly measurable.
+    expected_ids = expected_llm_agent_ids(agents, meta, levels, observed_llm_ids)
+    if expected_ids is None:
+        # Nothing to attribute levels with; fall back to the agents that showed LLM activity,
+        # which cannot detect a wholly silent agent but never rejects a supported run either.
+        expected_llm_agents = agents_with_llm
+        covered = agents_with_failure_counter
+    else:
+        expected_llm_agents = len(expected_ids)
+        covered = len(reported_failure_ids & expected_ids)
+    agent_coverage = (covered / expected_llm_agents
                       if expected_llm_agents else float("nan"))
     if expected_llm_agents:
         out["llm_failure_agent_coverage"] = round(agent_coverage, 6)
@@ -709,8 +784,8 @@ def run_metrics(run_dir: Path, expected_jobs: int | None) -> dict[str, Any]:
         metrics[f"{level_name}_count"] = 0 if pending_df is None else int(len(pending_df))
 
     # P0-4 instrumentation, from the per-agent payloads rather than the job CSVs.
-    metrics.update(instrumentation_metrics(read_agent_metrics(run_dir),
-                                          read_run_meta(run_dir)))
+    metrics.update(instrumentation_metrics(
+        read_agent_metrics(run_dir), read_run_meta(run_dir), read_agent_levels(run_dir)))
     # P0-8: bidders per job needs the fleet's bid count over the run's job count, and only
     # this scope knows the latter. Computed over jobs the run actually SAW, not the declared
     # count: a job never distributed was never available to bid on, and including it would
