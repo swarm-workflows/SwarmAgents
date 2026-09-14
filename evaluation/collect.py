@@ -354,13 +354,21 @@ def instrumentation_metrics(agents: dict[str, dict]) -> dict[str, Any]:
     if rows:
         frame = pd.DataFrame(rows)
         out["delegations"] = int(len(frame))
+        # The headline series: both terms on the coordinator's own clock, so inter-host
+        # offset cancels. This is what the staleness figure plots.
         out.update(_dist("ctx_age", _numeric(frame, "ctx_age_mean")))
         out.update(_dist("ctx_age_chosen", _numeric(frame, "ctx_age_chosen")))
+        # End-to-end, including propagation from the child, but straddling two clocks.
+        out.update(_dist("ctx_age_remote", _numeric(frame, "ctx_age_remote_mean")))
         out.update(_dist("decide_s", _numeric(frame, "decide_s")))
         out["ctx_unknown_groups"] = int(_numeric(frame, "ctx_age_unknown").sum())
-        # Not a distribution statistic. Non-zero means child and coordinator clocks disagree,
-        # and the whole ctx_age column from this run should be treated as suspect.
+        # Validity, not results. Non-zero skew means child and coordinator clocks disagree,
+        # so ctx_age_remote_* from this run is biased by up to ctx_skew_max_s; the headline
+        # ctx_age_* is taken on one clock and is unaffected. Reported as a MAX, not a sum: a
+        # count cannot separate a 1 ms artefact from a 1.1 s free-running clock.
         out["ctx_skewed_ages"] = int(_numeric(frame, "ctx_age_skewed").sum())
+        skew_max = _numeric(frame, "ctx_age_skew_max_s").max()
+        out["ctx_skew_max_s"] = float(skew_max) if pd.notna(skew_max) else 0.0
         for policy, count in frame["policy"].value_counts().items():
             out[f"delegations_{policy}"] = int(count)
     return out

@@ -16,6 +16,7 @@ STEPS=(
     04_push_swarm.sh
     05_deps.sh
     06_monitoring.sh
+    07_ntp.sh
 )
 
 for s in "${STEPS[@]}"; do

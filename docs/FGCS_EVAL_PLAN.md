@@ -813,10 +813,13 @@ The split (§0.9) changes what is on the critical path. In order:
 
 1. ~~**P0-4 instrumentation, including `GroupSnapshot` age at decision time.**~~ **Done
    2026-09-14** (see the P0-4 row above). Context age reaches `metrics.json`, the `[STATS]`
-   line, the Prometheus export and `decisions.csv`. **Not yet exercised on hardware** — like
-   the teardown fixes before it, its first real test is the next slice run, and the thing to
-   check there is `ctx_skewed_ages`: a non-zero count across the fleet means the 17 sites'
-   clocks disagree and F6's x-axis is unusable until NTP is fixed.
+   line, the Prometheus export and `decisions.csv`. **Exercised on hardware the same day, and
+   the validity column fired**: 678 skewed readings, one coordinator's entire age column
+   pinned at zero. The cause was not drift but 66 of 92 hosts unable to reach any NTP server
+   for 30 days. Fixed (`fix_slice_clocks.sh`; `07_ntp.sh` in the slice-build pipeline), re-run
+   clean — `ctx_skewed_ages` 0, 436-545 decisions, ages p50 0.25-0.44 s / p95 7.0-8.7 s — and
+   the headline series moved to a monotonic clock so it no longer depends on the fleet staying
+   fixed. Every campaign cell should run `./fix_slice_clocks.sh --check` first.
 2. **P1-1 oracle** (`evaluation/oracle.py`) — now the single most schedule-critical code item.
    E2's regret axis is a conference figure (F4) and regret needs the oracle; F6 plots that
    regret against the context age P0-4 now records, so the oracle is the remaining half of the

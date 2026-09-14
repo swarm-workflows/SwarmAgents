@@ -671,6 +671,7 @@ class ResourceAgent(Agent):
         return snapshots_from_children(
             self.children.values(),
             (info for _, info in self.delegated_jobs.items()),
+            seen_at=self._agent_seen_at,
         )
 
     def _get_live_child_groups(self) -> set:
@@ -1381,6 +1382,7 @@ class ResourceAgent(Agent):
                     time_since_update = current_time - agent.last_updated
                     if time_since_update <= self.peer_expiry_seconds:
                         target_dict.set(agent.agent_id, agent)
+                        self._note_agent_seen(agent.agent_id)
                         self.logger.debug(
                             f"Added new agent {agent.agent_id} to map "
                             f"(last_updated: {time_since_update:.1f}s ago)"
@@ -1393,15 +1395,30 @@ class ResourceAgent(Agent):
                 elif agent.last_updated > existing.last_updated:
                     # Existing agent - update with newer data from Redis
                     target_dict.set(agent.agent_id, agent)
+                    # Stamped only when the record is genuinely FRESHER. Re-reading the same
+                    # record must not refresh the local stamp, or a peer that went silent
+                    # would keep reporting an age of zero and the staleness metric would say
+                    # the coordinator's view is perfect right up until the peer is evicted.
+                    self._note_agent_seen(agent.agent_id)
 
         # Remove agents from map that are no longer active in Redis
         # (but keep agents that are still being processed/committed)
         for agent_id in list(target_dict.keys()):
             if agent_id != self.agent_id and agent_id not in active_ids:
                 target_dict.remove(agent_id)
+                self._agent_seen_at.pop(agent_id, None)
                 self.logger.info(
                     f"Removed agent {agent_id} from map (no longer in Redis)"
                 )
+
+    def _note_agent_seen(self, agent_id: int) -> None:
+        """Record, on this agent's own monotonic clock, that a fresher record arrived.
+
+        `time.monotonic()`, not `time.time()`: these values are only ever subtracted from
+        another monotonic reading taken in this same process, and monotonic is the only
+        clock an NTP step cannot move.
+        """
+        self._agent_seen_at[agent_id] = time.monotonic()
 
     def _generate_agent_info(self) -> AgentInfo:
         """
@@ -2289,6 +2306,21 @@ class ResourceAgent(Agent):
         self._textfile_dir = instr_cfg.get("textfile_dir") or None
         self._textfile_period_s = float(instr_cfg.get("textfile_period_s", 15.0))
         self._textfile_last = 0.0
+        # When THIS agent last took delivery of a fresher record for each peer, on its own
+        # MONOTONIC clock. Kept beside the agent map rather than on AgentInfo for two
+        # reasons: it must not be serialised back into Redis (a local observation, and a
+        # monotonic value is meaningless off this host), and it must never be compared with
+        # a timestamp from anywhere else.
+        #
+        # This is what makes context age usable on a real fleet. An age computed from the
+        # child's `last_updated` is (decision - child_stamp), one term per clock, so any
+        # inter-host offset lands directly in the measurement: measured on the slice
+        # 2026-09-14, 66 of 92 hosts had not reached an NTP server in 30 days and were
+        # free-running 0.4-1.1 s apart, which drove 229 of one coordinator's 229 decisions
+        # to a negative age. One clock fixes that -- but it has to be the MONOTONIC one,
+        # because the repaired fleet now steps its wall clock whenever it drifts past 0.1 s
+        # (`makestep 0.1 -1`), and a wall-clock pair spanning a step is wrong by the step.
+        self._agent_seen_at: dict = {}
 
     def llm_usage_snapshot(self) -> dict:
         """Per-call-site LLM accounting. Empty for a rule-based agent; `LlmAgent` overrides."""
@@ -2655,14 +2687,19 @@ class ResourceAgent(Agent):
             # Instrumentation must never be the reason a job fails to be delegated.
             self.logger.debug(f"Decision snapshot build failed: {exc}")
 
-        started_at = time.time()
+        # Monotonic for the two durations (how long the policy took, how old the view was),
+        # wall-clock only for `ts`, which exists to join a decision against the job records.
+        # A policy call can span an NTP step -- an LLM decision takes seconds and the fleet
+        # steps at 0.1 s of drift -- and a wall-clock duration across one is wrong by the
+        # step, or negative.
+        started_at = time.monotonic()
         selected = self._select_child_groups(job, capable_groups, snapshots=snapshots)
-        decided_at = time.time()
+        decided_at = time.monotonic()
 
         try:
             policy = getattr(self._decision_ctx, "policy", None) or "unknown"
             self.decision_log.add(DecisionRecord(
-                ts=decided_at,
+                ts=time.time(),
                 job_id=str(getattr(job, "job_id", "")),
                 job_type=getattr(job, "job_type", None),
                 policy=policy,
@@ -2670,7 +2707,8 @@ class ResourceAgent(Agent):
                 candidates=[int(g) for g in capable_groups],
                 selected=[int(g) for g in (selected or [])],
                 decide_s=decided_at - started_at,
-                age=context_age(snapshots or {}, selected or [], now=decided_at),
+                age=context_age(snapshots or {}, selected or [],
+                                now=time.time(), now_monotonic=decided_at),
             ))
         except Exception as exc:
             self.logger.debug(f"Decision record failed: {exc}")

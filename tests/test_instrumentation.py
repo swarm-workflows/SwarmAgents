@@ -82,33 +82,92 @@ def test_a_group_with_no_timestamps_has_an_unknown_age_not_a_large_one():
     age = context_age(snaps, selected=[1])
     assert age.unknown == 1
     assert age.mean is None and age.max is None
+    assert age.remote_unknown == 1 and age.remote_mean is None
+
+
+def test_a_wall_clock_step_cannot_reach_the_headline_age():
+    """One host is not enough — it has to be one host's MONOTONIC clock.
+
+    The repaired slice steps its wall clock whenever it drifts past 0.1 s (`makestep 0.1
+    -1`), so a wall-clock pair spanning a correction is wrong by the size of the step and
+    can come out negative. Here the wall clock jumps back 2 s between the stamp and the
+    decision; the monotonic pair is unmoved.
+    """
+    mono = time.monotonic()
+    wall = time.time()
+    snaps = {1: GroupSnapshot(received_at=mono - 3.0, observed_at=wall - 3.0)}
+    # Decision taken 3 s later on the monotonic clock, but the wall clock was stepped back
+    # 2 s in the meantime, so wall-clock arithmetic would report 1 s.
+    age = context_age(snaps, [1], now=wall - 2.0, now_monotonic=mono)
+    assert age.mean == pytest.approx(3.0), "monotonic pair must ignore the step"
+    assert age.remote_mean == pytest.approx(1.0), "the wall-clock series absorbs it"
+
+
+def test_local_stamps_come_from_the_seen_at_map_not_the_child_record():
+    """The coordinator's own delivery time is what the headline age is measured from, so it
+    has to come from the caller's map. It is deliberately NOT an AgentInfo field: that
+    object round-trips through Redis, and a local observation written back would be read by
+    peers as if it meant something to them."""
+    now = time.time()
+    child = _Child(1, now - 30.0)
+    child.agent_id = 7
+    snaps = snapshots_from_children([child], [], seen_at={7: now - 2.0})
+    assert snaps[1].observed_at == pytest.approx(now - 30.0)
+    assert snaps[1].received_at == pytest.approx(now - 2.0)
 
 
 def test_unknown_groups_are_counted_but_never_averaged_in():
-    now = time.time()
-    snaps = {1: GroupSnapshot(observed_at=now - 5.0), 2: GroupSnapshot()}
-    age = context_age(snaps, selected=[1], now=now)
+    mono = time.monotonic()
+    snaps = {1: GroupSnapshot(received_at=mono - 5.0), 2: GroupSnapshot()}
+    age = context_age(snaps, selected=[1], now_monotonic=mono)
     assert age.unknown == 1
     assert age.mean == pytest.approx(5.0)
     assert age.max == pytest.approx(5.0)
 
 
-def test_a_negative_age_is_skew_and_is_clamped_and_counted():
-    """`observed_at` is the child's clock read on the coordinator's, so a negative age is an
-    NTP problem, not a measurement. Clamped rather than dropped, and counted, so a run whose
-    `skewed` is not ~0 declares that its whole age column is suspect."""
-    now = time.time()
-    age = context_age({1: GroupSnapshot(observed_at=now + 4.0)}, selected=[1], now=now)
+def test_clock_skew_cannot_reach_the_headline_age():
+    """The measurement this whole item exists to produce has to survive the fleet it runs
+    on. Measured on the slice 2026-09-14: 66 of 92 hosts had not reached an NTP server in 30
+    days and were free-running 0.4-1.1 s apart, which drove 229 of one coordinator's 229
+    decisions to a negative remote age and pinned its whole column at zero. The headline age
+    takes both terms from the coordinator's own clock, so the offset cancels exactly."""
+    now, mono = time.time(), time.monotonic()
+    # A child whose clock runs 1.1 s fast, whose record the coordinator took delivery of 4 s
+    # ago. Only the remote reading is corrupted.
+    snaps = {1: GroupSnapshot(observed_at=now + 1.1, received_at=mono - 4.0)}
+    age = context_age(snaps, selected=[1], now=now, now_monotonic=mono)
+    assert age.mean == pytest.approx(4.0), "local age must be untouched by the offset"
     assert age.skewed == 1
-    assert age.mean == 0.0
-    assert age.min == 0.0
+    assert age.remote_mean == 0.0
+    assert age.skew_max_s == pytest.approx(1.1, abs=1e-3)
+
+
+def test_the_skew_magnitude_is_recorded_not_just_the_count():
+    """A count alone cannot tell a 1 ms artefact from a 1.1 s free-running clock, which is
+    exactly the judgement a reader has to make about whether the remote series is usable."""
+    now, mono = time.time(), time.monotonic()
+    snaps = {1: GroupSnapshot(observed_at=now + 0.002, received_at=mono - 1.0),
+             2: GroupSnapshot(observed_at=now + 0.9, received_at=mono - 1.0)}
+    age = context_age(snaps, selected=[1], now=now, now_monotonic=mono)
+    assert age.skewed == 2
+    assert age.skew_max_s == pytest.approx(0.9, abs=1e-3)
+
+
+def test_a_negative_local_age_is_impossible_by_construction():
+    """`received_at` is stamped by this agent before the decision it is compared against, so
+    the headline series has no skew term at all — not a small one, none."""
+    mono = time.monotonic()
+    age = context_age({1: GroupSnapshot(received_at=mono - 0.001)},
+                      selected=[1], now_monotonic=mono)
+    assert age.mean >= 0.0
+    assert age.skewed == 0
 
 
 def test_chosen_age_covers_only_the_groups_delegated_to():
-    now = time.time()
-    snaps = {1: GroupSnapshot(observed_at=now - 1.0),
-             2: GroupSnapshot(observed_at=now - 11.0)}
-    age = context_age(snaps, selected=[2], now=now)
+    mono = time.monotonic()
+    snaps = {1: GroupSnapshot(received_at=mono - 1.0),
+             2: GroupSnapshot(received_at=mono - 11.0)}
+    age = context_age(snaps, selected=[2], now_monotonic=mono)
     assert age.chosen == pytest.approx(11.0)
     assert age.mean == pytest.approx(6.0)
 
@@ -118,10 +177,10 @@ def test_age_is_taken_at_the_decision_not_at_the_build():
     decision, and under `delegation.policy: llm` that gap is the inference itself. Freezing
     the age at build time would define the effect the interaction claim tests out of
     existence."""
-    built_at = time.time()
-    snaps = {1: GroupSnapshot(observed_at=built_at - 3.0)}
-    at_build = context_age(snaps, [1], now=built_at)
-    at_decision = context_age(snaps, [1], now=built_at + 2.0)
+    built_at = time.monotonic()
+    snaps = {1: GroupSnapshot(received_at=built_at - 3.0)}
+    at_build = context_age(snaps, [1], now_monotonic=built_at)
+    at_decision = context_age(snaps, [1], now_monotonic=built_at + 2.0)
     assert at_build.mean == pytest.approx(3.0)
     assert at_decision.mean == pytest.approx(5.0)
 
@@ -147,7 +206,8 @@ def _record(policy="bandit", age=None, decide_s=0.1, job_id="j"):
     return DecisionRecord(ts=time.time(), job_id=job_id, job_type="cpu_short_low",
                           policy=policy, n_candidates=3, candidates=[1, 2, 3],
                           selected=[1], decide_s=decide_s,
-                          age=age or ContextAge(mean=2.0, min=1.0, max=3.0, chosen=2.0))
+                          age=age or ContextAge(mean=2.0, min=1.0, max=3.0, chosen=2.0,
+                                        remote_mean=2.1))
 
 
 def test_decision_log_summary_counts_by_policy():

@@ -972,10 +972,18 @@ def test_openai_provider_honours_a_configured_base_url(monkeypatch):
 # --------------------------------------------------------------------------------------------
 
 def _timed_snapshots(a, groups, ages):
-    """Give the agent a child view whose per-group observation ages are `ages` seconds."""
-    now = time.time()
+    """Give the agent a child view whose per-group ages are `ages` seconds.
+
+    The two stamp pairs are on DIFFERENT clocks — `observed_at` is the child's wall clock,
+    `received_at` this host's monotonic one — so each is offset from its own base. With
+    synchronised clocks and no step the two series then agree, which is the case these tests
+    are about; the divergence under skew and under a wall-clock step is covered in
+    `test_instrumentation.py`.
+    """
+    now, mono = time.time(), time.monotonic()
     view = {g: GroupSnapshot(active_children=2, cpu_headroom=0.5,
-                             observed_at=now - ages[g], oldest_observed_at=now - ages[g])
+                             observed_at=now - ages[g], oldest_observed_at=now - ages[g],
+                             received_at=mono - ages[g], oldest_received_at=mono - ages[g])
             for g in groups}
     a._build_group_snapshots = lambda: view
     if a.mab_manager is not None:

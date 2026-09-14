@@ -62,6 +62,12 @@ class GroupSnapshot:
     # the same as a large one and must never be substituted for one.
     observed_at: Optional[float] = None
     oldest_observed_at: Optional[float] = None
+    # The same two, but stamped on the COORDINATOR's clock when it took delivery of the
+    # record. `observed_at` minus a decision time is one term per clock, so any inter-host
+    # offset lands in the measurement; these two share a clock with the decision and so are
+    # immune to it. This is the pair the staleness figure is computed from.
+    received_at: Optional[float] = None
+    oldest_received_at: Optional[float] = None
 
 
 def _headroom(total: float, used: float) -> float:
@@ -71,12 +77,16 @@ def _headroom(total: float, used: float) -> float:
     return float(min(1.0, max(0.0, 1.0 - used / total)))
 
 
-def snapshots_from_children(children, delegation_infos) -> Dict[int, GroupSnapshot]:
+def snapshots_from_children(children, delegation_infos,
+                            seen_at: Optional[Dict[int, float]] = None
+                            ) -> Dict[int, GroupSnapshot]:
     """Aggregate per-group GroupSnapshots from a coordinator's view.
 
     *children*: iterable of AgentInfo-like records (``group``, ``capacities``,
     ``capacity_allocations``). *delegation_infos*: iterable of delegated-job
     tracking dicts (``{'groups': [...]}``) for in-flight counts.
+    *seen_at*: ``{agent_id: local_timestamp}`` of when the caller last took delivery of a
+    fresher record for each child, on the caller's own clock.
 
     Failure-rate fields are left at defaults — MABManager owns those and
     overwrites them from its outcome windows.
@@ -96,6 +106,7 @@ def snapshots_from_children(children, delegation_infos) -> Dict[int, GroupSnapsh
         total_core = total_ram = total_gpu = 0.0
         used_core = used_ram = used_gpu = 0.0
         stamps = []
+        local_stamps = []
         for child in members:
             caps = child.capacities
             alloc = child.capacity_allocations
@@ -108,6 +119,9 @@ def snapshots_from_children(children, delegation_infos) -> Dict[int, GroupSnapsh
             stamp = getattr(child, "last_updated", None)
             if stamp:
                 stamps.append(float(stamp))
+            local = (seen_at or {}).get(getattr(child, "agent_id", None))
+            if local:
+                local_stamps.append(float(local))
         snapshots[group] = GroupSnapshot(
             active_children=len(members),
             cpu_headroom=_headroom(total_core, used_core),
@@ -121,6 +135,8 @@ def snapshots_from_children(children, delegation_infos) -> Dict[int, GroupSnapsh
             # fresh on the first and stale on the second, and that is the honest answer.
             observed_at=max(stamps) if stamps else None,
             oldest_observed_at=min(stamps) if stamps else None,
+            received_at=max(local_stamps) if local_stamps else None,
+            oldest_received_at=min(local_stamps) if local_stamps else None,
         )
     return snapshots
 

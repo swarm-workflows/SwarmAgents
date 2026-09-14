@@ -202,12 +202,16 @@ class TestInstrumentationColumns(unittest.TestCase):
         return base
 
     @staticmethod
-    def _decision(ts, age, chosen=None, policy="bandit", job="j"):
+    def _decision(ts, age, chosen=None, policy="bandit", job="j",
+                  skewed=0, skew_max=0.0):
         return {"ts": ts, "job_id": job, "job_type": "cpu", "policy": policy,
                 "n_candidates": 2, "candidates": [1, 2], "selected": [1],
                 "decide_s": 0.01, "ctx_age_mean": age, "ctx_age_min": age,
                 "ctx_age_max": age, "ctx_age_chosen": chosen if chosen is not None else age,
-                "ctx_age_oldest_max": age, "ctx_age_unknown": 0, "ctx_age_skewed": 0}
+                "ctx_age_oldest_max": age, "ctx_age_remote_mean": age,
+                "ctx_age_remote_chosen": age, "ctx_age_unknown": 0,
+                "ctx_age_remote_unknown": 0, "ctx_age_skewed": skewed,
+                "ctx_age_skew_max_s": skew_max}
 
     def test_message_counts_are_summed_across_agents(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -241,18 +245,30 @@ class TestInstrumentationColumns(unittest.TestCase):
             self.assertAlmostEqual(metrics["ctx_age_mean"], 9.2, places=3)
             self.assertEqual(metrics["delegations_bandit"], 10)
 
-    def test_clock_skew_is_surfaced_as_its_own_column(self):
-        """Non-zero means child and coordinator clocks disagree and the whole ctx_age column
-        from that run is suspect. It must not be averaged into the distribution."""
+    def test_clock_skew_is_surfaced_with_its_magnitude(self):
+        """A count alone cannot separate a 1 ms artefact from a 1.1 s free-running clock, and
+        that is exactly the judgement a reader has to make about the remote-age series. The
+        magnitude is carried as a MAX across decisions, never summed or averaged."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            skewed = self._decision(0, 1.0)
-            skewed["ctx_age_skewed"] = 3
-            skewed["ctx_age_unknown"] = 1
-            run_dir = self._run_with_metrics(root, {"1": self._payload(1, [skewed])})
+            rows = [self._decision(0, 1.0, job="a", skewed=3, skew_max=0.002),
+                    self._decision(1, 1.0, job="b", skewed=1, skew_max=1.1)]
+            rows[0]["ctx_age_unknown"] = 1
+            run_dir = self._run_with_metrics(root, {"1": self._payload(1, rows)})
             metrics = run_metrics(run_dir, expected_jobs=1)
-            self.assertEqual(metrics["ctx_skewed_ages"], 3)
+            self.assertEqual(metrics["ctx_skewed_ages"], 4)
             self.assertEqual(metrics["ctx_unknown_groups"], 1)
+            self.assertAlmostEqual(metrics["ctx_skew_max_s"], 1.1)
+
+    def test_the_headline_and_remote_age_series_are_both_reported(self):
+        """They answer different questions and only one survives an unsynchronised fleet, so
+        a figure has to be able to say which it used."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._run_with_metrics(Path(tmp), {
+                "1": self._payload(1, [self._decision(0, 2.0)])})
+            metrics = run_metrics(run_dir, expected_jobs=1)
+            self.assertAlmostEqual(metrics["ctx_age_mean"], 2.0)
+            self.assertAlmostEqual(metrics["ctx_age_remote_mean"], 2.0)
 
     def test_a_run_without_metrics_json_keeps_its_other_columns(self):
         """Every archived run predating P0-4 has no metrics.json to read; the collector must

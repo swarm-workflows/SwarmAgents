@@ -197,67 +197,120 @@ UNKNOWN = None
 
 @dataclass
 class ContextAge:
-    """How old the view behind a delegation decision was, in seconds, at the decision."""
+    """How old the view behind a delegation decision was, in seconds, at the decision.
+
+    Two series, because they answer different questions and only one of them survives a
+    fleet whose clocks disagree:
+
+    * the unprefixed fields are the **local** age, `decision - received_at`, both terms from
+      the coordinator's own **monotonic** clock. "How long since I last learned anything
+      about this group." Immune to inter-host clock offset AND to the local wall clock being
+      stepped, so this is the series the staleness figure is plotted from. The monotonic
+      clock is what makes the second half true: the slice is configured to STEP rather than
+      slew whenever it is more than 0.1 s out (`makestep 0.1 -1`), so a wall-clock pair
+      spanning a correction is wrong by the size of the step and can come out negative.
+      Being on one host is not sufficient; it has to be on one host's monotonic clock.
+    * `remote_*` is `decision - observed_at`, which additionally includes the propagation
+      delay from the child — the more complete quantity, and the one that needs a
+      synchronised fleet. On the slice as measured on 2026-09-14 it did not have one.
+
+    `skew_max_s` is what makes the second series diagnosable rather than merely suspect: it
+    is the largest amount by which a child's stamp sat in the coordinator's future, so a
+    reader can tell a 1 ms artefact from a 1.1 s free-running clock.
+    """
     mean: Optional[float] = None
     min: Optional[float] = None
     max: Optional[float] = None
-    chosen: Optional[float] = None      # mean over the groups actually delegated to
-    oldest_max: Optional[float] = None  # worst *child* observation in any candidate group
-    unknown: int = 0                    # candidate groups with no observation behind them
-    skewed: int = 0                     # ages that came back negative and were clamped to 0
+    chosen: Optional[float] = None       # mean over the groups actually delegated to
+    oldest_max: Optional[float] = None   # worst *child* observation in any candidate group
+    remote_mean: Optional[float] = None
+    remote_chosen: Optional[float] = None
+    unknown: int = 0                     # candidate groups with no observation behind them
+    remote_unknown: int = 0
+    skewed: int = 0                      # remote ages that came back negative (clamped to 0)
+    skew_max_s: Optional[float] = None   # worst negative remote age, as a positive number
 
     def as_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
 
-def context_age(snapshots: Dict[int, Any], selected: Sequence[int],
-                now: Optional[float] = None) -> ContextAge:
-    """Age of *snapshots* at wall-clock *now*, from their `observed_at` timestamps.
-
-    `now` must be the moment the decision was made, not the moment the snapshots were built.
-    Under `delegation.policy: llm` those are seconds apart, and that gap is the effect the
-    inference budget item (P0-3) is about — it would vanish if the age were frozen at build.
-
-    Clock skew: `observed_at` is stamped on the *child's* clock and read on the coordinator's.
-    A negative age is therefore skew, not a measurement, and is clamped to 0 and counted in
-    `skewed` rather than dropped — a run whose `skewed` count is not ~0 has an NTP problem and
-    its age distribution should not be reported.
-    """
-    ts = time.time() if now is None else float(now)
+def _ages(snapshots: Dict[int, Any], newest_attr: str, oldest_attr: str,
+          selected_set: set, ts: float):
+    """(ages, oldest_ages, chosen_ages, unknown, skewed, worst_negative) for one stamp pair."""
     ages: List[float] = []
     oldest: List[float] = []
     chosen: List[float] = []
     unknown = 0
     skewed = 0
-    chosen_set = set(selected or ())
+    worst_negative: Optional[float] = None
 
     for group, snap in (snapshots or {}).items():
-        observed = getattr(snap, "observed_at", None)
-        if not observed:
+        newest = getattr(snap, newest_attr, None)
+        if not newest:
             unknown += 1
             continue
-        age = ts - float(observed)
+        age = ts - float(newest)
         if age < 0:
             skewed += 1
+            if worst_negative is None or -age > worst_negative:
+                worst_negative = -age
             age = 0.0
         ages.append(age)
-        if group in chosen_set:
+        if group in selected_set:
             chosen.append(age)
-        oldest_observed = getattr(snap, "oldest_observed_at", None) or observed
-        oldest_age = ts - float(oldest_observed)
-        oldest.append(max(0.0, oldest_age))
+        stalest = getattr(snap, oldest_attr, None) or newest
+        oldest.append(max(0.0, ts - float(stalest)))
+    return ages, oldest, chosen, unknown, skewed, worst_negative
 
-    if not ages:
-        return ContextAge(unknown=unknown, skewed=skewed)
-    return ContextAge(
-        mean=round(sum(ages) / len(ages), 6),
-        min=round(min(ages), 6),
-        max=round(max(ages), 6),
-        chosen=round(sum(chosen) / len(chosen), 6) if chosen else None,
-        oldest_max=round(max(oldest), 6) if oldest else None,
-        unknown=unknown,
+
+def context_age(snapshots: Dict[int, Any], selected: Sequence[int],
+                now: Optional[float] = None,
+                now_monotonic: Optional[float] = None) -> ContextAge:
+    """Age of *snapshots* at the decision.
+
+    *now* is wall-clock, for the `remote_*` series; *now_monotonic* is this host's monotonic
+    clock, for the headline series. Both must be the moment the decision was made, not the
+    moment the snapshots were built: under `delegation.policy: llm` those are seconds apart,
+    and that gap is the effect the inference budget item (P0-3) is about — it would vanish
+    if the age were frozen at build.
+
+    Two clocks for two jobs. `received_at` is stamped by the coordinator on its own
+    MONOTONIC clock when it took delivery of the record, so the headline age is immune both
+    to inter-host offset and to the local wall clock being stepped — and the slice is
+    configured to step aggressively (`makestep 0.1 -1`), so the second is a live hazard and
+    not a theoretical one. The `remote_*` series uses the child's wall-clock `observed_at`
+    and therefore straddles two machines; a negative value there is clock offset, not a
+    measurement, and is clamped to 0 and counted (with its worst magnitude) rather than
+    dropped. That is not hypothetical either: 66 of the slice's 92 hosts had not reached an
+    NTP server in 30 days and were free-running up to 1.1 s apart, which drove one
+    coordinator's entire remote-age column to zero until it was fixed.
+    """
+    ts = time.time() if now is None else float(now)
+    ts_mono = time.monotonic() if now_monotonic is None else float(now_monotonic)
+    chosen_set = set(selected or ())
+
+    local, local_oldest, local_chosen, local_unknown, _, _ = _ages(
+        snapshots, "received_at", "oldest_received_at", chosen_set, ts_mono)
+    remote, _, remote_chosen, remote_unknown, skewed, worst = _ages(
+        snapshots, "observed_at", "oldest_observed_at", chosen_set, ts)
+
+    age = ContextAge(
+        unknown=local_unknown,
+        remote_unknown=remote_unknown,
         skewed=skewed,
+        skew_max_s=round(worst, 6) if worst is not None else None,
+        remote_mean=round(sum(remote) / len(remote), 6) if remote else None,
+        remote_chosen=(round(sum(remote_chosen) / len(remote_chosen), 6)
+                       if remote_chosen else None),
     )
+    if not local:
+        return age
+    age.mean = round(sum(local) / len(local), 6)
+    age.min = round(min(local), 6)
+    age.max = round(max(local), 6)
+    age.chosen = round(sum(local_chosen) / len(local_chosen), 6) if local_chosen else None
+    age.oldest_max = round(max(local_oldest), 6) if local_oldest else None
+    return age
 
 
 @dataclass
@@ -306,6 +359,7 @@ class DecisionLog:
         self._decide = RunningStats()
         self._unknown = 0
         self._skewed = 0
+        self._skew_max = 0.0
 
     def add(self, record: DecisionRecord) -> None:
         with self._lock:
@@ -314,6 +368,8 @@ class DecisionLog:
             self._by_policy[record.policy] = self._by_policy.get(record.policy, 0) + 1
             self._unknown += record.age.unknown
             self._skewed += record.age.skewed
+            if record.age.skew_max_s and record.age.skew_max_s > self._skew_max:
+                self._skew_max = record.age.skew_max_s
         # RunningStats take their own lock; keep them out of the one above.
         if record.age.mean is not None:
             self._age.add(record.age.mean)
@@ -330,14 +386,18 @@ class DecisionLog:
             added = self._added
             kept = len(self._records)
             by_policy = dict(self._by_policy)
-            unknown, skewed = self._unknown, self._skewed
+            unknown, skewed, skew_max = self._unknown, self._skewed, self._skew_max
         out: Dict[str, Any] = {
             "decisions": added,
             "records_kept": kept,
             "records_dropped": max(0, added - kept),
             "by_policy": by_policy,
             "ctx_unknown_groups": unknown,
+            # Validity, not a result: non-zero means child and coordinator clocks disagree,
+            # so the `remote_*` ages from this run are biased by up to `ctx_skew_max_s`. The
+            # headline ages are taken on one clock and are unaffected.
             "ctx_skewed_ages": skewed,
+            "ctx_skew_max_s": round(skew_max, 6) if skew_max else 0.0,
         }
         out.update(self._age.summary("ctx_age_"))
         out.update(self._age_chosen.summary("ctx_age_chosen_"))
