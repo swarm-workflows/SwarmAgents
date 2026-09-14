@@ -445,6 +445,44 @@ def test_a_real_mismatch_is_still_flagged_when_the_sample_supports_it(tmp_path):
     assert report["per_job_type"][0]["beyond_noise"]
 
 
+def test_the_noise_band_is_zero_when_the_profile_leaves_no_room(tmp_path):
+    """The sharpest case for using the Poisson-binomial variance over the individual rates
+    rather than the binomial one at their mean. Here every job either cannot fail (p=0) or
+    cannot succeed (p=1), so the observed rate is pinned at exactly 0.5 and any deviation is
+    impossible — but the mean-p band (p=0.5) would accept a swing of +/-0.10 at n=100, i.e.
+    it accepts outcomes the injected profile rules out."""
+    # 4 jobs to a group that cannot fail, 4 to a group that cannot succeed. One of the
+    # "cannot fail" jobs failed anyway: impossible under the profile, and must be flagged.
+    rows = "".join(f"a{i},1,1,2,2,9,{1 if i == 0 else 0},1\n" for i in range(4))
+    rows += "".join(f"b{i},1,1,2,2,9,1,1\n" for i in range(4))
+    _write_jobs(tmp_path, rows)
+    truth = _truth(per_agent_failure_rates={"1": 0.0, "2": 0.0, "3": 1.0, "4": 1.0})
+    decisions = [_decision([0], job_id=f"a{i}") for i in range(4)]
+    decisions += [_decision([1], job_id=f"b{i}") for i in range(4)]
+    report = validate(_run(decisions, truth=truth), tmp_path)
+    entry = report["per_job_type"][0]
+    assert entry["sampling_noise_2se"] == pytest.approx(0.0)
+    assert entry["beyond_noise"], "an outcome the profile makes impossible must be flagged"
+
+
+def test_the_band_uses_the_individual_rates_not_their_mean(tmp_path):
+    """With half the jobs routed to a 0.75 group and half to a 0.05 group, the mean-p
+    binomial band is ~1.4x wider than the true one, so it accepts a real mismatch."""
+    import math as _math
+    rows = "".join(f"a{i},1,1,2,2,9,{1 if i < 3 else 0},1\n" for i in range(4))
+    rows += "".join(f"b{i},1,1,2,2,9,0,1\n" for i in range(4))
+    _write_jobs(tmp_path, rows)
+    decisions = [_decision([0], job_id=f"a{i}") for i in range(4)]     # predicted 0.8
+    decisions += [_decision([1], job_id=f"b{i}") for i in range(4)]    # predicted 0.05
+    report = validate(_run(decisions), tmp_path)
+    entry = report["per_job_type"][0]
+    exact = 2 * _math.sqrt(4 * 0.8 * 0.2 + 4 * 0.05 * 0.95) / 8
+    mean_p = (4 * 0.8 + 4 * 0.05) / 8
+    naive = 2 * _math.sqrt(mean_p * (1 - mean_p) / 8)
+    assert entry["sampling_noise_2se"] == pytest.approx(exact, abs=1e-6)
+    assert exact < naive, "the mean-p band would have been the wider, more permissive one"
+
+
 def test_validation_ignores_jobs_that_never_finished(tmp_path):
     """A job with no completion time has an exit status that means nothing. Counting those
     zeros as successes would make any run with a backlog look like a profile mismatch."""

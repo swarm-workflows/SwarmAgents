@@ -386,15 +386,21 @@ def validate(run: dict, run_dir: Path, aggregate: str = "mean") -> dict:
         observed = sum(p[1] for p in pairs) / n
         predicted = statistics.fmean(p[0] for p in pairs)
         # A deviation is only evidence against the profile if it is bigger than the sampling
-        # noise of n Bernoulli trials at that rate. Without this the check is dominated by
-        # rare job types: on the slice 2026-09-14 it flagged a run whose profile fitted to
-        # 0.018 mean absolute error because ONE type with six jobs came in 0.18 off — well
-        # inside its own +/-0.41 noise band. A validator that cries wolf on every run is one
-        # nobody reads, which is worse than not having it.
+        # noise of these n trials. Some band is necessary or the check is dominated by rare
+        # job types: on the slice 2026-09-14 it flagged a run whose profile fitted to 0.018
+        # because ONE type with six jobs came in 0.18 off. A validator that cries wolf every
+        # run is one nobody reads.
         #
-        # `predicted` is a mean of per-decision rates rather than a single p, so this is a
-        # noise *floor*, not an exact interval; two standard errors is deliberately generous.
-        noise = 2.0 * math.sqrt(max(predicted * (1.0 - predicted), 1e-9) / n)
+        # The band is the **Poisson-binomial** standard error over the individual predicted
+        # rates, not the binomial one at their mean. The trials are not identically
+        # distributed — each decision routed to a group with its own rate — and the mean-p
+        # binomial systematically overstates the variance, so it accepts deviations the
+        # profile says are implausible. Worst at the extreme: a profile under which half the
+        # jobs CANNOT fail (p=0) and half CANNOT succeed (p=1) pins the observed rate at
+        # exactly 0.5, yet the mean-p band (p=0.5) would accept a swing of +/-0.10 at n=100.
+        # The exact band is 0, which is the right answer: nothing else is possible.
+        variance = sum(p * (1.0 - p) for p, _ in pairs)
+        noise = 2.0 * math.sqrt(variance) / n
         comparison.append({
             "job_type": job_type,
             "n_jobs": n,
