@@ -81,6 +81,7 @@ class SwarmConfigGenerator:
         quantum_agents_pct: float = 0.0,
         master_fleet_size: Optional[int] = None,
         delegation_policy: Optional[str] = None,
+        textfile_dir: Optional[str] = None,
     ):
         self.num_agents = num_agents
         # Fleet size the per-agent draws are made FOR, which may exceed the fleet being written.
@@ -134,6 +135,14 @@ class SwarmConfigGenerator:
         if delegation_policy:
             self.base_config.setdefault("delegation", {})["policy"] = delegation_policy
             print(f"delegation.policy = {delegation_policy} (from --delegation-policy)")
+
+        # node_exporter textfile export (P0-4). Off in the base config because the directory
+        # has to exist on the agent host; set here so a Grafana-instrumented campaign does not
+        # depend on a hand edit to the base config, which is how the delegation arm used to be
+        # chosen and why nothing in a run directory recorded it.
+        if textfile_dir:
+            self.base_config.setdefault("instrumentation", {})["textfile_dir"] = textfile_dir
+            print(f"instrumentation.textfile_dir = {textfile_dir} (from --textfile-dir)")
 
         # legacy ring helper (used when no grouping flags provided for ring)
         self.rings_default = self._create_default_rings()
@@ -1083,6 +1092,13 @@ if __name__ == "__main__":
                              "whatever the base config says). Requires "
                              "--groups-per-coordinator > 1 to have any effect.")
 
+    parser.add_argument("--textfile-dir", default=None,
+                        help="node_exporter textfile collector directory on each agent host "
+                             "(e.g. /var/lib/node_exporter/textfile_collector). Sets "
+                             "instrumentation.textfile_dir in the generated configs; unset "
+                             "leaves the Prometheus export off. metrics.json is written "
+                             "either way.")
+
     parser.add_argument("--fit-all", action="store_true",
                         help="Size every job to fit ALL agents (min capacities). "
                              "Enables any agent to take over jobs from failed agents.")
@@ -1155,6 +1171,7 @@ if __name__ == "__main__":
         co_parent_count=args.co_parents,
         groups_per_coordinator=args.groups_per_coordinator,
         delegation_policy=args.delegation_policy,
+        textfile_dir=args.textfile_dir,
         quantum_agents_pct=args.quantum_agents_pct,
         master_fleet_size=args.master_fleet_size,
     )

@@ -176,3 +176,98 @@ class TestDiscoveryAndAggregation(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestInstrumentationColumns(unittest.TestCase):
+    """P0-4 columns, read out of the per-agent metrics.json payloads.
+
+    The wide row must carry the fleet totals the message-complexity figure predicts and a
+    context-age distribution weighted by DECISIONS, not by agents — a coordinator that made
+    400 decisions and one that made 4 are not equal evidence.
+    """
+
+    ROWS = "j1,1,1,2,2,9,0,1,0.1,0.5\n"
+
+    def _run_with_metrics(self, root: Path, payload: dict) -> Path:
+        import json
+        run_dir = write_run(root, "hier-30/run01", self.ROWS)
+        (run_dir / "metrics.json").write_text(json.dumps(payload))
+        return run_dir
+
+    def _payload(self, agent_id, decisions, **instr):
+        base = {"id": agent_id, "instrumentation": instr}
+        if decisions:
+            base["delegation_decisions"] = decisions
+
+        return base
+
+    @staticmethod
+    def _decision(ts, age, chosen=None, policy="bandit", job="j"):
+        return {"ts": ts, "job_id": job, "job_type": "cpu", "policy": policy,
+                "n_candidates": 2, "candidates": [1, 2], "selected": [1],
+                "decide_s": 0.01, "ctx_age_mean": age, "ctx_age_min": age,
+                "ctx_age_max": age, "ctx_age_chosen": chosen if chosen is not None else age,
+                "ctx_age_oldest_max": age, "ctx_age_unknown": 0, "ctx_age_skewed": 0}
+
+    def test_message_counts_are_summed_across_agents(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir = self._run_with_metrics(root, {
+                "1": self._payload(1, [], messages={"sent_msgs": 10, "recv_msgs": 8,
+                                                    "sent_bytes": 100, "recv_bytes": 80,
+                                                    "dropped_msgs": 1}),
+                "2": self._payload(2, [], messages={"sent_msgs": 5, "recv_msgs": 4,
+                                                    "sent_bytes": 50, "recv_bytes": 40,
+                                                    "dropped_msgs": 0}),
+            })
+            metrics = run_metrics(run_dir, expected_jobs=1)
+            self.assertEqual(metrics["msgs_sent"], 15)
+            self.assertEqual(metrics["msg_bytes_recv"], 120)
+            self.assertEqual(metrics["msgs_dropped"], 1)
+            self.assertEqual(metrics["agents_reporting"], 2)
+
+    def test_context_age_is_weighted_by_decisions_not_by_agents(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            busy = [self._decision(i, 10.0, job=f"a{i}") for i in range(9)]
+            quiet = [self._decision(0, 2.0, job="b0")]
+            run_dir = self._run_with_metrics(root, {
+                "1": self._payload(1, busy),
+                "2": self._payload(2, quiet),
+            })
+            metrics = run_metrics(run_dir, expected_jobs=1)
+            self.assertEqual(metrics["delegations"], 10)
+            # An unweighted mean of the two agents would be 6.0.
+            self.assertAlmostEqual(metrics["ctx_age_mean"], 9.2, places=3)
+            self.assertEqual(metrics["delegations_bandit"], 10)
+
+    def test_clock_skew_is_surfaced_as_its_own_column(self):
+        """Non-zero means child and coordinator clocks disagree and the whole ctx_age column
+        from that run is suspect. It must not be averaged into the distribution."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            skewed = self._decision(0, 1.0)
+            skewed["ctx_age_skewed"] = 3
+            skewed["ctx_age_unknown"] = 1
+            run_dir = self._run_with_metrics(root, {"1": self._payload(1, [skewed])})
+            metrics = run_metrics(run_dir, expected_jobs=1)
+            self.assertEqual(metrics["ctx_skewed_ages"], 3)
+            self.assertEqual(metrics["ctx_unknown_groups"], 1)
+
+    def test_a_run_without_metrics_json_keeps_its_other_columns(self):
+        """Every archived run predating P0-4 has no metrics.json to read; the collector must
+        yield those runs unchanged rather than dropping them or filling NaN columns."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = write_run(Path(tmp), "hier-30/run01", self.ROWS)
+            metrics = run_metrics(run_dir, expected_jobs=1)
+            self.assertEqual(metrics["jobs_completed"], 1)
+            self.assertNotIn("msgs_sent", metrics)
+            self.assertNotIn("ctx_age_mean", metrics)
+
+    def test_an_unreadable_metrics_file_does_not_kill_the_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = write_run(Path(tmp), "hier-30/run01", self.ROWS)
+            (run_dir / "metrics.json").write_text("{not json")
+            metrics = run_metrics(run_dir, expected_jobs=1)
+            self.assertEqual(metrics["jobs_completed"], 1)
+            self.assertNotIn("msgs_sent", metrics)

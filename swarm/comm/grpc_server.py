@@ -53,6 +53,17 @@ class ConsensusServiceServicer(consensus_pb2_grpc.ConsensusServiceServicer):
         self.observer = observer
 
     def SendMessage(self, request, context):
+        # Inbound message accounting (P0-4). Taken before parsing, so a message that is
+        # malformed or later dropped by the agent still counts as received bandwidth — the
+        # complexity figure is about what the network carried, not what the agent used.
+        # `record_inbound` is optional on the Observer protocol: a test double that only
+        # implements on_message stays usable.
+        record = getattr(self.observer, "record_inbound", None)
+        if record is not None:
+            try:
+                record(request.message_type, request.ByteSize())
+            except Exception:
+                pass
         msg = {
             "sender_id": request.sender_id,
             "receiver_id": request.receiver_id,

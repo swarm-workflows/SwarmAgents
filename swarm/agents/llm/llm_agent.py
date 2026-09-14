@@ -451,15 +451,11 @@ class LlmAgent(ResourceAgent):
     def _delegation_snapshots(self, group_ids: list) -> dict:
         """`{group_id: GroupSnapshot}` for the candidate groups.
 
-        Deliberately the *same* view the contextual bandit gets — the manager's failure and
-        timeout history merged into the agent's live load data — so `delegation.policy: bandit`
-        and `llm` differ in the decision rule and not in the information. Without the bandit
-        there is no failure history to merge, only live load.
+        Kept as a name of its own because the delegation prompt reads better for it, but the
+        view itself is `ResourceAgent._decision_snapshots` — one builder, so the model, the
+        bandit and the context-age record (P0-4) cannot end up describing different states.
         """
-        if self.mab_enabled and self.mab_manager:
-            return self.mab_manager.snapshots_for(group_ids)
-        base = self._build_group_snapshots() or {}
-        return {g: base.get(g, GroupSnapshot()) for g in group_ids}
+        return self._decision_snapshots(group_ids)
 
     def _group_summaries(self, job, group_ids: list, snapshots: Optional[dict] = None) -> dict:
         """The per-group state the model reasons over.
@@ -485,7 +481,8 @@ class LlmAgent(ResourceAgent):
             }
         return summaries
 
-    def _select_child_groups(self, job, capable_groups: list) -> list:
+    def _select_child_groups(self, job, capable_groups: list, top_k: int = None,
+                             snapshots: dict = None) -> list:
         """Let the LLM choose the child group, falling back to the bandit on anything unusual.
 
         Runs on the coordinator's scheduling thread, so the call is bounded by
@@ -495,24 +492,30 @@ class LlmAgent(ResourceAgent):
         (P0-7) applies here.
         """
         if self.delegation_policy != self.DELEGATE_LLM:
-            return super()._select_child_groups(job, capable_groups)
+            return super()._select_child_groups(job, capable_groups,
+                                                snapshots=snapshots)
 
         # Every fallback below passes `top_k`. The configured fan-out is a load and fairness
         # variable, so it must survive a failed decision unchanged — and `mab.top_k` is not it
         # when `delegation.top_k` was set.
         top_k = self._effective_delegation_top_k()
         if self.delegator is None:
-            return super()._select_child_groups(job, capable_groups, top_k)
+            return super()._select_child_groups(job, capable_groups, top_k,
+                                                snapshots=snapshots)
 
         if len(capable_groups) <= 1 or top_k >= len(capable_groups):
             # Every candidate is delegated to either way — there is no decision to buy, so do
             # not spend an inference on one. Keeps the bandit's own bookkeeping intact too.
             self.delegation_trivial += 1
-            return super()._select_child_groups(job, capable_groups, top_k)
+            return super()._select_child_groups(job, capable_groups, top_k,
+                                                snapshots=snapshots)
 
         # Taken once, before the call: the same state is shown to the model, written to the
-        # audit record, and (below) recorded as the bandit's selection-time context.
-        snaps = self._delegation_snapshots(capable_groups)
+        # audit record, and (below) recorded as the bandit's selection-time context. The
+        # instrumented wrapper (P0-4) normally hands it down already built, so the model and
+        # the context-age record describe the same instant; building here covers a direct
+        # call.
+        snaps = snapshots if snapshots is not None else self._delegation_snapshots(capable_groups)
         summaries = self._group_summaries(job, capable_groups, snaps)
         self.delegation_attempts += 1
         started_at = time.perf_counter()
@@ -528,7 +531,8 @@ class LlmAgent(ResourceAgent):
             self.logger.warning(
                 "[LLM_DELEGATE_FALLBACK] Job=%s Groups=%s falling back to %s: %s",
                 job.job_id, capable_groups, self.DELEGATE_BANDIT, e)
-            return super()._select_child_groups(job, capable_groups, top_k)
+            return super()._select_child_groups(job, capable_groups, top_k,
+                                                snapshots=snapshots)
 
         self.delegation_seconds += elapsed
         if not ranking:
@@ -539,9 +543,11 @@ class LlmAgent(ResourceAgent):
             self.logger.warning(
                 "[LLM_DELEGATE_EMPTY] Job=%s Groups=%s returned no usable group in %.3fs; "
                 "falling back to %s", job.job_id, capable_groups, elapsed, self.DELEGATE_BANDIT)
-            return super()._select_child_groups(job, capable_groups, top_k)
+            return super()._select_child_groups(job, capable_groups, top_k,
+                                                snapshots=snapshots)
 
         self.delegation_calls += 1
+        self._note_decision_policy(self.DELEGATE_LLM)
         # A short answer is still a decision — the model named a best group. Fill the tail with
         # the remaining candidates in their existing order so `top_k` is always satisfiable.
         named = set(ranking)
@@ -586,6 +592,24 @@ class LlmAgent(ResourceAgent):
             self.logger.exception("Failed to save LLM delegation record: %s", e)
 
         return selected
+
+    def llm_usage_snapshot(self) -> dict:
+        """Token, latency and failure counts per LLM call site (P0-4).
+
+        Reported per site rather than pooled: a delegation prompt carries a whole group table
+        and a bid carries one agent's state, so the two have very different token costs and
+        the inference-budget item (P0-3) needs to know which one dominates.
+        """
+        usage = {}
+        for attr, key in (("bidder", "bid"), ("delegator", "delegate")):
+            obj = getattr(self, attr, None)
+            counter = getattr(obj, "usage", None)
+            if counter is None:
+                continue
+            snap = counter.snapshot()
+            if snap["calls"]:
+                usage[key] = snap
+        return usage
 
     def delegation_stats(self) -> dict:
         """Delegation accounting for the [STATS] line, `metrics.json` and E4.

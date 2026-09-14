@@ -21,6 +21,7 @@ from pydantic_ai.providers.ollama import OllamaProvider
 from pydantic_ai.providers.openai import OpenAIProvider
 
 from swarm.agents.llm.llm_config import LlmConfig
+from swarm.utils.instrumentation import LlmUsage, extract_usage
 
 
 class Bid(BaseModel):
@@ -132,11 +133,22 @@ class LlmBidder:
                     "It may still advertise the wrong rating range.")
         self.logger.info(f"[LLM_BIDDER] System Prompt: {system_prompt}")
 
+        self._init_instrumentation()
+
         # Build the agent with a structured result type.
         self.agent: PydanticAgent = PydanticAgent(
             model=model,
             system_prompt=system_prompt,
         )
+
+    def _init_instrumentation(self) -> None:
+        """Token and latency accounting for the bidding call site (P0-4), separate from the
+        delegator's. `calls` counts every bid that reached the model, failures included.
+
+        A method rather than an inline assignment so a test double built with `__new__` calls
+        the same setup the shipped object runs, instead of assembling its own.
+        """
+        self.usage = LlmUsage("bid")
 
     def score(self, *, job: Dict[str, Any], agent_state: Dict[str, Any],
               peer_context: Optional[Dict[str, Any]] = None) -> Bid:
@@ -149,6 +161,9 @@ class LlmBidder:
         :return: Bid with score, explanation, and reasoning time
         """
         timeout_s = float(getattr(self.cfg, "timeout_seconds", 0) or 0)
+        # Bound before the try so the failure path can always charge the attempt; the inner
+        # `start` still times the call alone, which is what `reasoning_time` has always meant.
+        attempt_started = time.perf_counter()
         try:
             # Log LLM scoring start
             job_id = job.get('job_id', job.get('id', 'unknown'))
@@ -199,6 +214,7 @@ class LlmBidder:
             )
             bid = res.output
             bid.reasoning_time = time.perf_counter() - start
+            self.usage.record(bid.reasoning_time, usage=extract_usage(res))
 
             # Truncate long explanations to save tokens and improve performance
             if len(bid.explanation) > 100:
@@ -214,6 +230,11 @@ class LlmBidder:
 
             return bid
         except Exception as e:
+            # Timed exactly like a success: a bid that timed out cost the full
+            # `llm.timeout_seconds`, and the campaign's sharpest finding is that a *cheap*
+            # failure path is what captures the work (P0-7). Charging failures nothing would
+            # make inference look cheapest in exactly the runs that are drowning in them.
+            self.usage.record(time.perf_counter() - attempt_started, failed=True)
             if self.logger:
                 self.logger.exception(
                     f"[LLM_SCORE_ERROR] Job={job.get('job_id', job.get('id', 'unknown'))} "

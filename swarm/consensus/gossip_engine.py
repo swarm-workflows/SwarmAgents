@@ -50,6 +50,7 @@ from swarm.consensus.messages.proposal_info import ProposalContainer, ProposalIn
 from swarm.consensus.messages.snow_batch import SnowQueryBatch, SnowResponseBatch
 from swarm.consensus.messages.snow_query import SnowQuery
 from swarm.consensus.messages.snow_response import SnowResponse
+from swarm.utils.instrumentation import RunningStats
 from swarm.utils.tiebreak import tiebreak_rank
 
 
@@ -165,6 +166,15 @@ class GossipConsensusEngine:
         self._states: Dict[str, _SnowState] = {}
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+
+        # Finalization instrumentation (P0-4). Rounds-to-finalize is the mechanism figure's
+        # x-axis and, unlike the [SNOW_TIMING] log line it mirrors, survives into
+        # metrics.json — a run whose agent logs were rotated away can still be plotted.
+        self.rounds_to_finalize = RunningStats()
+        self.queries_to_finalize = RunningStats()
+        self.time_to_finalize = RunningStats()
+        self.finalized_count = 0
+        self.abandoned_count = 0
 
     def _alpha_threshold(self, sample_size: int) -> int:
         """Supermajority vote count required, relative to the peers actually sampled
@@ -505,6 +515,7 @@ class GossipConsensusEngine:
                 f"[SNOW_ABANDON] Object:{state.proposal.object_id} rounds={state.round_no} "
                 f"elapsed={elapsed:.3f}s — max_rounds exhausted, leaving for reselection"
             )
+            self.abandoned_count += 1
             with self._lock:
                 state.finalized = True
                 self.outgoing.remove_object(object_id=state.proposal.object_id)
@@ -552,6 +563,11 @@ class GossipConsensusEngine:
             f"[SNOW_TIMING] Object:{state.proposal.object_id} rounds={state.round_no} "
             f"queried={state.queried} elapsed={elapsed:.3f}s reason={reason}"
         )
+        self.finalized_count += 1
+        self.rounds_to_finalize.add(state.round_no)
+        self.queries_to_finalize.add(state.queried)
+        if elapsed >= 0:
+            self.time_to_finalize.add(elapsed)
 
         obj = self.host.get_object(state.proposal.object_id)
         if obj is None:
@@ -569,6 +585,26 @@ class GossipConsensusEngine:
                 f"leader:{winner} reason={reason}"
             )
             self.host.on_participant_commit(obj, int(winner), state.proposal.p_id)
+
+    def consensus_stats(self) -> Dict[str, object]:
+        """Per-agent finalization accounting, in the shape the PBFT engine also emits.
+
+        `abandoned` is reported alongside `finalized` on purpose: a tier that abandons most
+        decisions has a *flattering* rounds-to-finalize distribution, because only the easy
+        objects reach the finalize path at all. The two numbers are only meaningful together.
+        """
+        stats: Dict[str, object] = {
+            "protocol": "snow",
+            "finalized": self.finalized_count,
+            "abandoned": self.abandoned_count,
+            "sends_dropped": self.sends_dropped,
+            "conflict_rounds": sum(self.conflicts.values()),
+            "conflict_objects": len(self.conflicts),
+        }
+        stats.update(self.rounds_to_finalize.summary("rounds_"))
+        stats.update(self.queries_to_finalize.summary("queries_"))
+        stats.update(self.time_to_finalize.summary("finalize_s_"))
+        return stats
 
     # ---- Helpers --------------------------------------------------------- #
 

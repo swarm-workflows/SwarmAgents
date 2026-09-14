@@ -47,6 +47,7 @@ from pydantic_ai import Agent as PydanticAgent, ModelSettings, NativeOutput
 
 from swarm.agents.llm.llm_bidder import build_model
 from swarm.agents.llm.llm_config import LlmConfig
+from swarm.utils.instrumentation import LlmUsage, extract_usage
 
 #: How many distinct candidate-group sets keep a cached response schema. A coordinator sees a
 #: handful of shapes (all groups, all-but-one, ...); this only stops a pathological run from
@@ -108,10 +109,22 @@ class LlmDelegator:
         self.model = build_model(cfg)
         self._schema_cache: Dict[Tuple[int, ...], type[BaseModel]] = {}
 
+        self._init_instrumentation()
+
         system_prompt = prompt or (cfg.prompts or {}).get("delegate") or DEFAULT_PROMPT
         self.agent: PydanticAgent = PydanticAgent(model=self.model, system_prompt=system_prompt)
         if self.logger:
             self.logger.info(f"[LLM_DELEGATOR] System Prompt: {system_prompt}")
+
+    def _init_instrumentation(self) -> None:
+        """Token and latency accounting for this call site, kept apart from the bidder's
+        (P0-4): a delegation prompt carries a whole group table and a bid carries one agent's
+        state, so a single pooled counter would hide which one costs.
+
+        A method rather than an inline assignment so a test double built with `__new__` calls
+        the same setup the shipped object runs, instead of assembling its own.
+        """
+        self.usage = LlmUsage("delegate")
 
     def _output_type(self, group_ids: Sequence[int]):
         key = tuple(int(g) for g in group_ids)
@@ -145,17 +158,25 @@ class LlmDelegator:
                 f"[LLM_DELEGATE_PROMPT] candidates={candidates} len={len(prompt)} chars\n{prompt}")
 
         start = time.perf_counter()
-        res = self.agent.run_sync(
-            prompt,
-            output_type=self._output_type(candidates),
-            model_settings=ModelSettings(
-                temperature=float(getattr(self.cfg, "temperature", 0.0) or 0.0),
-                # Same reason as the bidder: this thread delegates every job the coordinator
-                # holds, so an unbounded call stalls the subtree. 0 disables.
-                **({"timeout": timeout_s} if timeout_s > 0 else {}),
-            ),
-        )
+        try:
+            res = self.agent.run_sync(
+                prompt,
+                output_type=self._output_type(candidates),
+                model_settings=ModelSettings(
+                    temperature=float(getattr(self.cfg, "temperature", 0.0) or 0.0),
+                    # Same reason as the bidder: this thread delegates every job the
+                    # coordinator holds, so an unbounded call stalls the subtree. 0 disables.
+                    **({"timeout": timeout_s} if timeout_s > 0 else {}),
+                ),
+            )
+        except BaseException:
+            # A timeout burned the full `llm.timeout_seconds` before it raised. Timing only
+            # the successes would make inference look cheapest in the runs with the most
+            # fallbacks — the same accounting trap `delegation_stats.mean_s` already avoids.
+            self.usage.record(time.perf_counter() - start, failed=True)
+            raise
         elapsed = time.perf_counter() - start
+        self.usage.record(elapsed, usage=extract_usage(res))
 
         out = res.output
         allowed = set(candidates)

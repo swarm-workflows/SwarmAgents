@@ -168,6 +168,21 @@ gossip:
   period_ms: 1000
   state_ttl_s: 30
 
+# Run instrumentation (P0-4). Everything here is on by default and costs a few counters per
+# message and one dict per delegation; the only thing that is off is the Prometheus export,
+# because it needs a path that exists on the agent host.
+instrumentation:
+  # Per-decision delegation rows kept in memory and written to metrics.json. The bound is a
+  # ring: when it binds the OLDEST rows go, because a delegation run's interesting regime is
+  # the converged one. At ~1 row per delegated job this does not bind below ~20k jobs.
+  decision_log_max: 20000
+
+  # node_exporter textfile collector directory, e.g. /var/lib/node_exporter/textfile_collector.
+  # Unset (the default) disables the export entirely; metrics.json is unaffected either way.
+  # Each agent writes swarm_agent_<id>.prom there, atomically.
+  textfile_dir:
+  textfile_period_s: 15     # node_exporter scrapes at 15s; writing per 0.5s tick buys nothing
+
 logging:
   ## The directory in which actor should create log files.
   ## This directory will be automatically created if it does not exist.

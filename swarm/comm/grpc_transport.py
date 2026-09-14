@@ -33,6 +33,7 @@ from swarm.comm.grpc_client import GrpcClient
 from swarm.comm.grpc_server import GrpcServer, ConsensusServiceServicer
 from swarm.consensus.messages.message import Message
 from swarm.comm.observer import Observer
+from swarm.utils.instrumentation import MessageCounters
 from swarm.utils.thread_safe_dict import ThreadSafeDict
 
 
@@ -44,11 +45,7 @@ class GrpcTransport(Observer):
         self.client = GrpcClient(on_peer_status=on_peer_status)
         self.observers = []
         self.logger = logger
-        # Broadcast latency instrumentation (post-parallelization this measures the
-        # submit loop; [BCAST_SLOW] then indicates pool saturation, not a dead peer).
-        self.broadcasts = 0
-        self.broadcast_time_total = 0.0
-        self.broadcast_time_max = 0.0
+        self._init_instrumentation()
         # Parallel fan-out pool: broadcast() must never block a consensus phase on one
         # slow/dead peer (serially, one dead peer cost ~8.7s per phase: 2s timeout x 4
         # retries + backoff). Sends are fire-and-forget with reduced retries — PBFT
@@ -56,7 +53,26 @@ class GrpcTransport(Observer):
         self._bcast_pool: Optional[ThreadPoolExecutor] = None
         self._bcast_sem: Optional[threading.BoundedSemaphore] = None
         self.bcast_workers = 16
+
+    def _init_instrumentation(self) -> None:
+        """Counters this transport keeps for the whole run.
+
+        One method, called by `__init__` and by any test double built with `__new__`, so a
+        double cannot end up exercising a differently-assembled transport than the one that
+        ships — the same reason the agent and the LLM call sites have one.
+
+        `broadcasts`/`broadcast_time_*` measure the submit loop (post-parallelization
+        [BCAST_SLOW] indicates pool saturation, not a dead peer). `counters` holds the P0-4
+        consensus message counts and protocol bytes, by direction and message type — counted
+        here rather than in the engines because this is the only place every message passes
+        through exactly once: PBFT phases, Snow queries and responses, SWIM probes and gossip
+        all funnel into send()/broadcast().
+        """
+        self.broadcasts = 0
+        self.broadcast_time_total = 0.0
+        self.broadcast_time_max = 0.0
         self.bcast_sends_dropped = 0
+        self.counters = MessageCounters()
 
     def register_observers(self, observer: Observer):
         if observer not in self.observers:
@@ -85,14 +101,13 @@ class GrpcTransport(Observer):
              timeout: float = 2.0, retries: int = 4) -> None:
         if not isinstance(payload, Message):
             raise TypeError("Payload must be of Message type")
-        req = consensus_pb2.ConsensusMessage(
-            sender_id=str(src),
-            receiver_id=str(dest),
-            message_type=str(payload.message_type),
-            payload=json.dumps(payload.to_dict()),
-            timestamp=int(time.time())
-        )
-        self.client.call_unary(host, port, "SendMessage", req, timeout=timeout, retries=retries)
+        # Routed through _send_raw so unicast and fan-out cannot drift on how a message is
+        # framed or on whether it is counted — the message-cost figure is per-agent totals,
+        # and a second construction site is a second place for one to go missing.
+        self._send_raw(host=host, port=port, src=src, dest=dest,
+                       payload_json=json.dumps(payload.to_dict()),
+                       msg_type=str(payload.message_type),
+                       timeout=timeout, retries=retries)
 
     def _send_raw(self, host: str, port: int, src: int, dest: int,
                   payload_json: str, msg_type: str,
@@ -104,7 +119,15 @@ class GrpcTransport(Observer):
             payload=payload_json,
             timestamp=int(time.time())
         )
+        # Counted before the call, so a message the network loses still counts as sent. What
+        # is NOT counted is a retry: call_unary retries internally, so these are messages the
+        # protocol asked for, which is the quantity the complexity analysis predicts.
+        self.counters.record_sent(msg_type, req.ByteSize())
         self.client.call_unary(host, port, "SendMessage", req, timeout=timeout, retries=retries)
+
+    def record_inbound(self, msg_type: str, nbytes: int) -> None:
+        """Called by the gRPC servicer for every message accepted off the wire."""
+        self.counters.record_received(msg_type, nbytes)
 
     def _bcast_send(self, host: str, port: int, src: int, dest: int,
                     payload_json: str, msg_type: str) -> None:
@@ -150,6 +173,7 @@ class GrpcTransport(Observer):
             # on one slow/dead peer (previously ~8.7s per dead peer per phase).
             if not self._bcast_sem.acquire(blocking=False):
                 self.bcast_sends_dropped += 1
+                self.counters.record_dropped(msg_type)
                 continue
             try:
                 self._bcast_pool.submit(
@@ -158,6 +182,7 @@ class GrpcTransport(Observer):
             except RuntimeError:  # pool shutting down
                 self._bcast_sem.release()
                 self.bcast_sends_dropped += 1
+                self.counters.record_dropped(msg_type)
         elapsed = time.time() - begin
         self.broadcasts += 1
         self.broadcast_time_total += elapsed

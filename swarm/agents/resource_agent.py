@@ -46,6 +46,8 @@ from swarm.models.object import Object
 from swarm.selection.engine import SelectionEngine
 from swarm.selection.penalties import apply_multiplicative_penalty
 from swarm.topology.topology import TopologyType
+from swarm.utils.instrumentation import (DecisionLog, DecisionRecord, context_age,
+                                        flatten_for_prom, render_prom, write_textfile)
 from swarm.utils.metrics import Metrics
 from swarm.utils.resource_queues import ResourceAgentQueues
 from swarm.utils.thread_safe_dict import ThreadSafeDict
@@ -62,7 +64,7 @@ from swarm.models.job import Job, ObjectState
 from swarm.models.quantum import QuantumBackend
 from swarm.quantum.measurement_layer import MeasurementLayer
 from swarm.quantum.split import build_post_process_job, experiment_id_for, split_comm_penalty
-from swarm.rl.context import snapshots_from_children
+from swarm.rl.context import GroupSnapshot, snapshots_from_children
 from swarm.rl.mab_manager import MABManager
 
 from swarm.agents.cost_scale import CostScale
@@ -460,6 +462,8 @@ class ResourceAgent(Agent):
 
         # Max retries before retiring an infeasible job (0 = infinite retries)
         self.max_infeasible_retries = self.runtime_config.get("max_infeasible_retries", 10)
+
+        self._init_instrumentation()
 
         # SWIM membership (Phase 1 of gossip-consensus migration). Enabled when
         # `failure_detection.protocol` is "swim"; otherwise the legacy heartbeat
@@ -1583,6 +1587,7 @@ class ResourceAgent(Agent):
             except Exception as exc:
                 self.logger.debug(f"[gossip] publish_local failed: {exc}")
 
+        self._export_textfile_metrics()
         self._restart_selection()
         self._monitor_delegated_jobs()
         current_time = int(time.time())
@@ -1694,6 +1699,20 @@ class ResourceAgent(Agent):
                                  f"mean={dg['mean_s']}s")
                     if dg.get("disabled"):
                         parts.append(f"delegate_DISABLED=\"{dg['disabled']}\"")
+            # Context age at decision time (P0-4). In the [STATS] line as well as
+            # metrics.json because a coordinator whose view is minutes stale is delegating on
+            # fiction, and that is worth seeing while a run is live rather than after it.
+            # `skew` is not a distribution statistic: any non-zero value means child and
+            # coordinator clocks disagree and the age column should not be reported.
+            dl = getattr(self, "decision_log", None)
+            if dl is not None:
+                ds = dl.summary()
+                if ds["decisions"]:
+                    parts.append(
+                        f"delegations={ds['decisions']} "
+                        f"policies={','.join(f'{k}:{v}' for k, v in sorted(ds['by_policy'].items()))} "
+                        f"ctx_age_p50={ds['ctx_age_p50']}s p95={ds['ctx_age_p95']}s "
+                        f"unknown={ds['ctx_unknown_groups']} skew={ds['ctx_skewed_ages']}")
             self.logger.info("[STATS] " + " ".join(parts))
         except Exception as exc:
             self.logger.debug(f"stats logging failed: {exc}")
@@ -2249,6 +2268,92 @@ class ResourceAgent(Agent):
                 self.logger.error(traceback.format_exc())
         self.logger.info(f"Agent: {self} stopped with restarts: {self.metrics.restarts}!")
 
+    # ---------- Instrumentation (P0-4) -------------------------------------------------
+
+    def _init_instrumentation(self) -> None:
+        """Set up the P0-4 containers from the `instrumentation:` config block.
+
+        One method, called by `__init__` and by every test double that builds an agent with
+        `__new__`, because a double that assembles this state itself will exercise the state
+        it built and not the state the agent ships with — the trap that let a deadlock test
+        pass against the deadlock (`swarm-test-the-default-not-your-example`).
+        """
+        instr_cfg = (self.config.get("instrumentation", {}) or {}) if self.config else {}
+        self.decision_log = DecisionLog(
+            max_records=int(instr_cfg.get("decision_log_max", 20000)))
+        # Which policy actually decided the delegation in flight. Thread-local because the
+        # wrapper that reads it and the policy that writes it are separated by an override
+        # chain; delegation runs on one thread today, and this keeps that from being a
+        # correctness assumption.
+        self._decision_ctx = threading.local()
+        self._textfile_dir = instr_cfg.get("textfile_dir") or None
+        self._textfile_period_s = float(instr_cfg.get("textfile_period_s", 15.0))
+        self._textfile_last = 0.0
+
+    def llm_usage_snapshot(self) -> dict:
+        """Per-call-site LLM accounting. Empty for a rule-based agent; `LlmAgent` overrides."""
+        return {}
+
+    def instrumentation_snapshot(self) -> dict:
+        """Everything P0-4 measures, in one dict.
+
+        Rendered twice from here — into `metrics.json` at teardown and into the node_exporter
+        textfile while the run is live — so the two exports cannot disagree about what a
+        counter means. Every section is defensive: instrumentation that raises at teardown
+        would cost the run its metrics, which is the failure P0-0's §0.8 already paid for once.
+        """
+        snapshot: dict = {}
+        try:
+            counters = getattr(self.transport, "counters", None)
+            if counters is not None:
+                snapshot["messages"] = counters.snapshot()
+        except Exception as exc:
+            self.logger.debug(f"message counters unavailable: {exc}")
+        try:
+            stats_fn = getattr(self.engine, "consensus_stats", None)
+            if callable(stats_fn):
+                snapshot["consensus"] = stats_fn()
+        except Exception as exc:
+            self.logger.debug(f"consensus stats unavailable: {exc}")
+        try:
+            summary = self.decision_log.summary()
+            if summary.get("decisions"):
+                snapshot["delegation"] = summary
+        except Exception as exc:
+            self.logger.debug(f"delegation summary unavailable: {exc}")
+        try:
+            usage = self.llm_usage_snapshot()
+            if usage:
+                snapshot["llm"] = usage
+        except Exception as exc:
+            self.logger.debug(f"llm usage unavailable: {exc}")
+        return snapshot
+
+    def _export_textfile_metrics(self) -> None:
+        """Write the live instrumentation for node_exporter's textfile collector.
+
+        Off unless `instrumentation.textfile_dir` is set. Rate-limited because `on_periodic`
+        ticks twice a second and the collector scrapes at 15s; a write per tick would be 30x
+        the fsyncs for no extra resolution.
+        """
+        if not self._textfile_dir:
+            return
+        now = time.time()
+        if now - self._textfile_last < self._textfile_period_s:
+            return
+        self._textfile_last = now
+        try:
+            labels = {"agent": str(self.agent_id)}
+            run_id = os.environ.get("SWARM_RUN_ID")
+            if run_id:
+                labels["run_id"] = run_id
+            samples = list(flatten_for_prom("swarm", self.instrumentation_snapshot(), labels))
+            path = os.path.join(self._textfile_dir, f"swarm_agent_{self.agent_id}.prom")
+            write_textfile(path, render_prom(samples))
+        except Exception as exc:
+            # A metrics sink is never allowed to take the agent with it.
+            self.logger.debug(f"textfile export failed: {exc}")
+
     def save_results(self):
         """Persist this agent's metrics payload to Redis.
 
@@ -2295,6 +2400,15 @@ class ResourceAgent(Agent):
         # is usable with the bandit off, and that arm is precisely the one E4 needs counted.
         if self.metrics.llm_delegations:
             agent_metrics["llm_delegations"] = copy.deepcopy(self.metrics.llm_delegations)
+        instrumentation = self.instrumentation_snapshot()
+        if instrumentation:
+            agent_metrics["instrumentation"] = instrumentation
+        # Per-decision rows, kept separate from the summary because the oracle (P1-1) labels
+        # them offline and F6 joins regret against the context age of the same row. Omitted
+        # entirely for an agent that never delegated, so a leaf agent's payload is unchanged.
+        decisions = self.decision_log.records()
+        if decisions:
+            agent_metrics["delegation_decisions"] = decisions
         deleg_stats = getattr(self, "delegation_stats", None)
         if callable(deleg_stats):
             dg = deleg_stats()
@@ -2495,7 +2609,75 @@ class ResourceAgent(Agent):
 
         return capable_groups
 
-    def _select_child_groups(self, job, capable_groups: list, top_k: int = None) -> list:
+    def _decision_snapshots(self, group_ids: list) -> dict:
+        """`{group_id: GroupSnapshot}` for *group_ids*: the view a delegation decides on.
+
+        The manager's failure and timeout history merged into the agent's live load data when
+        there is a bandit, live load alone when there is not. Built once per decision and
+        handed to whichever policy runs, so `delegation.policy: bandit` and `llm` differ in the
+        decision rule and not in the information — and so the context age recorded for the
+        decision is the age of the view the decision actually used.
+        """
+        if self.mab_enabled and self.mab_manager:
+            return self.mab_manager.snapshots_for(group_ids)
+        base = self._build_group_snapshots() or {}
+        return {g: base.get(g, GroupSnapshot()) for g in group_ids}
+
+    def _note_decision_policy(self, policy: str) -> None:
+        """Record which rule actually made the delegation decision in flight.
+
+        Called by the policy, read by `_delegate_child_groups`. The configured policy is not
+        the answer: an LLM decision that fell back to the bandit must be counted as a bandit
+        decision or E4's arms describe calls that never happened.
+        """
+        self._decision_ctx.policy = policy
+
+    def _delegate_child_groups(self, job, capable_groups: list) -> list:
+        """Instrumented entry to the delegation decision (P0-4).
+
+        Wraps `_select_child_groups` rather than living inside it, so exactly one record is
+        written per decision no matter how many times the policy chain re-enters itself —
+        `LlmAgent` calls `super()._select_child_groups(...)` on every one of its five fallback
+        paths, and instrumenting the overridable method would count those twice and attribute
+        the decision to the wrong rule.
+
+        Context age is taken at `decided_at`, **after** the policy returns. Under
+        `delegation.policy: llm` that is seconds after the snapshots were built, and that gap
+        is precisely what the interaction claim is about; freezing the age at build time would
+        define the effect away. `decide_s` is recorded alongside, so the age at build is
+        recoverable as `age - decide_s`.
+        """
+        self._decision_ctx.policy = None
+        snapshots = None
+        try:
+            snapshots = self._decision_snapshots(capable_groups)
+        except Exception as exc:
+            # Instrumentation must never be the reason a job fails to be delegated.
+            self.logger.debug(f"Decision snapshot build failed: {exc}")
+
+        started_at = time.time()
+        selected = self._select_child_groups(job, capable_groups, snapshots=snapshots)
+        decided_at = time.time()
+
+        try:
+            policy = getattr(self._decision_ctx, "policy", None) or "unknown"
+            self.decision_log.add(DecisionRecord(
+                ts=decided_at,
+                job_id=str(getattr(job, "job_id", "")),
+                job_type=getattr(job, "job_type", None),
+                policy=policy,
+                n_candidates=len(capable_groups),
+                candidates=[int(g) for g in capable_groups],
+                selected=[int(g) for g in (selected or [])],
+                decide_s=decided_at - started_at,
+                age=context_age(snapshots or {}, selected or [], now=decided_at),
+            ))
+        except Exception as exc:
+            self.logger.debug(f"Decision record failed: {exc}")
+        return selected
+
+    def _select_child_groups(self, job, capable_groups: list, top_k: int = None,
+                             snapshots: dict = None) -> list:
         """Choose which of *capable_groups* this job is delegated to.
 
         The delegation decision point. Feasibility, the liveness gate and the fallbacks have
@@ -2515,21 +2697,30 @@ class ResourceAgent(Agent):
         rewarded, this time with fan-out instead of speed.
         """
         k = self.mab_top_k if top_k is None else int(top_k)
+        # A fan-out covering every candidate is not a decision, whichever policy is
+        # configured: `select_groups` returns them all without consulting the bandit. Labelling
+        # it `bandit` would put inert delegations in the same bucket as real ones, which is
+        # exactly the inertness `_warn_if_delegation_cannot_choose` exists to surface.
+        covers_all = k >= len(capable_groups)
         if self.mab_enabled and self.mab_manager:
+            self._note_decision_policy("bandit_all" if covers_all else "bandit")
             selected_groups = self.mab_manager.select_groups(
-                capable_groups, job, top_k=k
+                capable_groups, job, top_k=k, snapshots=snapshots
             )
             for g in selected_groups:
                 self.metrics.mab_selections[g] = \
                     self.metrics.mab_selections.get(g, 0) + 1
             return selected_groups
         if top_k is None:
+            self._note_decision_policy("all")
             return capable_groups
         # No bandit and no model: nothing here ranks groups, so choose at random rather than
         # by list order. `capable_groups[:k]` would send every job of a sustained LLM outage
         # to the lowest group id, and that hot spot would read as a placement effect in E4.
-        if k >= len(capable_groups):
+        if covers_all:
+            self._note_decision_policy("all")
             return list(capable_groups)
+        self._note_decision_policy("random")
         return random.sample(list(capable_groups), max(k, 0))
 
     def scheduling_main(self):
@@ -2585,7 +2776,7 @@ class ResourceAgent(Agent):
                                 f"{job_id}; delegating ungated"
                             )
 
-                        selected_groups = self._select_child_groups(job, capable_groups)
+                        selected_groups = self._delegate_child_groups(job, capable_groups)
 
                         self.queues.selected_queue.remove(job_id)
                         job.level = self.topology.level - 1

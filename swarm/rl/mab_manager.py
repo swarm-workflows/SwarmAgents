@@ -279,12 +279,17 @@ class MABManager:
             del self._pending[job_id]
 
     def select_groups(self, capable_groups: List[int], job=None,
-                      top_k: int = 1) -> List[int]:
+                      top_k: int = 1,
+                      snapshots: Optional[Dict[int, GroupSnapshot]] = None) -> List[int]:
         """Use the bandit policy to pick *top_k* groups from *capable_groups*.
 
         If top_k >= len(capable_groups), all capable groups are returned
         (equivalent to the pre-MAB behaviour), but selection context is still
         recorded so their outcomes train the contextual model.
+
+        *snapshots*, when given, are used instead of building a fresh view. The caller
+        instruments the age of that view at the moment of the decision (P0-4), so rebuilding
+        here would train the model on one view and report the age of another.
         """
         if not capable_groups:
             return []
@@ -298,8 +303,9 @@ class MABManager:
 
             contexts = None
             if self.contextual and job is not None:
-                snapshots = self._build_snapshots(capable_groups)
-                contexts = self.extractor.build(job, capable_groups, snapshots)
+                snaps = (snapshots if snapshots is not None
+                         else self._build_snapshots(capable_groups))
+                contexts = self.extractor.build(job, capable_groups, snaps)
 
             if top_k >= len(capable_groups):
                 selected = list(capable_groups)

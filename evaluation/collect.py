@@ -8,6 +8,8 @@ metric set from ``docs/FGCS_EVAL_PLAN.md`` section 7, and writes:
 * ``runs_wide.csv``   -- one row per run, one column per metric
 * ``runs_tidy.csv``   -- one row per (run, metric); convenient for seaborn/ggplot
 * ``config_agg.csv``  -- per-configuration mean/std/n/ci95 across repeats
+* ``decisions.csv``   -- one row per delegation decision (P0-4), when any run recorded them:
+  the per-decision context age F6 needs, and the rows the oracle (P1-1) labels offline
 
 Every paper figure should be regenerable from these three files, so numbers never get
 hand-copied out of logs.
@@ -251,6 +253,134 @@ def selection_metrics(df: pd.DataFrame, prefix: str) -> dict[str, float]:
     return _dist(prefix, (assigned - started)[valid])
 
 
+# ------------------------------------------------------------------ per-agent instrumentation
+
+def read_agent_metrics(run_dir: Path) -> dict[str, dict]:
+    """`{agent_id: payload}` from a run's metrics.json, or {} when it is absent/unreadable.
+
+    This is the file run_test.py only fills once every agent has reported for THIS run, so a
+    run carrying metrics_shortfall.json yields aggregates over a subset — already flagged as
+    `metrics_complete` on the same row.
+    """
+    path = run_dir / "metrics.json"
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, ValueError):
+        print(f"  warn: {run_dir.name}/metrics.json is unreadable", file=sys.stderr)
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return {str(k): v for k, v in payload.items() if isinstance(v, dict)}
+
+
+def instrumentation_metrics(agents: dict[str, dict]) -> dict[str, Any]:
+    """P0-4 columns: message cost, finalization, delegation context age, LLM token cost.
+
+    Per-agent counters are **summed**, not averaged: the quantity the message-complexity
+    figure predicts is fleet total per job, and a mean over agents silently divides by a
+    denominator (how many agents reported) that varies with metrics completeness.
+
+    The context-age distribution is recomputed from the per-decision rows rather than
+    averaging the per-agent summaries — a coordinator that made 400 decisions and one that
+    made 4 would otherwise weigh the same.
+    """
+    out: dict[str, Any] = {}
+    if not agents:
+        return out
+
+    sent = sent_bytes = recv = recv_bytes = dropped = 0
+    finalized = abandoned = 0
+    protocols: set[str] = set()
+    llm_calls = llm_failures = llm_in = llm_out = 0
+    have_messages = have_consensus = have_llm = False
+    finalize_s: list[float] = []
+    rounds: list[float] = []
+
+    for payload in agents.values():
+        instr = payload.get("instrumentation") or {}
+        messages = instr.get("messages")
+        if isinstance(messages, dict):
+            have_messages = True
+            sent += int(messages.get("sent_msgs", 0) or 0)
+            sent_bytes += int(messages.get("sent_bytes", 0) or 0)
+            recv += int(messages.get("recv_msgs", 0) or 0)
+            recv_bytes += int(messages.get("recv_bytes", 0) or 0)
+            dropped += int(messages.get("dropped_msgs", 0) or 0)
+        consensus = instr.get("consensus")
+        if isinstance(consensus, dict):
+            have_consensus = True
+            protocols.add(str(consensus.get("protocol", "")))
+            finalized += int(consensus.get("finalized", 0) or 0)
+            abandoned += int(consensus.get("abandoned", 0) or 0)
+            # Per-agent p50s, weighted equally on purpose: each is one agent's typical
+            # finalize, and the figure compares agents' experience across protocols.
+            for key, sink in (("finalize_s_p50", finalize_s), ("rounds_p50", rounds)):
+                value = consensus.get(key)
+                if value is not None:
+                    sink.append(float(value))
+        llm = instr.get("llm")
+        if isinstance(llm, dict):
+            for site in llm.values():
+                if not isinstance(site, dict):
+                    continue
+                have_llm = True
+                llm_calls += int(site.get("calls", 0) or 0)
+                llm_failures += int(site.get("failures", 0) or 0)
+                llm_in += int(site.get("input_tokens", 0) or 0)
+                llm_out += int(site.get("output_tokens", 0) or 0)
+
+    out["agents_reporting"] = len(agents)
+    if have_messages:
+        out["msgs_sent"] = sent
+        out["msgs_recv"] = recv
+        out["msg_bytes_sent"] = sent_bytes
+        out["msg_bytes_recv"] = recv_bytes
+        out["msgs_dropped"] = dropped
+    if have_consensus:
+        out["consensus_protocol"] = "/".join(sorted(p for p in protocols if p)) or float("nan")
+        out["consensus_finalized"] = finalized
+        out["consensus_abandoned"] = abandoned
+        out.update(_dist("finalize_s", pd.Series(finalize_s, dtype=float)))
+        out.update(_dist("rounds", pd.Series(rounds, dtype=float)))
+    if have_llm:
+        out["llm_calls"] = llm_calls
+        out["llm_failures"] = llm_failures
+        out["llm_input_tokens"] = llm_in
+        out["llm_output_tokens"] = llm_out
+
+    rows = decision_rows(agents)
+    if rows:
+        frame = pd.DataFrame(rows)
+        out["delegations"] = int(len(frame))
+        out.update(_dist("ctx_age", _numeric(frame, "ctx_age_mean")))
+        out.update(_dist("ctx_age_chosen", _numeric(frame, "ctx_age_chosen")))
+        out.update(_dist("decide_s", _numeric(frame, "decide_s")))
+        out["ctx_unknown_groups"] = int(_numeric(frame, "ctx_age_unknown").sum())
+        # Not a distribution statistic. Non-zero means child and coordinator clocks disagree,
+        # and the whole ctx_age column from this run should be treated as suspect.
+        out["ctx_skewed_ages"] = int(_numeric(frame, "ctx_age_skewed").sum())
+        for policy, count in frame["policy"].value_counts().items():
+            out[f"delegations_{policy}"] = int(count)
+    return out
+
+
+def decision_rows(agents: dict[str, dict]) -> list[dict[str, Any]]:
+    """Flatten every agent's `delegation_decisions` into rows tagged with the agent id."""
+    rows: list[dict[str, Any]] = []
+    for agent_id, payload in agents.items():
+        for record in payload.get("delegation_decisions") or []:
+            if not isinstance(record, dict):
+                continue
+            row = dict(record)
+            row["agent_id"] = agent_id
+            row["candidates"] = " ".join(str(g) for g in row.get("candidates") or [])
+            row["selected"] = " ".join(str(g) for g in row.get("selected") or [])
+            rows.append(row)
+    return rows
+
+
 def run_metrics(run_dir: Path, expected_jobs: int | None) -> dict[str, Any]:
     """Compute the full metric set for one run directory."""
     raw = read_jobs_csv(run_dir / RUN_MARKER)
@@ -373,6 +503,9 @@ def run_metrics(run_dir: Path, expected_jobs: int | None) -> dict[str, Any]:
         pending_df = read_jobs_csv(run_dir / filename)
         metrics[f"{level_name}_count"] = 0 if pending_df is None else int(len(pending_df))
 
+    # P0-4 instrumentation, from the per-agent payloads rather than the job CSVs.
+    metrics.update(instrumentation_metrics(read_agent_metrics(run_dir)))
+
     return metrics
 
 
@@ -439,6 +572,7 @@ def main() -> int:
 
     labels = parse_labels(args.label)
     records: list[dict[str, Any]] = []
+    decisions: list[dict[str, Any]] = []
 
     for root in args.root:
         root = root.expanduser().resolve()
@@ -463,6 +597,15 @@ def main() -> int:
             record.update(metrics)
             records.append(record)
 
+            # Per-decision rows for F6 and for the oracle's offline labelling (P1-1). Carried
+            # here rather than derived later because the factors that identify the run live
+            # in this loop and the rows are useless without them.
+            for row in decision_rows(read_agent_metrics(run_dir)):
+                row.update({"root": str(root),
+                            "run_dir": os.path.relpath(run_dir, root)})
+                row.update(factors)
+                decisions.append(row)
+
     if not records:
         print("No runs collected.", file=sys.stderr)
         return 1
@@ -481,6 +624,14 @@ def main() -> int:
     tidy = wide.melt(id_vars=id_cols, var_name="metric", value_name="value")
     tidy.to_csv(args.out / "runs_tidy.csv", index=False)
 
+    if decisions:
+        decision_frame = pd.DataFrame(decisions)
+        lead = [c for c in ("root", "run_dir", "agent_id", "ts", "job_id")
+                if c in decision_frame.columns]
+        decision_frame = decision_frame[
+            lead + [c for c in decision_frame.columns if c not in lead]]
+        decision_frame.to_csv(args.out / "decisions.csv", index=False)
+
     if args.group_by:
         group_cols = [c.strip() for c in args.group_by.split(",") if c.strip() in wide.columns]
     else:
@@ -492,6 +643,8 @@ def main() -> int:
         agg.to_csv(args.out / "config_agg.csv", index=False)
 
     print(f"\n{len(wide)} runs -> {args.out}")
+    if decisions:
+        print(f"  delegation decisions: {len(decisions)} -> decisions.csv")
     print(f"  grouped by: {', '.join(group_cols) if group_cols else '(nothing varies)'}")
     print(f"  configurations: {len(agg)}")
     return 0

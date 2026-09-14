@@ -55,6 +55,13 @@ class GroupSnapshot:
     # even when the arm is never tried — no refresh hysteresis after an
     # outage ends (design doc section 8.3).
     timeout_rate: float = 0.0
+    # When the freshest / stalest child record behind this snapshot was stamped, on the
+    # *child's* clock (P0-4). Timestamps rather than ages, because the age that matters is
+    # taken at the instant of the decision and an LLM delegation decides seconds after the
+    # snapshot is built. ``None`` means no observation at all — an unknown age, which is not
+    # the same as a large one and must never be substituted for one.
+    observed_at: Optional[float] = None
+    oldest_observed_at: Optional[float] = None
 
 
 def _headroom(total: float, used: float) -> float:
@@ -88,6 +95,7 @@ def snapshots_from_children(children, delegation_infos) -> Dict[int, GroupSnapsh
     for group, members in per_group.items():
         total_core = total_ram = total_gpu = 0.0
         used_core = used_ram = used_gpu = 0.0
+        stamps = []
         for child in members:
             caps = child.capacities
             alloc = child.capacity_allocations
@@ -97,12 +105,22 @@ def snapshots_from_children(children, delegation_infos) -> Dict[int, GroupSnapsh
             used_core += getattr(alloc, "core", 0) or 0
             used_ram += getattr(alloc, "ram", 0) or 0
             used_gpu += getattr(alloc, "gpu", 0) or 0
+            stamp = getattr(child, "last_updated", None)
+            if stamp:
+                stamps.append(float(stamp))
         snapshots[group] = GroupSnapshot(
             active_children=len(members),
             cpu_headroom=_headroom(total_core, used_core),
             ram_headroom=_headroom(total_ram, used_ram),
             gpu_headroom=_headroom(total_gpu, used_gpu),
             inflight=inflight.get(group, 0),
+            # A group's load view is only as fresh as the child records it was aggregated
+            # from. Both ends are kept: the newest says how recently the coordinator heard
+            # anything about the group at all, the oldest how stale the worst contributor to
+            # these headroom numbers is. A group of nine where one child went quiet reads as
+            # fresh on the first and stale on the second, and that is the honest answer.
+            observed_at=max(stamps) if stamps else None,
+            oldest_observed_at=min(stamps) if stamps else None,
         )
     return snapshots
 

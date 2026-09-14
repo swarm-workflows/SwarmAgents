@@ -27,13 +27,12 @@ def _bare_transport():
     t = GrpcTransport.__new__(GrpcTransport)
     t.logger = logging.getLogger("test-bcast")
     t.observers = []
-    t.broadcasts = 0
-    t.broadcast_time_total = 0.0
-    t.broadcast_time_max = 0.0
+    # The counters come from the shipped setup, not from a list rebuilt here: a double that
+    # assembles its own state stops testing the object that ships the moment one is added.
+    t._init_instrumentation()
     t._bcast_pool = None
     t._bcast_sem = None
     t.bcast_workers = 4
-    t.bcast_sends_dropped = 0
     return t
 
 
@@ -92,6 +91,18 @@ class ParallelBroadcastTests(unittest.TestCase):
             t.broadcast(payload=_msg(), peers=peers,
                         neighbor_map=_neighbor_map(peers), sender=1)
             self.assertGreater(t.bcast_sends_dropped, 0)
+
+            # P0-4: a shed fan-out send never reached the network, so it must appear in
+            # `dropped` and NOT in `sent`. Folding it into `sent` would understate the
+            # message cost per *delivered* message of exactly the saturated coordinator the
+            # scaling figure is about — and the counter class alone cannot catch that,
+            # because the mistake is at this call site.
+            # This double overrides `_send_raw`, which is where a real send is counted, so
+            # every message this transport counts as SENT is a shed one miscounted.
+            snap = t.counters.snapshot()
+            self.assertEqual(snap["dropped_msgs"], t.bcast_sends_dropped)
+            self.assertEqual(snap["sent_msgs"], 0,
+                             "a shed fan-out send must not be counted as sent")
         finally:
             if t._bcast_pool is not None:
                 t._bcast_pool.shutdown(wait=False)

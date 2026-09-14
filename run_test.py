@@ -301,6 +301,8 @@ def generate_configs(args, agent_hosts_list: list[str]) -> Path:
             gen_args += ["--groups-per-coordinator", str(args.groups_per_coordinator)]
     if getattr(args, "delegation_policy", None):
         gen_args += ["--delegation-policy", args.delegation_policy]
+    if getattr(args, "textfile_dir", None):
+        gen_args += ["--textfile-dir", str(args.textfile_dir)]
     # Pass initial group size for dynamic agent addition
     if hasattr(args, 'initial_group_size') and args.initial_group_size is not None:
         gen_args += ["--initial-group-size", str(args.initial_group_size)]
@@ -1025,6 +1027,13 @@ def parse_args() -> argparse.Namespace:
                          "(E4's arms). Overrides delegation.policy in the generated configs; "
                          "default is whatever the base config says. Recorded in run_meta.json, "
                          "so an arm is no longer selected by an unrecorded hand edit.")
+
+    ap.add_argument("--textfile-dir", default=None,
+                    help="node_exporter textfile collector directory on each agent host. "
+                         "Turns on the Prometheus export of the P0-4 counters (consensus "
+                         "messages and bytes, rounds to finalize, delegation context age, "
+                         "LLM tokens). metrics.json carries them either way, so this is for "
+                         "watching a run live rather than for the figures.")
 
     # Job generation
     ap.add_argument("--fit-all", action="store_true",

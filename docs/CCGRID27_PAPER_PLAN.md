@@ -136,6 +136,10 @@ Ten pages *including references* is roughly 8.5 of text. Budget:
 5. **F5 — churn.** Time-to-re-adoption after a group outage and rejoin, fixes on/off.
 6. **F6 — the link, or its absence.** Bandit regret under PBFT vs Snow at equal scale against
    context age. If the effect is null, this becomes a table in §VI and F1–F5 carry the paper.
+   Both axes now come from one collector run: context age per decision from `decisions.csv`
+   (P0-4), regret from the oracle labelling those same rows (P1-1, open). Report
+   `ctx_skewed_ages` in the caption — it is a validity number, not a result, and a non-zero
+   fleet total means the x-axis is clock skew rather than staleness.
 
 Two tables at most: the fleet/workload table and the E7 baseline comparison.
 
@@ -149,7 +153,7 @@ acknowledgements and the artifact URL before submitting.
 
 | By | Gate |
 |---|---|
-| **12 Oct** | Code freeze (unchanged). P0-4 instrumentation must include **context age at decision time**, or F6 cannot be produced at all — see §4 of the master plan |
+| **12 Oct** | Code freeze (unchanged). ~~P0-4 instrumentation must include **context age at decision time**~~ — **landed 2026-09-14**: per-decision context age is in `metrics.json`, the `[STATS]` line and `evaluation/collect.py`'s `decisions.csv`. F6's other half is **P1-1** (the oracle that turns a decision row into regret), now the only code item blocking a conference figure. First hardware exercise is the next slice run; check `ctx_skewed_ages` there, because a fleet whose clocks disagree has no usable age axis |
 | 13 Oct | Campaign starts. E0 first, then E1′, on the frozen revision, interleaved placement |
 | **10 Nov** | All E1′/E2 cells collected. **Gate: is the staleness effect (F6) real?** The answer decides whether the paper is "two mechanisms + an interaction" or "two mechanisms + a scale story", and the intro is written differently in each case |
 | 17 Nov | E3a/E5/E6 analysis complete; all six figures drafted from real data |

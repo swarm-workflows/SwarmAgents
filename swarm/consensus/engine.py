@@ -22,6 +22,8 @@
 # SOFTWARE.
 #
 # Author: Komal Thareja(kthare10@renci.org)
+import time
+
 from swarm.consensus.messages.proposal_info import ProposalContainer, ProposalInfo
 from swarm.consensus.messages.proposal import Proposal
 from swarm.consensus.messages.prepare import Prepare
@@ -29,6 +31,7 @@ from swarm.consensus.messages.commit import Commit
 from .interfaces import ConsensusHost, ConsensusTransport, TopologyRouter
 from ..models.agent_info import AgentInfo
 from ..models.object import ObjectState
+from ..utils.instrumentation import RunningStats
 from ..utils.tiebreak import dominates
 
 
@@ -52,6 +55,67 @@ class ConsensusEngine:
         # conflicts is diagnostic (per-job conflict counts, read by plotting); cap it so
         # long runs with high job churn can't grow it without bound.
         self._conflicts_max = 4096
+
+        # Finalization instrumentation (P0-4), measured at the PROPOSER only — the same
+        # vantage point the Snow engine measures from, so the two protocols' finalize-time
+        # distributions are comparable. A participant's clock would start when it first
+        # heard of the object, which is a different and shorter quantity.
+        #
+        # PBFT has no round count: its phase structure is fixed at proposal->prepare->commit,
+        # so what varies is how many votes a decision had to collect and how long that took.
+        # `votes_` is the analogue of Snow's `rounds_`; the mechanism figure pairs it with
+        # the per-agent message counts the transport records.
+        self._proposed_at: dict[str, float] = {}
+        self._proposed_at_max = 8192
+        self.time_to_finalize = RunningStats()
+        self.votes_to_finalize = RunningStats()
+        self.finalized_count = 0
+        self.reproposals = 0
+
+    def _mark_proposed(self, object_id: str, now: float) -> None:
+        """Stamp the start of a proposal attempt for *object_id*.
+
+        A re-proposal after a reselection timeout restarts the clock rather than extending
+        the first attempt's: the quantity the figure needs is how long the attempt that won
+        took, and carrying a timed-out attempt into it would report the reselection timeout
+        as consensus latency. The re-proposals are counted separately so the churn is not
+        lost — that is what `reselection_multiplier` in the collector is cross-checked against.
+        """
+        if object_id in self._proposed_at:
+            self.reproposals += 1
+        elif len(self._proposed_at) >= self._proposed_at_max:
+            self._proposed_at.pop(next(iter(self._proposed_at)), None)
+        self._proposed_at[object_id] = now
+
+    def _record_finalize(self, proposal: ProposalInfo) -> None:
+        """Record one finalization, at the proposer only."""
+        if proposal.agent_id != self.agent_id:
+            return
+        started = self._proposed_at.pop(proposal.object_id, None)
+        self.finalized_count += 1
+        self.votes_to_finalize.add(len(proposal.commits))
+        if started is not None:
+            self.time_to_finalize.add(time.time() - started)
+
+    def consensus_stats(self) -> dict:
+        """Per-agent finalization accounting, in the same shape the Snow engine emits.
+
+        `rounds_*` is absent by design rather than faked as a constant 3: PBFT's phase count
+        is fixed, so a column of 3s would invite a comparison of round counts across
+        protocols that means nothing. Compare `finalize_s_*` and the transport's message
+        counts instead.
+        """
+        stats: dict = {
+            "protocol": "pbft",
+            "finalized": self.finalized_count,
+            "abandoned": 0,  # PBFT leaves stuck objects to the reselection timeout
+            "reproposals": self.reproposals,
+            "conflict_rounds": sum(self.conflicts.values()),
+            "conflict_objects": len(self.conflicts),
+        }
+        stats.update(self.votes_to_finalize.summary("votes_"))
+        stats.update(self.time_to_finalize.summary("finalize_s_"))
+        return stats
 
     def _bump_conflict(self, object_id: str) -> None:
         if object_id not in self.conflicts and len(self.conflicts) >= self._conflicts_max:
@@ -114,11 +178,13 @@ class ConsensusEngine:
         msg = Proposal(source=self.agent_id,
                        agents=[AgentInfo(agent_id=self.agent_id)],
                        proposals=proposals)
+        now = time.time()
         for proposal in proposals:
             # Proposer implicitly prepares its own proposal
             if self.agent_id not in proposal.prepares:
                 proposal.prepares.append(self.agent_id)
             self.outgoing.add_proposal(proposal)
+            self._mark_proposed(proposal.object_id, now)
         self.transport.broadcast(payload=msg)
         #for proposal in proposals:
         #    self.outgoing.add_proposal(proposal)
@@ -308,6 +374,7 @@ class ConsensusEngine:
             self.host.log_debug(f"Is quorum? /{quorum}")
             if len(proposal.commits) >= quorum:
                 self.host.log_debug("Is quorum!!")
+                self._record_finalize(proposal)
                 # leader vs participant path
                 if proposal.agent_id == self.agent_id and self.outgoing.contains(object_id=proposal.object_id, p_id=proposal.p_id):
                     # I am leader, do selection

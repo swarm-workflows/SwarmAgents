@@ -18,6 +18,7 @@ What these tests hold to:
 import os
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -91,6 +92,7 @@ def make_agent(delegation=None, mab=None, ranking=None, error=None, with_delegat
     if delegation is not None:
         cfg["delegation"] = delegation
     a.config = cfg
+    a._init_instrumentation()
     a._init_llm_state()
     a.logger = _Log()
     a.agent_id = 1
@@ -479,6 +481,7 @@ def make_delegator(output, timeout_seconds=6):
     d.logger = _Log()
     d.provider = "openai"
     d._schema_cache = {}
+    d._init_instrumentation()
     d.agent = _RecordingAgent(output)
     return d
 
@@ -962,3 +965,134 @@ def test_openai_provider_honours_a_configured_base_url(monkeypatch):
     env = build_model(LlmConfig.from_dict(
         {"provider": "openai", "model": "m", "base_url": "https://config.example/v1"}))
     assert "env-wins.example" in str(env.client.base_url), "env must win over config"
+
+
+# --------------------------------------------------------------------------------------------
+# P0-4: one instrumented record per delegation, whatever the policy chain does.
+# --------------------------------------------------------------------------------------------
+
+def _timed_snapshots(a, groups, ages):
+    """Give the agent a child view whose per-group observation ages are `ages` seconds."""
+    now = time.time()
+    view = {g: GroupSnapshot(active_children=2, cpu_headroom=0.5,
+                             observed_at=now - ages[g], oldest_observed_at=now - ages[g])
+            for g in groups}
+    a._build_group_snapshots = lambda: view
+    if a.mab_manager is not None:
+        a.mab_manager._snapshot_provider = lambda: view
+    return view
+
+
+def test_one_record_per_delegation_even_when_the_llm_falls_back():
+    """`LlmAgent` re-enters the bandit through `super()._select_child_groups` on five
+    different fallback routes. Instrumenting the overridable method instead of wrapping it
+    would count a fallback twice and attribute the decision to the rule that failed."""
+    a = make_agent(delegation={"policy": "llm", "top_k": 1},
+                   mab={"top_k": 1, "groups": [1, 2, 3]},
+                   error=RuntimeError("provider down"))
+    _timed_snapshots(a, [1, 2, 3], {1: 1.0, 2: 2.0, 3: 3.0})
+    a._delegate_child_groups(_Job(), [1, 2, 3])
+    records = a.decision_log.records()
+    assert len(records) == 1
+    assert records[0]["policy"] == "bandit", "a fallback is a bandit decision, not an LLM one"
+    assert a.decision_log.summary()["by_policy"] == {"bandit": 1}
+
+
+def test_a_real_llm_decision_is_recorded_as_one():
+    a = make_agent(delegation={"policy": "llm", "top_k": 1},
+                   mab={"top_k": 1, "groups": [1, 2, 3]}, ranking=[3, 1, 2])
+    _timed_snapshots(a, [1, 2, 3], {1: 1.0, 2: 2.0, 3: 3.0})
+    selected = a._delegate_child_groups(_Job(), [1, 2, 3])
+    assert selected == [3]
+    record = a.decision_log.records()[0]
+    assert record["policy"] == "llm"
+    assert record["selected"] == [3]
+    assert record["candidates"] == [1, 2, 3]
+    assert record["ctx_age_chosen"] == pytest.approx(3.0, abs=0.5)
+
+
+def test_a_fan_out_covering_every_candidate_is_not_recorded_as_a_decision():
+    """`select_groups` returns every candidate without consulting the bandit when top_k
+    covers them all. Labelling that `bandit` would put inert delegations in the same bucket
+    as real ones — the inertness `_warn_if_delegation_cannot_choose` exists to surface."""
+    a = make_agent(mab={"top_k": 5, "groups": [1, 2, 3]})
+    _timed_snapshots(a, [1, 2, 3], {1: 1.0, 2: 1.0, 3: 1.0})
+    a._delegate_child_groups(_Job(), [1, 2, 3])
+    assert a.decision_log.summary()["by_policy"] == {"bandit_all": 1}
+
+
+def test_the_default_agent_with_no_bandit_records_the_pass_through():
+    a = make_agent()
+    _timed_snapshots(a, [1, 2, 3], {1: 4.0, 2: 4.0, 3: 4.0})
+    assert a._delegate_child_groups(_Job(), [1, 2, 3]) == [1, 2, 3]
+    assert a.decision_log.summary()["by_policy"] == {"all": 1}
+
+
+def test_the_age_recorded_covers_the_time_the_inference_took():
+    """The claim F6 tests is that a coordinator deciding later decides on older context. A
+    slow policy must therefore push the recorded age out by exactly its own latency, and
+    `decide_s` must be recorded alongside so the age at build is recoverable."""
+    a = make_agent(delegation={"policy": "llm", "top_k": 1},
+                   mab={"top_k": 1, "groups": [1, 2, 3]}, ranking=[1, 2, 3])
+
+    class _SlowDelegator:
+        def rank(self, *, job, groups):
+            time.sleep(0.3)
+            return [1], "slow", 0.3
+
+    a.delegator = _SlowDelegator()
+    _timed_snapshots(a, [1, 2, 3], {1: 1.0, 2: 1.0, 3: 1.0})
+    a._delegate_child_groups(_Job(), [1, 2, 3])
+    record = a.decision_log.records()[0]
+    assert record["decide_s"] >= 0.3
+    assert record["ctx_age_mean"] == pytest.approx(1.0 + record["decide_s"], abs=0.1)
+
+
+def test_the_model_and_the_age_describe_the_same_instant():
+    """The wrapper builds the view once and hands it down. If the LLM path rebuilt it, the
+    summaries the model reasoned over and the age recorded for the decision would be two
+    different observations of the world."""
+    a = make_agent(delegation={"policy": "llm", "top_k": 1},
+                   mab={"top_k": 1, "groups": [1, 2, 3]}, ranking=[2])
+    view = _timed_snapshots(a, [1, 2, 3], {1: 1.0, 2: 2.0, 3: 3.0})
+    seen = {}
+    original = a._group_summaries
+    a._group_summaries = lambda job, gids, snaps=None: seen.setdefault("snaps", snaps) or \
+        original(job, gids, snaps)
+    a._delegate_child_groups(_Job(), [1, 2, 3])
+    assert seen["snaps"] == view
+
+
+def test_instrumentation_failure_never_blocks_a_delegation():
+    """A metrics sink is not allowed to cost the run a job placement. This is the fault path
+    the recurring review finding says goes untested."""
+    a = make_agent(mab={"top_k": 1, "groups": [1, 2, 3]})
+    _timed_snapshots(a, [1, 2, 3], {1: 1.0, 2: 1.0, 3: 1.0})
+
+    def _boom():
+        raise RuntimeError("redis went away mid-build")
+
+    a.mab_manager._snapshot_provider = _boom
+    a._decision_snapshots = lambda gids: (_ for _ in ()).throw(RuntimeError("no view"))
+    selected = a._delegate_child_groups(_Job(), [1, 2, 3])
+    assert len(selected) == 1
+    record = a.decision_log.records()[0]
+    assert record["ctx_age_mean"] is None, "no view means no age, not a fabricated one"
+
+
+def test_textfile_export_is_off_unless_a_directory_is_configured():
+    """The shipped config leaves `instrumentation.textfile_dir` unset. An agent that wrote
+    .prom files into its cwd by default would litter every run directory on the slice."""
+    a = make_agent()
+    assert a._textfile_dir is None
+    a._export_textfile_metrics()  # must be a no-op, not an error
+
+
+def test_the_shipped_config_enables_the_decision_log():
+    """Test the default, not the example: `instrumentation` is a new block, and an agent
+    built from a config that predates it must still record decisions."""
+    a = LlmAgent.__new__(LlmAgent)
+    a.config = {}
+    a._init_instrumentation()
+    assert a.decision_log.summary()["decisions"] == 0
+    assert a._textfile_dir is None
