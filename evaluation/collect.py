@@ -50,6 +50,10 @@ from plotting.stats import jains_fairness  # noqa: E402
 
 # A run directory is anything holding this file.
 RUN_MARKER = "all_jobs.csv"
+
+#: Bids a run must have made before a 100% failure rate is called an outage rather than noise.
+#: Mirrors `LlmAgent._LLM_DEAD_MIN_CALLS`, which raises the same alarm while the run is live.
+LLM_DEAD_MIN_CALLS = 20
 META_FILE = "collect_meta.json"
 
 TOPOLOGY_ALIASES = {
@@ -365,6 +369,13 @@ def instrumentation_metrics(agents: dict[str, dict]) -> dict[str, Any]:
         out["llm_failures"] = llm_failures
         out["llm_input_tokens"] = llm_in
         out["llm_output_tokens"] = llm_out
+        # Derived HERE and not only from the `bidding` block, because that block exists only
+        # in payloads written after P0-8. Every LlmAgent run has this one, so a run archived
+        # before then showed `llm_calls` and `llm_failures` as two unremarkable integers among
+        # eighty columns with nothing computing the ratio — a wholly dead LLM plane reading as
+        # an ordinary row.
+        out["llm_failure_rate"] = (round(llm_failures / llm_calls, 6) if llm_calls
+                                   else float("nan"))
     if have_bidding:
         # P0-8. `llm_bid_jobs` is the fleet sum of distinct jobs each agent paid an LLM bid
         # for; over the jobs in the run it gives bidders-per-job, the ~3.7 that designated
@@ -396,6 +407,18 @@ def instrumentation_metrics(agents: dict[str, dict]) -> dict[str, Any]:
             # reselection rounds and dilute the share in the flattering direction.
             out["designate_forced_share"] = (round(forced / claimed_jobs, 6) if claimed_jobs
                                              else float("nan"))
+
+    # One flag, computed from whichever failure signal the payload happens to carry, so the
+    # answer does not depend on how old the run is. A run that trips this is not an LLM-plane
+    # measurement AND not a clean analytic baseline: a failed bid returns in ~0s, which is the
+    # race-to-propose regime. The minimum call count keeps a handful of bids from tripping it.
+    for calls, failures in ((bid_calls, bid_failures), (llm_calls, llm_failures)):
+        if calls >= LLM_DEAD_MIN_CALLS and failures >= calls:
+            out["llm_plane_dead"] = True
+            break
+    else:
+        if have_llm or have_bidding:
+            out["llm_plane_dead"] = False
 
     rows = decision_rows(agents)
     if rows:
@@ -694,6 +717,13 @@ def main() -> int:
             if not metrics:
                 print(f"  warn: no usable job data in {run_dir}", file=sys.stderr)
                 continue
+
+            if metrics.get("llm_plane_dead"):
+                print(f"  WARNING: {run_dir.name} — every LLM call failed. This run is 100% "
+                      f"analytic fallback: not an LLM-plane measurement, and not a clean "
+                      f"analytic baseline either (a failed bid returns in ~0s, which is the "
+                      f"race-to-propose regime). Check the model name against the provider "
+                      f"key's allowed list.", file=sys.stderr)
 
             record = {"root": str(root), "run_dir": os.path.relpath(run_dir, root)}
             record.update(factors)

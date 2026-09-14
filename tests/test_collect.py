@@ -442,3 +442,70 @@ class TestBiddersPerJob(unittest.TestCase):
             metrics = run_metrics(run_dir, expected_jobs=2)
             self.assertNotIn("bidders_per_job", metrics)
             self.assertNotIn("designate_forced_share", metrics)
+
+
+class TestDeadLlmPlaneIsFlaggedWhateverTheRunsAge(unittest.TestCase):
+    """A run whose every LLM call failed must not read as an ordinary row.
+
+    Measured on the slice 2026-09-14: the shipped config asked for `gpt-4o-mini` while the
+    gateway key allowed only `gpt-oss-20b` and friends, so all 924 bids returned 403 — and the
+    run completed 197/197 jobs and drained normally. It was neither an LLM-plane measurement
+    nor a clean analytic baseline (a failed bid returns in ~0 s, which is the race-to-propose
+    regime), yet nothing in the row said so.
+    """
+
+    ROWS = "j1,1,1,2,2,9,0,1,0.1,0.5\n"
+
+    def _run(self, root: Path, instr: dict) -> Path:
+        import json
+        run_dir = write_run(root, "hier-30/run01", self.ROWS)
+        (run_dir / "metrics.json").write_text(
+            json.dumps({"1": {"id": 1, "instrumentation": instr}}))
+        return run_dir
+
+    def test_a_legacy_payload_with_only_the_usage_block_is_still_flagged(self):
+        """The `bidding` block exists only in payloads written after P0-8. Deriving the rate
+        from it alone left every earlier LLM run with two unremarkable integers and no ratio."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._run(Path(tmp), {
+                "llm": {"bid": {"calls": 924, "failures": 924,
+                                "input_tokens": 0, "output_tokens": 0}}})
+            metrics = run_metrics(run_dir, expected_jobs=1)
+            self.assertAlmostEqual(metrics["llm_failure_rate"], 1.0)
+            self.assertTrue(metrics["llm_plane_dead"])
+
+    def test_a_current_payload_is_flagged_from_the_bidding_block(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._run(Path(tmp), {
+                "llm": {"bidding": {"designate_bidder": False, "bid_jobs": 40,
+                                    "bid_calls": 40, "bid_failures": 40}}})
+            metrics = run_metrics(run_dir, expected_jobs=1)
+            self.assertAlmostEqual(metrics["llm_bid_failure_rate"], 1.0)
+            self.assertTrue(metrics["llm_plane_dead"])
+
+    def test_a_working_plane_is_explicitly_not_dead(self):
+        """False, not absent: a missing column reads the same as a column nobody computed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._run(Path(tmp), {
+                "llm": {"bid": {"calls": 900, "failures": 12,
+                                "input_tokens": 1, "output_tokens": 1}}})
+            metrics = run_metrics(run_dir, expected_jobs=1)
+            self.assertFalse(metrics["llm_plane_dead"])
+            self.assertAlmostEqual(metrics["llm_failure_rate"], round(12 / 900, 6))
+
+    def test_a_handful_of_early_failures_is_not_an_outage(self):
+        """A run that made five bids and lost them all is noise, not an outage; a flag that
+        fires on that is a flag that gets ignored."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._run(Path(tmp), {
+                "llm": {"bid": {"calls": 5, "failures": 5,
+                                "input_tokens": 0, "output_tokens": 0}}})
+            metrics = run_metrics(run_dir, expected_jobs=1)
+            self.assertFalse(metrics["llm_plane_dead"])
+
+    def test_an_analytic_run_has_no_opinion_either_way(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._run(Path(tmp), {"messages": {"sent_msgs": 10}})
+            metrics = run_metrics(run_dir, expected_jobs=1)
+            self.assertNotIn("llm_plane_dead", metrics)
+            self.assertNotIn("llm_failure_rate", metrics)
