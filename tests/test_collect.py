@@ -558,3 +558,58 @@ class TestAnAbsentFailureCounterIsUnknownNotZero(unittest.TestCase):
             metrics = run_metrics(run_dir, expected_jobs=1)
             self.assertFalse(metrics["llm_plane_unchecked"])
             self.assertTrue(metrics["llm_plane_dead"])
+
+
+class TestPartialCounterCoverage(unittest.TestCase):
+    """A fleet on mixed revisions must not dilute one agent's failures across everyone's calls.
+
+    Real scenario, not hypothetical: a partial code push, or dynamic agents launched from an
+    older image. `bid_calls` was summed from every agent while `bid_failures` came only from
+    those that carried the counter, so with 1 of 30 agents reporting, a fleet in which EVERY
+    bid fails reads as a 3.3% failure rate — comfortably healthy.
+    """
+
+    ROWS = "j1,1,1,2,2,9,0,1,0.1,0.5\n"
+
+    def _run(self, root: Path, agents: dict) -> Path:
+        import json
+        run_dir = write_run(root, "hier-30/run01", self.ROWS)
+        (run_dir / "metrics.json").write_text(json.dumps(agents))
+        return run_dir
+
+    @staticmethod
+    def _bidding(calls, failures=None):
+        block = {"designate_bidder": False, "bid_jobs": calls, "bid_calls": calls}
+        if failures is not None:
+            block["bid_failures"] = failures
+        return {"id": 0, "instrumentation": {"llm": {"bidding": block}}}
+
+    def test_the_rate_is_computed_only_over_agents_that_reported_failures(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            agents = {"1": self._bidding(35, 35)}          # reports: all its bids failed
+            for i in range(2, 31):
+                agents[str(i)] = self._bidding(35)         # silent about failures
+            run_dir = self._run(Path(tmp), agents)
+            metrics = run_metrics(run_dir, expected_jobs=1)
+            self.assertAlmostEqual(metrics["llm_bid_failure_rate"], 1.0,
+                                   msg="one agent's failures over one agent's calls")
+            self.assertTrue(metrics["llm_plane_dead"])
+
+    def test_coverage_says_how_much_of_the_fleet_the_rate_speaks_for(self):
+        """Below 1.0 the rate describes a subset, so a healthy value says nothing about the
+        rest — the reader has to be able to see that."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._run(Path(tmp), {
+                "1": self._bidding(100, 2), "2": self._bidding(300)})
+            metrics = run_metrics(run_dir, expected_jobs=1)
+            self.assertAlmostEqual(metrics["llm_failure_coverage"], 0.25)
+            self.assertAlmostEqual(metrics["llm_bid_failure_rate"], 0.02)
+
+    def test_full_coverage_reports_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._run(Path(tmp), {
+                "1": self._bidding(100, 2), "2": self._bidding(300, 6)})
+            metrics = run_metrics(run_dir, expected_jobs=1)
+            self.assertAlmostEqual(metrics["llm_failure_coverage"], 1.0)
+            self.assertAlmostEqual(metrics["llm_bid_failure_rate"], 0.02)
+            self.assertFalse(metrics["llm_plane_dead"])

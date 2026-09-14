@@ -299,9 +299,9 @@ def instrumentation_metrics(agents: dict[str, dict]) -> dict[str, Any]:
     protocols: set[str] = set()
     llm_calls = llm_failures = llm_in = llm_out = 0
     bid_jobs = bid_calls = designated = forced = claimed_jobs = 0
-    bid_failures = 0
+    bid_failures = bid_calls_paired = llm_calls_paired = 0
     have_messages = have_consensus = have_llm = False
-    have_bidding = designate_on = have_bid_failures = False
+    have_bidding = designate_on = have_bid_failures = have_llm_failures = False
     finalize_s: list[float] = []
     rounds: list[float] = []
 
@@ -335,14 +335,23 @@ def instrumentation_metrics(agents: dict[str, dict]) -> dict[str, Any]:
                 if key == "bidding":       # P0-8 counters, not a per-call-site usage block
                     have_bidding = True
                     bid_jobs += int(site.get("bid_jobs", 0) or 0)
-                    bid_calls += int(site.get("bid_calls", 0) or 0)
+                    calls_here = int(site.get("bid_calls", 0) or 0)
+                    bid_calls += calls_here
                     # Presence is tracked, not defaulted. `bid_failures` was added after the
                     # first payloads that carried a `bidding` block, and reading its absence
                     # as 0 makes a run where EVERY bid failed report a 0.0 failure rate — a
                     # perfectly healthy plane. Absent is unknown, never zero.
+                    #
+                    # The denominator is PAIRED with the numerator: only calls from agents
+                    # that also reported their failures. A fleet on mixed revisions — a
+                    # partial push, dynamic agents from an older image — would otherwise
+                    # divide one agent's failures by thirty agents' calls. With 1 of 30
+                    # reporting, a fleet in which every single bid fails reads as a 3.3%
+                    # failure rate.
                     if "bid_failures" in site:
                         have_bid_failures = True
                         bid_failures += int(site.get("bid_failures", 0) or 0)
+                        bid_calls_paired += calls_here
                     designated += int(site.get("designate_mine", 0) or 0)
                     forced += int(site.get("designate_forced", 0) or 0)
                     # The agent already resolved the mine/forced overlap into a union; the
@@ -352,8 +361,13 @@ def instrumentation_metrics(agents: dict[str, dict]) -> dict[str, Any]:
                         designate_on = True
                     continue
                 have_llm = True
-                llm_calls += int(site.get("calls", 0) or 0)
-                llm_failures += int(site.get("failures", 0) or 0)
+                site_calls = int(site.get("calls", 0) or 0)
+                llm_calls += site_calls
+                # Paired for the same reason as the bidding counters above.
+                if "failures" in site:
+                    have_llm_failures = True
+                    llm_failures += int(site.get("failures", 0) or 0)
+                    llm_calls_paired += site_calls
                 llm_in += int(site.get("input_tokens", 0) or 0)
                 llm_out += int(site.get("output_tokens", 0) or 0)
 
@@ -380,8 +394,9 @@ def instrumentation_metrics(agents: dict[str, dict]) -> dict[str, Any]:
         # before then showed `llm_calls` and `llm_failures` as two unremarkable integers among
         # eighty columns with nothing computing the ratio — a wholly dead LLM plane reading as
         # an ordinary row.
-        out["llm_failure_rate"] = (round(llm_failures / llm_calls, 6) if llm_calls
-                                   else float("nan"))
+        if have_llm_failures:
+            out["llm_failure_rate"] = (round(llm_failures / llm_calls_paired, 6)
+                                       if llm_calls_paired else float("nan"))
     if have_bidding:
         # P0-8. `llm_bid_jobs` is the fleet sum of distinct jobs each agent paid an LLM bid
         # for; over the jobs in the run it gives bidders-per-job, the ~3.7 that designated
@@ -399,7 +414,12 @@ def instrumentation_metrics(agents: dict[str, dict]) -> dict[str, Any]:
         # than reported as 0.
         if have_bid_failures:
             out["llm_bid_failures"] = bid_failures
-            out["llm_bid_failure_rate"] = (round(bid_failures / bid_calls, 6) if bid_calls
+            out["llm_bid_failure_rate"] = (round(bid_failures / bid_calls_paired, 6)
+                                           if bid_calls_paired else float("nan"))
+            # How much of the fleet's bidding the rate above actually covers. Below 1.0 the
+            # rate describes a subset of the agents, so a healthy-looking value says nothing
+            # about the rest.
+            out["llm_failure_coverage"] = (round(bid_calls_paired / bid_calls, 6) if bid_calls
                                            else float("nan"))
         if designate_on:
             out["designate_designated"] = designated
@@ -427,9 +447,9 @@ def instrumentation_metrics(agents: dict[str, dict]) -> dict[str, Any]:
     # one of 924 bids failed report a 0.0 failure rate.
     signals = []
     if have_bid_failures:
-        signals.append((bid_calls, bid_failures))
-    if have_llm:
-        signals.append((llm_calls, llm_failures))
+        signals.append((bid_calls_paired, bid_failures))
+    if have_llm_failures:
+        signals.append((llm_calls_paired, llm_failures))
     if not signals:
         if have_bidding or have_llm:
             out["llm_plane_unchecked"] = True
