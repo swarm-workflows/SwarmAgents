@@ -585,6 +585,7 @@ class TestPartialCounterCoverage(unittest.TestCase):
         return {"id": 0, "instrumentation": {"llm": {"bidding": block}}}
 
     def test_the_rate_is_computed_only_over_agents_that_reported_failures(self):
+        """Paired: one agent's failures over that agent's calls, never over the fleet's."""
         with tempfile.TemporaryDirectory() as tmp:
             agents = {"1": self._bidding(35, 35)}          # reports: all its bids failed
             for i in range(2, 31):
@@ -593,6 +594,31 @@ class TestPartialCounterCoverage(unittest.TestCase):
             metrics = run_metrics(run_dir, expected_jobs=1)
             self.assertAlmostEqual(metrics["llm_bid_failure_rate"], 1.0,
                                    msg="one agent's failures over one agent's calls")
+
+    def test_a_thin_slice_does_not_condemn_the_whole_fleet(self):
+        """The pairing fix, taken alone, swaps one error for its mirror image. If the single
+        agent carrying the counter is the broken one — a host with a bad key — the covered
+        rate is 1.0 and the WHOLE run gets classified dead while 29 of 30 agents bid fine.
+        Both errors are wrong, so a verdict needs coverage behind it: the rate is still
+        reported over the subset it measures, but no fleet conclusion is drawn from it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            agents = {"1": self._bidding(35, 35)}
+            for i in range(2, 31):
+                agents[str(i)] = self._bidding(35)
+            run_dir = self._run(Path(tmp), agents)
+            metrics = run_metrics(run_dir, expected_jobs=1)
+            self.assertLess(metrics["llm_failure_coverage"], 0.1)
+            self.assertNotIn("llm_plane_dead", metrics, "3% of the fleet cannot condemn it")
+            self.assertTrue(metrics["llm_plane_unchecked"])
+
+    def test_a_well_covered_outage_is_still_called(self):
+        """Coverage must gate the verdict without suppressing it: when the counter really does
+        speak for the fleet, a total outage is still a total outage."""
+        with tempfile.TemporaryDirectory() as tmp:
+            agents = {str(i): self._bidding(35, 35) for i in range(1, 31)}
+            run_dir = self._run(Path(tmp), agents)
+            metrics = run_metrics(run_dir, expected_jobs=1)
+            self.assertAlmostEqual(metrics["llm_failure_coverage"], 1.0)
             self.assertTrue(metrics["llm_plane_dead"])
 
     def test_coverage_says_how_much_of_the_fleet_the_rate_speaks_for(self):

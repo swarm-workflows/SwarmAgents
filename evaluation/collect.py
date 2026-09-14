@@ -54,6 +54,13 @@ RUN_MARKER = "all_jobs.csv"
 #: Bids a run must have made before a 100% failure rate is called an outage rather than noise.
 #: Mirrors `LlmAgent._LLM_DEAD_MIN_CALLS`, which raises the same alarm while the run is live.
 LLM_DEAD_MIN_CALLS = 20
+
+#: Fraction of a run's bidding a failure counter must cover before it may speak for the whole
+#: fleet. Below this the rate is still reported — over the subset it actually measures — but no
+#: verdict is drawn from it, because the two possible errors are symmetric and both wrong: a
+#: counter present on a few healthy agents hides a fleet-wide outage, and a counter present
+#: only on one broken agent condemns a fleet that was 29/30 fine.
+LLM_COVERAGE_MIN = 0.9
 META_FILE = "collect_meta.json"
 
 TOPOLOGY_ALIASES = {
@@ -445,18 +452,25 @@ def instrumentation_metrics(agents: dict[str, dict]) -> dict[str, Any]:
     # `llm_plane_unchecked` says so. "We checked and it is fine" and "we could not check" must
     # not be the same value: reading a missing counter as zero is what let a run where every
     # one of 924 bids failed report a 0.0 failure rate.
+    # (covered calls, failures, total calls) for each signal the payload actually carries.
     signals = []
     if have_bid_failures:
-        signals.append((bid_calls_paired, bid_failures))
+        signals.append((bid_calls_paired, bid_failures, bid_calls))
     if have_llm_failures:
-        signals.append((llm_calls_paired, llm_failures))
-    if not signals:
+        signals.append((llm_calls_paired, llm_failures, llm_calls))
+    # Only signals that cover enough of the fleet may decide. A verdict drawn from a thin
+    # slice is wrong in both directions and the two errors are symmetric: a counter that
+    # happens to sit on a few healthy agents hides a fleet-wide outage, and one that sits on a
+    # single broken agent condemns a fleet that was 29 of 30 fine.
+    deciding = [(c, f) for c, f, total in signals
+                if total and c / total >= LLM_COVERAGE_MIN and c]
+    if not deciding:
         if have_bidding or have_llm:
             out["llm_plane_unchecked"] = True
     else:
         out["llm_plane_unchecked"] = False
         out["llm_plane_dead"] = any(
-            calls >= LLM_DEAD_MIN_CALLS and failures >= calls for calls, failures in signals)
+            calls >= LLM_DEAD_MIN_CALLS and failures >= calls for calls, failures in deciding)
 
     rows = decision_rows(agents)
     if rows:
@@ -757,9 +771,13 @@ def main() -> int:
                 continue
 
             if metrics.get("llm_plane_unchecked"):
-                print(f"  WARNING: {run_dir.name} — this run used the LLM plane but carries no "
-                      f"failure counter, so whether its bids worked CANNOT be determined. Do "
-                      f"not read its absence as health.", file=sys.stderr)
+                cov = metrics.get("llm_failure_coverage")
+                detail = ("carries no failure counter" if not cov or cov != cov else
+                          f"has a failure counter covering only {cov:.1%} of its bidding")
+                print(f"  WARNING: {run_dir.name} — this run used the LLM plane but {detail}, "
+                      f"so whether its bids worked CANNOT be determined for the fleet. Any "
+                      f"rate on this row describes only the covered agents; do not read it, "
+                      f"or its absence, as health.", file=sys.stderr)
             if metrics.get("llm_plane_dead"):
                 print(f"  WARNING: {run_dir.name} — every LLM call failed. This run is 100% "
                       f"analytic fallback: not an LLM-plane measurement, and not a clean "
