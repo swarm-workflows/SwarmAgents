@@ -374,6 +374,46 @@ def instrumentation_metrics(agents: dict[str, dict]) -> dict[str, Any]:
     return out
 
 
+def regret_metrics(run_dir: Path) -> dict[str, Any]:
+    """Delegation regret against the offline optimum (P1-1), when the run can be scored.
+
+    Silently absent rather than NaN for a run with no injected failure profile: with every
+    group equally good there is no optimum to be short of, and a zero-filled regret column
+    would read as a perfect policy instead of as no measurement. `evaluation/oracle.py`
+    refuses those runs for the same reason, and this mirrors it.
+    """
+    try:
+        from evaluation.oracle import OracleError, load_run, score_run
+    except ImportError:
+        return {}
+    try:
+        rows, summary = score_run(load_run(run_dir))
+    except OracleError:
+        return {}
+    except Exception as exc:  # a broken run must not take the whole collection down
+        print(f"  warn: regret scoring failed for {run_dir.name}: {exc}", file=sys.stderr)
+        return {}
+
+    out = {
+        "regret_total": summary["regret_total"],
+        "regret_mean": summary["regret_mean"],
+        "routing_accuracy": summary["routing_accuracy"],
+        "regret_decisions_scored": summary["decisions_scored"],
+        "regret_aggregate": summary["regret_aggregate"],
+    }
+    # The staleness figure (F6) is regret against context age, so the correlation between
+    # them belongs on the same row as both — otherwise every plot of it starts by rejoining
+    # two files.
+    paired = [(r["ctx_age_mean"], r["regret"]) for r in rows
+              if r.get("ctx_age_mean") is not None]
+    if len(paired) > 2:
+        ages = pd.Series([p[0] for p in paired], dtype=float)
+        regrets = pd.Series([p[1] for p in paired], dtype=float)
+        if ages.std(ddof=1) > 0 and regrets.std(ddof=1) > 0:
+            out["regret_ctx_age_corr"] = round(float(ages.corr(regrets)), 6)
+    return out
+
+
 def decision_rows(agents: dict[str, dict]) -> list[dict[str, Any]]:
     """Flatten every agent's `delegation_decisions` into rows tagged with the agent id."""
     rows: list[dict[str, Any]] = []
@@ -513,6 +553,8 @@ def run_metrics(run_dir: Path, expected_jobs: int | None) -> dict[str, Any]:
 
     # P0-4 instrumentation, from the per-agent payloads rather than the job CSVs.
     metrics.update(instrumentation_metrics(read_agent_metrics(run_dir)))
+    # P1-1 regret, when the run archived the failure profile it was scored against.
+    metrics.update(regret_metrics(run_dir))
 
     return metrics
 

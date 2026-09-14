@@ -29,8 +29,8 @@ Sep 6. At the time of this review **none of the P0 code existed in the tree** �
 `evaluation/oracle.py`. P0-0 and P0-5..P0-7 landed on 2026-09-08, and **P0-1 landed the same day**
 (`swarm/agents/llm/llm_delegator.py`, `delegation.policy`). **P0-4 landed 2026-09-14**
 (`swarm/utils/instrumentation.py`), which closes the one item neither paper's figure list could
-route around; P0-8, P0-2/P0-3 and P1-1 are still open, and P1-1 is now the only code item on a
-conference figure's critical path. P1-2 (`collect.py`) and P1-3 (site-aware configs) are done. The critical path is ~3 weeks behind, which is the practical reason
+route around, and **P1-1 landed the same day** (`evaluation/oracle.py`), which was the last
+one. P0-8 and P0-2/P0-3 remain open; none of them blocks a conference figure. P1-2 (`collect.py`) and P1-3 (site-aware configs) are done. The critical path is ~3 weeks behind, which is the practical reason
 the journal target is right: a Nov 24 abstract was no longer reachable with an honest campaign.
 IPDPS'27 (abstract Oct 2, paper Oct 9, 2026) is out for the same reason and should not be named
 as a fallback.
@@ -757,8 +757,8 @@ reviews return in months, so keep the deployment reproducible from `SWARM-2slice
 | Wk | Dates | Milestone | Gate |
 |---|---|---|---|
 | 1 | Sep 8–14 | ~~Pre-campaign fixes (§0.2)~~, ~~P0-5~~, ~~P0-1~~ done Sep 8. ~~Metrics attribution (§0.8)~~ and ~~Hier-30 smoke on the slice~~ done Sep 9-10; the smoke pair is `runs/smoke-g3-*`, both arms 30/30 agents reporting. Confirm GPU node status and slice lease horizon. | Smoke green ✅ |
-| 2–4 | Sep 15–Oct 5 | ~~P0-4 instrumentation~~ **done 2026-09-14, ahead of this window** — context age lands in `decisions.csv`. Window now goes to **P1-1 oracle** (the other half of F6) and P0-8 designated bidder. vLLM bring-up moves *after* the conference (E4 is journal-only). | Regret vs context age plottable end to end from one collector run |
-| 5 | Oct 6–12 | P1-1 oracle (E2's regret axis — conference-critical). P0-2/P0-3 slip to the journal window with E4. Pilot one cell each of **E1′ and E2** end-to-end at Hier-30 with `--groups-per-coordinator 2` and interleaved placement; verify every §7 metric lands. | **Code freeze Oct 12** — tag it |
+| 2–4 | Sep 15–Oct 5 | ~~P0-4 instrumentation~~ and ~~P1-1 oracle~~ **both done 2026-09-14, ahead of this window** — regret and context age land on the same collected row. Window now goes to P0-8 designated bidder and an early E2 pilot. vLLM bring-up moves *after* the conference (E4 is journal-only). | ✅ Regret vs context age plottable end to end from one collector run (`regret_ctx_age_corr`) |
+| 5 | Oct 6–12 | ~~P1-1 oracle~~ **done 2026-09-14, ahead of this window.** P0-2/P0-3 slip to the journal window with E4. Pilot one cell each of **E1′ and E2** end-to-end at Hier-30 with `--groups-per-coordinator 2` and interleaved placement; verify every §7 metric lands. | **Code freeze Oct 12** — tag it |
 | 6–8 | Oct 13–Nov 2 | **Conference campaign:** E0 (gate) → E1′ → E2, on the frozen revision, interleaved hosts file, Hier-30 / Hier-80 at 1 agent/VM and Mesh-180 / Hier-270 dense. E6 accumulates for free. **Start writing §III design from Oct 20.** | E0 reference established |
 | 9 | Nov 3–9 | E5 (needs P0-4 + the ladder), E7 external baselines, E3a re-analysis of the E1′ pull by RTT bin. | E1′ + E2 + E5 + E7 complete |
 | **10** | **Nov 10** | **Staleness gate.** Is bandit regret lower under Snow at equal scale, against context age (F6)? Yes → the paper is two mechanisms **plus an interaction**. No → two mechanisms plus a scale story, F6 becomes a §VI table. **The title and abstract differ between these.** | Answer recorded, not deferred |
@@ -820,11 +820,17 @@ The split (§0.9) changes what is on the critical path. In order:
    clean — `ctx_skewed_ages` 0, 436-545 decisions, ages p50 0.25-0.44 s / p95 7.0-8.7 s — and
    the headline series moved to a monotonic clock so it no longer depends on the fleet staying
    fixed. Every campaign cell should run `./fix_slice_clocks.sh --check` first.
-2. **P1-1 oracle** (`evaluation/oracle.py`) — now the single most schedule-critical code item.
-   E2's regret axis is a conference figure (F4) and regret needs the oracle; F6 plots that
-   regret against the context age P0-4 now records, so the oracle is the remaining half of the
-   interaction claim. It joins against `decisions.csv`, whose rows already carry the job id,
-   job type, candidate set, chosen set and decision timestamp it needs.
+2. ~~**P1-1 oracle**~~ **Done 2026-09-14** (see the P1-1 row). Regret and routing accuracy
+   land on the collected row beside the context age, so **F6 is one collector run**. With P0-4
+   this clears every code item that was blocking a conference figure; what remains before the
+   freeze is P0-8 and the campaign itself.
+2b. **Two pre-run checks, both learned the hard way, both cheap.** `./fix_slice_clocks.sh
+   --check` — the fleet's clocks were wrong for a month with nothing reporting it, and
+   `ctx_skewed_ages`/`ctx_skew_max_s` on the collected row are the post-hoc evidence. And for
+   any cell whose figure is regret, `oracle.py --validate` on the cell's first run: it is the
+   only thing that catches a failure profile that does not describe the run, and a profile
+   whose contrast runs *between* coordinators rather than within each one yields a meaningless
+   `routing_accuracy` of 1.0.
 3. **Confirm the slice lease horizon.** Still the only hard external clock. The **GPU node
    dropped off the critical path** — everything it serves (E4, the model-capability sweep) is
    journal-only — so confirm it, but do not wait on it.

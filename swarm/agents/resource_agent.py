@@ -2420,6 +2420,11 @@ class ResourceAgent(Agent):
             "failed_agents_count": len(self.failed_agents),
             "final_quorum": self.calculate_quorum(),
             "infeasible_retired": getattr(self.metrics, 'infeasible_retired', []),
+            # When THIS agent's failure-simulation clock started. Failure phases are resolved
+            # against it per agent, and a 30-host remote launch spreads starts over a minute,
+            # so the oracle (P1-1) cannot resolve which phase a decision fell in from the run
+            # start alone -- it would misattribute every decision near a phase boundary.
+            "failure_sim_start": getattr(self, "failure_sim_start", None),
         }
         if self.mab_enabled and self.mab_manager:
             agent_metrics["mab_stats"] = copy.deepcopy(self.mab_manager.get_stats())
@@ -3023,6 +3028,18 @@ class ResourceAgent(Agent):
         (agent, job type) — the regime where contextual delegation beats
         context-blind (see docs/CONTEXTUAL_BANDIT_DESIGN.md section 8)."""
         entry = per_agent.get(agent_key)
+        if entry is None:
+            # YAML parses `{3: 0.5}` -- the form this config's own comment documents -- with
+            # INT keys, while every caller passes `str(agent_id)`. So the documented form
+            # matched nothing and every agent silently fell through to the base rate, which
+            # is the whole point of a per-agent profile gone. It also made the run and the
+            # oracle disagree: `run_meta.json` archives the profile through JSON, whose keys
+            # are always strings, so the oracle WOULD match a key the run had ignored and
+            # would score routing against a world the run never ran in.
+            try:
+                entry = per_agent.get(int(agent_key))
+            except (TypeError, ValueError):
+                entry = None
         if entry is not None:
             if isinstance(entry, dict):
                 if job_type is not None and job_type in entry:

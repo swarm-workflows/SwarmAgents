@@ -287,3 +287,66 @@ class TestInstrumentationColumns(unittest.TestCase):
             metrics = run_metrics(run_dir, expected_jobs=1)
             self.assertEqual(metrics["jobs_completed"], 1)
             self.assertNotIn("msgs_sent", metrics)
+
+
+class TestRegretColumns(unittest.TestCase):
+    """P1-1 regret, folded into the same wide row as the context age it is plotted against."""
+
+    ROWS = "j1,1,1,2,2,9,0,1,0.1,0.5\n"
+
+    def _run(self, root: Path, ground_truth: dict, decisions: list) -> Path:
+        import json
+        run_dir = write_run(root, "hier-30/run01", self.ROWS)
+        (run_dir / "run_meta.json").write_text(
+            json.dumps({"started_at": 900.0, "ground_truth": ground_truth}))
+        (run_dir / "metrics.json").write_text(json.dumps({
+            "9": {"id": 9, "failure_sim_start": 900.0,
+                  "delegation_decisions": decisions}}))
+        (run_dir / "all_agents.csv").write_text(json.dumps([
+            {"agent_id": 1, "group": 0, "level": 0},
+            {"agent_id": 2, "group": 1, "level": 0},
+        ]))
+        return run_dir
+
+    @staticmethod
+    def _truth():
+        return {"enabled": True, "failure_probability": 0.1,
+                "per_agent_failure_rates": {"1": 0.8, "2": 0.05},
+                "per_job_type_failure_rates": {}, "phases": [], "reward": {}}
+
+    @staticmethod
+    def _decision(selected, job="j", ts=1000.0, age=1.0):
+        return {"ts": ts, "job_id": job, "job_type": "cpu", "policy": "bandit",
+                "candidates": [0, 1], "selected": selected, "decide_s": 0.001,
+                "ctx_age_mean": age, "ctx_age_chosen": age}
+
+    def test_regret_lands_on_the_wide_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._run(Path(tmp), self._truth(), [
+                self._decision([0], job="a"), self._decision([1], job="b", ts=1001.0)])
+            metrics = run_metrics(run_dir, expected_jobs=1)
+            self.assertAlmostEqual(metrics["regret_total"], 1.5)
+            self.assertAlmostEqual(metrics["routing_accuracy"], 0.5)
+            self.assertEqual(metrics["regret_decisions_scored"], 2)
+
+    def test_a_run_with_no_injected_profile_gets_no_regret_columns(self):
+        """Absent, not zero. A zero-filled regret column on a run that had no optimum to be
+        short of reads as a perfect policy rather than as no measurement, and it would be
+        averaged into `config_agg.csv` alongside runs that were really scored."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._run(Path(tmp), {"enabled": False}, [self._decision([0])])
+            metrics = run_metrics(run_dir, expected_jobs=1)
+            self.assertNotIn("regret_total", metrics)
+            self.assertNotIn("routing_accuracy", metrics)
+
+    def test_regret_against_context_age_is_correlated_on_the_same_row(self):
+        """F6 is regret vs context age; carrying the correlation here means a plot of it does
+        not begin by rejoining two files."""
+        with tempfile.TemporaryDirectory() as tmp:
+            decisions = [self._decision([0] if i % 2 else [1], job=f"j{i}",
+                                        ts=1000.0 + i, age=float(i))
+                         for i in range(8)]
+            run_dir = self._run(Path(tmp), self._truth(), decisions)
+            metrics = run_metrics(run_dir, expected_jobs=1)
+            self.assertIn("regret_ctx_age_corr", metrics)
+            self.assertTrue(-1.0 <= metrics["regret_ctx_age_corr"] <= 1.0)

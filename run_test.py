@@ -760,6 +760,54 @@ def _effective_delegation_policy(args) -> str | None:
         return None
 
 
+def _effective_config(args) -> dict:
+    """The config the agents of this run will actually read.
+
+    Same resolution order as `_effective_delegation_policy`: the pre-existing config
+    directory under --use-config-dir, else the base config the generator copies from.
+    """
+    candidates = [BASE_CONFIG]
+    if getattr(args, "use_config_dir", False):
+        cfg_dir = Path(getattr(args, "config_dir", "configs"))
+        candidates = sorted(cfg_dir.glob("*.yml"))[:1] or candidates
+    try:
+        from swarm.utils.yaml_strict import safe_load
+        with open(candidates[0]) as f:
+            return safe_load(f) or {}
+    except Exception:
+        return {}
+
+
+def _ground_truth(args) -> dict:
+    """The injected failure profile and reward shape, archived with the run.
+
+    Delegation regret (P1-1) is computed against these: they are what decides whether a
+    delegated job fails, so they are the only definition of a "right" routing choice. They
+    live in the base config, which is edited between arms — so a regret number computed a
+    week later from whatever the config says *then* would silently be scored against a
+    profile the run never ran under. The ground truth has to travel with the run.
+
+    Empty when failure simulation is off, which is the shipped default; the oracle then
+    reports that the run has no signal to compute regret from rather than inventing one.
+    """
+    mab = (_effective_config(args).get("mab") or {})
+    sim = mab.get("failure_simulation") or {}
+    if not sim.get("enabled"):
+        return {"enabled": False}
+    return {
+        "enabled": True,
+        "failure_probability": sim.get("failure_probability", 0.1),
+        "per_agent_failure_rates": sim.get("per_agent_failure_rates", {}),
+        "per_job_type_failure_rates": sim.get("per_job_type_failure_rates", {}),
+        "phases": sim.get("phases", []) or [],
+        # The reward the bandit was actually given, so the oracle scores on the same scale
+        # the policy was optimising rather than an assumed one.
+        "reward": mab.get("reward", {}),
+        "algorithm": mab.get("algorithm"),
+        "top_k": mab.get("top_k"),
+    }
+
+
 def _hosts_file_for_stop(args, host_list: list[str] | None) -> str:
     """Path to a hosts file the stop script can read, writing one if needed.
 
@@ -1170,6 +1218,9 @@ def main() -> None:
             "jobs": args.jobs,
             "delegation_policy": _effective_delegation_policy(args),
             "groups_per_coordinator": getattr(args, "groups_per_coordinator", 1),
+            # What made a delegated job fail, and what the bandit was rewarded with. The
+            # oracle (P1-1) scores routing choices against exactly this.
+            "ground_truth": _ground_truth(args),
             "argv": sys.argv,
         }, f, indent=2)
 
