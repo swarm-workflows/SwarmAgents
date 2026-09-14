@@ -175,6 +175,15 @@ class LlmAgent(ResourceAgent):
         """
         bid_started_at = time.time()
         try:
+            # FIRST statement in the try, so an attempt is counted from the moment this path is
+            # entered. It used to sit just above `bidder.score(...)`, below the payload build,
+            # the peer-context gather and the log line — and the `except` below counts a
+            # failure. So anything failing in that gap incremented failures with no matching
+            # attempt: `bid_failures` could exceed `bid_calls`, and if EVERY bid failed there
+            # (a broken peer-context gather, say) the run reported bid_calls=0, a NaN failure
+            # rate, and no [LLM_PLANE_DEAD] warning at all — because that check needs a
+            # minimum number of calls. A wholly dead plane would have looked untouched.
+            self._note_bid(getattr(job, "job_id", None))
             payload_job = job.to_dict(compact=True)
             payload_agent = agent.to_dict() if hasattr(agent, "to_dict") else json.loads(agent.to_json())
 
@@ -187,11 +196,11 @@ class LlmAgent(ResourceAgent):
                 f"GatheringPeerContext=yes Peers={len(peer_context.get('peer_agents', {}))}"
             )
 
-            # Counted here, not at the call site that selected the job: this is the line that
-            # actually spends an inference, and it is the only thing bidders-per-job should
-            # count. A cache hit in SelectionEngine never reaches it, which is correct — a
-            # reused cost is not a bid.
-            self._note_bid(getattr(job, "job_id", None))
+            # `bid_calls` is ATTEMPTS on the LLM plane — what designation partitions and what
+            # bidders-per-job is about. The count of inferences that actually reached the
+            # model is a different number and lives in `llm.bid.calls` (LlmUsage), so the two
+            # readings stay separable. A cache hit in SelectionEngine reaches neither, which
+            # is correct: a reused cost is not a bid.
             # Pass peer context to LLM bidder
             bid = self.bidder.score(
                 job=payload_job,
@@ -238,6 +247,11 @@ class LlmAgent(ResourceAgent):
                 self.logger.exception("Failed to save LLM bidder: %s", e)
             return cost
         except Exception as e:
+            try:
+                self._bid_failures += 1
+                self._warn_if_the_llm_plane_is_dead(e)
+            except Exception:
+                pass   # accounting must never be why a bid fails differently
             if self.llm_disable_fallback:
                 # Ablation: the analytic safety net is removed, so a failed bid means this agent
                 # simply does not bid. An infinite cost is how SelectionEngine expresses "not a
@@ -964,6 +978,8 @@ class LlmAgent(ResourceAgent):
         # priced a job, not how many times one of them did.
         self._bid_job_ids: set = set()
         self._bid_calls = 0
+        self._bid_failures = 0
+        self._llm_dead_warned_at = 0.0
         # Designation outcomes as DISTINCT JOBS, not job-iterations. `pending_queue.gets()` is
         # a non-destructive peek, so an unplaced job reappears on every pass of the selection
         # loop (~2 Hz) and a naive `+= len(...)` counts it once per pass. The categories then
@@ -985,6 +1001,36 @@ class LlmAgent(ResourceAgent):
             "iterations": 0,
             "requeued": 0,
         }
+
+    #: Bids to see before judging the LLM plane dead, and how often to repeat the warning.
+    _LLM_DEAD_MIN_CALLS = 20
+    _LLM_DEAD_WARN_S = 120
+
+    def _warn_if_the_llm_plane_is_dead(self, error) -> None:
+        """Say so, loudly, when every bid is failing.
+
+        A wholesale LLM failure is invisible in everything a run produces. Measured on the
+        slice 2026-09-14: the shipped config asks for `gpt-4o-mini`, the gateway key allows
+        only `gpt-oss-20b` and friends, so all 924 bids returned 403 — and the run completed
+        197 of 197 jobs, drained normally, and wrote a metrics payload that looked entirely
+        healthy. Every bid was an analytic fallback, which also means the run sat in the
+        race-to-propose regime P0-7 exists to fix (a failed bid returns in ~0 s), so it was
+        not even a valid *analytic* baseline.
+
+        `llm_failures == llm_calls` in `metrics.json` is what caught it after the fact. This
+        is the same fact while there is still time to kill the run.
+        """
+        if self._bid_calls < self._LLM_DEAD_MIN_CALLS or self._bid_failures < self._bid_calls:
+            return
+        now = time.time()
+        if now - self._llm_dead_warned_at < self._LLM_DEAD_WARN_S:
+            return
+        self._llm_dead_warned_at = now
+        self.logger.warning(
+            "[LLM_PLANE_DEAD] Agent=%s every one of %d bids has failed; this run is 100%% "
+            "analytic fallback and is NOT an LLM-plane measurement (nor a clean analytic one "
+            "— a failed bid returns in ~0s, which is the race-to-propose regime). Last error: "
+            "%s", self.agent_id, self._bid_calls, error)
 
     def _note_bid(self, job_id) -> None:
         """Record that this agent paid for an LLM bid on *job_id*.
@@ -1017,7 +1063,13 @@ class LlmAgent(ResourceAgent):
             "designate_bidder": bool(self.designate_bidder),
             "bid_jobs": len(self._bid_job_ids),
             "bid_calls": self._bid_calls,
+            "bid_failures": self._bid_failures,
         }
+        # Attempts are counted before anything that can fail, so this is an invariant, not a
+        # hope: a failure with no attempt behind it means the counter moved and the run's
+        # failure rate is not trustworthy.
+        if self._bid_failures > self._bid_calls:
+            stats["bid_failures_exceed_calls"] = True
         stats.update({f"designate_{k}": v for k, v in self.designation.items()})
         stats.update({f"designate_{k}": len(v) for k, v in self._designation_jobs.items()})
         # Over the jobs this agent actually took: the UNION of `mine` and `forced`, not their

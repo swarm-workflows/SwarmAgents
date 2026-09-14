@@ -560,3 +560,83 @@ def test_stats_stay_out_of_a_run_that_never_bid():
     a.bidder = None
     a.delegator = None
     assert a.llm_usage_snapshot() == {}
+
+
+# --- a wholesale LLM failure must not look like a healthy run ---------------------------------
+
+def test_a_totally_dead_llm_plane_is_announced():
+    """Measured on the slice 2026-09-14: the shipped config asks for `gpt-4o-mini`, the gateway
+    key allows only `gpt-oss-20b` and friends, so all 924 bids returned 403 — and the run
+    completed 197 of 197 jobs, drained normally, and wrote a metrics payload that looked
+    entirely healthy. It was not an LLM-plane measurement, and not a clean analytic baseline
+    either: a failed bid returns in ~0 s, which is the race-to-propose regime P0-7 exists for."""
+    a = make_agent(1, [1, 2], lambda job, assignees: (_Agent(1), 1.0))
+    warnings = []
+    a.logger = type("L", (), {"info": lambda *_a, **_k: None,
+                              "warning": lambda self, *args: warnings.append(args)})()
+    for i in range(a._LLM_DEAD_MIN_CALLS):
+        a._note_bid(f"j{i}")
+        a._bid_failures += 1
+        a._warn_if_the_llm_plane_is_dead("403 model access denied")
+    assert warnings, "a run where every bid fails must say so while it is still running"
+    assert "LLM_PLANE_DEAD" in warnings[0][0]
+    assert a.bidding_stats()["bid_failures"] == a._LLM_DEAD_MIN_CALLS
+
+
+def test_a_partly_working_llm_plane_is_not_called_dead():
+    """Fallbacks are expected and are already counted; only a total outage is this warning."""
+    a = make_agent(1, [1, 2], lambda job, assignees: (_Agent(1), 1.0))
+    warnings = []
+    a.logger = type("L", (), {"info": lambda *_a, **_k: None,
+                              "warning": lambda self, *args: warnings.append(args)})()
+    for i in range(50):
+        a._note_bid(f"j{i}")
+        if i % 2:
+            a._bid_failures += 1
+        a._warn_if_the_llm_plane_is_dead("some error")
+    assert not warnings
+
+
+def test_the_warning_does_not_fire_on_a_handful_of_early_failures():
+    """A provider hiccup in the first few bids is not an outage, and a warning that fires on
+    one is a warning that gets filtered out."""
+    a = make_agent(1, [1, 2], lambda job, assignees: (_Agent(1), 1.0))
+    warnings = []
+    a.logger = type("L", (), {"info": lambda *_a, **_k: None,
+                              "warning": lambda self, *args: warnings.append(args)})()
+    for i in range(a._LLM_DEAD_MIN_CALLS - 1):
+        a._note_bid(f"j{i}")
+        a._bid_failures += 1
+        a._warn_if_the_llm_plane_is_dead("e")
+    assert not warnings
+
+
+def test_a_bid_that_fails_before_the_model_call_is_still_an_attempt():
+    """The attempt counter is the FIRST statement in the bid path's try, because the `except`
+    counts a failure. When it sat lower — below the payload build, the peer-context gather and
+    a log line — anything failing in that gap counted a failure with no attempt behind it. If
+    every bid failed there, the run reported bid_calls=0, a NaN failure rate and no
+    [LLM_PLANE_DEAD] warning, because that check needs a minimum number of calls: a wholly
+    dead LLM plane looked untouched."""
+    from swarm.agents.llm.llm_agent import LlmAgent
+    import inspect
+    src = inspect.getsource(LlmAgent._llm_or_analytic_cost)
+    body = src[src.index("try:"):]
+    note_at = body.index("self._note_bid(")
+    for later in ("job.to_dict(", "self._get_peer_context()", "self.bidder.score("):
+        assert note_at < body.index(later), f"_note_bid must precede {later}"
+
+
+def test_failures_can_never_outnumber_attempts():
+    """With the attempt counted first this is an invariant, so a violation means the counter
+    moved and the failure rate cannot be trusted — say so rather than emitting a rate above 1."""
+    a = make_agent(1, [1, 2], lambda job, assignees: (_Agent(1), 1.0))
+    for i in range(10):
+        a._note_bid(f"j{i}")
+        a._bid_failures += 1
+    stats = a.bidding_stats()
+    assert stats["bid_failures"] == stats["bid_calls"] == 10
+    assert "bid_failures_exceed_calls" not in stats
+
+    a._bid_failures += 1                      # only reachable if the ordering regressed
+    assert a.bidding_stats()["bid_failures_exceed_calls"] is True

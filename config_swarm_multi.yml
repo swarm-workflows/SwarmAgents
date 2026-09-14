@@ -344,7 +344,14 @@ mab:
 llm:
   enabled: true
   provider: openai            # "openai" (FABRIC gateway), "ollama" (per-host), or "none"
-  model: "gpt-4o-mini"       # any text model that returns JSON
+  # MUST be a model the provider's key can actually reach. On the FABRIC gateway the key is
+  # scoped to a list, and asking for anything else returns 403 on EVERY bid — which does not
+  # stop the run: it completes normally, every bid silently becomes an analytic fallback, and
+  # nothing but `llm_bid_failure_rate` says so. Measured 2026-09-14: 924/924 bids 403'd for
+  # `gpt-4o-mini` while the key allowed ['gpt-oss-20b', 'nemotron-nano-30b', 'qwen3.5-122b',
+  # 'minimax-m2.7'], and the run still completed 197/197 jobs. Check the gateway's list before
+  # a campaign cell, and check `llm_bid_failure_rate` after it.
+  model: "gpt-4o-mini"       # any text model that returns JSON the provider key can access
   base_url: ""                # ollama only, e.g. "http://127.0.0.1:11434/v1"; OLLAMA_BASE_URL env overrides
   temperature: 0.1
   timeout_seconds: 6

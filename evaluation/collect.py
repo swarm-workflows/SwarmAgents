@@ -295,6 +295,7 @@ def instrumentation_metrics(agents: dict[str, dict]) -> dict[str, Any]:
     protocols: set[str] = set()
     llm_calls = llm_failures = llm_in = llm_out = 0
     bid_jobs = bid_calls = designated = forced = claimed_jobs = 0
+    bid_failures = 0
     have_messages = have_consensus = have_llm = False
     have_bidding = designate_on = False
     finalize_s: list[float] = []
@@ -331,6 +332,7 @@ def instrumentation_metrics(agents: dict[str, dict]) -> dict[str, Any]:
                     have_bidding = True
                     bid_jobs += int(site.get("bid_jobs", 0) or 0)
                     bid_calls += int(site.get("bid_calls", 0) or 0)
+                    bid_failures += int(site.get("bid_failures", 0) or 0)
                     designated += int(site.get("designate_mine", 0) or 0)
                     forced += int(site.get("designate_forced", 0) or 0)
                     # The agent already resolved the mine/forced overlap into a union; the
@@ -371,6 +373,15 @@ def instrumentation_metrics(agents: dict[str, dict]) -> dict[str, Any]:
         out["designate_bidder"] = designate_on
         out["llm_bid_jobs"] = bid_jobs
         out["llm_bid_calls"] = bid_calls
+        out["llm_bid_failures"] = bid_failures
+        # Read this before anything else on an LLM row. A run whose bids all failed completes
+        # normally and looks healthy in every other column, but it is neither an LLM-plane
+        # measurement nor a clean analytic baseline — a failed bid returns in ~0s, which is
+        # the race-to-propose regime. Measured on the slice 2026-09-14: 924 of 924 bids
+        # returned 403 for a model the gateway key cannot access, and the run completed
+        # 197/197 jobs.
+        out["llm_bid_failure_rate"] = (round(bid_failures / bid_calls, 6) if bid_calls
+                                       else float("nan"))
         if designate_on:
             out["designate_designated"] = designated
             out["designate_forced"] = forced
