@@ -557,10 +557,19 @@ def instrumentation_metrics(agents: dict[str, dict], meta: dict | None = None,
     # on a run that is perfectly measurable.
     expected_ids = expected_llm_agent_ids(agents, meta, levels, observed_llm_ids)
     if expected_ids is None:
-        # Nothing to attribute levels with; fall back to the agents that showed LLM activity,
-        # which cannot detect a wholly silent agent but never rejects a supported run either.
-        expected_llm_agents = agents_with_llm
-        covered = agents_with_failure_counter
+        # Roles cannot be attributed. Falling back to the observed set here is NOT safe: it
+        # makes every agent that reported nothing vanish from the denominator, which is the
+        # exact blindness this gate exists to prevent — 10 instrumented agents out of 30 would
+        # read as 1.00 coverage. The observed set is only trustworthy when there is nothing
+        # unattributed left over, i.e. every reporting agent carried an LLM block.
+        if agents_with_llm == len(agents):
+            expected_llm_agents = agents_with_llm
+            covered = agents_with_failure_counter
+        else:
+            # Some agents are unaccounted for and we cannot say whether they should have bid.
+            # Unknown, so no verdict — an honest "unchecked" beats a verdict over a subset.
+            expected_llm_agents = 0
+            covered = 0
     else:
         expected_llm_agents = len(expected_ids)
         covered = len(reported_failure_ids & expected_ids)
@@ -568,6 +577,10 @@ def instrumentation_metrics(agents: dict[str, dict], meta: dict | None = None,
                       if expected_llm_agents else float("nan"))
     if expected_llm_agents:
         out["llm_failure_agent_coverage"] = round(agent_coverage, 6)
+    elif have_llm or have_bidding:
+        # The roles could not be attributed and agents are unaccounted for. Report it as 0
+        # rather than omitting it: an absent coverage column is what a reader skims past.
+        out["llm_failure_agent_coverage"] = 0.0
 
     # BOTH coverages must hold. Call coverage catches an agent that bid without reporting its
     # failures; agent coverage catches an agent that reported nothing at all.

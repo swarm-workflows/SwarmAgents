@@ -772,12 +772,43 @@ class TestMixedRoleRuns(unittest.TestCase):
             self.assertLess(metrics["llm_failure_agent_coverage"], 0.9)
             self.assertTrue(metrics["llm_plane_unchecked"])
 
-    def test_a_run_predating_the_level1_field_falls_back_to_what_was_observed(self):
-        """Guessing either way is wrong: 'llm' rejects a supported run, 'resource' hides
-        unmeasured agents. Fall back to observed activity and say nothing about the rest."""
+    def test_a_run_predating_the_level1_field_blocks_rather_than_assuming(self):
+        """Guessing either way is wrong — 'llm' rejects a supported run, 'resource' hides
+        unmeasured agents — but falling back to the OBSERVED set is worse than both: it makes
+        every silent agent vanish from the denominator, so 10 instrumented agents out of 30
+        read as 1.00 coverage. That is the blindness this gate exists to prevent. When agents
+        are unaccounted for, say unchecked."""
         agents, levels = self._fleet(llm_levels={0})
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = self._run(Path(tmp), agents,
                                 {"agent_type": "llm", "topology": "hierarchical"}, levels)
             metrics = run_metrics(run_dir, expected_jobs=1)
+            self.assertEqual(metrics["llm_failure_agent_coverage"], 0.0)
+            self.assertTrue(metrics["llm_plane_unchecked"])
+            self.assertNotIn("llm_plane_dead", metrics)
+
+    def test_an_unattributable_run_where_every_agent_reported_is_still_judged(self):
+        """The conservative fallback must not block a run that has no holes in it: if every
+        reporting agent carried an LLM block there is nothing unaccounted for."""
+        agents, levels = self._fleet(llm_levels={0, 1})       # all 30 instrumented
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._run(Path(tmp), agents,
+                                {"agent_type": "llm", "topology": "hierarchical"}, levels)
+            metrics = run_metrics(run_dir, expected_jobs=1)
             self.assertAlmostEqual(metrics["llm_failure_agent_coverage"], 1.0)
+            self.assertFalse(metrics["llm_plane_dead"])
+
+    def test_a_missing_all_agents_file_also_blocks_rather_than_assuming(self):
+        """The same hole reached the other way: without levels the roles are unattributable
+        even when run_meta carries the level-1 type."""
+        agents, _ = self._fleet(llm_levels={0})
+        import json as _json
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = write_run(Path(tmp), "hier-30/run01", self.ROWS)
+            (run_dir / "metrics.json").write_text(_json.dumps(agents))
+            (run_dir / "run_meta.json").write_text(_json.dumps(
+                {"agent_type": "llm", "topology": "hierarchical",
+                 "hierarchical_level1_agent_type": "resource"}))
+            metrics = run_metrics(run_dir, expected_jobs=1)
+            self.assertEqual(metrics["llm_failure_agent_coverage"], 0.0)
+            self.assertTrue(metrics["llm_plane_unchecked"])
