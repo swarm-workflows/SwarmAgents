@@ -286,7 +286,17 @@ def read_agent_metrics(run_dir: Path) -> dict[str, dict]:
     return {str(k): v for k, v in payload.items() if isinstance(v, dict)}
 
 
-def instrumentation_metrics(agents: dict[str, dict]) -> dict[str, Any]:
+def read_run_meta(run_dir: Path) -> dict:
+    """`run_meta.json`, or {} — it carries the declared agent type, which is what says whether
+    an agent with no LLM block was analytic by design or simply unmeasured."""
+    try:
+        payload = json.loads((run_dir / "run_meta.json").read_text())
+    except (OSError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def instrumentation_metrics(agents: dict[str, dict], meta: dict | None = None) -> dict[str, Any]:
     """P0-4 columns: message cost, finalization, delegation context age, LLM token cost.
 
     Per-agent counters are **summed**, not averaged: the quantity the message-complexity
@@ -309,11 +319,22 @@ def instrumentation_metrics(agents: dict[str, dict]) -> dict[str, Any]:
     bid_failures = bid_calls_paired = llm_calls_paired = 0
     have_messages = have_consensus = have_llm = False
     have_bidding = designate_on = have_bid_failures = have_llm_failures = False
+    # Counted per AGENT, not per call: call coverage is blind to an agent that reported no
+    # instrumentation at all, because such an agent contributes nothing to either side of the
+    # ratio. A mixed-revision fleet where a third of the agents carry the new blocks reads as
+    # 1.00 call coverage while two thirds of the bidding was never measured.
+    agents_with_llm = agents_with_failure_counter = 0
     finalize_s: list[float] = []
     rounds: list[float] = []
 
     for payload in agents.values():
         instr = payload.get("instrumentation") or {}
+        llm_block = instr.get("llm") if isinstance(instr.get("llm"), dict) else {}
+        if llm_block:
+            agents_with_llm += 1
+            if any(isinstance(v, dict) and ("failures" in v or "bid_failures" in v)
+                   for v in llm_block.values()):
+                agents_with_failure_counter += 1
         messages = instr.get("messages")
         if isinstance(messages, dict):
             have_messages = True
@@ -462,8 +483,22 @@ def instrumentation_metrics(agents: dict[str, dict]) -> dict[str, Any]:
     # slice is wrong in both directions and the two errors are symmetric: a counter that
     # happens to sit on a few healthy agents hides a fleet-wide outage, and one that sits on a
     # single broken agent condemns a fleet that was 29 of 30 fine.
+    # How many agents that ran the LLM plane actually reported a failure counter. When the
+    # run declares `agent_type: llm` every reporting agent ran it, so an agent with no LLM
+    # block is unmeasured rather than simply analytic — which is exactly the mixed-revision
+    # case call coverage cannot see.
+    declared_llm = (meta or {}).get("agent_type") == "llm"
+    expected_llm_agents = len(agents) if declared_llm else agents_with_llm
+    agent_coverage = (agents_with_failure_counter / expected_llm_agents
+                      if expected_llm_agents else float("nan"))
+    if expected_llm_agents:
+        out["llm_failure_agent_coverage"] = round(agent_coverage, 6)
+
+    # BOTH coverages must hold. Call coverage catches an agent that bid without reporting its
+    # failures; agent coverage catches an agent that reported nothing at all.
+    agent_ok = bool(expected_llm_agents) and agent_coverage >= LLM_COVERAGE_MIN
     deciding = [(c, f) for c, f, total in signals
-                if total and c / total >= LLM_COVERAGE_MIN and c]
+                if total and c / total >= LLM_COVERAGE_MIN and c and agent_ok]
     if not deciding:
         if have_bidding or have_llm:
             out["llm_plane_unchecked"] = True
@@ -674,7 +709,8 @@ def run_metrics(run_dir: Path, expected_jobs: int | None) -> dict[str, Any]:
         metrics[f"{level_name}_count"] = 0 if pending_df is None else int(len(pending_df))
 
     # P0-4 instrumentation, from the per-agent payloads rather than the job CSVs.
-    metrics.update(instrumentation_metrics(read_agent_metrics(run_dir)))
+    metrics.update(instrumentation_metrics(read_agent_metrics(run_dir),
+                                          read_run_meta(run_dir)))
     # P0-8: bidders per job needs the fleet's bid count over the run's job count, and only
     # this scope knows the latter. Computed over jobs the run actually SAW, not the declared
     # count: a job never distributed was never available to bid on, and including it would

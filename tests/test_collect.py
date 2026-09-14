@@ -639,3 +639,65 @@ class TestPartialCounterCoverage(unittest.TestCase):
             self.assertAlmostEqual(metrics["llm_failure_coverage"], 1.0)
             self.assertAlmostEqual(metrics["llm_bid_failure_rate"], 0.02)
             self.assertFalse(metrics["llm_plane_dead"])
+
+
+class TestAgentCoverage(unittest.TestCase):
+    """Call coverage is blind to an agent that reported nothing at all.
+
+    Such an agent contributes to neither side of the calls ratio, so a mixed-revision fleet
+    where a third of the agents carry the new blocks reads as 1.00 call coverage while two
+    thirds of the bidding was never measured. `run_meta.json`'s declared agent type is what
+    distinguishes "analytic by design" from "unmeasured".
+    """
+
+    ROWS = "j1,1,1,2,2,9,0,1,0.1,0.5\n"
+
+    def _run(self, root: Path, agents: dict, meta: dict) -> Path:
+        import json
+        run_dir = write_run(root, "hier-30/run01", self.ROWS)
+        (run_dir / "metrics.json").write_text(json.dumps(agents))
+        (run_dir / "run_meta.json").write_text(json.dumps(meta))
+        return run_dir
+
+    @staticmethod
+    def _instrumented(calls, failures):
+        return {"id": 0, "instrumentation": {"llm": {"bid": {
+            "calls": calls, "failures": failures,
+            "input_tokens": 0, "output_tokens": 0}}}}
+
+    @staticmethod
+    def _bare():
+        """An agent from a revision that predates the instrumentation entirely."""
+        return {"id": 0, "instrumentation": {}}
+
+    def test_unmeasured_agents_block_the_verdict_on_a_declared_llm_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            agents = {str(i): self._instrumented(35, 0) for i in range(1, 11)}
+            agents.update({str(i): self._bare() for i in range(11, 31)})
+            run_dir = self._run(Path(tmp), agents, {"agent_type": "llm"})
+            metrics = run_metrics(run_dir, expected_jobs=1)
+            self.assertAlmostEqual(metrics["llm_failure_agent_coverage"], 10 / 30, places=5)
+            self.assertNotIn("llm_plane_dead", metrics,
+                             "two thirds of the fleet was never measured")
+            self.assertTrue(metrics["llm_plane_unchecked"])
+
+    def test_a_fully_instrumented_llm_run_still_gets_a_verdict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            agents = {str(i): self._instrumented(35, 0) for i in range(1, 31)}
+            run_dir = self._run(Path(tmp), agents, {"agent_type": "llm"})
+            metrics = run_metrics(run_dir, expected_jobs=1)
+            self.assertAlmostEqual(metrics["llm_failure_agent_coverage"], 1.0)
+            self.assertFalse(metrics["llm_plane_dead"])
+
+    def test_analytic_agents_in_a_resource_run_are_not_counted_as_unmeasured(self):
+        """In a hierarchical run only the coordinators may be LLM agents. Without the declared
+        type, every level-0 agent would look like a hole in the coverage and no LLM run of
+        that shape could ever be judged."""
+        with tempfile.TemporaryDirectory() as tmp:
+            agents = {str(i): self._instrumented(35, 35) for i in range(1, 4)}
+            agents.update({str(i): self._bare() for i in range(4, 31)})
+            run_dir = self._run(Path(tmp), agents, {"agent_type": "resource"})
+            metrics = run_metrics(run_dir, expected_jobs=1)
+            self.assertAlmostEqual(metrics["llm_failure_agent_coverage"], 1.0,
+                                   msg="all three agents that used the LLM plane reported")
+            self.assertTrue(metrics["llm_plane_dead"])
