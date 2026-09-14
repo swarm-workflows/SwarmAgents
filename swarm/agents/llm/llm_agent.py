@@ -136,6 +136,7 @@ class LlmAgent(ResourceAgent):
         # agent could have bid and designation buys nothing.
         self.designate_bidder_fallback_s = float(
             job_cfg.get("designate_bidder_fallback_s", 30.0))
+        self._init_bidding_stats()
 
         # ResourceAgent.__init__ has just built a selection engine over the ANALYTIC cost model.
         # Keep it before overwriting self.selector below: the cheap model is what makes
@@ -186,6 +187,11 @@ class LlmAgent(ResourceAgent):
                 f"GatheringPeerContext=yes Peers={len(peer_context.get('peer_agents', {}))}"
             )
 
+            # Counted here, not at the call site that selected the job: this is the line that
+            # actually spends an inference, and it is the only thing bidders-per-job should
+            # count. A cache hit in SelectionEngine never reaches it, which is correct — a
+            # reused cost is not a bid.
+            self._note_bid(getattr(job, "job_id", None))
             # Pass peer context to LLM bidder
             bid = self.bidder.score(
                 job=payload_job,
@@ -601,6 +607,11 @@ class LlmAgent(ResourceAgent):
         the inference-budget item (P0-3) needs to know which one dominates.
         """
         usage = {}
+        stats = self.bidding_stats()
+        # Only when this agent actually bid, or was configured to designate: a run with no LLM
+        # bidding keeps exactly the metrics payload it always had.
+        if stats["bid_calls"] or stats["designate_bidder"]:
+            usage["bidding"] = stats
         for attr, key in (("bidder", "bid"), ("delegator", "delegate")):
             obj = getattr(self, attr, None)
             counter = getattr(obj, "usage", None)
@@ -935,6 +946,105 @@ class LlmAgent(ResourceAgent):
             return super().native_cost_for_job(object_id)
         return None
 
+    def _init_bidding_stats(self) -> None:
+        """Counters for what designated bidding is supposed to buy (P0-8).
+
+        The claim is that designation takes bidders-per-job from ~3.7 to ~1, so an added agent
+        becomes a new server instead of a redundant bidder. Nothing measured that: the mode
+        logged per-iteration counts and no run recorded how many agents actually paid for a
+        bid on the same job, which left the claim unfalsifiable — and left its failure mode
+        (the liveness deadline firing on everything, so every agent bids anyway) looking
+        identical to success in every artefact a run produces.
+
+        A method, not inline assignment, so a test double built with `__new__` runs the same
+        setup the shipped agent does.
+        """
+        # Distinct jobs this agent spent a real LLM bid on. A set, because the same job can be
+        # re-bid across reselection rounds and the quantity of interest is how many AGENTS
+        # priced a job, not how many times one of them did.
+        self._bid_job_ids: set = set()
+        self._bid_calls = 0
+        # Designation outcomes as DISTINCT JOBS, not job-iterations. `pending_queue.gets()` is
+        # a non-destructive peek, so an unplaced job reappears on every pass of the selection
+        # loop (~2 Hz) and a naive `+= len(...)` counts it once per pass. The categories then
+        # accumulate at wildly different rates — a job designated to me leaves after ~1 pass
+        # because I bid on it immediately, while a job designated elsewhere sits in `deferred`
+        # for the whole 30 s deadline, ~60 passes, and is then `forced` on every pass after
+        # that. Measured on those numbers, a fleet that is really 50% fallback reports 67%,
+        # and `candidates` reports pending-job-passes rather than jobs at all.
+        self._designation_jobs: dict = {
+            "candidates": set(),   # jobs this agent ran designation over
+            "mine": set(),         # designated to this agent
+            "deferred": set(),     # designated elsewhere, seen inside the deadline
+            "forced": set(),       # bid anyway because the deadline expired
+            "infeasible": set(),   # no live agent could run it
+        }
+        self.designation = {
+            # These two are genuine event counts, not per-job facts: the loop really does run
+            # many times, and a job really can be requeued more than once.
+            "iterations": 0,
+            "requeued": 0,
+        }
+
+    def _note_bid(self, job_id) -> None:
+        """Record that this agent paid for an LLM bid on *job_id*.
+
+        Never raises. It is called from inside the bid path's `try`, whose `except` falls back
+        to the analytic cost — so an AttributeError here would not surface as a broken counter,
+        it would silently turn a working LLM bid into an analytic one and move placement. A
+        metrics sink is not allowed to change the decision it is measuring.
+        """
+        try:
+            if job_id is None:
+                return
+            self._bid_calls += 1
+            self._bid_job_ids.add(str(job_id))
+        except Exception:
+            pass
+
+    def bidding_stats(self) -> dict:
+        """What this agent actually bid on, and how designation behaved (P0-8).
+
+        `bid_jobs` is the number this agent contributes to the fleet's bidders-per-job: summed
+        across agents and divided by the jobs in the run, it is the 3.7 that designated
+        bidding exists to reduce.
+
+        `forced` is reported beside it because a run where the deadline fires on most jobs has
+        designation in name only — bidders-per-job returns to the undesignated value, and
+        without this counter the two runs are indistinguishable after the fact.
+        """
+        stats = {
+            "designate_bidder": bool(self.designate_bidder),
+            "bid_jobs": len(self._bid_job_ids),
+            "bid_calls": self._bid_calls,
+        }
+        stats.update({f"designate_{k}": v for k, v in self.designation.items()})
+        stats.update({f"designate_{k}": len(v) for k, v in self._designation_jobs.items()})
+        # Over the jobs this agent actually took: the UNION of `mine` and `forced`, not their
+        # sum. Those two sets overlap. Within one round they are disjoint — a job designated
+        # here is bid on at once and never reaches its deadline — but a job that loses
+        # consensus goes back to PENDING and comes round again, and can be designated here in
+        # one round and reach its fallback deadline in another. Summing then counts it twice
+        # and dilutes the share: a fleet where EVERY job eventually hit the fallback reports
+        # 0.50 instead of 1.00, which is precisely the wrong direction for the number whose
+        # job is to reveal that designation has stopped holding.
+        #
+        # The cost of those retries is not lost by counting jobs once: `bid_calls` minus
+        # `bid_jobs` is exactly the redundant re-bidding.
+        claimed = self._designation_jobs["mine"] | self._designation_jobs["forced"]
+        stats["designate_claimed"] = len(claimed)
+        if claimed:
+            stats["designate_forced_share"] = round(
+                len(self._designation_jobs["forced"]) / len(claimed), 6)
+        return stats
+
+    def _note_designation(self, category: str, job) -> None:
+        """Record *job* under *category* once, however many passes it is seen on."""
+        job_id = getattr(job, "job_id", None)
+        if job_id is None:
+            return
+        self._designation_jobs[category].add(str(job_id))
+
     def _designate_bidders(self, pending_jobs: list) -> list:
         """Pick one bidder per job using the ANALYTIC cost, and keep only this agent's share.
 
@@ -1000,8 +1110,10 @@ class LlmAgent(ResourceAgent):
         now = time.time()
         mine, deferred, forced, infeasible, requeued = [], 0, 0, 0, 0
         for job, (agent, _cost) in zip(pending_jobs, designations):
+            self._note_designation("candidates", job)
             if agent is None:
                 infeasible += 1
+                self._note_designation("infeasible", job)
                 # "Infeasible for the whole fleet" is a LOCAL verdict, not a fact: it is computed
                 # over `self.neighbor_map`, which is per-agent live membership. An agent that has
                 # transiently dropped the one peer able to run this job concludes nobody can,
@@ -1041,6 +1153,7 @@ class LlmAgent(ResourceAgent):
 
             if agent.agent_id == self.agent_id:
                 mine.append(job)
+                self._note_designation("mine", job)
                 continue
             first_seen = getattr(job, "designation_deferred_at", None)
             if first_seen is None:
@@ -1049,8 +1162,13 @@ class LlmAgent(ResourceAgent):
             if now - first_seen >= self.designate_bidder_fallback_s:
                 forced += 1
                 mine.append(job)
+                self._note_designation("forced", job)
             else:
                 deferred += 1
+                self._note_designation("deferred", job)
+
+        self.designation["iterations"] += 1
+        self.designation["requeued"] += requeued
 
         if forced:
             # Not routine: it means a designated agent did not bid within the deadline. A rate

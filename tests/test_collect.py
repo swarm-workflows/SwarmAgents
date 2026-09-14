@@ -350,3 +350,95 @@ class TestRegretColumns(unittest.TestCase):
             metrics = run_metrics(run_dir, expected_jobs=1)
             self.assertIn("regret_ctx_age_corr", metrics)
             self.assertTrue(-1.0 <= metrics["regret_ctx_age_corr"] <= 1.0)
+
+
+class TestBiddersPerJob(unittest.TestCase):
+    """P0-8: the number designated bidding exists to move, and the failure it can hide."""
+
+    ROWS = ("j1,1,1,2,2,9,0,1,0.1,0.5\n"
+            "j2,1,1,3,3,10,0,2,0.1,0.5\n")
+
+    def _run(self, root: Path, agents: dict) -> Path:
+        import json
+        run_dir = write_run(root, "hier-30/run01", self.ROWS)
+        (run_dir / "metrics.json").write_text(json.dumps(agents))
+        return run_dir
+
+    @staticmethod
+    def _agent(aid, bid_jobs, designate=None, bid_calls=None, claimed=None):
+        # bid_calls deliberately differs from bid_jobs by default: a job re-bid after a lost
+        # consensus round is not a second bidder, and the two must not be interchangeable.
+        bidding = {"designate_bidder": designate is not None,
+                   "bid_jobs": bid_jobs,
+                   "bid_calls": bid_jobs * 2 if bid_calls is None else bid_calls}
+        if designate is not None:
+            mine, forced = designate
+            bidding["designate_mine"], bidding["designate_forced"] = mine, forced
+            # The agent reports the UNION, which is what the collector must divide by. Default
+            # to a disjoint fleet; `claimed` overrides it for the retry-overlap case.
+            bidding["designate_claimed"] = (claimed if claimed is not None
+                                            else mine + forced)
+        return {"id": aid, "instrumentation": {"llm": {"bidding": bidding}}}
+
+    def test_bidders_per_job_is_the_fleet_sum_over_the_jobs_seen(self):
+        """Undesignated: several agents each pay for a bid on a job placed once. This is the
+        ~3.7 the mode exists to cut."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._run(Path(tmp), {
+                "1": self._agent(1, 2), "2": self._agent(2, 2), "3": self._agent(3, 1)})
+            metrics = run_metrics(run_dir, expected_jobs=2)
+            self.assertEqual(metrics["llm_bid_jobs"], 5)
+            self.assertEqual(metrics["llm_bid_calls"], 10, "raw calls are tracked apart")
+            # Distinct-jobs, not calls: re-bidding a job does not make a second bidder.
+            self.assertAlmostEqual(metrics["bidders_per_job"], 2.5)  # 5 agent-jobs / 2 jobs
+
+    def test_the_denominator_is_jobs_the_run_saw_not_the_declared_count(self):
+        """A job never distributed was never available to bid on. Dividing by the declared
+        count would make a stalled run look well partitioned."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._run(Path(tmp), {"1": self._agent(1, 2)})
+            metrics = run_metrics(run_dir, expected_jobs=5000)
+            self.assertAlmostEqual(metrics["bidders_per_job"], 1.0)
+
+    def test_a_deadline_that_fires_on_everything_is_visible_in_the_row(self):
+        """The mode's failure is silent in every other artefact: completion, latency and the
+        per-iteration log all look ordinary while designation buys nothing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._run(Path(tmp), {
+                "1": self._agent(1, 2, designate=(0, 2)),
+                "2": self._agent(2, 2, designate=(0, 2))})
+            metrics = run_metrics(run_dir, expected_jobs=2)
+            self.assertTrue(metrics["designate_bidder"])
+            self.assertEqual(metrics["designate_forced"], 4)
+            self.assertAlmostEqual(metrics["designate_forced_share"], 1.0)
+            self.assertAlmostEqual(metrics["bidders_per_job"], 2.0)
+
+    def test_a_healthy_designated_run_reports_one_bidder_per_job(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._run(Path(tmp), {
+                "1": self._agent(1, 1, designate=(1, 0)),
+                "2": self._agent(2, 1, designate=(1, 0))})
+            metrics = run_metrics(run_dir, expected_jobs=2)
+            self.assertAlmostEqual(metrics["bidders_per_job"], 1.0)
+            self.assertAlmostEqual(metrics["designate_forced_share"], 0.0)
+
+    def test_a_job_that_took_both_routes_does_not_dilute_the_share(self):
+        """The agent resolves the mine/forced overlap into a union; the collector must use it
+        rather than adding the two back up. A job designated in one round and forced in a later
+        one is one job — summing counts it twice and reports 0.5 where the truth is 1.0."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._run(Path(tmp), {
+                "1": self._agent(1, 2, designate=(2, 2), claimed=2)})
+            metrics = run_metrics(run_dir, expected_jobs=2)
+            self.assertEqual(metrics["designate_claimed"], 2)
+            self.assertAlmostEqual(metrics["designate_forced_share"], 1.0)
+
+    def test_an_analytic_run_gets_no_bidding_columns(self):
+        """A run with no LLM bidding keeps exactly the row it always had."""
+        with tempfile.TemporaryDirectory() as tmp:
+            import json
+            run_dir = write_run(Path(tmp), "hier-30/run01", self.ROWS)
+            (run_dir / "metrics.json").write_text(json.dumps({"1": {"id": 1}}))
+            metrics = run_metrics(run_dir, expected_jobs=2)
+            self.assertNotIn("bidders_per_job", metrics)
+            self.assertNotIn("designate_forced_share", metrics)

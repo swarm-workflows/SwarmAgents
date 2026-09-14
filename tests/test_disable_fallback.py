@@ -92,6 +92,8 @@ def make_agent(disable_fallback: bool):
     # bid path records its verdict in this cache (P0-5) and would AttributeError without it.
     a.config = {}
     a._init_llm_state()
+    a.designate_bidder = False
+    a._init_bidding_stats()
     a.analytic_calls = []
     a.logged = []
 

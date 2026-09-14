@@ -238,6 +238,13 @@ job_selection:
   # counter of a few loop iterations (~1.5 s) would fire first on every job, restoring full
   # redundancy while adding delay. Keep it several times bid-plus-consensus.
   designate_bidder_fallback_s: 30.0
+  #
+  # Whether it is working is measurable and must be checked, not assumed. Every agent reports
+  # the distinct jobs it paid an LLM bid for; `evaluation/collect.py` turns the fleet sum over
+  # the run's jobs into `bidders_per_job` — the ~3.7 this mode exists to cut to ~1 — and reports
+  # `designate_forced_share` beside it. That second number is the one to read first: if the
+  # liveness deadline above is firing on most jobs, every agent bids anyway, bidders_per_job
+  # returns to its undesignated value, and nothing else in the run looks any different.
 
 # Quantum runtime (Phase 2: data-triggered split hybrid scheduling).
 # Applies to all agents; inert unless split hybrid jobs / post-processing

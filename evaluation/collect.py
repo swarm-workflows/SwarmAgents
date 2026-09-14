@@ -294,7 +294,9 @@ def instrumentation_metrics(agents: dict[str, dict]) -> dict[str, Any]:
     finalized = abandoned = 0
     protocols: set[str] = set()
     llm_calls = llm_failures = llm_in = llm_out = 0
+    bid_jobs = bid_calls = designated = forced = claimed_jobs = 0
     have_messages = have_consensus = have_llm = False
+    have_bidding = designate_on = False
     finalize_s: list[float] = []
     rounds: list[float] = []
 
@@ -322,8 +324,20 @@ def instrumentation_metrics(agents: dict[str, dict]) -> dict[str, Any]:
                     sink.append(float(value))
         llm = instr.get("llm")
         if isinstance(llm, dict):
-            for site in llm.values():
+            for key, site in llm.items():
                 if not isinstance(site, dict):
+                    continue
+                if key == "bidding":       # P0-8 counters, not a per-call-site usage block
+                    have_bidding = True
+                    bid_jobs += int(site.get("bid_jobs", 0) or 0)
+                    bid_calls += int(site.get("bid_calls", 0) or 0)
+                    designated += int(site.get("designate_mine", 0) or 0)
+                    forced += int(site.get("designate_forced", 0) or 0)
+                    # The agent already resolved the mine/forced overlap into a union; the
+                    # collector must use that, not re-derive it by adding the two back up.
+                    claimed_jobs += int(site.get("designate_claimed", 0) or 0)
+                    if site.get("designate_bidder"):
+                        designate_on = True
                     continue
                 have_llm = True
                 llm_calls += int(site.get("calls", 0) or 0)
@@ -349,6 +363,28 @@ def instrumentation_metrics(agents: dict[str, dict]) -> dict[str, Any]:
         out["llm_failures"] = llm_failures
         out["llm_input_tokens"] = llm_in
         out["llm_output_tokens"] = llm_out
+    if have_bidding:
+        # P0-8. `llm_bid_jobs` is the fleet sum of distinct jobs each agent paid an LLM bid
+        # for; over the jobs in the run it gives bidders-per-job, the ~3.7 that designated
+        # bidding exists to cut to ~1. The denominator is added by the caller, which knows how
+        # many jobs the run actually had.
+        out["designate_bidder"] = designate_on
+        out["llm_bid_jobs"] = bid_jobs
+        out["llm_bid_calls"] = bid_calls
+        if designate_on:
+            out["designate_designated"] = designated
+            out["designate_forced"] = forced
+            out["designate_claimed"] = claimed_jobs
+            # A run whose deadline fires on most jobs has designation in name only: every
+            # agent bids anyway and bidders-per-job returns to its undesignated value. Without
+            # this the two runs are indistinguishable in every artefact.
+            #
+            # Denominator is the agents' own `designate_claimed` — the union of the jobs they
+            # were designated and the jobs they took on the deadline. Adding `designated` and
+            # `forced` back together would double-count every job that took both routes across
+            # reselection rounds and dilute the share in the flattering direction.
+            out["designate_forced_share"] = (round(forced / claimed_jobs, 6) if claimed_jobs
+                                             else float("nan"))
 
     rows = decision_rows(agents)
     if rows:
@@ -553,6 +589,12 @@ def run_metrics(run_dir: Path, expected_jobs: int | None) -> dict[str, Any]:
 
     # P0-4 instrumentation, from the per-agent payloads rather than the job CSVs.
     metrics.update(instrumentation_metrics(read_agent_metrics(run_dir)))
+    # P0-8: bidders per job needs the fleet's bid count over the run's job count, and only
+    # this scope knows the latter. Computed over jobs the run actually SAW, not the declared
+    # count: a job never distributed was never available to bid on, and including it would
+    # make a stalled run look like a well-partitioned one.
+    if metrics.get("llm_bid_jobs") is not None and n_unique:
+        metrics["bidders_per_job"] = round(metrics["llm_bid_jobs"] / n_unique, 6)
     # P1-1 regret, when the run archived the failure profile it was scored against.
     metrics.update(regret_metrics(run_dir))
 

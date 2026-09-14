@@ -127,7 +127,11 @@ def make_agent(agent_id, peer_ids, designate, fallback_s=30.0):
     a.queues = _Queues()
     a.selection_threshold_pct = 10.0
     a.designate_bidder_fallback_s = fallback_s
+    a.designate_bidder = True
     a._projected_load_factor = lambda ag: 1.0
+    # The shipped setup, not a hand-rolled copy of it: a double that assembles its own
+    # counters stops exercising the agent that ships the moment one is added.
+    a._init_bidding_stats()
 
     class _Log:
         def info(self, *_a, **_k):
@@ -429,3 +433,130 @@ def test_all_live_peers_are_considered():
     agent = make_agent(1, [1, 2, 3, 4, 5], designate)
     agent._designate_bidders([_Job("j1")])
     assert seen["ids"] == [1, 2, 3, 4, 5]
+
+
+# --- P0-8: measuring what designation is supposed to buy --------------------------------------
+#
+# The mode's whole claim is that bidders-per-job falls from ~3.7 to ~1, so an added agent is a
+# new server rather than a redundant bidder. Nothing measured that: the per-iteration log line
+# says how many jobs THIS agent kept, never how many agents paid for a bid on the same job. That
+# left the claim unfalsifiable and, worse, made its failure mode invisible — a run where the
+# liveness deadline fires on everything has designation in name only, and produced artefacts
+# identical to a healthy one.
+
+def test_bidders_per_job_counts_agents_not_bids():
+    """Re-bidding a job after a lost consensus round is not a second bidder. The quantity that
+    matters is how many AGENTS priced the job, which is what the fleet sum divides by."""
+    a = make_agent(1, [1, 2], lambda job, assignees: (_Agent(1), 1.0))
+    a._note_bid("j1")
+    a._note_bid("j1")          # same job again, same agent
+    a._note_bid("j2")
+    stats = a.bidding_stats()
+    assert stats["bid_jobs"] == 2, "distinct jobs this agent paid for"
+    assert stats["bid_calls"] == 3, "and the raw call count, kept separately"
+
+
+def test_the_bid_counter_can_never_change_the_bid():
+    """It is called from inside the bid path's `try`, whose `except` falls back to the analytic
+    cost. An AttributeError there would not show up as a broken counter — it would silently turn
+    a working LLM bid into an analytic one and move placement. This is not hypothetical: adding
+    the counter did exactly that to a pacing test before the guard went in."""
+    a = LlmAgent.__new__(LlmAgent)          # no _init_bidding_stats: counters absent
+    a._note_bid("j1")                        # must not raise
+    a._bid_job_ids = set()
+    a._bid_calls = 0
+    a._note_bid(None)                        # a job with no id is not a bid
+    assert a.bidding_stats  # attribute exists
+    assert a._bid_calls == 0
+
+
+def test_designation_counts_jobs_not_passes_of_the_loop():
+    """`pending_queue.gets()` is a non-destructive peek, so an unplaced job comes back on every
+    pass of the selection loop (~2 Hz). Counting `+= len(pending_jobs)` therefore counts
+    job-PASSES, and the categories accumulate at wildly different rates: a job designated here
+    leaves after ~1 pass because it is bid on at once, while a job designated elsewhere sits in
+    `deferred` for the whole 30 s deadline — ~60 passes. On those numbers a fleet that is really
+    50% fallback reports 67%, and `candidates` reports pending-job-passes rather than jobs."""
+    jobs = [_Job("j1"), _Job("j2"), _Job("j3")]
+    designate = lambda job, assignees: (_Agent(1 if job.job_id == "j1" else 2), 1.0)
+    a = make_agent(1, [1, 2], designate)
+    for _ in range(5):                       # five passes over the same unplaced jobs
+        a._designate_bidders(jobs)
+    stats = a.bidding_stats()
+    assert a.designation["iterations"] == 5, "the loop really did run five times"
+    assert stats["designate_candidates"] == 3, "three jobs, not fifteen job-passes"
+    assert stats["designate_mine"] == 1, "j1"
+    assert stats["designate_deferred"] == 2, "j2 and j3"
+    assert stats["designate_forced"] == 0
+
+
+def test_a_run_where_the_deadline_fires_on_everything_is_visible():
+    """The failure mode. If every job hits the fallback, bidders-per-job returns to its
+    undesignated value and the mode buys nothing — but completion, latency and the [DESIGNATE]
+    line all look ordinary. `designate_forced_share` is what separates the two runs."""
+    jobs = [_Job("j1"), _Job("j2")]
+    a = make_agent(1, [1, 2], lambda job, assignees: (_Agent(2), 1.0))  # never designated to us
+    a._designate_bidders(jobs)
+    for job in jobs:                      # age every deferral past the deadline
+        job.designation_deferred_at -= 31.0
+    mine = a._designate_bidders(jobs)
+    a._designate_bidders(jobs)               # and again on the next pass
+    assert len(mine) == 2, "the deadline must still guarantee liveness"
+    stats = a.bidding_stats()
+    assert stats["designate_forced"] == 2, "two jobs, not two-jobs-times-two-passes"
+    assert stats["designate_forced_share"] == 1.0, "designation held for nothing"
+
+
+def test_mine_and_forced_are_counted_apart():
+    """`mine` is the list actually bid on, which INCLUDES the forced ones. Counting it whole
+    would report a coordinator as healthily designated while every job it took was a fallback."""
+    jobs = [_Job("j1"), _Job("j2")]
+    designate = lambda job, assignees: (_Agent(1 if job.job_id == "j1" else 2), 1.0)
+    a = make_agent(1, [1, 2], designate)
+    a._designate_bidders(jobs)
+    jobs[1].designation_deferred_at -= 31.0
+    a._designate_bidders(jobs)
+    a._designate_bidders(jobs)               # still unplaced: forced again, same job
+    stats = a.bidding_stats()
+    assert stats["designate_mine"] == 1, "j1 — genuinely designated"
+    assert stats["designate_forced"] == 1, "j2, once, however many passes it is forced on"
+    assert stats["designate_forced_share"] == 0.5
+
+
+def test_a_job_that_took_both_routes_is_not_counted_twice():
+    """`mine` and `forced` overlap across reselection rounds. Within one round they are
+    disjoint, but a job that loses consensus returns to PENDING and comes round again — so it
+    can be designated here once and reach its fallback deadline later. Summing the two sets
+    then counts it twice and DILUTES the share: a fleet where every job eventually hit the
+    fallback would report 0.50 instead of 1.00, understating exactly the failure this number
+    exists to expose."""
+    a = make_agent(1, [1, 2], lambda job, assignees: (_Agent(1), 1.0))
+    for category in ("mine", "forced"):
+        for job_id in ("j1", "j2", "j3"):
+            a._note_designation(category, _Job(job_id))
+    stats = a.bidding_stats()
+    assert stats["designate_mine"] == 3
+    assert stats["designate_forced"] == 3
+    assert stats["designate_claimed"] == 3, "three jobs took both routes, not six"
+    assert stats["designate_forced_share"] == 1.0, "every job hit the fallback"
+
+
+def test_retry_cost_is_still_visible_even_though_jobs_are_counted_once():
+    """Counting a job once is right for the share and wrong for the cost, so the cost lives in
+    a different pair: re-bidding the same job after a lost round is `bid_calls` above
+    `bid_jobs`."""
+    a = make_agent(1, [1, 2], lambda job, assignees: (_Agent(1), 1.0))
+    for _ in range(3):
+        a._note_bid("j1")
+    stats = a.bidding_stats()
+    assert stats["bid_jobs"] == 1
+    assert stats["bid_calls"] == 3, "two redundant re-bids, visible"
+
+
+def test_stats_stay_out_of_a_run_that_never_bid():
+    """A rule-based or analytic run must keep exactly the metrics payload it always had."""
+    a = make_agent(1, [1, 2], lambda job, assignees: (_Agent(1), 1.0))
+    a.designate_bidder = False
+    a.bidder = None
+    a.delegator = None
+    assert a.llm_usage_snapshot() == {}
