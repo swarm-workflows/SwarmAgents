@@ -509,3 +509,52 @@ class TestDeadLlmPlaneIsFlaggedWhateverTheRunsAge(unittest.TestCase):
             metrics = run_metrics(run_dir, expected_jobs=1)
             self.assertNotIn("llm_plane_dead", metrics)
             self.assertNotIn("llm_failure_rate", metrics)
+
+
+class TestAnAbsentFailureCounterIsUnknownNotZero(unittest.TestCase):
+    """The `bidding` block shipped before `bid_failures` existed. Reading its absence as 0
+    makes a run where EVERY bid failed report a 0.0 failure rate — a perfectly healthy plane.
+    That is exactly the payload shape of the invalid run measured on the slice 2026-09-14; it
+    was caught only because the separate `llm` usage block happened to exist alongside it.
+    """
+
+    ROWS = "j1,1,1,2,2,9,0,1,0.1,0.5\n"
+
+    def _run(self, root: Path, instr: dict) -> Path:
+        import json
+        run_dir = write_run(root, "hier-30/run01", self.ROWS)
+        (run_dir / "metrics.json").write_text(
+            json.dumps({"1": {"id": 1, "instrumentation": instr}}))
+        return run_dir
+
+    def test_a_bidding_block_without_the_counter_is_not_reported_as_healthy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._run(Path(tmp), {          # the exact shipped intermediate shape
+                "llm": {"bidding": {"designate_bidder": True, "bid_jobs": 924,
+                                    "bid_calls": 924, "designate_mine": 924}}})
+            metrics = run_metrics(run_dir, expected_jobs=1)
+            self.assertNotIn("llm_bid_failure_rate", metrics,
+                             "a rate computed from a counter that does not exist is a lie")
+            self.assertNotIn("llm_plane_dead", metrics)
+            self.assertTrue(metrics["llm_plane_unchecked"])
+
+    def test_checked_and_fine_is_distinguishable_from_could_not_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._run(Path(tmp), {
+                "llm": {"bidding": {"designate_bidder": True, "bid_jobs": 900,
+                                    "bid_calls": 900, "bid_failures": 3}}})
+            metrics = run_metrics(run_dir, expected_jobs=1)
+            self.assertFalse(metrics["llm_plane_unchecked"])
+            self.assertFalse(metrics["llm_plane_dead"])
+            self.assertAlmostEqual(metrics["llm_bid_failure_rate"], round(3 / 900, 6))
+
+    def test_the_usage_block_alone_is_enough_to_check(self):
+        """A legacy payload with no bidding block at all is still checkable, so it must not be
+        lumped in with the genuinely unknowable ones."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._run(Path(tmp), {
+                "llm": {"bid": {"calls": 924, "failures": 924,
+                                "input_tokens": 0, "output_tokens": 0}}})
+            metrics = run_metrics(run_dir, expected_jobs=1)
+            self.assertFalse(metrics["llm_plane_unchecked"])
+            self.assertTrue(metrics["llm_plane_dead"])

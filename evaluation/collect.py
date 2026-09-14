@@ -301,7 +301,7 @@ def instrumentation_metrics(agents: dict[str, dict]) -> dict[str, Any]:
     bid_jobs = bid_calls = designated = forced = claimed_jobs = 0
     bid_failures = 0
     have_messages = have_consensus = have_llm = False
-    have_bidding = designate_on = False
+    have_bidding = designate_on = have_bid_failures = False
     finalize_s: list[float] = []
     rounds: list[float] = []
 
@@ -336,7 +336,13 @@ def instrumentation_metrics(agents: dict[str, dict]) -> dict[str, Any]:
                     have_bidding = True
                     bid_jobs += int(site.get("bid_jobs", 0) or 0)
                     bid_calls += int(site.get("bid_calls", 0) or 0)
-                    bid_failures += int(site.get("bid_failures", 0) or 0)
+                    # Presence is tracked, not defaulted. `bid_failures` was added after the
+                    # first payloads that carried a `bidding` block, and reading its absence
+                    # as 0 makes a run where EVERY bid failed report a 0.0 failure rate — a
+                    # perfectly healthy plane. Absent is unknown, never zero.
+                    if "bid_failures" in site:
+                        have_bid_failures = True
+                        bid_failures += int(site.get("bid_failures", 0) or 0)
                     designated += int(site.get("designate_mine", 0) or 0)
                     forced += int(site.get("designate_forced", 0) or 0)
                     # The agent already resolved the mine/forced overlap into a union; the
@@ -384,15 +390,17 @@ def instrumentation_metrics(agents: dict[str, dict]) -> dict[str, Any]:
         out["designate_bidder"] = designate_on
         out["llm_bid_jobs"] = bid_jobs
         out["llm_bid_calls"] = bid_calls
-        out["llm_bid_failures"] = bid_failures
         # Read this before anything else on an LLM row. A run whose bids all failed completes
         # normally and looks healthy in every other column, but it is neither an LLM-plane
         # measurement nor a clean analytic baseline — a failed bid returns in ~0s, which is
         # the race-to-propose regime. Measured on the slice 2026-09-14: 924 of 924 bids
         # returned 403 for a model the gateway key cannot access, and the run completed
-        # 197/197 jobs.
-        out["llm_bid_failure_rate"] = (round(bid_failures / bid_calls, 6) if bid_calls
-                                       else float("nan"))
+        # 197/197 jobs. Omitted entirely when the payload never carried the counter, rather
+        # than reported as 0.
+        if have_bid_failures:
+            out["llm_bid_failures"] = bid_failures
+            out["llm_bid_failure_rate"] = (round(bid_failures / bid_calls, 6) if bid_calls
+                                           else float("nan"))
         if designate_on:
             out["designate_designated"] = designated
             out["designate_forced"] = forced
@@ -408,17 +416,27 @@ def instrumentation_metrics(agents: dict[str, dict]) -> dict[str, Any]:
             out["designate_forced_share"] = (round(forced / claimed_jobs, 6) if claimed_jobs
                                              else float("nan"))
 
-    # One flag, computed from whichever failure signal the payload happens to carry, so the
-    # answer does not depend on how old the run is. A run that trips this is not an LLM-plane
+    # One flag, computed from whichever failure signal the payload actually carries, so the
+    # answer does not depend on how old the run is. A run that trips it is not an LLM-plane
     # measurement AND not a clean analytic baseline: a failed bid returns in ~0s, which is the
     # race-to-propose regime. The minimum call count keeps a handful of bids from tripping it.
-    for calls, failures in ((bid_calls, bid_failures), (llm_calls, llm_failures)):
-        if calls >= LLM_DEAD_MIN_CALLS and failures >= calls:
-            out["llm_plane_dead"] = True
-            break
+    #
+    # Only signals that EXIST are consulted, and when none does the flag is omitted and
+    # `llm_plane_unchecked` says so. "We checked and it is fine" and "we could not check" must
+    # not be the same value: reading a missing counter as zero is what let a run where every
+    # one of 924 bids failed report a 0.0 failure rate.
+    signals = []
+    if have_bid_failures:
+        signals.append((bid_calls, bid_failures))
+    if have_llm:
+        signals.append((llm_calls, llm_failures))
+    if not signals:
+        if have_bidding or have_llm:
+            out["llm_plane_unchecked"] = True
     else:
-        if have_llm or have_bidding:
-            out["llm_plane_dead"] = False
+        out["llm_plane_unchecked"] = False
+        out["llm_plane_dead"] = any(
+            calls >= LLM_DEAD_MIN_CALLS and failures >= calls for calls, failures in signals)
 
     rows = decision_rows(agents)
     if rows:
@@ -718,6 +736,10 @@ def main() -> int:
                 print(f"  warn: no usable job data in {run_dir}", file=sys.stderr)
                 continue
 
+            if metrics.get("llm_plane_unchecked"):
+                print(f"  WARNING: {run_dir.name} — this run used the LLM plane but carries no "
+                      f"failure counter, so whether its bids worked CANNOT be determined. Do "
+                      f"not read its absence as health.", file=sys.stderr)
             if metrics.get("llm_plane_dead"):
                 print(f"  WARNING: {run_dir.name} — every LLM call failed. This run is 100% "
                       f"analytic fallback: not an LLM-plane measurement, and not a clean "
