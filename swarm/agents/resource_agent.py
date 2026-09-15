@@ -746,14 +746,30 @@ class ResourceAgent(Agent):
 
     def _data_predicate_ready(self, job: Job) -> bool:
         """
-        True when the job's data predicate is satisfied (or absent). Gated
-        jobs are not proposed for selection — computation is steered by the
-        availability of quantum measurement data.
+        True when the job's data predicate is satisfied (or absent). Gated jobs are not
+        proposed for selection — computation is steered by the availability of data.
+
+        Two kinds of predicate share this gate, dispatched on shape rather than on a flag so
+        that predicates written before the second kind existed keep working:
+
+        * ``{"experiment_id", "min_snapshots", ...}`` — the quantum measurement stream.
+        * ``{"kind": "files", "files": [...]}`` — a **workflow DAG edge**. A Pegasus DAG's
+          dependencies *are* file dependencies, so a job is runnable exactly when every input
+          it does not bring with it has been produced by some other job. Gating on names
+          rather than on parent job ids is what lets the converter recover the edges by
+          matching one job's outputs against another's inputs, without the scheduler ever
+          being told the graph.
+
+        A failure to *check* is never treated as satisfied: an unreachable Redis would
+        otherwise release the whole DAG at once, which is the one error this gate exists to
+        prevent.
         """
         pred = job.data_predicate
         if not pred:
             return True
         try:
+            if pred.get("kind") == "files" or "files" in pred:
+                return self.repository.data_available(list(pred.get("files") or []))
             return self.measurement_layer.predicate_satisfied(
                 pred.get("experiment_id", ""), int(pred.get("min_snapshots", 1)))
         except Exception as e:
@@ -1961,8 +1977,14 @@ class ResourceAgent(Agent):
         pred = job.data_predicate
         pred_sig = None
         if pred:
-            pred_sig = (pred.get("experiment_id"), int(pred.get("min_snapshots", 1)),
-                        int(pred.get("total_snapshots", 1)))
+            if pred.get("kind") == "files" or "files" in pred:
+                # Part of the signature for the same reason the quantum fields are: two jobs
+                # identical but for which files they wait on are not interchangeable, and a
+                # cache that conflated them would price one with the other's cost.
+                pred_sig = ("files", tuple(sorted(str(f) for f in (pred.get("files") or []))))
+            else:
+                pred_sig = (pred.get("experiment_id"), int(pred.get("min_snapshots", 1)),
+                            int(pred.get("total_snapshots", 1)))
         return (
             job.job_id,
             round(caps.core, 3),
@@ -2168,6 +2190,9 @@ class ResourceAgent(Agent):
         # job is ever costed, so the lookup is stable and cacheable.
         comm_penalty = 1.0
         pred = job.data_predicate
+        if pred and pred.get("kind") == "files":
+            # A DAG edge, not a measurement stream: there is no producer site to look up.
+            pred = None
         if pred and self.split_comm_penalty_factor > 0:
             producer_site = self.measurement_layer.producer_site(pred.get("experiment_id", ""))
             comm_penalty = split_comm_penalty(
@@ -2984,6 +3009,20 @@ class ResourceAgent(Agent):
             # post_process push a classical post-processing job (data-triggered)
             if job.sub_role is None and job.exit_status == 0:
                 self._maybe_push_post_process(job)
+
+            # Publish what this job produced, so descendants gated on those names become
+            # selectable. After execution and only on success: a failed job's outputs do not
+            # exist, and releasing a child on a parent's failure would run it on missing
+            # inputs. Non-raising for the same reason `_note_bid` is — a bookkeeping error
+            # here must not turn a completed job into a failed one.
+            if job.exit_status == 0:
+                try:
+                    produced = [d.file for d in (job.data_out or []) if getattr(d, "file", None)]
+                    if produced:
+                        self.repository.mark_data_available(produced)
+                        self.logger.debug(f"[DATA_READY] {job_id} produced {produced}")
+                except Exception as e:
+                    self.logger.warning(f"Failed to publish produced data for {job_id}: {e}")
 
             # Always persist job with exit_status so parent coordinator can read outcome
             self.repository.save(

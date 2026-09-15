@@ -289,6 +289,49 @@ def map_profile(profile: dict, job_number: int,
 
 
 # ---------------------------------------------------------------------------
+# Workflow DAG
+# ---------------------------------------------------------------------------
+
+def apply_dag_gating(jobs: List[dict]) -> Tuple[int, List[str]]:
+    """Give every job a data predicate naming the inputs another job produces.
+
+    A Pegasus DAG's edges *are* file dependencies, so the graph is recoverable from the
+    profiles alone: job B depends on job A exactly when B lists an input that A lists as an
+    output. Nothing has to be extracted that the profile extractor does not already carry, and
+    the scheduler is never told the graph — it only ever asks whether the names a job needs
+    exist yet (`Repository.data_available`).
+
+    Only names produced *inside this set* become predicates. A root job's inputs were staged in
+    from outside the workflow and nothing in the run will ever produce them, so gating on them
+    would hold the whole DAG at its root forever — the failure mode that makes an unattended
+    cell look like a livelock.
+
+    Returns (edges, roots).
+    """
+    producer: Dict[str, str] = {}
+    for job in jobs:
+        for dn in (job.get("data_out") or []):
+            f = dn.get("file")
+            if f:
+                producer[f] = job["id"]
+
+    edges = 0
+    roots: List[str] = []
+    for job in jobs:
+        needs = []
+        for dn in (job.get("data_in") or []):
+            f = dn.get("file")
+            if f and producer.get(f) and producer[f] != job["id"]:
+                needs.append(f)
+                edges += 1
+        if needs:
+            job["data_predicate"] = {"kind": "files", "files": sorted(set(needs))}
+        else:
+            roots.append(job["id"])
+    return edges, roots
+
+
+# ---------------------------------------------------------------------------
 # Baseline builder
 # ---------------------------------------------------------------------------
 
@@ -565,6 +608,7 @@ def convert_pegasus_profiles(
     dtn_map: Optional[Dict[str, str]] = None,
     dtn_names: Optional[List[str]] = None,
     dtn_scope: str = "file",
+    dag_gating: bool = False,
 ) -> dict:
     """Convert Pegasus profiles to SwarmAgents job JSON files.
 
@@ -612,6 +656,15 @@ def convert_pegasus_profiles(
 
     os.makedirs(output_dir, exist_ok=True)
 
+    dag_note = None
+    if dag_gating and data_nodes_mode != "per-file":
+        # per-site keeps one data node per job, which silently drops every edge after the
+        # first: measured on the 11-job earthquake workflow, 10 of 13 edges survived. A
+        # partial DAG runs and looks fine, so this is forced rather than warned about.
+        dag_note = (f"--dag-gating forced --data-nodes per-file (was {data_nodes_mode!r}); "
+                    "per-site collapses a job's inputs and loses DAG edges")
+        data_nodes_mode = "per-file"
+
     dtn_resolver = make_dtn_resolver(dtn_map, dtn_names, dtn_scope)
     baseline = BaselineBuilder()
     all_warnings: List[dict] = []
@@ -619,6 +672,8 @@ def convert_pegasus_profiles(
     total_data_in = 0
     total_data_out = 0
 
+    # Two passes when gating: an edge is only known once every job's outputs are known.
+    mapped: List[Tuple[int, dict, dict, List[str]]] = []
     for i, (key, profile) in enumerate(profiles, 1):
         job, warnings = map_profile(
             profile, i,
@@ -629,7 +684,12 @@ def convert_pegasus_profiles(
             data_nodes_mode=data_nodes_mode,
             dtn_resolver=dtn_resolver,
         )
+        mapped.append((i, job, profile, warnings))
 
+    dag_edges, dag_roots = (apply_dag_gating([j for _, j, _, _ in mapped])
+                            if dag_gating else (0, []))
+
+    for i, job, profile, warnings in mapped:
         # Write job file
         job_path = os.path.join(output_dir, f"job_{i}.json")
         with open(job_path, "w") as fh:
@@ -674,6 +734,12 @@ def convert_pegasus_profiles(
             "total_data_in_nodes": total_data_in,
             "total_data_out_nodes": total_data_out,
             "sites_seen": sites_seen,
+        },
+        "dag": {
+            "gating": bool(dag_gating),
+            "edges": dag_edges,
+            "roots": dag_roots,
+            "note": dag_note,
         },
         "warnings_count": warnings_count,
         "warnings": all_warnings,
@@ -726,6 +792,16 @@ def convert(args: argparse.Namespace):
     total_data_in = 0
     total_data_out = 0
 
+    data_nodes_mode = args.data_nodes
+    dag_note = None
+    if args.dag_gating and data_nodes_mode != "per-file":
+        dag_note = (f"--dag-gating forced --data-nodes per-file (was {data_nodes_mode!r}); "
+                    "per-site collapses a job's inputs and loses DAG edges")
+        data_nodes_mode = "per-file"
+        print(f"  [dag] {dag_note}")
+
+    # Two passes when gating: an edge is only known once every job's outputs are known.
+    mapped = []
     for i, (key, profile) in enumerate(profiles, 1):
         job, warnings = map_profile(
             profile, i,
@@ -733,10 +809,15 @@ def convert(args: argparse.Namespace):
             default_cores=args.default_cores,
             min_ram_gb=args.min_ram_gb,
             min_disk_gb=args.min_disk_gb,
-            data_nodes_mode=args.data_nodes,
+            data_nodes_mode=data_nodes_mode,
             dtn_resolver=dtn_resolver,
         )
+        mapped.append((i, job, profile, warnings))
 
+    dag_edges, dag_roots = (apply_dag_gating([j for _, j, _, _ in mapped])
+                            if args.dag_gating else (0, []))
+
+    for i, job, profile, warnings in mapped:
         # Write job file
         job_path = os.path.join(args.output_dir, f"job_{i}.json")
         with open(job_path, "w") as fh:
@@ -801,6 +882,12 @@ def convert(args: argparse.Namespace):
             "total_data_in_nodes": total_data_in,
             "total_data_out_nodes": total_data_out,
             "sites_seen": sites_seen,
+        },
+        "dag": {
+            "gating": bool(args.dag_gating),
+            "edges": dag_edges,
+            "roots": dag_roots,
+            "note": dag_note,
         },
         "warnings_count": sum(len(w["warnings"]) for w in all_warnings),
         "warnings": all_warnings,
@@ -881,6 +968,16 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated DTN pool, e.g. 'dtn1,dtn2,dtn3'. Files are spread "
              "across the pool by a stable hash (see --dtn-scope), so the same "
              "input always maps to the same DTN. Overrides --dtn-map."
+    )
+    parser.add_argument(
+        "--dag-gating", action="store_true",
+        help="Reconstruct the workflow DAG from the profiles and emit it as a per-job data "
+             "predicate, so a job is not selectable until the inputs another job produces "
+             "exist. Edges are recovered by matching one job's output file names against "
+             "another's inputs — no extra extraction is needed. Implies --data-nodes per-file, "
+             "because per-site collapses a job's inputs and silently loses edges (measured: 10 "
+             "of 13 survived on an 11-job workflow). Without this flag every job in a workflow "
+             "is independent and the whole DAG is proposed at once."
     )
     parser.add_argument(
         "--dtn-scope", choices=["file", "job"], default="file",

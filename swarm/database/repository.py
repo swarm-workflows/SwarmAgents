@@ -325,6 +325,41 @@ class Repository:
         existing = self.redis.get(key)
         return int(existing) if existing is not None else int(agent_id)
 
+    # ---- Produced-data registry (workflow DAG gating) -------------------------------- #
+    #
+    # One Redis SET per run holding the logical file names that have actually been produced.
+    # A job whose inputs name files in this set is runnable; one whose inputs do not is a
+    # descendant whose parent has not finished. Deliberately a *set of names* rather than a
+    # graph of job ids: a Pegasus DAG's edges are file dependencies, the converter recovers
+    # them by matching one job's outputs against another's inputs, and a name is the only
+    # thing both halves agree on. It is also flat across levels and groups, because the
+    # producer and the consumer of a file are on different agents by construction.
+
+    KEY_DATA_READY = "data_ready"
+
+    def mark_data_available(self, names: List[str]) -> None:
+        """Record that *names* now exist. Called once a job has actually completed."""
+        names = [str(n) for n in names if n]
+        if not names:
+            return
+        self.redis.sadd(self.KEY_DATA_READY, *names)
+
+    def data_available(self, names: List[str]) -> bool:
+        """True when every name in *names* has been produced (or the list is empty).
+
+        One round trip regardless of how many names are asked about: this is called for every
+        gated job on every scheduling pass, and a per-name GET loop would put a WAN round trip
+        per edge into the scheduling loop of every agent."""
+        names = [str(n) for n in names if n]
+        if not names:
+            return True
+        return all(self.redis.smismember(self.KEY_DATA_READY, names))
+
+    def available_data(self) -> set:
+        """Every name produced so far — for diagnostics, not for the scheduling path."""
+        return {v.decode() if isinstance(v, bytes) else v
+                for v in self.redis.smembers(self.KEY_DATA_READY)}
+
     def get_assignment(self, job_id: str, level: int = 0, group: int = 0):
         """Return the committed assignee for ``job_id``, or None if unclaimed."""
         key = f"{self.KEY_ASSIGNEE}:{level}:{group}:{job_id}"
