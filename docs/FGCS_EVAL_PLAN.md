@@ -8,14 +8,23 @@ contribution here.
 **Testbed:** 2-slice FABRIC deployment, ~90 VMs across 17 sites (16c/16G/500G), one `database` node
 (Redis) and one Prometheus/Grafana monitor VM. Driven from `notebooks/SWARM-2slice.ipynb` +
 `db_node_setup/`.
-**Venue (decided 2026-09-08):** *Future Generation Computer Systems* (Elsevier), regular article.
-Rolling submission, no abstract gate; single-anonymized review, so citing SWARM+ and naming the
-FABRIC slice is not an anonymity problem (the reason CCGrid'27, double-blind, was dropped — together
-with its 10-page cap). Length: verify against the current Guide for Authors before drafting; a
-secondary source quotes ~18 pages, and journal reviewers expect a fuller related-work and threats
-section than a conference allows. Self-imposed dates in §9 replace the conference deadline.
-**Fallback venue:** a conference *after* FGCS returns reviews. IPDPS'27 is **not** a fallback —
-its abstract/paper deadlines are 2 / 9 Oct 2026, before the P0 code exists (§0.1).
+**Two papers, one campaign (decided 2026-09-10, §0.9).** This document is the **journal**
+plan — *Future Generation Computer Systems* (Elsevier), regular article, submit by **31 Jan
+2027**; rolling submission, no abstract gate, single-anonymized review, so citing SWARM+ and
+naming the FABRIC slice is not an anonymity problem. Length: verify against the current Guide
+for Authors before drafting (a secondary source quotes ~18 pages); journal reviewers expect a
+fuller related-work and threats section than a conference allows. It is **also the master for
+what both papers share**: substrate rules (§0.2, §5 placement rules), the P0 code list (§4),
+metric definitions (§7) and the experiment matrix and budget (§5).
+
+**What is NOT here:** everything specific to the conference paper — its claims, figure budget,
+fleet, owed code and **calendar** — lives in `docs/CCGRID27_PAPER_PLAN.md` (C1 bandit + C3
+Snow; abstract 24 Nov 2026, **paper 1 Dec 2026**, verified against the CFP 2026-09-14 — both
+files said 8 Dec for four days). §9 below carries only the shared campaign clock and the
+journal-only window, and points at that file for the rest. The 2026-09-08 review that dropped
+CCGrid (double-blind, 10 pages) was reversed on 2026-09-10 for the *two-claim* paper; the
+objections stand for the *full* story, which is why the composite stays here. IPDPS'27 is not a
+fallback for either (deadlines 2 / 9 Oct 2026).
 
 ---
 
@@ -30,10 +39,14 @@ Sep 6. At the time of this review **none of the P0 code existed in the tree** �
 (`swarm/agents/llm/llm_delegator.py`, `delegation.policy`). **P0-4 landed 2026-09-14**
 (`swarm/utils/instrumentation.py`), which closes the one item neither paper's figure list could
 route around, and **P1-1 landed the same day** (`evaluation/oracle.py`), which was the last
-one. P0-8 and P0-2/P0-3 remain open; none of them blocks a conference figure. P1-2 (`collect.py`) and P1-3 (site-aware configs) are done. The critical path is ~3 weeks behind, which is the practical reason
-the journal target is right: a Nov 24 abstract was no longer reachable with an honest campaign.
-IPDPS'27 (abstract Oct 2, paper Oct 9, 2026) is out for the same reason and should not be named
-as a fallback.
+one. **P0-8 landed 2026-09-14** too. P0-2/P0-3 remain open and are journal-only (E4). P1-2
+(`collect.py`) and P1-3 (site-aware configs) are done. *(Historical: as of 2026-09-08 the
+critical path was ~3 weeks behind, which is why this review retargeted to a journal and judged a
+24 Nov abstract unreachable. §0.9 reversed that two days later for the two-claim conference
+paper once P0-1 was in; with P0-4/P1-1/P0-8 landed on 09-14, every code item a conference
+figure needs is done — see `CCGRID27_PAPER_PLAN.md` §4 for the four tooling items that were
+never on this list.)* IPDPS'27 (abstract Oct 2, paper Oct 9, 2026) is out and should not be
+named as a fallback.
 
 ### 0.2 Pre-campaign fixes — silent bugs that would corrupt paper numbers
 
@@ -136,7 +149,8 @@ arrival time, and the LLM's output is close to inert.** Evidence, all measured:
 - Single-anonymized review: the eScience'26 delta table in §1 can be stated openly, and the
   FABRIC 17-site deployment can be described in full (it identifies the group either way).
 - Reviewers will expect a **threats-to-validity** section: single testbed, one workload family
-  (Pegasus-derived), Redis in the control plane, flat-sleep execution if F-9 is not fixed, LLM
+  (Pegasus-derived), Redis in the control plane, simulated execution (F-9 is fixed, so wall times
+  replay faithfully, but jobs still sleep rather than compute — state the 120 s cap), LLM
   nondeterminism (temperature 0.1) and model version pinning. Write it from the §0.2 list.
 - Reproducibility appendix: seeds, frozen fleet, `collect.py` outputs, tagged revision.
 
@@ -310,10 +324,155 @@ fallback) and one case in `tests/test_collect.py`. **The smoke pair must be re-r
 from either is citable.
 ---
 
+### 0.10 The bandit learns from a success signal written before the job runs (found 2026-09-14)
+
+A code review pass (Codex, verified by hand and then on hardware) found that the reward the
+delegation bandit receives is decided at *scheduling* time, not at *completion* time.
+`schedule_job` persists the job as `COMPLETE` with `exit_status` at its default of 0 and then
+submits it to the executor; the leaf writes the real exit status only after the simulated
+wall time, up to 120 s later. The coordinator's delegation monitor polls every tick and takes
+the first `COMPLETE` as terminal. Failures are therefore visible to the bandit only for jobs
+that finish *before* the coordinator's next observation.
+
+Measured on `runs/p11-oracle2` (Hier-30, ε-greedy, the P1-1 validation run):
+
+| | count |
+|---|---|
+| failures injected at leaves (`[FAILURE_SIM]`) | 83 |
+| leaf `[COMPLETE] … FAILED` lines | 83 |
+| failures the bandit recorded (`mab_stats` over both coordinators) | **19** |
+| successes the bandit recorded | 421 |
+
+Event order for one failed job: scheduled 18:02:46.28 → coordinator logged it complete
+18:02:46.54 → leaf actually finished, FAILED, 18:03:06.93. Four of six sampled failed jobs
+show the same inversion; the two that were credited correctly ran under a second.
+
+Consequences: (a) every bandit-vs-bandit comparison to date measured how *fast* a group's
+jobs finish, not how often they fail — a long-running failure is a success to the learner;
+(b) the `CONTEXTUAL_BANDIT_DESIGN.md` §8 deployment validation and the smoke pair inherit
+this; (c) the P1-1 oracle was **not** fooled, because it labels decisions from the injected
+profile rather than from rewards — which is also why its validation could pass over a blind
+learner.
+
+**Fixed the same day (P0-9 in §4).** Three consequences that change how runs behave and how
+their numbers compare, all corrections rather than regressions:
+
+1. **A run no longer ends when every job is merely *scheduled*.** `run_test.py`'s early-exit
+   poll treats states 8/9/10 as terminal and `RUNNING` is 6, so a cell now waits for execution
+   to finish and is longer by up to `wall_time_max_s` (120 s). Same for the `jobs-completed`
+   dynamic-agent trigger, which counts state-8 members. Size `--runtime` /
+   `--shutdown-after-seconds` accordingly.
+2. **Completion % falls in any run that kills agents.** A job whose executor died is now
+   persisted `RUNNING` with no `completed_at` and correctly counted as incomplete; before, it
+   had been written `COMPLETE` at scheduling time and counted as done. E2b, E6 and every
+   failure-injection cell therefore cannot be compared against a pre-fix number.
+3. **Latency and makespan were *not* affected.** `Job.execute()` calls `mark_completed()`
+   explicitly after the sleep, so `completed_at` always held the real finish time even while
+   the state had been flipped early. The damage was confined to what the monitor read.
+
+**Re-run on the fixed revision, 2026-09-15 — the fix is confirmed on hardware.** Same fleet,
+same 400-job workload, interleaved placement, clocks checked; the failure profile was restored
+into `config_swarm_multi.yml` from `runs/p11-oracle2/run_meta.json` so the arms are comparable
+(the base config had been edited for the P0-8 runs in between, which is exactly the hazard
+P1-1's `ground_truth` archival exists for):
+
+| run | injected | leaf FAILED | bandit failures | bandit successes | leaf SUCCESS |
+|---|---|---|---|---|---|
+| `p11-oracle2` (before) | 83 | 83 | **19** | 421 | 358 |
+| `p11-oracle4` (after) | 76 | 76 | **122** | 304 | 325 |
+| `smoke-g4-bandit` (after) | 56 | 56 | **55** | 312 | 314 |
+| `smoke-g4-llm` (after) | 108 | 108 | **108** | 230 | 230 |
+
+`p11-oracle4`'s 122 is exactly 76 exit failures **plus 46 delegation timeouts**, which the
+bandit is supposed to count as failures; `smoke-g4-llm` agrees to the job (338 outcomes for
+338 leaf completions). All three re-runs reported 30/30 agents with no metrics shortfall, and
+the oracle scored `p11-oracle4` end to end: **488 decisions, 0 unscored, routing accuracy
+0.822** (was 0.794 on the blind run), regret 117.6, and `--validate` agreeing to **0.041**
+job-weighted error over 436 jobs with no type beyond sampling noise.
+
+The LLM arm also confirms P0-1 still works on the fixed code: coordinators 28 and 29 made
+106/107 and 116/116 real ranking calls, zero fallbacks, mean 2.6 s, while coordinator 30 leads
+one group and logged the §0.6 `can never choose` warning for all 121 of its trivial
+delegations — the expected `[2,2,1]` shape for five groups at `G=2`.
+
+**A further defect the verification exposed, now FIXED (2026-09-15):** a job in state
+`FAILED` yielded no bandit outcome at all. `_restore_infeasible_jobs` marks a job `FAILED`
+once it exhausts `max_infeasible_retries`; the delegation monitor's terminal test was
+`COMPLETE` only, so such a job fell into the in-progress branch, waited out
+`delegation_timeout_s + delegation_exec_grace_s` and was dropped uncounted — 2 of 400 in
+`smoke-g4-bandit`, which is the whole of that arm's gap between 56 injected failures and 55
+recorded. A group that *cannot run* a job is precisely the routing signal C1 is about, so
+`FAILED` is now terminal and reported as a failure immediately.
+
+**Observed and deliberately NOT changed:** with the bandit disabled, delegation fans out to
+every capable group and each group runs the job. Seen in `p11-oracle3` (run before the profile was restored): 400 distinct jobs,
+   **952 leaf completions, up to 6 executions of one job** across different groups. Exactly-once
+   holds *within* a group — the Redis CAS is scoped per level and group — so this is redundant
+execution by design, not a safety violation. But it means completion counts, throughput and
+makespan from any fan-out-to-all cell are inflated, which matters if `all` is ever used as
+F4's stand-in baseline (`CCGRID27_PAPER_PLAN.md` §4 already says not to call it `static`).
+Whether redundant delegation *should* duplicate execution is a design question for the
+hierarchy, not a defect to patch mid-campaign, so it is recorded rather than changed.
+
+### 0.11 Five more defects from the same review pass, all FIXED 2026-09-15
+
+None was found by a failing run; all five bias a number one of the papers reports. Pinned by
+`tests/test_review_fixes.py` (18 cases, 9 of which fail against the pre-fix tree, and 2 more
+against the first, flawed version of fixes 3 and 5 — both caught by the stop-time review gate,
+and both the same mistake in different clothes: a decision taken from state read outside the
+step that changes it).
+
+**Status of the three slice runs against these fixes.** `p11-oracle4` and the `smoke-g4` pair
+were run *before* this group landed, so they remain valid as the P0-9 verification (none of
+these five touches how an outcome is reported) but are **not** campaign baselines. E5 in
+particular must be measured on the fixed PBFT engine.
+
+| # | Defect | Which number it moved |
+|---|---|---|
+| 1 | **PBFT proposers re-broadcast COMMIT on every PREPARE past quorum.** The "already committed" guard asked `incoming.contains(...)`, which is false for the proposer's *own* proposal because that lives in `outgoing`. Now keyed on a `_commits_sent` set of `(object_id, p_id)`, released with the object — so adopting a better proposal and re-proposing after a reselection timeout both still commit | Up to `n - quorum` redundant COMMITs per job, inflating **E5/F2 messages-per-job against PBFT** — the direction that flatters this work's own argument. E5 must be measured on the fixed engine |
+| 2 | **Snow's `finalized_count` / `abandoned_count` / `sends_dropped` were plain `+=` across the finalize pool and the driver thread.** Now under a dedicated `_stats_lock`, separate from `_lock` so an increment is never taken across a host callback | Undercounts finalizations and shed sends in exactly the saturated runs F1/F2 are about. The race is probabilistic under the GIL, so the tests assert the lock is *taken*, not that a count was lost |
+| 3 | **A Snow finalize whose CAS or callback raised was counted nowhere.** `_finalize` has already marked the state finalized and dropped the object, so the decision was neither `finalized` nor `abandoned`. New `finalize_errors` counter, reported in `consensus_stats()`. The outcome is now counted **once, at the end** of `_finalize_work_inner`: the first version of this fix incremented `finalized_count` before the host callbacks, so a decision whose callback raised reported `finalized=1, finalize_errors=1` and broke the very invariant the counter exists for. The round/query/latency summaries moved with the count, so they describe the population they are counted with | `finalized + abandoned + finalize_errors` is now the whole population. A non-zero third term means assignments were lost — a correctness signal that used to be a warning line |
+| 4 | **An unknown consensus engine name silently became PBFT.** `consensus.protocol` and both `hybrid.{level0,coordinator}` names are now validated, and an unknown one raises | A typo made a cell labelled Snow or Hybrid run PBFT throughout, with nothing in the run saying so — it would have invalidated protocol attribution in E1 |
+| 5 | **SWIM's `_indirect_acked` never shrank** — `on_ack` pops the probe, so the timeout sweep never reached the flag, and the relay-forwarding loop walked every entry ever created on every tick. The cleanup takes the **whole decision under the lock on live flags** and claims the entries it will forward there: the first version decided from a snapshot, and since `on_ack` pops the probe and sets the flag in one step, a snapshot taken a moment earlier reads "not acked, probe gone" — the orphan case — so it deleted a *fresh* ack and its relay destination and the initiator suspected a live peer | Failure-detection cost grew with uptime on exactly the long unattended runs the campaign is made of; the snapshot version would have dropped acks and caused false suspicions |
+
+Plus two harness fixes: `batch_tests_v2.py` **floored** the auto-generated host count where
+`run_test.py` and `generate_configs.py` **ceil** it (270 agents at 4/VM asked for 67 hosts and
+needed 68, so the run died *after* Redis had been flushed), and it could not forward
+`--expect-silent-agents`, so a batched failure-injection campaign could only check *how many*
+agents were silent, never *which*.
+
+**Two findings from the same pass deliberately left alone**, because each is a design decision
+rather than a defect and changing either would move every hierarchical number:
+
+- **`scheduling_main`'s `# TEMP HACK`:** at `level > 0` the cost matrix is built over `[self]`
+  only, so every coordinator proposes itself for every job at the coordinator tier. The
+  Hier-250 PBFT collapse C3 rests on may be partly "n proposals per job" rather than PBFT
+  itself. **E5 must report proposals/job by tier so the two are separable**, and §III has to
+  describe the behaviour either way.
+- **Failed-agent reassignment only searches the local pending queue** (the TODO at
+  `resource_agent.py:277`): a job already READY or RUNNING on a failed agent is logged as
+  "likely completed" and dropped from reassignment. That is the known gap in the failure story
+  and it needs a design, not a patch, before E2b/E6.
+
+Two smaller findings from the same pass that touch conference figures, recorded here and in
+`CCGRID27_PAPER_PLAN.md` §4:
+
+- **PBFT proposers re-broadcast COMMIT on every PREPARE past quorum.** The "already
+  committed" guard in `ConsensusEngine.on_prepare` checks `incoming.contains(...)`, which is
+  false for the proposer's own `outgoing` proposal, so each extra PREPARE re-appends the
+  proposal and sends another COMMIT. Inflates PBFT `sent_commit` by up to (n − quorum) per job
+  — the E5/F2 messages-per-job curve is biased *against* PBFT. Fix the guard, re-measure E5.
+- **Coordinator-tier selection is self-only.** `scheduling_main` has a `# TEMP HACK` that, at
+  `level > 0`, builds the cost matrix over `[self]` only, so every coordinator proposes itself
+  for every job at the coordinator tier. The Hier-250 PBFT collapse that C3 rests on may be
+  partly "n proposals per job" rather than PBFT per se; E5 should report proposals/job by tier
+  so the two are separable, and the hack should either be removed or named in the design
+  section.
+
 ### 0.9 The work splits into two papers (decided 2026-09-10)
 
 C1 (bandit delegation) and C3 (Snow consensus) go to **CCGrid 2027** — abstract 24 Nov 2026,
-paper 8 Dec 2026, 10 pages including references, double-blind. C2 (LLM coordinators) and the
+paper **1 Dec 2026** (corrected 2026-09-14 from 8 Dec), 10 pages including references, double-blind. C2 (LLM coordinators) and the
 quantum-hybrid strand stay here for **FGCS, 31 Jan 2027**. The conference plan is
 `docs/CCGRID27_PAPER_PLAN.md`; **this document stays the master** for substrate rules, P0 code
 work, metric definitions and the experiment matrix, and the conference paper draws cells from
@@ -336,7 +495,21 @@ run, and the LLM is what makes a decision plane expensive — a LinUCB update is
 The conference paper therefore cannot carry that claim. It gets a smaller, still-real one: Snow
 finalizes faster, so a coordinator's `GroupSnapshot` context is younger when it decides, so
 bandit regret should fall under Snow at equal scale. **That effect may be null**, and the
-campaign has a gate on 10 Nov to find out (`CCGRID27_PAPER_PLAN.md` §5).
+campaign has a gate on 10 Nov to find out (`CCGRID27_PAPER_PLAN.md` §6).
+
+**Caveat found 2026-09-14, and it applies to the journal's composite claim too:** the context
+*age* P0-4 records cannot vary with the consensus protocol. `received_at` is stamped only when
+`_refresh_neighbors` reads a fresher child `AgentInfo` from Redis, on the full-refresh cadence
+(5 s with gossip on, the default); the gossip overlay updates `load` without touching the
+stamp; no consensus code path is involved. The slice numbers already look like a refresh
+period (p50 0.25–0.44 s, p95 7–8.7 s). Age is a validity column; the quantity that *can* move
+with finalization speed is context **error** — `GroupSnapshot.inflight` versus the true
+in-flight count reconstructed offline from `all_jobs.csv` at the decision timestamp. That needs
+the snapshot's per-candidate `inflight` on the `DecisionRecord` (it carries candidates, selection
+and ages, not the values the policy saw) plus the offline join in `collect.py`, and is owed to
+the conference paper before the freeze
+(`CCGRID27_PAPER_PLAN.md` §1, §4). The journal's F2 inherits the same caveat when it argues
+mechanism rather than outcome.
 
 Two consequences for this plan:
 
@@ -433,18 +606,20 @@ that previously existed only at 30 agents, plus a SWARM+ (PBFT + analytic) re-ba
 **Measurement gaps**
 1. No LLM × Snow/hybrid cell anywhere — the C2 fix is unmeasured.
 2. No analytic-cost control row for the LLM runs → cannot claim LLM *quality*, only LLM *cost*.
-3. Bandit evaluated only at 30 agents, ≤2 runs per config in places, no oracle upper bound, no
-   static-heuristic baseline, and never combined with LLM coordinators.
-4. Snow has no message-count / bandwidth instrumentation (E5 of the old plan) → the O(n²)→O(fanout)
-   claim is asserted, not measured. The monitor VM makes this cheap now.
+3. Bandit evaluated only at 30 agents, ≤2 runs per config in places, ~~no oracle upper bound~~
+   (P1-1, done), **no static-heuristic baseline (still true — no static/greedy delegation policy
+   exists in code; `mab.enabled: false` is fan-out-to-all, recorded as `all`)**, and never
+   combined with LLM coordinators. LinTS exists (`mab.algorithm: lin_ts`).
+4. ~~Snow has no message-count / bandwidth instrumentation~~ **Done (P0-4, 2026-09-14)** — counted
+   in the transport under a lock, by direction and type.
 5. No exactly-once safety stress at scale; reviewers already flagged the safety argument as informal.
 6. Decision-quality metrics are thin everywhere: completion + selection time only. Need makespan,
    Jain's fairness, data-locality hit rate, and delegation regret.
 
 **Mechanism gaps (code work, §4)**
-7. There is **no LLM-based delegation** today — `LlmAgent` only overrides *its own* bid cost
-   (`_llm_or_analytic_cost`). "LLM coordinator" currently means "coordinator with an LLM-scored bid."
-   To claim a semantic decision plane, the LLM must choose *among child groups*.
+7. ~~There is **no LLM-based delegation** today~~ **Done (P0-1, 2026-09-08)** — `delegation.policy:
+   llm` puts the model in the child-group routing seat; before that "LLM coordinator" meant
+   "coordinator with an LLM-scored bid".
 8. No coupling between the bandit and the LLM. The obvious and defensible mechanism —
    **bandit proposes, LLM disposes** (or the reverse) — is the paper's systems contribution.
 9. No decision caching / inference-aware delegation (named as future work in the cut eScience text).
@@ -461,12 +636,13 @@ that previously existed only at 30 agents, plus a SWARM+ (PBFT + analytic) re-ba
 | **P0-7** ✅ | **Fallback parity (done 2026-09-08).** **As landed:** `llm.bid_pacing` with three modes, defaulting to `none` (the measured baseline). `fallback_parity` holds a fallback bid until it has taken as long as a real one; `uniform` holds *every* bid to the same target, so arrival time carries no information about the agent — the direct test of race-to-propose. The wait **tops a bid up to** the target rather than adding to it, so a timeout failure (which already burned `timeout_seconds`) and an instant 503 are treated alike, and a slow bid waits not at all. The target self-calibrates from this agent's own observed latencies at a configurable quantile (use ~0.9 for `uniform`), but **not from those alone**: an agent whose LLM never succeeds — the entire S05 faulted population — would never learn one and would never pace, leaving the 38.5× capture untouched. `bid_pacing_bootstrap_s` covers that and the cold-start window, defaulting to `llm.timeout_seconds` **resolved through `LlmConfig`**, which (with the timeout now enforced) is an upper bound on a successful bid and so a provable parity bound. Resolving it there rather than from the raw config dict matters: `LlmConfig` defaults the key to 6 s, so a config that omits it still bounds the bidder — reading the dict with a default of 0 left pacing inert on exactly that config. Same failure shape as the duplicated `runtime.peer_expiry_seconds` in §0.2: one key, two defaults. Capped by `bid_pacing_max_s` and sliced so shutdown is not delayed. `[STATS]` reports mode, target, waits and seconds held. `llm.disable_fallback` remains the separate ablation arm and is deliberately not paced — an agent that is not a candidate gains nothing by being quick to say so. | `llm_agent.py` `_llm_or_analytic_cost` | 1 d |
 | **P0-8** ✅ | **Designated bidding is measurable (done 2026-09-14).** The two items this row asked for — per-job counters and a deadline sized to the designee's window, not to one bid — were **already implemented** by the chaos-branch port: `_designate_bidders` uses a per-job deadline (`designation_deferred_at`, 30 s) and its docstring argues why a retry counter cannot work. Three other candidate causes were checked and ruled out rather than assumed: the designation arithmetic is linear and negligible (0.57 ms at 30 agents → 4.18 ms at 270, against a 500 ms loop), the deadline state survives because `gets()` returns live `Job` references and nothing replaces them, and an agent *is* in its own `neighbor_map` (it would otherwise never designate to itself and every job would wait out the deadline). **What was actually missing is the measurement**: nothing counted how many agents paid for a bid on the same job, so "3.7 bidders/job → 1" was unfalsifiable, and the mode's failure — the liveness deadline firing on everything, so every agent bids anyway — produced artefacts identical to success. **As landed:** each agent records the distinct jobs it paid an LLM bid for and its designation outcomes; `collect.py` reports `bidders_per_job` (fleet sum over the jobs the run *saw* — dividing by the declared count would make a stalled run look well partitioned) with `designate_forced_share` beside it. Three counting traps, each found by review and each biasing the flattering way: **(a)** `gets()` is a non-destructive peek, so `+= len(pending_jobs)` counts job-*passes* — `deferred` inflated ~60× and a fleet that is really 50% fallback reported 67%; counters are distinct-job sets now. **(b)** `mine` and `forced` overlap across reselection rounds (a job that loses consensus returns to PENDING and can take both routes), so the share denominator is their **union**, not their sum — summing reports 0.50 where every job hit the fallback. **(c)** `_note_bid` sat inside the bid path's `try`, whose `except` falls back to the analytic cost: an error there would have silently turned working LLM bids into analytic ones and moved placement, so it is non-raising. Retry cost stays visible as `bid_calls` − `bid_jobs`. Tests: 10 added to `test_designate_bidder.py`, 6 to `test_collect.py`. | `llm_agent.py` `_designate_bidders`, `collect.py` | 1 d |
 | **P0-1** ✅ | **LLM group delegation (done 2026-09-08).** At a coordinator, prompt over child-group summaries and return a ranked group choice + rationale. **As landed:** `delegation.policy` (`bandit` default = the pre-existing behaviour, `llm` = the model decides), with the decision point extracted into one overridable `ResourceAgent._select_child_groups` so both policies see the identical candidate list — the arms of E4 differ in the decision *rule*, not in what they were told. The summary the model gets is the **same `GroupSnapshot`** the contextual bandit gets, via a new public `MABManager.snapshots_for`, so headroom, inflight and the failure/timeout history are common to both. Candidate ids go in the **JSON schema** as a `Literal`, not just the prompt — the `score_scale` lesson again, since Ollama's `NativeOutput` generates from the schema and would happily answer `[0,1,2]` for groups 3, 7, 11 — and the answer is sanitised anyway (unknown ids dropped, de-duplicated, short rankings completed from the candidate order). Every failure path falls back to `bandit` **for that job**: provider error, `llm.timeout_seconds` breach, a ranking naming no group we offered, or a delegator that could not even be built. A decision that cannot change the outcome (one candidate, or `top_k ≥ len(candidates)`) spends no inference and is counted as `trivial`. Under `llm` the bandit still receives outcomes from the delegation monitor, so `MABManager.record_external_selection` hands it the **decision-time** context (not a rebuild after a multi-second call) — otherwise its arm counters would climb while the contextual model silently skipped every update, describing a run it did not steer. Delegation is **not** paced (P0-7): one coordinator owns its job, so a fast fallback out-races nobody. Audited to `llm_score:delegate:*`; `metrics.json` gets `llm_delegations` + `llm_delegation_stats`, kept apart from `mab_selections`; `[STATS]` reports calls/fallbacks/empty/trivial/mean latency. Two review findings worth recording because both are the campaign's recurring failure shape — *the fallback path is cheaper than the path it stands in for*: a failed decision originally widened the fan-out to every capable group (failing rewarded with the whole subtree, the fan-out analogue of §12.2's race-to-propose), and a timed-out call was charged nothing, which would have made `mean_s` cheapest in precisely the fallback-heavy runs E4 exists to price. Both fixed; the fallback now keeps the configured fan-out and picks at random when nothing ranks. **Two open limits, both P0-3's:** the call is synchronous on the coordinator's scheduling thread, so its delegation rate is capped at 1/latency; and `llm.timeout_seconds` is per-request, so provider and output-validation retries can stack several into one decision — there is no wall-clock deadline. Tests in `tests/test_delegation.py`. | `swarm/agents/llm/llm_delegator.py`, `resource_agent.py` `_select_child_groups`, `mab_manager.py`, `config_swarm_multi.yml` | 3–4 d |
+| **P0-9** ✅ | **The delegation bandit was rewarded before the job ran (found and FIXED 2026-09-14, §0.10).** `ResourceAgent.schedule_job` sets `job.state = COMPLETE` and persists it *before* `executor.submit(execute_job)`; `execute_job` persists again with the real `exit_status` after the (up to 120 s) simulated sleep. The coordinator's `_monitor_delegated_jobs` runs every tick and, with MAB on, treats the first `COMPLETE` it sees as terminal: `exit_status` is still its default 0, so it reports success to the bandit, removes the job from `delegated_jobs`, and never reads the real outcome. **As landed:** `schedule_job` persists **`RUNNING`** and only `execute_job` may write `COMPLETE`. The local `completed_jobs_set` is still updated at scheduling, because it is the *consensus* dedupe set and the job is genuinely out of election — the two meanings of "completed" were the trap, and they are now separated by which one is persisted. The periodic Redis state scan takes `RUNNING` alongside `COMPLETE` for the same reason, so a peer's scheduled job still leaves everyone's pending queue. The monitor no longer drops an in-progress job when `delegation_timeout_s` expires: that key bounds *selection*, and a scheduled job legitimately runs past it for its whole simulated wall time, so it waits for the `COMPLETE` that carries the real `exit_status` and gives up only after a new `delegation_exec_grace_s` — which **defaults to `Job._WALL_TIME_MAX_S`**, read from the class rather than re-read from the config, so the execution budget and the wait for it cannot drift apart ([[swarm-one-key-one-default]]). A job dropped on that grace reports **no** outcome rather than a fabricated failure: the child died mid-run, which says nothing about the group's failure rate. **No bandit success rate measured before this fix is citable** (Scenario A/B/C in `CONTEXTUAL_BANDIT_DESIGN.md` §8 included). Verified three ways: 10 tests in `tests/test_reward_timing.py`, 5 of which fail against the unfixed agent; the full suite at 567; and the `RUNNING`→`COMPLETE` secondary-index transition exercised against a real Redis. | `resource_agent.py` `schedule_job`, `_monitor_delegated_jobs`, state scan, `delegation_exec_grace_s` | 1 d |
 | **P0-2** | **Bandit×LLM composition.** Config `delegation.policy` already exists (P0-1) with `bandit` and `llm`; this adds the third mode `bandit_gated_llm` — bandit narrows `capable_groups` → top-m, LLM ranks those m, and the LLM's pick is the arm the bandit is rewarded on. The reward path is in place: `record_external_selection` already lands an LLM-routed outcome on the right arm with its selection-time context. One key, one place — do **not** add a second switch. | `mab_manager.py`, `resource_agent.scheduling_main` | 3 d |
 | **P0-3** | **Decision cache + inference budget.** Cache LLM verdicts keyed by (job-type signature, coarse group-state bucket) with TTL; hard cap on in-flight inference per coordinator, fall back to bandit/analytic when exceeded. Emit hit rate + fallback counts. | `llm_delegator.py`, `llm_bidder.py` | 2–3 d |
 | **P0-4** ✅ | **Instrumentation (done 2026-09-14).** Per-agent consensus message counts & bytes, rounds-to-finalize, LLM calls/tokens/latency/fallbacks, delegation decisions with the fields the oracle labels offline, **plus `GroupSnapshot` age at decision time** — the conference paper's only interaction claim, which no existing counter could source. **As landed:** one module, `swarm/utils/instrumentation.py`, holding every container, so `metrics.json` and the Prometheus export render from the same dicts and cannot drift. Config block `instrumentation:` (`decision_log_max`, `textfile_dir`, `textfile_period_s`); `--textfile-dir` on `generate_configs.py`/`run_test.py` so a Grafana-instrumented campaign is not selected by a hand edit. Details worth recording, each of them a way the numbers could have been quietly wrong: **(a)** age is taken at the **decision**, not at the snapshot build — under `policy: llm` those are seconds apart and freezing it at build would define the effect away; `decide_s` is stored alongside so the age at build is recoverable. **(b)** `GroupSnapshot` carries the newest *and* oldest child stamp: a group of nine where one child went quiet is genuinely fresh on one and stale on the other. **(c)** An unknown age (no live child, or `last_updated` still 0.0) is counted as unknown and never substituted with a large one — `AgentInfo.last_updated` defaults to 0.0, so the naive reading is a 56-year age landing in the p99, exactly where the dead groups are. **(d)** A negative age is clock skew, not a measurement: clamped to 0 and counted in `ctx_skewed_ages`, which is a *validity* column — non-zero means the run's whole age distribution is suspect. **(e)** The decision record is written in a wrapper around `_select_child_groups`, not inside it, because `LlmAgent` re-enters the bandit on five fallback routes; a fallback is recorded as `bandit`, and a fan-out covering every candidate as `bandit_all`/`all`, so inert delegations never appear as decisions. **(f)** The two new `GroupSnapshot` fields are provably invisible to `ContextExtractor` — a changed `schema_version` discards every persisted LinUCB model. **(g)** Messages are counted in the transport, the one funnel every message passes through exactly once, under a lock (`d[k] = d.get(k,0)+1` loses increments across the 16 broadcast workers, i.e. undercounts in precisely the saturated runs the figure is about); a shed fan-out send counts as `dropped`, never as `sent`. **(h)** PBFT's finalize time is measured at the *proposer* only, the same vantage point Snow measures from, and a re-proposal restarts the clock (otherwise a 60 s reselection timeout lands in a sub-second distribution); PBFT deliberately emits no `rounds_*`, since a column of 3s would invite a meaningless cross-protocol comparison. **(i)** Quantiles come from a uniform reservoir sample, not a head or tail. **(j)** Failed and timed-out LLM calls are counted *and timed* — the same trap `delegation_stats.mean_s` already avoids. Collector: `evaluation/collect.py` gains the summary columns (fleet **sums**, not per-agent means — the denominator would vary with metrics completeness) and writes `decisions.csv`, one row per delegation, which is the tidy CSV F6 plots from and P1-1 joins against. Tests: `tests/test_instrumentation.py` (27), plus 10 in `test_delegation.py`, 5 in `test_collect.py`, 1 in `test_broadcast.py`. | `swarm/utils/instrumentation.py`, `grpc_transport.py`, `grpc_server.py`, `gossip_engine.py`, `engine.py`, `resource_agent.py`, `llm_agent.py`, `llm_bidder.py`, `llm_delegator.py`, `rl/context.py`, `rl/mab_manager.py`, `evaluation/collect.py` | 2 d |
 | **P1-1** ✅ | **Oracle / offline-optimal delegator (done 2026-09-14).** Replays each delegation against the injected per-group failure profile and charges the gap as regret, scoring the rows P0-4's `decisions.csv` already carries; `collect.py` adds `regret_total`, `routing_accuracy` and `regret_ctx_age_corr` to the wide row, so **F6 is one collector run** rather than a manual join. The ground truth is resolved with the agents' own `_select_failure_phase`/`_resolve_failure_rate` — a second implementation would drift and make every regret number quietly wrong. **Everything it cannot know it refuses rather than approximates**, which is not a style choice: four separate times a missing input got a plausible substitute, and every substitute biased regret *downward*, the direction that flatters the policy and so never shows up in a figure. **(a)** The profile is archived in `run_meta.json` (`ground_truth`) because the base config is edited between arms; a run without it is refused rather than scored against today's config. **(b)** Phases resolve on each **member agent's own** `failure_sim_start` (now in the metrics payload), never the coordinator's or the run's, and there is **no fallback clock**: `after_s` counts from agent construction, a 30-host launch spreads that over a minute, and a member read as post-flip when it is pre-flip prices a bad group as good — exactly around the mid-run flip E2a is built on. **(c)** A decision is scored only if **every** candidate can be priced; pricing a subset and taking the best of it records a bad choice as `regret 0, optimal` when the genuinely best group is the one that dropped out. **(d)** A decision whose candidates are all equally good is not graded. **The model is checked, not trusted**: `--validate` joins predicted failure against real exit statuses on `job_id` (**not** `job_type`, which `all_jobs.csv` does not carry — a type-keyed join matches nothing and reports a clean bill of health for a check that never ran), gated on the job-weighted error and on per-type deviations beyond 2 SE. That SE is the **Poisson-binomial** one over the individual predicted rates, not the binomial at their mean: the trials are not identically distributed, and the mean-p form overstates the variance and accepts outcomes the profile rules out — at the extreme, a profile under which half the jobs cannot fail and half cannot succeed pins the observed rate exactly, yet the mean-p band would accept ±0.10. **Validated on hardware** (Hier-30, ε-greedy, contrast *within* each coordinator's candidate set — a profile varying *between* coordinators gives every candidate set one rate and reports a meaningless `routing_accuracy` of 1.0): 480 decisions scored, 0 unscored, 457 with a material choice, regret 131.6 (mean 0.274), **routing accuracy 0.794**, validation agreeing to **0.018** job-weighted error over 465 jobs with no type beyond sampling noise. Tests: `tests/test_oracle.py` (33) + 3 in `test_collect.py`. | `evaluation/oracle.py`, `collect.py`, `run_test.py`, `resource_agent.py` | 2 d |
-| **P1-2** | Analysis harness: one script that walks a run tree → tidy CSV (config × run × metric), so every figure is regenerable. | `evaluation/collect.py` | 2 d |
-| **P1-3** | Site-aware config generation for 17 sites (`--agent-sites-file`) so Snow's `local_sample_frac` is meaningful and figures can be grouped by site. | `generate_configs.py` (§Part C of `CONSENSUS_SCALING_PLAN.md` — partially done) | 1 d |
+| **P1-2** ✅ | Analysis harness (done; extended by P0-4/P1-1/P0-8 columns): one script that walks a run tree → tidy CSV (config × run × metric), so every figure is regenerable. | `evaluation/collect.py` | 2 d |
+| **P1-3** ✅ | Site-aware config generation (done — `make_agent_hosts.py --sites-out`; **but nothing joins `agent_sites.txt` to `collect.py` or measures RTT, see E3a**) for 17 sites (`--agent-sites-file`) so Snow's `local_sample_frac` is meaningful and figures can be grouped by site. | `generate_configs.py` (§Part C of `CONSENSUS_SCALING_PLAN.md` — partially done) | 1 d |
 
 **LLM serving decision — GPU slice available (confirmed 2026-08-17).** Coordinators are only ~10% of
 agents (Hier-270 → ~27 coordinators), so inference load is bounded and does **not** scale with agent
@@ -514,18 +690,24 @@ Cells marked shared are run **once**, on the frozen revision, and appear in both
 the conference paper cited. Nothing is re-measured between submissions.
 
 Common workload: Pegasus-derived jobs, ~20 jobs/agent, generated by duplicating the 547-job base
-(`duplicate_jobs.py`). Agent counts must divide evenly by agents-per-host (`run_test.py` floors
-`hosts = agents // per_host`).
+(`duplicate_jobs.py`). `run_test.py` sizes hosts as `math.ceil(agents / per_host)`, so a
+non-multiple is legal and the last host carries the remainder (270 at 4/VM → 68 hosts, two
+agents on the last). Prefer exact multiples anyway: an uneven last host is one more thing to
+disclose.
 
-**Scale ladder on 83 VMs** (revised 2026-09-10: PSC `agent-10`–`18` is down indefinitely, so
-the fleet is 83 of 92 and every rung below was sized for ~90 hosts):
+**Scale ladder** (re-revised 2026-09-14: **PSC is back, 92 of 92 VMs up**, so the original
+~90-host sizing is reachable again; the 2026-09-10 83-host sizing is kept as the fallback):
 
 | Agents | Agents/VM | Hosts | Jobs | Notes |
 |---|---|---|---|---|
 | 30 | 1 | 30 | 600 | Matches eScience Hier-30; cheap, use for sweeps |
-| **80** | 1 | 80 | 1600 | **Primary operating point, replacing Hier-90.** 8 groups of 9 + 8 coordinators keeps group *shape* identical to Hier-90/270, so the ladder still scales group count. Hier-90 at 1 agent/VM cannot start on 83 hosts at all |
-| 180 | 3 | 60 | 3600 | Flat-PBFT livelock regime. Was 2/VM on 90 hosts |
-| 270 | 4 | 68 | 5400 | The collapse point. Was 3/VM on 90 hosts |
+| **90** | 1 | 90 | 1800 | **Primary operating point.** 9 groups of 9 + 9 coordinators; E2 uses `--groups-per-coordinator 3`. Fallback if the fleet drops below 90 before E0: **Hier-80** (8 groups of 9 + 8 coordinators, same group shape) at 1/VM |
+| 180 | 2 | 90 | 3600 | Flat-PBFT livelock regime. Fallback: 3/VM on 60 |
+| 270 | 3 | 90 | 5400 | The collapse point. Fallback: 4/VM on 68 |
+
+**Pick the rung set at E0 from a fresh `make_agent_hosts.py` sweep and do not change it
+mid-campaign.** The fleet lost two sites in one week in September; a ladder that mixes the
+primary and fallback sizings is not a scaling curve.
 
 Two placement rules, both load-bearing and both newly enforced:
 
@@ -567,8 +749,13 @@ learn, so every arm below would score identically; **G is the second axis of thi
 sweep G ∈ {3, 9} (3 coordinators, then 1) and report the coordinator count alongside it, since
 raising G trades delegation breadth against coordinator parallelism.
 
-Arms: `{static-greedy, epsilon-greedy, UCB1, LinUCB, LinTS, oracle}` under the context-dependent
-failure profile (Scenario A generalized to 9 groups). Then the two stressors, now at scale:
+Arms: `{epsilon-greedy, UCB1, LinUCB, LinTS}` under the context-dependent failure profile
+(Scenario A generalized to 9 groups), scored offline against the **oracle** (P1-1 — it is a
+label, not a runnable arm). **`static-greedy` is named here and in the conference F4 but does
+not exist in code**: there is no static or greedy delegation policy; `mab.enabled: false`
+delegates to *every* capable group and is recorded as `all`. Either implement a static
+least-loaded/round-robin policy before the freeze or drop the arm — do not relabel `all` as
+static (`CCGRID27_PAPER_PLAN.md` §4). Then the two stressors, now at scale:
 - **E2a non-stationarity:** mid-run failure-parity flip, `discount ∈ {1.0, 0.98}` (scale up Scenario B).
 - **E2b churn:** group outage + rejoin, with the liveness-gating and decayed-timeout fixes on/off
   (validates the fixes from `CONTEXTUAL_BANDIT_DESIGN.md` §8.3 as an ablation).
@@ -589,6 +776,12 @@ failure profile (Scenario A generalized to 9 groups). Then the two stressors, no
   can be re-analyzed for free — do E3a as analysis over E1 data before spending any run on E3b).
   "First" here means *before E3b*, not early in the calendar: E3a cannot start until the E1 cells
   exist (weeks 6–11), and it needs AMST up to have a transatlantic bin at all (§9, §10).
+- **Tooling gap (2026-09-14):** nothing in the tree measures RTT. There is no per-site RTT
+  matrix captured into the run dir, `collect.py` has no `site`/`rtt_bin` column, and
+  `agent_sites.txt` is joined to nothing. "Analysis only" describes the runs, not the code —
+  E3a needs (a) a ping or gRPC-echo matrix from each coordinator host to every agent host,
+  captured per run, and (b) the join in `collect.py`. Owed to the conference paper (its F3) before
+  the 12 Oct freeze.
 
 ### E4 — Cost of reasoning (C2, the honest-accounting section)
 Hier-90, Hybrid engine. Two orthogonal sweeps, now separable because the GPU decouples them:
@@ -626,12 +819,19 @@ for free — include a per-node network-bytes panel as a figure.
   no two sub-groups both finalize the same job, and report behavior on heal. The eScience reviewer
   explicitly questioned quorum under partition with Redis-inferred `n_live` — answer it with data plus
   a short argument (safety comes from the Redis CAS claim, not from quorum inference; state that).
+- **Tooling gap (2026-09-14):** no partition driver exists. The only iptables/netem in the tree is
+  a netplan firewall setup script; blackholing one site group from another and healing it on a
+  timer is a small script, but it has to be written and rehearsed at Hier-30 before the freeze.
 - Repeats: 3.
 
 ### E7 — External baselines (see §6)
 Centralized greedy / round-robin / random with remote execution workers, plus a **sampling-based
 (Sparrow-style) decentralized baseline** at Hier-90 and 270. Metrics: makespan, selection latency,
 fairness, and behavior under the same failure injection.
+- **Not implemented (checked 2026-09-14):** `baselines/scheduler.py` has `GreedyScheduler`,
+  `RoundRobinScheduler`, `RandomScheduler` only; no file mentions Sparrow or late binding. §6
+  calls this non-negotiable and the conference paper needs it in T2 — it is a pre-freeze code
+  item (`CCGRID27_PAPER_PLAN.md` §4), not an experiment-week task.
 - Repeats: 5.
 
 ### E8 — Decision-plane resilience under fault injection (C2(a), added 2026-09-08)
@@ -669,7 +869,7 @@ per §2):
 
 ~150 testbed-hours ≈ 4 weeks of mostly-unattended running with a driver script, assuming the slice
 stays healthy. Budget 2× for reruns (~300 h), which is what the 8-week campaign window in §9
-(Oct 13 – Dec 7) is sized for. **This is the reason to freeze the code on Oct 12.**
+(Oct 13 – Nov 30) is sized for. **This is the reason to freeze the code on Oct 12.**
 
 ---
 
@@ -742,67 +942,58 @@ in-paper (§0.5) rather than tech-report material.
 
 ---
 
-## 9. Schedule — two deadlines, one campaign (revised 2026-09-10 for the split, §0.9)
+## 9. Schedule — one campaign clock, two submission windows (revised 2026-09-14)
 
-The conference deadline is **back and it is the near clock**: CCGrid abstract 24 Nov 2026, paper
-8 Dec 2026, then FGCS 31 Jan 2027. The campaign is reordered around that, because the cells the
-conference needs are a subset of the cells the journal needs, and the subset has to finish
-first. Also still binding: the **code freeze**, the **slice lease**, and the fact that FGCS
-reviews return in months, so keep the deployment reproducible from `SWARM-2slice.ipynb` +
-`db_node_setup/` and tag the frozen revision.
+**The conference calendar is in `CCGRID27_PAPER_PLAN.md` §6 and is not repeated here.** What
+this section keeps is the shared campaign clock both papers run on, and the journal-only window.
+Dates that appear in both files have been wrong in both before (8 Dec for a 1 Dec deadline), so
+each date now has one home.
 
-**Conference cells** (`{analytic, bandit}` only): E0, E1′, E2, E3a, E5, E6, E7.
-**Journal-only cells:** E1's LLM columns, E3b, E4, E8. Nothing is re-measured between the two.
+**Conference cells** (`{analytic, bandit}` only): E0, E1′, E2, E3a, E5, E6, E7 — owned and
+scheduled by the conference plan. **Journal-only cells:** E1's LLM columns, E3b, E4, E8. Shared
+cells are run once and nothing is re-measured between the two submissions.
 
 | Wk | Dates | Milestone | Gate |
 |---|---|---|---|
-| 1 | Sep 8–14 | ~~Pre-campaign fixes (§0.2)~~, ~~P0-5~~, ~~P0-1~~ done Sep 8. ~~Metrics attribution (§0.8)~~ and ~~Hier-30 smoke on the slice~~ done Sep 9-10; the smoke pair is `runs/smoke-g3-*`, both arms 30/30 agents reporting. Confirm GPU node status and slice lease horizon. | Smoke green ✅ |
-| 2–4 | Sep 15–Oct 5 | ~~P0-4 instrumentation~~ and ~~P1-1 oracle~~ **both done 2026-09-14, ahead of this window** — regret and context age land on the same collected row. Window now goes to P0-8 designated bidder and an early E2 pilot. vLLM bring-up moves *after* the conference (E4 is journal-only). | ✅ Regret vs context age plottable end to end from one collector run (`regret_ctx_age_corr`) |
-| 5 | Oct 6–12 | ~~P1-1 oracle~~ **done 2026-09-14, ahead of this window.** P0-2/P0-3 slip to the journal window with E4. Pilot one cell each of **E1′ and E2** end-to-end at Hier-30 with `--groups-per-coordinator 2` and interleaved placement; verify every §7 metric lands. | **Code freeze Oct 12** — tag it |
-| 6–8 | Oct 13–Nov 2 | **Conference campaign:** E0 (gate) → E1′ → E2, on the frozen revision, interleaved hosts file, Hier-30 / Hier-80 at 1 agent/VM and Mesh-180 / Hier-270 dense. E6 accumulates for free. **Start writing §III design from Oct 20.** | E0 reference established |
-| 9 | Nov 3–9 | E5 (needs P0-4 + the ladder), E7 external baselines, E3a re-analysis of the E1′ pull by RTT bin. | E1′ + E2 + E5 + E7 complete |
-| **10** | **Nov 10** | **Staleness gate.** Is bandit regret lower under Snow at equal scale, against context age (F6)? Yes → the paper is two mechanisms **plus an interaction**. No → two mechanisms plus a scale story, F6 becomes a §VI table. **The title and abstract differ between these.** | Answer recorded, not deferred |
-| 10–11 | Nov 10–23 | All six figures drafted from real data. Results and intro written to the gate's answer. Rerun high-variance cells. | Figures final Nov 23 |
-| **11** | **Nov 24** | **CCGrid abstract due (AoE).** | Submitted |
-| 12–13 | Nov 25–Dec 7 | Full conference draft, internal review (Hamza/Anirban), §6 pre-mortem pass, double-blind check (eScience'26 cited third-person, artifact URL anonymized). | Reviewed draft Dec 5 |
-| **13** | **Dec 8** | **Submit to CCGrid 2027.** | Submitted |
-| 14–17 | Dec 9–Jan 4 | **Journal campaign:** E1's LLM columns, E4, E8, E3b — same frozen revision, same slice. vLLM/GPU bring-up happens here. P0-2, P0-3, P0-8 land before these cells run. Holidays are inside this window; plan for it. | Journal data freeze Jan 4 |
-| 18–20 | Jan 5–25 | Journal draft. **C1 and C3 sections are the conference paper's material** — the incremental writing is C2, the composite interaction, and the threats section. Reproducibility appendix. | Complete draft Jan 25 |
+| 1 | Sep 8–14 | ~~Pre-campaign fixes~~, ~~P0-5~~, ~~P0-1~~ (Sep 8); ~~metrics attribution (§0.8)~~, ~~Hier-30 smoke~~ (Sep 9–10, `runs/smoke-g3-*`, 30/30 reporting); ~~P0-4~~, ~~P1-1~~, ~~P0-8~~ (Sep 14). Fleet clocks repaired (`fix_slice_clocks.sh`); PSC back, 92/92. | Smoke green ✅ |
+| 2–5 | Sep 15–Oct 12 | **Shared:** the four tooling items the conference paper is owed (Sparrow baseline, RTT matrix + site join, partition driver, `static` arm or its removal) plus the F6 context-error column — all in `CCGRID27_PAPER_PLAN.md` §4. Pilot one E1′ and one E2 cell at Hier-30 (`--groups-per-coordinator 2`, interleaved, clocks checked). Confirm slice lease horizon. **Journal-only, only if slack:** P0-2/P0-3 design; GPU node request (do not wait on it). | **Code freeze Oct 12 — tag it** |
+| 6–11 | Oct 13–Nov 23 | **Conference campaign and drafting** — see the conference plan. E6 accumulates for free. Journal work in this window: none that touches the slice. Start the journal's §II related work and threats section (§0.4) in writing time the conference does not need. | Conference gates (10 Nov framing, 24 Nov abstract) |
+| 12 | Nov 24–Dec 1 | Conference submission week. | **CCGrid paper due 1 Dec (AoE)** |
+| 13–17 | Dec 2–Jan 4 | **Journal campaign:** E1's LLM columns, E4, E8, E3b — same frozen revision, same slice. vLLM/GPU bring-up here. P0-2, P0-3 land before the E4 cells that need them (they are the only post-freeze code, and they must not touch anything a shared cell measured — or the shared cells are re-measured). Holidays are inside this window. | Journal data freeze Jan 4 |
+| 18–20 | Jan 5–25 | Journal draft. **C1 and C3 sections are the conference paper's material, cited** — the incremental writing is C2, the composite interaction (with the §0.9 caveat stated), the threats section and the reproducibility appendix. | Complete draft Jan 25 |
 | 21 | Jan 26–31 | Polish, cover letter (state the CCGrid relationship explicitly), submit. | **Submit to FGCS by Jan 31, 2027** |
 
-**What the split costs in schedule terms.** The journal's measurement window shrinks from
-weeks 6–13 to weeks 14–17 — four weeks with the holidays inside — and its draft window from
-five weeks to three. That is only survivable because the conference paper writes C1 and C3
-first; if the conference draft slips past 8 Dec, the journal loses the same days twice. **The
-8 Dec date is the one to defend.**
+**What the split costs in schedule terms.** The journal's measurement window is Dec 2 – Jan 4
+with the holidays inside, and its draft window three weeks. That is only survivable because the
+conference paper writes C1 and C3 first; a conference slip costs the same days twice. **The 1 Dec
+date is the one to defend.** If the conference draft is not review-ready by 27 Nov, the conference
+plan says to cut a figure, not to slip.
 
-**Parallelization (corrected 2026-09-09, re-checked 2026-09-10).** What parallelizes in
-weeks 2–5 is code, not experiments:
+**Post-freeze code rule.** P0-2 and P0-3 are the only code allowed after 12 Oct. Both live in
+`llm_delegator.py` / `mab_manager.py` behind `delegation.policy` and `llm.*` keys that no
+conference cell sets, so a shared cell's measurement is unaffected — verify that with the test
+suite and a diff review before the first journal cell, because "same frozen revision" is the
+premise of citing the conference numbers.
 
-- **E5 moved earlier, to week 9.** It is instrumented message counts across the ladder, so it
-  is gated on P0-4 and on the ladder existing — both true by Oct 13. It is a *conference*
-  figure (F2, the mechanism behind F1), so it can no longer sit in December.
-- **E3a still cannot start early**: it re-analyzes E1′ data, which does not exist until week 8.
-  It needs AMST for a transatlantic bin — **AMST returned 2026-09-09**, so that risk is closed;
-  PSC is the outage now, and PSC is not an RTT bin the plan depends on.
-- **E6 is free**: its double-assignment audit aggregates over every run in the campaign.
-- **vLLM and P0-2/P0-3/P0-8 are no longer on the critical path**, because everything they serve
-  is journal-only. That is the single biggest schedule dividend of the split.
+**Parallelization.** What parallelizes in weeks 2–5 is code, not experiments. E5 is a conference
+figure and runs in the conference window; E3a re-analyzes E1′ data and cannot start before it
+exists; E6 is free (aggregate over every run); vLLM, GPU, P0-2/P0-3 are off the critical path
+because everything they serve is journal-only.
 
 ## 10. Risks and fallbacks
 
 | Risk | Mitigation / fallback |
 |---|---|
 | LLM delegation (P0-1) doesn't beat analytic on quality | This is a *result*, not a failure — E4 is framed as honest accounting. Fallback thesis shifts weight to "expensive decision planes break BFT; here's the envelope where reasoning pays." |
-| **Site outages shrink the VM pool below the ladder** | **Updated 2026-09-10. AMST returned; PSC (`agent-10`–`18`, 9 VMs) is out indefinitely, leaving 83 of 92.** The ladder was re-sized rather than waited on (§5): **Hier-80 replaces Hier-90** — 8 groups of 9 plus 8 coordinators, the same group shape, fitting 80 hosts at 1 agent/VM with 3 spare — and Mesh-180 / Hier-270 pack denser (3/VM on 60 hosts, 4/VM on 68). Agents-per-VM is reported per rung, because a substituted density is a different experiment: co-location turns inter-agent messages into loopback, flattering exactly the coordination cost C3 measures. Sweep before sizing any cell with `make_agent_hosts.py`, **not** a bare `ssh` loop: a node returning from a rebuild has a new host key, and plain ssh under `BatchMode` fails it indistinguishably from a timeout — that is how AMST was recorded as down for a day while all 7 nodes were up and answering, which would have written a whole site out of the fleet. **E3a's risk is closed**: its transatlantic bin is AMST, which is back. PSC is not a bin the plan depends on. |
+| **Site outages shrink the VM pool below the ladder** | **Updated 2026-09-14. PSC returned; 92 of 92 up, so the ~90-host ladder is primary again (§5).** The 83-host sizing from 2026-09-10 stays as the fallback: **Hier-80** (8 groups of 9 + 8 coordinators, same group shape) at 1/VM, Mesh-180 at 3/VM on 60, Hier-270 at 4/VM on 68. Choose at E0 from a fresh sweep, then hold it — agents-per-VM is reported per rung, because a substituted density is a different experiment: co-location turns inter-agent messages into loopback, flattering exactly the coordination cost C3 measures. Sweep before sizing any cell with `make_agent_hosts.py`, **not** a bare `ssh` loop: a node returning from a rebuild has a new host key, and plain ssh under `BatchMode` fails it indistinguishably from a timeout — that is how AMST was recorded as down for a day while all 7 nodes were up and answering, which would have written a whole site out of the fleet. **E3a's risk is closed**: its transatlantic bin is AMST, which is back. PSC is not a bin the plan depends on. |
 | **GPU node not granted / preempted** | Highest-probability schedule risk — request in week 1 and confirm before the campaign. Fallback: CPU-served 7–8B on a dedicated VM, which caps the model-capability sweep in E4 but leaves E1/E2/E3 fully intact (a slow LLM is still a valid expensive-decision plane — arguably a more dramatic one). |
 | Inference throughput bottlenecks the 270-agent runs | With vLLM on GPU this should not bind: coordinators only (~27 LLM agents), batched. Plus cache + inference budget (P0-3). If it still binds, cap LLM runs at Hier-90 and report 270 as PBFT/Snow-only, with any projection clearly labeled as such. |
 | Journal review cycle demands new runs months later | Tag the frozen code revision; keep the slice reproducible from the notebook; archive every run tree plus `agent_profiles.json`/`agent_dtns.json`/seeds so any cell can be re-run identically. |
-| **Two deadlines seven weeks apart** | The journal's measurement window is now weeks 14–17 (Dec 9 – Jan 4, holidays inside) and its draft window three weeks. Survivable only because the conference paper writes C1 and C3 first, so a conference slip costs the same days twice — **defend 8 Dec**. If the conference draft is not reviewed-ready by Dec 5, the correct move is to cut a conference figure (F6 first, F5 second), not to slip. If CCGrid is missed outright, do **not** chase HPDC on 5 Feb: it is ~15% acceptance, its abstract lands 5 days after the FGCS deadline, and the simulated-execution framing needs work that window does not contain. Fold C1/C3 back into the journal and submit one paper. |
+| **Two deadlines 8.5 weeks apart** | The journal's measurement window is Dec 2 – Jan 4 (holidays inside) and its draft window three weeks. Survivable only because the conference paper writes C1 and C3 first, so a conference slip costs the same days twice — **defend 1 Dec** (not 8 Dec: the CFP was checked 2026-09-14). If the conference draft is not review-ready by 27 Nov, the correct move is to cut a conference figure (F6 first, F5 second), not to slip. If CCGrid is missed outright, do **not** chase HPDC on 5 Feb: it is ~15% acceptance, its abstract lands 5 days after the FGCS deadline, and the simulated-execution framing needs work that window does not contain. Fold C1/C3 back into the journal and submit one paper. |
 | Slice lease expires mid-campaign or before revisions | Check the lease horizon now and renew ahead of the campaign; it is the only hard external clock left. |
 | Slice instability / site outages mid-campaign (17 sites is a lot of failure surface) | Run configurations in interleaved order (not blocked by config) so partial data is still balanced; keep a 30-agent single-site fallback config; log per-run site health from the monitor VM. |
 | ~120 h of testbed time doesn't fit | Cut order: E7 second scale point → E3b impairment levels (keep +50 ms and 1% loss) → E5 repeats → E1 non-headline cells. Never cut E7 entirely (§6). |
-| Paper reads as three stapled features | **This happened, and the split is now the plan, not the fallback (§0.9, decided 2026-09-10).** C1+C3 go to CCGrid 8 Dec, C2 and the composite interaction stay here. The row below it was right: the natural seam is [Snow + bandit systems paper] and [LLM decision plane paper]. What the old advice — "do not plan for the split up front" — got wrong is that planning for it *earlier* would have removed vLLM, P0-2, P0-3 and P0-8 from the critical path months ago. Each remaining experiment section still opens by naming the claim it tests. |
+| Paper reads as three stapled features | **This happened, and the split is now the plan, not the fallback (§0.9, decided 2026-09-10).** C1+C3 go to CCGrid (1 Dec), C2 and the composite interaction stay here. The row below it was right: the natural seam is [Snow + bandit systems paper] and [LLM decision plane paper]. What the old advice — "do not plan for the split up front" — got wrong is that planning for it *earlier* would have removed vLLM, P0-2, P0-3 and P0-8 from the critical path months ago. Each remaining experiment section still opens by naming the claim it tests. |
 | LLM plane's output turns out inert for placement even after P0-5/6/7 (§0.3) | Then C2 is reframed, not abandoned: the paper reports *why* (race-to-propose, degenerate scores) with E8 as the evidence, and the cost/latency envelope stands on its own. This is a publishable negative result in a journal. |
 
 ---
@@ -822,8 +1013,11 @@ The split (§0.9) changes what is on the critical path. In order:
    fixed. Every campaign cell should run `./fix_slice_clocks.sh --check` first.
 2. ~~**P1-1 oracle**~~ **Done 2026-09-14** (see the P1-1 row). Regret and routing accuracy
    land on the collected row beside the context age, so **F6 is one collector run**. With P0-4
-   this clears every code item that was blocking a conference figure; what remains before the
-   freeze is P0-8 and the campaign itself.
+   this clears every *P0* item that was blocking a conference figure. ~~P0-8~~ landed the same
+   day. **What remains before the freeze is tooling the plan described as experiments:** the
+   Sparrow baseline (E7), the RTT matrix and site join (E3a), the partition driver (E6), the
+   `static` delegation arm or its removal (E2/F4), and the F6 context-error column — all listed
+   in `CCGRID27_PAPER_PLAN.md` §4.
 2b. **Two pre-run checks, both learned the hard way, both cheap.** `./fix_slice_clocks.sh
    --check` — the fleet's clocks were wrong for a month with nothing reporting it, and
    `ctx_skewed_ages`/`ctx_skew_max_s` on the collected row are the post-hoc evidence. And for
