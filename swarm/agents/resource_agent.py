@@ -446,6 +446,12 @@ class ResourceAgent(Agent):
         # Track jobs delegated to children for hierarchical monitoring
         # Maps: job_id -> {'delegated_at': timestamp, 'groups': [list of child groups]}
         self.delegated_jobs = ThreadSafeDict[str, dict]()  # job_id -> delegation_info
+        # Output names a completed job produced but could not publish (see `_publish_produced`).
+        # Retried on every periodic tick: a publish that is merely dropped gates every
+        # descendant of that job for the rest of the run, which looks like a livelock and is
+        # indistinguishable from a workflow that is genuinely waiting.
+        self._unpublished_data: set[str] = set()
+        self._unpublished_lock = threading.RLock()
 
         # MAB (Multi-Armed Bandit) configuration for hierarchical delegation
         mab_cfg = self.config.get("mab", {})
@@ -958,6 +964,52 @@ class ResourceAgent(Agent):
             self.engine.incoming.remove_object(object_id=j)
             self.engine.outgoing.remove_object(object_id=j)
             self.queues.pending_queue.remove(j)
+
+    def _publish_produced(self, job_id: str, names: list) -> bool:
+        """Announce the outputs of a completed job, and never lose them if that fails.
+
+        Non-raising, for the same reason `_note_bid` is: a bookkeeping error must not turn a
+        job that really completed into a failed one. But swallowing it is not enough either —
+        the names are what release this job's descendants, so a dropped publish gates the rest
+        of that subtree for the whole run, and a transient Redis blip is indistinguishable
+        from a workflow that is legitimately waiting. Unpublished names are kept and retried
+        on every periodic tick until they land.
+        """
+        if not names:
+            return True
+        try:
+            self.repository.mark_data_available(list(names))
+            self.logger.debug(f"[DATA_READY] {job_id} produced {list(names)}")
+            return True
+        except Exception as e:
+            # The recovery path must not raise either: it runs inside `execute_job`, whose
+            # own handler would mark this completed job FAILED — turning a bookkeeping blip
+            # into a wrong outcome, which is the P0-9 mistake in a new place.
+            try:
+                with self._unpublished_lock:
+                    self._unpublished_data.update(str(n) for n in names)
+                    pending = len(self._unpublished_data)
+                self.logger.warning(
+                    f"Failed to publish produced data for {job_id}: {e} — "
+                    f"queued for retry ({pending} name(s) pending)")
+            except Exception:
+                pass
+            return False
+
+    def _retry_unpublished_data(self) -> None:
+        """Re-announce anything a completed job produced but could not publish."""
+        with self._unpublished_lock:
+            if not self._unpublished_data:
+                return
+            pending = sorted(self._unpublished_data)
+        try:
+            self.repository.mark_data_available(pending)
+        except Exception as e:
+            self.logger.debug(f"[DATA_READY] retry of {len(pending)} name(s) failed: {e}")
+            return
+        with self._unpublished_lock:
+            self._unpublished_data.difference_update(pending)
+        self.logger.info(f"[DATA_READY] republished {len(pending)} name(s) after an earlier failure")
 
     def _update_completed_jobs(self, jobs: list[str]):
         self.update_jobs(jobs, self.completed_jobs_set, self.completed_lock)
@@ -1667,6 +1719,7 @@ class ResourceAgent(Agent):
                 self.logger.debug(f"[gossip] publish_local failed: {exc}")
 
         self._export_textfile_metrics()
+        self._retry_unpublished_data()
         self._restart_selection()
         self._monitor_delegated_jobs()
         current_time = int(time.time())
@@ -3013,16 +3066,10 @@ class ResourceAgent(Agent):
             # Publish what this job produced, so descendants gated on those names become
             # selectable. After execution and only on success: a failed job's outputs do not
             # exist, and releasing a child on a parent's failure would run it on missing
-            # inputs. Non-raising for the same reason `_note_bid` is — a bookkeeping error
-            # here must not turn a completed job into a failed one.
+            # inputs.
             if job.exit_status == 0:
-                try:
-                    produced = [d.file for d in (job.data_out or []) if getattr(d, "file", None)]
-                    if produced:
-                        self.repository.mark_data_available(produced)
-                        self.logger.debug(f"[DATA_READY] {job_id} produced {produced}")
-                except Exception as e:
-                    self.logger.warning(f"Failed to publish produced data for {job_id}: {e}")
+                produced = [d.file for d in (job.data_out or []) if getattr(d, "file", None)]
+                self._publish_produced(job_id, produced)
 
             # Always persist job with exit_status so parent coordinator can read outcome
             self.repository.save(

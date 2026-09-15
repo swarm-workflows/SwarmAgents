@@ -24,6 +24,7 @@
 
 import json
 import logging
+import os
 import random
 import threading
 import time
@@ -49,14 +50,19 @@ class Repository:
     KEY_METRICS = "metrics"
     KEY_ASSIGNEE = "assignee"
 
-    def __init__(self, redis_client: redis.Redis):
+    def __init__(self, redis_client: redis.Redis, run_id: Optional[str] = None):
         """
         Initialize Repository instance.
 
         Args:
             redis_client (redis.Redis): Redis client connection object.
+            run_id (Optional[str]): Identity of the run, for keys that must not be inherited
+                by the next one. Defaults to ``SWARM_RUN_ID``, which ``run_test.py`` exports
+                to every agent (inherited locally, re-exported over ssh), so every agent in a
+                run agrees on it without being told. Resolved here and only here.
         """
         self.redis = redis_client
+        self.run_id = run_id or os.environ.get("SWARM_RUN_ID") or "norun"
         # Contention instrumentation: total WatchError retries across all save() calls.
         # A high rate at scale means hot keys are serializing writers (see SCALABILITY_REVIEW).
         self.watch_retries = 0
@@ -337,12 +343,25 @@ class Repository:
 
     KEY_DATA_READY = "data_ready"
 
+    def _data_ready_key(self) -> str:
+        """Run-scoped, and shaped like every other key so cleanup finds it.
+
+        Both halves are load-bearing. The shape (`prefix:a:b:c`) matters because
+        `delete_all("*")` — which `cleanup.py` runs between runs — scans `*:*`, so a *bare*
+        key survives every cleanup this project has: the next run of the same workflow would
+        find its predecessor's file names already present and release the whole DAG at once,
+        on the first tick, with nothing saying so. The run id matters because cleanup is not
+        the only path — an operator flushing by hand, or a cell that skipped it, must still
+        not inherit readiness. It is the same reason metrics payloads are run-stamped.
+        """
+        return f"{self.KEY_DATA_READY}:{self.run_id}:0:names"
+
     def mark_data_available(self, names: List[str]) -> None:
         """Record that *names* now exist. Called once a job has actually completed."""
         names = [str(n) for n in names if n]
         if not names:
             return
-        self.redis.sadd(self.KEY_DATA_READY, *names)
+        self.redis.sadd(self._data_ready_key(), *names)
 
     def data_available(self, names: List[str]) -> bool:
         """True when every name in *names* has been produced (or the list is empty).
@@ -353,12 +372,12 @@ class Repository:
         names = [str(n) for n in names if n]
         if not names:
             return True
-        return all(self.redis.smismember(self.KEY_DATA_READY, names))
+        return all(self.redis.smismember(self._data_ready_key(), names))
 
     def available_data(self) -> set:
         """Every name produced so far — for diagnostics, not for the scheduling path."""
         return {v.decode() if isinstance(v, bytes) else v
-                for v in self.redis.smembers(self.KEY_DATA_READY)}
+                for v in self.redis.smembers(self._data_ready_key())}
 
     def get_assignment(self, job_id: str, level: int = 0, group: int = 0):
         """Return the committed assignee for ``job_id``, or None if unclaimed."""

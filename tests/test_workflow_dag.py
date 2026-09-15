@@ -203,6 +203,8 @@ def _leaf_agent():
     a.consumer_timeout_s = 1.0
     a.site = None
     a.shutdown = False
+    a._unpublished_data = set()
+    a._unpublished_lock = threading.RLock()
     return a
 
 
@@ -243,6 +245,112 @@ def test_a_publishing_error_does_not_turn_a_completed_job_into_a_failed_one():
     a.execute_job(job)
 
     assert job.exit_status == 0, "bookkeeping must not rewrite the job's outcome"
+
+
+# --------------------------------------------------------------------------------------
+# Readiness must not outlive the run that produced it.
+# --------------------------------------------------------------------------------------
+
+class _FakeRedis:
+    """Enough of a Redis for the registry: sets, SCAN and DELETE with real key semantics."""
+
+    def __init__(self):
+        self.sets = {}
+
+    def sadd(self, key, *vals):
+        self.sets.setdefault(key, set()).update(str(v) for v in vals)
+
+    def smismember(self, key, names):
+        have = self.sets.get(key, set())
+        return [n in have for n in names]
+
+    def smembers(self, key):
+        return set(self.sets.get(key, set()))
+
+    def scan_iter(self, match):
+        import fnmatch
+        return [k for k in list(self.sets) if fnmatch.fnmatch(k, match)]
+
+    def delete(self, *keys):
+        for k in keys:
+            self.sets.pop(k, None)
+
+
+def _repo(client, run_id):
+    from swarm.database.repository import Repository
+    return Repository(client, run_id=run_id)
+
+
+def test_a_second_run_does_not_inherit_the_first_runs_readiness():
+    """The regression: a bare key survived `delete_all`, so a repeat of the same workflow
+    found every file name already present and released the whole DAG on the first tick."""
+    from swarm.database.repository import Repository
+    client = _FakeRedis()
+
+    r1 = _repo(client, "run-1")
+    r1.mark_data_available(["california_catalog.csv"])
+    assert r1.data_available(["california_catalog.csv"]) is True
+
+    Repository(client, run_id="run-1").delete_all(key_prefix="*")   # what cleanup.py runs
+
+    r2 = _repo(client, "run-1")
+    assert r2.data_available(["california_catalog.csv"]) is False, \
+        "cleanup must reach the registry — its key has to contain a colon"
+
+
+def test_readiness_is_scoped_to_the_run_even_without_cleanup():
+    """Cleanup is not the only path: a cell that skipped it must still not inherit."""
+    client = _FakeRedis()
+    _repo(client, "run-1").mark_data_available(["catalog.csv"])
+
+    assert _repo(client, "run-2").data_available(["catalog.csv"]) is False
+    assert _repo(client, "run-1").data_available(["catalog.csv"]) is True
+
+
+def test_the_registry_key_has_the_shape_cleanup_scans_for():
+    client = _FakeRedis()
+    key = _repo(client, "run-1")._data_ready_key()
+    import fnmatch
+    assert fnmatch.fnmatch(key, "*:*"), f"{key!r} would survive delete_all('*')"
+
+
+# --------------------------------------------------------------------------------------
+# A publish that fails must not gate the subtree for the rest of the run.
+# --------------------------------------------------------------------------------------
+
+def test_a_failed_publish_is_retried_until_it_lands():
+    a = _leaf_agent()
+    a.repository.mark_data_available.side_effect = RuntimeError("redis down")
+    job = _producing_job()
+
+    a.execute_job(job)
+
+    assert job.exit_status == 0, "bookkeeping must not rewrite the job's outcome"
+    assert a._unpublished_data == {"catalog.csv", "index.json"}, "the names must be kept"
+
+    a.repository.mark_data_available.side_effect = None            # Redis comes back
+    a._retry_unpublished_data()
+
+    assert a._unpublished_data == set()
+    assert sorted(a.repository.mark_data_available.call_args.args[0]) == \
+        ["catalog.csv", "index.json"]
+
+
+def test_a_retry_that_fails_again_keeps_the_names():
+    a = _leaf_agent()
+    a.repository.mark_data_available.side_effect = RuntimeError("still down")
+    a.execute_job(_producing_job())
+
+    a._retry_unpublished_data()
+
+    assert a._unpublished_data == {"catalog.csv", "index.json"}, \
+        "names are only dropped once they have actually landed"
+
+
+def test_retrying_with_nothing_pending_does_not_touch_redis():
+    a = _leaf_agent()
+    a._retry_unpublished_data()
+    a.repository.mark_data_available.assert_not_called()
 
 
 def test_the_predicate_survives_a_round_trip_through_redis():
