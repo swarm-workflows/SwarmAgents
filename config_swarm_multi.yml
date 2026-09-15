@@ -66,6 +66,13 @@ runtime:
   wall_time_scale: 1.0
   wall_time_min_s: 0.0
   wall_time_max_s: 120.0
+  # How long past delegation_timeout_s a coordinator keeps waiting for a job its children have
+  # already scheduled (persisted RUNNING) to finish before dropping it from delegation tracking
+  # without a bandit outcome. Default (key absent) = wall_time_max_s, or 1800 if that is 0.
+  # Since P0-9 a leaf persists RUNNING for the whole simulated wall time and COMPLETE only with
+  # the real exit_status, so the bandit's reward arrives when the job finishes, not when it is
+  # scheduled. Set this only to make the monitor give up sooner than the execution cap.
+  # delegation_exec_grace_s: 120.0
 
   # Teardown's budget for jobs still executing when the agent is asked to stop. Metrics are
   # saved BEFORE this drain, so the only thing a short value costs is the last few job

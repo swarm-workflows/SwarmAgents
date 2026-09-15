@@ -531,6 +531,24 @@ class ResourceAgent(Agent):
         return self.runtime_config.get("delegation_timeout_s", self.reselection_timeout_s * 2)
 
     @property
+    def delegation_exec_grace_s(self) -> float:
+        """How long past `delegation_timeout_s` the delegation monitor keeps waiting for a job
+        a child has already picked up (persisted READY/RUNNING) to finish, before dropping it
+        from tracking without reporting an outcome to the bandit.
+
+        `delegation_timeout_s` bounds selection: a job still PENDING at the children after it
+        is reassigned. Execution is a separate budget — a scheduled job runs for its simulated
+        wall time, up to `runtime.wall_time_max_s` — so the default is that cap when one is set.
+        Reading it from `Job` rather than from the config again keeps one key, one default.
+        With no cap (`wall_time_max_s: 0`) fall back to 30 min; the Pegasus tail is ~2000 s.
+        """
+        configured = self.runtime_config.get("delegation_exec_grace_s")
+        if configured is not None:
+            return float(configured)
+        cap = float(getattr(Job, "_WALL_TIME_MAX_S", 0.0) or 0.0)
+        return cap if cap > 0 else 1800.0
+
+    @property
     def capacities(self) -> Capacities:
         return self._capacities
 
@@ -1061,11 +1079,20 @@ class ResourceAgent(Agent):
                                 )
                                 break
                         else:
-                            # Job in progress (READY, RUNNING, etc.) — not yet done
-                            if timed_out:
-                                # Job was picked up but hasn't finished — processed
-                                self.logger.debug(
-                                    f"Delegated job {job_id} processed by children (state: {job_state})"
+                            # Job in progress (READY, RUNNING, ...) — picked up by a child but
+                            # not finished. Since P0-9 the child persists RUNNING for the whole
+                            # simulated wall time, so a job can legitimately sit here well past
+                            # `delegation_timeout_s` (which bounds *selection*, not execution).
+                            # Keep waiting for the COMPLETE that carries the real exit_status;
+                            # give up only after the execution grace, which is the one case
+                            # (child died mid-run) where no COMPLETE is coming.
+                            if time_since_delegation > self.delegation_timeout_s + self.delegation_exec_grace_s:
+                                self.logger.warning(
+                                    f"Delegated job {job_id} still {job_state} at child group "
+                                    f"{child_group} {time_since_delegation:.0f}s after delegation "
+                                    f"(grace {self.delegation_exec_grace_s:.0f}s past the "
+                                    f"{self.delegation_timeout_s:.0f}s timeout) — dropping it "
+                                    f"from delegation tracking without a bandit outcome"
                                 )
                                 jobs_processed.append(job_id)
 
@@ -1642,10 +1669,14 @@ class ResourceAgent(Agent):
         state_map = self.repository.get_all_ids_multi(
             key_prefix=Repository.KEY_JOB, level=self.topology.level,
             group=group, states=[ObjectState.PENDING.value, ObjectState.READY.value,
-                                 ObjectState.COMPLETE.value])
+                                 ObjectState.RUNNING.value, ObjectState.COMPLETE.value])
         self._update_pending_jobs(jobs=state_map.get(ObjectState.PENDING.value, []))
         self._update_ready_jobs(jobs=state_map.get(ObjectState.READY.value, []))
-        self._update_completed_jobs(jobs=state_map.get(ObjectState.COMPLETE.value, []))
+        # A job a peer has scheduled is persisted RUNNING until it finishes (P0-9); for
+        # consensus purposes it is as settled as a COMPLETE one, so both feed the dedupe set.
+        self._update_completed_jobs(
+            jobs=state_map.get(ObjectState.RUNNING.value, [])
+            + state_map.get(ObjectState.COMPLETE.value, []))
 
         if self.debug:
             self.save_consensus_votes()
@@ -2869,9 +2900,17 @@ class ResourceAgent(Agent):
         # Add the job to the list of allocated jobs
         self.queues.ready_queue.add(job)
 
+        # Out of consensus from here on (the local "completed" set is the consensus dedupe
+        # set, not the execution outcome), but NOT persisted as COMPLETE: the persisted state
+        # is what the parent coordinator's delegation monitor reads, and `exit_status` is
+        # still at its default of 0 until `execute_job` finishes. Writing COMPLETE here made
+        # the monitor credit the bandit with a success the moment the job was scheduled,
+        # and it never saw the real outcome (P0-9: on `p11-oracle2` the leaves injected 83
+        # failures and the bandit recorded 19). Only `execute_job` may write COMPLETE.
         self._update_completed_jobs(jobs=[job.job_id])
-        job.state = ObjectState.COMPLETE
-        self.repository.save(obj=job.to_dict(), level=self.topology.level, group=self.topology.group)
+        job.state = ObjectState.RUNNING
+        self.repository.save(obj=job.to_dict(), key_prefix=Repository.KEY_JOB,
+                             level=self.topology.level, group=self.topology.group)
         self.executor.submit(self.execute_job, job)
 
     def select_job(self, job: Job):
