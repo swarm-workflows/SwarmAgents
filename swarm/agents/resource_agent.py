@@ -966,7 +966,12 @@ class ResourceAgent(Agent):
             self.queues.pending_queue.remove(j)
 
     def _publish_produced(self, job_id: str, names: list) -> bool:
-        """Announce the outputs of a completed job, and never lose them if that fails.
+        """Announce the outputs of a completed job out-of-band, and keep them if that fails.
+
+        The normal path does **not** come through here: `execute_job` publishes inside the
+        same transaction that writes the job's COMPLETE state, so the two cannot separate.
+        This is the out-of-band route for a caller that has no such write to attach to, and
+        the retry queue behind it covers a transient Redis failure on that route.
 
         Non-raising, for the same reason `_note_bid` is: a bookkeeping error must not turn a
         job that really completed into a failed one. But swallowing it is not enough either —
@@ -3063,21 +3068,25 @@ class ResourceAgent(Agent):
             if job.sub_role is None and job.exit_status == 0:
                 self._maybe_push_post_process(job)
 
-            # Publish what this job produced, so descendants gated on those names become
-            # selectable. After execution and only on success: a failed job's outputs do not
-            # exist, and releasing a child on a parent's failure would run it on missing
-            # inputs.
-            if job.exit_status == 0:
-                produced = [d.file for d in (job.data_out or []) if getattr(d, "file", None)]
-                self._publish_produced(job_id, produced)
-
-            # Always persist job with exit_status so parent coordinator can read outcome
+            # Persist the outcome and publish what this job produced in ONE write. The names
+            # are what release this job's descendants, so as two writes an agent dying in
+            # between gated the whole subtree for the rest of the run — and a retry queue
+            # cannot cover that, because the queue dies with the agent. In one transaction
+            # there is no in-between: either the job is COMPLETE and its outputs exist, or
+            # neither, and a job left short of COMPLETE is reselected by the existing
+            # machinery. Only on success — a failed job's outputs do not exist, and releasing
+            # a child on its parent's failure would run it against inputs never written.
+            produced = ([d.file for d in (job.data_out or []) if getattr(d, "file", None)]
+                        if job.exit_status == 0 else None)
             self.repository.save(
                 obj=job.to_dict(),
                 key_prefix=Repository.KEY_JOB,
                 level=self.topology.level,
                 group=self.topology.group,
+                produced_data=produced,
             )
+            if produced:
+                self.logger.debug(f"[DATA_READY] {job_id} produced {produced}")
 
             self.queues.ready_queue.remove(job_id)
             exit_status_str = "SUCCESS" if job.exit_status == 0 else f"FAILED (exit={job.exit_status})"

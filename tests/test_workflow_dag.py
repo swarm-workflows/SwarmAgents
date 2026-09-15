@@ -219,13 +219,18 @@ def _producing_job(should_fail=False):
     return j
 
 
-def test_a_successful_job_publishes_what_it_produced():
+def test_completion_and_publication_are_one_write():
+    """The gap this closes: as two writes, an agent dying between them gated every descendant
+    of the job for the rest of the run, and no retry queue can cover that — the queue dies
+    with the agent. The names therefore ride along inside the transaction that records the
+    job as COMPLETE."""
     a = _leaf_agent()
     a.execute_job(_producing_job())
 
-    a.repository.mark_data_available.assert_called_once()
-    assert sorted(a.repository.mark_data_available.call_args.args[0]) == \
-        ["catalog.csv", "index.json"]
+    a.repository.mark_data_available.assert_not_called()
+    kw = a.repository.save.call_args.kwargs
+    assert sorted(kw["produced_data"]) == ["catalog.csv", "index.json"]
+    assert kw["obj"]["state"] == 8, "the same write records COMPLETE"
 
 
 def test_a_failed_job_publishes_nothing():
@@ -234,17 +239,17 @@ def test_a_failed_job_publishes_nothing():
     a = _leaf_agent()
     a.execute_job(_producing_job(should_fail=True))
 
+    assert a.repository.save.call_args.kwargs["produced_data"] is None
     a.repository.mark_data_available.assert_not_called()
 
 
-def test_a_publishing_error_does_not_turn_a_completed_job_into_a_failed_one():
+def test_a_job_with_no_outputs_publishes_nothing():
     a = _leaf_agent()
-    a.repository.mark_data_available.side_effect = RuntimeError("redis down")
-    job = _producing_job()
-
-    a.execute_job(job)
-
-    assert job.exit_status == 0, "bookkeeping must not rewrite the job's outcome"
+    j = Job()
+    j.job_id = "sink"
+    j.wall_time = 0.0
+    a.execute_job(j)
+    assert not a.repository.save.call_args.kwargs["produced_data"]
 
 
 # --------------------------------------------------------------------------------------
@@ -318,14 +323,12 @@ def test_the_registry_key_has_the_shape_cleanup_scans_for():
 # A publish that fails must not gate the subtree for the rest of the run.
 # --------------------------------------------------------------------------------------
 
-def test_a_failed_publish_is_retried_until_it_lands():
+def test_an_out_of_band_publish_that_fails_is_retried_until_it_lands():
+    """`_publish_produced` is the route for a caller with no completion write to ride on."""
     a = _leaf_agent()
     a.repository.mark_data_available.side_effect = RuntimeError("redis down")
-    job = _producing_job()
 
-    a.execute_job(job)
-
-    assert job.exit_status == 0, "bookkeeping must not rewrite the job's outcome"
+    assert a._publish_produced("j1", ["catalog.csv", "index.json"]) is False
     assert a._unpublished_data == {"catalog.csv", "index.json"}, "the names must be kept"
 
     a.repository.mark_data_available.side_effect = None            # Redis comes back
@@ -339,7 +342,7 @@ def test_a_failed_publish_is_retried_until_it_lands():
 def test_a_retry_that_fails_again_keeps_the_names():
     a = _leaf_agent()
     a.repository.mark_data_available.side_effect = RuntimeError("still down")
-    a.execute_job(_producing_job())
+    a._publish_produced("j1", ["catalog.csv", "index.json"])
 
     a._retry_unpublished_data()
 
@@ -347,10 +350,49 @@ def test_a_retry_that_fails_again_keeps_the_names():
         "names are only dropped once they have actually landed"
 
 
+def test_an_out_of_band_publish_error_never_raises():
+    """It runs inside `execute_job`, whose handler would mark a completed job FAILED."""
+    a = _leaf_agent()
+    a.repository.mark_data_available.side_effect = RuntimeError("down")
+    a._unpublished_lock = None                       # make the recovery path itself break
+    assert a._publish_produced("j1", ["x"]) is False
+
+
 def test_retrying_with_nothing_pending_does_not_touch_redis():
     a = _leaf_agent()
     a._retry_unpublished_data()
     a.repository.mark_data_available.assert_not_called()
+
+
+def test_a_failed_transaction_leaves_neither_the_job_nor_its_outputs():
+    """Atomicity is the whole point: a partial write is what created the gap. If EXEC never
+    runs, the job must not be COMPLETE *and* its names must not be readable — the gated
+    descendants then wait for a reselection, which is the correct outcome."""
+    from swarm.database.repository import Repository
+
+    class _Exploding(_FakeRedis):
+        def pipeline(self):
+            outer = self
+
+            class _P:
+                def watch(self, *a): pass
+                def get(self, *a): return None
+                def multi(self): pass
+                def set(self, *a): pass
+                def sadd(self, *a): pass
+                def srem(self, *a): pass
+                def execute(self):
+                    raise RuntimeError("connection lost mid-transaction")
+                def reset(self): pass
+            return _P()
+
+    client = _Exploding()
+    repo = Repository(client, run_id="run-1")
+    with pytest.raises(RuntimeError):
+        repo.save(obj={"id": "j1", "state": 8}, produced_data=["catalog.csv"])
+
+    assert client.sets == {}, "a transaction that did not commit must publish nothing"
+    assert repo.data_available(["catalog.csv"]) is False
 
 
 def test_the_predicate_survives_a_round_trip_through_redis():

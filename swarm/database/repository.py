@@ -73,7 +73,8 @@ class Repository:
     ##########################
 
     def save(self, obj: dict, key_prefix: str = KEY_JOB, key: Optional[str] = None,
-             level: int = 0, group: int = 0, max_retries: int = 10):
+             level: int = 0, group: int = 0, max_retries: int = 10,
+             produced_data: Optional[List[str]] = None):
         """
         Save a generic object into Redis under the given key.
 
@@ -87,6 +88,15 @@ class Repository:
             level (int): Agent level in hierarchy.
             group (int): Agent group in hierarchy at a level.
             max_retries (int): Maximum retry attempts on WatchError (default: 10).
+            produced_data (Optional[List[str]]): Output names this write makes available,
+                added to the readiness registry **inside the same MULTI**. This is what closes
+                the window between "the job is complete" and "its outputs exist": as two
+                writes, an agent dying in between left every descendant of that job gated for
+                the rest of the run, and no retry queue can cover it because the queue dies
+                with the agent. As one transaction there is no in-between — either both landed
+                or neither, and a job that is not COMPLETE is reselected by the existing
+                machinery. Pass it only on a *successful* terminal write; a failed job's
+                outputs do not exist.
         """
         if not key:
             obj_id = obj.get("id") or obj.get(f"{key_prefix}_id")
@@ -103,6 +113,9 @@ class Repository:
                 pipeline.set(key, json.dumps(obj))
                 if key_prefix == self.KEY_AGENT:
                     pipeline.sadd(self._members_key(level, group), key)
+                if produced_data:
+                    pipeline.sadd(self._data_ready_key(),
+                                  *[str(n) for n in produced_data if n])
 
                 # Maintain secondary index by state
                 new_state = obj.get(self.KEY_STATE)
