@@ -65,6 +65,15 @@ class ConsensusEngine:
         # so what varies is how many votes a decision had to collect and how long that took.
         # `votes_` is the analogue of Snow's `rounds_`; the mechanism figure pairs it with
         # the per-agent message counts the transport records.
+        # (object_id, p_id) pairs this agent has already broadcast a COMMIT for. The old
+        # guard asked `self.incoming.contains(...)`, which is false for the proposer's OWN
+        # proposal (it lives in `outgoing`), so a proposer re-entered the commit branch on
+        # every PREPARE that arrived after quorum and broadcast another COMMIT each time —
+        # up to (n - quorum) redundant COMMITs per job, biasing messages-per-job *against*
+        # PBFT, which is the direction that flatters this paper's argument. Keyed by p_id
+        # rather than by object so that adopting a better proposal (which resets the object
+        # to PREPARE) still commits, and so does a re-proposal after a reselection timeout.
+        self._commits_sent: set[tuple[str, str]] = set()
         self._proposed_at: dict[str, float] = {}
         self._proposed_at_max = 8192
         self.time_to_finalize = RunningStats()
@@ -301,9 +310,10 @@ class ConsensusEngine:
             if msg.agents[0].agent_id not in proposal.prepares:
                 proposal.prepares.append(msg.agents[0].agent_id)
 
-            # Commit has already been triggered for THIS proposal
-            if object.is_commit and self.incoming.contains(object_id=object.object_id, p_id=proposal.p_id):
-                # Already committed to this specific proposal, don't re-commit
+            # Commit has already been broadcast for THIS proposal, by us. Asked of a set we
+            # own rather than of a container, so it holds for a proposal we proposed
+            # ourselves as well as one we adopted from a peer.
+            if (object.object_id, proposal.p_id) in self._commits_sent:
                 continue
 
             quorum_count = self.host.calculate_quorum()
@@ -319,10 +329,21 @@ class ConsensusEngine:
 
         if len(proposals):
             commit = Commit(source=self.agent_id, agents=[AgentInfo(agent_id=self.agent_id)], proposals=proposals)
+            for sent in proposals:
+                self._commits_sent.add((sent.object_id, sent.p_id))
             self.transport.broadcast(payload=commit)
 
         if self.router.should_forward():
             self.transport.broadcast(payload=msg)
+
+    def _forget_object(self, object_id: str) -> None:
+        """Drop per-object commit bookkeeping once the object leaves the engine.
+
+        Bounded by objects in flight, not by objects ever seen: without this the set would
+        grow for the life of the agent, which is the same slow leak `_proposed_at` caps."""
+        stale = [k for k in self._commits_sent if k[0] == object_id]
+        for k in stale:
+            self._commits_sent.discard(k)
 
     def on_commit(self, msg: Commit) -> None:
         for p in msg.proposals:
@@ -334,6 +355,7 @@ class ConsensusEngine:
                 else:
                     self.outgoing.remove_object(object_id=p.object_id)
                     self.incoming.remove_object(object_id=p.object_id)
+                    self._forget_object(p.object_id)
                     self.host.log_debug(f"Skipped commit {p.p_id}/{p.object_id} (missing)")
                 continue
 
@@ -386,6 +408,7 @@ class ConsensusEngine:
                     self.host.on_participant_commit(object, msg.agents[0].agent_id, proposal.p_id)
                 self.outgoing.remove_object(object_id=proposal.object_id)
                 self.incoming.remove_object(object_id=proposal.object_id)
+                self._forget_object(proposal.object_id)
 
         if self.router.should_forward():
             self.transport.broadcast(payload=msg)

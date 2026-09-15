@@ -360,18 +360,48 @@ class SwimMembership:
         # Relay ack forwarding: any indirect-probe ack should be re-emitted to
         # the original initiator. We do this opportunistically here for any
         # relay slots that have observed a true ack.
-        for pid, acked in list(self._indirect_acked.items()):
-            initiator = self._relay_initiators.get(pid)
-            if acked and initiator is not None and initiator != self.host.agent_id:
-                ack = SwimAck(
-                    source=self.host.agent_id,
-                    probe_id=pid,
-                    target_agent=self._indirect_probes.get(pid).target  # type: ignore[union-attr]
-                    if pid in self._indirect_probes else None,
-                    updates=self._fresh_piggy(),
-                )
-                self._safe_send(initiator, ack)
-                self._relay_initiators.pop(pid, None)
+        #
+        # The whole decision is taken under the lock, on the *live* flags, and the entries we
+        # are going to forward are claimed there too — reading a snapshot and deciding outside
+        # the lock loses acks. `on_ack` pops the probe and sets the flag in one step, so a
+        # snapshot taken a moment earlier says "not acked" while the probe has already gone,
+        # which is exactly the shape of the orphan branch below: it would delete a *fresh* ack
+        # and its relay destination, and the initiator would suspect a live peer. Claiming
+        # under the lock also means a later `on_ack` simply re-creates the entry and the next
+        # tick forwards it, rather than racing with this one.
+        to_forward: list[tuple[str, int, Optional[int]]] = []
+        with self._lock:
+            for pid in list(self._indirect_acked.keys()):
+                acked = self._indirect_acked.get(pid, False)
+                initiator = self._relay_initiators.get(pid)
+                probe = self._indirect_probes.get(pid)
+                if acked and initiator is not None and initiator != self.host.agent_id:
+                    to_forward.append((pid, initiator, probe.target if probe else None))
+                    self._relay_initiators.pop(pid, None)
+                    self._indirect_acked.pop(pid, None)
+                elif acked:
+                    # Acked with nothing left to forward: either we were the initiator, or the
+                    # relay already forwarded it. `on_ack` pops the probe itself, so the
+                    # timeout sweep — which only walks `_indirect_probes` — never reaches this
+                    # entry, and it used to live for the life of the agent. Every successful
+                    # indirect probe left one behind and this loop walked all of them on every
+                    # tick, so failure-detection cost grew with uptime on exactly the long
+                    # runs a campaign is made of.
+                    self._indirect_acked.pop(pid, None)
+                    self._relay_initiators.pop(pid, None)
+                elif probe is None:
+                    # Orphaned: the probe is gone and the flag never went true.
+                    self._indirect_acked.pop(pid, None)
+                    self._relay_initiators.pop(pid, None)
+
+        for pid, initiator, target in to_forward:
+            ack = SwimAck(
+                source=self.host.agent_id,
+                probe_id=pid,
+                target_agent=target,
+                updates=self._fresh_piggy(),
+            )
+            self._safe_send(initiator, ack)
 
     # ---- Membership transitions ----------------------------------------- #
 

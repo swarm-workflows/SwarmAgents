@@ -302,6 +302,12 @@ class ResourceAgent(Agent):
 
         def _make_engine(engine_name: str):
             """Build a consensus engine by name ('pbft' | 'snow')."""
+            if engine_name not in ("pbft", "snow"):
+                raise ValueError(
+                    f"consensus engine {engine_name!r} is not one of 'pbft' or 'snow'. "
+                    "Refused rather than defaulted: a typo used to fall through to PBFT "
+                    "silently, so a cell labelled Snow or Hybrid in the results table could "
+                    "have been PBFT throughout, and nothing in the run would say so.")
             if engine_name == "snow":
                 snow_cfg = consensus_cfg.get("snow", {})
                 return GossipConsensusEngine(
@@ -326,6 +332,10 @@ class ResourceAgent(Agent):
         # (potentially large) coordinator tiers where flat PBFT hits O(g^2). Engine is
         # chosen from the agent's immutable topology level; consensus only ever flows
         # among same-level peers, so a level exchanges messages of a single engine type.
+        if protocol not in ("pbft", "snow", "hybrid"):
+            raise ValueError(
+                f"consensus.protocol {protocol!r} is not one of 'pbft', 'snow' or 'hybrid'. "
+                "Refused rather than defaulted to 'pbft' — see _make_engine.")
         if protocol == "hybrid":
             hybrid_cfg = consensus_cfg.get("hybrid", {})
             level0_engine = (hybrid_cfg.get("level0") or "pbft").lower()
@@ -1059,10 +1069,19 @@ class ResourceAgent(Agent):
                         job_found = True
                         job_state = job_data.get('state', ObjectState.PENDING.value)
 
-                        if job_state == ObjectState.COMPLETE.value:
+                        if job_state in (ObjectState.COMPLETE.value, ObjectState.FAILED.value):
+                            # FAILED is terminal too: `_restore_infeasible_jobs` sets it once a
+                            # job exhausts `max_infeasible_retries`, i.e. the group could not run
+                            # it at all. Testing only for COMPLETE sent such a job down the
+                            # in-progress branch, where it waited out the timeout and the
+                            # execution grace and was dropped with no outcome — losing exactly
+                            # the signal C1 is about, that this group was the wrong choice.
+                            # Seen on `runs/smoke-g4-bandit`: 2 of 400 jobs, and the whole of
+                            # that run's gap between 56 injected failures and 55 recorded.
                             job_complete = True
                             completed_group = child_group
-                            job_exit_status = int(job_data.get('exit_status', 0))
+                            job_exit_status = (1 if job_state == ObjectState.FAILED.value
+                                               else int(job_data.get('exit_status', 0)))
                             self.logger.debug(
                                 f"Delegated job {job_id} COMPLETE at child group {child_group}, "
                                 f"exit_status={job_exit_status}"

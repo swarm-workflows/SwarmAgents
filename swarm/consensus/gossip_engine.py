@@ -163,6 +163,12 @@ class GossipConsensusEngine:
         self.conflicts: Dict[str, int] = {}
 
         self._lock = threading.RLock()
+        # Counter lock, deliberately separate from `_lock`. These are incremented from the
+        # finalize pool workers and the driver tick thread; `d += 1` is a read-modify-write
+        # that loses increments under contention, i.e. it undercounts in exactly the
+        # saturated runs the mechanism figure is about. A separate lock because the
+        # increments must never be taken while `_lock` is held across a host callback.
+        self._stats_lock = threading.Lock()
         self._states: Dict[str, _SnowState] = {}
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -175,6 +181,7 @@ class GossipConsensusEngine:
         self.time_to_finalize = RunningStats()
         self.finalized_count = 0
         self.abandoned_count = 0
+        self.finalize_errors = 0
 
     def _alpha_threshold(self, sample_size: int) -> int:
         """Supermajority vote count required, relative to the peers actually sampled
@@ -515,7 +522,8 @@ class GossipConsensusEngine:
                 f"[SNOW_ABANDON] Object:{state.proposal.object_id} rounds={state.round_no} "
                 f"elapsed={elapsed:.3f}s — max_rounds exhausted, leaving for reselection"
             )
-            self.abandoned_count += 1
+            with self._stats_lock:
+                self.abandoned_count += 1
             with self._lock:
                 state.finalized = True
                 self.outgoing.remove_object(object_id=state.proposal.object_id)
@@ -550,6 +558,12 @@ class GossipConsensusEngine:
             self._finalize_work_inner(state, candidate, reason)
         except Exception as exc:
             # Runs on pool workers whose Future nobody reads — never let an error vanish.
+            # Counted as well as logged: `_finalize` has already marked the state finalized
+            # and dropped the object, so without this the decision is neither `finalized` nor
+            # `abandoned` and the accounting silently fails to add up. A run where this is
+            # non-zero has lost assignments, which is a correctness signal, not a log line.
+            with self._stats_lock:
+                self.finalize_errors += 1
             self.host.log_warn(
                 f"[snow] finalize of {state.proposal.object_id} failed: {exc}")
 
@@ -563,28 +577,34 @@ class GossipConsensusEngine:
             f"[SNOW_TIMING] Object:{state.proposal.object_id} rounds={state.round_no} "
             f"queried={state.queried} elapsed={elapsed:.3f}s reason={reason}"
         )
-        self.finalized_count += 1
+        obj = self.host.get_object(state.proposal.object_id)
+        if obj is not None:
+            if int(winner) == self.agent_id:
+                self.host.log_info(
+                    f"[SNOW_LEADER] Object:{state.proposal.object_id} "
+                    f"agent:{self.agent_id} reason={reason}"
+                )
+                obj.leader_id = self.agent_id
+                self.host.on_leader_elected(obj, state.proposal.p_id)
+            else:
+                self.host.log_info(
+                    f"[SNOW_PART] Object:{state.proposal.object_id} "
+                    f"leader:{winner} reason={reason}"
+                )
+                self.host.on_participant_commit(obj, int(winner), state.proposal.p_id)
+
+        # Counted last, and only here: `_finalize_work` charges any exception to
+        # `finalize_errors`, so incrementing before the host callbacks reported a single
+        # decision as *both* finalized and failed — and `finalized + abandoned +
+        # finalize_errors` is supposed to be the whole population, which is the only reason
+        # the error counter is worth having. The distribution summaries move with the count
+        # for the same reason: they must describe the population they are counted with.
+        with self._stats_lock:
+            self.finalized_count += 1
         self.rounds_to_finalize.add(state.round_no)
         self.queries_to_finalize.add(state.queried)
         if elapsed >= 0:
             self.time_to_finalize.add(elapsed)
-
-        obj = self.host.get_object(state.proposal.object_id)
-        if obj is None:
-            return
-        if int(winner) == self.agent_id:
-            self.host.log_info(
-                f"[SNOW_LEADER] Object:{state.proposal.object_id} "
-                f"agent:{self.agent_id} reason={reason}"
-            )
-            obj.leader_id = self.agent_id
-            self.host.on_leader_elected(obj, state.proposal.p_id)
-        else:
-            self.host.log_info(
-                f"[SNOW_PART] Object:{state.proposal.object_id} "
-                f"leader:{winner} reason={reason}"
-            )
-            self.host.on_participant_commit(obj, int(winner), state.proposal.p_id)
 
     def consensus_stats(self) -> Dict[str, object]:
         """Per-agent finalization accounting, in the shape the PBFT engine also emits.
@@ -597,6 +617,9 @@ class GossipConsensusEngine:
             "protocol": "snow",
             "finalized": self.finalized_count,
             "abandoned": self.abandoned_count,
+            # Decisions that left the pending set without reaching either outcome: the CAS or
+            # a host callback raised. finalized + abandoned + errors is the whole population.
+            "finalize_errors": self.finalize_errors,
             "sends_dropped": self.sends_dropped,
             "conflict_rounds": sum(self.conflicts.values()),
             "conflict_objects": len(self.conflicts),
@@ -660,14 +683,16 @@ class GossipConsensusEngine:
             self._do_send(dest, payload)
             return True
         if not sem.acquire(blocking=False):
-            self.sends_dropped += 1
+            with self._stats_lock:
+                self.sends_dropped += 1
             return False
         try:
             pool.submit(self._do_send_release, dest, payload)
             return True
         except RuntimeError:  # pool shutting down
             sem.release()
-            self.sends_dropped += 1
+            with self._stats_lock:
+                self.sends_dropped += 1
             return False
 
     def _do_send_release(self, dest: int, payload: object) -> None:
