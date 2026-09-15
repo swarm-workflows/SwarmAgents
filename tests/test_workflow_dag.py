@@ -204,6 +204,7 @@ def _leaf_agent():
     a.site = None
     a.shutdown = False
     a._unpublished_data = set()
+    a._unpersisted_completions = {}
     a._unpublished_lock = threading.RLock()
     return a
 
@@ -250,6 +251,63 @@ def test_a_job_with_no_outputs_publishes_nothing():
     j.wall_time = 0.0
     a.execute_job(j)
     assert not a.repository.save.call_args.kwargs["produced_data"]
+
+
+def test_a_persistence_failure_does_not_become_an_execution_failure():
+    """The regression: sharing one `try` meant a Redis blip on the completion write rewrote a
+    successful job as `exit_status=1`, persisted it COMPLETE — so reselection would never
+    revisit it — and published nothing. Every descendant stayed gated for the rest of the run.
+    """
+    a = _leaf_agent()
+    a.repository.save.side_effect = RuntimeError("redis blip")
+    job = _producing_job()
+
+    a.execute_job(job)
+
+    assert job.exit_status == 0, "a failure to persist is not a failure to execute"
+    assert a._unpersisted_completions, "the completion must be kept for retry"
+    payload, produced = a._unpersisted_completions["producer"]
+    assert payload["exit_status"] == 0
+    assert sorted(produced) == ["catalog.csv", "index.json"], \
+        "the outputs are retried WITH the completion, not separately"
+
+
+def test_the_queued_completion_is_re_persisted_with_its_outputs():
+    a = _leaf_agent()
+    a.repository.save.side_effect = RuntimeError("redis blip")
+    a.execute_job(_producing_job())
+
+    a.repository.save.side_effect = None                 # Redis comes back
+    a._retry_unpersisted_completions()
+
+    assert a._unpersisted_completions == {}
+    kw = a.repository.save.call_args.kwargs
+    assert kw["obj"]["exit_status"] == 0
+    assert sorted(kw["produced_data"]) == ["catalog.csv", "index.json"]
+
+
+def test_a_retry_that_fails_again_keeps_the_completion():
+    a = _leaf_agent()
+    a.repository.save.side_effect = RuntimeError("still down")
+    a.execute_job(_producing_job())
+
+    a._retry_unpersisted_completions()
+
+    assert "producer" in a._unpersisted_completions
+
+
+def test_a_genuinely_failed_job_is_still_recorded_as_failed():
+    """Separating the two concerns must not stop a real execution failure being recorded."""
+    a = _leaf_agent()
+    job = _producing_job()
+    job.execute = MagicMock(side_effect=RuntimeError("the task blew up"))
+
+    a.execute_job(job)
+
+    assert job.exit_status == 1
+    kw = a.repository.save.call_args.kwargs
+    assert kw["obj"]["exit_status"] == 1
+    assert kw["produced_data"] is None, "a failed job publishes nothing"
 
 
 # --------------------------------------------------------------------------------------

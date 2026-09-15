@@ -451,6 +451,10 @@ class ResourceAgent(Agent):
         # descendant of that job for the rest of the run, which looks like a livelock and is
         # indistinguishable from a workflow that is genuinely waiting.
         self._unpublished_data: set[str] = set()
+        # Completed jobs whose outcome+outputs transaction failed, keyed by job id. Retried
+        # whole: publishing without the completion would release descendants of a job that is
+        # not recorded as done, and completing without the names strands them.
+        self._unpersisted_completions: dict = {}
         self._unpublished_lock = threading.RLock()
 
         # MAB (Multi-Armed Bandit) configuration for hierarchical delegation
@@ -1725,6 +1729,7 @@ class ResourceAgent(Agent):
 
         self._export_textfile_metrics()
         self._retry_unpublished_data()
+        self._retry_unpersisted_completions()
         self._restart_selection()
         self._monitor_delegated_jobs()
         current_time = int(time.time())
@@ -3034,8 +3039,16 @@ class ResourceAgent(Agent):
         return self._has_sufficient_capacity(job, available)
 
     def execute_job(self, job: Job):
+        """Run the job, then record the outcome — two concerns, deliberately separated.
+
+        They used to share one `try`, so a failure to *persist* was handled as a failure to
+        *execute*: a job that ran fine had its `exit_status` rewritten to 1, was persisted
+        COMPLETE (so reselection would never revisit it) and published none of its outputs,
+        which stranded every descendant in the DAG for the rest of the run. A Redis blip is
+        not a job failure and must not be recorded as one.
+        """
+        job_id = job.job_id
         try:
-            job_id = job.job_id
             self.logger.info(f"[EXECUTE] Starting job {job_id} on agent {self.agent_id}")
             if job.sub_role == "quantum":
                 # Split hybrid: produce snapshot batches into the measurement layer
@@ -3062,22 +3075,51 @@ class ResourceAgent(Agent):
                         f"[FAILURE_SIM] Injected failure for job {job_id} on agent {self.agent_id} "
                         f"(rate={fail_rate:.2f})"
                     )
+        except Exception as e:
+            # A real execution failure — the only thing that may set a non-zero exit status.
+            self.logger.error(f"[ERROR] Job {job} failed on agent {self.agent_id}: {e}")
+            self.logger.error(traceback.format_exc())
+            job.exit_status = 1
+            job.state = ObjectState.COMPLETE
 
-            # Self-expanding pool: successful one-shot quantum jobs with
-            # post_process push a classical post-processing job (data-triggered)
-            if job.sub_role is None and job.exit_status == 0:
+        # Self-expanding pool: successful one-shot quantum jobs with post_process push a
+        # classical post-processing job (data-triggered). Outside the execution try and
+        # non-raising: pushing a successor is a side effect, not part of this job's outcome.
+        if job.sub_role is None and job.exit_status == 0:
+            try:
                 self._maybe_push_post_process(job)
+            except Exception as e:
+                self.logger.warning(f"Post-process push failed for {job_id}: {e}")
 
-            # Persist the outcome and publish what this job produced in ONE write. The names
-            # are what release this job's descendants, so as two writes an agent dying in
-            # between gated the whole subtree for the rest of the run — and a retry queue
-            # cannot cover that, because the queue dies with the agent. In one transaction
-            # there is no in-between: either the job is COMPLETE and its outputs exist, or
-            # neither, and a job left short of COMPLETE is reselected by the existing
-            # machinery. Only on success — a failed job's outputs do not exist, and releasing
-            # a child on its parent's failure would run it against inputs never written.
-            produced = ([d.file for d in (job.data_out or []) if getattr(d, "file", None)]
-                        if job.exit_status == 0 else None)
+        # Persist the outcome and publish what the job produced in ONE write. The names are
+        # what release this job's descendants, so as two writes an agent dying in between
+        # gated the whole subtree for the rest of the run — and a retry queue cannot cover
+        # that, because the queue dies with the agent. In one transaction there is no
+        # in-between. Only on success: a failed job's outputs do not exist, and releasing a
+        # child on its parent's failure would run it against inputs never written.
+        produced = ([d.file for d in (job.data_out or []) if getattr(d, "file", None)]
+                    if job.exit_status == 0 else None)
+        self._persist_completion(job, produced)
+
+        try:
+            self.queues.ready_queue.remove(job_id)
+            exit_status_str = "SUCCESS" if job.exit_status == 0 else f"FAILED (exit={job.exit_status})"
+            self.logger.info(f"[COMPLETE] Job {job_id} {exit_status_str} on agent {self.agent_id}")
+            if not self.queues.ready_queue.gets():
+                self.start_idle()
+        except Exception as e:
+            self.logger.error(f"Post-completion bookkeeping failed for {job_id}: {e}")
+
+    def _persist_completion(self, job: Job, produced: Optional[list]) -> bool:
+        """Write a finished job's outcome, with its outputs, in one transaction.
+
+        On failure the *whole* record is queued and retried on the periodic tick — the
+        outcome and the names together, because publishing without the completion would
+        release descendants of a job that is not recorded as done, and completing without the
+        names is exactly the stranding this method exists to prevent. Non-raising: the job has
+        already run, and its result must not depend on Redis being reachable at this instant.
+        """
+        try:
             self.repository.save(
                 obj=job.to_dict(),
                 key_prefix=Repository.KEY_JOB,
@@ -3086,28 +3128,43 @@ class ResourceAgent(Agent):
                 produced_data=produced,
             )
             if produced:
-                self.logger.debug(f"[DATA_READY] {job_id} produced {produced}")
-
-            self.queues.ready_queue.remove(job_id)
-            exit_status_str = "SUCCESS" if job.exit_status == 0 else f"FAILED (exit={job.exit_status})"
-            self.logger.info(f"[COMPLETE] Job {job_id} {exit_status_str} on agent {self.agent_id}")
-            if not self.queues.ready_queue.gets():
-                self.start_idle()
+                self.logger.debug(f"[DATA_READY] {job.job_id} produced {produced}")
+            return True
         except Exception as e:
-            self.logger.error(f"[ERROR] Job {job} failed on agent {self.agent_id}: {e}")
-            self.logger.error(traceback.format_exc())
-            # Persist failure status even on exception
             try:
-                job.exit_status = 1
-                job.state = ObjectState.COMPLETE
+                with self._unpublished_lock:
+                    self._unpersisted_completions[job.job_id] = (job.to_dict(),
+                                                                 list(produced or []))
+                    pending = len(self._unpersisted_completions)
+                self.logger.warning(
+                    f"Failed to persist completion of {job.job_id}: {e} — queued for retry "
+                    f"({pending} completion(s) pending). The job's outcome is unchanged.")
+            except Exception:
+                pass
+            return False
+
+    def _retry_unpersisted_completions(self) -> None:
+        """Re-write completions whose transaction failed, outcome and outputs together."""
+        with self._unpublished_lock:
+            if not self._unpersisted_completions:
+                return
+            pending = list(self._unpersisted_completions.items())
+        for job_id, (payload, produced) in pending:
+            try:
                 self.repository.save(
-                    obj=job.to_dict(),
+                    obj=payload,
                     key_prefix=Repository.KEY_JOB,
                     level=self.topology.level,
                     group=self.topology.group,
+                    produced_data=produced or None,
                 )
             except Exception as e:
-                self.logger.error(f"Failed to persist failure status for job {job}: {e}")
+                self.logger.debug(f"[DATA_READY] completion retry for {job_id} failed: {e}")
+                continue
+            with self._unpublished_lock:
+                self._unpersisted_completions.pop(job_id, None)
+            self.logger.info(
+                f"[DATA_READY] re-persisted completion of {job_id} after an earlier failure")
 
     def _maybe_push_post_process(self, job: Job):
         """
