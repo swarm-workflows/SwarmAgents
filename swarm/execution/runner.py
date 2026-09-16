@@ -184,9 +184,16 @@ def resolve_under_root(path: str, kind: str, pol: Optional[ExecutionPolicy] = No
     this fleet; a job authored by hand says `bin/analyze.py` and means "in the code root".
     Neither has to know about the other.
 
-    Returns "" when a relative path is given and no root is configured for its kind, which
-    the caller turns into a refusal naming the missing key — guessing a base directory would
-    run whatever happened to sit at that relative path from the process's cwd.
+    Returns "" when the path cannot be resolved — no root configured for its kind, or a
+    relative path that climbs out of that root. Call `unresolved_reason` for which. Guessing
+    a base directory would run whatever happened to sit at that relative path from the
+    process's own working directory.
+
+    **Containment is enforced here**, in the single place every relative path passes through.
+    A job record is workflow-supplied data: `../../usr/bin/something` joined onto a root
+    escapes it, and the whole point of naming a root is that everything resolves inside it.
+    The check is lexical (`normpath`), which is what defeats `..`; a symlink *inside* the
+    root is placed by whoever administers the root and is deliberately still followed.
     """
     if not path:
         return ""
@@ -196,7 +203,25 @@ def resolve_under_root(path: str, kind: str, pol: Optional[ExecutionPolicy] = No
     root = (pol.roots or {}).get(kind, "")
     if not root:
         return ""
-    return os.path.join(root, path)
+    root_norm = os.path.normpath(root)
+    candidate = os.path.normpath(os.path.join(root_norm, path))
+    if candidate != root_norm and not candidate.startswith(root_norm + os.sep):
+        return ""
+    return candidate
+
+
+def unresolved_reason(path: str, kind: str, pol: Optional[ExecutionPolicy] = None) -> str:
+    """Why `resolve_under_root` returned nothing, so a refusal can say which it was.
+
+    "No root configured" and "climbs out of the root" are different mistakes with different
+    fixes, and a message covering both vaguely sends a reader to the wrong one.
+    """
+    pol = pol or _POLICY
+    root = (pol.roots or {}).get(kind, "")
+    if not root:
+        return f"runtime.execution.roots.{kind} is not set, so {path!r} cannot be resolved"
+    return (f"{path!r} resolves outside runtime.execution.roots.{kind} ({root}); a relative "
+            f"path may not climb out of its root")
 
 
 def resolve_image(spec: ExecutionSpec, pol: Optional[ExecutionPolicy] = None) -> str:
@@ -284,11 +309,10 @@ def build_command(spec: ExecutionSpec, work_dir: str,
             return [], "no container and no pfn: nothing to execute"
         target = resolve_under_root(spec.pfn, "code", pol)
         if not target:
-            # Distinguished from "no pfn at all": there IS one, it is relative, and nothing
-            # says what it is relative to. Reporting the generic message would send a reader
-            # looking for a missing field that is present.
-            return [], (f"pfn {spec.pfn!r} is relative and runtime.execution.roots.code is "
-                        f"not set, so it cannot be resolved")
+            # Distinguished from "no pfn at all": there IS one, and it cannot be resolved.
+            # The reason says which — an unset root and an escaping path are different
+            # mistakes with different fixes.
+            return [], f"pfn: {unresolved_reason(spec.pfn, 'code', pol)}"
         if not os.path.exists(target):
             return [], f"executable not found at {target} (after path_rewrites)"
         return [target] + args, ""
@@ -299,9 +323,7 @@ def build_command(spec: ExecutionSpec, work_dir: str,
         if (declared and not os.path.isabs(declared) and "://" not in declared
                 and (declared.lower().endswith(_IMAGE_FILE_SUFFIXES)
                      or (container.kind or "").lower() in _SIF_KINDS)):
-            return [], (f"container image {declared!r} is relative and "
-                        f"runtime.execution.roots.images is not set, so it cannot be "
-                        f"resolved")
+            return [], f"container image: {unresolved_reason(declared, 'images', pol)}"
         return [], f"container {container.name!r} has no resolvable image"
     runtime = _available_runtime(container.kind, pol)
     if runtime is None:
@@ -329,8 +351,7 @@ def build_command(spec: ExecutionSpec, work_dir: str,
     if (spec.pfn_type or "").lower() != "installed" and spec.pfn:
         host_pfn = resolve_under_root(spec.pfn, "code", pol)
         if not host_pfn:
-            return [], (f"pfn {spec.pfn!r} is relative and runtime.execution.roots.code is "
-                        f"not set, so it cannot be resolved")
+            return [], f"pfn: {unresolved_reason(spec.pfn, 'code', pol)}"
         if not os.path.exists(host_pfn):
             return [], f"staged code not found at {host_pfn}"
         binds.append((host_pfn, spec.path))
@@ -371,13 +392,13 @@ def build_command(spec: ExecutionSpec, work_dir: str,
         #
         # Existence is checkable, so it is checked rather than inferred from the string. Only
         # a reference that resolves to nothing on disk is treated as a registry reference.
+        # Only the configured images root counts. An earlier version also tried
+        # `os.path.exists(image)` as a fall-back, which tests the path against the AGENT'S
+        # OWN working directory — so an unrelated file that happens to share the name gets
+        # run instead of the image. That is the cwd fall-back this module refuses everywhere
+        # else, reintroduced by accident while fixing the sandbox case.
         local = resolve_under_root(image, "images", pol)
-        if local and os.path.exists(local):
-            image = local
-        elif os.path.exists(image):
-            image = os.path.abspath(image)
-        else:
-            image = "docker://" + image
+        image = local if (local and os.path.exists(local)) else "docker://" + image
     cmd = [runtime, "exec", "--bind", f"{work_dir}:{work_dir}", "--pwd", work_dir]
     for host, inside in binds:
         cmd += ["--bind", f"{host}:{inside}"]
@@ -428,8 +449,7 @@ def stage_inputs(data_in, work_dir: str,
         src = resolve_under_root(name, "inputs", pol)
         if not src:
             return staged, (f"input {name!r} is not in the working directory and "
-                            f"runtime.execution.roots.inputs is not set, so there is nowhere "
-                            f"to stage it from")
+                            f"{unresolved_reason(name, 'inputs', pol)}")
         if not os.path.isfile(src):
             return staged, (f"input {name!r} is not in the working directory and was not "
                             f"found in the inputs root ({(pol.roots or {})['inputs']})")

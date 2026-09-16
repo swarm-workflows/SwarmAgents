@@ -216,7 +216,16 @@ not proof. An apptainer *sandbox* is a directory with no extension at all
 (`apptainer build --sandbox mybox/ …`, then `apptainer exec mybox/ …`), and an image in the
 images root need not be named `.sif`. Prefixing either turns a local image into a registry
 pull for a repository nobody published. Existence is checkable, so only a reference that
-resolves to nothing on disk is treated as a registry reference.
+resolves to nothing on disk is treated as a registry reference — and it is checked **only
+under the configured root**, never against the agent's own working directory, or an unrelated
+file that happens to share the name would be run instead of the image.
+
+Relative paths are also **contained**: a job record is workflow-supplied data, and
+`../../usr/bin/something` joined onto a root escapes it, which defeats the point of naming a
+root. `resolve_under_root` is the single place every relative path passes through, so the
+check lives there and covers code, inputs and images at once. It is lexical (`normpath`),
+which is what defeats `..`; a symlink *inside* a root is placed by whoever administers it and
+is deliberately still followed.
 
 **There is no new field for inputs.** The files a job reads are already `Job.data_in`, which
 the converter populates; a second list would be a second source of truth for the same fact and

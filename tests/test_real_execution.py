@@ -669,6 +669,66 @@ class TestInputStaging(PolicyTestCase):
             self.assertTrue(os.path.isfile(os.path.join(work, "passwd")))
 
 
+class TestRootContainment(PolicyTestCase):
+    """A job record is workflow-supplied data; naming a root means everything resolves in it."""
+
+    def test_an_image_may_not_climb_out_of_the_images_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            outside = os.path.join(tmp, "outside"); os.makedirs(outside)
+            Path(outside, "evil.sif").write_bytes(b"x")
+            images = os.path.join(tmp, "images"); os.makedirs(images)
+            runner.configure(container_runtime="apptainer", roots={"images": images})
+            spec = ExecutionSpec.from_dict({
+                "path": "/srv/x", "arguments": [], "pfn_type": "installed",
+                "container": {"name": "c", "kind": "singularity",
+                              "image": "../outside/evil.sif"}})
+            with patch("shutil.which", return_value="/usr/bin/apptainer"):
+                cmd, reason = runner.build_command(spec, "/w")
+            self.assertEqual(cmd, [])
+            self.assertIn("outside", reason)
+
+    def test_a_pfn_may_not_climb_out_of_the_code_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code = os.path.join(tmp, "code"); os.makedirs(code)
+            runner.configure(container_runtime="none", roots={"code": code})
+            spec = ExecutionSpec.from_dict(
+                {"path": "/srv/x", "arguments": [], "pfn": "../../bin/sh"})
+            cmd, reason = runner.build_command(spec, "/w")
+            self.assertEqual(cmd, [])
+            self.assertIn("outside", reason)
+
+    def test_an_ordinary_nested_path_still_resolves(self):
+        """Containment must not break the normal case it is wrapped around."""
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "bin"))
+            script(os.path.join(tmp, "bin"), "a.sh", "exit 0")
+            runner.configure(container_runtime="none", roots={"code": tmp})
+            spec = ExecutionSpec.from_dict(
+                {"path": "/srv/x", "arguments": [], "pfn": "bin/a.sh"})
+            cmd, reason = runner.build_command(spec, "/w")
+            self.assertEqual(cmd[0], os.path.join(tmp, "bin", "a.sh"))
+
+    def test_a_bare_name_is_not_taken_from_the_agents_working_directory(self):
+        """An unrelated file that happens to share the name must not be run instead of the
+        image. This fall-back was reintroduced once already while fixing the sandbox case."""
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "decoy"))
+            images = os.path.join(tmp, "images"); os.makedirs(images)
+            runner.configure(container_runtime="apptainer", roots={"images": images})
+            spec = ExecutionSpec.from_dict({
+                "path": "/srv/x", "arguments": [], "pfn_type": "installed",
+                "container": {"name": "c", "kind": "docker", "image": "decoy"}})
+            cwd = os.getcwd()
+            try:
+                os.chdir(tmp)          # the decoy is now in the process's cwd
+                with patch("shutil.which", return_value="/usr/bin/apptainer"):
+                    cmd, _ = runner.build_command(spec, "/w")
+            finally:
+                os.chdir(cwd)
+            self.assertIn("docker://decoy", cmd)
+            self.assertNotIn(os.path.join(tmp, "decoy"), cmd)
+
+
 class TestUnresolvableRelativePaths(PolicyTestCase):
     """A relative path with no root must refuse, and say which key is missing."""
 
