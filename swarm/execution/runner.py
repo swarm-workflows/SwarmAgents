@@ -349,6 +349,20 @@ def build_command(spec: ExecutionSpec, work_dir: str,
         return cmd, ""
 
     # apptainer / singularity
+    #
+    # The mirror of the docker case above, and it has to be done explicitly. Apptainer reads a
+    # bare reference as a LOCAL FILE NAME: handed `ubuntu:22.04` it looks for a file of that
+    # name in the working directory and fails with an error naming a path nobody wrote. It
+    # needs the scheme to pull from a registry. So docker has its scheme removed and apptainer
+    # has one added, from the same resolved reference.
+    #
+    # This is not a guess about an ambiguous string: it only applies to what `resolve_image`
+    # already classified as a registry reference (by the catalog's `kind`, or by the absence
+    # of an image-file suffix). A resolved .sif is an absolute path by this point and is left
+    # exactly as it is.
+    if (image and "://" not in image and not os.path.isabs(image)
+            and not image.lower().endswith(_IMAGE_FILE_SUFFIXES)):
+        image = "docker://" + image
     cmd = [runtime, "exec", "--bind", f"{work_dir}:{work_dir}", "--pwd", work_dir]
     for host, inside in binds:
         cmd += ["--bind", f"{host}:{inside}"]

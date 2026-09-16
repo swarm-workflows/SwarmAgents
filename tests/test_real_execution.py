@@ -701,6 +701,41 @@ class TestUnresolvableRelativePaths(PolicyTestCase):
             "container": {"name": "c", "kind": "docker", "image": "repo/img:1"}})
         self.assertEqual(runner.resolve_image(spec), "repo/img:1")
 
+    def test_apptainer_gets_a_scheme_added_for_a_registry_reference(self):
+        """The mirror of docker having its scheme stripped. Apptainer reads a bare reference
+        as a LOCAL FILE NAME — handed `ubuntu:22.04` it looks for a file of that name and
+        fails with an error naming a path nobody wrote."""
+        runner.configure(container_runtime="apptainer", roots={})
+        spec = ExecutionSpec.from_dict({
+            "path": "/srv/x", "arguments": [], "pfn_type": "installed",
+            "container": {"name": "c", "kind": "docker", "image": "ubuntu:22.04"}})
+        with patch("shutil.which", return_value="/usr/bin/apptainer"):
+            cmd, reason = runner.build_command(spec, "/w")
+        self.assertEqual(reason, "")
+        self.assertIn("docker://ubuntu:22.04", cmd)
+        self.assertNotIn("ubuntu:22.04", cmd)
+
+    def test_apptainer_does_not_double_a_scheme_it_already_has(self):
+        runner.configure(container_runtime="apptainer", roots={})
+        spec = ExecutionSpec.from_dict({
+            "path": "/srv/x", "arguments": [], "pfn_type": "installed",
+            "container": {"name": "c", "kind": "docker", "image": "docker://repo/img:1"}})
+        with patch("shutil.which", return_value="/usr/bin/apptainer"):
+            cmd, _ = runner.build_command(spec, "/w")
+        self.assertIn("docker://repo/img:1", cmd)
+        self.assertNotIn("docker://docker://repo/img:1", cmd)
+
+    def test_a_resolved_sif_path_is_left_alone_under_apptainer(self):
+        """A .sif is an absolute path by this point; prefixing it would be nonsense."""
+        runner.configure(container_runtime="apptainer", roots={"images": "/imgs"})
+        spec = ExecutionSpec.from_dict({
+            "path": "/srv/x", "arguments": [], "pfn_type": "installed",
+            "container": {"name": "c", "kind": "singularity", "image": "Soil.sif"}})
+        with patch("shutil.which", return_value="/usr/bin/apptainer"):
+            cmd, _ = runner.build_command(spec, "/w")
+        self.assertIn("/imgs/Soil.sif", cmd)
+        self.assertNotIn("docker:///imgs/Soil.sif", cmd)
+
     def test_a_sif_suffix_is_a_file_even_when_the_kind_says_docker(self):
         """The suffix is the tiebreak when the catalog's kind is missing or wrong."""
         runner.configure(container_runtime="apptainer", roots={"images": "/imgs"})

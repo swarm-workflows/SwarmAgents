@@ -204,6 +204,13 @@ the kind is absent or wrong. Resolving every bare name as a path breaks every ca
 names a plain docker tag; resolving every bare name as a registry reference sends a
 hand-authored `.sif` to a registry.
 
+Once classified, the **scheme is then adjusted per runtime, in both directions**. Docker
+wants a bare `repo:tag` and has any `docker://` removed; apptainer *requires* the scheme and
+has one added, because it reads a bare reference as a local file name. Measured on the slice:
+`apptainer exec busybox:latest …` fails with
+`could not open image /home/ubuntu/busybox:latest`, while `docker://busybox:latest` runs. A
+resolved `.sif` is an absolute path by that point and is left alone.
+
 **There is no new field for inputs.** The files a job reads are already `Job.data_in`, which
 the converter populates; a second list would be a second source of truth for the same fact and
 the two would drift. The runner stages `data_in` into the working directory before the job
