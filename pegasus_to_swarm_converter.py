@@ -837,6 +837,20 @@ BUNDLE_INPUTS = "inputs"
 BUNDLE_IMAGES = "images"
 
 
+def _safe_component(name: str, fallback: str = "unnamed") -> str:
+    """Reduce a workflow-supplied name to ONE safe path component.
+
+    A transformation name comes from the workflow and is used as a directory name, so it is
+    untrusted input on a *write* path: `../../etc/cron.d/pwn` joined onto the output
+    directory escapes it, and the bundler then creates directories and copies files there.
+    Everything outside a conservative set is replaced, and the result can contain no
+    separator and cannot be a traversal segment.
+    """
+    cleaned = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in str(name or ""))
+    cleaned = cleaned.strip("._") or fallback
+    return cleaned
+
+
 def _sha256(path: str) -> str:
     digest = hashlib.sha256()
     with open(path, "rb") as fh:
@@ -892,39 +906,62 @@ def bundle_payload(jobs_and_profiles, output_dir: str, source_root: Optional[str
     inputs_dir = os.path.join(output_dir, BUNDLE_INPUTS)
     manifest = {"code": {}, "inputs": {}, "images": {}, "missing": []}
 
-    seen_transformations = {}
+    # Keyed by the PFN, not by the transformation name. A name is not unique: converting
+    # several runs at once (which `--root` does, and the shipped multi-workflow profile
+    # carries five labels) can put two different workflows' `process` in the same bundle,
+    # and keying by name silently bundled whichever came first and handed it to both. The
+    # pfn is what actually identifies the executable.
+    pfn_to_transformations = {}
     replicas_wanted = {}
 
     for job, profile in jobs_and_profiles:
         execution = job.get("execution") or {}
         transformation = execution.get("transformation") or profile.get("transformation_db") or ""
         pfn = execution.get("pfn")
-        if pfn and transformation and transformation not in seen_transformations:
-            seen_transformations[transformation] = pfn
+        if pfn:
+            pfn_to_transformations.setdefault(pfn, set()).add(transformation)
         for lfn, host_path in (profile.get("replicas_db") or {}).items():
             replicas_wanted.setdefault(lfn, host_path)
 
+    # A transformation name serving several distinct pfns needs distinct directories, or one
+    # copy overwrites the other and every job of that name gets the survivor.
+    names_in_use = {}
+    for pfn in sorted(pfn_to_transformations):
+        base = _safe_component(sorted(pfn_to_transformations[pfn])[0] or "unnamed")
+        names_in_use.setdefault(base, []).append(pfn)
+
     # --- executables -----------------------------------------------------------------
-    for transformation, pfn in sorted(seen_transformations.items()):
-        src = _resolve(pfn)
-        if not os.path.isfile(src):
-            manifest["missing"].append({"kind": "code", "transformation": transformation,
-                                        "path": pfn})
-            continue
-        dest_dir = os.path.join(code_dir, transformation)
-        os.makedirs(dest_dir, exist_ok=True)
-        dest = os.path.join(dest_dir, os.path.basename(src))
-        shutil.copy2(src, dest)
-        manifest["code"][transformation] = {
-            # Two forms on purpose. `bundled` is relative to the BUNDLE and is what a reader
-            # (or a checksum audit) wants. `root_relative` is relative to the CODE ROOT and
-            # is what goes in the job record, because `roots.code` already points at code/.
-            # Conflating them put `code/` in the path twice and every job refused.
-            "bundled": os.path.relpath(dest, output_dir),
-            "root_relative": os.path.relpath(dest, code_dir),
-            "source": pfn,
-            "sha256": _sha256(dest),
-        }
+    for base, pfns in sorted(names_in_use.items()):
+        for pfn in sorted(pfns):
+            # Disambiguate only when it is actually needed, so the common case keeps a
+            # readable directory name.
+            component = base if len(pfns) == 1 else f"{base}-{hashlib.sha256(pfn.encode()).hexdigest()[:8]}"
+            src = _resolve(pfn)
+            if not os.path.isfile(src):
+                manifest["missing"].append({"kind": "code", "transformation": base,
+                                            "path": pfn})
+                continue
+            dest_dir = os.path.join(code_dir, component)
+            # Belt and braces: the component is already sanitised, and the result is checked
+            # to be inside the bundle before anything is created.
+            if not os.path.normpath(dest_dir).startswith(os.path.normpath(code_dir) + os.sep):
+                manifest["missing"].append({"kind": "code", "transformation": base,
+                                            "path": pfn, "reason": "unsafe destination"})
+                continue
+            os.makedirs(dest_dir, exist_ok=True)
+            dest = os.path.join(dest_dir, os.path.basename(src) or "executable")
+            shutil.copy2(src, dest)
+            manifest["code"][pfn] = {
+                # Two forms on purpose. `bundled` is relative to the BUNDLE and is what a
+                # reader (or a checksum audit) wants. `root_relative` is relative to the CODE
+                # ROOT and is what goes in the job record, because `roots.code` already points
+                # at code/. Conflating them put `code/` in the path twice and every job refused.
+                "bundled": os.path.relpath(dest, output_dir),
+                "root_relative": os.path.relpath(dest, code_dir),
+                "transformation": base,
+                "source": pfn,
+                "sha256": _sha256(dest),
+            }
 
     # --- root inputs -----------------------------------------------------------------
     for lfn, host_path in sorted(replicas_wanted.items()):
@@ -933,7 +970,7 @@ def bundle_payload(jobs_and_profiles, output_dir: str, source_root: Optional[str
             manifest["missing"].append({"kind": "input", "lfn": lfn, "path": host_path})
             continue
         os.makedirs(inputs_dir, exist_ok=True)
-        dest = os.path.join(inputs_dir, os.path.basename(lfn))
+        dest = os.path.join(inputs_dir, _safe_component(os.path.basename(lfn), "input"))
         shutil.copy2(src, dest)
         manifest["inputs"][lfn] = {
             "bundled": os.path.relpath(dest, output_dir),
@@ -976,8 +1013,9 @@ def rewrite_job_for_bundle(job: dict, manifest: dict) -> dict:
     execution = job.get("execution")
     if not execution:
         return job
-    transformation = execution.get("transformation") or ""
-    bundled = (manifest.get("code") or {}).get(transformation)
+    # By pfn, because that is what identifies the executable — two workflows in one bundle
+    # may share a transformation name and must not share its code.
+    bundled = (manifest.get("code") or {}).get(execution.get("pfn") or "")
     if bundled:
         # Relative to the CODE ROOT, which is what `roots.code` names — not to the bundle.
         execution["pfn"] = bundled["root_relative"]

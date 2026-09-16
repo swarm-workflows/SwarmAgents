@@ -498,6 +498,54 @@ class TestBundling(unittest.TestCase):
             for entry in list(manifest["code"].values()) + list(manifest["inputs"].values()):
                 self.assertEqual(len(entry["sha256"]), 64)
 
+    def test_a_transformation_name_cannot_write_outside_the_bundle(self):
+        """A transformation name is workflow-supplied and becomes a directory name, so it is
+        untrusted input on a WRITE path: `../../` escapes the output directory and the
+        bundler then creates directories and copies files there."""
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "wf"); os.makedirs(src)
+            Path(src, "x.py").write_text("payload")
+            out = os.path.join(tmp, "out"); os.makedirs(out)
+            escape = os.path.join(tmp, "ESCAPED")
+            pairs = [({"execution": {"transformation": "../../ESCAPED/pwn",
+                                     "pfn": os.path.join(src, "x.py")}}, {})]
+            bundle_payload(pairs, out)
+            self.assertFalse(os.path.exists(escape), "wrote outside the bundle")
+            written = [p for p, _d, f in os.walk(out) for _ in f]
+            for path, _dirs, files in os.walk(out):
+                for f in files:
+                    self.assertTrue(os.path.realpath(os.path.join(path, f))
+                                    .startswith(os.path.realpath(out)))
+
+    def test_two_workflows_sharing_a_transformation_name_do_not_share_code(self):
+        """Converting several runs at once can put two different `process` executables in one
+        bundle. Keying by name bundled whichever came first and handed it to both."""
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a"); os.makedirs(a)
+            b = os.path.join(tmp, "b"); os.makedirs(b)
+            Path(a, "process.py").write_text("WORKFLOW-A")
+            Path(b, "process.py").write_text("WORKFLOW-B")
+            out = os.path.join(tmp, "out"); os.makedirs(out)
+            job_a = {"execution": {"transformation": "process",
+                                   "pfn": os.path.join(a, "process.py")}}
+            job_b = {"execution": {"transformation": "process",
+                                   "pfn": os.path.join(b, "process.py")}}
+            manifest = bundle_payload([(job_a, {}), (job_b, {})], out)
+            self.assertEqual(len(manifest["code"]), 2)
+            rewrite_job_for_bundle(job_a, manifest)
+            rewrite_job_for_bundle(job_b, manifest)
+            read = lambda j: Path(out, "code", j["execution"]["pfn"]).read_text()
+            self.assertEqual(read(job_a), "WORKFLOW-A")
+            self.assertEqual(read(job_b), "WORKFLOW-B")
+
+    def test_a_unique_transformation_keeps_a_readable_directory_name(self):
+        """Disambiguation only where it is needed; the common case stays legible."""
+        with tempfile.TemporaryDirectory() as tmp:
+            src, pairs = self._fixture(tmp)
+            out = os.path.join(tmp, "out"); os.makedirs(out)
+            bundle_payload(pairs, out)
+            self.assertTrue(os.path.isdir(os.path.join(out, "code", "analyze")))
+
     def test_a_simulated_job_bundles_cleanly_with_nothing_to_copy(self):
         """Jobs with no execution block are the default case and must still convert."""
         with tempfile.TemporaryDirectory() as tmp:

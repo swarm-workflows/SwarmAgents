@@ -182,6 +182,16 @@ is verifiable without being carried.
 absolute submit-host paths. Simulated jobs are unaffected throughout: a job with no execution
 block has nothing to bundle and converts exactly as before.
 
+`manifest.json` is keyed by the executable's **source pfn**, not by transformation name. A
+name is not unique: converting several runs at once (`--root`, and the shipped multi-workflow
+profile carries five labels) can put two different workflows' `process` in one bundle, and
+keying by name bundled whichever came first and gave it to both. Directories stay named after
+the transformation and are disambiguated with a short hash only when one name genuinely serves
+several executables, so the common case stays readable. A transformation name is also
+workflow-supplied data used as a *directory name* — untrusted input on a write path — so it is
+reduced to a single safe component and the destination is checked to be inside the bundle
+before anything is created.
+
 Two forms appear in the manifest for each file and they are not interchangeable: `bundled` is
 relative to the bundle (for reading and auditing), `root_relative` is relative to its root and
 is what goes in the job record — `roots.code` already names `code/`, so using the bundle-relative
