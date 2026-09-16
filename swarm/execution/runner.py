@@ -49,6 +49,10 @@ KNOWN_RUNTIMES = ("apptainer", "singularity", "docker")
 #: words a transformation catalog may use, not binaries to invoke.
 _SIF_KINDS = ("singularity", "apptainer")
 
+#: Extensions that make an image reference unambiguously a FILE rather than a registry
+#: reference, whatever the catalog called the container's kind.
+_IMAGE_FILE_SUFFIXES = (".sif", ".simg", ".img", ".sqsh")
+
 #: Binaries that can run a .sif, in preference order — which is a different list from the
 #: kinds above, though the words overlap. `apptainer` comes first because it is the real
 #: binary: current packages ship `singularity` only as a compatibility symlink to it, so
@@ -216,12 +220,21 @@ def resolve_image(spec: ExecutionSpec, pol: Optional[ExecutionPolicy] = None) ->
         # for all of them and the rewrite applies here.
         return rewrite_path(image[len("file://"):], pol)
     if image and not os.path.isabs(image) and "://" not in image:
-        # A bare relative name means "in the images root" -- how a hand-authored job names
-        # its container. Returning the bare name when no root is configured would hand the
-        # runtime a relative path, which it resolves against the process's own working
-        # directory: the exact fall-back this is documented not to do. Return "" so
-        # `build_command` refuses and names the key.
-        return resolve_under_root(image, "images", pol)
+        # A bare reference with no scheme is ambiguous, and the two container kinds resolve
+        # it in opposite ways: `ubuntu:22.04` is a REGISTRY reference that docker looks up
+        # itself, while `Soil.sif` is a FILE that lives in the images root. Treating every
+        # bare name as a path broke every catalog that names a plain docker tag; treating
+        # every bare name as a registry reference would send a hand-authored .sif to a
+        # registry. The catalog's own `kind` is what distinguishes them, with a filename
+        # suffix as the tiebreak when the kind is missing or wrong.
+        looks_like_file = image.lower().endswith(_IMAGE_FILE_SUFFIXES)
+        if looks_like_file or (container.kind or "").lower() in _SIF_KINDS:
+            # Returning the bare name when no root is configured would hand the runtime a
+            # relative path, which it resolves against the process's own working directory:
+            # the exact fall-back this is documented not to do. Return "" so `build_command`
+            # refuses and names the key.
+            return resolve_under_root(image, "images", pol)
+        return image                       # registry reference; the runtime resolves it
     # `docker://` is deliberately NOT stripped here: whether it belongs depends on the
     # runtime, so it is decided in `build_command`. Docker wants a bare `repo:tag`;
     # apptainer *requires* the scheme (`apptainer exec docker://repo:tag`) and, given a bare
@@ -283,7 +296,9 @@ def build_command(spec: ExecutionSpec, work_dir: str,
     image = resolve_image(spec, pol)
     if not image:
         declared = container.image or ""
-        if declared and not os.path.isabs(declared) and "://" not in declared:
+        if (declared and not os.path.isabs(declared) and "://" not in declared
+                and (declared.lower().endswith(_IMAGE_FILE_SUFFIXES)
+                     or (container.kind or "").lower() in _SIF_KINDS)):
             return [], (f"container image {declared!r} is relative and "
                         f"runtime.execution.roots.images is not set, so it cannot be "
                         f"resolved")

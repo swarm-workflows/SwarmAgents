@@ -195,6 +195,15 @@ root. A relative path with no root configured is a **refusal naming the missing 
 a fall back to the process's working directory, which would run whatever happened to sit
 there.
 
+One exception, and it is not arbitrary: **a bare container image reference is not a path**.
+`ubuntu:22.04` and `repo/img:1` are registry references that the runtime resolves itself,
+while `Soil.sif` is a file in the images root, and neither has a scheme or a leading slash to
+tell them apart. The catalog's own `kind` decides — `docker` means registry, `singularity`
+means file — with an image-file suffix (`.sif`, `.simg`, `.img`, `.sqsh`) as the tiebreak when
+the kind is absent or wrong. Resolving every bare name as a path breaks every catalog that
+names a plain docker tag; resolving every bare name as a registry reference sends a
+hand-authored `.sif` to a registry.
+
 **There is no new field for inputs.** The files a job reads are already `Job.data_in`, which
 the converter populates; a second list would be a second source of truth for the same fact and
 the two would drift. The runner stages `data_in` into the working directory before the job

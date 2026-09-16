@@ -681,6 +681,34 @@ class TestUnresolvableRelativePaths(PolicyTestCase):
         self.assertIn("roots.code", reason)
         self.assertNotIn("no pfn", reason)      # there IS one; it just cannot be resolved
 
+    def test_a_bare_docker_tag_is_a_registry_reference_not_a_path(self):
+        """`ubuntu:22.04` has no scheme and no leading slash, but it is not a file. Treating
+        every bare name as a path broke every catalog that names a plain docker tag."""
+        runner.configure(container_runtime="docker", roots={"images": "/imgs"})
+        spec = ExecutionSpec.from_dict({
+            "path": "/srv/x", "arguments": [], "pfn_type": "installed",
+            "container": {"name": "c", "kind": "docker", "image": "ubuntu:22.04"}})
+        self.assertEqual(runner.resolve_image(spec), "ubuntu:22.04")
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            cmd, reason = runner.build_command(spec, "/w")
+        self.assertEqual(reason, "")
+        self.assertIn("ubuntu:22.04", cmd)
+
+    def test_a_namespaced_docker_reference_is_not_a_path(self):
+        runner.configure(container_runtime="docker", roots={})
+        spec = ExecutionSpec.from_dict({
+            "path": "/srv/x", "arguments": [], "pfn_type": "installed",
+            "container": {"name": "c", "kind": "docker", "image": "repo/img:1"}})
+        self.assertEqual(runner.resolve_image(spec), "repo/img:1")
+
+    def test_a_sif_suffix_is_a_file_even_when_the_kind_says_docker(self):
+        """The suffix is the tiebreak when the catalog's kind is missing or wrong."""
+        runner.configure(container_runtime="apptainer", roots={"images": "/imgs"})
+        spec = ExecutionSpec.from_dict({
+            "path": "/srv/x", "arguments": [], "pfn_type": "installed",
+            "container": {"name": "c", "kind": "", "image": "Soil.sif"}})
+        self.assertEqual(runner.resolve_image(spec), "/imgs/Soil.sif")
+
     def test_a_relative_image_without_an_images_root_refuses(self):
         """Returning the bare name would hand the runtime a relative path, which it
         resolves against the process's own working directory."""
