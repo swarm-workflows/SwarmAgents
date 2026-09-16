@@ -769,10 +769,52 @@ class TestBundling(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     conv.convert_pegasus_profiles(
                         input_path=profiles, input_type="json", output_dir=out)
-            # Previous bundle untouched, and no staging debris left behind.
+            # Previous bundle untouched. Staging debris may remain — it is swept by the
+            # next successful conversion, and leaving it is strictly better than damaging
+            # the only working copy of the output.
             self.assertEqual(Path(out, "code", "good", "g.py").read_text(), "PREVIOUS")
             self.assertTrue(os.path.exists(os.path.join(out, "job_1.json")))
-            self.assertEqual([d for d in os.listdir(out) if d.startswith(".convert-staging")], [])
+
+    def test_a_failure_while_writing_job_files_also_leaves_the_bundle_intact(self):
+        """Staging only the payload moved the hole one step along rather than closing it:
+        the job files were still written straight to the output directory, after the
+        previous one had been cleared. Everything is staged now, so the replacement is the
+        last thing that happens."""
+        import pegasus_to_swarm_converter as conv
+        from unittest.mock import patch as _patch
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out")
+            os.makedirs(os.path.join(out, "code", "good"))
+            Path(out, "code", "good", "g.py").write_text("PREVIOUS")
+            Path(out, "job_1.json").write_text('{"id": "previous"}')
+            profiles = os.path.join(tmp, "profiles.json")
+            Path(profiles).write_text(json.dumps([{
+                "run_name": "r", "job_name": "j", "transformation_db": "t",
+                "kickstart_sec_stats": 1.0, "exitcode_db": 0,
+                "input_files_db": [], "output_files_db": [],
+                "request_memory_mb_db": 1024, "request_cpus_db": 1,
+            }]))
+            real_dump = json.dump
+
+            def fail_on_job_file(obj, fh, **kw):
+                if getattr(fh, "name", "").endswith(".json") and "job_" in getattr(fh, "name", ""):
+                    raise OSError("no space left on device")
+                return real_dump(obj, fh, **kw)
+
+            with _patch.object(conv.json, "dump", side_effect=fail_on_job_file):
+                with self.assertRaises(OSError):
+                    conv.convert_pegasus_profiles(
+                        input_path=profiles, input_type="json", output_dir=out)
+            self.assertEqual(Path(out, "code", "good", "g.py").read_text(), "PREVIOUS")
+            self.assertTrue(os.path.exists(os.path.join(out, "job_1.json")))
+
+    def test_staging_debris_is_swept_by_the_next_conversion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, ".convert-staging-99999"))
+            Path(tmp, ".convert-staging-99999", "leftover").write_text("x")
+            clear_previous_output(tmp)
+            self.assertEqual([d for d in os.listdir(tmp)
+                              if d.startswith(".convert-staging")], [])
 
     def test_clearing_an_empty_or_missing_directory_is_harmless(self):
         with tempfile.TemporaryDirectory() as tmp:

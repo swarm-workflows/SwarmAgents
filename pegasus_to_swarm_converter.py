@@ -744,26 +744,28 @@ def convert_pegasus_profiles(
     # can fail has succeeded. Clearing first — which is what this did — destroyed a working
     # bundle whenever the conversion after it raised, leaving neither the new one nor the
     # old. A conversion that fails must leave what was there alone.
+    # EVERYTHING this conversion produces is written to a staging directory — job records,
+    # bundle payload, baseline, manifest, summary — and the previous output is replaced only
+    # at the very end, once nothing is left that can fail. Staging just the payload, which is
+    # what this did first, moved the hole one step along: a failure while writing the job
+    # files still destroyed the previous bundle and left a partial one.
+    #
+    # A conversion that dies part way leaves its staging directory behind rather than
+    # damaging anything; `clear_previous_output` sweeps those on the next successful run.
     manifest = None
-    staging = os.path.join(output_dir, f".convert-staging-{os.getpid()}")
-    try:
-        if bundle:
-            manifest = bundle_payload([(j, p) for _i, j, p, _w in mapped], staging,
-                                      source_root=bundle_source_root,
-                                      include_images=bundle_images)
-        stale = clear_previous_output(output_dir)
-        if stale:
-            print(f"  Cleared:     {stale} artefact(s) from a previous conversion")
-        if manifest is not None:
-            promote_staged_bundle(staging, output_dir)
-    finally:
-        shutil.rmtree(staging, ignore_errors=True)
+    write_dir = os.path.join(output_dir, f".convert-staging-{os.getpid()}")
+    shutil.rmtree(write_dir, ignore_errors=True)
+    os.makedirs(write_dir, exist_ok=True)
+    if bundle:
+        manifest = bundle_payload([(j, p) for _i, j, p, _w in mapped], write_dir,
+                                  source_root=bundle_source_root,
+                                  include_images=bundle_images)
 
     for i, job, profile, warnings in mapped:
         if manifest:
             job = rewrite_job_for_bundle(job, manifest)
         # Write job file
-        job_path = os.path.join(output_dir, f"job_{i}.json")
+        job_path = os.path.join(write_dir, f"job_{i}.json")
         with open(job_path, "w") as fh:
             json.dump(job, fh, indent=2)
 
@@ -783,7 +785,7 @@ def convert_pegasus_profiles(
 
     # Write baseline
     baseline_data = baseline.build(source=input_path)
-    baseline_path = os.path.join(output_dir, "pegasus_baseline.json")
+    baseline_path = os.path.join(write_dir, "pegasus_baseline.json")
     with open(baseline_path, "w") as fh:
         json.dump(baseline_data, fh, indent=2)
 
@@ -821,11 +823,20 @@ def convert_pegasus_profiles(
         # The bundle's own record: what was copied, from where, and its checksum. A bundle
         # whose payload is incomplete says so here AND on stdout, rather than looking whole
         # and failing per job later, on whichever agent happens to draw one.
-        with open(os.path.join(output_dir, "manifest.json"), "w") as fh:
+        with open(os.path.join(write_dir, "manifest.json"), "w") as fh:
             json.dump(manifest, fh, indent=2)
-    summary_path = os.path.join(output_dir, "conversion_summary.json")
+    summary_path = os.path.join(write_dir, "conversion_summary.json")
     with open(summary_path, "w") as fh:
         json.dump(summary, fh, indent=2)
+
+    # Everything is written and nothing below can fail: replace the previous output now.
+    stale = clear_previous_output(output_dir, keep=write_dir)
+    if stale:
+        print(f"  Cleared:     {stale} artefact(s) from a previous conversion")
+    promote_staged_output(write_dir, output_dir)
+    shutil.rmtree(write_dir, ignore_errors=True)
+    baseline_path = os.path.join(output_dir, os.path.basename(baseline_path))
+    summary_path = os.path.join(output_dir, os.path.basename(summary_path))
 
     return {
         "jobs_written": len(profiles),
@@ -850,7 +861,7 @@ BUNDLE_INPUTS = "inputs"
 BUNDLE_IMAGES = "images"
 
 
-def clear_previous_output(output_dir: str) -> int:
+def clear_previous_output(output_dir: str, keep: Optional[str] = None) -> int:
     """Remove a previous conversion's artefacts from *output_dir*. Returns how many.
 
     The converter owns `job_*.json` in its output directory, and writing a new set does NOT
@@ -874,6 +885,13 @@ def clear_previous_output(output_dir: str) -> int:
         elif name in (BUNDLE_CODE, BUNDLE_INPUTS, BUNDLE_IMAGES) and os.path.isdir(path):
             shutil.rmtree(path)
             removed += 1
+        elif name.startswith(".convert-staging-") and os.path.isdir(path):
+            # Debris from a conversion that died part way. Harmless, but it accumulates.
+            # `keep` is the staging directory of the conversion calling this, which is about
+            # to be promoted — sweeping it would delete the output being installed.
+            if keep and os.path.abspath(path) == os.path.abspath(keep):
+                continue
+            shutil.rmtree(path, ignore_errors=True)
     return removed
 
 
@@ -1129,23 +1147,28 @@ def bundle_payload(jobs_and_profiles, output_dir: str, source_root: Optional[str
     return manifest
 
 
-def promote_staged_bundle(staging_dir: str, output_dir: str) -> None:
-    """Move a staged bundle's payload directories into place, replacing any older ones.
+def promote_staged_output(staging_dir: str, output_dir: str) -> None:
+    """Move a completed conversion from its staging directory into place.
 
-    The payload is built in a staging directory so the previous bundle survives a conversion
-    that fails part way. Manifest paths stay valid across the move because both forms are
-    relative — `bundled` to the bundle root, `root_relative` to its own root — and the
-    layout inside is identical.
+    Everything the conversion produces is written to staging first — job records, bundle
+    payload, baseline, manifest, summary — so the destructive replacement of the previous
+    output is the LAST thing that happens, with nothing left that can fail after it. Moving
+    the payload but writing the job files straight to the output directory, which is what
+    this did at first, left the same hole one step further along: a failure while writing
+    them destroyed the previous bundle and produced a partial one.
+
+    Paths inside the manifest survive the move untouched because both forms are relative —
+    `bundled` to the bundle root, `root_relative` to its own root — and the layout is
+    identical on either side.
     """
-    for name in (BUNDLE_CODE, BUNDLE_INPUTS, BUNDLE_IMAGES):
+    for name in sorted(os.listdir(staging_dir)):
         src = os.path.join(staging_dir, name)
-        if not os.path.isdir(src):
-            continue
         dest = os.path.join(output_dir, name)
         if os.path.isdir(dest):
             shutil.rmtree(dest)
+        elif os.path.exists(dest):
+            os.remove(dest)
         shutil.move(src, dest)
-    shutil.rmtree(staging_dir, ignore_errors=True)
 
 
 def rewrite_job_for_bundle(job: dict, manifest: dict) -> dict:
@@ -1232,26 +1255,21 @@ def convert(args: argparse.Namespace):
 
     # See the note in convert_pegasus_profiles: staged, then promoted, so a conversion that
     # fails leaves the previous bundle intact.
+    # Staged in full, promoted last — see the note in convert_pegasus_profiles.
     manifest = None
-    staging = os.path.join(args.output_dir, f".convert-staging-{os.getpid()}")
-    try:
-        if not args.no_bundle:
-            manifest = bundle_payload([(j, p) for _i, j, p, _w in mapped], staging,
-                                      source_root=args.bundle_source_root,
-                                      include_images=args.bundle_images)
-        stale = clear_previous_output(args.output_dir)
-        if stale:
-            print(f"  Cleared:     {stale} artefact(s) from a previous conversion")
-        if manifest is not None:
-            promote_staged_bundle(staging, args.output_dir)
-    finally:
-        shutil.rmtree(staging, ignore_errors=True)
+    write_dir = os.path.join(args.output_dir, f".convert-staging-{os.getpid()}")
+    shutil.rmtree(write_dir, ignore_errors=True)
+    os.makedirs(write_dir, exist_ok=True)
+    if not args.no_bundle:
+        manifest = bundle_payload([(j, p) for _i, j, p, _w in mapped], write_dir,
+                                  source_root=args.bundle_source_root,
+                                  include_images=args.bundle_images)
 
     for i, job, profile, warnings in mapped:
         if manifest:
             job = rewrite_job_for_bundle(job, manifest)
         # Write job file
-        job_path = os.path.join(args.output_dir, f"job_{i}.json")
+        job_path = os.path.join(write_dir, f"job_{i}.json")
         with open(job_path, "w") as fh:
             json.dump(job, fh, indent=2)
 
@@ -1273,7 +1291,7 @@ def convert(args: argparse.Namespace):
 
     # Write baseline
     baseline_data = baseline.build(source=args.input)
-    baseline_path = os.path.join(args.output_dir, "pegasus_baseline.json")
+    baseline_path = os.path.join(write_dir, "pegasus_baseline.json")
     with open(baseline_path, "w") as fh:
         json.dump(baseline_data, fh, indent=2)
 
@@ -1282,7 +1300,7 @@ def convert(args: argparse.Namespace):
     if args.generate_agent_configs:
         all_jobs = []
         for i in range(1, len(profiles) + 1):
-            job_path = os.path.join(args.output_dir, f"job_{i}.json")
+            job_path = os.path.join(write_dir, f"job_{i}.json")
             with open(job_path) as fh:
                 all_jobs.append(json.load(fh))
 
@@ -1331,11 +1349,18 @@ def convert(args: argparse.Namespace):
         # The bundle's own record: what was copied, from where, and its checksum. A bundle
         # whose payload is incomplete says so here AND on stdout, rather than looking whole
         # and failing per job later, on whichever agent happens to draw one.
-        with open(os.path.join(args.output_dir, "manifest.json"), "w") as fh:
+        with open(os.path.join(write_dir, "manifest.json"), "w") as fh:
             json.dump(manifest, fh, indent=2)
-    summary_path = os.path.join(args.output_dir, "conversion_summary.json")
+    summary_path = os.path.join(write_dir, "conversion_summary.json")
     with open(summary_path, "w") as fh:
         json.dump(summary, fh, indent=2)
+
+    # Everything is written and nothing below can fail: replace the previous output now.
+    stale = clear_previous_output(args.output_dir, keep=write_dir)
+    if stale:
+        print(f"  Cleared:     {stale} artefact(s) from a previous conversion")
+    promote_staged_output(write_dir, args.output_dir)
+    shutil.rmtree(write_dir, ignore_errors=True)
 
     print(f"Converted {len(profiles)} Pegasus profiles → {args.output_dir}/")
     print(f"  Job files:   job_1.json .. job_{len(profiles)}.json")

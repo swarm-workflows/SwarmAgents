@@ -207,9 +207,13 @@ manifest claims both are bundled hands a job the wrong file silently.
 A conversion **replaces** the previous bundle: job records left over from a larger earlier
 conversion would otherwise be published alongside the new ones (a 4-job workflow written over
 a 400-job run left 406 files, all of which got scheduled). The replacement happens only once
-everything that can fail has succeeded — the payload is built in a staging directory and
-promoted at the end — so a conversion that fails part way leaves the previous, working bundle
-exactly as it was, rather than destroying it and producing nothing.
+everything that can fail has succeeded: **the whole conversion** — job records, payload,
+baseline, manifest, summary — is written to a staging directory and promoted as the last
+step, so a conversion that fails part way leaves the previous, working bundle exactly as it
+was. Staging only the payload is not enough; the job files were then still written straight
+into the output directory after the old one had been cleared, which moves the hole one step
+along rather than closing it. A conversion that dies leaves its staging directory behind
+rather than damaging anything, and the next successful conversion sweeps it.
 
 `--no-bundle` restores the old behaviour, where job records only *describe* their code by
 absolute submit-host paths. Simulated jobs are unaffected throughout: a job with no execution
