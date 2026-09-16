@@ -729,6 +729,57 @@ class TestRootContainment(PolicyTestCase):
             self.assertNotIn(os.path.join(tmp, "decoy"), cmd)
 
 
+class TestOverrideResolution(PolicyTestCase):
+    """An override REPLACES the catalog's image, so it goes through the same resolution.
+
+    Returning it verbatim was the last remaining way a relative path reached the runtime
+    unresolved, and so got resolved against the agent's own working directory. It matters
+    because `image_overrides` is the documented answer to "the catalog names a .sif and this
+    host runs docker" — writing a path there is the natural thing to do.
+    """
+
+    def test_a_relative_override_resolves_under_the_images_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "imgs"))
+            Path(tmp, "imgs", "Soil.sif").write_bytes(b"x")
+            runner.configure(container_runtime="apptainer", roots={"images": tmp},
+                             image_overrides={"c": "imgs/Soil.sif"})
+            spec = ExecutionSpec.from_dict({
+                "path": "/srv/x", "arguments": [], "pfn_type": "installed",
+                "container": {"name": "c", "kind": "singularity", "image": "Other.sif"}})
+            self.assertEqual(runner.resolve_image(spec),
+                             os.path.join(tmp, "imgs", "Soil.sif"))
+
+    def test_a_registry_override_still_works(self):
+        """The documented case: substituting a docker image for a singularity one. The
+        override must NOT inherit the kind it is replacing, or this refuses."""
+        runner.configure(container_runtime="docker", roots={"images": "/imgs"},
+                         image_overrides={"c": "swarm/soil:1.0"})
+        spec = ExecutionSpec.from_dict({
+            "path": "/srv/x", "arguments": [], "pfn_type": "installed",
+            "container": {"name": "c", "kind": "singularity", "image": "Soil.sif"}})
+        self.assertEqual(runner.resolve_image(spec), "swarm/soil:1.0")
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            cmd, reason = runner.build_command(spec, "/w")
+        self.assertEqual(reason, "")
+        self.assertIn("swarm/soil:1.0", cmd)
+
+
+class TestRootEdgeCases(PolicyTestCase):
+    def test_a_root_of_slash_does_not_refuse_everything(self):
+        """`root + os.sep` makes "//" for a root of "/", which nothing matches."""
+        runner.configure(roots={"images": "/"})
+        self.assertEqual(runner.resolve_under_root("etc/hosts", "images"), "/etc/hosts")
+
+    def test_a_trailing_slash_on_a_root_is_harmless(self):
+        runner.configure(roots={"images": "/imgs/"})
+        self.assertEqual(runner.resolve_under_root("a.sif", "images"), "/imgs/a.sif")
+
+    def test_containment_still_holds_for_a_root_of_slash(self):
+        runner.configure(roots={"images": "/"})
+        self.assertEqual(runner.resolve_under_root("../etc/hosts", "images"), "/etc/hosts")
+
+
 class TestUnresolvableRelativePaths(PolicyTestCase):
     """A relative path with no root must refuse, and say which key is missing."""
 

@@ -227,6 +227,15 @@ check lives there and covers code, inputs and images at once. It is lexical (`no
 which is what defeats `..`; a symlink *inside* a root is placed by whoever administers it and
 is deliberately still followed.
 
+`image_overrides` is resolved the same way, **not trusted verbatim** — it was the last door
+through which a relative path reached the runtime unresolved, and therefore got resolved
+against the agent's own working directory. What an override does *not* inherit is the
+catalog's `kind`: substituting a docker image for a singularity one is the entire purpose of
+the key, so classifying the override by the kind it replaces would refuse the case it exists
+for. An override is classified by its own shape — a recognisable image-file suffix, or
+something that actually exists under the images root, is a file; anything else is a registry
+reference.
+
 **There is no new field for inputs.** The files a job reads are already `Job.data_in`, which
 the converter populates; a second list would be a second source of truth for the same fact and
 the two would drift. The runner stages `data_in` into the working directory before the job

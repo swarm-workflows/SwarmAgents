@@ -205,7 +205,10 @@ def resolve_under_root(path: str, kind: str, pol: Optional[ExecutionPolicy] = No
         return ""
     root_norm = os.path.normpath(root)
     candidate = os.path.normpath(os.path.join(root_norm, path))
-    if candidate != root_norm and not candidate.startswith(root_norm + os.sep):
+    # `root_norm + os.sep` is wrong for a root that already ends in the separator: a root of
+    # "/" made the prefix "//", which nothing matches, so every path under it was refused.
+    prefix = root_norm if root_norm.endswith(os.sep) else root_norm + os.sep
+    if candidate != root_norm and not candidate.startswith(prefix):
         return ""
     return candidate
 
@@ -236,10 +239,22 @@ def resolve_image(spec: ExecutionSpec, pol: Optional[ExecutionPolicy] = None) ->
     container = spec.container
     if container is None:
         return ""
+    # An override REPLACES the catalog's image, so it goes through the same resolution as
+    # any other value. Returning it verbatim was the last remaining way a relative path
+    # reached the runtime unresolved -- and so got resolved against the agent's own working
+    # directory -- which is the fall-back refused everywhere else here. It matters because
+    # `image_overrides` is the documented answer to "the catalog names a .sif and this host
+    # runs docker", so writing a path there is the natural thing to do.
+    #
+    # What the override does NOT inherit is the catalog's `kind`. Substituting a docker
+    # image for a singularity one is the entire purpose of the key, so classifying the
+    # override by the kind it is replacing would refuse exactly the case it exists for. The
+    # override is classified by its own shape instead: a recognisable image-file suffix, or
+    # something that actually exists under the images root, is a file; anything else is a
+    # registry reference.
     override = pol.image_overrides.get(container.name)
-    if override:
-        return override
-    image = container.image or ""
+    image = override or (container.image or "")
+    treat_as_file_kind = (container.kind or "").lower() in _SIF_KINDS and not override
     if image.startswith("file://"):
         # A file:// image is a local path under every runtime, so it resolves the same way
         # for all of them and the rewrite applies here.
@@ -253,7 +268,12 @@ def resolve_image(spec: ExecutionSpec, pol: Optional[ExecutionPolicy] = None) ->
         # registry. The catalog's own `kind` is what distinguishes them, with a filename
         # suffix as the tiebreak when the kind is missing or wrong.
         looks_like_file = image.lower().endswith(_IMAGE_FILE_SUFFIXES)
-        if looks_like_file or (container.kind or "").lower() in _SIF_KINDS:
+        # Something that is actually present under the images root is a file whatever it is
+        # named -- the sandbox case, and any override written as a relative path.
+        under_root = resolve_under_root(image, "images", pol)
+        if under_root and os.path.exists(under_root):
+            return under_root
+        if looks_like_file or treat_as_file_kind:
             # Returning the bare name when no root is configured would hand the runtime a
             # relative path, which it resolves against the process's own working directory:
             # the exact fall-back this is documented not to do. Return "" so `build_command`
