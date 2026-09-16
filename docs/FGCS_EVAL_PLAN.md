@@ -449,10 +449,18 @@ rather than a defect and changing either would move every hierarchical number:
   Hier-250 PBFT collapse C3 rests on may be partly "n proposals per job" rather than PBFT
   itself. **E5 must report proposals/job by tier so the two are separable**, and §III has to
   describe the behaviour either way.
-- **Failed-agent reassignment only searches the local pending queue** (the TODO at
-  `resource_agent.py:277`): a job already READY or RUNNING on a failed agent is logged as
-  "likely completed" and dropped from reassignment. That is the known gap in the failure story
-  and it needs a design, not a patch, before E2b/E6.
+- ~~**Failed-agent reassignment only searches the local pending queue**~~ **FIXED
+  2026-09-15.** A job already READY or RUNNING on a failed agent was logged as "likely
+  completed" and dropped, and since its persisted state is not PENDING nothing re-added it —
+  the work was stranded for the rest of the run. P0-9 widened that window from milliseconds to
+  the job's whole duration. Recovery needed three things at once: candidates sourced from
+  Redis (the job record's `leader_id`, not the local map); **release of the exactly-once
+  claim**, which `try_claim_assignment` sets and nothing ever deleted, so a re-finalization
+  returned the dead agent forever and reassignment was impossible under Snow regardless of the
+  rest; and peers discarding the job from their consensus dedupe set when it returns to
+  PENDING, or every commit for it is skipped. One reassigner per (job, failure) via a
+  TTL'd `SET NX`. **E2b and E6 measure exactly this path, so no pre-fix failure-injection
+  number describes the system.** Tests: `tests/test_failed_agent_reassignment.py`.
 
 Two smaller findings from the same pass that touch conference figures, recorded here and in
 `CCGRID27_PAPER_PLAN.md` §4:

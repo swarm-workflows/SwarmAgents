@@ -398,6 +398,37 @@ class Repository:
         v = self.redis.get(key)
         return int(v) if v is not None else None
 
+    def release_assignment(self, job_id: str, level: int = 0, group: int = 0) -> bool:
+        """Drop the exactly-once claim on ``job_id`` so it can be assigned again.
+
+        The claim is what makes a Snow finalization exactly-once: `try_claim_assignment` is a
+        `SET NX`, and every later finalizer is told the first winner. Nothing released it, so a
+        job whose assignee *died* could never be re-finalized to anyone else — the CAS kept
+        returning the dead agent for the rest of the run, and reassignment was silently
+        impossible under the shipped protocol. Releasing is safe only once the job is no
+        longer running anywhere, which is exactly the failed-agent case; it must never be
+        called on a live assignment, or two agents could execute the same job.
+        """
+        return bool(self.redis.delete(f"{self.KEY_ASSIGNEE}:{level}:{group}:{job_id}"))
+
+    KEY_REASSIGN = "reassign"
+
+    def try_claim_reassignment(self, job_id: str, failed_agent_id: int,
+                               level: int = 0, group: int = 0, ttl_s: int = 300) -> bool:
+        """Win the right to reassign ``job_id`` away from ``failed_agent_id``. `SET NX`.
+
+        Every live agent detects the same failure at roughly the same moment and would
+        otherwise each reset the job. Resetting twice is not harmless: the second reset can
+        land *after* the first reassignment has already won a fresh election, clobbering a
+        live assignment back to PENDING and running the job twice. One winner per (job,
+        failure) removes that, using the same primitive as the assignment claim itself.
+
+        The TTL matters: if the winner dies mid-reassignment, the right has to become
+        available again, or the job is stranded by the very mechanism meant to rescue it.
+        """
+        key = f"{self.KEY_REASSIGN}:{level}:{group}:{job_id}:{int(failed_agent_id)}"
+        return bool(self.redis.set(key, "1", nx=True, ex=int(ttl_s)))
+
     def delete_all(self, key_prefix: str = KEY_JOB):
         """
         Delete all objects under given key prefix.

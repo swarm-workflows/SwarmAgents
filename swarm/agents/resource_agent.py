@@ -936,6 +936,12 @@ class ResourceAgent(Agent):
             missing, key_prefix=Repository.KEY_JOB,
             level=self.topology.level, group=self.topology.group) if missing else {}
         for job_id in jobs:
+            # Redis says this job is up for election again — a reassignment after an agent
+            # failure, or any other return to the pool. Drop it from the consensus dedupe set
+            # or `is_agreement_achieved` stays true here and every commit for it is skipped,
+            # so the job would be reset by one agent and ignored by all of them.
+            with self.completed_lock:
+                self.completed_jobs_set.discard(job_id)
             job = fetched.get(job_id)
             if job:
                 job_obj = Job()
@@ -3733,75 +3739,104 @@ class ResourceAgent(Agent):
             return False
 
     def _reassign_jobs_from_failed_agent(self, failed_agent_id: int) -> None:
-        """
-        Reassign jobs that were assigned to a failed agent.
+        """Return the failed agent's in-flight jobs to the pool so someone else runs them.
 
-        This implements the TODO at resource_agent.py:277.
+        Sourced from **Redis, not the local queues**. A job that won consensus is no longer in
+        any peer's pending queue — `_update_ready_jobs` takes it out — so the old version
+        looked it up locally, found nothing, logged "likely completed" and dropped it. Its
+        persisted state is READY or RUNNING rather than PENDING, so no agent re-adds it, and
+        `_restart_selection` only covers the three consensus states. The work was silently
+        stranded for the rest of the run.
 
-        Jobs are reset to PENDING state and cleared from consensus containers,
-        allowing them to go through the selection process again with remaining agents.
+        P0-9 widened that window from milliseconds to the job's whole duration: a scheduled
+        job used to flip to COMPLETE at once, so a dead agent's job merely *looked* finished,
+        and now it is honestly RUNNING for its real wall time. E2b and E6 measure exactly this.
+
+        Exactly one agent reassigns each (job, failure) pair, via a `SET NX` claim: every live
+        agent detects the same failure at the same moment, and a second reset landing after
+        the first reassignment has already won a fresh election would clobber a live
+        assignment and run the job twice.
 
         :param failed_agent_id: ID of the failed agent
         """
-        jobs_to_reassign = []
+        level, group = self.topology.level, self.topology.group
 
-        # Find jobs assigned to the failed agent
+        # In-flight jobs are READY (selected, not yet started) or RUNNING (executing). Both
+        # are lost when their assignee dies; COMPLETE ones are done and must not be touched.
+        try:
+            state_map = self.repository.get_all_ids_multi(
+                key_prefix=Repository.KEY_JOB, level=level, group=group,
+                states=[ObjectState.READY.value, ObjectState.RUNNING.value])
+            in_flight = (state_map.get(ObjectState.READY.value, [])
+                         + state_map.get(ObjectState.RUNNING.value, []))
+            records = self.repository.get_many(
+                in_flight, key_prefix=Repository.KEY_JOB,
+                level=level, group=group) if in_flight else {}
+        except Exception as e:
+            self.logger.warning(
+                f"Could not read in-flight jobs while reassigning from {failed_agent_id}: {e}")
+            return
+
+        # The job record's leader_id is the authority on who holds it — the local
+        # `job_assignments` map only ever sees the elections this agent witnessed.
+        candidates = [jid for jid, rec in records.items()
+                      if rec and rec.get("leader_id") is not None
+                      and int(rec["leader_id"]) == int(failed_agent_id)]
+
+        # Local bookkeeping for the same agent, whether or not it also appears above.
         for job_id, assigned_agent in list(self.job_assignments.items()):
             if assigned_agent == failed_agent_id:
-                jobs_to_reassign.append(job_id)
+                self.job_assignments.remove(job_id)
 
-        if not jobs_to_reassign:
-            self.logger.debug(f"No jobs to reassign from failed agent {failed_agent_id}")
+        if not candidates:
+            self.logger.debug(f"No in-flight jobs to reassign from failed agent {failed_agent_id}")
             return
 
         self.logger.info(
-            f"Reassigning {len(jobs_to_reassign)} jobs from failed agent {failed_agent_id}: {jobs_to_reassign}"
-        )
+            f"Found {len(candidates)} in-flight job(s) on failed agent {failed_agent_id}: {candidates}")
 
-        reassigned_count = 0
-        for job_id in jobs_to_reassign:
-            # Get job from pending queue
-            job = self.queues.pending_queue.get(job_id)
-            if not job:
-                # Job might have completed or moved to another state
-                self.logger.debug(f"Job {job_id} not in pending queue (likely completed)")
-                self.job_assignments.remove(job_id)
+        reassigned = 0
+        for job_id in candidates:
+            if not self.repository.try_claim_reassignment(
+                    job_id, failed_agent_id, level=level, group=group):
+                self.logger.debug(f"Another agent is reassigning {job_id}; skipping")
                 continue
+            try:
+                job_obj = Job()
+                job_obj.from_dict(records[job_id])
+                old_state = job_obj.state
 
-            # Only reassign if job is not already completed
-            if self.is_job_completed(job_id):
-                self.logger.debug(f"Job {job_id} already completed, skipping reassignment")
-                self.job_assignments.remove(job_id)
-                continue
+                # Release the exactly-once claim FIRST. Until it is gone a re-finalization
+                # returns the dead agent, so the job would be "reassigned" straight back to
+                # the corpse — the reason reassignment could not work under Snow at all.
+                self.repository.release_assignment(job_id, level=level, group=group)
 
-            # Reset job to PENDING for reselection
-            old_state = job.state
-            job.state = ObjectState.PENDING
+                job_obj.state = ObjectState.PENDING
+                job_obj.leader_id = None
+                self.repository.save(obj=job_obj.to_dict(), key_prefix=Repository.KEY_JOB,
+                                     level=level, group=group)
 
-            # Clear from consensus containers
-            self.engine.outgoing.remove_object(object_id=job_id)
-            self.engine.incoming.remove_object(object_id=job_id)
-            if job.job_id in self.completed_jobs_set:
-                self.completed_jobs_set.remove(job.job_id)
+                # Local consensus state for a job that is up for election again.
+                self.engine.outgoing.remove_object(object_id=job_id)
+                self.engine.incoming.remove_object(object_id=job_id)
+                with self.completed_lock:
+                    self.completed_jobs_set.discard(job_id)
 
-            # Remove from assignment tracking
-            self.job_assignments.remove(job_id)
+                self.metrics.reassignments[job_id] = {
+                    'failed_agent': failed_agent_id,
+                    'reassigned_at': time.time(),
+                    'reason': 'agent_failure',
+                    'old_state': old_state.value if hasattr(old_state, 'value') else str(old_state),
+                }
+                reassigned += 1
+                self.logger.info(
+                    f"[REASSIGN] Job {job_id} reset to PENDING (was {old_state} on failed "
+                    f"agent {failed_agent_id}); assignment claim released")
+            except Exception as e:
+                self.logger.error(f"Failed to reassign {job_id} from {failed_agent_id}: {e}")
 
-            # Track reassignment in metrics
-            self.metrics.reassignments[job_id] = {
-                'failed_agent': failed_agent_id,
-                'reassigned_at': time.time(),
-                'reason': 'agent_failure',
-                'old_state': old_state.value if hasattr(old_state, 'value') else str(old_state)
-            }
-
-            reassigned_count += 1
-            self.logger.info(
-                f"Job {job_id} reset to PENDING for reassignment "
-                f"(was {old_state} on failed agent {failed_agent_id})"
-            )
-
-        self.logger.info(f"Successfully reassigned {reassigned_count}/{len(jobs_to_reassign)} jobs")
+        self.logger.info(
+            f"Reassigned {reassigned}/{len(candidates)} in-flight jobs from agent {failed_agent_id}")
 
     def _check_failure_threshold(self) -> None:
         """
