@@ -395,6 +395,31 @@ class TestImageSchemePerRuntime(PolicyTestCase):
         self.assertIn("repo/img:1", cmd)
 
 
+class TestRuntimePreference(PolicyTestCase):
+    def test_auto_prefers_apptainer_over_the_singularity_alias(self):
+        """Current packages ship `singularity` as a symlink to `apptainer`. Preferring that
+        name depends on an alias a future package could drop, and logs a command naming a
+        program that is not the one that ran."""
+        runner.configure(container_runtime="auto")
+        spec = ExecutionSpec.from_dict({
+            "path": "/srv/x", "arguments": [], "pfn_type": "installed",
+            "container": {"name": "c", "kind": "singularity", "image": "/i.sif"}})
+        with patch("shutil.which", lambda b: f"/usr/bin/{b}"):   # both present
+            cmd, reason = runner.build_command(spec, "/w")
+        self.assertEqual(reason, "")
+        self.assertEqual(cmd[0], "apptainer")
+
+    def test_the_singularity_alias_is_still_accepted_when_it_is_all_there_is(self):
+        runner.configure(container_runtime="auto")
+        spec = ExecutionSpec.from_dict({
+            "path": "/srv/x", "arguments": [], "pfn_type": "installed",
+            "container": {"name": "c", "kind": "singularity", "image": "/i.sif"}})
+        with patch("shutil.which", lambda b: "/usr/bin/singularity" if b == "singularity" else None):
+            cmd, reason = runner.build_command(spec, "/w")
+        self.assertEqual(reason, "")
+        self.assertEqual(cmd[0], "singularity")
+
+
 class TestNoZombies(PolicyTestCase):
     def test_a_timed_out_process_is_reaped(self):
         """Killing without waiting leaves a zombie per timeout, and an agent runs many jobs

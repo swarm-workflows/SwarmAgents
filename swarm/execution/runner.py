@@ -44,8 +44,16 @@ from swarm.models.execution import ExecutionSpec
 #: Container runtimes understood here, in the order `auto` prefers them.
 KNOWN_RUNTIMES = ("apptainer", "singularity", "docker")
 
-#: Catalog container kinds that mean "a .sif run by apptainer/singularity".
+#: Catalog container kinds that mean "a .sif run by apptainer/singularity". These are the
+#: words a transformation catalog may use, not binaries to invoke.
 _SIF_KINDS = ("singularity", "apptainer")
+
+#: Binaries that can run a .sif, in preference order — which is a different list from the
+#: kinds above, though the words overlap. `apptainer` comes first because it is the real
+#: binary: current packages ship `singularity` only as a compatibility symlink to it, so
+#: preferring that name depends on an alias a future package could drop, and logs a command
+#: naming a program that is not what ran.
+_SIF_RUNTIMES = ("apptainer", "singularity")
 
 #: Substrings marking an environment variable as the agent's business, not the job's. A job
 #: inherits the agent's environment, which on this fleet holds `OPENAI_API_KEY` among other
@@ -195,7 +203,7 @@ def _available_runtime(kind: str, pol: ExecutionPolicy) -> Optional[str]:
         return requested if shutil.which(requested) else None
     # `auto`: honour what the catalog declared, then accept the other family only if the
     # image reference is plausibly for it (an override will have rewritten a .sif already).
-    order = _SIF_KINDS if (kind or "").lower() in _SIF_KINDS else ("docker",)
+    order = _SIF_RUNTIMES if (kind or "").lower() in _SIF_KINDS else ("docker",)
     for candidate in tuple(order) + KNOWN_RUNTIMES:
         if shutil.which(candidate):
             return candidate
