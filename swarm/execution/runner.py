@@ -268,11 +268,12 @@ def resolve_image(spec: ExecutionSpec, pol: Optional[ExecutionPolicy] = None) ->
         # registry. The catalog's own `kind` is what distinguishes them, with a filename
         # suffix as the tiebreak when the kind is missing or wrong.
         looks_like_file = image.lower().endswith(_IMAGE_FILE_SUFFIXES)
-        # Something that is actually present under the images root is a file whatever it is
-        # named -- the sandbox case, and any override written as a relative path.
-        under_root = resolve_under_root(image, "images", pol)
-        if under_root and os.path.exists(under_root):
-            return under_root
+        # NOTE: no filesystem check here. "A local file wins" is an APPTAINER rule -- only
+        # apptainer can run an image from a path. Applied here, where the runtime is not yet
+        # known, it also fired for docker, turning a valid registry reference that happened
+        # to collide with a name in the images root into `docker run /imgs/ubuntu`, which
+        # docker cannot execute. The check belongs in the apptainer branch of
+        # `build_command`, and that is where it is.
         if looks_like_file or treat_as_file_kind:
             # Returning the bare name when no root is configured would hand the runtime a
             # relative path, which it resolves against the process's own working directory:
@@ -381,6 +382,14 @@ def build_command(spec: ExecutionSpec, work_dir: str,
         # remove here rather than in `resolve_image` (see there).
         if image.startswith("docker://"):
             image = image[len("docker://"):]
+        if os.path.isabs(image):
+            # Docker cannot run an image from a filesystem path -- it resolves references
+            # against a registry or its local image store, never a file. Refusing here says
+            # so plainly instead of letting docker fail with "invalid reference format".
+            return [], (f"{image} is a filesystem path and the runtime is docker, which can "
+                        f"only run a registry reference. Use apptainer for a local image, or "
+                        f"set runtime.execution.image_overrides[{container.name!r}] to a "
+                        f"docker image.")
         cmd = ["docker", "run", "--rm", "-v", f"{work_dir}:{work_dir}", "-w", work_dir]
         for host, inside in binds:
             cmd += ["-v", f"{host}:{inside}:ro"]
@@ -419,6 +428,7 @@ def build_command(spec: ExecutionSpec, work_dir: str,
         # else, reintroduced by accident while fixing the sandbox case.
         local = resolve_under_root(image, "images", pol)
         image = local if (local and os.path.exists(local)) else "docker://" + image
+        # (apptainer only -- see the note in `resolve_image`.)
     cmd = [runtime, "exec", "--bind", f"{work_dir}:{work_dir}", "--pwd", work_dir]
     for host, inside in binds:
         cmd += ["--bind", f"{host}:{inside}"]

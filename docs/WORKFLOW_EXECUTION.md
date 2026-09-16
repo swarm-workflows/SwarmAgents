@@ -220,6 +220,20 @@ resolves to nothing on disk is treated as a registry reference — and it is che
 under the configured root**, never against the agent's own working directory, or an unrelated
 file that happens to share the name would be run instead of the image.
 
+**That check is apptainer-only, and the placement is the point.** Only apptainer can run an
+image from a path; docker resolves references against a registry or its local image store and
+never a file, so handing it one produces `invalid reference format`, which says nothing about
+the cause. So the same bare reference legitimately resolves *differently per runtime*: a name
+colliding with something in the images root is a local image under apptainer and a registry
+reference under docker. `resolve_image` classifies (runtime-agnostic); `build_command` adapts
+(runtime-specific). Putting the filesystem check in the shared half broke every docker
+reference that collided with a name in the images root.
+
+The full table — `kind` × reference form × runtime × present-or-absent in the root — is
+enumerated in `tests/test_real_execution.py::TestImageResolutionMatrix`. It is a table rather
+than prose because fixing this one reported case at a time kept uncovering the next empty
+cell.
+
 Relative paths are also **contained**: a job record is workflow-supplied data, and
 `../../usr/bin/something` joined onto a root escapes it, which defeats the point of naming a
 root. `resolve_under_root` is the single place every relative path passes through, so the

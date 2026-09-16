@@ -729,6 +729,83 @@ class TestRootContainment(PolicyTestCase):
             self.assertNotIn(os.path.join(tmp, "decoy"), cmd)
 
 
+class TestImageResolutionMatrix(PolicyTestCase):
+    """The whole table, in one place.
+
+    Image resolution has four independent dimensions — the catalog's `kind`, the form of the
+    reference, the runtime, and whether a matching file exists in the images root — and
+    fixing it one reported case at a time kept uncovering the next empty cell. Enumerating it
+    is what makes the cases finite and reviewable.
+
+    The rule the table encodes: **only apptainer can run an image from a path.** Docker
+    resolves references against a registry or its local image store and never a file, so the
+    same reference legitimately resolves differently per runtime. A bare name colliding with
+    something in the images root is a local image under apptainer and a registry reference
+    under docker.
+    """
+
+    # (kind, image) -> (expected under apptainer, expected under docker)
+    # REFUSED means build_command returns no command.
+    CASES = [
+        (("docker", "ubuntu:22.04"),        "docker://ubuntu:22.04",    "ubuntu:22.04"),
+        (("docker", "docker://ubuntu:1"),   "docker://ubuntu:1",        "ubuntu:1"),
+        (("docker", "repo/img:1"),          "docker://repo/img:1",      "repo/img:1"),
+        (("docker", "absent:1"),            "docker://absent:1",        "absent:1"),
+        # collides with a directory in the images root
+        (("docker", "ubuntu"),              "<root>/ubuntu",            "ubuntu"),
+        (("docker", "sandbox"),             "<root>/sandbox",           "sandbox"),
+        (("singularity", "Soil.sif"),       "<root>/Soil.sif",          "REFUSED"),
+        (("singularity", "<root>/Soil.sif"), "<root>/Soil.sif",         "REFUSED"),
+        (("singularity", "file://<root>/Soil.sif"), "<root>/Soil.sif",  "REFUSED"),
+        (("singularity", "../outside.sif"), "REFUSED",                  "REFUSED"),
+        (("", "Soil.sif"),                  "<root>/Soil.sif",          "REFUSED"),
+    ]
+
+    def test_every_combination(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "imgs")
+            os.makedirs(os.path.join(root, "sandbox"))
+            os.makedirs(os.path.join(root, "ubuntu"))
+            Path(root, "Soil.sif").write_bytes(b"x")
+            Path(tmp, "outside.sif").write_bytes(b"x")
+
+            def expand(s):
+                return s.replace("<root>", root)
+
+            for (kind, image), want_app, want_dock in self.CASES:
+                for runtime, want in (("apptainer", want_app), ("docker", want_dock)):
+                    with self.subTest(kind=kind, image=image, runtime=runtime):
+                        runner.configure(container_runtime=runtime, roots={"images": root})
+                        spec = ExecutionSpec.from_dict({
+                            "path": "/srv/x", "arguments": [], "pfn_type": "installed",
+                            "container": {"name": "c", "kind": kind,
+                                          "image": expand(image)}})
+                        with patch("shutil.which", lambda b: f"/usr/bin/{b}"):
+                            cmd, reason = runner.build_command(spec, "/w")
+                        if want == "REFUSED":
+                            self.assertEqual(cmd, [], f"expected refusal, got {cmd}")
+                            continue
+                        self.assertTrue(cmd, f"unexpected refusal: {reason}")
+                        got = (cmd[cmd.index("--entrypoint") + 2] if runtime == "docker"
+                               else cmd[-2])
+                        self.assertEqual(got, expand(want))
+
+    def test_docker_is_never_handed_a_filesystem_path(self):
+        """The invariant behind the table's docker column. Docker fails such a command with
+        "invalid reference format", which says nothing about the cause."""
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "img.oci").write_bytes(b"x")
+            runner.configure(container_runtime="docker", roots={"images": tmp})
+            spec = ExecutionSpec.from_dict({
+                "path": "/srv/x", "arguments": [], "pfn_type": "installed",
+                "container": {"name": "c", "kind": "docker",
+                              "image": os.path.join(tmp, "img.oci")}})
+            with patch("shutil.which", return_value="/usr/bin/docker"):
+                cmd, reason = runner.build_command(spec, "/w")
+            self.assertEqual(cmd, [])
+            self.assertIn("docker", reason)
+
+
 class TestOverrideResolution(PolicyTestCase):
     """An override REPLACES the catalog's image, so it goes through the same resolution.
 
