@@ -215,6 +215,33 @@ nothing below changes an ordinary run.
 Worked example, end to end, using the `soilmoisture` workflow (5 jobs). Full detail and the
 validated results are in [WORKFLOW_EXECUTION.md](docs/WORKFLOW_EXECUTION.md).
 
+**0. Get the workflow.** It is public:
+
+```bash
+git clone https://github.com/pegasus-isi/soilmoisture-workflow.git
+```
+
+The clone gives you the five executables (`fetch_soil_data.py` and `bin/*.py`), the root input
+`polygons.json`, and both container recipes (`Apptainer/SoilMoisture_Container.def`,
+`Docker/SoilMoisture_Dockerfile`). It does **not** contain three things you need, because each
+is generated rather than committed:
+
+| needed | where it comes from |
+|---|---|
+| `workflow.yml`, `transformations.yml`, `replicas.yml` | `python workflow_generator.py` — these carry **absolute** pfn paths, baked in at generation time |
+| `SoilMoisture_Container.sif` | `apptainer build SoilMoisture_Container.sif Apptainer/SoilMoisture_Container.def` |
+| `*.stampede.db` | **an actual Pegasus run.** There is no way around this one |
+
+That last row is the important one. This pipeline replays a *completed Pegasus run* and
+compares against it, so its input is a run, not a workflow definition — the stampede DB is
+where the per-job durations, exit codes and the baseline makespan come from. Cloning and
+planning the workflow is not a substitute for having run it under Pegasus at least once.
+
+A useful consequence of the catalogs being generated: if you generate them **on the machine
+where the code will live**, their pfn paths already point at the right place and
+`path_rewrites` (step 5) can be empty. Rewrites are needed when the run happened somewhere
+else, which is the usual case when comparing against an existing run.
+
 **1. Extract on the Pegasus submit host.** Executable, arguments and container all come out
 here — arguments from the abstract `workflow.yml`, *not* from the stampede DB's `argv`, which
 is empty for these jobs.
@@ -242,7 +269,9 @@ sudo ./setup_nfs_workflow.sh       # one shared work dir, identical path on ever
 ```
 
 **4. Stage the workflow.** Code on the shared export; the multi-GB image on each agent's
-**local** disk (a WAN read of it per job start would dominate every measurement):
+**local** disk (a WAN read of it per job start would dominate every measurement). Stage the
+tree **from the submit host**, not from a fresh clone — it must be the one whose generated
+catalogs match the run you extracted:
 
 ```bash
 # code, catalogs and declared replicas

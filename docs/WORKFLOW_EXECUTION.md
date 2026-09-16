@@ -103,6 +103,24 @@ guard) and `ordered_task_ids` (order-preserving and unique, for accumulation).
 
 ## 2. Running it
 
+### 2.0 Getting the workflow
+
+`soilmoisture` is public: `git clone https://github.com/pegasus-isi/soilmoisture-workflow.git`.
+The clone carries the five executables, `polygons.json`, and both container recipes. Three
+things it does not carry, because each is generated rather than committed: the catalogs
+(`workflow.yml`/`transformations.yml`/`replicas.yml`, from `workflow_generator.py`, and they
+bake in **absolute** pfn paths), the built `.sif` (from
+`Apptainer/SoilMoisture_Container.def`), and any `*.stampede.db`.
+
+The stampede DB is the one that cannot be produced from the clone at all. **This pipeline's
+input is a completed Pegasus run, not a workflow definition** — the DB is where per-job
+durations, exit codes and the baseline makespan come from, and comparing against a run means
+having that run. Cloning and planning is not a substitute.
+
+One consequence worth knowing: because the catalogs are generated with absolute paths,
+generating them *on the machine where the code will live* makes `path_rewrites` unnecessary.
+Rewrites exist for the normal case, where the run happened somewhere else.
+
 ### 2.1 Extract and convert
 
 ```bash
