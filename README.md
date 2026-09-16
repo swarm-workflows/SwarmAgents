@@ -9,6 +9,7 @@ A framework for greedy distributed consensus and selection algorithms, designed 
 - [Job Selection](#job-selection)
 - [Network Topologies](#network-topologies)
 - [Testing](#testing)
+- [Running a Real Workflow](#running-a-real-workflow-for-real-soilmoisture)
 - [Results](#results)
 - [Agent Failure Handling](#agent-failure-handling)
 - [Dynamic Agent Addition](#dynamic-agent-addition)
@@ -25,6 +26,7 @@ A framework for greedy distributed consensus and selection algorithms, designed 
 - Multi-Armed Bandit (Epsilon-Greedy, UCB1) and contextual bandit (LinUCB, LinTS) reinforcement learning for hierarchical delegation
 - Hybrid quantum-classical job support: quantum backends on agents, qubit-aware feasibility/cost, and split producer/consumer co-scheduling over a Redis-streams measurement layer
 - Replay of real Pegasus workflow executions as swarm workloads (extractor + converter pipeline)
+- **Real execution** of those workflows — the workflow's own executables, arguments and container — for like-for-like comparison against Pegasus
 - Agent failure detection, job reassignment, and dynamic agent addition
 - Extensible for other distributed resource allocation problems
 
@@ -203,6 +205,91 @@ python run_test.py --mode local --agents 10 --topology mesh --jobs <N> --db-host
 
 See [PEGASUS_TO_SWARM.md](docs/PEGASUS_TO_SWARM.md) for the full pipeline, DTN naming options, and field mappings.
 
+### Running a Real Workflow For Real (soilmoisture)
+
+Replay (above) simulates each job's wall time, which is what the scheduling results are built
+on. SWARM can also **actually run** a workflow's executables in the workflow's own container,
+which is what an apples-to-apples comparison against Pegasus needs. Default stays `simulate`;
+nothing below changes an ordinary run.
+
+Worked example, end to end, using the `soilmoisture` workflow (5 jobs). Full detail and the
+validated results are in [WORKFLOW_EXECUTION.md](docs/WORKFLOW_EXECUTION.md).
+
+**1. Extract on the Pegasus submit host.** Executable, arguments and container all come out
+here — arguments from the abstract `workflow.yml`, *not* from the stampede DB's `argv`, which
+is empty for these jobs.
+
+```bash
+python3 pegasus_profile_extractor.py \
+    --submit-dir ~/soilmoisture-workflow/ubuntu/pegasus/soilmoisture/run0001 \
+    --output soil_profiles.json
+```
+
+**2. Convert to swarm jobs**, with the DAG reconstructed as data predicates:
+
+```bash
+python pegasus_to_swarm_converter.py --input soil_profiles.json \
+    --input-type json --output-dir converted_jobs/ --dag-gating
+# check conversion_summary.json -> dag.edges / dag.roots; a partial DAG still looks healthy
+```
+
+**3. Prepare the fleet** (once). Both scripts verify by *doing* the thing — running a real
+container, performing a real write — and both exit non-zero on a partial fleet:
+
+```bash
+sudo ./setup_apptainer.sh          # apptainer on every agent, so the workflow's .sif runs as itself
+sudo ./setup_nfs_workflow.sh       # one shared work dir, identical path on every node
+```
+
+**4. Stage the workflow.** Code on the shared export; the multi-GB image on each agent's
+**local** disk (a WAN read of it per job start would dominate every measurement):
+
+```bash
+# code, catalogs and declared replicas
+tar czf - --exclude=Apptainer soilmoisture-workflow | \
+    ssh database 'sudo tar xzf - -C /export/swarm-wf/workflows'
+# the container image, to local disk on each agent
+sudo ./setup_nfs_workflow.sh --stage-image /root/wf-images/SoilMoisture_Container.sif
+```
+
+**5. Point the config at it.** Two rewrites, because code and image live in different places;
+longest prefix wins, so ordering does not matter:
+
+```yaml
+runtime:
+  execution:
+    mode: real
+    work_dir: /export/swarm-wf/work
+    container_runtime: auto
+    path_rewrites:
+      - {from: /home/ubuntu/soilmoisture-workflow, to: /export/swarm-wf/workflows/soilmoisture-workflow}
+      - {from: /home/ubuntu/soilmoisture-workflow/Apptainer, to: /root/wf-images}
+```
+
+**6. Place the root inputs.** There is no stage-in step yet, so files the workflow *declares*
+rather than produces (`replicas.yml`) must be copied into the work dir first:
+
+```bash
+sudo cp /export/swarm-wf/workflows/soilmoisture-workflow/polygons.json /export/swarm-wf/work/<run-id>/
+```
+
+**7. Run**, as any other remote test:
+
+```bash
+python run_test.py --mode remote --agent-type resource --agents 5 --topology mesh \
+    --jobs 5 --db-host database --agent-hosts-file agent_hosts.txt \
+    --run-dir runs/soil-real --pegasus-profiles soil_profiles.json --pegasus-input-type json
+```
+
+A job that cannot be run properly is **refused and fails loudly** — it never silently falls
+back to simulating, because a run mixing executed and simulated jobs with nothing to tell them
+apart is worse than one that stops. Refusals log at `ERROR` with the reason.
+
+Validated on the slice: outputs byte-identical to the original Pegasus run for every
+computational job, per-job times within ~15% of Pegasus's own. Caveats that matter before
+quoting any number — no stage-in, NFS flattens data locality, and the substrates differ — are
+in [WORKFLOW_EXECUTION.md](docs/WORKFLOW_EXECUTION.md#4-known-limits).
+
 ### Quantum / Hybrid Jobs
 
 ```bash
@@ -333,6 +420,7 @@ All documentation lives in the [`docs/`](docs/) directory.
 - [QUANTUM_HYBRID_DESIGN.md](docs/QUANTUM_HYBRID_DESIGN.md) — Hybrid quantum-classical job taxonomy, models, and split co-scheduling design
 - [QUANTUM_HYBRID_IMPLEMENTATION.md](docs/QUANTUM_HYBRID_IMPLEMENTATION.md) — Code-level walkthrough of the quantum support
 - [PEGASUS_TO_SWARM.md](docs/PEGASUS_TO_SWARM.md) — Replaying real Pegasus workflow executions as swarm workloads
+- [WORKFLOW_EXECUTION.md](docs/WORKFLOW_EXECUTION.md) — Running a real Pegasus workflow **for real**: where the executable, pfn, container and arguments each live, slice setup, validated soilmoisture results, and the limits that matter before quoting a number
 
 ### Hierarchical Topology & Delegation
 - [HIERARCHICAL_LLM_AGENTS.md](docs/HIERARCHICAL_LLM_AGENTS.md) — LLM agents as Level-1 coordinators in hierarchical topology

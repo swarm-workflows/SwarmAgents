@@ -246,6 +246,7 @@ Consensus and selection engines are **decoupled** from agents via adapter classe
 - `docs/COMPLEXITY.md` — PBFT message complexity analysis (mesh and hierarchical)
 - `docs/GOSSIP_CONSENSUS_DESIGN.md` — Gossip-based consensus stack (SWIM + gossip + Snow). Phases 1-3 implemented, wired, and unit-tested; Phase 4 (hybrid hierarchical) and at-scale evaluation pending
 - `docs/DISTRIBUTED_BASELINE_DESIGN.md` — Distributed baseline scheduler design
+- `docs/WORKFLOW_EXECUTION.md` — **Running a real Pegasus workflow for real.** Where the executable, `pfn`, container and arguments each live (four different places, and `invocation.argv` is empty — the arguments are in the abstract `workflow.yml`); the two-rewrite config that splits code onto the shared export and the image onto local disk; validated soilmoisture results (outputs byte-identical to Pegasus, per-job times within ~15%); and the limits to read before quoting anything — no stage-in, NFS flattens locality, substrates differ
 - `docs/QUANTUM_HYBRID_DESIGN.md` — Hybrid quantum-classical job support (classical/quantum/hybrid taxonomy, QuantumSpec/QuantumBackend models, feasibility/cost integration, Phase 2 split co-scheduling, Phase 3 roadmap)
 - `docs/QUANTUM_HYBRID_IMPLEMENTATION.md` — Code-level walkthrough of the quantum support: module map, data-flow, cost formula term by term, cache-signature correctness, measurement layer internals, execution paths, end-to-end job trace, known gotchas
 - `docs/ROADMAP.md` — Feature roadmap and identified improvements

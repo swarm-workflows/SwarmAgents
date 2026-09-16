@@ -84,7 +84,18 @@ def _find_abstract_workflow(run_dir: str) -> Optional[str]:
 
 
 def load_workflow_uses(run_dir: str) -> Dict[str, Dict[str, List[str]]]:
-    """Parse the abstract workflow -> {abs_job_id: {"input": [...], "output": [...]}}."""
+    """Parse the abstract workflow -> {abs_job_id: {"input", "output", "arguments"}}.
+
+    `arguments` is here because it is **the** source for them, and the obvious other
+    candidate is empty. `invocation.argv` in the stampede DB records the kickstart-level
+    command line, which for these workflows carries nothing: measured on the soilmoisture
+    run, every compute job had `argv = ''` while the workflow declares
+    `['--fetch', '--polygon-id', 'field1', ...]`. A job re-run from argv alone gets no
+    arguments at all and dies on its own usage message, which is exactly how this was found.
+
+    Keyed by abstract job id, the same key `uses` is keyed by, so the existing abs_task_id
+    lookup in `extract_run` resolves both at once.
+    """
     if yaml is None:
         return {}
     path = _find_abstract_workflow(run_dir)
@@ -97,12 +108,22 @@ def load_workflow_uses(run_dir: str) -> Dict[str, Dict[str, List[str]]]:
         abs_id = job.get("id")
         if not abs_id:
             continue
-        entry = {"input": [], "output": []}
+        entry = {"input": [], "output": [], "arguments": []}
         for use in job.get("uses", []) or []:
             ftype = use.get("type")
             lfn = use.get("lfn")
             if lfn and ftype in ("input", "output"):
                 entry[ftype].append(lfn)
+        # An argument is usually a plain string, but the Pegasus API also permits a File
+        # object, which round-trips through YAML as a mapping carrying its `lfn`. Rendering
+        # that with str() would put a Python dict repr on the command line.
+        for arg in job.get("arguments", []) or []:
+            if isinstance(arg, dict):
+                lfn = arg.get("lfn")
+                if lfn:
+                    entry["arguments"].append(str(lfn))
+            else:
+                entry["arguments"].append(str(arg))
         uses_map[abs_id] = entry
     return uses_map
 
@@ -410,12 +431,22 @@ def extract_run(run_dir: str, job_types: List[str],
             m = ABS_ID_RE.search(exec_job_id)
             if m and m.group(1) in uses_map:
                 abs_ids = [m.group(1)]
-        uses = {"input": [], "output": []}
+        uses = {"input": [], "output": [], "arguments": []}
         for aid in abs_ids:
             for ftype in ("input", "output"):
                 for lfn in uses_map[aid][ftype]:
                     if lfn not in uses[ftype]:
                         uses[ftype].append(lfn)
+            # Not de-duplicated and not sorted: an argument list is ordered and may repeat a
+            # value legitimately. A clustered job with several tasks concatenates them, which
+            # is the same thing Pegasus would have run.
+            uses["arguments"].extend(uses_map[aid].get("arguments", []))
+        # The abstract workflow's declaration wins over the recorded argv, which is empty for
+        # every job in these workflows. Falling back the other way keeps a run whose abstract
+        # workflow is missing from silently losing arguments it did record.
+        if uses["arguments"]:
+            argv_list = uses["arguments"]
+            argv_raw = " ".join(uses["arguments"])
         input_files = [file_entry(lfn, site) for lfn in uses["input"]]
         output_files = [file_entry(lfn, site) for lfn in uses["output"]]
         total_in = sum(f["size_bytes"] for f in input_files)

@@ -25,7 +25,9 @@ from pathlib import Path
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
-from pegasus_profile_extractor import load_transformation_catalog  # noqa: E402
+from pegasus_profile_extractor import (  # noqa: E402
+    load_transformation_catalog, load_workflow_uses,
+)
 from pegasus_to_swarm_converter import _map_execution  # noqa: E402
 from swarm.models.execution import ContainerSpec, ExecutionSpec  # noqa: E402
 from swarm.models.job import Job  # noqa: E402
@@ -119,6 +121,69 @@ class TestTransformationCatalog(unittest.TestCase):
             write_catalog(root, "catalogs/transformations.yml")
             transformations, _ = load_transformation_catalog(str(root))
         self.assertIsNone(transformations["installed_tool"]["container"])
+
+
+# --------------------------------------------------------------------------------------
+# Arguments live in the abstract workflow, not in the recorded argv.
+# --------------------------------------------------------------------------------------
+
+WORKFLOW = """
+pegasus: 5.0.4
+jobs:
+- id: fetch_field1
+  name: fetch_soil_data
+  arguments: ['--fetch', '--polygon-id', 'field1', '--output', 'field1_soil_data.csv']
+  uses:
+  - {lfn: polygons.json, type: input}
+  - {lfn: field1_soil_data.csv, type: output}
+- id: analyze_field1
+  name: analyze_moisture
+  arguments: ['--input', {lfn: field1_soil_data.csv}, '--threshold', 0.5]
+  uses:
+  - {lfn: field1_soil_data.csv, type: input}
+- id: bare
+  name: no_args
+  uses: []
+"""
+
+
+class TestWorkflowArguments(unittest.TestCase):
+    """`invocation.argv` is empty for every compute job in these workflows — measured on the
+    soilmoisture run — while the abstract workflow declares the real command line. A job
+    re-run from argv alone gets no arguments and dies on its own usage message, which is
+    exactly how this was found: the container ran, the code ran, and it printed
+    `error: the following arguments are required: --polygons-file`.
+    """
+
+    def _load(self, body=WORKFLOW):
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "workflow.yml").write_text(body)
+            return load_workflow_uses(tmp)
+
+    def test_arguments_are_parsed_per_abstract_job(self):
+        uses = self._load()
+        self.assertEqual(uses["fetch_field1"]["arguments"][:2], ["--fetch", "--polygon-id"])
+        self.assertIn("field1_soil_data.csv", uses["fetch_field1"]["arguments"])
+
+    def test_a_file_object_argument_renders_as_its_lfn(self):
+        """The Pegasus API permits a File where a string would do; it round-trips through
+        YAML as a mapping, and str() on it would put a dict repr on the command line."""
+        uses = self._load()
+        self.assertIn("field1_soil_data.csv", uses["analyze_field1"]["arguments"])
+        self.assertFalse(any("{" in a for a in uses["analyze_field1"]["arguments"]))
+
+    def test_non_string_scalars_survive(self):
+        uses = self._load()
+        self.assertIn("0.5", uses["analyze_field1"]["arguments"])
+
+    def test_a_job_with_no_arguments_gets_an_empty_list(self):
+        self.assertEqual(self._load()["bare"]["arguments"], [])
+
+    def test_uses_still_parses_alongside(self):
+        """The arguments were added to an existing loader; its original job must not regress."""
+        uses = self._load()
+        self.assertEqual(uses["fetch_field1"]["input"], ["polygons.json"])
+        self.assertEqual(uses["fetch_field1"]["output"], ["field1_soil_data.csv"])
 
 
 # --------------------------------------------------------------------------------------
