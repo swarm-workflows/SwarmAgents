@@ -91,6 +91,14 @@ recognised, and the first task's recorded argv executes as though it described t
 cluster. Missing metadata means we know *less* about a job, which can only make executing it
 less safe, never more.
 
+The task id list is also **de-duplicated**, in invocation order. One job instance can carry
+several invocation rows for the same abstract task; arguments are accumulated per entry and
+deliberately not de-duplicated (an argument list is ordered and a value may legitimately
+repeat), so a duplicate row doubles the command line — and since it is still one *distinct*
+task, the cluster guard correctly does not fire and the doubled command line runs. The two
+safeguards are therefore different functions on purpose: `cluster_task_ids` (a set, for the
+guard) and `ordered_task_ids` (order-preserving and unique, for accumulation).
+
 ---
 
 ## 2. Running it

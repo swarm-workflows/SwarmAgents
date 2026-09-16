@@ -145,6 +145,34 @@ def cluster_task_ids(main_tasks) -> set:
     return {tid for (_transformation, tid, *_rest) in main_tasks if tid}
 
 
+def ordered_task_ids(main_tasks, known=None) -> List[str]:
+    """Abstract task ids in invocation order, each appearing once.
+
+    De-duplication is the point. One job instance can carry several invocation rows for the
+    same abstract task, and the caller accumulates that task's ARGUMENTS per entry — without
+    de-duplicating, because an argument list is ordered and a value may legitimately repeat.
+    Those two facts together turn a duplicate row into a doubled command line
+    (`--input a.csv --output b.json --input a.csv --output b.json`) that is still a single
+    task, so nothing flags it as a cluster and it runs.
+
+    Order is preserved rather than sorted: for a genuine cluster the sequence is the order
+    Pegasus ran the tasks in, and it is the only ordering information available.
+
+    `known` optionally restricts to ids present in the abstract workflow. Note the cluster
+    guard must NOT be derived from the filtered result — see `cluster_task_ids`.
+    """
+    seen = set()
+    out: List[str] = []
+    for (_transformation, tid, *_rest) in main_tasks:
+        if not tid or tid in seen:
+            continue
+        if known is not None and tid not in known:
+            continue
+        seen.add(tid)
+        out.append(tid)
+    return out
+
+
 def load_transformation_catalog(run_dir: str) -> Tuple[Dict[str, dict], Dict[str, dict]]:
     """Parse the planned transformation catalog -> (transformations, containers).
 
@@ -443,7 +471,9 @@ def extract_run(run_dir: str, job_types: List[str],
         # Prefer the DB's abs_task_id (handles custom job ids and clustered
         # jobs with multiple tasks); fall back to the _IDnnnnnnn suffix
         # convention in exec_job_id.
-        abs_ids = [t[1] for t in main_tasks if t[1] in uses_map]
+        # De-duplicated: duplicate invocation rows for one task would otherwise repeat that
+        # task's arguments and produce a doubled command line that still looks single-task.
+        abs_ids = ordered_task_ids(main_tasks, known=uses_map)
         if not abs_ids:
             m = ABS_ID_RE.search(exec_job_id)
             if m and m.group(1) in uses_map:

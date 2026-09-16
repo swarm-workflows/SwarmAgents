@@ -26,7 +26,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
 from pegasus_profile_extractor import (  # noqa: E402
-    cluster_task_ids, load_transformation_catalog, load_workflow_uses,
+    cluster_task_ids, load_transformation_catalog, load_workflow_uses, ordered_task_ids,
 )
 from pegasus_to_swarm_converter import _map_execution  # noqa: E402
 from swarm.models.execution import ContainerSpec, ExecutionSpec  # noqa: E402
@@ -222,6 +222,26 @@ class TestClusteredJobs(unittest.TestCase):
     def test_rows_without_a_task_id_are_ignored(self):
         self.assertEqual(len(cluster_task_ids([("a", None, "/srv/a", ""),
                                                ("a", "", "/srv/a", "")])), 0)
+
+    def test_duplicate_invocation_rows_do_not_double_the_command_line(self):
+        """One job instance can carry several invocation rows for the same abstract task.
+        Arguments are accumulated per entry and deliberately not de-duplicated (order
+        matters, repeats are legitimate), so a duplicate row would double the command line
+        — and because it is still ONE distinct task, nothing flags it as a cluster and it
+        runs. De-duplication has to happen at the id list."""
+        rows = [("analyze", "t1", "/srv/a", ""), ("analyze", "t1", "/srv/a", "")]
+        self.assertEqual(ordered_task_ids(rows), ["t1"])
+        self.assertEqual(len(cluster_task_ids(rows)), 1)   # correctly not a cluster
+
+    def test_invocation_order_is_preserved(self):
+        """For a real cluster this is the order Pegasus ran the tasks in, and the only
+        ordering information there is."""
+        rows = [("b", "t2", "/srv/b", ""), ("a", "t1", "/srv/a", "")]
+        self.assertEqual(ordered_task_ids(rows), ["t2", "t1"])
+
+    def test_ids_absent_from_the_workflow_map_are_dropped_when_asked(self):
+        rows = [("a", "t1", "/srv/a", ""), ("b", "t2", "/srv/b", "")]
+        self.assertEqual(ordered_task_ids(rows, known={"t1"}), ["t1"])
 
     def test_merging_would_have_produced_a_contradictory_command_line(self):
         """Documents the shape of the bug so it is recognisable if it returns: two tasks
