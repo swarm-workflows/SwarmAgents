@@ -47,6 +47,35 @@ KNOWN_RUNTIMES = ("apptainer", "singularity", "docker")
 #: Catalog container kinds that mean "a .sif run by apptainer/singularity".
 _SIF_KINDS = ("singularity", "apptainer")
 
+#: Substrings marking an environment variable as the agent's business, not the job's. A job
+#: inherits the agent's environment, which on this fleet holds `OPENAI_API_KEY` among other
+#: things; handing that to arbitrary workflow code -- inside a container built by someone
+#: else, whose stdout is captured to a shared filesystem -- is not something a scheduler
+#: should do quietly. Matched case-insensitively as substrings, so a new `..._TOKEN` is
+#: covered without anyone remembering to add it.
+_SECRET_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL")
+
+#: Agent-internal variables that are not secrets but mean nothing to a job and would be
+#: actively misleading inside one.
+_AGENT_ONLY_VARS = ("SWARM_RUN_ID", "LLM_BASE_URL")
+
+
+def job_environment(base: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """The environment a job runs with: the agent's, minus the agent's own secrets.
+
+    A denylist rather than an allowlist, deliberately. Real workflow code needs an
+    unremarkable amount of ambient environment (PATH, HOME, LANG, proxy settings), and an
+    allowlist would break workflows in ways that look like workflow bugs. The denylist errs
+    the other way -- it can drop a variable a job legitimately wanted -- which fails loudly
+    in that job rather than silently leaking a credential.
+    """
+    env = dict(os.environ if base is None else base)
+    for name in list(env):
+        upper = name.upper()
+        if name in _AGENT_ONLY_VARS or any(m in upper for m in _SECRET_MARKERS):
+            env.pop(name, None)
+    return env
+
 
 @dataclass
 class ExecutionResult:
@@ -142,9 +171,13 @@ def resolve_image(spec: ExecutionSpec, pol: Optional[ExecutionPolicy] = None) ->
         return override
     image = container.image or ""
     if image.startswith("file://"):
+        # A file:// image is a local path under every runtime, so it resolves the same way
+        # for all of them and the rewrite applies here.
         return rewrite_path(image[len("file://"):], pol)
-    if image.startswith("docker://"):
-        return image[len("docker://"):]
+    # `docker://` is deliberately NOT stripped here: whether it belongs depends on the
+    # runtime, so it is decided in `build_command`. Docker wants a bare `repo:tag`;
+    # apptainer *requires* the scheme (`apptainer exec docker://repo:tag`) and, given a bare
+    # reference, looks for a local file of that name and fails with a confusing error.
     return image
 
 
@@ -209,7 +242,7 @@ def build_command(spec: ExecutionSpec, work_dir: str,
     # is trusted: supplying a docker image for a .sif container is exactly what that key is
     # for, and second-guessing it would make the escape hatch unusable.
     overridden = container.name in pol.image_overrides
-    if runtime == "docker" and not overridden and (
+    if runtime == "docker" and not overridden and not image.startswith("docker://") and (
             (container.kind or "").lower() in _SIF_KINDS or image.endswith(".sif")):
         return [], (f"container {container.name!r} is a {container.kind} image ({image}) and "
                     f"the only runtime available is docker, which cannot run it. Supply a "
@@ -226,6 +259,10 @@ def build_command(spec: ExecutionSpec, work_dir: str,
         binds.append((host_pfn, spec.path))
 
     if runtime == "docker":
+        # Docker takes a bare reference; the scheme, if the catalog carried one, is ours to
+        # remove here rather than in `resolve_image` (see there).
+        if image.startswith("docker://"):
+            image = image[len("docker://"):]
         cmd = ["docker", "run", "--rm", "-v", f"{work_dir}:{work_dir}", "-w", work_dir]
         for host, inside in binds:
             cmd += ["-v", f"{host}:{inside}:ro"]
@@ -286,7 +323,15 @@ def run(spec: ExecutionSpec, job_id: str,
             stdout = open(out_path, "wb")
             stderr = open(err_path, "wb")
         except OSError as exc:
-            # Losing the logs must not lose the run; fall back to discarding output.
+            # Losing the logs must not lose the run; fall back to discarding output. Close
+            # whichever handle did open first -- the fallback rebinds both names to DEVNULL,
+            # so without this the `finally` would close DEVNULL and leak the real file.
+            for handle in (stdout, stderr):
+                if handle not in (subprocess.DEVNULL, None):
+                    try:
+                        handle.close()
+                    except OSError:
+                        pass
             logger.warning("[EXEC] %s: cannot capture output (%s)", job_id, exc)
             out_path = err_path = None
             stdout = stderr = subprocess.DEVNULL
@@ -298,7 +343,8 @@ def run(spec: ExecutionSpec, job_id: str,
         # parent of the real work: killing only the child leaves the container running and
         # the job's resources held for the rest of the run.
         proc = subprocess.Popen(cmd, cwd=work_dir, stdout=stdout, stderr=stderr,
-                                stdin=subprocess.DEVNULL, start_new_session=True)
+                                stdin=subprocess.DEVNULL, start_new_session=True,
+                                env=job_environment())
         rc = proc.wait(timeout=timeout_s if timeout_s is not None else pol.timeout_s)
         return ExecutionResult(exit_status=int(rc), duration_s=time.monotonic() - started,
                                stdout_path=out_path, stderr_path=err_path, command=cmd)
@@ -326,7 +372,14 @@ def run(spec: ExecutionSpec, job_id: str,
 
 
 def _kill_group(proc) -> None:
-    """SIGKILL the process group, tolerating a process that already exited."""
+    """SIGKILL the process group and reap it, tolerating a process that already exited.
+
+    The reap is not optional. Killing without waiting leaves a zombie for every timeout, and
+    an agent is a long-lived process running many jobs, so they accumulate until it runs out
+    of PIDs. The wait is bounded because the group has just been SIGKILLed: if it somehow
+    still has not exited we would rather leak one entry than block the executor thread for
+    the rest of the run.
+    """
     if proc is None:
         return
     try:
@@ -336,6 +389,10 @@ def _kill_group(proc) -> None:
             proc.kill()
         except OSError:
             pass
+    try:
+        proc.wait(timeout=10)
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        logger.warning("[EXEC] pid %s did not reap after SIGKILL", getattr(proc, "pid", "?"))
 
 
 def describe(cmd: List[str]) -> str:

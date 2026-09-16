@@ -248,10 +248,12 @@ class TestPathsAndImages(PolicyTestCase):
             "name": "c", "kind": "singularity", "image": "file:///home/ubuntu/wf/i.sif"}})
         self.assertEqual(runner.resolve_image(spec), "/export/wf/i.sif")
 
-    def test_a_docker_uri_is_stripped(self):
+    def test_a_docker_uri_keeps_its_scheme_until_the_runtime_is_known(self):
+        """This used to strip the scheme here, which is the wrong layer: docker wants it
+        gone, apptainer requires it. `build_command` decides -- see TestImageSchemePerRuntime."""
         spec = ExecutionSpec.from_dict({"path": "/u", "container": {
             "name": "c", "kind": "docker", "image": "docker://repo/img:1"}})
-        self.assertEqual(runner.resolve_image(spec), "repo/img:1")
+        self.assertEqual(runner.resolve_image(spec), "docker://repo/img:1")
 
     def test_an_override_replaces_the_catalogs_image_by_name(self):
         """The slice has Docker; the catalogs declare .sif. Which image stands in for which is
@@ -349,6 +351,125 @@ class TestBuildCommand(PolicyTestCase):
         spec = self._spec(container={"name": "c", "kind": "docker", "image": ""})
         cmd, reason = runner.build_command(spec, "/work")
         self.assertEqual(cmd, [])
+
+
+# --------------------------------------------------------------------------------------
+# Defects found reviewing the first cut. Each only fires in anger.
+# --------------------------------------------------------------------------------------
+
+class TestImageSchemePerRuntime(PolicyTestCase):
+    """`docker://` belongs to docker and must survive for apptainer.
+
+    Stripping it unconditionally made apptainer look for a local FILE named `repo:tag`,
+    which fails with an error naming a path nobody wrote.
+    """
+
+    def _spec(self, kind, image):
+        return ExecutionSpec.from_dict({
+            "path": "/srv/x", "arguments": [], "pfn_type": "installed",
+            "container": {"name": "c", "kind": kind, "image": image}})
+
+    def test_docker_gets_the_bare_reference(self):
+        runner.configure(container_runtime="docker")
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            cmd, reason = runner.build_command(self._spec("docker", "docker://repo/img:1"), "/w")
+        self.assertEqual(reason, "")
+        self.assertIn("repo/img:1", cmd)
+        self.assertNotIn("docker://repo/img:1", cmd)
+
+    def test_apptainer_keeps_the_scheme(self):
+        runner.configure(container_runtime="apptainer")
+        with patch("shutil.which", return_value="/usr/bin/apptainer"):
+            cmd, reason = runner.build_command(self._spec("docker", "docker://repo/img:1"), "/w")
+        self.assertEqual(reason, "")
+        self.assertIn("docker://repo/img:1", cmd)
+
+    def test_a_docker_uri_is_not_mistaken_for_a_sif(self):
+        """The .sif guard must not fire on a docker:// image just because the catalog
+        called the container singularity — apptainer can pull from a registry."""
+        runner.configure(container_runtime="docker")
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            cmd, reason = runner.build_command(
+                self._spec("singularity", "docker://repo/img:1"), "/w")
+        self.assertEqual(reason, "")
+        self.assertIn("repo/img:1", cmd)
+
+
+class TestNoZombies(PolicyTestCase):
+    def test_a_timed_out_process_is_reaped(self):
+        """Killing without waiting leaves a zombie per timeout, and an agent runs many jobs
+        over its life."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = script(tmp, "hang.sh", "sleep 60")
+            runner.configure(mode="real", work_dir=os.path.join(tmp, "work"), timeout_s=0.3)
+            import subprocess as sp
+            spawned = []
+            real_popen = sp.Popen
+
+            def capture(*a, **kw):
+                proc = real_popen(*a, **kw)
+                spawned.append(proc)
+                return proc
+
+            with patch("subprocess.Popen", side_effect=capture):
+                result = runner.run(ExecutionSpec.from_dict(
+                    {"path": "/u", "pfn": path, "arguments": []}), "z")
+            self.assertTrue(spawned, "expected a process to have been started")
+            proc = spawned[0]
+        self.assertEqual(result.exit_status, 124)
+        # returncode is set only once the child has been waited for.
+        self.assertIsNotNone(proc.returncode)
+
+
+class TestOutputHandleLeak(PolicyTestCase):
+    def test_the_first_log_handle_is_closed_when_the_second_fails(self):
+        """The fallback rebinds both names to DEVNULL, so without an explicit close the
+        `finally` closes DEVNULL and leaks the real file."""
+        opened = []
+        real_open = open
+
+        def flaky(path, *a, **kw):
+            if str(path).endswith(".err"):
+                raise OSError("no space left on device")
+            handle = real_open(path, *a, **kw)
+            opened.append(handle)
+            return handle
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = script(tmp, "ok.sh", "exit 0")
+            runner.configure(mode="real", work_dir=os.path.join(tmp, "work"))
+            with patch("builtins.open", side_effect=flaky):
+                result = runner.run(ExecutionSpec.from_dict(
+                    {"path": "/u", "pfn": path, "arguments": []}), "leak")
+        self.assertEqual(result.exit_status, 0)     # losing logs must not lose the run
+        self.assertTrue(opened, "expected the .out handle to have been opened")
+        self.assertTrue(all(h.closed for h in opened), "a log handle was leaked")
+
+
+class TestEnvironmentIsScrubbed(PolicyTestCase):
+    def test_agent_secrets_do_not_reach_the_job(self):
+        env = {"PATH": "/usr/bin", "HOME": "/root", "OPENAI_API_KEY": "sk-secret",
+               "REDIS_PASSWORD": "hunter2", "MY_TOKEN": "t", "SWARM_RUN_ID": "run-1"}
+        out = runner.job_environment(env)
+        for leaked in ("OPENAI_API_KEY", "REDIS_PASSWORD", "MY_TOKEN", "SWARM_RUN_ID"):
+            self.assertNotIn(leaked, out)
+
+    def test_ordinary_environment_survives(self):
+        """A denylist, not an allowlist: real workflow code needs ambient environment, and
+        an allowlist would break workflows in ways that look like workflow bugs."""
+        env = {"PATH": "/usr/bin", "HOME": "/root", "LANG": "C.UTF-8",
+               "HTTPS_PROXY": "http://p:3128"}
+        self.assertEqual(runner.job_environment(env), env)
+
+    def test_the_running_job_really_cannot_see_them(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = os.path.join(tmp, "work")
+            path = script(tmp, "e.sh", 'echo "${OPENAI_API_KEY:-ABSENT}"')
+            runner.configure(mode="real", work_dir=work)
+            with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-secret"}):
+                result = runner.run(ExecutionSpec.from_dict(
+                    {"path": "/u", "pfn": path, "arguments": []}), "env")
+            self.assertEqual(Path(result.stdout_path).read_text().strip(), "ABSENT")
 
 
 if __name__ == "__main__":
