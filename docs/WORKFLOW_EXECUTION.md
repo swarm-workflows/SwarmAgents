@@ -220,6 +220,15 @@ promotion is still wrong, because promotion moves several entries and can fail b
 A conversion that dies leaves its staging directory behind rather than damaging anything;
 the next successful conversion sweeps it.
 
+The rollback catches `BaseException`, not `Exception` — an interrupt is the likeliest way a
+long conversion stops, and catching only `Exception` let Ctrl-C walk out with the output half
+installed and the previous copies stranded. Every step of the rollback is best effort and
+cannot itself raise: one that aborts on its first problem leaves exactly the half-state it
+exists to prevent, and one that raises replaces the real cause with its own (the reported
+error was "rollback cleanup failed" while the actual failure went unmentioned). Displaced
+copies stranded by a rollback that could not finish are swept by the next conversion, since
+nothing else ever removed them.
+
 `--no-bundle` restores the old behaviour, where job records only *describe* their code by
 absolute submit-host paths. Simulated jobs are unaffected throughout: a job with no execution
 block has nothing to bundle and converts exactly as before.

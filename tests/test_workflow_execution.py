@@ -850,6 +850,72 @@ class TestBundling(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(out, "job_99.json")))
             self.assertEqual([d for d in os.listdir(out) if ".replacing-" in d], [])
 
+    def _promote_fixture(self, tmp):
+        out = os.path.join(tmp, "out"); os.makedirs(out)
+        stag = os.path.join(tmp, "stag"); os.makedirs(stag)
+        for n in ("a.json", "b.json"):
+            Path(stag, n).write_text("NEW")
+            Path(out, n).write_text("OLD")
+        return out, stag
+
+    def test_an_interrupt_during_promotion_still_rolls_back(self):
+        """`except Exception` does not catch KeyboardInterrupt, and an interrupt is the
+        likeliest way a long conversion stops. It walked out with the output half installed
+        and the previous copies stranded as `.replacing-*`."""
+        import shutil as _shutil
+        import pegasus_to_swarm_converter as conv
+        from unittest.mock import patch as _patch
+        with tempfile.TemporaryDirectory() as tmp:
+            out, stag = self._promote_fixture(tmp)
+            real = _shutil.move
+            calls = {"n": 0}
+
+            def interrupt(s, d, *a, **k):
+                calls["n"] += 1
+                if calls["n"] == 2:
+                    raise KeyboardInterrupt()
+                return real(s, d, *a, **k)
+
+            with _patch.object(conv.shutil, "move", side_effect=interrupt):
+                with self.assertRaises(KeyboardInterrupt):
+                    conv.promote_staged_output(stag, out)
+            self.assertEqual(Path(out, "a.json").read_text(), "OLD")
+            self.assertEqual([n for n in os.listdir(out) if ".replacing-" in n], [])
+
+    def test_a_failure_during_rollback_neither_stops_it_nor_hides_the_cause(self):
+        """A rollback that aborts on its first problem leaves the half-state it exists to
+        prevent, and one that raises replaces the real cause with its own."""
+        import shutil as _shutil
+        import pegasus_to_swarm_converter as conv
+        from unittest.mock import patch as _patch
+        with tempfile.TemporaryDirectory() as tmp:
+            out, stag = self._promote_fixture(tmp)
+            real = _shutil.move
+            calls = {"n": 0}
+
+            def boom(s, d, *a, **k):
+                calls["n"] += 1
+                if calls["n"] == 2:
+                    raise OSError("primary failure")
+                return real(s, d, *a, **k)
+
+            with _patch.object(conv.shutil, "move", side_effect=boom), \
+                 _patch.object(conv.os, "remove", side_effect=OSError("cleanup failed")):
+                with self.assertRaises(OSError) as caught:
+                    conv.promote_staged_output(stag, out)
+            self.assertIn("primary failure", str(caught.exception))
+            self.assertEqual(Path(out, "a.json").read_text(), "OLD")
+            self.assertEqual([n for n in os.listdir(out) if ".replacing-" in n], [])
+
+    def test_stranded_displaced_copies_are_swept(self):
+        """Nothing else ever removed these, so a rollback that could not finish left debris
+        accumulating in the output directory forever."""
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "code.replacing-9999").write_text("stranded")
+            os.makedirs(os.path.join(tmp, "inputs.replacing-9999"))
+            clear_previous_output(tmp)
+            self.assertEqual([n for n in os.listdir(tmp) if ".replacing-" in n], [])
+
     def test_the_sweep_never_removes_what_was_just_installed(self):
         """The sweep runs AFTER promotion now, so it has to tell the new output from the
         surplus it exists to remove."""

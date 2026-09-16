@@ -862,6 +862,13 @@ BUNDLE_INPUTS = "inputs"
 BUNDLE_IMAGES = "images"
 
 
+def _quiet_remove(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
 def clear_previous_output(output_dir: str, keep: Optional[str] = None,
                           installed: Optional[set] = None) -> int:
     """Remove a previous conversion's artefacts from *output_dir*. Returns how many.
@@ -893,6 +900,10 @@ def clear_previous_output(output_dir: str, keep: Optional[str] = None,
         elif name in (BUNDLE_CODE, BUNDLE_INPUTS, BUNDLE_IMAGES) and os.path.isdir(path):
             shutil.rmtree(path)
             removed += 1
+        elif ".replacing-" in name:
+            # A previous conversion's displaced copy, stranded by a rollback that could not
+            # finish. Nothing else ever removes these, so they accumulate silently.
+            shutil.rmtree(path, ignore_errors=True) if os.path.isdir(path) else _quiet_remove(path)
         elif name.startswith(".convert-staging-") and os.path.isdir(path):
             # Debris from a conversion that died part way. Harmless, but it accumulates.
             # `keep` is the staging directory of the conversion calling this, which is about
@@ -1174,32 +1185,49 @@ def promote_staged_output(staging_dir: str, output_dir: str) -> List[str]:
     """
     aside: List[tuple] = []
     promoted: List[str] = []
+
+    def _discard(path: str) -> None:
+        """Best effort, never raising: used only on the rollback path."""
+        try:
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path, ignore_errors=True)
+            elif os.path.exists(path) or os.path.islink(path):
+                os.remove(path)
+        except OSError:
+            pass
+
     try:
         for name in sorted(os.listdir(staging_dir)):
             src = os.path.join(staging_dir, name)
             dest = os.path.join(output_dir, name)
-            if os.path.exists(dest):
+            if os.path.exists(dest) or os.path.islink(dest):
                 shelved = f"{dest}.replacing-{os.getpid()}"
-                if os.path.exists(shelved):
-                    shutil.rmtree(shelved, ignore_errors=True)
+                _discard(shelved)
                 os.rename(dest, shelved)
                 aside.append((shelved, dest))
             shutil.move(src, dest)
             promoted.append(name)
-    except Exception:
+    except BaseException:
+        # BaseException, not Exception: an interrupt is the likeliest way a long conversion
+        # stops, and `except Exception` let Ctrl-C walk out of here with the output half
+        # installed and the previous copies stranded as `.replacing-*`.
+        #
+        # Every step below is best effort and cannot raise. A rollback that aborts on its
+        # first problem leaves exactly the half-state it exists to prevent, and one that
+        # raises replaces the real cause with its own — the reported error was "rollback
+        # cleanup failed" while the actual failure went unmentioned.
         for name in promoted:
-            path = os.path.join(output_dir, name)
-            shutil.rmtree(path, ignore_errors=True) if os.path.isdir(path) else \
-                (os.remove(path) if os.path.exists(path) else None)
+            _discard(os.path.join(output_dir, name))
         for shelved, dest in aside:
-            if os.path.exists(shelved):
-                if os.path.exists(dest):
-                    shutil.rmtree(dest, ignore_errors=True) if os.path.isdir(dest) else os.remove(dest)
-                os.rename(shelved, dest)
+            try:
+                if os.path.exists(shelved) or os.path.islink(shelved):
+                    _discard(dest)
+                    os.rename(shelved, dest)
+            except OSError:
+                continue
         raise
     for shelved, _dest in aside:
-        shutil.rmtree(shelved, ignore_errors=True) if os.path.isdir(shelved) else \
-            (os.remove(shelved) if os.path.exists(shelved) else None)
+        _discard(shelved)
     return promoted
 
 
