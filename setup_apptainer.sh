@@ -65,29 +65,39 @@ fi
 # ---------------------------------------------------------------------------- check mode
 if [[ $CHECK_ONLY -eq 1 ]]; then
     echo "=== agents (${#HOSTS[@]}) ==="
-    probe_arg=""
-    [[ -f "$PROBE_SIF" ]] && probe_arg="yes"
+    # Without the probe image this can only compare version strings, and a version string is
+    # explicitly not what this script means by "installed" (see the header). Rebuild the probe
+    # if apptainer is here to build it; refuse otherwise, rather than quietly downgrading the
+    # check and then printing a readiness claim that was never tested.
+    if [[ ! -f "$PROBE_SIF" ]] && command -v apptainer >/dev/null 2>&1; then
+        mkdir -p "$STAGE"
+        apptainer build --force "$PROBE_SIF" docker://busybox:latest >/dev/null 2>&1 || true
+    fi
+    if [[ ! -f "$PROBE_SIF" ]]; then
+        echo "cannot verify: no probe image at $PROBE_SIF, and apptainer is not available" >&2
+        echo "here to rebuild one. Run the installer first; a version check alone does not" >&2
+        echo "establish that a container can start." >&2
+        exit 1
+    fi
     results=$(printf '%s\n' "${HOSTS[@]}" | xargs -P 20 -I{} bash -c "
         v=\$($SSH {} 'apptainer --version 2>/dev/null || echo MISSING' 2>/dev/null | tr -d '\r')
         [[ -z \"\$v\" ]] && v=UNREACHABLE
         if [[ \"\$v\" == MISSING || \"\$v\" == UNREACHABLE ]]; then
             echo \"BAD {} \$v\"
-        elif [[ -n '$probe_arg' ]]; then
-            if $SSH {} 'apptainer exec /root/apptainer-probe.sif true' >/dev/null 2>&1; then
-                echo \"OK {} \$v\"
-            else
-                echo \"BAD {} \$v (installed, cannot run a container)\"
-            fi
-        else
+        elif $SSH {} 'apptainer exec /root/apptainer-probe.sif true' >/dev/null 2>&1; then
             echo \"OK {} \$v\"
+        else
+            echo \"BAD {} \$v (installed, cannot run a container)\"
         fi")
     echo "$results" | sort | sed 's/^/  /'
-    bad=$(echo "$results" | grep -c '^BAD' || true)
-    if [[ "$bad" -gt 0 ]]; then
-        echo "NOT READY: $bad/${#HOSTS[@]} host(s) without a working apptainer" >&2
+    ok=$(echo "$results" | grep -c '^OK' || true)
+    # Counted by what actually passed, not by total-minus-failures: a worker that dies emits
+    # no line at all, and subtraction would score that silence as a success.
+    if [[ "$ok" -ne "${#HOSTS[@]}" ]]; then
+        echo "NOT READY: $ok/${#HOSTS[@]} host(s) verified able to run a container" >&2
         exit 1
     fi
-    echo "READY: ${#HOSTS[@]}/${#HOSTS[@]} host(s) can run a container"
+    echo "READY: $ok/${#HOSTS[@]} host(s) can run a container"
     exit 0
 fi
 
@@ -157,11 +167,19 @@ export -f install_one
 # node's uplink is not the new bottleneck.
 mapfile -t RESULTS < <(printf '%s\n' "${HOSTS[@]}" | xargs -P 15 -I{} bash -c \
     'if install_one {} >/dev/null 2>&1; then echo "OK {}"; else echo "BAD {}"; fi')
-FAILED=()
+# Score by the hosts that reported OK, then name every host that did not. Subtracting
+# failures from the total scores *silence* as success: a worker that is killed, or one whose
+# subshell never got `install_one`, emits neither OK nor BAD, and the old arithmetic reported
+# the full fleet installed having touched fewer.
+declare -A SEEN=()
 for line in "${RESULTS[@]}"; do
-    [[ "$line" == BAD* ]] && FAILED+=("${line#BAD }")
+    [[ "$line" == OK* ]] && SEEN["${line#OK }"]=1
 done
-echo "      installed and probed on $(( ${#HOSTS[@]} - ${#FAILED[@]} ))/${#HOSTS[@]}"
+FAILED=()
+for h in "${HOSTS[@]}"; do
+    [[ -n "${SEEN[$h]:-}" ]] || FAILED+=("$h")
+done
+echo "      installed and probed on ${#SEEN[@]}/${#HOSTS[@]}"
 if [[ ${#FAILED[@]} -gt 0 ]]; then
     # Fatal, for the same reason the NFS setup is: a partial fleet that reports success stays
     # invisible until a job lands on one of the hosts that was skipped.
