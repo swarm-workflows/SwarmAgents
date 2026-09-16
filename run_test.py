@@ -206,6 +206,13 @@ def convert_pegasus_jobs(args) -> dict:
         # looks for the executables at the paths the SUBMIT HOST recorded, which do not
         # exist here, and writes a bundle that converts cleanly and cannot run.
         bundle_source_root=getattr(args, "pegasus_bundle_source_root", None),
+        # Without this a converted workflow carries no `data_predicate`, so nothing holds a
+        # job until its parents have produced what it reads: the DAG is published as a flat
+        # set and the agents schedule it in whatever order consensus lands. It is off by
+        # default in the converter, and run_test never passed it — so every workflow run
+        # through this path was unordered, which only shows up as a child failing on a file
+        # its parent had not written yet.
+        dag_gating=getattr(args, "pegasus_dag_gating", False),
     )
     log(f"Pegasus conversion: {result['jobs_written']} jobs written, "
         f"{result['warnings_count']} warnings")
@@ -1132,6 +1139,11 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--pegasus-profiles", default=None,
                     help="Path to Pegasus profiles file (text/export) or Redis host. "
                          "When set, jobs are converted from Pegasus profiles instead of generated synthetically.")
+    ap.add_argument(
+        "--pegasus-dag-gating", action="store_true",
+        help="Reconstruct the workflow's dependency graph as per-job data predicates, so a "
+             "job is not selectable until its parents have produced what it reads. Required "
+             "for any real workflow; forces --pegasus-data-nodes per-file.")
     ap.add_argument(
         "--pegasus-bundle-source-root",
         help="Where the workflow tree lives on this fleet, so the converter can copy the "
