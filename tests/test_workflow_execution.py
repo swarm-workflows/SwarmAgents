@@ -606,6 +606,44 @@ class TestBundling(unittest.TestCase):
             manifest = bundle_payload(pairs, out, source_root=f"/there={local}")
             self.assertEqual(len(manifest["code"]), 1)
 
+    def test_a_dot_leading_component_is_not_mangled_into_another_path(self):
+        """`lstrip("./")` strips a CHARACTER SET, not a prefix, so `.venv/bin/tool` became
+        `venv/bin/tool` — a different path. If something existed there the bundler copied a
+        completely unrelated file while the manifest recorded the original source: the
+        failure looks correct and is wrong."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "local")
+            os.makedirs(os.path.join(root, "venv", "bin"))
+            os.makedirs(os.path.join(root, "bin"))
+            Path(root, "venv", "bin", "tool").write_text("DECOY")
+            Path(root, "bin", "other.py").write_text("x")
+            out = os.path.join(tmp, "out"); os.makedirs(out)
+            pairs = [({"execution": {"transformation": "t1",
+                                     "pfn": "/wf/.venv/bin/tool"}}, {}),
+                     ({"execution": {"transformation": "t2",
+                                     "pfn": "/wf/bin/other.py"}}, {})]
+            manifest = bundle_payload(pairs, out, source_root=root)
+            self.assertNotIn("/wf/.venv/bin/tool", manifest["code"])
+            self.assertIn("/wf/.venv/bin/tool",
+                          [m["path"] for m in manifest["missing"]])
+            self.assertIn("/wf/bin/other.py", manifest["code"])
+
+    def test_a_dot_directory_that_really_exists_resolves(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "local")
+            os.makedirs(os.path.join(root, ".venv", "bin"))
+            os.makedirs(os.path.join(root, "bin"))
+            Path(root, ".venv", "bin", "tool").write_text("RIGHT")
+            Path(root, "bin", "other.py").write_text("x")
+            out = os.path.join(tmp, "out"); os.makedirs(out)
+            pairs = [({"execution": {"transformation": "t1",
+                                     "pfn": "/wf/.venv/bin/tool"}}, {}),
+                     ({"execution": {"transformation": "t2",
+                                     "pfn": "/wf/bin/other.py"}}, {})]
+            manifest = bundle_payload(pairs, out, source_root=root)
+            entry = manifest["code"]["/wf/.venv/bin/tool"]
+            self.assertEqual(Path(out, entry["bundled"]).read_text(), "RIGHT")
+
     def test_two_inputs_sharing_a_basename_are_reported_not_overwritten(self):
         """The working directory is flat so both genuinely cannot be staged. Copying the
         second over the first while claiming both are bundled hands a job the wrong file."""

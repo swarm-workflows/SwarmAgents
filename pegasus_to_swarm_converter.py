@@ -922,8 +922,23 @@ def bundle_payload(jobs_and_profiles, output_dir: str, source_root: Optional[str
         if not _old_prefix:
             return path
         if path == _old_prefix or path.startswith(_old_prefix.rstrip("/") + "/"):
-            return os.path.join(_new_prefix,
-                                os.path.relpath(path, _old_prefix).lstrip("./"))
+            rel = os.path.relpath(path, _old_prefix)
+            # NOT `lstrip("./")`. That strips a CHARACTER SET, not a prefix, so any
+            # dot-leading component became a different path: `.venv/bin/tool` turned into
+            # `venv/bin/tool`, and if something existed there the bundler copied a
+            # completely unrelated file while the manifest recorded the original source.
+            # Reproduced before this fix. `relpath` under a verified prefix already yields a
+            # clean downward path; nothing needs stripping.
+            if rel == os.curdir or rel == os.pardir or rel.startswith(os.pardir + os.sep):
+                return path                 # not genuinely under the prefix
+            candidate = os.path.normpath(os.path.join(_new_prefix, rel))
+            # The prefix check above makes escape impossible, but the destination is
+            # confirmed to sit under the root anyway: this decides which executable runs.
+            root_norm = os.path.normpath(_new_prefix)
+            prefix = root_norm if root_norm.endswith(os.sep) else root_norm + os.sep
+            if candidate != root_norm and not candidate.startswith(prefix):
+                return path
+            return candidate
         return path
 
     code_dir = os.path.join(output_dir, BUNDLE_CODE)
