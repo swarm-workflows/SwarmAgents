@@ -285,7 +285,53 @@ def map_profile(profile: dict, job_number: int,
         "target_agent": None,
     }
 
+    execution = _map_execution(profile)
+    if execution:
+        job["execution"] = execution
+
     return job, warnings
+
+
+def _map_execution(profile: dict) -> Optional[dict]:
+    """Carry the executable, its arguments and its container through to the job record.
+
+    Emitted only when the extractor found an in-container path to invoke. A profile from
+    before the extractor recorded these — every profile written before 2026-09-16 — has none
+    of these keys, so the job converts exactly as it did and simulates, which is what keeps
+    the existing converted corpora valid rather than silently half-runnable.
+
+    `arguments` preserves the empty/unknown distinction deliberately: `argv_db` is `None`
+    when the recorded command line could not be parsed, and that `None` has to survive to
+    `ExecutionSpec.runnable()`, which refuses it. Substituting `[]` here would turn "we do
+    not know the arguments" into "there are no arguments" and run a different command than
+    the one being compared against.
+    """
+    path = profile.get("executable_db")
+    if not path:
+        return None
+    execution = {
+        "transformation": profile.get("transformation_db") or "",
+        "path": path,
+        "arguments": profile.get("argv_db"),
+    }
+    pfn = profile.get("pfn_db")
+    if pfn:
+        execution["pfn"] = pfn
+    pfn_type = profile.get("pfn_type_db")
+    if pfn_type:
+        execution["pfn_type"] = pfn_type
+    container = profile.get("container_db")
+    if container:
+        # The extractor's key is `type`; the model calls it `kind`, because `type` shadows the
+        # builtin and reads badly at every use site. Renamed here, at the boundary, so the
+        # extractor stays a faithful record of the catalog's own vocabulary.
+        execution["container"] = {
+            "name": container.get("name") or "",
+            "kind": container.get("type") or "",
+            "image": container.get("image") or "",
+            "image_site": container.get("image_site") or "",
+        }
+    return execution
 
 
 # ---------------------------------------------------------------------------

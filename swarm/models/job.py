@@ -29,6 +29,7 @@ from typing import Any, List, Optional, Dict
 from swarm.models.object import Object, ObjectState
 from swarm.models.capacities import Capacities
 from swarm.models.data_node import DataNode
+from swarm.models.execution import ExecutionSpec
 from swarm.models.quantum import QuantumSpec
 
 
@@ -63,6 +64,13 @@ class Job(Object):
         # describes the quantum component (see swarm/models/quantum.py).
         self._quantum: Optional[QuantumSpec] = None
         self._quantum_time: Optional[float] = None  # simulated quantum execution seconds
+
+        # Real execution (None = simulate, which is the default and what every measurement
+        # so far used). When present it carries the executable, its arguments and the
+        # container to run them in — see swarm/models/execution.py. Carrying the spec does
+        # NOT by itself make a job execute: that is gated separately, so a workflow can be
+        # converted and scheduled long before anything is run for real.
+        self._execution: Optional[ExecutionSpec] = None
 
         # Split hybrid sub-jobs (Phase 2, docs/QUANTUM_HYBRID_DESIGN.md):
         #   sub_role      : None (whole job) | "quantum" (measurement producer)
@@ -227,6 +235,22 @@ class Job(Object):
                 self._quantum = QuantumSpec.from_dict(spec)
             else:
                 raise ValueError("Unsupported value type for quantum spec")
+
+    # ---------- Real execution ----------
+    @property
+    def execution(self) -> Optional[ExecutionSpec]:
+        with self.lock:
+            return self._execution
+
+    @execution.setter
+    def execution(self, spec) -> None:
+        with self.lock:
+            if spec is None or isinstance(spec, ExecutionSpec):
+                self._execution = spec
+            elif isinstance(spec, dict):
+                self._execution = ExecutionSpec.from_dict(spec)
+            else:
+                raise ValueError("Unsupported value type for execution spec")
 
     @property
     def job_class(self) -> str:
@@ -755,6 +779,7 @@ class Job(Object):
             snap_level = self.level
             snap_quantum = self._quantum
             snap_quantum_time = self._quantum_time
+            snap_execution = self._execution
             snap_sub_role = self._sub_role
             snap_linked = self._linked_job_id
             snap_experiment = self._experiment_id
@@ -791,6 +816,7 @@ class Job(Object):
             "level": snap_level,
             "quantum": snap_quantum.to_dict() if snap_quantum else None,
             "quantum_time": snap_quantum_time,
+            "execution": snap_execution.to_dict() if snap_execution else None,
             "sub_role": snap_sub_role,
             "linked_job_id": snap_linked,
             "experiment_id": snap_experiment,
@@ -886,6 +912,9 @@ class Job(Object):
             QuantumSpec.from_dict(job_data["quantum"]) if job_data.get("quantum") else None
         )
         parsed_quantum_time = job_data.get("quantum_time")
+        parsed_execution = (
+            ExecutionSpec.from_dict(job_data["execution"]) if job_data.get("execution") else None
+        )
         parsed_sub_role = job_data.get("sub_role")
         parsed_linked = job_data.get("linked_job_id")
         parsed_experiment = job_data.get("experiment_id")
@@ -918,6 +947,7 @@ class Job(Object):
             self._delegation_failed = parsed_deleg_failed if parsed_deleg_failed is not None else False
             self._delegation_failed_count = parsed_deleg_count if parsed_deleg_count is not None else 0
             self._quantum = parsed_quantum
+            self._execution = parsed_execution
             self._quantum_time = float(parsed_quantum_time) if parsed_quantum_time is not None else None
             self._sub_role = parsed_sub_role
             self._linked_job_id = parsed_linked

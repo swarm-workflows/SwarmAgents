@@ -35,6 +35,7 @@ import json
 import math
 import os
 import re
+import shlex
 import sqlite3
 import sys
 from typing import Dict, List, Optional, Tuple
@@ -104,6 +105,81 @@ def load_workflow_uses(run_dir: str) -> Dict[str, Dict[str, List[str]]]:
                 entry[ftype].append(lfn)
         uses_map[abs_id] = entry
     return uses_map
+
+
+def load_transformation_catalog(run_dir: str) -> Tuple[Dict[str, dict], Dict[str, dict]]:
+    """Parse the planned transformation catalog -> (transformations, containers).
+
+    This is where the *executable* of a job lives, and it is not in the stampede DB in any
+    usable form. The DB's `invocation.executable` is the path the job ran under **inside its
+    container** (`/srv/analyze_moisture`); the catalog holds the `pfn`, the host path of the
+    script that was staged there, plus which container it ran in and that container's image
+    URI. Both halves are needed to re-run the job anywhere else: the pfn says what code to
+    ship, the in-container path says what to invoke once it is shipped.
+
+    Preferred location is `<run_dir>/catalogs/transformations.yml` — the copy Pegasus *planned
+    with*, so it describes the run that actually happened. The workflow-root copy is a
+    fallback and can have been edited since; a run whose catalog was rewritten afterwards
+    would otherwise be described by a file that never governed it. Parent directories are
+    walked only after the planned copy is missing, and the walk stops at the filesystem root.
+
+    Returns two maps keyed by name. Both are empty when PyYAML is absent or no catalog is
+    found; callers must treat an unknown transformation as "not executable" rather than
+    guessing a path.
+    """
+    if yaml is None:
+        return {}, {}
+    candidates = [os.path.join(run_dir, "catalogs", "transformations.yml"),
+                  os.path.join(run_dir, "transformations.yml")]
+    probe = os.path.abspath(run_dir)
+    while True:
+        candidates.append(os.path.join(probe, "transformations.yml"))
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    path = next((c for c in candidates if os.path.isfile(c)), None)
+    if not path:
+        return {}, {}
+    try:
+        with open(path) as fh:
+            tc = yaml.safe_load(fh) or {}
+    except Exception:  # noqa: BLE001 - a malformed catalog must not abort the whole run
+        return {}, {}
+
+    containers: Dict[str, dict] = {}
+    for entry in tc.get("containers", []) or []:
+        name = entry.get("name")
+        if not name:
+            continue
+        containers[name] = {
+            "name": name,
+            "type": entry.get("type"),
+            "image": entry.get("image"),
+            "image_site": entry.get("image.site"),
+        }
+
+    transformations: Dict[str, dict] = {}
+    for entry in tc.get("transformations", []) or []:
+        name = entry.get("name")
+        if not name:
+            continue
+        sites = entry.get("sites", []) or []
+        # A transformation can be listed for several sites. Prefer a non-local execution site
+        # over "local": "local" is the submit host, whose pfn is frequently a wrapper rather
+        # than the science code. Order within a site list is not meaningful, so the choice has
+        # to be explicit rather than "first wins".
+        site = next((s for s in sites if s.get("name") not in (None, "local")), None)
+        if site is None:
+            site = sites[0] if sites else {}
+        transformations[name] = {
+            "name": name,
+            "pfn": site.get("pfn"),
+            "type": site.get("type"),
+            "site": site.get("name"),
+            "container": site.get("container"),
+        }
+    return transformations, containers
 
 
 def load_cache_sites(run_dir: str) -> Dict[str, str]:
@@ -214,6 +290,7 @@ def extract_run(run_dir: str, job_types: List[str],
 
     # --- auxiliary per-run maps ---
     uses_map = load_workflow_uses(run_dir)
+    transformations_tc, containers_tc = load_transformation_catalog(run_dir)
     cache_sites = load_cache_sites(run_dir)
     sub_requests = load_sub_requests(run_dir)
     lfn_sizes = load_lfn_sizes(conn)
@@ -304,11 +381,25 @@ def extract_run(run_dir: str, job_types: List[str],
         rt = _stats(try_durations)
 
         main_tasks = conn.execute(
-            "SELECT transformation, abs_task_id FROM invocation "
+            "SELECT transformation, abs_task_id, executable, argv FROM invocation "
             "WHERE job_instance_id = ? AND abs_task_id IS NOT NULL",
             (ji_id,),
         ).fetchall()
         transformation = main_tasks[0][0] if main_tasks else ""
+        # `executable` is the path the job ran under *inside its container*; `argv` is the
+        # argument string as recorded. Both come from the same row as `transformation` so a
+        # clustered job cannot pair one task's name with another task's command line.
+        exec_path = (main_tasks[0][2] or "") if main_tasks else ""
+        argv_raw = (main_tasks[0][3] or "") if main_tasks else ""
+        try:
+            argv_list = shlex.split(argv_raw)
+        except ValueError:
+            # An unbalanced quote in a recorded command line is not worth aborting a run
+            # over, but silently returning [] would fabricate an argument-free job. Keep the
+            # raw string so the converter can refuse it rather than run something wrong.
+            argv_list = None
+        tc_entry = transformations_tc.get(transformation, {})
+        container = containers_tc.get(tc_entry.get("container")) if tc_entry else None
 
         # Abstract job id(s) -> input/output files from workflow.yml.
         # Prefer the DB's abs_task_id (handles custom job ids and clustered
@@ -340,6 +431,16 @@ def extract_run(run_dir: str, job_types: List[str],
             "job_id_db": job_id,
             "job_type": type_desc,
             "transformation_db": transformation,
+            # --- execution (what it takes to actually re-run this job) ---
+            # In-container path Pegasus invoked, the host path of the code that was staged
+            # there, and the container it ran in. Any of these may be None for a workflow
+            # with no catalog or no container; a consumer must check rather than assume.
+            "executable_db": exec_path or None,
+            "argv_db": argv_list,
+            "argv_raw_db": argv_raw or None,
+            "pfn_db": tc_entry.get("pfn"),
+            "pfn_type_db": tc_entry.get("type"),
+            "container_db": container,
             # workflow-level
             "wf_uuid_db": wf_uuid,
             "dax_label_db": dax_label or "",
