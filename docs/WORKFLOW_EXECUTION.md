@@ -70,6 +70,19 @@ A Pegasus argument may also be a `File` object rather than a string; it round-tr
 YAML as a mapping, and `str()` on it would put a Python dict repr on the command line, so the
 `lfn` is taken.
 
+### 1.3 Clustered jobs are refused, not merged
+
+A clustered Condor job bundles several tasks, and Pegasus runs them as **separate sequential
+invocations**. There is no single `(executable, argv)` pair that describes such a job: the
+executable is taken from the first task, so concatenating every task's arguments would run
+task A's binary with A's and B's flags together, the later overriding the earlier. Two tasks
+chained by a file become one invocation with two `--input` flags — which *executes*, produces
+output, and is a job that never existed. That is the worst outcome available to a comparison,
+so `argv` is set to `None` (the "unknown" value `runnable()` already rejects) and the job
+schedules normally but declines to execute. Input and output files are still unioned, which is
+correct — a cluster really does consume and produce all of them. `clustered_tasks_db` on the
+profile distinguishes this from arguments that genuinely could not be parsed.
+
 ---
 
 ## 2. Running it
@@ -221,6 +234,8 @@ invisible until a job lands on the host nobody remembers skipping.
    number.
 3. **Per-job resource enforcement.** The catalog carries `memory`/`cores` requests; the runner
    does not pass them to the container runtime, so a job can exceed what it asked for.
+4. **Clustered jobs**, which currently refuse (§1.3). Supporting them means representing a job
+   as an ordered list of invocations rather than one command line.
 
 Tests: `tests/test_workflow_execution.py` (27), `tests/test_real_execution.py` (38).
 Related: `docs/QUANTUM_HYBRID_DESIGN.md` for the other execution path (`_execute_quantum`).

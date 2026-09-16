@@ -186,6 +186,32 @@ class TestWorkflowArguments(unittest.TestCase):
         self.assertEqual(uses["fetch_field1"]["output"], ["field1_soil_data.csv"])
 
 
+class TestClusteredJobs(unittest.TestCase):
+    """A clustered Condor job bundles several tasks, which Pegasus runs as separate
+    sequential invocations.
+
+    There is no single (executable, argv) pair that describes one: the executable is taken
+    from the first task, so merging every task's arguments would run task A's binary with
+    A's and B's flags together, the later overriding the earlier. That executes, produces
+    output, and is a job that never existed — the worst possible outcome for a comparison.
+    """
+
+    def test_a_clustered_job_refuses_rather_than_merging_command_lines(self):
+        merged = ExecutionSpec.from_dict({
+            "path": "/srv/a", "arguments": None,      # what the extractor now emits
+            "container": {"name": "c", "kind": "docker", "image": "docker://x:1"}})
+        self.assertFalse(merged.runnable())
+
+    def test_merging_would_have_produced_a_contradictory_command_line(self):
+        """Documents the shape of the bug so it is recognisable if it returns: two tasks
+        chained by a file, concatenated, give one invocation with two --input flags."""
+        a = ["--input", "a.csv", "--output", "b.json"]
+        b = ["--input", "b.json", "--output", "c.json"]
+        merged = a + b
+        self.assertEqual(merged.count("--input"), 2)
+        self.assertEqual(merged.count("--output"), 2)
+
+
 # --------------------------------------------------------------------------------------
 # What may and may not be executed.
 # --------------------------------------------------------------------------------------

@@ -437,14 +437,30 @@ def extract_run(run_dir: str, job_types: List[str],
                 for lfn in uses_map[aid][ftype]:
                     if lfn not in uses[ftype]:
                         uses[ftype].append(lfn)
-            # Not de-duplicated and not sorted: an argument list is ordered and may repeat a
-            # value legitimately. A clustered job with several tasks concatenates them, which
-            # is the same thing Pegasus would have run.
+            # Not de-duplicated and not sorted: an argument list is ordered and a value may
+            # legitimately repeat.
             uses["arguments"].extend(uses_map[aid].get("arguments", []))
-        # The abstract workflow's declaration wins over the recorded argv, which is empty for
-        # every job in these workflows. Falling back the other way keeps a run whose abstract
-        # workflow is missing from silently losing arguments it did record.
-        if uses["arguments"]:
+
+        # A CLUSTERED job bundles several tasks into one Condor job, and Pegasus runs them as
+        # separate sequential invocations -- not as one merged command line. `transformation`
+        # and `executable` above are taken from the FIRST task only, so concatenating every
+        # task's arguments would describe a job that never existed: task A's executable run
+        # with A's and B's flags together, the later ones overriding the earlier.
+        #
+        # There is no single (executable, argv) pair that represents such a job, so refuse to
+        # invent one. `None` is the "arguments unknown" value that `ExecutionSpec.runnable()`
+        # already rejects, so the job converts and schedules as before and declines to
+        # *execute* -- rather than executing something plausible and wrong. Input and output
+        # files are still unioned, which is correct for a cluster: it really does consume and
+        # produce all of them.
+        clustered = len(abs_ids) > 1
+        if clustered:
+            argv_list = None
+            argv_raw = ""
+        elif uses["arguments"]:
+            # The abstract workflow's declaration wins over the recorded argv, which is empty
+            # for every compute job in these workflows. Falling back the other way keeps a run
+            # whose abstract workflow is missing from losing arguments it did record.
             argv_list = uses["arguments"]
             argv_raw = " ".join(uses["arguments"])
         input_files = [file_entry(lfn, site) for lfn in uses["input"]]
@@ -469,6 +485,10 @@ def extract_run(run_dir: str, job_types: List[str],
             "executable_db": exec_path or None,
             "argv_db": argv_list,
             "argv_raw_db": argv_raw or None,
+            # >1 when this Condor job bundled several tasks. Such a job is deliberately not
+            # executable (see above); it is recorded so a reader can tell "clustered" from
+            # "arguments genuinely could not be parsed", which are both argv_db=None.
+            "clustered_tasks_db": len(abs_ids),
             "pfn_db": tc_entry.get("pfn"),
             "pfn_type_db": tc_entry.get("type"),
             "container_db": container,
