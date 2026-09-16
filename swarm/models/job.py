@@ -521,6 +521,45 @@ class Job(Object):
             sim = min(sim, cls._WALL_TIME_MAX_S)
         return sim
 
+    def _real_execution_applies(self) -> bool:
+        """True when this job should actually run rather than sleep.
+
+        Both halves are required: the run has to have asked for real execution *and* the job
+        has to carry an execution spec. A synthetic job in a real-execution run simulates,
+        which is what lets a workflow and a synthetic background load share one run.
+        """
+        from swarm.execution import runner
+
+        return runner.policy().enabled() and self._execution is not None
+
+    def _execute_real(self) -> int:
+        """Run the job for real and return its exit status.
+
+        A **refusal** — no container runtime, unresolvable executable, no working directory —
+        is logged at ERROR and returned as a failure rather than falling back to the sleep.
+        Falling back would be worse than useless: the run would contain a mix of executed and
+        simulated jobs with nothing in the results distinguishing them, and the comparison
+        this feature exists for would be quietly meaningless. A refusal repeats for every
+        job, so it is loud once and obvious immediately.
+        """
+        from swarm.execution import runner
+
+        result = runner.run(self._execution, self.job_id)
+        if result.refused:
+            self.logger.error(
+                "[EXEC] Job %s REFUSED (not run): %s. This is a configuration problem and "
+                "will repeat for every job; results from this run are not comparable.",
+                self.job_id, result.reason)
+        elif result.exit_status != 0:
+            self.logger.warning(
+                "[EXEC] Job %s exited %s after %.3fs%s (stderr: %s)",
+                self.job_id, result.exit_status, result.duration_s,
+                f" — {result.reason}" if result.reason else "", result.stderr_path)
+        else:
+            self.logger.info("[EXEC] Job %s completed in %.3fs: %s",
+                             self.job_id, result.duration_s, runner.describe(result.command))
+        return int(result.exit_status)
+
     def execute(self):
         try:
             self.logger.info("Starting execution for job: %s", self.job_id)
@@ -529,9 +568,16 @@ class Job(Object):
 
             # TODO: staged-in transfers using self.data_in if data_transfer
 
-            # Simulate execution
+            # Real execution when the run asked for it and this job carries what it takes;
+            # simulation otherwise. `real_status` stays None on the simulated path, which is
+            # what keeps the replayed `should_fail` outcome below applying to simulated jobs
+            # only — a real run's exit status is the process's own and must never be
+            # overwritten by what the job did on somebody else's cluster months ago.
+            real_status = None
             if self._quantum is not None:
                 self._execute_quantum()
+            elif self._real_execution_applies():
+                real_status = self._execute_real()
             else:
                 wt = self.wall_time or 0.0
                 sim = self.simulated_execution_seconds(wt)
@@ -545,8 +591,11 @@ class Job(Object):
 
             self.state = ObjectState.COMPLETE
 
-            # Check pre-determined failure flag (from job generator)
-            if self._should_fail:
+            if real_status is not None:
+                self._exit_status = real_status
+            elif self._should_fail:
+                # Pre-determined failure flag (from the job generator, or replayed from the
+                # original Pegasus run). Simulated jobs only — see above.
                 self._exit_status = 1
                 self.logger.info("Job %s marked as FAILED (pre-determined)", self.job_id)
             else:

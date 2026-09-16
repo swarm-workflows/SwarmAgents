@@ -66,6 +66,45 @@ runtime:
   wall_time_scale: 1.0
   wall_time_min_s: 0.0
   wall_time_max_s: 120.0
+
+  # Real execution. Default `simulate` = sleep for the (scaled) wall_time, which is what every
+  # measurement so far used. `real` = run the job's executable in its container, so exit
+  # statuses are the processes' own and durations are real work. The two produce results that
+  # cannot be compared; an unknown value raises rather than defaulting, and `real` is logged at
+  # WARNING, because a run meant to be simulated that quietly executed would be hard to spot
+  # from the metrics afterwards.
+  #
+  # Only jobs carrying an `execution` block (converted from a Pegasus workflow — see
+  # swarm/models/execution.py) ever execute; a synthetic job in a `real` run still simulates,
+  # so a workflow and a background load can share one run.
+  #
+  # A refusal (no container runtime, unresolvable executable, no work_dir) FAILS the job and
+  # logs at ERROR. It deliberately does not fall back to the sleep: a run silently mixing
+  # executed and simulated jobs, with nothing in the results telling them apart, is worse than
+  # one that stops.
+  execution:
+    mode: simulate                # simulate | real
+    # Shared scratch directory; the run id is appended, and every job of a run executes with
+    # this as its cwd. It must be SHARED, not per-job: data_in/data_out carry bare logical
+    # file names, so job B finds job A's output only if both ran in the same directory.
+    # On the slice this is the NFS export from setup_nfs_workflow.sh.
+    work_dir: /export/swarm-wf/work
+    timeout_s: 3600.0             # per job; on expiry the whole process group is killed
+    container_runtime: auto       # auto | docker | apptainer | singularity | none
+    capture_output: true          # stdout/stderr to <work_dir>/.swarm-logs/<job>.{out,err}
+    # A catalog's pfn is a path on the Pegasus SUBMIT host, which does not exist on this
+    # fleet. Map prefixes onto wherever the code was actually staged. An explicit prefix map,
+    # not a basename search: two workflows can both have a `process.py`, and running the wrong
+    # one would succeed and produce plausible output.
+    path_rewrites: []
+    #   - from: /home/ubuntu/soilmoisture-workflow
+    #     to:   /export/swarm-wf/soilmoisture
+    # Substitute an image by container NAME. The catalogs here declare singularity .sif images
+    # while the agent VMs have only Docker; which image stands in for which is a deployment
+    # decision with real consequences for what is measured, so it is stated here and never
+    # inferred from whatever the host happens to have installed.
+    image_overrides: {}
+    #   soilmoisture_container: swarm/soilmoisture:1.0
   # How long past delegation_timeout_s a coordinator keeps waiting for a job its children have
   # already scheduled (persisted RUNNING) to finish before dropping it from delegation tracking
   # without a bandit outcome. Default (key absent) = wall_time_max_s, or 1800 if that is 0.

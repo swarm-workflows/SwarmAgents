@@ -83,6 +83,7 @@ class Agent(Observer):
         self.repository = Repository(redis_client=self.redis_client)
 
         self._configure_job_execution_simulation()
+        self._configure_real_execution()
 
         self.condition = threading.Condition()
         self.shutdown = False
@@ -121,6 +122,50 @@ class Agent(Observer):
             self.logger.info(
                 "[EXEC_SIM] wall_time_scale=%s min=%ss max=%ss", scale,
                 Job._WALL_TIME_MIN_S, Job._WALL_TIME_MAX_S)
+
+    def _configure_real_execution(self) -> None:
+        """Apply `runtime.execution` to the process-wide real-execution policy.
+
+        Default is `simulate`, so an agent that says nothing about execution behaves exactly
+        as it always has. `real` is logged at WARNING because it changes what the run *is* —
+        exit statuses become the processes' own rather than the replayed ones, and job
+        durations become real work rather than a scaled wall_time — and because a run that
+        was meant to be simulated and quietly executed instead would be hard to spot
+        afterwards from the metrics alone.
+        """
+        from swarm.execution import runner
+
+        cfg = (self.runtime_config.get("execution") or {}) if self.runtime_config else {}
+        mode = str(cfg.get("mode", "simulate")).lower()
+        if mode not in ("simulate", "real"):
+            # Same rule as consensus.protocol: an unknown value raises rather than becoming
+            # the default, because the two modes produce results that cannot be compared and
+            # nothing in the run would say which one had been used.
+            raise ValueError(
+                f"runtime.execution.mode {mode!r} is not 'simulate' or 'real'. Refused "
+                "rather than defaulted: the two produce results that cannot be compared.")
+
+        work_dir = str(cfg.get("work_dir", "") or "")
+        # A shared scratch per run, so logical file names resolve between jobs of one DAG
+        # while two concurrent runs cannot overwrite each other's outputs.
+        run_id = os.environ.get("SWARM_RUN_ID", "")
+        if work_dir and run_id:
+            work_dir = os.path.join(work_dir, run_id)
+
+        runner.configure(
+            mode=mode,
+            work_dir=work_dir,
+            timeout_s=float(cfg.get("timeout_s", 3600.0)),
+            container_runtime=str(cfg.get("container_runtime", "auto")),
+            path_rewrites=cfg.get("path_rewrites", ()) or (),
+            image_overrides=dict(cfg.get("image_overrides", {}) or {}),
+            capture_output=bool(cfg.get("capture_output", True)),
+        )
+        if mode == "real":
+            self.logger.warning(
+                "[EXEC] runtime.execution.mode=real — jobs will RUN, not simulate. "
+                "work_dir=%s timeout=%ss runtime=%s", work_dir,
+                cfg.get("timeout_s", 3600.0), cfg.get("container_runtime", "auto"))
 
     @property
     def live_agent_count(self) -> int:
