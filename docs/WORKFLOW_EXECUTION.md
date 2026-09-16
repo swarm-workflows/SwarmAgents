@@ -83,6 +83,14 @@ schedules normally but declines to execute. Input and output files are still uni
 correct — a cluster really does consume and produce all of them. `clustered_tasks_db` on the
 profile distinguishes this from arguments that genuinely could not be parsed.
 
+The clustering signal is taken from the **stampede DB** (`cluster_task_ids`), never from the
+abstract-workflow map. Counting the ids that resolved against `workflow.yml` fails *open*:
+that list is filtered by what the workflow map contains, so a run with no `workflow.yml`
+(absent file, or PyYAML not installed) yields an empty list for every job, no cluster is
+recognised, and the first task's recorded argv executes as though it described the whole
+cluster. Missing metadata means we know *less* about a job, which can only make executing it
+less safe, never more.
+
 ---
 
 ## 2. Running it

@@ -26,7 +26,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
 from pegasus_profile_extractor import (  # noqa: E402
-    load_transformation_catalog, load_workflow_uses,
+    cluster_task_ids, load_transformation_catalog, load_workflow_uses,
 )
 from pegasus_to_swarm_converter import _map_execution  # noqa: E402
 from swarm.models.execution import ContainerSpec, ExecutionSpec  # noqa: E402
@@ -201,6 +201,27 @@ class TestClusteredJobs(unittest.TestCase):
             "path": "/srv/a", "arguments": None,      # what the extractor now emits
             "container": {"name": "c", "kind": "docker", "image": "docker://x:1"}})
         self.assertFalse(merged.runnable())
+
+    def test_clustering_is_detected_from_the_db_not_the_workflow_map(self):
+        """The signal must not depend on workflow.yml. Counting the ids that resolved
+        against the abstract workflow FAILS OPEN: with no workflow.yml that list is empty
+        for every job, so a cluster is not recognised and executes the first task's argv as
+        though it described the whole thing. Missing metadata means we know less about a
+        job, which can only make running it less safe."""
+        # (transformation, abs_task_id, executable, argv) — as selected from `invocation`.
+        main_tasks = [("analyze", "t1", "/srv/a", ""), ("merge", "t2", "/srv/b", "")]
+        self.assertEqual(len(cluster_task_ids(main_tasks)), 2)
+
+    def test_a_single_task_job_is_not_clustered(self):
+        self.assertEqual(len(cluster_task_ids([("analyze", "t1", "/srv/a", "")])), 1)
+
+    def test_repeated_rows_for_one_task_are_not_a_cluster(self):
+        self.assertEqual(
+            len(cluster_task_ids([("a", "t1", "/srv/a", ""), ("a", "t1", "/srv/a", "")])), 1)
+
+    def test_rows_without_a_task_id_are_ignored(self):
+        self.assertEqual(len(cluster_task_ids([("a", None, "/srv/a", ""),
+                                               ("a", "", "/srv/a", "")])), 0)
 
     def test_merging_would_have_produced_a_contradictory_command_line(self):
         """Documents the shape of the bug so it is recognisable if it returns: two tasks

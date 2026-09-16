@@ -128,6 +128,23 @@ def load_workflow_uses(run_dir: str) -> Dict[str, Dict[str, List[str]]]:
     return uses_map
 
 
+def cluster_task_ids(main_tasks) -> set:
+    """Distinct abstract task ids in one Condor job, straight from the stampede DB.
+
+    This is the clustering signal, and it must come from the DB rather than from the
+    abstract-workflow map, because it decides whether a job is safe to execute. The obvious
+    alternative -- counting the abstract ids that resolved against `workflow.yml` -- **fails
+    open**: that list is filtered by what is present in the workflow map, so a run with no
+    `workflow.yml` (absent file, or PyYAML not installed) yields an empty list for *every*
+    job, a clustered job is not recognised as one, and it goes on to execute the first task's
+    recorded argv as though it described the whole cluster.
+
+    Failing open is the wrong direction here. Missing metadata means we know *less* about a
+    job, which can only make executing it less safe, never more.
+    """
+    return {tid for (_transformation, tid, *_rest) in main_tasks if tid}
+
+
 def load_transformation_catalog(run_dir: str) -> Tuple[Dict[str, dict], Dict[str, dict]]:
     """Parse the planned transformation catalog -> (transformations, containers).
 
@@ -453,7 +470,11 @@ def extract_run(run_dir: str, job_types: List[str],
         # *execute* -- rather than executing something plausible and wrong. Input and output
         # files are still unioned, which is correct for a cluster: it really does consume and
         # produce all of them.
-        clustered = len(abs_ids) > 1
+        # From the DB, not from `abs_ids`: see `cluster_task_ids`. `abs_ids` is filtered by
+        # what resolved against workflow.yml, so using it here would stop recognising
+        # clusters exactly when the workflow metadata is missing.
+        task_ids = cluster_task_ids(main_tasks)
+        clustered = len(task_ids) > 1
         if clustered:
             argv_list = None
             argv_raw = ""
@@ -488,7 +509,7 @@ def extract_run(run_dir: str, job_types: List[str],
             # >1 when this Condor job bundled several tasks. Such a job is deliberately not
             # executable (see above); it is recorded so a reader can tell "clustered" from
             # "arguments genuinely could not be parsed", which are both argv_db=None.
-            "clustered_tasks_db": len(abs_ids),
+            "clustered_tasks_db": len(task_ids),
             "pfn_db": tc_entry.get("pfn"),
             "pfn_type_db": tc_entry.get("type"),
             "container_db": container,
