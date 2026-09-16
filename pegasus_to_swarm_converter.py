@@ -888,18 +888,42 @@ def bundle_payload(jobs_and_profiles, output_dir: str, source_root: Optional[str
     `source_root` rewrites the submit-host prefix when the converter runs somewhere the
     original paths do not resolve — the same job `path_rewrites` does at run time.
     """
+    # `source_root` maps the submit-host tree onto a local copy. It is a PREFIX REPLACEMENT,
+    # computed once, not a search.
+    #
+    # The first version tried progressively shorter suffixes and took the first that existed,
+    # which at its last step matches on the BASENAME alone — so `/wf-a/bin/process.py` and
+    # `/wf-b/bin/process.py` both resolved to `<root>/process.py`, and two workflows got the
+    # same executable. That is the basename-search hazard this file warns about elsewhere, and
+    # it silently undid the pfn-keying that exists to keep those workflows apart: distinct
+    # keys, identical wrong content.
+    #
+    # Instead: `OLD=NEW` states the mapping outright, and a bare root is anchored to the
+    # common parent of everything being bundled. Either way a path that does not resolve is
+    # REPORTED MISSING rather than guessed at.
+    if source_root and "=" in source_root:
+        _old_prefix, _new_prefix = source_root.split("=", 1)
+    elif source_root:
+        _sources = [os.path.dirname(pfn) for job, _p in jobs_and_profiles
+                    for pfn in [((job.get("execution") or {}).get("pfn") or "")] if pfn]
+        _sources += [os.path.dirname(v) for _j, prof in jobs_and_profiles
+                     for v in (prof.get("replicas_db") or {}).values() if v]
+        try:
+            _old_prefix = os.path.commonpath(_sources) if _sources else ""
+        except ValueError:          # mixed absolute/relative — no common anchor
+            _old_prefix = ""
+        _new_prefix = source_root
+    else:
+        _old_prefix = _new_prefix = ""
+
     def _resolve(path: str) -> str:
-        if not path:
+        if not path or os.path.exists(path):
             return path
-        if source_root and not os.path.exists(path):
-            # Map an absolute submit-host path onto a local copy of the same tree by
-            # replacing everything up to a shared suffix. Deliberately simple: the caller
-            # names the root, we do not search for it.
-            stripped = path.lstrip("/")
-            for depth in range(len(stripped.split("/"))):
-                candidate = os.path.join(source_root, *stripped.split("/")[depth:])
-                if os.path.exists(candidate):
-                    return candidate
+        if not _old_prefix:
+            return path
+        if path == _old_prefix or path.startswith(_old_prefix.rstrip("/") + "/"):
+            return os.path.join(_new_prefix,
+                                os.path.relpath(path, _old_prefix).lstrip("./"))
         return path
 
     code_dir = os.path.join(output_dir, BUNDLE_CODE)
@@ -913,6 +937,7 @@ def bundle_payload(jobs_and_profiles, output_dir: str, source_root: Optional[str
     # pfn is what actually identifies the executable.
     pfn_to_transformations = {}
     replicas_wanted = {}
+    _dest_owner = {}
 
     for job, profile in jobs_and_profiles:
         execution = job.get("execution") or {}
@@ -938,8 +963,14 @@ def bundle_payload(jobs_and_profiles, output_dir: str, source_root: Optional[str
             component = base if len(pfns) == 1 else f"{base}-{hashlib.sha256(pfn.encode()).hexdigest()[:8]}"
             src = _resolve(pfn)
             if not os.path.isfile(src):
-                manifest["missing"].append({"kind": "code", "transformation": base,
-                                            "path": pfn})
+                manifest["missing"].append({
+                    "kind": "code", "transformation": base, "path": pfn,
+                    "reason": ((f"not found at {src}. The bare --bundle-source-root form "
+                                f"anchors on the common parent of what is being bundled "
+                                f"({_old_prefix or 'none'}), which is ambiguous when those "
+                                f"paths share a single directory; use "
+                                f"--bundle-source-root OLD=NEW to state the mapping.")
+                               if source_root else f"not found at {src}")})
                 continue
             dest_dir = os.path.join(code_dir, component)
             # Belt and braces: the component is already sanitised, and the result is checked
@@ -971,6 +1002,18 @@ def bundle_payload(jobs_and_profiles, output_dir: str, source_root: Optional[str
             continue
         os.makedirs(inputs_dir, exist_ok=True)
         dest = os.path.join(inputs_dir, _safe_component(os.path.basename(lfn), "input"))
+        # Two distinct replicas can share a basename (`a/data.csv` and `b/data.csv`). The
+        # working directory is flat, so they genuinely cannot coexist — but silently copying
+        # the second over the first, while the manifest claims both are bundled, hands a job
+        # the wrong file and says nothing. Report it and keep the first.
+        previous = _dest_owner.get(dest)
+        if previous is not None and previous != src:
+            manifest["missing"].append({
+                "kind": "input", "lfn": lfn, "path": host_path,
+                "reason": f"basename collides with {previous!r}; the working directory is "
+                          f"flat so both cannot be staged"})
+            continue
+        _dest_owner[dest] = src
         shutil.copy2(src, dest)
         manifest["inputs"][lfn] = {
             "bundled": os.path.relpath(dest, output_dir),

@@ -178,6 +178,20 @@ Images are **referenced, not copied** (`--bundle-images` overrides): they are gi
 bundle is meant to be copied around. Their checksums are recorded either way, so the reference
 is verifiable without being carried.
 
+`--bundle-source-root` maps the submit-host tree onto a local copy when the converter runs
+somewhere the profiles' absolute paths do not resolve. It is a **prefix replacement**, not a
+search: the `OLD=NEW` form states the mapping outright, and a bare root anchors on the common
+parent of everything being bundled. A path that does not resolve is reported missing rather
+than guessed at — an earlier version tried progressively shorter suffixes and took the first
+that existed, which matches on the *basename* at its last step, so two workflows' `process.py`
+both resolved to the same file and quietly undid the pfn keying that keeps them apart. With a
+single source directory the bare form is genuinely ambiguous (the common parent *is* that
+directory), so it resolves deterministically and the refusal names the `OLD=NEW` form.
+
+Two replicas sharing a basename are **reported, not overwritten**. The working directory is
+flat, so they genuinely cannot both be staged; copying the second over the first while the
+manifest claims both are bundled hands a job the wrong file silently.
+
 `--no-bundle` restores the old behaviour, where job records only *describe* their code by
 absolute submit-host paths. Simulated jobs are unaffected throughout: a job with no execution
 block has nothing to bundle and converts exactly as before.

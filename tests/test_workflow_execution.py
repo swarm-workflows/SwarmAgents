@@ -546,6 +546,93 @@ class TestBundling(unittest.TestCase):
             bundle_payload(pairs, out)
             self.assertTrue(os.path.isdir(os.path.join(out, "code", "analyze")))
 
+    def test_source_root_is_a_prefix_map_not_a_basename_search(self):
+        """The first version tried shorter and shorter suffixes and took the first that
+        existed — matching on BASENAME at its last step, so two workflows' `process.py`
+        resolved to the same file. Distinct manifest keys, identical wrong content, which
+        silently undoes keying by pfn."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "src"); os.makedirs(root)
+            Path(root, "process.py").write_text("THE-WRONG-ONE")
+            out = os.path.join(tmp, "out"); os.makedirs(out)
+            pairs = [({"execution": {"transformation": "ta", "pfn": "/wf-a/bin/process.py"}}, {}),
+                     ({"execution": {"transformation": "tb", "pfn": "/wf-b/bin/process.py"}}, {})]
+            manifest = bundle_payload(pairs, out, source_root=root)
+            self.assertEqual(manifest["code"], {})
+            self.assertEqual(len(manifest["missing"]), 2)
+
+    def test_source_root_maps_a_real_tree(self):
+        """The case it exists for: paths spread over more than one directory, so their
+        common parent is the workflow root — which is what soilmoisture looks like."""
+        with tempfile.TemporaryDirectory() as tmp:
+            local = os.path.join(tmp, "local")
+            os.makedirs(os.path.join(local, "bin"))
+            Path(local, "bin", "analyze.py").write_text("RIGHT")
+            Path(local, "fetch.py").write_text("ALSO-RIGHT")
+            out = os.path.join(tmp, "out"); os.makedirs(out)
+            pairs = [({"execution": {"transformation": "analyze",
+                                     "pfn": "/submit/wf/bin/analyze.py"}}, {}),
+                     ({"execution": {"transformation": "fetch",
+                                     "pfn": "/submit/wf/fetch.py"}}, {})]
+            manifest = bundle_payload(pairs, out, source_root=local)
+            self.assertEqual(len(manifest["code"]), 2)
+            self.assertEqual(Path(out, "code", "analyze", "analyze.py").read_text(), "RIGHT")
+
+    def test_a_single_directory_is_ambiguous_and_says_so(self):
+        """With one source directory the common parent IS that directory, so there is no way
+        to tell whether the root stands for it or for its parent. Rather than guess, the
+        mapping is deterministic and the refusal names the explicit form."""
+        with tempfile.TemporaryDirectory() as tmp:
+            local = os.path.join(tmp, "local", "bin"); os.makedirs(local)
+            Path(local, "analyze.py").write_text("RIGHT")
+            out = os.path.join(tmp, "out"); os.makedirs(out)
+            pairs = [({"execution": {"transformation": "analyze",
+                                     "pfn": "/submit/wf/bin/analyze.py"}}, {})]
+            manifest = bundle_payload(pairs, out,
+                                      source_root=os.path.join(tmp, "local"))
+            self.assertEqual(manifest["code"], {})
+            self.assertIn("OLD=NEW", manifest["missing"][0]["reason"])
+            # and the explicit form resolves it
+            manifest = bundle_payload(pairs, out,
+                                      source_root=f"/submit/wf={os.path.join(tmp, 'local')}")
+            self.assertEqual(len(manifest["code"]), 1)
+
+    def test_an_explicit_old_equals_new_mapping_works(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            local = os.path.join(tmp, "here"); os.makedirs(local)
+            Path(local, "x.py").write_text("RIGHT")
+            out = os.path.join(tmp, "out"); os.makedirs(out)
+            pairs = [({"execution": {"transformation": "t", "pfn": "/there/x.py"}}, {})]
+            manifest = bundle_payload(pairs, out, source_root=f"/there={local}")
+            self.assertEqual(len(manifest["code"]), 1)
+
+    def test_two_inputs_sharing_a_basename_are_reported_not_overwritten(self):
+        """The working directory is flat so both genuinely cannot be staged. Copying the
+        second over the first while claiming both are bundled hands a job the wrong file."""
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a"); os.makedirs(a)
+            b = os.path.join(tmp, "b"); os.makedirs(b)
+            Path(a, "data.csv").write_text("FROM-A")
+            Path(b, "data.csv").write_text("FROM-B")
+            out = os.path.join(tmp, "out"); os.makedirs(out)
+            profile = {"replicas_db": {"a/data.csv": os.path.join(a, "data.csv"),
+                                       "b/data.csv": os.path.join(b, "data.csv")}}
+            manifest = bundle_payload([({"id": "j"}, profile)], out)
+            self.assertEqual(len(manifest["inputs"]), 1)
+            self.assertEqual(len(manifest["missing"]), 1)
+            self.assertIn("collides", manifest["missing"][0]["reason"])
+            self.assertEqual(Path(out, "inputs", "data.csv").read_text(), "FROM-A")
+
+    def test_the_same_file_listed_twice_is_not_a_collision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a"); os.makedirs(a)
+            Path(a, "data.csv").write_text("X")
+            out = os.path.join(tmp, "out"); os.makedirs(out)
+            profile = {"replicas_db": {"data.csv": os.path.join(a, "data.csv"),
+                                       "also/data.csv": os.path.join(a, "data.csv")}}
+            manifest = bundle_payload([({"id": "j"}, profile)], out)
+            self.assertEqual(manifest["missing"], [])
+
     def test_a_simulated_job_bundles_cleanly_with_nothing_to_copy(self):
         """Jobs with no execution block are the default case and must still convert."""
         with tempfile.TemporaryDirectory() as tmp:
