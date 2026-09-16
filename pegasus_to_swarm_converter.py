@@ -904,10 +904,20 @@ def bundle_payload(jobs_and_profiles, output_dir: str, source_root: Optional[str
     if source_root and "=" in source_root:
         _old_prefix, _new_prefix = source_root.split("=", 1)
     elif source_root:
+        # Every path the mapping will be applied to, not just the executables. Leaving
+        # images out made the anchor too DEEP as well as missing them: with all code in
+        # `/wf/bin` the common parent was `/wf/bin`, so `/wf/Apptainer/x.sif` fell outside
+        # it and the code itself resolved one directory too high. Including them gives `/wf`,
+        # and both halves resolve.
         _sources = [os.path.dirname(pfn) for job, _p in jobs_and_profiles
                     for pfn in [((job.get("execution") or {}).get("pfn") or "")] if pfn]
         _sources += [os.path.dirname(v) for _j, prof in jobs_and_profiles
                      for v in (prof.get("replicas_db") or {}).values() if v]
+        _sources += [os.path.dirname(img[len("file://"):])
+                     for job, _p in jobs_and_profiles
+                     for img in [(((job.get("execution") or {}).get("container") or {})
+                                  .get("image") or "")]
+                     if img.startswith("file://")]
         try:
             _old_prefix = os.path.commonpath(_sources) if _sources else ""
         except ValueError:          # mixed absolute/relative — no common anchor
@@ -916,11 +926,10 @@ def bundle_payload(jobs_and_profiles, output_dir: str, source_root: Optional[str
     else:
         _old_prefix = _new_prefix = ""
 
-    def _resolve(path: str) -> str:
-        if not path or os.path.exists(path):
-            return path
+    def _map(path: str) -> str:
+        """The configured prefix mapping applied to *path*, or "" if it does not apply."""
         if not _old_prefix:
-            return path
+            return ""
         if path == _old_prefix or path.startswith(_old_prefix.rstrip("/") + "/"):
             rel = os.path.relpath(path, _old_prefix)
             # NOT `lstrip("./")`. That strips a CHARACTER SET, not a prefix, so any
@@ -930,16 +939,36 @@ def bundle_payload(jobs_and_profiles, output_dir: str, source_root: Optional[str
             # Reproduced before this fix. `relpath` under a verified prefix already yields a
             # clean downward path; nothing needs stripping.
             if rel == os.curdir or rel == os.pardir or rel.startswith(os.pardir + os.sep):
-                return path                 # not genuinely under the prefix
+                return ""                   # not genuinely under the prefix
             candidate = os.path.normpath(os.path.join(_new_prefix, rel))
             # The prefix check above makes escape impossible, but the destination is
             # confirmed to sit under the root anyway: this decides which executable runs.
             root_norm = os.path.normpath(_new_prefix)
             prefix = root_norm if root_norm.endswith(os.sep) else root_norm + os.sep
             if candidate != root_norm and not candidate.startswith(prefix):
-                return path
+                return ""
             return candidate
-        return path
+        return ""
+
+    def _resolve(path: str) -> str:
+        """Where to read *path* from on this machine.
+
+        The mapping is tried FIRST when one is configured. Checking `os.path.exists(path)`
+        before it meant an incidental file at the submit-host location won over the tree the
+        caller explicitly named — so converting on any machine that happens to have
+        `/home/ubuntu/...` silently bundled that instead of the requested copy, and an
+        explicit `OLD=NEW` was ignored for every path that happened to exist locally.
+        """
+        if not path:
+            return path
+        mapped = _map(path)
+        if mapped and os.path.exists(mapped):
+            return mapped
+        if os.path.exists(path):
+            return path
+        # Neither resolved: report against the mapped location when there was one, since
+        # that is where the caller asked us to look.
+        return mapped or path
 
     code_dir = os.path.join(output_dir, BUNDLE_CODE)
     inputs_dir = os.path.join(output_dir, BUNDLE_INPUTS)

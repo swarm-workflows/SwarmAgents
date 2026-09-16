@@ -188,6 +188,18 @@ both resolved to the same file and quietly undid the pfn keying that keeps them 
 single source directory the bare form is genuinely ambiguous (the common parent *is* that
 directory), so it resolves deterministically and the refusal names the `OLD=NEW` form.
 
+The anchor is computed over **every** path the mapping is applied to — executables, replicas
+*and* images. Leaving images out made it too deep as well as missing them: with all code in
+`/wf/bin` the common parent was `/wf/bin`, so `/wf/Apptainer/x.sif` fell outside it and the
+code itself resolved one directory too high.
+
+When a mapping is configured it is tried **first**. Checking the recorded path before it let
+an incidental file at the submit-host location win over the tree the caller explicitly named,
+so converting on any machine that happens to have `/home/ubuntu/…` bundled that instead — and
+an explicit `OLD=NEW` was ignored for every path that happened to exist locally. Without a
+mapping the recorded path is used as before, which is the common case of converting on the
+submit host.
+
 Two replicas sharing a basename are **reported, not overwritten**. The working directory is
 flat, so they genuinely cannot both be staged; copying the second over the first while the
 manifest claims both are bundled hands a job the wrong file silently.

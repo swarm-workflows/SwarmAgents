@@ -644,6 +644,55 @@ class TestBundling(unittest.TestCase):
             entry = manifest["code"]["/wf/.venv/bin/tool"]
             self.assertEqual(Path(out, entry["bundled"]).read_text(), "RIGHT")
 
+    def test_an_explicit_mapping_beats_a_file_at_the_submit_host_path(self):
+        """Checking the original path first meant an incidental file at the submit-host
+        location won over the tree the caller explicitly named — so converting on any
+        machine that happens to have `/home/ubuntu/...` bundled that instead."""
+        with tempfile.TemporaryDirectory() as tmp:
+            submit = os.path.join(tmp, "submit", "wf", "bin"); os.makedirs(submit)
+            Path(submit, "a.py").write_text("STALE-LOCAL-COPY")
+            local = os.path.join(tmp, "local", "bin"); os.makedirs(local)
+            Path(local, "a.py").write_text("ASKED-FOR")
+            out = os.path.join(tmp, "out"); os.makedirs(out)
+            pfn = os.path.join(submit, "a.py")
+            manifest = bundle_payload(
+                [({"execution": {"transformation": "t", "pfn": pfn}}, {})], out,
+                source_root=f"{os.path.join(tmp, 'submit', 'wf')}={os.path.join(tmp, 'local')}")
+            self.assertEqual(Path(out, manifest["code"][pfn]["bundled"]).read_text(),
+                             "ASKED-FOR")
+
+    def test_without_a_mapping_the_recorded_path_is_still_used(self):
+        """The common case: converting on the submit host, where the paths resolve."""
+        with tempfile.TemporaryDirectory() as tmp:
+            d = os.path.join(tmp, "wf", "bin"); os.makedirs(d)
+            Path(d, "a.py").write_text("LOCAL")
+            out = os.path.join(tmp, "out"); os.makedirs(out)
+            manifest = bundle_payload(
+                [({"execution": {"transformation": "t",
+                                 "pfn": os.path.join(d, "a.py")}}, {})], out)
+            self.assertEqual(len(manifest["code"]), 1)
+
+    def test_the_bare_root_anchor_covers_images_too(self):
+        """Leaving images out of the anchor made it too DEEP as well as missing them: with
+        all code in `/wf/bin` the common parent was `/wf/bin`, so the image fell outside it
+        and the code resolved one directory too high."""
+        with tempfile.TemporaryDirectory() as tmp:
+            local = os.path.join(tmp, "local")
+            os.makedirs(os.path.join(local, "bin"))
+            os.makedirs(os.path.join(local, "Apptainer"))
+            for n in ("a.py", "b.py"):
+                Path(local, "bin", n).write_text("code")
+            Path(local, "Apptainer", "x.sif").write_text("IMAGE")
+            out = os.path.join(tmp, "out"); os.makedirs(out)
+            pairs = [({"execution": {
+                "transformation": f"t{i}", "pfn": f"/wf/bin/{n}",
+                "container": {"name": "c", "kind": "singularity",
+                              "image": "file:///wf/Apptainer/x.sif"}}}, {})
+                for i, n in enumerate(("a.py", "b.py"))]
+            manifest = bundle_payload(pairs, out, source_root=local)
+            self.assertEqual(len(manifest["code"]), 2)
+            self.assertIsNotNone(manifest["images"]["c"]["sha256"])
+
     def test_two_inputs_sharing_a_basename_are_reported_not_overwritten(self):
         """The working directory is flat so both genuinely cannot be staged. Copying the
         second over the first while claiming both are bundled hands a job the wrong file."""
