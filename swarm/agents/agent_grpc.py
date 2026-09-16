@@ -152,6 +152,20 @@ class Agent(Observer):
         if work_dir and run_id:
             work_dir = os.path.join(work_dir, run_id)
 
+        # A bundle expands to the three roots. `pegasus_to_swarm_converter.py` writes
+        # `code/`, `inputs/` and (optionally) `images/` into its output directory, so
+        # pointing at that directory is all a converted workflow needs — which is the point
+        # of bundling: copy the directory anywhere and run it.
+        #
+        # Explicit `roots` entries still win. Images are normally NOT bundled (they are
+        # gigabytes), so `roots.images` pointing at each host's local image store alongside
+        # `bundle` is the expected combination rather than an exception.
+        roots = dict(cfg.get("roots", {}) or {})
+        bundle = str(cfg.get("bundle", "") or "")
+        if bundle:
+            for kind, sub in (("code", "code"), ("inputs", "inputs"), ("images", "images")):
+                roots.setdefault(kind, os.path.join(bundle, sub))
+
         runner.configure(
             mode=mode,
             work_dir=work_dir,
@@ -160,7 +174,7 @@ class Agent(Observer):
             path_rewrites=cfg.get("path_rewrites", ()) or (),
             image_overrides=dict(cfg.get("image_overrides", {}) or {}),
             capture_output=bool(cfg.get("capture_output", True)),
-            roots=dict(cfg.get("roots", {}) or {}),
+            roots=roots,
         )
         if mode == "real":
             self.logger.warning(

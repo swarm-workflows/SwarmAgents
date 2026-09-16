@@ -112,6 +112,13 @@ runtime:
     #   code:   /export/swarm-wf/workflows/soilmoisture-workflow
     #   inputs: /export/swarm-wf/inputs
     #   images: /root/wf-images
+    # A converted-jobs directory from pegasus_to_swarm_converter.py is SELF-CONTAINED: it
+    # carries the executables in code/ and the root inputs in inputs/, so pointing at it
+    # sets all three roots at once. Copy the directory anywhere and the jobs run.
+    # Explicit `roots` entries above still win — images are normally not bundled (they are
+    # gigabytes), so `bundle` plus `roots.images` is the expected pairing, not an exception.
+    bundle: ""
+    #   bundle: /export/swarm-wf/converted_jobs
     # Substitute an image by container NAME. The catalogs here declare singularity .sif images
     # while the agent VMs have only Docker; which image stands in for which is a deployment
     # decision with real consequences for what is measured, so it is stated here and never

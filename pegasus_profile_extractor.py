@@ -248,6 +248,53 @@ def load_transformation_catalog(run_dir: str) -> Tuple[Dict[str, dict], Dict[str
     return transformations, containers
 
 
+def load_replica_catalog(run_dir: str) -> Dict[str, str]:
+    """Parse the replica catalog -> {lfn: host path}.
+
+    These are the run's ROOT INPUTS: files a workflow consumes but no job in it produces.
+    Nothing else records them. Job `data_in` lists what each job reads, but cannot say which
+    of those came from outside the run — that distinction is the difference between a file
+    that must be shipped with the workflow and one that appears when its parent job finishes.
+
+    Same lookup order as the transformation catalog: the run dir's planned copy first,
+    because it is the one Pegasus used, then the workflow root, then upwards.
+    """
+    if yaml is None:
+        return {}
+    candidates = [os.path.join(run_dir, "catalogs", "replicas.yml"),
+                  os.path.join(run_dir, "replicas.yml")]
+    probe = os.path.abspath(run_dir)
+    while True:
+        candidates.append(os.path.join(probe, "replicas.yml"))
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    path = next((c for c in candidates if os.path.isfile(c)), None)
+    if not path:
+        return {}
+    try:
+        with open(path) as fh:
+            rc = yaml.safe_load(fh) or {}
+    except Exception:  # noqa: BLE001 - a malformed catalog must not abort the run
+        return {}
+    out: Dict[str, str] = {}
+    for entry in rc.get("replicas", []) or []:
+        lfn = entry.get("lfn")
+        if not lfn:
+            continue
+        pfns = entry.get("pfns", []) or []
+        # Prefer a non-local site for the same reason the transformation catalog does; fall
+        # back to the first listed so a single-site catalog still resolves.
+        chosen = next((p for p in pfns if p.get("site") not in (None, "local")), None)
+        if chosen is None:
+            chosen = pfns[0] if pfns else {}
+        pfn = chosen.get("pfn")
+        if pfn:
+            out[str(lfn)] = str(pfn)
+    return out
+
+
 def load_cache_sites(run_dir: str) -> Dict[str, str]:
     """Parse <label>-0.cache -> {lfn: site}. First site seen per LFN wins."""
     sites: Dict[str, str] = {}
@@ -357,6 +404,7 @@ def extract_run(run_dir: str, job_types: List[str],
     # --- auxiliary per-run maps ---
     uses_map = load_workflow_uses(run_dir)
     transformations_tc, containers_tc = load_transformation_catalog(run_dir)
+    replicas_rc = load_replica_catalog(run_dir)
     cache_sites = load_cache_sites(run_dir)
     sub_requests = load_sub_requests(run_dir)
     lfn_sizes = load_lfn_sizes(conn)
@@ -543,6 +591,12 @@ def extract_run(run_dir: str, job_types: List[str],
             "pfn_db": tc_entry.get("pfn"),
             "pfn_type_db": tc_entry.get("type"),
             "container_db": container,
+            # The run's root inputs: {lfn: host path}. Run-level rather than per-job, and
+            # repeated on each profile so a single job record stays self-describing -- the
+            # converter reads it from whichever profile it is holding. Only the entries this
+            # job actually reads are its own concern; the whole map is carried because the
+            # converter bundles the union for the run.
+            "replicas_db": replicas_rc,
             # workflow-level
             "wf_uuid_db": wf_uuid,
             "dax_label_db": dax_label or "",

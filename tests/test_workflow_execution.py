@@ -28,7 +28,9 @@ sys.path.insert(0, REPO)
 from pegasus_profile_extractor import (  # noqa: E402
     cluster_task_ids, load_transformation_catalog, load_workflow_uses, ordered_task_ids,
 )
-from pegasus_to_swarm_converter import _map_execution  # noqa: E402
+from pegasus_to_swarm_converter import (  # noqa: E402
+    _map_execution, bundle_payload, rewrite_job_for_bundle,
+)
 from swarm.models.execution import ContainerSpec, ExecutionSpec  # noqa: E402
 from swarm.models.job import Job  # noqa: E402
 
@@ -386,6 +388,123 @@ class TestConverterPassthrough(unittest.TestCase):
         out = _map_execution({"executable_db": "/srv/x", "argv_db": None})
         self.assertIsNone(out["arguments"])
         self.assertFalse(ExecutionSpec.from_dict(out).runnable())
+
+
+# --------------------------------------------------------------------------------------
+# Self-contained bundles: copy the directory, run the jobs.
+# --------------------------------------------------------------------------------------
+
+class TestBundling(unittest.TestCase):
+    def _fixture(self, tmp):
+        """A tiny workflow tree plus the (job, profile) pairs a conversion would produce."""
+        src = os.path.join(tmp, "wf")
+        os.makedirs(os.path.join(src, "bin"))
+        Path(src, "bin", "analyze.py").write_text("#!/usr/bin/env python3\n")
+        Path(src, "bin", "train.py").write_text("#!/usr/bin/env python3\n")
+        Path(src, "seed.json").write_text("{}")
+        pairs = []
+        for name, script_name in (("analyze", "analyze.py"), ("train", "train.py")):
+            job = {"id": f"j-{name}",
+                   "execution": {"transformation": name, "path": f"/srv/{name}",
+                                 "pfn": os.path.join(src, "bin", script_name),
+                                 "arguments": [],
+                                 "container": {"name": "c", "kind": "singularity",
+                                               "image": "file:///nowhere/x.sif"}}}
+            profile = {"transformation_db": name,
+                       "replicas_db": {"seed.json": os.path.join(src, "seed.json")}}
+            pairs.append((job, profile))
+        return src, pairs
+
+    def test_executables_and_root_inputs_are_copied_in(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src, pairs = self._fixture(tmp)
+            out = os.path.join(tmp, "out"); os.makedirs(out)
+            manifest = bundle_payload(pairs, out)
+            self.assertTrue(os.path.isfile(os.path.join(out, "code", "analyze", "analyze.py")))
+            self.assertTrue(os.path.isfile(os.path.join(out, "inputs", "seed.json")))
+            self.assertEqual(manifest["missing"], [])
+
+    def test_the_job_points_at_the_code_root_not_the_bundle(self):
+        """`roots.code` already names code/, so a bundle-relative pfn puts it in the path
+        twice and every job refuses. Caught end to end, not by construction."""
+        with tempfile.TemporaryDirectory() as tmp:
+            src, pairs = self._fixture(tmp)
+            out = os.path.join(tmp, "out"); os.makedirs(out)
+            manifest = bundle_payload(pairs, out)
+            job = rewrite_job_for_bundle(pairs[0][0], manifest)
+            self.assertEqual(job["execution"]["pfn"], os.path.join("analyze", "analyze.py"))
+            self.assertFalse(job["execution"]["pfn"].startswith("code"))
+
+    def test_one_copy_per_transformation_not_per_job(self):
+        """A workflow runs the same executable many times; the DAG's shape must not decide
+        how many copies a bundle carries."""
+        with tempfile.TemporaryDirectory() as tmp:
+            src, pairs = self._fixture(tmp)
+            pairs = pairs + [pairs[0]] * 5          # same transformation, many jobs
+            out = os.path.join(tmp, "out"); os.makedirs(out)
+            manifest = bundle_payload(pairs, out)
+            self.assertEqual(len(manifest["code"]), 2)
+            self.assertEqual(len(os.listdir(os.path.join(out, "code", "analyze"))), 1)
+
+    def test_same_basename_in_two_transformations_does_not_collide(self):
+        """Two transformations may both ship a run.py; a flat directory silently keeps one."""
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "wf")
+            os.makedirs(os.path.join(src, "a")); os.makedirs(os.path.join(src, "b"))
+            Path(src, "a", "run.py").write_text("A")
+            Path(src, "b", "run.py").write_text("B")
+            pairs = [({"execution": {"transformation": t, "pfn": os.path.join(src, d, "run.py")}},
+                      {}) for t, d in (("ta", "a"), ("tb", "b"))]
+            out = os.path.join(tmp, "out"); os.makedirs(out)
+            bundle_payload(pairs, out)
+            self.assertEqual(Path(out, "code", "ta", "run.py").read_text(), "A")
+            self.assertEqual(Path(out, "code", "tb", "run.py").read_text(), "B")
+
+    def test_a_missing_executable_is_reported_not_silently_dropped(self):
+        """A bundle that looks whole and fails per job, later, on whichever agent draws it,
+        is the worst way to find out."""
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out"); os.makedirs(out)
+            pairs = [({"execution": {"transformation": "gone", "pfn": "/nowhere/x.py"}}, {})]
+            manifest = bundle_payload(pairs, out)
+            self.assertEqual(len(manifest["missing"]), 1)
+            self.assertEqual(manifest["missing"][0]["kind"], "code")
+
+    def test_a_job_that_could_not_be_bundled_keeps_its_original_path(self):
+        """Still a faithful description; rewriting it to a path that does not exist is worse."""
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out"); os.makedirs(out)
+            job = {"execution": {"transformation": "gone", "pfn": "/nowhere/x.py"}}
+            manifest = bundle_payload([(job, {})], out)
+            self.assertEqual(rewrite_job_for_bundle(job, manifest)["execution"]["pfn"],
+                             "/nowhere/x.py")
+
+    def test_images_are_referenced_not_copied_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src, pairs = self._fixture(tmp)
+            out = os.path.join(tmp, "out"); os.makedirs(out)
+            manifest = bundle_payload(pairs, out)
+            self.assertIn("c", manifest["images"])
+            self.assertIsNone(manifest["images"]["c"]["bundled"])
+            self.assertFalse(os.path.exists(os.path.join(out, "images")))
+
+    def test_every_copied_file_is_checksummed(self):
+        """A path says where code was, not which code it was: edit a script after a run and
+        a replayed job silently executes a different program than the baseline's."""
+        with tempfile.TemporaryDirectory() as tmp:
+            src, pairs = self._fixture(tmp)
+            out = os.path.join(tmp, "out"); os.makedirs(out)
+            manifest = bundle_payload(pairs, out)
+            for entry in list(manifest["code"].values()) + list(manifest["inputs"].values()):
+                self.assertEqual(len(entry["sha256"]), 64)
+
+    def test_a_simulated_job_bundles_cleanly_with_nothing_to_copy(self):
+        """Jobs with no execution block are the default case and must still convert."""
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out"); os.makedirs(out)
+            manifest = bundle_payload([({"id": "j1", "wall_time": 1.0}, {})], out)
+            self.assertEqual(manifest["missing"], [])
+            self.assertEqual(manifest["code"], {})
 
 
 if __name__ == "__main__":

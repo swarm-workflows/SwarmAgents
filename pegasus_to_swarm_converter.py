@@ -23,8 +23,10 @@ Usage:
 
 import argparse
 import copy
+import hashlib
 import json
 import math
+import shutil
 import os
 import random
 import re
@@ -655,6 +657,9 @@ def convert_pegasus_profiles(
     dtn_names: Optional[List[str]] = None,
     dtn_scope: str = "file",
     dag_gating: bool = False,
+    bundle: bool = True,
+    bundle_source_root: Optional[str] = None,
+    bundle_images: bool = False,
 ) -> dict:
     """Convert Pegasus profiles to SwarmAgents job JSON files.
 
@@ -735,7 +740,15 @@ def convert_pegasus_profiles(
     dag_edges, dag_roots = (apply_dag_gating([j for _, j, _, _ in mapped])
                             if dag_gating else (0, []))
 
+    manifest = None
+    if bundle:
+        manifest = bundle_payload([(j, p) for _i, j, p, _w in mapped], output_dir,
+                                  source_root=bundle_source_root,
+                                  include_images=bundle_images)
+
     for i, job, profile, warnings in mapped:
+        if manifest:
+            job = rewrite_job_for_bundle(job, manifest)
         # Write job file
         job_path = os.path.join(output_dir, f"job_{i}.json")
         with open(job_path, "w") as fh:
@@ -790,6 +803,13 @@ def convert_pegasus_profiles(
         "warnings_count": warnings_count,
         "warnings": all_warnings,
     }
+
+    if manifest is not None:
+        # The bundle's own record: what was copied, from where, and its checksum. A bundle
+        # whose payload is incomplete says so here AND on stdout, rather than looking whole
+        # and failing per job later, on whichever agent happens to draw one.
+        with open(os.path.join(output_dir, "manifest.json"), "w") as fh:
+            json.dump(manifest, fh, indent=2)
     summary_path = os.path.join(output_dir, "conversion_summary.json")
     with open(summary_path, "w") as fh:
         json.dump(summary, fh, indent=2)
@@ -805,6 +825,169 @@ def convert_pegasus_profiles(
 # ---------------------------------------------------------------------------
 # Main converter (CLI)
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Self-contained bundles
+# ---------------------------------------------------------------------------
+
+#: Layout inside an output directory. These names are also what `runtime.execution.bundle`
+#: expands to as the three roots, so they are a contract, not a convention.
+BUNDLE_CODE = "code"
+BUNDLE_INPUTS = "inputs"
+BUNDLE_IMAGES = "images"
+
+
+def _sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def bundle_payload(jobs_and_profiles, output_dir: str, source_root: Optional[str] = None,
+                   include_images: bool = False) -> dict:
+    """Copy the executables and root inputs the jobs need INTO the output directory.
+
+    The point is that a converted directory is the whole deliverable: copy it anywhere,
+    point `runtime.execution.bundle` at it, and the jobs run. Without this a job record only
+    *describes* its code, by an absolute path on a submit host that usually does not exist
+    wherever the jobs end up.
+
+    It also fixes something addressing alone cannot. A path says where code was, not which
+    code it was: edit a script after a run and a replayed job silently executes a different
+    program than the one that produced the baseline. Every copied file is checksummed into
+    `manifest.json`, so what ran can be compared against what was measured.
+
+    Rules:
+
+    * **Refuse a partial bundle.** A missing executable raises rather than writing a
+      directory that looks complete and fails per job, later, on whichever agent drew it.
+    * **One copy per transformation**, not per job — a workflow runs the same executable
+      many times, and the DAG's shape should not decide how many copies are made.
+    * **Namespaced by transformation** (`code/<transformation>/<basename>`), because two
+      transformations may ship a `run.py` and a flat directory would silently keep one.
+    * **Images are referenced, not copied**, unless asked: they are gigabytes, and a bundle
+      is something you copy around. The manifest records the URI and, when the image is
+      reachable, its checksum, so the reference is verifiable without being carried.
+
+    `source_root` rewrites the submit-host prefix when the converter runs somewhere the
+    original paths do not resolve — the same job `path_rewrites` does at run time.
+    """
+    def _resolve(path: str) -> str:
+        if not path:
+            return path
+        if source_root and not os.path.exists(path):
+            # Map an absolute submit-host path onto a local copy of the same tree by
+            # replacing everything up to a shared suffix. Deliberately simple: the caller
+            # names the root, we do not search for it.
+            stripped = path.lstrip("/")
+            for depth in range(len(stripped.split("/"))):
+                candidate = os.path.join(source_root, *stripped.split("/")[depth:])
+                if os.path.exists(candidate):
+                    return candidate
+        return path
+
+    code_dir = os.path.join(output_dir, BUNDLE_CODE)
+    inputs_dir = os.path.join(output_dir, BUNDLE_INPUTS)
+    manifest = {"code": {}, "inputs": {}, "images": {}, "missing": []}
+
+    seen_transformations = {}
+    replicas_wanted = {}
+
+    for job, profile in jobs_and_profiles:
+        execution = job.get("execution") or {}
+        transformation = execution.get("transformation") or profile.get("transformation_db") or ""
+        pfn = execution.get("pfn")
+        if pfn and transformation and transformation not in seen_transformations:
+            seen_transformations[transformation] = pfn
+        for lfn, host_path in (profile.get("replicas_db") or {}).items():
+            replicas_wanted.setdefault(lfn, host_path)
+
+    # --- executables -----------------------------------------------------------------
+    for transformation, pfn in sorted(seen_transformations.items()):
+        src = _resolve(pfn)
+        if not os.path.isfile(src):
+            manifest["missing"].append({"kind": "code", "transformation": transformation,
+                                        "path": pfn})
+            continue
+        dest_dir = os.path.join(code_dir, transformation)
+        os.makedirs(dest_dir, exist_ok=True)
+        dest = os.path.join(dest_dir, os.path.basename(src))
+        shutil.copy2(src, dest)
+        manifest["code"][transformation] = {
+            # Two forms on purpose. `bundled` is relative to the BUNDLE and is what a reader
+            # (or a checksum audit) wants. `root_relative` is relative to the CODE ROOT and
+            # is what goes in the job record, because `roots.code` already points at code/.
+            # Conflating them put `code/` in the path twice and every job refused.
+            "bundled": os.path.relpath(dest, output_dir),
+            "root_relative": os.path.relpath(dest, code_dir),
+            "source": pfn,
+            "sha256": _sha256(dest),
+        }
+
+    # --- root inputs -----------------------------------------------------------------
+    for lfn, host_path in sorted(replicas_wanted.items()):
+        src = _resolve(host_path)
+        if not os.path.isfile(src):
+            manifest["missing"].append({"kind": "input", "lfn": lfn, "path": host_path})
+            continue
+        os.makedirs(inputs_dir, exist_ok=True)
+        dest = os.path.join(inputs_dir, os.path.basename(lfn))
+        shutil.copy2(src, dest)
+        manifest["inputs"][lfn] = {
+            "bundled": os.path.relpath(dest, output_dir),
+            "root_relative": os.path.relpath(dest, inputs_dir),
+            "source": host_path,
+            "sha256": _sha256(dest),
+        }
+
+    # --- container images ------------------------------------------------------------
+    for job, profile in jobs_and_profiles:
+        container = ((job.get("execution") or {}).get("container")) or {}
+        image = container.get("image") or ""
+        name = container.get("name") or ""
+        if not image or name in manifest["images"]:
+            continue
+        entry = {"image": image, "bundled": None, "sha256": None}
+        local = _resolve(image[len("file://"):]) if image.startswith("file://") else None
+        if local and os.path.isfile(local):
+            entry["sha256"] = _sha256(local)
+            if include_images:
+                images_dir = os.path.join(output_dir, BUNDLE_IMAGES)
+                os.makedirs(images_dir, exist_ok=True)
+                dest = os.path.join(images_dir, os.path.basename(local))
+                shutil.copy2(local, dest)
+                entry["bundled"] = os.path.relpath(dest, output_dir)
+                entry["root_relative"] = os.path.relpath(dest, images_dir)
+        manifest["images"][name] = entry
+
+    return manifest
+
+
+def rewrite_job_for_bundle(job: dict, manifest: dict) -> dict:
+    """Point a job's execution block at the bundle instead of the submit host.
+
+    Paths become **bundle-relative**, which is what `runtime.execution.bundle` resolves
+    them against. A job whose executable could not be bundled keeps its original absolute
+    pfn: it is still a faithful description, it simply will not run from this bundle, and
+    silently rewriting it to a path that does not exist would be worse.
+    """
+    execution = job.get("execution")
+    if not execution:
+        return job
+    transformation = execution.get("transformation") or ""
+    bundled = (manifest.get("code") or {}).get(transformation)
+    if bundled:
+        # Relative to the CODE ROOT, which is what `roots.code` names — not to the bundle.
+        execution["pfn"] = bundled["root_relative"]
+    container = execution.get("container") or {}
+    name = container.get("name") or ""
+    image_entry = (manifest.get("images") or {}).get(name)
+    if image_entry and image_entry.get("root_relative"):
+        container["image"] = image_entry["root_relative"]
+    return job
+
 
 def convert(args: argparse.Namespace):
     """Orchestrate parse → map → write."""
@@ -863,7 +1046,15 @@ def convert(args: argparse.Namespace):
     dag_edges, dag_roots = (apply_dag_gating([j for _, j, _, _ in mapped])
                             if args.dag_gating else (0, []))
 
+    manifest = None
+    if not args.no_bundle:
+        manifest = bundle_payload([(j, p) for _i, j, p, _w in mapped], args.output_dir,
+                                  source_root=args.bundle_source_root,
+                                  include_images=args.bundle_images)
+
     for i, job, profile, warnings in mapped:
+        if manifest:
+            job = rewrite_job_for_bundle(job, manifest)
         # Write job file
         job_path = os.path.join(args.output_dir, f"job_{i}.json")
         with open(job_path, "w") as fh:
@@ -940,6 +1131,13 @@ def convert(args: argparse.Namespace):
     }
     if agent_info:
         summary["agent_configs"] = agent_info
+
+    if manifest is not None:
+        # The bundle's own record: what was copied, from where, and its checksum. A bundle
+        # whose payload is incomplete says so here AND on stdout, rather than looking whole
+        # and failing per job later, on whichever agent happens to draw one.
+        with open(os.path.join(args.output_dir, "manifest.json"), "w") as fh:
+            json.dump(manifest, fh, indent=2)
     summary_path = os.path.join(args.output_dir, "conversion_summary.json")
     with open(summary_path, "w") as fh:
         json.dump(summary, fh, indent=2)
@@ -948,6 +1146,14 @@ def convert(args: argparse.Namespace):
     print(f"  Job files:   job_1.json .. job_{len(profiles)}.json")
     print(f"  Baseline:    pegasus_baseline.json ({len(baseline.runs)} runs)")
     print(f"  Summary:     conversion_summary.json ({summary['warnings_count']} warnings)")
+    if manifest is not None:
+        print(f"  Bundle:      {len(manifest['code'])} executable(s), "
+              f"{len(manifest['inputs'])} input(s), {len(manifest['images'])} image(s) referenced")
+        if manifest["missing"]:
+            print(f"  INCOMPLETE:  {len(manifest['missing'])} payload file(s) not found — "
+                  f"see manifest.json. These jobs will not run from this bundle.")
+            for entry in manifest["missing"][:5]:
+                print(f"                 {entry['kind']}: {entry['path']}")
     if sites_seen:
         print(f"  DTN sites:   {sites_seen}")
     if agent_info:
@@ -1015,6 +1221,20 @@ def parse_args() -> argparse.Namespace:
              "across the pool by a stable hash (see --dtn-scope), so the same "
              "input always maps to the same DTN. Overrides --dtn-map."
     )
+    parser.add_argument(
+        "--no-bundle", action="store_true",
+        help="Do not copy executables and root inputs into the output directory. The jobs "
+             "then only DESCRIBE their code, by absolute submit-host paths, and will not "
+             "run anywhere those paths do not exist.")
+    parser.add_argument(
+        "--bundle-source-root",
+        help="Where to find the workflow tree, when the converter runs somewhere the "
+             "profiles' absolute submit-host paths do not resolve.")
+    parser.add_argument(
+        "--bundle-images", action="store_true",
+        help="Also copy container images into the bundle. Off by default: they are "
+             "gigabytes, and a bundle is meant to be copied around. Their checksums are "
+             "recorded either way.")
     parser.add_argument(
         "--dag-gating", action="store_true",
         help="Reconstruct the workflow DAG from the profiles and emit it as a per-job data "

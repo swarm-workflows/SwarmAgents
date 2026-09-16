@@ -138,6 +138,55 @@ python pegasus_to_swarm_converter.py --input soil_profiles.json \
 `CLAUDE.md` and `tests/test_workflow_dag.py`. Check `conversion_summary.json`'s `dag.edges`
 and `dag.roots` — a partial DAG still runs and looks healthy.
 
+### 2.1a The output directory is the deliverable
+
+The converter writes a **self-contained bundle**: job records plus the executables they run
+plus the root inputs they read. Copy the directory anywhere, point one config key at it, and
+the jobs run.
+
+```
+converted_jobs/
+  job_1.json …            the job records; `pfn` is relative to code/
+  code/<transformation>/  the executables, one copy per transformation
+  inputs/                 declared replicas — the files no job produces
+  manifest.json           what was copied, from where, and its sha256
+  conversion_summary.json
+  pegasus_baseline.json   the Pegasus timings to compare against
+```
+
+```yaml
+runtime:
+  execution:
+    bundle: /export/swarm-wf/converted_jobs
+    roots:
+      images: /root/wf-images        # images are referenced, not carried
+```
+
+Why this rather than paths into a staged tree:
+
+* **A path says where code was, not which code it was.** Edit a script after the run and a
+  replayed job silently executes a different program than the one that produced the baseline.
+  Every bundled file is checksummed in `manifest.json`, so what ran can be compared with what
+  was measured.
+* **Nothing to stage by hand.** Root inputs — the files a workflow declares but no job
+  produces — come from the replica catalog, which nothing recorded before. They land in
+  `inputs/` and the runner stages them into the working directory itself.
+* **A partial bundle says so**, on stdout and in `manifest.json`, instead of looking whole and
+  failing per job later on whichever agent drew it.
+
+Images are **referenced, not copied** (`--bundle-images` overrides): they are gigabytes and a
+bundle is meant to be copied around. Their checksums are recorded either way, so the reference
+is verifiable without being carried.
+
+`--no-bundle` restores the old behaviour, where job records only *describe* their code by
+absolute submit-host paths. Simulated jobs are unaffected throughout: a job with no execution
+block has nothing to bundle and converts exactly as before.
+
+Two forms appear in the manifest for each file and they are not interchangeable: `bundled` is
+relative to the bundle (for reading and auditing), `root_relative` is relative to its root and
+is what goes in the job record — `roots.code` already names `code/`, so using the bundle-relative
+form put `code/` in the path twice and every job refused.
+
 ### 2.2 Slice setup
 
 ```bash
