@@ -829,12 +829,13 @@ def convert_pegasus_profiles(
     with open(summary_path, "w") as fh:
         json.dump(summary, fh, indent=2)
 
-    # Everything is written and nothing below can fail: replace the previous output now.
-    stale = clear_previous_output(output_dir, keep=write_dir)
+    # Install first, sweep second. Nothing is destroyed until the replacement is complete,
+    # and the sweep skips what was just installed.
+    installed = promote_staged_output(write_dir, output_dir)
+    shutil.rmtree(write_dir, ignore_errors=True)
+    stale = clear_previous_output(output_dir, installed=set(installed))
     if stale:
         print(f"  Cleared:     {stale} artefact(s) from a previous conversion")
-    promote_staged_output(write_dir, output_dir)
-    shutil.rmtree(write_dir, ignore_errors=True)
     baseline_path = os.path.join(output_dir, os.path.basename(baseline_path))
     summary_path = os.path.join(output_dir, os.path.basename(summary_path))
 
@@ -861,7 +862,8 @@ BUNDLE_INPUTS = "inputs"
 BUNDLE_IMAGES = "images"
 
 
-def clear_previous_output(output_dir: str, keep: Optional[str] = None) -> int:
+def clear_previous_output(output_dir: str, keep: Optional[str] = None,
+                          installed: Optional[set] = None) -> int:
     """Remove a previous conversion's artefacts from *output_dir*. Returns how many.
 
     The converter owns `job_*.json` in its output directory, and writing a new set does NOT
@@ -876,7 +878,13 @@ def clear_previous_output(output_dir: str, keep: Optional[str] = None) -> int:
     and produces plausible output.
     """
     removed = 0
+    installed = installed or set()
     for name in os.listdir(output_dir) if os.path.isdir(output_dir) else []:
+        # Never remove what this conversion just installed. Running after promotion is what
+        # keeps the previous output intact until the new one is complete, and the only way
+        # that is safe is if the sweep can tell the two apart.
+        if name in installed:
+            continue
         path = os.path.join(output_dir, name)
         if re.fullmatch(r"job_\d+\.json", name) or name in (
                 "conversion_summary.json", "pegasus_baseline.json", "manifest.json"):
@@ -1147,28 +1155,52 @@ def bundle_payload(jobs_and_profiles, output_dir: str, source_root: Optional[str
     return manifest
 
 
-def promote_staged_output(staging_dir: str, output_dir: str) -> None:
-    """Move a completed conversion from its staging directory into place.
+def promote_staged_output(staging_dir: str, output_dir: str) -> List[str]:
+    """Install a completed conversion, atomically per entry and with rollback.
 
-    Everything the conversion produces is written to staging first — job records, bundle
-    payload, baseline, manifest, summary — so the destructive replacement of the previous
-    output is the LAST thing that happens, with nothing left that can fail after it. Moving
-    the payload but writing the job files straight to the output directory, which is what
-    this did at first, left the same hole one step further along: a failure while writing
-    them destroyed the previous bundle and produced a partial one.
+    Returns the names installed.
 
-    Paths inside the manifest survive the move untouched because both forms are relative —
-    `bundled` to the bundle root, `root_relative` to its own root — and the layout is
-    identical on either side.
+    The ordering here is the whole point, and it took three attempts to get right. Clearing
+    the previous output first — at any point before the new one is fully in place — means a
+    failure afterwards leaves neither: not when it cleared at the start, and not when it
+    cleared just before promoting, because promotion moves several entries and can fail
+    between them.
+
+    So nothing is removed before the replacement is installed. Each entry displaces its
+    predecessor by renaming it aside first (atomic, same filesystem), and if any step fails
+    everything already done is undone and the originals are put back. Surplus artefacts from
+    a larger previous conversion are removed by the caller *afterwards*, when the new output
+    is already complete and the worst a failure can do is leave extra files behind.
     """
-    for name in sorted(os.listdir(staging_dir)):
-        src = os.path.join(staging_dir, name)
-        dest = os.path.join(output_dir, name)
-        if os.path.isdir(dest):
-            shutil.rmtree(dest)
-        elif os.path.exists(dest):
-            os.remove(dest)
-        shutil.move(src, dest)
+    aside: List[tuple] = []
+    promoted: List[str] = []
+    try:
+        for name in sorted(os.listdir(staging_dir)):
+            src = os.path.join(staging_dir, name)
+            dest = os.path.join(output_dir, name)
+            if os.path.exists(dest):
+                shelved = f"{dest}.replacing-{os.getpid()}"
+                if os.path.exists(shelved):
+                    shutil.rmtree(shelved, ignore_errors=True)
+                os.rename(dest, shelved)
+                aside.append((shelved, dest))
+            shutil.move(src, dest)
+            promoted.append(name)
+    except Exception:
+        for name in promoted:
+            path = os.path.join(output_dir, name)
+            shutil.rmtree(path, ignore_errors=True) if os.path.isdir(path) else \
+                (os.remove(path) if os.path.exists(path) else None)
+        for shelved, dest in aside:
+            if os.path.exists(shelved):
+                if os.path.exists(dest):
+                    shutil.rmtree(dest, ignore_errors=True) if os.path.isdir(dest) else os.remove(dest)
+                os.rename(shelved, dest)
+        raise
+    for shelved, _dest in aside:
+        shutil.rmtree(shelved, ignore_errors=True) if os.path.isdir(shelved) else \
+            (os.remove(shelved) if os.path.exists(shelved) else None)
+    return promoted
 
 
 def rewrite_job_for_bundle(job: dict, manifest: dict) -> dict:
@@ -1355,12 +1387,12 @@ def convert(args: argparse.Namespace):
     with open(summary_path, "w") as fh:
         json.dump(summary, fh, indent=2)
 
-    # Everything is written and nothing below can fail: replace the previous output now.
-    stale = clear_previous_output(args.output_dir, keep=write_dir)
+    # Install first, sweep second — see convert_pegasus_profiles.
+    installed = promote_staged_output(write_dir, args.output_dir)
+    shutil.rmtree(write_dir, ignore_errors=True)
+    stale = clear_previous_output(args.output_dir, installed=set(installed))
     if stale:
         print(f"  Cleared:     {stale} artefact(s) from a previous conversion")
-    promote_staged_output(write_dir, args.output_dir)
-    shutil.rmtree(write_dir, ignore_errors=True)
 
     print(f"Converted {len(profiles)} Pegasus profiles → {args.output_dir}/")
     print(f"  Job files:   job_1.json .. job_{len(profiles)}.json")

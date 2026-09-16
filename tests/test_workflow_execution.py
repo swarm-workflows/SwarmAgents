@@ -808,6 +808,59 @@ class TestBundling(unittest.TestCase):
             self.assertEqual(Path(out, "code", "good", "g.py").read_text(), "PREVIOUS")
             self.assertTrue(os.path.exists(os.path.join(out, "job_1.json")))
 
+    def test_a_failure_during_promotion_itself_rolls_back(self):
+        """The window that survived two previous fixes. Promotion moves several entries and
+        can fail between them, so clearing the old output before it — at the start, or just
+        before promoting — still left neither the new output nor the old. Nothing is removed
+        until the replacement is installed, each entry displaces its predecessor atomically,
+        and a failure puts everything back."""
+        import shutil as _shutil
+        import pegasus_to_swarm_converter as conv
+        from unittest.mock import patch as _patch
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out")
+            os.makedirs(os.path.join(out, "code", "good"))
+            Path(out, "code", "good", "g.py").write_text("PREVIOUS")
+            Path(out, "job_1.json").write_text('{"id": "previous"}')
+            Path(out, "job_99.json").write_text('{"id": "surplus"}')
+            src = os.path.join(tmp, "wf"); os.makedirs(src)
+            Path(src, "a.py").write_text("code")
+            profiles = os.path.join(tmp, "profiles.json")
+            Path(profiles).write_text(json.dumps([{
+                "run_name": "r", "job_name": "j", "transformation_db": "t",
+                "kickstart_sec_stats": 1.0, "exitcode_db": 0,
+                "input_files_db": [], "output_files_db": [],
+                "request_memory_mb_db": 1024, "request_cpus_db": 1,
+            }]))
+            real_move = _shutil.move
+            calls = {"n": 0}
+
+            def flaky(s, d, *a, **k):
+                calls["n"] += 1
+                if calls["n"] == 2:
+                    raise OSError("no space left on device")
+                return real_move(s, d, *a, **k)
+
+            with _patch.object(conv.shutil, "move", side_effect=flaky):
+                with self.assertRaises(OSError):
+                    conv.convert_pegasus_profiles(
+                        input_path=profiles, input_type="json", output_dir=out)
+            self.assertEqual(Path(out, "code", "good", "g.py").read_text(), "PREVIOUS")
+            self.assertTrue(os.path.exists(os.path.join(out, "job_1.json")))
+            self.assertTrue(os.path.exists(os.path.join(out, "job_99.json")))
+            self.assertEqual([d for d in os.listdir(out) if ".replacing-" in d], [])
+
+    def test_the_sweep_never_removes_what_was_just_installed(self):
+        """The sweep runs AFTER promotion now, so it has to tell the new output from the
+        surplus it exists to remove."""
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "job_1.json").write_text("new")
+            Path(tmp, "job_2.json").write_text("new")
+            Path(tmp, "job_50.json").write_text("surplus")
+            clear_previous_output(tmp, installed={"job_1.json", "job_2.json"})
+            remaining = sorted(f for f in os.listdir(tmp) if f.startswith("job_"))
+            self.assertEqual(remaining, ["job_1.json", "job_2.json"])
+
     def test_staging_debris_is_swept_by_the_next_conversion(self):
         with tempfile.TemporaryDirectory() as tmp:
             os.makedirs(os.path.join(tmp, ".convert-staging-99999"))
