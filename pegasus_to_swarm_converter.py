@@ -706,9 +706,6 @@ def convert_pegasus_profiles(
         )
 
     os.makedirs(output_dir, exist_ok=True)
-    _stale = clear_previous_output(output_dir)
-    if _stale:
-        print(f"  Cleared:     {_stale} artefact(s) from a previous conversion")
 
     dag_note = None
     if dag_gating and data_nodes_mode != "per-file":
@@ -743,11 +740,24 @@ def convert_pegasus_profiles(
     dag_edges, dag_roots = (apply_dag_gating([j for _, j, _, _ in mapped])
                             if dag_gating else (0, []))
 
+    # The payload is built in a staging directory and only promoted once everything that
+    # can fail has succeeded. Clearing first — which is what this did — destroyed a working
+    # bundle whenever the conversion after it raised, leaving neither the new one nor the
+    # old. A conversion that fails must leave what was there alone.
     manifest = None
-    if bundle:
-        manifest = bundle_payload([(j, p) for _i, j, p, _w in mapped], output_dir,
-                                  source_root=bundle_source_root,
-                                  include_images=bundle_images)
+    staging = os.path.join(output_dir, f".convert-staging-{os.getpid()}")
+    try:
+        if bundle:
+            manifest = bundle_payload([(j, p) for _i, j, p, _w in mapped], staging,
+                                      source_root=bundle_source_root,
+                                      include_images=bundle_images)
+        stale = clear_previous_output(output_dir)
+        if stale:
+            print(f"  Cleared:     {stale} artefact(s) from a previous conversion")
+        if manifest is not None:
+            promote_staged_bundle(staging, output_dir)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
     for i, job, profile, warnings in mapped:
         if manifest:
@@ -1119,6 +1129,25 @@ def bundle_payload(jobs_and_profiles, output_dir: str, source_root: Optional[str
     return manifest
 
 
+def promote_staged_bundle(staging_dir: str, output_dir: str) -> None:
+    """Move a staged bundle's payload directories into place, replacing any older ones.
+
+    The payload is built in a staging directory so the previous bundle survives a conversion
+    that fails part way. Manifest paths stay valid across the move because both forms are
+    relative — `bundled` to the bundle root, `root_relative` to its own root — and the
+    layout inside is identical.
+    """
+    for name in (BUNDLE_CODE, BUNDLE_INPUTS, BUNDLE_IMAGES):
+        src = os.path.join(staging_dir, name)
+        if not os.path.isdir(src):
+            continue
+        dest = os.path.join(output_dir, name)
+        if os.path.isdir(dest):
+            shutil.rmtree(dest)
+        shutil.move(src, dest)
+    shutil.rmtree(staging_dir, ignore_errors=True)
+
+
 def rewrite_job_for_bundle(job: dict, manifest: dict) -> dict:
     """Point a job's execution block at the bundle instead of the submit host.
 
@@ -1161,9 +1190,6 @@ def convert(args: argparse.Namespace):
         sys.exit(1)
 
     os.makedirs(args.output_dir, exist_ok=True)
-    _stale = clear_previous_output(args.output_dir)
-    if _stale:
-        print(f"  Cleared:     {_stale} artefact(s) from a previous conversion")
 
     dtn_map = None
     if args.dtn_map:
@@ -1204,11 +1230,22 @@ def convert(args: argparse.Namespace):
     dag_edges, dag_roots = (apply_dag_gating([j for _, j, _, _ in mapped])
                             if args.dag_gating else (0, []))
 
+    # See the note in convert_pegasus_profiles: staged, then promoted, so a conversion that
+    # fails leaves the previous bundle intact.
     manifest = None
-    if not args.no_bundle:
-        manifest = bundle_payload([(j, p) for _i, j, p, _w in mapped], args.output_dir,
-                                  source_root=args.bundle_source_root,
-                                  include_images=args.bundle_images)
+    staging = os.path.join(args.output_dir, f".convert-staging-{os.getpid()}")
+    try:
+        if not args.no_bundle:
+            manifest = bundle_payload([(j, p) for _i, j, p, _w in mapped], staging,
+                                      source_root=args.bundle_source_root,
+                                      include_images=args.bundle_images)
+        stale = clear_previous_output(args.output_dir)
+        if stale:
+            print(f"  Cleared:     {stale} artefact(s) from a previous conversion")
+        if manifest is not None:
+            promote_staged_bundle(staging, args.output_dir)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
     for i, job, profile, warnings in mapped:
         if manifest:

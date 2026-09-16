@@ -204,6 +204,13 @@ Two replicas sharing a basename are **reported, not overwritten**. The working d
 flat, so they genuinely cannot both be staged; copying the second over the first while the
 manifest claims both are bundled hands a job the wrong file silently.
 
+A conversion **replaces** the previous bundle: job records left over from a larger earlier
+conversion would otherwise be published alongside the new ones (a 4-job workflow written over
+a 400-job run left 406 files, all of which got scheduled). The replacement happens only once
+everything that can fail has succeeded — the payload is built in a staging directory and
+promoted at the end — so a conversion that fails part way leaves the previous, working bundle
+exactly as it was, rather than destroying it and producing nothing.
+
 `--no-bundle` restores the old behaviour, where job records only *describe* their code by
 absolute submit-host paths. Simulated jobs are unaffected throughout: a job with no execution
 block has nothing to bundle and converts exactly as before.

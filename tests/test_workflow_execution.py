@@ -739,6 +739,41 @@ class TestBundling(unittest.TestCase):
             # Files the converter does not own are left alone.
             self.assertTrue(os.path.exists(os.path.join(tmp, "keep_me.txt")))
 
+    def test_a_failed_conversion_leaves_the_previous_bundle_intact(self):
+        """Clearing first destroyed a working bundle whenever the conversion after it
+        raised, leaving neither the new one nor the old — and a bundle is the thing you
+        copy to a fleet and run. The payload is staged and only promoted once everything
+        that can fail has succeeded."""
+        import pegasus_to_swarm_converter as conv
+        from unittest.mock import patch as _patch
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out")
+            os.makedirs(os.path.join(out, "code", "good"))
+            Path(out, "code", "good", "g.py").write_text("PREVIOUS")
+            Path(out, "job_1.json").write_text('{"id": "previous"}')
+
+            real = conv.bundle_payload
+
+            def boom(*a, **kw):
+                real(*a, **kw)          # builds into staging
+                raise RuntimeError("failure after the old destructive point")
+
+            profiles = os.path.join(tmp, "profiles.json")
+            Path(profiles).write_text(json.dumps([{
+                "run_name": "r", "job_name": "j", "transformation_db": "t",
+                "kickstart_sec_stats": 1.0, "exitcode_db": 0,
+                "input_files_db": [], "output_files_db": [],
+                "request_memory_mb_db": 1024, "request_cpus_db": 1,
+            }]))
+            with _patch.object(conv, "bundle_payload", side_effect=boom):
+                with self.assertRaises(RuntimeError):
+                    conv.convert_pegasus_profiles(
+                        input_path=profiles, input_type="json", output_dir=out)
+            # Previous bundle untouched, and no staging debris left behind.
+            self.assertEqual(Path(out, "code", "good", "g.py").read_text(), "PREVIOUS")
+            self.assertTrue(os.path.exists(os.path.join(out, "job_1.json")))
+            self.assertEqual([d for d in os.listdir(out) if d.startswith(".convert-staging")], [])
+
     def test_clearing_an_empty_or_missing_directory_is_harmless(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(clear_previous_output(tmp), 0)
