@@ -715,6 +715,42 @@ class TestUnresolvableRelativePaths(PolicyTestCase):
         self.assertIn("docker://ubuntu:22.04", cmd)
         self.assertNotIn("ubuntu:22.04", cmd)
 
+    def test_a_sandbox_directory_is_not_turned_into_a_registry_pull(self):
+        """An apptainer sandbox is a directory with no extension — a real local image that
+        no suffix rule can recognise. Prefixing it pulls a repository nobody published."""
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "mybox"))
+            runner.configure(container_runtime="apptainer", roots={"images": tmp})
+            spec = ExecutionSpec.from_dict({
+                "path": "/srv/x", "arguments": [], "pfn_type": "installed",
+                "container": {"name": "c", "kind": "docker", "image": "mybox"}})
+            with patch("shutil.which", return_value="/usr/bin/apptainer"):
+                cmd, reason = runner.build_command(spec, "/w")
+            self.assertEqual(reason, "")
+            self.assertIn(os.path.join(tmp, "mybox"), cmd)
+            self.assertFalse(any(c.startswith("docker://") for c in cmd))
+
+    def test_a_local_image_without_a_known_suffix_is_not_prefixed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "image.oci").write_bytes(b"x")
+            runner.configure(container_runtime="apptainer", roots={"images": tmp})
+            spec = ExecutionSpec.from_dict({
+                "path": "/srv/x", "arguments": [], "pfn_type": "installed",
+                "container": {"name": "c", "kind": "docker", "image": "image.oci"}})
+            with patch("shutil.which", return_value="/usr/bin/apptainer"):
+                cmd, _ = runner.build_command(spec, "/w")
+            self.assertIn(os.path.join(tmp, "image.oci"), cmd)
+
+    def test_a_reference_that_exists_nowhere_is_still_a_registry_pull(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner.configure(container_runtime="apptainer", roots={"images": tmp})
+            spec = ExecutionSpec.from_dict({
+                "path": "/srv/x", "arguments": [], "pfn_type": "installed",
+                "container": {"name": "c", "kind": "docker", "image": "ubuntu:22.04"}})
+            with patch("shutil.which", return_value="/usr/bin/apptainer"):
+                cmd, _ = runner.build_command(spec, "/w")
+            self.assertIn("docker://ubuntu:22.04", cmd)
+
     def test_apptainer_does_not_double_a_scheme_it_already_has(self):
         runner.configure(container_runtime="apptainer", roots={})
         spec = ExecutionSpec.from_dict({

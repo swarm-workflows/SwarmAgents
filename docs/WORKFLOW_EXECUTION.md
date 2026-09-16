@@ -211,6 +211,13 @@ has one added, because it reads a bare reference as a local file name. Measured 
 `could not open image /home/ubuntu/busybox:latest`, while `docker://busybox:latest` runs. A
 resolved `.sif` is an absolute path by that point and is left alone.
 
+Before adding the scheme the runner **checks the filesystem**, because a suffix is a hint and
+not proof. An apptainer *sandbox* is a directory with no extension at all
+(`apptainer build --sandbox mybox/ …`, then `apptainer exec mybox/ …`), and an image in the
+images root need not be named `.sif`. Prefixing either turns a local image into a registry
+pull for a repository nobody published. Existence is checkable, so only a reference that
+resolves to nothing on disk is treated as a registry reference.
+
 **There is no new field for inputs.** The files a job reads are already `Job.data_in`, which
 the converter populates; a second list would be a second source of truth for the same fact and
 the two would drift. The runner stages `data_in` into the working directory before the job

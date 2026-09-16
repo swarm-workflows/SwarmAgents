@@ -362,7 +362,22 @@ def build_command(spec: ExecutionSpec, work_dir: str,
     # exactly as it is.
     if (image and "://" not in image and not os.path.isabs(image)
             and not image.lower().endswith(_IMAGE_FILE_SUFFIXES)):
-        image = "docker://" + image
+        # Before deciding this is a registry reference, LOOK. A suffix is a hint, not proof:
+        # an apptainer **sandbox** is a directory with no extension at all
+        # (`apptainer build --sandbox mybox/ …` then `apptainer exec mybox/ …`), and an image
+        # file in the images root need not be named `.sif`. Prefixing either turns a local
+        # image into a registry pull for something that does not exist, which fails with a
+        # network error about a repository nobody published.
+        #
+        # Existence is checkable, so it is checked rather than inferred from the string. Only
+        # a reference that resolves to nothing on disk is treated as a registry reference.
+        local = resolve_under_root(image, "images", pol)
+        if local and os.path.exists(local):
+            image = local
+        elif os.path.exists(image):
+            image = os.path.abspath(image)
+        else:
+            image = "docker://" + image
     cmd = [runtime, "exec", "--bind", f"{work_dir}:{work_dir}", "--pwd", work_dir]
     for host, inside in binds:
         cmd += ["--bind", f"{host}:{inside}"]
