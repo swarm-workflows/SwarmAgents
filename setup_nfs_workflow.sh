@@ -227,6 +227,10 @@ else
     # Local disk on each agent, deliberately NOT the export -- see the header. Sequential
     # scp of a multi-GB image to 92 WAN hosts is slow; that is a one-time cost, and paying
     # it once beats paying a WAN read on every job start.
+    # Sibling of the mount point, so it is on LOCAL disk rather than the export. Printed
+    # below because it is derived, not stated: pointing runtime.execution.roots.images at a
+    # different directory is a silent misconfiguration that only shows up as every job
+    # refusing to find its image.
     IMG_DIR="$(dirname "$MOUNT_DIR")/images"
     BASE="$(basename "$STAGE_IMAGE")"
     SIZE=$(du -h "$STAGE_IMAGE" | cut -f1)
@@ -241,6 +245,7 @@ else
             || echo "      WARN: $h image copy failed" >&2
     done
     echo "      done"
+    echo "      set runtime.execution.roots.images: $IMG_DIR"
 fi
 
 echo

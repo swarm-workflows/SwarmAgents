@@ -29,7 +29,7 @@ from pegasus_profile_extractor import (  # noqa: E402
     cluster_task_ids, load_transformation_catalog, load_workflow_uses, ordered_task_ids,
 )
 from pegasus_to_swarm_converter import (  # noqa: E402
-    _map_execution, bundle_payload, rewrite_job_for_bundle,
+    _map_execution, bundle_payload, clear_previous_output, rewrite_job_for_bundle,
 )
 from swarm.models.execution import ContainerSpec, ExecutionSpec  # noqa: E402
 from swarm.models.job import Job  # noqa: E402
@@ -719,6 +719,59 @@ class TestBundling(unittest.TestCase):
                                        "also/data.csv": os.path.join(a, "data.csv")}}
             manifest = bundle_payload([({"id": "j"}, profile)], out)
             self.assertEqual(manifest["missing"], [])
+
+    def test_a_previous_conversions_jobs_do_not_survive(self):
+        """Writing a new set of job files does not replace the old one. A 4-job workflow
+        written over a 400-job synthetic run left 406 files; the distributor pushed all of
+        them and the agents spent the run scheduling a campaign that had finished days
+        earlier. Nothing said so — the run simply looked busy."""
+        with tempfile.TemporaryDirectory() as tmp:
+            for i in range(1, 21):
+                Path(tmp, f"job_{i}.json").write_text("{}")
+            Path(tmp, "conversion_summary.json").write_text("{}")
+            os.makedirs(os.path.join(tmp, "code", "old"))
+            Path(tmp, "code", "old", "old.py").write_text("STALE")
+            Path(tmp, "keep_me.txt").write_text("not ours")
+            removed = clear_previous_output(tmp)
+            self.assertGreaterEqual(removed, 21)
+            self.assertEqual([f for f in os.listdir(tmp) if f.startswith("job_")], [])
+            self.assertFalse(os.path.exists(os.path.join(tmp, "code")))
+            # Files the converter does not own are left alone.
+            self.assertTrue(os.path.exists(os.path.join(tmp, "keep_me.txt")))
+
+    def test_clearing_an_empty_or_missing_directory_is_harmless(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(clear_previous_output(tmp), 0)
+            self.assertEqual(clear_previous_output(os.path.join(tmp, "nope")), 0)
+
+    def test_a_published_job_keeps_the_fields_that_make_it_a_workflow(self):
+        """job_distributor built a Job field by field and dropped everything added since:
+        data_predicate (DAG gating), should_fail (failure replay) and execution (real
+        execution). A converted workflow reached Redis without the halves that make it one,
+        and the run looked healthy. Pinned here because the loss is silent."""
+        import job_distributor  # noqa: F401 - import is part of the assertion
+        from swarm.models.job import Job as _Job
+        record = {
+            "id": "j1", "wall_time": 1.0,
+            "capacities": {"core": 1.0, "ram": 1.0, "disk": 1.0},
+            "data_in": [{"name": "local", "file": "in.csv"}],
+            "data_out": [{"name": "local", "file": "out.csv"}],
+            "should_fail": True,
+            "data_predicate": {"kind": "files", "files": ["in.csv"]},
+            "execution": {"transformation": "t", "path": "/srv/t", "pfn": "t/t.py",
+                          "arguments": ["--x"]},
+        }
+        job = _Job()
+        job.from_dict(record)
+        self.assertIsNotNone(job.execution, "execution dropped")
+        self.assertEqual(job.data_predicate, {"kind": "files", "files": ["in.csv"]})
+        self.assertTrue(job.to_dict()['should_fail'])
+        self.assertEqual([n.file for n in job.data_in], ["in.csv"])
+        # and it survives the trip through Redis serialisation
+        back = _Job()
+        back.from_dict(job.to_dict())
+        self.assertIsNotNone(back.execution)
+        self.assertEqual(back.execution.arguments, ["--x"])
 
     def test_a_simulated_job_bundles_cleanly_with_nothing_to_copy(self):
         """Jobs with no execution block are the default case and must still convert."""

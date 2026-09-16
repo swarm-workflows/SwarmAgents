@@ -202,6 +202,10 @@ def convert_pegasus_jobs(args) -> dict:
         # One DTN per job: agents hold only a few DTNs and feasibility requires all of a
         # job's DTNs, so spreading a job's files would make multi-file jobs unschedulable.
         dtn_scope="job",
+        # Where the workflow's code actually lives on this fleet. Without it the bundler
+        # looks for the executables at the paths the SUBMIT HOST recorded, which do not
+        # exist here, and writes a bundle that converts cleanly and cannot run.
+        bundle_source_root=getattr(args, "pegasus_bundle_source_root", None),
     )
     log(f"Pegasus conversion: {result['jobs_written']} jobs written, "
         f"{result['warnings_count']} warnings")
@@ -1128,6 +1132,11 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--pegasus-profiles", default=None,
                     help="Path to Pegasus profiles file (text/export) or Redis host. "
                          "When set, jobs are converted from Pegasus profiles instead of generated synthetically.")
+    ap.add_argument(
+        "--pegasus-bundle-source-root",
+        help="Where the workflow tree lives on this fleet, so the converter can copy the "
+             "executables and root inputs into the jobs directory. Either a path (anchored "
+             "on the common parent of the recorded paths) or OLD=NEW to state the mapping.")
     ap.add_argument("--pegasus-input-type", choices=["text", "redis", "export", "json"], default="text",
                     help="Format of the Pegasus profiles source (default: text)")
     ap.add_argument("--pegasus-data-nodes", choices=["per-site", "per-file"], default="per-file",

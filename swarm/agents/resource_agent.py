@@ -3166,6 +3166,12 @@ class ResourceAgent(Agent):
         """
         job_id = job.job_id
         try:
+            # A Job rebuilt from Redis has the default `Job` logger, which is not the agent's
+            # and is not wired to the agent's log file — so everything Job.execute() reports,
+            # including a real-execution REFUSAL and its reason, went nowhere visible. The
+            # job ran, failed, and the log said only that it failed. Hand it the agent's
+            # logger so its own account of what happened lands with the rest of the run.
+            job.logger = self.logger
             self.logger.info(f"[EXECUTE] Starting job {job_id} on agent {self.agent_id}")
             if job.sub_role == "quantum":
                 # Split hybrid: produce snapshot batches into the measurement layer

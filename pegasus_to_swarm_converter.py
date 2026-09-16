@@ -706,6 +706,9 @@ def convert_pegasus_profiles(
         )
 
     os.makedirs(output_dir, exist_ok=True)
+    _stale = clear_previous_output(output_dir)
+    if _stale:
+        print(f"  Cleared:     {_stale} artefact(s) from a previous conversion")
 
     dag_note = None
     if dag_gating and data_nodes_mode != "per-file":
@@ -835,6 +838,33 @@ def convert_pegasus_profiles(
 BUNDLE_CODE = "code"
 BUNDLE_INPUTS = "inputs"
 BUNDLE_IMAGES = "images"
+
+
+def clear_previous_output(output_dir: str) -> int:
+    """Remove a previous conversion's artefacts from *output_dir*. Returns how many.
+
+    The converter owns `job_*.json` in its output directory, and writing a new set does NOT
+    replace the old one: a conversion producing fewer jobs than the last leaves the surplus
+    behind, and every consumer of that directory then reads both. Measured on the slice — a
+    4-job workflow written over a 400-job synthetic run left 406 files, the distributor
+    pushed all of them, and the agents spent the run scheduling jobs from a campaign that had
+    finished days earlier. Nothing in the run said so; it simply looked busy.
+
+    The bundle directories go too, for the same reason: last conversion's executables are not
+    this one's, and a stale `code/<transformation>/` is exactly the kind of payload that runs
+    and produces plausible output.
+    """
+    removed = 0
+    for name in os.listdir(output_dir) if os.path.isdir(output_dir) else []:
+        path = os.path.join(output_dir, name)
+        if re.fullmatch(r"job_\d+\.json", name) or name in (
+                "conversion_summary.json", "pegasus_baseline.json", "manifest.json"):
+            os.remove(path)
+            removed += 1
+        elif name in (BUNDLE_CODE, BUNDLE_INPUTS, BUNDLE_IMAGES) and os.path.isdir(path):
+            shutil.rmtree(path)
+            removed += 1
+    return removed
 
 
 def _safe_component(name: str, fallback: str = "unnamed") -> str:
@@ -1131,6 +1161,9 @@ def convert(args: argparse.Namespace):
         sys.exit(1)
 
     os.makedirs(args.output_dir, exist_ok=True)
+    _stale = clear_previous_output(args.output_dir)
+    if _stale:
+        print(f"  Cleared:     {_stale} artefact(s) from a previous conversion")
 
     dtn_map = None
     if args.dtn_map:

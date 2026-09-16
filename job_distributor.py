@@ -119,18 +119,20 @@ class JobDistributor(threading.Thread):
                     jobs.append(job)
                 return jobs
 
+        # `Job.from_dict` rather than copying fields across by hand. The hand-written version
+        # carried id, capacities, wall_time, data_in, data_out and quantum — and silently
+        # dropped every field added since, which by now meant:
+        #
+        #   data_predicate  -> DAG gating never reached the agents through this path
+        #   should_fail     -> a replayed failure profile was discarded
+        #   execution       -> real execution could not fire; jobs simulated instead
+        #
+        # None of these announced themselves. A converted workflow published to Redis simply
+        # arrived without the halves that make it a workflow, and the run looked healthy.
+        # The model already knows how to read its own serialisation; a second partial copy of
+        # that knowledge can only drift from it, and did.
         job = Job()
-        job.job_id = job_data['id']
-        job.capacities = Capacities.from_dict(job_data['capacities'])
-        job.wall_time = job_data['wall_time']
-        if job_data.get('data_in'):
-            for data_in in job_data['data_in']:
-                job.add_incoming_data_dep(DataNode.from_dict(data_in))
-        if job_data.get('data_out'):
-            for data_out in job_data['data_out']:
-                job.add_outgoing_data_dep(DataNode.from_dict(data_out))
-        if job_data.get('quantum'):
-            job.quantum = job_data['quantum']
+        job.from_dict(job_data)
         return [job]
 
     def run(self) -> None:
