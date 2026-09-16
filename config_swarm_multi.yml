@@ -99,6 +99,19 @@ runtime:
     path_rewrites: []
     #   - from: /home/ubuntu/soilmoisture-workflow
     #     to:   /export/swarm-wf/soilmoisture
+    # Where the three kinds of thing a job needs live, for jobs that name them RELATIVELY.
+    # These map onto fields that already exist rather than adding new ones:
+    #   code   <- execution.pfn        (the executable)
+    #   inputs <- the job's data_in    (the files it reads; staged into work_dir before it runs)
+    #   images <- execution.container.image
+    # An ABSOLUTE path is used as written, so a Pegasus-derived job keeps resolving through
+    # path_rewrites exactly as before; roots are how a hand-authored job says "bin/analyze.py".
+    # A relative path with no root configured is a refusal naming the missing key, never a
+    # guess at a base directory.
+    roots: {}
+    #   code:   /export/swarm-wf/workflows/soilmoisture-workflow
+    #   inputs: /export/swarm-wf/inputs
+    #   images: /root/wf-images
     # Substitute an image by container NAME. The catalogs here declare singularity .sif images
     # while the agent VMs have only Docker; which image stands in for which is a deployment
     # decision with real consequences for what is measured, so it is stated here and never

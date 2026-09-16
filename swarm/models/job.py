@@ -544,7 +544,9 @@ class Job(Object):
         """
         from swarm.execution import runner
 
-        result = runner.run(self._execution, self.job_id)
+        # `data_in` is the job's own declaration of what it reads; the runner stages from
+        # it rather than from a second list on the execution spec.
+        result = runner.run(self._execution, self.job_id, data_in=self.data_in)
         if result.refused:
             self.logger.error(
                 "[EXEC] Job %s REFUSED (not run): %s. This is a configuration problem and "

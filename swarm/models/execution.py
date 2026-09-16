@@ -93,6 +93,10 @@ class ExecutionSpec(JSONField):
         self.pfn = ""                       # host path of the code staged to `path`
         self.pfn_type = ""                  # stageable | installed
         self.arguments: Optional[List[str]] = []
+        # NOTE: there is deliberately no `inputs` field here. The files a job needs are
+        # already `Job.data_in`, which the converter populates from the workflow; a second
+        # list would be a second source of truth for the same fact, and the two would drift.
+        # The runner stages from `data_in` — see `swarm/execution/runner.py`.
         self.container: Optional[ContainerSpec] = None
         self._set_fields(**kwargs)
 

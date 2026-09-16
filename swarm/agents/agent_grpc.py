@@ -160,6 +160,7 @@ class Agent(Observer):
             path_rewrites=cfg.get("path_rewrites", ()) or (),
             image_overrides=dict(cfg.get("image_overrides", {}) or {}),
             capture_output=bool(cfg.get("capture_output", True)),
+            roots=dict(cfg.get("roots", {}) or {}),
         )
         if mode == "real":
             self.logger.warning(

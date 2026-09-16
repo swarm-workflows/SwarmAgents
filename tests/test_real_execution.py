@@ -497,5 +497,137 @@ class TestEnvironmentIsScrubbed(PolicyTestCase):
             self.assertEqual(Path(result.stdout_path).read_text().strip(), "ABSENT")
 
 
+# --------------------------------------------------------------------------------------
+# Roots: naming code, inputs and images without absolute paths.
+# --------------------------------------------------------------------------------------
+
+class _Node:
+    """Just enough DataNode for staging."""
+    def __init__(self, file):
+        self.file = file
+        self.name = "local"
+
+
+class TestRoots(PolicyTestCase):
+    def test_an_absolute_pfn_is_used_as_written(self):
+        """A Pegasus-derived job carries absolute submit-host paths and must keep resolving
+        through path_rewrites exactly as before roots existed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            real = script(tmp, "a.sh", "exit 0")
+            runner.configure(container_runtime="none",
+                             roots={"code": "/wrong/place"})
+            spec = ExecutionSpec.from_dict({"path": "/srv/x", "arguments": [], "pfn": real})
+            cmd, reason = runner.build_command(spec, "/w")
+        self.assertEqual(cmd[0], real)
+
+    def test_a_relative_pfn_resolves_under_the_code_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "bin"))
+            script(os.path.join(tmp, "bin"), "analyze.py", "exit 0")
+            runner.configure(container_runtime="none", roots={"code": tmp})
+            spec = ExecutionSpec.from_dict(
+                {"path": "/srv/x", "arguments": [], "pfn": "bin/analyze.py"})
+            cmd, reason = runner.build_command(spec, "/w")
+        self.assertEqual(cmd[0], os.path.join(tmp, "bin", "analyze.py"))
+
+    def test_a_relative_pfn_with_no_root_is_refused_not_guessed(self):
+        """Falling back to the process cwd would run whatever happened to sit there."""
+        runner.configure(container_runtime="none", roots={})
+        spec = ExecutionSpec.from_dict(
+            {"path": "/srv/x", "arguments": [], "pfn": "bin/analyze.py"})
+        cmd, reason = runner.build_command(spec, "/w")
+        self.assertEqual(cmd, [])
+
+    def test_a_relative_image_resolves_under_the_images_root(self):
+        runner.configure(container_runtime="apptainer", roots={"images": "/imgs"})
+        spec = ExecutionSpec.from_dict({
+            "path": "/srv/x", "arguments": [], "pfn_type": "installed",
+            "container": {"name": "c", "kind": "singularity", "image": "Soil.sif"}})
+        self.assertEqual(runner.resolve_image(spec), "/imgs/Soil.sif")
+
+    def test_a_docker_uri_is_not_treated_as_a_relative_name(self):
+        runner.configure(container_runtime="docker", roots={"images": "/imgs"})
+        spec = ExecutionSpec.from_dict({
+            "path": "/srv/x", "arguments": [], "pfn_type": "installed",
+            "container": {"name": "c", "kind": "docker", "image": "docker://repo/img:1"}})
+        self.assertEqual(runner.resolve_image(spec), "docker://repo/img:1")
+
+
+class TestInputStaging(PolicyTestCase):
+    def test_a_declared_input_is_staged_from_the_inputs_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            inputs = os.path.join(tmp, "in"); os.makedirs(inputs)
+            Path(inputs, "polygons.json").write_text("{}")
+            work = os.path.join(tmp, "work"); os.makedirs(work)
+            runner.configure(roots={"inputs": inputs})
+            staged, refusal = runner.stage_inputs([_Node("polygons.json")], work)
+            self.assertEqual(refusal, "")
+            self.assertEqual(staged, ["polygons.json"])
+            self.assertTrue(os.path.exists(os.path.join(work, "polygons.json")))
+
+    def test_an_existing_file_is_never_overwritten(self):
+        """It is a parent job's output. Replacing it with a stale replica corrupts the DAG in
+        the most confusing way available: the parent ran, the child read something else."""
+        with tempfile.TemporaryDirectory() as tmp:
+            inputs = os.path.join(tmp, "in"); os.makedirs(inputs)
+            Path(inputs, "shared.csv").write_text("STALE")
+            work = os.path.join(tmp, "work"); os.makedirs(work)
+            Path(work, "shared.csv").write_text("FRESH-FROM-PARENT")
+            runner.configure(roots={"inputs": inputs})
+            staged, refusal = runner.stage_inputs([_Node("shared.csv")], work)
+            self.assertEqual(refusal, "")
+            self.assertEqual(staged, [])
+            self.assertEqual(Path(work, "shared.csv").read_text(), "FRESH-FROM-PARENT")
+
+    def test_a_missing_input_is_refused_not_ignored(self):
+        """A job without its input usually does not fail — it produces empty or default
+        output, which looks like a result until someone checks the numbers."""
+        with tempfile.TemporaryDirectory() as tmp:
+            inputs = os.path.join(tmp, "in"); os.makedirs(inputs)
+            work = os.path.join(tmp, "work"); os.makedirs(work)
+            runner.configure(roots={"inputs": inputs})
+            staged, refusal = runner.stage_inputs([_Node("absent.json")], work)
+        self.assertIn("absent.json", refusal)
+
+    def test_a_job_refuses_to_run_when_an_input_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = script(tmp, "ok.sh", "exit 0")
+            runner.configure(mode="real", work_dir=os.path.join(tmp, "work"),
+                             container_runtime="none", roots={"inputs": tmp})
+            res = runner.run(ExecutionSpec.from_dict(
+                {"path": "/u", "pfn": path, "arguments": []}), "j",
+                data_in=[_Node("nope.csv")])
+        self.assertTrue(res.refused)
+        self.assertIn("nope.csv", res.reason)
+
+    def test_staging_is_atomic_so_a_partial_file_is_never_visible(self):
+        """The working directory is shared and several agents stage concurrently; a
+        half-written file is readable and looks complete."""
+        with tempfile.TemporaryDirectory() as tmp:
+            inputs = os.path.join(tmp, "in"); os.makedirs(inputs)
+            Path(inputs, "big.bin").write_bytes(b"x" * 4096)
+            work = os.path.join(tmp, "work"); os.makedirs(work)
+            runner.configure(roots={"inputs": inputs})
+            seen = []
+            real_replace = os.replace
+
+            def watch(src, dst):
+                # At the moment of the rename the destination must not already exist as a
+                # partial file: the copy went to a temporary name.
+                seen.append(os.path.exists(dst))
+                return real_replace(src, dst)
+
+            with patch("os.replace", side_effect=watch):
+                runner.stage_inputs([_Node("big.bin")], work)
+            self.assertEqual(seen, [False])
+            self.assertEqual(Path(work, "big.bin").read_bytes(), b"x" * 4096)
+
+    def test_no_inputs_is_not_an_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner.configure(roots={})
+            self.assertEqual(runner.stage_inputs([], tmp), ([], ""))
+            self.assertEqual(runner.stage_inputs(None, tmp), ([], ""))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -164,6 +164,55 @@ runtime:
         to:   /root/wf-images
 ```
 
+### 2.4 Roots — for jobs you author yourself
+
+`path_rewrites` exists because a Pegasus catalog records **absolute** submit-host paths that do
+not exist on this fleet. A job written by hand has no such history and should not have to
+invent one. For those, say where the three kinds of thing live:
+
+```yaml
+runtime:
+  execution:
+    roots:
+      code:   /export/swarm-wf/workflows/soilmoisture-workflow
+      inputs: /export/swarm-wf/inputs
+      images: /root/wf-images
+```
+
+and name them relatively:
+
+```json
+"data_in":   [{"name": "local", "file": "field1_soil_data.csv"}],
+"execution": {"path": "/srv/analyze_moisture",
+              "pfn":  "bin/analyze_moisture.py",
+              "arguments": ["--input", "field1_soil_data.csv", "--output", "out.json"],
+              "container": {"kind": "singularity", "image": "SoilMoisture_Container.sif"}}
+```
+
+**The rule is one line:** an absolute path is used as written (so every Pegasus-derived job
+keeps resolving through `path_rewrites` exactly as before), a relative one resolves under its
+root. A relative path with no root configured is a **refusal naming the missing key** — never
+a fall back to the process's working directory, which would run whatever happened to sit
+there.
+
+**There is no new field for inputs.** The files a job reads are already `Job.data_in`, which
+the converter populates; a second list would be a second source of truth for the same fact and
+the two would drift. The runner stages `data_in` into the working directory before the job
+starts, under three rules that each prevent a quiet corruption:
+
+* **Never overwrite.** A file already in the working directory is a parent job's output or
+  another agent's copy. Replacing the first with a stale replica corrupts a DAG in the most
+  confusing way available — the parent ran, the child read something else.
+* **Copy atomically** (temp name in the same directory, then `os.replace`). The working
+  directory is shared and several agents stage concurrently; a half-written file is readable
+  and looks complete.
+* **Refuse a missing input.** A job without its input usually does not fail — it writes empty
+  or default output, which is indistinguishable from a real result until someone checks the
+  numbers.
+
+Only files the run does *not* produce belong in the inputs root. An intermediate is produced
+by its parent into the shared working directory.
+
 **Two rewrites, deliberately.** A catalog's paths are all under the workflow root, but the
 code and the image want to live in different places: code on the shared export (small, and
 every agent must see the same bytes), the multi-gigabyte image on each agent's **local disk**.

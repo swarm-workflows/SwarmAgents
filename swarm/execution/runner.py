@@ -35,6 +35,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -117,6 +118,15 @@ class ExecutionPolicy:
     path_rewrites: Tuple[Tuple[str, str], ...] = ()
     image_overrides: Dict[str, str] = field(default_factory=dict)
     capture_output: bool = True
+    # Where to find the three kinds of thing a job needs, for jobs that name them RELATIVELY.
+    # They map onto fields that already exist rather than introducing new ones:
+    #   code   <- ExecutionSpec.pfn          (the executable)
+    #   inputs <- Job.data_in                (the files it reads)
+    #   images <- ContainerSpec.image        (the container)
+    # An ABSOLUTE path is used as written, so a Pegasus-derived job -- whose catalog records
+    # absolute submit-host paths -- keeps working through `path_rewrites` exactly as before.
+    # Relative is for jobs authored directly, where a root is the natural way to say it.
+    roots: Dict[str, str] = field(default_factory=dict)
 
     def enabled(self) -> bool:
         return str(self.mode).lower() == "real"
@@ -162,6 +172,29 @@ def rewrite_path(path: str, pol: Optional[ExecutionPolicy] = None) -> str:
     return path
 
 
+def resolve_under_root(path: str, kind: str, pol: Optional[ExecutionPolicy] = None) -> str:
+    """Resolve one path: absolute as written (after rewrites), relative under its root.
+
+    The split is what lets one mechanism serve two quite different callers. A job converted
+    from a Pegasus run carries absolute submit-host paths, which `path_rewrites` maps onto
+    this fleet; a job authored by hand says `bin/analyze.py` and means "in the code root".
+    Neither has to know about the other.
+
+    Returns "" when a relative path is given and no root is configured for its kind, which
+    the caller turns into a refusal naming the missing key — guessing a base directory would
+    run whatever happened to sit at that relative path from the process's cwd.
+    """
+    if not path:
+        return ""
+    if os.path.isabs(path):
+        return rewrite_path(path, pol)
+    pol = pol or _POLICY
+    root = (pol.roots or {}).get(kind, "")
+    if not root:
+        return ""
+    return os.path.join(root, path)
+
+
 def resolve_image(spec: ExecutionSpec, pol: Optional[ExecutionPolicy] = None) -> str:
     """The image reference to hand the runtime, with the catalog's URI scheme honoured.
 
@@ -182,6 +215,11 @@ def resolve_image(spec: ExecutionSpec, pol: Optional[ExecutionPolicy] = None) ->
         # A file:// image is a local path under every runtime, so it resolves the same way
         # for all of them and the rewrite applies here.
         return rewrite_path(image[len("file://"):], pol)
+    if image and not os.path.isabs(image) and "://" not in image:
+        # A bare relative name means "in the images root" -- how a hand-authored job names
+        # its container. An empty result (no root configured) falls through to the refusal
+        # in `build_command`, which names the key rather than guessing a directory.
+        return resolve_under_root(image, "images", pol) or image
     # `docker://` is deliberately NOT stripped here: whether it belongs depends on the
     # runtime, so it is decided in `build_command`. Docker wants a bare `repo:tag`;
     # apptainer *requires* the scheme (`apptainer exec docker://repo:tag`) and, given a bare
@@ -227,7 +265,7 @@ def build_command(spec: ExecutionSpec, work_dir: str,
     if container is None:
         # No container: run the staged code directly. `spec.path` is an in-container path and
         # is meaningless here, so the pfn is the only thing that can be executed.
-        target = rewrite_path(spec.pfn or "", pol)
+        target = resolve_under_root(spec.pfn or "", "code", pol)
         if not target:
             return [], "no container and no pfn: nothing to execute"
         if not os.path.exists(target):
@@ -261,7 +299,7 @@ def build_command(spec: ExecutionSpec, work_dir: str,
     # already in the image and must not be shadowed by a bind.
     binds: List[Tuple[str, str]] = []
     if (spec.pfn_type or "").lower() != "installed" and spec.pfn:
-        host_pfn = rewrite_path(spec.pfn, pol)
+        host_pfn = resolve_under_root(spec.pfn, "code", pol)
         if not os.path.exists(host_pfn):
             return [], f"staged code not found at {host_pfn} (after path_rewrites)"
         binds.append((host_pfn, spec.path))
@@ -287,10 +325,56 @@ def build_command(spec: ExecutionSpec, work_dir: str,
     return cmd, ""
 
 
+def stage_inputs(data_in, work_dir: str,
+                 pol: Optional[ExecutionPolicy] = None) -> Tuple[List[str], str]:
+    """Put the job's declared inputs in the working directory. Returns (staged, refusal).
+
+    Driven by `Job.data_in`, which already records what a job reads — there is no second list
+    to keep in step with it.
+
+    Three rules, and each is a way this would otherwise go quietly wrong:
+
+    * **Never overwrite.** A file already in the working directory is either a parent job's
+      output or another agent's copy of the same input. Overwriting the first with a stale
+      replica would corrupt a DAG in the most confusing way available: the parent ran, the
+      child read something else.
+    * **Copy atomically.** The working directory is shared, and several agents stage
+      concurrently; a half-written file is readable and looks complete. Write to a unique
+      temporary name in the same directory, then `os.replace`, which is atomic on POSIX.
+    * **Refuse a missing input**, rather than letting the job start without it. A job whose
+      input is absent does not usually fail — it produces empty or default output, which is
+      indistinguishable from a real result until someone checks the numbers.
+    """
+    pol = pol or _POLICY
+    staged: List[str] = []
+    for node in data_in or []:
+        name = getattr(node, "file", None) or getattr(node, "name", None)
+        if not name:
+            continue
+        name = os.path.basename(str(name))
+        dest = os.path.join(work_dir, name)
+        if os.path.exists(dest):
+            continue                        # parent output, or already staged
+        src = resolve_under_root(name, "inputs", pol)
+        if not src or not os.path.isfile(src):
+            return staged, (f"input {name!r} is not in the working directory and was not "
+                            f"found in the inputs root "
+                            f"({(pol.roots or {}).get('inputs') or 'runtime.execution.roots.inputs unset'})")
+        try:
+            tmp = f"{dest}.staging.{os.getpid()}.{threading.get_ident()}"
+            shutil.copy2(src, tmp)
+            os.replace(tmp, dest)
+            staged.append(name)
+        except OSError as exc:
+            return staged, f"could not stage input {name!r}: {exc}"
+    return staged, ""
+
+
 def run(spec: ExecutionSpec, job_id: str,
         work_dir: Optional[str] = None,
         timeout_s: Optional[float] = None,
-        pol: Optional[ExecutionPolicy] = None) -> ExecutionResult:
+        pol: Optional[ExecutionPolicy] = None,
+        data_in=None) -> ExecutionResult:
     """Execute one job and return its real outcome.
 
     Never raises: a refusal and a crash are both reported as an `ExecutionResult`, because
@@ -312,6 +396,12 @@ def run(spec: ExecutionSpec, job_id: str,
     except OSError as exc:
         return ExecutionResult(exit_status=1, refused=True,
                                reason=f"working directory {work_dir} unusable: {exc}")
+
+    # Inputs first: a missing one is a configuration problem, and finding that out before
+    # starting a container is both faster and a clearer error than after.
+    _staged, staging_refusal = stage_inputs(data_in, work_dir, pol)
+    if staging_refusal:
+        return ExecutionResult(exit_status=1, refused=True, reason=staging_refusal)
 
     cmd, refusal = build_command(spec, work_dir, pol)
     if not cmd:
