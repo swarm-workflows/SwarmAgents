@@ -609,18 +609,90 @@ class TestInputStaging(PolicyTestCase):
             work = os.path.join(tmp, "work"); os.makedirs(work)
             runner.configure(roots={"inputs": inputs})
             seen = []
-            real_replace = os.replace
+            real_link = os.link
 
             def watch(src, dst):
-                # At the moment of the rename the destination must not already exist as a
-                # partial file: the copy went to a temporary name.
+                # At the moment the name appears the destination must not already exist as
+                # a partial file: the copy went to a temporary name first.
                 seen.append(os.path.exists(dst))
-                return real_replace(src, dst)
+                return real_link(src, dst)
 
-            with patch("os.replace", side_effect=watch):
+            with patch("os.link", side_effect=watch):
                 runner.stage_inputs([_Node("big.bin")], work)
             self.assertEqual(seen, [False])
             self.assertEqual(Path(work, "big.bin").read_bytes(), b"x" * 4096)
+            self.assertEqual([p for p in os.listdir(work) if ".staging." in p], [])
+
+    def test_a_parent_output_written_during_the_copy_is_not_clobbered(self):
+        """The existence check is check-then-act: a parent job can finish while the copy is
+        in flight. A replace would then overwrite a fresh result with a stale replica —
+        the never-overwrite rule defeated through a window rather than directly."""
+        with tempfile.TemporaryDirectory() as tmp:
+            inputs = os.path.join(tmp, "in"); os.makedirs(inputs)
+            Path(inputs, "shared.csv").write_text("STALE")
+            work = os.path.join(tmp, "work"); os.makedirs(work)
+            runner.configure(roots={"inputs": inputs})
+            real_copy = __import__("shutil").copy2
+
+            def racing_copy(src, dst):
+                out = real_copy(src, dst)
+                # the parent finishes right here, after the existence check
+                Path(work, "shared.csv").write_text("FRESH-FROM-PARENT")
+                return out
+
+            with patch("shutil.copy2", side_effect=racing_copy):
+                staged, refusal = runner.stage_inputs([_Node("shared.csv")], work)
+            self.assertEqual(refusal, "")
+            self.assertEqual(staged, [])
+            self.assertEqual(Path(work, "shared.csv").read_text(), "FRESH-FROM-PARENT")
+            self.assertEqual([p for p in os.listdir(work) if ".staging." in p], [])
+
+    def test_a_site_name_is_never_treated_as_a_file(self):
+        """On a DataNode `name` is the SITE (`local`, `dtn3`) and `file` is the file name.
+        Falling back to `name` would try to stage a file called "dtn3" and refuse a job
+        that was fine."""
+        node = _Node(None)
+        node.name = "dtn3"
+        with tempfile.TemporaryDirectory() as tmp:
+            runner.configure(roots={"inputs": tmp})
+            staged, refusal = runner.stage_inputs([node], tmp)
+        self.assertEqual((staged, refusal), ([], ""))
+
+    def test_a_path_in_a_declared_name_cannot_escape_the_work_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            inputs = os.path.join(tmp, "in"); os.makedirs(inputs)
+            Path(inputs, "passwd").write_text("staged-not-escaped")
+            work = os.path.join(tmp, "work"); os.makedirs(work)
+            runner.configure(roots={"inputs": inputs})
+            staged, refusal = runner.stage_inputs([_Node("../../etc/passwd")], work)
+            self.assertEqual(staged, ["passwd"])
+            self.assertTrue(os.path.isfile(os.path.join(work, "passwd")))
+
+
+class TestUnresolvableRelativePaths(PolicyTestCase):
+    """A relative path with no root must refuse, and say which key is missing."""
+
+    def test_a_relative_pfn_without_a_code_root_names_the_key(self):
+        runner.configure(container_runtime="none", roots={})
+        spec = ExecutionSpec.from_dict(
+            {"path": "/srv/x", "arguments": [], "pfn": "bin/analyze.py"})
+        cmd, reason = runner.build_command(spec, "/w")
+        self.assertEqual(cmd, [])
+        self.assertIn("roots.code", reason)
+        self.assertNotIn("no pfn", reason)      # there IS one; it just cannot be resolved
+
+    def test_a_relative_image_without_an_images_root_refuses(self):
+        """Returning the bare name would hand the runtime a relative path, which it
+        resolves against the process's own working directory."""
+        runner.configure(container_runtime="apptainer", roots={})
+        spec = ExecutionSpec.from_dict({
+            "path": "/srv/x", "arguments": [], "pfn_type": "installed",
+            "container": {"name": "c", "kind": "singularity", "image": "Soil.sif"}})
+        self.assertEqual(runner.resolve_image(spec), "")
+        with patch("shutil.which", return_value="/usr/bin/apptainer"):
+            cmd, reason = runner.build_command(spec, "/w")
+        self.assertEqual(cmd, [])
+        self.assertIn("roots.images", reason)
 
     def test_no_inputs_is_not_an_error(self):
         with tempfile.TemporaryDirectory() as tmp:

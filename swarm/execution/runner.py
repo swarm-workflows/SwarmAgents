@@ -217,9 +217,11 @@ def resolve_image(spec: ExecutionSpec, pol: Optional[ExecutionPolicy] = None) ->
         return rewrite_path(image[len("file://"):], pol)
     if image and not os.path.isabs(image) and "://" not in image:
         # A bare relative name means "in the images root" -- how a hand-authored job names
-        # its container. An empty result (no root configured) falls through to the refusal
-        # in `build_command`, which names the key rather than guessing a directory.
-        return resolve_under_root(image, "images", pol) or image
+        # its container. Returning the bare name when no root is configured would hand the
+        # runtime a relative path, which it resolves against the process's own working
+        # directory: the exact fall-back this is documented not to do. Return "" so
+        # `build_command` refuses and names the key.
+        return resolve_under_root(image, "images", pol)
     # `docker://` is deliberately NOT stripped here: whether it belongs depends on the
     # runtime, so it is decided in `build_command`. Docker wants a bare `repo:tag`;
     # apptainer *requires* the scheme (`apptainer exec docker://repo:tag`) and, given a bare
@@ -265,15 +267,26 @@ def build_command(spec: ExecutionSpec, work_dir: str,
     if container is None:
         # No container: run the staged code directly. `spec.path` is an in-container path and
         # is meaningless here, so the pfn is the only thing that can be executed.
-        target = resolve_under_root(spec.pfn or "", "code", pol)
-        if not target:
+        if not spec.pfn:
             return [], "no container and no pfn: nothing to execute"
+        target = resolve_under_root(spec.pfn, "code", pol)
+        if not target:
+            # Distinguished from "no pfn at all": there IS one, it is relative, and nothing
+            # says what it is relative to. Reporting the generic message would send a reader
+            # looking for a missing field that is present.
+            return [], (f"pfn {spec.pfn!r} is relative and runtime.execution.roots.code is "
+                        f"not set, so it cannot be resolved")
         if not os.path.exists(target):
             return [], f"executable not found at {target} (after path_rewrites)"
         return [target] + args, ""
 
     image = resolve_image(spec, pol)
     if not image:
+        declared = container.image or ""
+        if declared and not os.path.isabs(declared) and "://" not in declared:
+            return [], (f"container image {declared!r} is relative and "
+                        f"runtime.execution.roots.images is not set, so it cannot be "
+                        f"resolved")
         return [], f"container {container.name!r} has no resolvable image"
     runtime = _available_runtime(container.kind, pol)
     if runtime is None:
@@ -300,8 +313,11 @@ def build_command(spec: ExecutionSpec, work_dir: str,
     binds: List[Tuple[str, str]] = []
     if (spec.pfn_type or "").lower() != "installed" and spec.pfn:
         host_pfn = resolve_under_root(spec.pfn, "code", pol)
+        if not host_pfn:
+            return [], (f"pfn {spec.pfn!r} is relative and runtime.execution.roots.code is "
+                        f"not set, so it cannot be resolved")
         if not os.path.exists(host_pfn):
-            return [], f"staged code not found at {host_pfn} (after path_rewrites)"
+            return [], f"staged code not found at {host_pfn}"
         binds.append((host_pfn, spec.path))
 
     if runtime == "docker":
@@ -348,24 +364,55 @@ def stage_inputs(data_in, work_dir: str,
     pol = pol or _POLICY
     staged: List[str] = []
     for node in data_in or []:
-        name = getattr(node, "file", None) or getattr(node, "name", None)
+        # `DataNode.name` is the SITE (`local`, `dtn3`); `file` is the logical file name.
+        # Only `file` may be used here — falling back to `name` would try to stage a file
+        # called "dtn3". A per-site conversion carries no `file` at all, so such a node
+        # simply describes where data lives and has nothing to stage; skip it rather than
+        # invent a name. (Per-file conversion, which `--dag-gating` already forces, is what
+        # produces stageable nodes.)
+        name = getattr(node, "file", None)
         if not name:
             continue
+        # basename is the traversal guard: a declared name may not escape the working
+        # directory, whatever the workflow says.
         name = os.path.basename(str(name))
+        if not name or name in (".", ".."):
+            continue
         dest = os.path.join(work_dir, name)
         if os.path.exists(dest):
             continue                        # parent output, or already staged
         src = resolve_under_root(name, "inputs", pol)
-        if not src or not os.path.isfile(src):
+        if not src:
+            return staged, (f"input {name!r} is not in the working directory and "
+                            f"runtime.execution.roots.inputs is not set, so there is nowhere "
+                            f"to stage it from")
+        if not os.path.isfile(src):
             return staged, (f"input {name!r} is not in the working directory and was not "
-                            f"found in the inputs root "
-                            f"({(pol.roots or {}).get('inputs') or 'runtime.execution.roots.inputs unset'})")
+                            f"found in the inputs root ({(pol.roots or {})['inputs']})")
+        tmp = f"{dest}.staging.{os.getpid()}.{threading.get_ident()}"
         try:
-            tmp = f"{dest}.staging.{os.getpid()}.{threading.get_ident()}"
             shutil.copy2(src, tmp)
-            os.replace(tmp, dest)
-            staged.append(name)
+            # Exclusive link, NOT os.replace. The existence check above is check-then-act:
+            # a parent job can finish and write its output during the copy, and a replace
+            # would then clobber a fresh result with a stale replica -- precisely the
+            # corruption the never-overwrite rule exists to prevent, just through a window
+            # instead of directly. os.link fails if the destination exists, which makes the
+            # rule atomic rather than merely intended.
+            try:
+                os.link(tmp, dest)
+                staged.append(name)
+            except FileExistsError:
+                pass                        # someone won the race; their copy stands
+            finally:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
         except OSError as exc:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
             return staged, f"could not stage input {name!r}: {exc}"
     return staged, ""
 

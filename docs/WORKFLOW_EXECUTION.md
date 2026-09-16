@@ -203,15 +203,27 @@ starts, under three rules that each prevent a quiet corruption:
 * **Never overwrite.** A file already in the working directory is a parent job's output or
   another agent's copy. Replacing the first with a stale replica corrupts a DAG in the most
   confusing way available — the parent ran, the child read something else.
-* **Copy atomically** (temp name in the same directory, then `os.replace`). The working
-  directory is shared and several agents stage concurrently; a half-written file is readable
-  and looks complete.
+* **Copy atomically, and create exclusively.** The copy goes to a temporary name in the same
+  directory (the working directory is shared and several agents stage concurrently; a
+  half-written file is readable and looks complete), and the destination is then created with
+  `os.link`, **not** `os.replace`. The existence check above is check-then-act: a parent job
+  can finish *during* the copy, and a replace would overwrite that fresh result with a stale
+  replica — the never-overwrite rule defeated through a window rather than directly.
+  `os.link` fails when the destination exists, which makes the rule atomic rather than
+  merely intended.
 * **Refuse a missing input.** A job without its input usually does not fail — it writes empty
   or default output, which is indistinguishable from a real result until someone checks the
   numbers.
 
 Only files the run does *not* produce belong in the inputs root. An intermediate is produced
 by its parent into the shared working directory.
+
+Staging reads `DataNode.file`, never `DataNode.name` — on a data node **`name` is the site**
+(`local`, `dtn3`) and `file` is the logical file name. A per-site conversion carries no `file`
+at all, so its nodes describe where data lives and have nothing to stage; they are skipped
+rather than given an invented name. Per-file conversion, which `--dag-gating` already forces,
+is what produces stageable nodes. A declared name is reduced to its basename, so a workflow
+cannot name a path that escapes the working directory.
 
 **Two rewrites, deliberately.** A catalog's paths are all under the workflow root, but the
 code and the image want to live in different places: code on the shared export (small, and
