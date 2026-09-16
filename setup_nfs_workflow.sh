@@ -100,10 +100,20 @@ if [[ $CHECK_ONLY -eq 1 ]]; then
     echo "export dir: $EXPORT_DIR $([[ -d $EXPORT_DIR ]] && echo present || echo MISSING)"
     echo "exports:"; exportfs -s 2>/dev/null | sed 's/^/  /' || echo "  (none)"
     echo "=== agents (mounted at $MOUNT_DIR) ==="
-    printf '%s\n' "${HOSTS[@]}" | xargs -P 40 -I{} bash -c "
+    results=$(printf '%s\n' "${HOSTS[@]}" | xargs -P 40 -I{} bash -c "
         out=\$($SSH {} \"findmnt -n -o SOURCE --target $MOUNT_DIR 2>/dev/null\" 2>&1) || out=''
-        if [[ \"\$out\" == *:* ]]; then echo \"MOUNTED {} \$out\"; else echo \"NOT-MOUNTED {}\"; fi" \
-        | sort | uniq -c -f1 -s0 | sed 's/^/  /' || true
+        if [[ \"\$out\" == *:* ]]; then echo \"MOUNTED {} \$out\"; else echo \"NOT-MOUNTED {}\"; fi")
+    echo "$results" | sort | sed 's/^/  /'
+    # Exit non-zero when anything is missing, so a campaign script can gate a run on this
+    # instead of parsing the output. A partial setup that reports success is the same class
+    # of defect as a mount that exists but cannot be written to: it stays invisible until a
+    # job lands on one of the hosts that was never set up.
+    unmounted=$(echo "$results" | grep -c '^NOT-MOUNTED' || true)
+    if ! systemctl is-active --quiet nfs-server 2>/dev/null || [[ "$unmounted" -gt 0 ]]; then
+        echo "NOT READY: $unmounted/${#HOSTS[@]} host(s) unmounted" >&2
+        exit 1
+    fi
+    echo "READY: ${#HOSTS[@]}/${#HOSTS[@]} host(s) mounted"
     exit 0
 fi
 
@@ -181,7 +191,15 @@ for h in "${HOSTS[@]}"; do
     mount_one "$h" >/dev/null 2>&1 || FAILED+=("$h")
 done
 echo "      mounted on $(( ${#HOSTS[@]} - ${#FAILED[@]} ))/${#HOSTS[@]}"
-[[ ${#FAILED[@]} -gt 0 ]] && echo "      FAILED: ${FAILED[*]}"
+if [[ ${#FAILED[@]} -gt 0 ]]; then
+    # Deliberately fatal rather than a warning. Continuing would run the write probe against
+    # the one host that happened to work and print a success banner for a fleet that is only
+    # partly set up; the first sign of trouble would then be a job failing on a host nobody
+    # remembers skipping.
+    echo "      FAILED: ${FAILED[*]}" >&2
+    echo "Refusing to report success for a partial setup. Fix or exclude those hosts and rerun." >&2
+    exit 1
+fi
 
 # ------------------------------------------------------------------- write-through check
 # A mount that exists but cannot be written to is the failure this whole step is meant to
