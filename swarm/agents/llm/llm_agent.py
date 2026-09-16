@@ -1339,6 +1339,10 @@ class LlmAgent(ResourceAgent):
                     self.logger.debug(f"Identified jobs to propose: {proposals}")
                     if self.debug:
                         self.logger.info(f"Identified jobs to select: {jobs}")
+                    # `agents` is this agent alone at every level here — the LLM plane scores
+                    # only itself by design — so the width recorded is 1 and the tier's
+                    # proposers-per-job is what `designate_bidder` is trying to bring down.
+                    self._note_proposals(proposals, assignees=len(agents))
                     self.engine.propose(proposals=proposals)
                     proposals.clear()
 

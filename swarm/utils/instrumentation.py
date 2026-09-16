@@ -186,6 +186,79 @@ class MessageCounters:
         }
 
 
+# ---------------------------------------------------------------------- proposal accounting
+
+class SelectionCounters:
+    """What this agent proposed, and how wide the cost matrix behind each proposal was.
+
+    Exists to separate the two candidate causes of the hierarchical PBFT collapse E5/F2
+    report. A messages-per-job curve cannot tell "PBFT costs O(n^2) per decision" from "the
+    coordinator tier runs n decisions per job", and the second is real: `selection_main`
+    builds the cost matrix over `[self]` alone at level > 0, and the LLM plane scores only
+    itself at every level, so every agent holding the job proposes itself for it.
+    `proposers_per_job` by tier is what makes the two separable.
+
+    Counting rules, each of them a mistake already made once in this tree:
+
+    * **Distinct jobs, never per loop pass.** `pending_queue.gets()` is a non-destructive
+      peek, so an unplaced job reappears about twice a second; a counter bumped per pass
+      measures the length of the run, not the fan-out (this is what inflated `deferred`
+      ~60x in P0-8).
+    * **Re-proposals are their own column**, `proposals_issued - jobs_proposed`. A
+      reselection timeout re-proposes the same job, and folding that into either the
+      numerator or the denominator of proposers-per-job would move it for a reason that has
+      nothing to do with tier width.
+    * **`assignees` is the matrix width, not the peer count.** 1 means the agent scored only
+      itself, which is the structural cause; recording it here means a run says which regime
+      it was in instead of the reader inferring it from the config.
+    """
+
+    __slots__ = ("_lock", "level", "_issued", "_jobs", "_assignee_sum", "_assignee_batches",
+                 "_assignee_min", "_assignee_max")
+
+    def __init__(self, level: Optional[int] = None):
+        self._lock = threading.Lock()
+        self.level = level
+        self._issued = 0
+        self._jobs: set = set()
+        self._assignee_sum = 0
+        self._assignee_batches = 0
+        self._assignee_min: Optional[int] = None
+        self._assignee_max: Optional[int] = None
+
+    def record_proposals(self, object_ids: Iterable[Any], assignees: Optional[int] = None) -> None:
+        """One call per `engine.propose()` batch, with the ids actually proposed."""
+        ids = [str(o) for o in object_ids]
+        if not ids:
+            return
+        with self._lock:
+            self._issued += len(ids)
+            self._jobs.update(ids)
+            if assignees is not None:
+                width = int(assignees)
+                self._assignee_sum += width
+                self._assignee_batches += 1
+                self._assignee_min = width if self._assignee_min is None else min(self._assignee_min, width)
+                self._assignee_max = width if self._assignee_max is None else max(self._assignee_max, width)
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            issued = self._issued
+            jobs = len(self._jobs)
+            batches = self._assignee_batches
+            mean = round(self._assignee_sum / batches, 3) if batches else None
+            out = {
+                "proposals_issued": issued,
+                "jobs_proposed": jobs,
+                "reproposals": issued - jobs,
+                "matrix_assignees_mean": mean,
+                "matrix_assignees_min": self._assignee_min,
+                "matrix_assignees_max": self._assignee_max,
+            }
+            if self.level is not None:
+                out["level"] = int(self.level)
+        return out
+
 # ------------------------------------------------------------------ context age at decision
 
 #: Returned when a candidate group has no observation behind it at all (no live child, or a

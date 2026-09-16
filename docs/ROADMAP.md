@@ -69,10 +69,13 @@ Several `except Exception: pass` blocks silently swallow errors:
 
 **Recommendation:** Add logging at `WARNING` level minimum in all catch blocks.
 
-### 6. Temporary Hack in Selection
-`resource_agent.py:1313` contains a `# TEMP HACK` that restricts hierarchical agents (level > 0) to only evaluate themselves in the cost matrix. This bypasses the normal multi-agent selection for parent nodes.
+### 6. Temporary Hack in Selection — RESOLVED 2026-09-16
+The `# TEMP HACK` that restricted hierarchical agents (level > 0) to evaluating only themselves in the cost matrix is now the config key `job_selection.coordinator_cost_matrix`, taking the first of the two recommendations below (formalize and document) while leaving the second available as an experiment arm:
 
-**Recommendation:** Either formalize this as the intended design for hierarchical agents and document it, or implement proper multi-agent evaluation for parent-level selection.
+- `self` (default) is the old behaviour exactly — the coordinator scores itself alone, so every coordinator holding a job proposes itself and the tier runs one consensus decision per coordinator per job.
+- `peers` is the proper multi-agent evaluation for parent-level selection: the coordinator peers are scored just as level 0 scores its own, for one proposal per job at the tier.
+
+An unknown value raises rather than defaulting. `peers` is an experiment arm and not a drop-in fix — it makes the optimistic subtree estimate in `is_job_feasible` load-bearing and moves every hierarchical number, so no figure may mix the two. Which regime a run used is now measured rather than inferred from the config: `proposers_per_job_l1` in `evaluation/collect.py`. Tests: `tests/test_coordinator_matrix.py`.
 
 ### 7. Data Transfer + Execution Simulation
 `Job.execute()` sleeps a flat 1s — `time.sleep(wt)` is commented out — and the staged-in/staged-out transfer TODOs remain. Flat-1s execution also distorts load balance (one agent can win every election because utilization never rises) and makes replayed makespans meaningless.

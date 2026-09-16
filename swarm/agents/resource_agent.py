@@ -46,8 +46,9 @@ from swarm.models.object import Object
 from swarm.selection.engine import SelectionEngine
 from swarm.selection.penalties import apply_multiplicative_penalty
 from swarm.topology.topology import TopologyType
-from swarm.utils.instrumentation import (DecisionLog, DecisionRecord, context_age,
-                                        flatten_for_prom, render_prom, write_textfile)
+from swarm.utils.instrumentation import (DecisionLog, DecisionRecord, SelectionCounters,
+                                        context_age, flatten_for_prom, render_prom,
+                                        write_textfile)
 from swarm.utils.metrics import Metrics
 from swarm.utils.resource_queues import ResourceAgentQueues
 from swarm.utils.thread_safe_dict import ThreadSafeDict
@@ -70,6 +71,31 @@ from swarm.rl.mab_manager import MABManager
 from swarm.agents.cost_scale import CostScale
 from swarm.utils.tiebreak import tiebreak_rank
 from swarm.utils.utils import generate_id, job_capacities
+
+
+#: The two regimes a hierarchical coordinator can score a job under. See
+#: `job_selection.coordinator_cost_matrix` in config_swarm_multi.yml for what each means.
+COORDINATOR_COST_MATRIX_MODES = ("self", "peers")
+
+
+def resolve_coordinator_cost_matrix(job_cfg: dict) -> str:
+    """Resolve `job_selection.coordinator_cost_matrix`, refusing an unknown value.
+
+    One function, called from one place, because a key resolved twice acquires two defaults
+    and the effective value then depends on which copy ran (`peer_expiry_seconds` shipped
+    that way for the whole campaign). Refusing rather than defaulting is the same rule the
+    consensus engine name follows: the two regimes differ by a factor of the coordinator
+    count in proposals per job, so a typo would produce a cell that cannot be interpreted and
+    nothing in the run would say which one it was.
+    """
+    mode = str((job_cfg or {}).get("coordinator_cost_matrix", "self")).lower()
+    if mode not in COORDINATOR_COST_MATRIX_MODES:
+        raise ValueError(
+            f"job_selection.coordinator_cost_matrix {mode!r} is not one of "
+            f"{' or '.join(repr(m) for m in COORDINATOR_COST_MATRIX_MODES)}. Refused rather "
+            "than defaulted: the two differ by a factor of the coordinator count in proposals "
+            "per job, and a run that silently took the other one would be uninterpretable.")
+    return mode
 
 
 class _HostAdapter(ConsensusHost):
@@ -413,6 +439,21 @@ class ResourceAgent(Agent):
         self.quantum_penalty_factor = job_cfg.get("quantum_penalty_factor", 1.0)
         # % above min cost allowed in candidate selection (lower = stricter, higher = more agents considered)
         self.selection_threshold_pct = job_cfg.get("selection_threshold_pct", 10.0)
+        # Which assignees a coordinator (level > 0) scores a job against.
+        #   "self"  - this agent only. The shipped behaviour and the one behind every
+        #             hierarchical number measured so far: each coordinator proposes itself
+        #             for every job it holds, so the coordinator tier runs one consensus
+        #             decision per coordinator per job rather than one per job.
+        #   "peers" - the coordinator peers in `neighbor_map`, exactly as level 0 does. The
+        #             plumbing for it already exists and is dead code under "self": a
+        #             parent's published AgentInfo carries its subtree's aggregate
+        #             capacities/allocations/load, and `is_job_feasible` prices a peer
+        #             parent off `max_child_capacity`. It is an arm of E5, not a fix to
+        #             switch on quietly, because it moves every hierarchical number.
+        # Validated rather than defaulted, for the reason spelled out in `_make_engine`: a
+        # typo that silently selected the other regime would mislabel a whole cell. Resolved
+        # in one place (the module-level function) so the key cannot acquire a second default.
+        self.coordinator_cost_matrix = resolve_coordinator_cost_matrix(job_cfg)
 
         self.selector = SelectionEngine(
             feasible=lambda job, agent: self.is_job_feasible(job, agent),
@@ -1865,6 +1906,17 @@ class ResourceAgent(Agent):
                         f"policies={','.join(f'{k}:{v}' for k, v in sorted(ds['by_policy'].items()))} "
                         f"ctx_age_p50={ds['ctx_age_p50']}s p95={ds['ctx_age_p95']}s "
                         f"unknown={ds['ctx_unknown_groups']} skew={ds['ctx_skewed_ages']}")
+            # Proposals this agent put to consensus, and how wide the matrix behind them
+            # was. `width=1` is the self-only regime, in which the tier's proposals per job
+            # is the number of agents holding the job rather than one.
+            sc = getattr(self, "selection_counters", None)
+            if sc is not None:
+                sel = sc.snapshot()
+                if sel["proposals_issued"]:
+                    parts.append(f"proposals={sel['proposals_issued']} "
+                                 f"jobs={sel['jobs_proposed']} "
+                                 f"reproposals={sel['reproposals']} "
+                                 f"width={sel['matrix_assignees_mean']}")
             self.logger.info("[STATS] " + " ".join(parts))
         except Exception as exc:
             self.logger.debug(f"stats logging failed: {exc}")
@@ -2275,6 +2327,58 @@ class ResourceAgent(Agent):
         return round(cost, 2)
 
 
+    def _selection_assignees(self) -> list:
+        """The assignees this agent scores pending jobs against.
+
+        Level 0 scores every live peer, so exactly one agent proposes each job and the tier
+        runs one consensus decision per job.
+
+        Level > 0 depends on `job_selection.coordinator_cost_matrix`:
+
+        * ``self`` (shipped) scores this agent alone, so every coordinator holding the job
+          proposes ITSELF and the tier runs one decision per coordinator per job. This is the
+          `# TEMP HACK` that predates the key, now named and measured rather than hidden:
+          `proposers_per_job_l1` is what separates it from PBFT's own cost in E5/F2.
+        * ``peers`` scores the coordinator peers exactly as level 0 does. The inputs are
+          already subtree-wide — a parent publishes its children's aggregate capacities,
+          allocations and load in its own AgentInfo, and `is_job_feasible` prices a peer
+          parent off `max_child_capacity` — so this path makes that optimistic estimate
+          load-bearing, with the delegation-timeout recovery documented there as its failure
+          mode. An experiment arm; it moves every hierarchical number.
+        """
+        agents_map = self.neighbor_map
+        if int(self.topology.level) > 0 and self.coordinator_cost_matrix == "self":
+            # Preserved verbatim from the hack, `None` entry included: an agent whose own
+            # record has not yet landed in neighbor_map scores nothing this pass and retries,
+            # which is what it did before the key existed.
+            return [agents_map.get(self.agent_id)]
+        return [info for info in (agents_map.get(aid) for aid in list(agents_map.keys()))
+                if info is not None]
+
+    def _note_proposals(self, proposals, assignees: int | None = None) -> None:
+        """Record a proposal batch for the proposals-per-job-by-tier measurement.
+
+        Called immediately before `engine.propose`, on every path that proposes, so what is
+        counted is proposals actually put to consensus — not jobs considered, and not passes
+        of the selection loop (`gets()` peeks, so an unplaced job comes back ~2x/s).
+
+        It cannot raise. It is called from inside `selection_main`'s per-pass `try`, whose
+        `except` abandons the whole batch, so a broken counter here would stop the agent
+        proposing rather than merely lose a number — the same trap `_note_bid` carries a
+        guard for, and the general rule that bookkeeping about a job must never change what
+        happens to the job.
+        """
+        counters = getattr(self, "selection_counters", None)
+        if counters is None:
+            return
+        try:
+            counters.record_proposals(
+                [getattr(p, "object_id", "") for p in proposals], assignees=assignees)
+        except Exception as exc:                                  # pragma: no cover - defensive
+            logger = getattr(self, "logger", None)
+            if logger is not None:
+                logger.debug(f"proposal counters unavailable: {exc}")
+
     def selection_main(self):
         self.logger.info(f"Starting agent: {self}")
         while self.live_agent_count != self.configured_agent_count:
@@ -2311,13 +2415,7 @@ class ResourceAgent(Agent):
                 jobs = []
 
                 # Step 1: Compute cost matrix ONCE for all agents and jobs
-                agents_map = self.neighbor_map
-                agent_ids = list(agents_map.keys())
-                agents = [agents_map.get(aid) for aid in agent_ids if agents_map.get(aid) is not None]
-
-                # TEMP HACK
-                if self.topology.level > 0:
-                    agents = [agents_map.get(self.agent_id)]
+                agents = self._selection_assignees()
 
                 # Build once
                 cost_matrix = self.selector.compute_cost_matrix(
@@ -2395,6 +2493,7 @@ class ResourceAgent(Agent):
                     self.logger.debug(f"Identified jobs to propose: {proposals}")
                     if self.debug:
                         self.logger.info(f"Identified jobs to select: {jobs}")
+                    self._note_proposals(proposals, assignees=len(agents))
                     self.engine.propose(proposals=proposals)
                     proposals.clear()
 
@@ -2442,6 +2541,12 @@ class ResourceAgent(Agent):
         instr_cfg = (self.config.get("instrumentation", {}) or {}) if self.config else {}
         self.decision_log = DecisionLog(
             max_records=int(instr_cfg.get("decision_log_max", 20000)))
+        # Proposals this agent issued, tagged with the tier it sits at. `getattr` because a
+        # test double built with `__new__` calls this before it has a topology, and losing
+        # instrumentation must never be what stops an agent from starting.
+        topo = getattr(self, "topology", None)
+        self.selection_counters = SelectionCounters(
+            level=int(topo.level) if topo is not None else None)
         # Which policy actually decided the delegation in flight. Thread-local because the
         # wrapper that reads it and the policy that writes it are separated by an override
         # chain; delegation runs on one thread today, and this keeps that from being a
@@ -2491,6 +2596,12 @@ class ResourceAgent(Agent):
                 snapshot["consensus"] = stats_fn()
         except Exception as exc:
             self.logger.debug(f"consensus stats unavailable: {exc}")
+        try:
+            selection = self.selection_counters.snapshot()
+            if selection.get("proposals_issued"):
+                snapshot["selection"] = selection
+        except Exception as exc:
+            self.logger.debug(f"selection counters unavailable: {exc}")
         try:
             summary = self.decision_log.summary()
             if summary.get("decisions"):

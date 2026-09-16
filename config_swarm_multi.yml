@@ -223,6 +223,25 @@ job_selection:
   quantum_penalty_factor: 1.0         # Multiplier for quantum backend quality penalty (error rate + calibration downtime)
   selection_threshold_pct: 10.0       # % above min cost allowed in candidate selection (lower = stricter, higher = more agents considered)
 
+  # Which assignees a hierarchical coordinator (level > 0) scores a job against. Leaf agents
+  # (level 0) are unaffected by this key.
+  #
+  # self  = this agent only (shipped, and the behaviour behind every hierarchical number
+  #         measured so far). Every coordinator that holds the job proposes ITSELF for it, so
+  #         the coordinator tier runs one consensus decision per coordinator per job. That is
+  #         a second explanation for the Hier-250 PBFT collapse besides PBFT's own O(n^2), and
+  #         the two are only separable from proposers_per_job_l1 (see evaluation/collect.py).
+  # peers = the coordinator peers in neighbor_map, exactly as level 0 works, so one proposal
+  #         per job at the tier. The inputs for it already exist: a parent publishes its
+  #         SUBTREE's aggregate capacities/allocations/load in its AgentInfo, and
+  #         is_job_feasible prices a peer parent off max_child_capacity — an optimistic
+  #         estimate whose failure mode (delegation timeout, job returns to the tier) is
+  #         documented in is_job_feasible and becomes load-bearing under this setting.
+  #
+  # Treat `peers` as an experiment arm, not a fix: it changes placement at the coordinator
+  # tier, so no hierarchical figure may mix the two. An unknown value raises.
+  coordinator_cost_matrix: self
+
 
   # Designated-bidder mode (LLM agents only). Default false = every agent bids on every job it
   # can run, which is what the campaign measured: ~3.7 distinct agents pay a full LLM bid per

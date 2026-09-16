@@ -352,6 +352,62 @@ def expected_llm_agent_ids(agents: dict[str, dict], meta: dict | None,
     return declared | observed
 
 
+def selection_by_tier(agents: dict[str, dict], levels: dict[str, int]) -> dict[str, Any]:
+    """Proposal fan-out per tier, from the per-agent `instrumentation.selection` blocks.
+
+    Fleet **sums** per tier, for the same reason the rest of this function sums: a mean over
+    agents divides by how many reported, which varies with metrics completeness.
+
+    The tier of an agent is taken from the counter block itself, which the agent stamped from
+    its own topology, and only then from all_agents.csv. An agent whose tier cannot be
+    established at all is counted in `sel_unattributed_agents` rather than folded into level
+    0 — putting a coordinator's proposals in the leaf tier is precisely the confusion the
+    measurement exists to remove.
+
+    The denominator (jobs at that tier) is not here: it comes from the per-level job CSVs,
+    which only `run_metrics` reads. This returns the numerators.
+    """
+    out: dict[str, Any] = {}
+    per_level: dict[int, dict[str, float]] = {}
+    unattributed = 0
+    for agent_id, payload in agents.items():
+        instr = payload.get("instrumentation") or {}
+        block = instr.get("selection")
+        if not isinstance(block, dict) or not block.get("proposals_issued"):
+            continue
+        level = block.get("level")
+        if level is None:
+            level = levels.get(str(agent_id))
+        if level is None:
+            unattributed += 1
+            continue
+        acc = per_level.setdefault(int(level), {
+            "agents": 0, "proposals": 0, "jobs": 0, "reproposals": 0,
+            "width_sum": 0.0, "width_n": 0, "width_max": 0})
+        acc["agents"] += 1
+        acc["proposals"] += int(block.get("proposals_issued") or 0)
+        acc["jobs"] += int(block.get("jobs_proposed") or 0)
+        acc["reproposals"] += int(block.get("reproposals") or 0)
+        width = block.get("matrix_assignees_mean")
+        if width is not None:
+            acc["width_sum"] += float(width)
+            acc["width_n"] += 1
+        width_max = block.get("matrix_assignees_max")
+        if width_max is not None:
+            acc["width_max"] = max(acc["width_max"], int(width_max))
+    for level, acc in sorted(per_level.items()):
+        out[f"sel_agents_l{level}"] = acc["agents"]
+        out[f"sel_proposals_l{level}"] = acc["proposals"]
+        out[f"sel_proposer_pairs_l{level}"] = acc["jobs"]
+        out[f"sel_reproposals_l{level}"] = acc["reproposals"]
+        if acc["width_n"]:
+            out[f"sel_matrix_width_l{level}"] = round(acc["width_sum"] / acc["width_n"], 4)
+            out[f"sel_matrix_width_max_l{level}"] = acc["width_max"]
+    if unattributed:
+        out["sel_unattributed_agents"] = unattributed
+    return out
+
+
 def instrumentation_metrics(agents: dict[str, dict], meta: dict | None = None,
                             levels: dict[str, int] | None = None) -> dict[str, Any]:
     """P0-4 columns: message cost, finalization, delegation context age, LLM token cost.
@@ -595,6 +651,8 @@ def instrumentation_metrics(agents: dict[str, dict], meta: dict | None = None,
         out["llm_plane_dead"] = any(
             calls >= LLM_DEAD_MIN_CALLS and failures >= calls for calls, failures in deciding)
 
+    out.update(selection_by_tier(agents, levels))
+
     rows = decision_rows(agents)
     if rows:
         frame = pd.DataFrame(rows)
@@ -805,6 +863,32 @@ def run_metrics(run_dir: Path, expected_jobs: int | None) -> dict[str, Any]:
     # make a stalled run look like a well-partitioned one.
     if metrics.get("llm_bid_jobs") is not None and n_unique:
         metrics["bidders_per_job"] = round(metrics["llm_bid_jobs"] / n_unique, 6)
+    # Proposal fan-out per tier. The numerators are fleet sums from the agent payloads; the
+    # denominator is the jobs that reached that tier, which only this scope knows.
+    #
+    # `proposers_per_job` is the quantity E5 needs: how many DISTINCT agents proposed a given
+    # job at that tier. 1.0 is "the tier ran one consensus decision per job"; the coordinator
+    # count is "every coordinator holding the job proposed itself", which is what the
+    # self-only cost matrix produces and what a messages-per-job curve cannot tell from
+    # PBFT's own cost. `proposals_per_job` adds re-proposals on top, so the gap between the
+    # two is reselection churn and nothing to do with tier width.
+    #
+    # Level 0 falls back to the run's distinct job count when no level0_jobs.csv was written
+    # (flat runs before that file existed); a higher tier has no such fallback, because
+    # all_jobs.csv is every tier at once and dividing by it would understate the fan-out by
+    # exactly the factor being measured.
+    for level in (0, 1, 2):
+        pairs = metrics.get(f"sel_proposer_pairs_l{level}")
+        if pairs is None:
+            continue
+        denom = metrics.get(f"l{level}_jobs")
+        if not denom and level == 0:
+            denom = n_unique
+        if not denom:
+            continue
+        metrics[f"proposers_per_job_l{level}"] = round(pairs / denom, 6)
+        metrics[f"proposals_per_job_l{level}"] = round(
+            metrics.get(f"sel_proposals_l{level}", 0) / denom, 6)
     # P1-1 regret, when the run archived the failure profile it was scored against.
     metrics.update(regret_metrics(run_dir))
 

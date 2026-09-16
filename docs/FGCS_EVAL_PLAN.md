@@ -441,14 +441,31 @@ needed 68, so the run died *after* Redis had been flushed), and it could not for
 `--expect-silent-agents`, so a batched failure-injection campaign could only check *how many*
 agents were silent, never *which*.
 
-**Two findings from the same pass deliberately left alone**, because each is a design decision
-rather than a defect and changing either would move every hierarchical number:
+**Both findings from that pass are now closed**, the second as a defect and the first as what
+it always was — a design decision, which is now named and measured rather than hidden:
 
-- **`scheduling_main`'s `# TEMP HACK`:** at `level > 0` the cost matrix is built over `[self]`
-  only, so every coordinator proposes itself for every job at the coordinator tier. The
-  Hier-250 PBFT collapse C3 rests on may be partly "n proposals per job" rather than PBFT
-  itself. **E5 must report proposals/job by tier so the two are separable**, and §III has to
-  describe the behaviour either way.
+- ~~**`scheduling_main`'s `# TEMP HACK`**~~ **NAMED AND MEASURED 2026-09-16.** The behaviour
+  is unchanged by default, because changing it would move every hierarchical number; what
+  changed is that a run now says which regime it was in. It is the config key
+  `job_selection.coordinator_cost_matrix`: `self` (shipped, and the behaviour behind every
+  hierarchical number measured so far) scores the coordinator against itself alone, so every
+  coordinator holding a job proposes itself and the tier runs **one consensus decision per
+  coordinator per job**; `peers` scores the coordinator peers exactly as level 0 does, for one
+  proposal per job at the tier. An unknown value **raises** rather than defaulting, for the
+  same reason `consensus.protocol` does — the two regimes differ by a factor of the
+  coordinator count in proposals per job, so a typo would produce a cell nothing in the run
+  could label. `peers` is **an E5 arm, not a fix**: the plumbing behind it already exists and
+  is dead code under `self` (a parent publishes its subtree's aggregate capacities,
+  allocations and load in its own `AgentInfo`, and `is_job_feasible` prices a peer parent off
+  `max_child_capacity`), so switching it on makes that optimistic estimate load-bearing, with
+  the delegation timeout as its failure mode. **The separability E5 needed is the measurement,
+  not the key:** agents count proposals per tier and `collect.py` reports
+  `proposers_per_job_l1` — 1.0 means the tier ran one decision per job, the coordinator count
+  means every coordinator proposed itself. Counted as **distinct jobs**, never per loop pass
+  (`gets()` peeks, so an unplaced job returns ~2x/s), with re-proposals in their own column so
+  a reselection timeout cannot move the ratio for a reason unrelated to tier width. §III must
+  still describe the behaviour, but it can now cite a number for it.
+  Tests: `tests/test_coordinator_matrix.py`.
 - ~~**Failed-agent reassignment only searches the local pending queue**~~ **FIXED
   2026-09-15.** A job already READY or RUNNING on a failed agent was logged as "likely
   completed" and dropped, and since its persisted state is not PENDING nothing re-added it —
@@ -470,12 +487,11 @@ Two smaller findings from the same pass that touch conference figures, recorded 
   false for the proposer's own `outgoing` proposal, so each extra PREPARE re-appends the
   proposal and sends another COMMIT. Inflates PBFT `sent_commit` by up to (n − quorum) per job
   — the E5/F2 messages-per-job curve is biased *against* PBFT. Fix the guard, re-measure E5.
-- **Coordinator-tier selection is self-only.** `scheduling_main` has a `# TEMP HACK` that, at
-  `level > 0`, builds the cost matrix over `[self]` only, so every coordinator proposes itself
-  for every job at the coordinator tier. The Hier-250 PBFT collapse that C3 rests on may be
-  partly "n proposals per job" rather than PBFT per se; E5 should report proposals/job by tier
-  so the two are separable, and the hack should either be removed or named in the design
-  section.
+- ~~**Coordinator-tier selection is self-only.**~~ **NAMED AND MEASURED 2026-09-16**, see the
+  first bullet above. The default is unchanged (`job_selection.coordinator_cost_matrix: self`),
+  `peers` is the arm that changes it, and `proposers_per_job_l1` from `collect.py` is what
+  separates "n proposals per job" from PBFT's own cost in the Hier-250 collapse. Both numbers
+  come out of the same E5 runs; no extra cell is needed to tell them apart.
 
 ### 0.9 The work splits into two papers (decided 2026-09-10)
 
