@@ -239,7 +239,7 @@ planning the workflow is not a substitute for having run it under Pegasus at lea
 
 A useful consequence of the catalogs being generated: if you generate them **on the machine
 where the code will live**, their pfn paths already point at the right place and
-`path_rewrites` (step 5) can be empty. Rewrites are needed when the run happened somewhere
+`path_rewrites` (step 6) can be empty. Rewrites are needed when the run happened somewhere
 else, which is the usual case when comparing against an existing run.
 
 **1. Extract on the Pegasus submit host.** Executable, arguments and container all come out
@@ -252,13 +252,16 @@ python3 pegasus_profile_extractor.py \
     --output soil_profiles.json
 ```
 
-**2. Convert to swarm jobs**, with the DAG reconstructed as data predicates:
+**2. Check the conversion** before involving a fleet. This is also how you convert for a
+local run; step 5 repeats it onto the shared export for a remote one:
 
 ```bash
 python pegasus_to_swarm_converter.py --input soil_profiles.json \
     --input-type json --output-dir converted_jobs/ --dag-gating
-# check conversion_summary.json -> dag.edges / dag.roots; a partial DAG still looks healthy
 ```
+
+Read `conversion_summary.json` → `dag.edges` and `dag.roots`, and `manifest.json` → `missing`.
+A partial DAG and an incomplete bundle both still look healthy from the outside.
 
 **3. Prepare the fleet** (once). Both scripts verify by *doing* the thing — running a real
 container, performing a real write — and both exit non-zero on a partial fleet:
@@ -268,21 +271,32 @@ sudo ./setup_apptainer.sh          # apptainer on every agent, so the workflow's
 sudo ./setup_nfs_workflow.sh       # one shared work dir, identical path on every node
 ```
 
-**4. Stage the workflow.** Code on the shared export; the multi-GB image on each agent's
-**local** disk (a WAN read of it per job start would dominate every measurement). Stage the
-tree **from the submit host**, not from a fresh clone — it must be the one whose generated
-catalogs match the run you extracted:
+**4. Stage the workflow and the image.** The workflow tree goes somewhere the database node
+can read it (the converter copies the executables out of it into the bundle); the multi-GB
+image goes on each agent's **local** disk, never the export — a WAN read of it per job start
+would dominate every measurement. Stage the tree **from the submit host**, not a fresh clone:
+its generated catalogs must match the run you extracted.
 
 ```bash
-# code, catalogs and declared replicas
 tar czf - --exclude=Apptainer soilmoisture-workflow | \
     ssh database 'sudo tar xzf - -C /export/swarm-wf/workflows'
-# the container image, to local disk on each agent
-sudo ./setup_nfs_workflow.sh --stage-image /root/wf-images/SoilMoisture_Container.sif
+sudo ./setup_nfs_workflow.sh --stage-image /path/to/SoilMoisture_Container.sif
+# the script prints the directory it staged to — use that as roots.images below
 ```
 
-**5. Point the config at it.** Two rewrites, because code and image live in different places;
-longest prefix wins, so ordering does not matter:
+**5. Build the bundle on the shared export**, so every agent resolves the same code:
+
+```bash
+python3 pegasus_to_swarm_converter.py --input soil_profiles.json --input-type json \
+    --output-dir /export/swarm-wf/jobs --dag-gating \
+    --data-nodes per-file --dtn-names local --dtn-scope job \
+    --bundle-source-root /export/swarm-wf/workflows/soilmoisture-workflow
+sudo chown -R nobody:nogroup /export/swarm-wf/jobs
+```
+
+**6. Point the config at it** (`config_swarm_multi.yml`). `roots` covers code and inputs,
+which the bundle carries. The container image is *not* bundled, so its absolute submit-host
+path is redirected with a rewrite — `roots.images` only applies to relative image names:
 
 ```yaml
 runtime:
@@ -291,33 +305,59 @@ runtime:
     work_dir: /export/swarm-wf/work
     container_runtime: auto
     path_rewrites:
-      - {from: /home/ubuntu/soilmoisture-workflow, to: /export/swarm-wf/workflows/soilmoisture-workflow}
-      - {from: /home/ubuntu/soilmoisture-workflow/Apptainer, to: /root/wf-images}
+      - {from: /home/ubuntu/soilmoisture-workflow/Apptainer, to: /export/images}
+    roots:
+      code:   /export/swarm-wf/jobs/code
+      inputs: /export/swarm-wf/jobs/inputs
+      images: /export/images
 ```
 
-**6. Place the root inputs.** There is no stage-in step yet, so files the workflow *declares*
-rather than produces (`replicas.yml`) must be copied into the work dir first:
+The work directory must be writable by the **squashed** NFS user, or every job refuses with
+`Permission denied`:
 
 ```bash
-sudo cp /export/swarm-wf/workflows/soilmoisture-workflow/polygons.json /export/swarm-wf/work/<run-id>/
+sudo chown nobody:nogroup /export/swarm-wf/work && sudo chmod 1777 /export/swarm-wf/work
 ```
 
-**7. Run**, as any other remote test:
+**7. Run.** `--pegasus-dag-gating` is not optional for a workflow: without it no job carries a
+data predicate, nothing waits for its parents, and a child fails on a file that has not been
+written yet.
 
 ```bash
-python run_test.py --mode remote --agent-type resource --agents 5 --topology mesh \
-    --jobs 5 --db-host database --agent-hosts-file agent_hosts.txt \
-    --run-dir runs/soil-real --pegasus-profiles soil_profiles.json --pegasus-input-type json
+python3 run_test.py --mode remote --agent-type resource --agents 5 --agents-per-host 1 \
+    --topology mesh --jobs 4 --jobs-per-interval 4 --db-host database \
+    --agent-hosts-file agent_hosts.txt --run-dir runs/soil-real \
+    --pegasus-profiles soil_profiles.json --pegasus-input-type json \
+    --pegasus-data-nodes per-file --pegasus-dtn-names local --pegasus-dag-gating \
+    --pegasus-bundle-source-root /export/swarm-wf/workflows/soilmoisture-workflow \
+    --runtime 420
 ```
 
 A job that cannot be run properly is **refused and fails loudly** — it never silently falls
 back to simulating, because a run mixing executed and simulated jobs with nothing to tell them
-apart is worse than one that stops. Refusals log at `ERROR` with the reason.
+apart is worse than one that stops. Refusals log at `ERROR` with the reason, in the agent's own
+log (`swarm-multi/agent-N.log`).
 
-Validated on the slice: outputs byte-identical to the original Pegasus run for every
-computational job, per-job times within ~15% of Pegasus's own. Caveats that matter before
-quoting any number — no stage-in, NFS flattens data locality, and the substrates differ — are
-in [WORKFLOW_EXECUTION.md](docs/WORKFLOW_EXECUTION.md#4-known-limits).
+**Note on this particular workflow:** `fetch_soil_data` calls `archive-api.open-meteo.com`,
+which is unreachable from the FABRIC slice (generic HTTPS is fine; that host times out). The
+run above converts the other four jobs and supplies its output, `field1_soil_data.csv`, as a
+root input. A job whose runtime is an external service's latency is a poor comparison subject
+in any case.
+
+**Measured on the slice** — 5 agents, mesh, real execution, DAG order respected:
+
+| job | SWARM | Pegasus `remote_duration` |
+|---|---|---|
+| analyze_moisture | 0.915s | 1.029s |
+| train_model | 14.889s | 14.863s |
+| predict_irrigation | 3.772s | 4.487s |
+| visualize_moisture | 2.219s | 2.459s |
+
+All exit 0, and the computational outputs are byte-identical to the original Pegasus run
+(2073 / 1270 / 222002 / 831 bytes); the PNG differs by font rendering. Before quoting any of
+this as a comparison, read the limits — no stage-in, NFS flattens data locality, the
+substrates differ, and Pegasus's 351s makespan is queueing and staging rather than compute:
+[WORKFLOW_EXECUTION.md](docs/WORKFLOW_EXECUTION.md#4-known-limits).
 
 ### Quantum / Hybrid Jobs
 
