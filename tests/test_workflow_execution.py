@@ -907,6 +907,38 @@ class TestBundling(unittest.TestCase):
             self.assertEqual(Path(out, "a.json").read_text(), "OLD")
             self.assertEqual([n for n in os.listdir(out) if ".replacing-" in n], [])
 
+    def test_the_sweep_never_touches_files_it_does_not_own(self):
+        """The output directory is shared with whatever else the user keeps there, and this
+        function deletes things. A substring test for ".replacing-" removed a user's
+        `notes.replacing-the-old-plan.txt`, `data.replacing-v2.csv` and an
+        `experiments.replacing-baseline/` directory — silently."""
+        with tempfile.TemporaryDirectory() as tmp:
+            user_files = ["notes.replacing-the-old-plan.txt", "data.replacing-v2.csv",
+                          "keep_me.txt",
+                          # owned BASE name but not a pid suffix: still the user's
+                          "code.replacing-notes.txt"]
+            for n in user_files:
+                Path(tmp, n).write_text("USER DATA")
+            os.makedirs(os.path.join(tmp, "experiments.replacing-baseline"))
+            os.makedirs(os.path.join(tmp, ".convert-staging-notes"))
+            clear_previous_output(tmp)
+            for n in user_files:
+                self.assertTrue(os.path.exists(os.path.join(tmp, n)), f"deleted {n}")
+            self.assertTrue(os.path.isdir(os.path.join(tmp, "experiments.replacing-baseline")))
+            self.assertTrue(os.path.isdir(os.path.join(tmp, ".convert-staging-notes")))
+
+    def test_the_sweep_does_remove_what_it_owns(self):
+        """The other half: the guard must not be so strict that debris survives."""
+        with tempfile.TemporaryDirectory() as tmp:
+            owned = ["job_1.json", "manifest.json", "code.replacing-9999",
+                     "inputs.replacing-123"]
+            for n in owned:
+                Path(tmp, n).write_text("owned")
+            os.makedirs(os.path.join(tmp, ".convert-staging-4242"))
+            clear_previous_output(tmp)
+            for n in owned + [".convert-staging-4242"]:
+                self.assertFalse(os.path.exists(os.path.join(tmp, n)), f"kept {n}")
+
     def test_stranded_displaced_copies_are_swept(self):
         """Nothing else ever removed these, so a rollback that could not finish left debris
         accumulating in the output directory forever."""

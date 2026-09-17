@@ -862,6 +862,24 @@ BUNDLE_INPUTS = "inputs"
 BUNDLE_IMAGES = "images"
 
 
+#: Exactly the names a conversion writes into its output directory. Every removal decision
+#: is made against this and nothing else — the output directory is shared with whatever else
+#: the user keeps there, and this function deletes things.
+_OWNED_NAME = re.compile(
+    r"job_\d+\.json|conversion_summary\.json|pegasus_baseline\.json|manifest\.json"
+    r"|code|inputs|images")
+
+#: A copy displaced during promotion: an owned artefact plus the promoting process's pid.
+#: Anchored and pid-numeric on purpose. A substring test for ".replacing-" deleted a user's
+#: `notes.replacing-the-old-plan.txt`, `data.replacing-v2.csv` and an
+#: `experiments.replacing-baseline/` directory — silently, in a function that otherwise takes
+#: care to leave unowned files alone.
+_DISPLACED_NAME = re.compile(r"^(?:" + _OWNED_NAME.pattern + r")\.replacing-\d+$")
+
+#: A staging directory, likewise pid-suffixed rather than merely prefixed.
+_STAGING_NAME = re.compile(r"^\.convert-staging-\d+$")
+
+
 def _quiet_remove(path: str) -> None:
     try:
         os.remove(path)
@@ -894,17 +912,17 @@ def clear_previous_output(output_dir: str, keep: Optional[str] = None,
             continue
         path = os.path.join(output_dir, name)
         if re.fullmatch(r"job_\d+\.json", name) or name in (
-                "conversion_summary.json", "pegasus_baseline.json", "manifest.json"):
+                "conversion_summary.json", "pegasus_baseline.json", "manifest.json"):  # noqa: E501
             os.remove(path)
             removed += 1
         elif name in (BUNDLE_CODE, BUNDLE_INPUTS, BUNDLE_IMAGES) and os.path.isdir(path):
             shutil.rmtree(path)
             removed += 1
-        elif ".replacing-" in name:
+        elif _DISPLACED_NAME.fullmatch(name):
             # A previous conversion's displaced copy, stranded by a rollback that could not
             # finish. Nothing else ever removes these, so they accumulate silently.
             shutil.rmtree(path, ignore_errors=True) if os.path.isdir(path) else _quiet_remove(path)
-        elif name.startswith(".convert-staging-") and os.path.isdir(path):
+        elif _STAGING_NAME.fullmatch(name) and os.path.isdir(path):
             # Debris from a conversion that died part way. Harmless, but it accumulates.
             # `keep` is the staging directory of the conversion calling this, which is about
             # to be promoted — sweeping it would delete the output being installed.

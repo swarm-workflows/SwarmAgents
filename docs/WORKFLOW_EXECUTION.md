@@ -229,6 +229,15 @@ error was "rollback cleanup failed" while the actual failure went unmentioned). 
 copies stranded by a rollback that could not finish are swept by the next conversion, since
 nothing else ever removed them.
 
+Every removal is matched against **exactly the names a conversion writes** — `job_N.json`,
+the three metadata files, the three bundle directories, and those same names suffixed with
+`.replacing-<pid>` or a `.convert-staging-<pid>` directory. The output directory is shared
+with whatever else you keep there and this code deletes things, so a substring test is not
+good enough: matching `".replacing-"` anywhere in a name removed a user's
+`notes.replacing-the-old-plan.txt`, `data.replacing-v2.csv` and an
+`experiments.replacing-baseline/` directory, silently. `code.replacing-notes.txt` has an
+owned base name and is still the user's, because the suffix is not a pid.
+
 `--no-bundle` restores the old behaviour, where job records only *describe* their code by
 absolute submit-host paths. Simulated jobs are unaffected throughout: a job with no execution
 block has nothing to bundle and converts exactly as before.
