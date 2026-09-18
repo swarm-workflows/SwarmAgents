@@ -710,6 +710,26 @@ class SwarmConfigGenerator:
                     f"Hierarchical topology currently supports 30, 60, 90, 100, 110, 120, 250, "
                     f"270, 990, or 1000 agents (got {self.num_agents})")
 
+            # Preset support is decided HERE, on the G=1 shape, before any fan-out rebalancing.
+            # The `<= 110` branch above accepts a RANGE while describing a 110-agent hierarchy,
+            # and the only thing that refused 95 was the post-hoc "topology does not total the
+            # request" check at the end — which the fan-out path defeats: at G>1 the freed
+            # coordinator slots are redistributed so the fleet totals exactly `num_agents`,
+            # so once G defaulted to 2 (2026-09-18) a size with no preset built a topology of
+            # odd-sized groups and exited 0. `run_test.py` invokes this with check=True, so a
+            # campaign cell would have launched a fleet of the wrong shape and said nothing.
+            preset_total = num_groups * group_size + num_groups + num_super_groups
+            if preset_total != self.num_agents:
+                supported = "30, 60, 80, 90, 100, 110, 120, 250, 270, 990, 1000"
+                raise TopologyError(
+                    f"Hierarchical topology for {self.num_agents} agents would need "
+                    f"{preset_total} agents ({num_groups} groups of {group_size} plus "
+                    f"{num_groups} coordinator(s)"
+                    f"{' plus ' + str(num_super_groups) + ' super-coordinators' if num_super_groups > 0 else ''}"
+                    f"). Only ids 1..{self.num_agents} would be written, silently dropping the "
+                    f"rest — a fleet with no coordinators if the drop reaches Level 1. Use one "
+                    f"of the supported sizes: {supported}.")
+
             # How many child groups one coordinator exclusively parents. G=1 is the shipped
             # 1:1 mapping and takes the original code path untouched. G>1 is what gives a
             # coordinator a delegation decision to make at all: with one group there is no

@@ -17,8 +17,13 @@ docker run -d -p 6379:6379 redis   # Required for all distributed tests
 
 ### Unit Tests
 ```bash
-python -m pytest tests/                    # All tests: test_bandit.py (MAB), test_snow.py (Snow engine), test_gossip.py (gossip)
-python -m pytest tests/test_bandit.py -v   # Single test file
+.venv/bin/python -m pytest tests/          # ALL tests. Use the venv: four files import pydantic_ai
+                                           # (test_delegation, test_bid_pacing, test_elicitation,
+                                           # test_repository) and under the system python they fail
+                                           # to COLLECT — the run reports "9 errors" and passes over
+                                           # ~200 tests. On 2026-09-18 that hid eight regressions from
+                                           # a default change for a whole day.
+.venv/bin/python -m pytest tests/test_bandit.py -v   # Single test file
 ```
 
 ### Running Experiments

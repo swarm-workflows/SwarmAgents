@@ -125,12 +125,15 @@ def _snapshots(a, groups):
 # The default is the shipped config, which mentions no delegation at all.
 # --------------------------------------------------------------------------------------------
 
-def test_absent_delegation_key_is_the_old_behaviour():
-    """No `delegation:` section: every capable group, no delegator, no inference."""
+def test_absent_delegation_key_is_the_bandit_policy_with_no_model():
+    """No `delegation:` section: bandit policy, no delegator, no inference — and, since
+    2026-09-18, `mab.top_k` groups at random rather than every capable group (fan-out-to-all
+    duplicated every job across groups once --groups-per-coordinator defaulted to 2)."""
     a = make_agent()
     assert a.delegation_policy == a.DELEGATE_BANDIT
     assert a.delegator is None
-    assert a._select_child_groups(_Job(), [1, 2, 3]) == [1, 2, 3]
+    selected = a._select_child_groups(_Job(), [1, 2, 3])
+    assert len(selected) == 1 and selected[0] in (1, 2, 3)
 
 
 def test_default_policy_still_defers_to_the_bandit():
@@ -161,7 +164,8 @@ def test_unknown_policy_warns_and_falls_back():
     a = make_agent(delegation={"policy": "magic"})
     assert a.delegation_policy == a.DELEGATE_BANDIT
     assert any("magic" in w for w in a._delegation_warnings)
-    assert a._select_child_groups(_Job(), [1, 2]) == [1, 2]
+    selected = a._select_child_groups(_Job(), [1, 2])
+    assert len(selected) == 1 and selected[0] in (1, 2)   # bandit policy, no bandit: random pick at mab.top_k
 
 
 # --------------------------------------------------------------------------------------------
@@ -681,9 +685,12 @@ def test_hier80_is_a_shape_preserving_stand_in_for_hier90(tmp_path):
 
     out_dir = tmp_path / "h80"
     out_dir.mkdir()
+    # The preset SHAPE is a G=1 statement; the default fan-out is 2 since 2026-09-18 and
+    # halves the coordinator count, so it is asked for explicitly here.
     proc = subprocess.run(
         [sys.executable, "generate_configs.py", "80", "10", "./config_swarm_multi.yml",
-         str(out_dir), "hierarchical", "localhost", "100", "--seed", "42", "--skip-jobs"],
+         str(out_dir), "hierarchical", "localhost", "100", "--seed", "42", "--skip-jobs",
+         "--groups-per-coordinator", "1"],
         cwd=REPO, capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr[-2000:]
 
@@ -758,10 +765,10 @@ def test_shipped_topology_gives_no_coordinator_a_routing_choice(tmp_path):
     (and a Level-2 super-coordinator's `children` is the single Level-1 group it manages).
     Every delegation is then trivial and neither the bandit nor the LLM chooses anything.
     """
-    coords = _generated_coordinators(tmp_path / "default")
+    coords = _generated_coordinators(tmp_path / "g1", "--groups-per-coordinator", "1")
     assert coords, "Hier-30 must produce coordinators at all"
-    assert all(t == "llm" for t, _c, _m in coords.values()), \
-        "Level-1 coordinators are the LLM agents"
+    assert all(t == "resource" for t, _c, _m in coords.values()), \
+        "Level-1 coordinators default to resource since 2026-09-18 (was llm)"
     assert _led_counts(coords) == [1, 1, 1, 1, 1]
 
 
@@ -779,7 +786,7 @@ def test_groups_per_coordinator_gives_coordinators_a_real_choice(tmp_path):
         coords = _generated_coordinators(
             tmp_path / f"g{fan_out}", "--groups-per-coordinator", str(fan_out))
         assert _led_counts(coords) == expected_led, f"G={fan_out}"
-        assert all(t == "llm" for t, _c, _m in coords.values())
+        assert all(t == "resource" for t, _c, _m in coords.values())
         assert sum(1 for n in _led_counts(coords) if n > 1) >= 1, \
             f"G={fan_out} must leave at least one coordinator with a routing decision"
 
@@ -807,13 +814,17 @@ def test_fan_out_keeps_the_fleet_the_size_it_was_asked_for(tmp_path):
         assert max(sizes.values()) - min(sizes.values()) <= 1, f"G={fan_out}: {sizes}"
 
 
-def test_fan_out_leaves_the_default_topology_untouched(tmp_path):
+def test_explicit_g1_reproduces_the_preset_and_the_default_is_g2(tmp_path):
     """G=1 must take the original code path, not a recomputation that happens to agree — the
-    scale ladder and every prior run depend on the shipped presets."""
-    baseline = _generated_coordinators(tmp_path / "baseline")
-    explicit = _generated_coordinators(tmp_path / "explicit", "--groups-per-coordinator", "1")
-    assert baseline == explicit
-    assert _led_counts(baseline) == [1, 1, 1, 1, 1]
+    scale ladder and every prior run depend on the shipped presets. Since 2026-09-18 the
+    DEFAULT is G=2 (at G=1 every delegation is inert), so the preset shape is what an explicit
+    `--groups-per-coordinator 1` gives, and no flag at all equals an explicit 2."""
+    preset = _generated_coordinators(tmp_path / "g1", "--groups-per-coordinator", "1")
+    assert _led_counts(preset) == [1, 1, 1, 1, 1]
+    default = _generated_coordinators(tmp_path / "default")
+    explicit2 = _generated_coordinators(tmp_path / "g2", "--groups-per-coordinator", "2")
+    assert default == explicit2
+    assert _led_counts(default) == [1, 2, 2]
 
 
 def test_fan_out_is_refused_on_three_level_hierarchies(tmp_path):
@@ -842,13 +853,16 @@ def test_co_parents_concentrates_leadership_instead_of_spreading_choice(tmp_path
     Co-parenting is failover, not fan-out. Measuring delegation on this topology needs a
     coordinator that exclusively parents several groups, which the generator cannot express.
     """
-    k2 = _generated_coordinators(tmp_path / "k2", "--co-parents", "2")
+    # On the G=1 preset (5 coordinators); the default fan-out narrows the coordinator tier.
+    k2 = _generated_coordinators(tmp_path / "k2", "--co-parents", "2",
+                                 "--groups-per-coordinator", "1")
     assert all(len(c) == 2 for _t, c, _m in k2.values()), "K=2 assigns two groups to each"
     assert _led_counts(k2) == [0, 1, 1, 1, 2], \
         "assignment is even; leadership is not — this is why the guard checks led groups"
     assert sum(1 for n in _led_counts(k2) if n > 1) == 1
 
-    k5 = _generated_coordinators(tmp_path / "k5", "--co-parents", "5")
+    k5 = _generated_coordinators(tmp_path / "k5", "--co-parents", "5",
+                                 "--groups-per-coordinator", "1")
     assert _led_counts(k5) == [0, 0, 0, 0, 5], \
         "raising K concentrates every group on the lowest-ID coordinator"
 
@@ -863,9 +877,9 @@ def test_the_plans_fleet_sizes_build_a_hierarchy(tmp_path):
 
     for agents, expected_groups in ((30, 5), (90, 9), (270, 27)):
         out = tmp_path / f"h{agents}"
-        coords = _generated_coordinators(out, agents=agents)
+        coords = _generated_coordinators(out, "--groups-per-coordinator", "1", agents=agents)
         assert len(coords) == expected_groups, f"Hier-{agents}"
-        assert all(t == "llm" for t, _c, _m in coords.values())
+        assert all(t == "resource" for t, _c, _m in coords.values())
         ids = sorted(int(n.rsplit("_", 1)[1].split(".")[0])
                      for n in os.listdir(out) if n.endswith(".yml"))
         assert ids == list(range(1, agents + 1)), f"Hier-{agents} must be exactly that size"
