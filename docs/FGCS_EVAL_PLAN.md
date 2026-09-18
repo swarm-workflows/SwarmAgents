@@ -414,6 +414,18 @@ F4's stand-in baseline (`CCGRID27_PAPER_PLAN.md` §4 already says not to call it
 Whether redundant delegation *should* duplicate execution is a design question for the
 hierarchy, not a defect to patch mid-campaign, so it is recorded rather than changed.
 
+**Update 2026-09-18 — the calculus above no longer holds.** It rested on G=1 being the default,
+so that a no-bandit coordinator had one group and the fan-out was inert. `--groups-per-coordinator`
+now **defaults to 2**, so every analytic hierarchical run — E0, the analytic half of E1′, and
+every journal cell with `mab.enabled: false` — duplicates every job across two groups unless it
+passes `--groups-per-coordinator 1` explicitly. That is now a paper-blocking decision, not a
+recorded curiosity: `CCGRID27_PAPER_PLAN.md` §4 (2026-09-18 row) gives the two options — pass
+G=1 on every analytic cell, or make the no-bandit path pick one group at random (the LLM path's
+own fallback already does exactly this) — and argues for the second. It has to land before E0
+either way, because the reference cell is what every other number is compared against.
+`run_meta.json` records the fan-out and coordinator type *observed* in the generated configs
+(since 2026-09-18), so a cell that got the wrong one is detectable; check both at E0.
+
 ### 0.11 Five more defects from the same review pass, all FIXED 2026-09-15
 
 None was found by a failing run; all five bias a number one of the papers reports. Pinned by
@@ -1063,13 +1075,29 @@ The split (§0.9) changes what is on the critical path. In order:
    LLM arm completed 349 of 400 jobs against the bandit arm's 367. If E1 shows LLM-plane
    throughput flat in fleet size, this — not the consensus protocol — may be why.
 
-**Standing obligations on every campaign run** (unchanged, all three now enforced or tested):
-`--master-fleet-size 270` (else the ladder compares different fleets), a `--runtime` cap or
-`--shutdown-after-seconds` (else a stalled cell polls all night), and
-`--groups-per-coordinator 2` or more on any delegation cell (else no coordinator has a choice
-and E2 measures nothing, §0.6). Add a fourth: **`--delegation-policy` on every E2 cell**, so the
-arm is recorded in `run_meta.json` rather than depending on an unrecorded edit to the
-controller's config.
+**Standing obligations on every campaign run** (revised 2026-09-18 for the two default
+changes of that day): `--master-fleet-size 270` (else the ladder compares different fleets); a
+`--runtime` cap or `--shutdown-after-seconds` (else a stalled cell polls all night);
+**`--delegation-policy` on every E2 cell**, so the arm is recorded in `run_meta.json` rather
+than depending on an unrecorded edit to the controller's config; and now **explicit
+`--groups-per-coordinator` and `--hierarchical-level1-agent-type` on every hierarchical
+cell**, both ways. The old obligation was "2 or more on any delegation cell"; 2 is the default
+now, so delegation cells get it for free — but E0 and every analytic cell must pass **1**, or
+they duplicate every job (§0.10, 2026-09-18 update) and E0 is not the eScience topology. The
+coordinator type defaults to `resource` and does not follow `--agent-type`: a journal cell
+that wants LLM coordinators passes `--hierarchical-level1-agent-type llm`, and every host that
+can receive a coordinator must carry `OPENAI_API_KEY` — today only ~30 of 92 do, so **push the
+key to all 92 hosts before the first journal cell**, or coordinator placement is site-clustered
+and every WAN number from the LLM columns is invalid. Both values are recorded in
+`run_meta.json` as *observed* from the generated configs, not as requested. `collect.py` reads
+the coordinator type (it decides the LLM coverage denominator) but **not yet the fan-out** — add
+`groups_per_coordinator` to the wide row before E0, or a cell that silently ran at the wrong
+fan-out is visible only to someone who opens its `run_meta.json`.
+
+Two flags that must **never** appear on a campaign cell: `--size-to-jobs` and the converter's
+`--generate-agent-configs` (both 2026-09-17/18). They raise every agent to the largest job and
+give every agent every DTN — right for running a workflow (conference §8), wrong for a fleet
+whose heterogeneity is the thing being measured.
 
 Done and no longer listed: the §0.2 pre-campaign fixes, P0-5, P0-1, the metrics-attribution
 fix (§0.8), and the Hier-30 smoke — `runs/smoke-g3-bandit` and `runs/smoke-g3-llm`, both arms
