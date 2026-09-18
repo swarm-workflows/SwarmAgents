@@ -70,7 +70,9 @@ already discard from the completed set. Keep `_commits_sent` and finalized ids f
 rather than forgetting at finalize. **Must land before E0**; E5 must be re-measured on it. The
 two xfail tests become the regression tests.
 
-## 2. `--groups-per-coordinator 2` switches on fan-out duplication for every analytic cell — **HIGH, decision owed**
+## 2. `--groups-per-coordinator 2` switches on fan-out duplication for every analytic cell — **HIGH — FIXED (option b)**
+
+*Status:* the no-bandit path in `_select_child_groups` now delegates to `mab.top_k` groups chosen at random, recorded as `random` (a fan-out covering every candidate is still `all`). One fan-out key for both paths. `tests/test_fanout_default.py` (7 tests).
 
 Recorded today in `CCGRID27_PAPER_PLAN.md` §4 and `FGCS_EVAL_PLAN.md` §0.10: with `mab.enabled:
 false` a coordinator delegates to every capable group and each group executes the job (job key is

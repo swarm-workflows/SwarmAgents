@@ -1029,11 +1029,16 @@ def test_a_fan_out_covering_every_candidate_is_not_recorded_as_a_decision():
     assert a.decision_log.summary()["by_policy"] == {"bandit_all": 1}
 
 
-def test_the_default_agent_with_no_bandit_records_the_pass_through():
+def test_the_default_agent_with_no_bandit_records_a_random_pick():
+    """Changed 2026-09-18: the no-bandit default used to pass every capable group through
+    (recorded `all`), which duplicated every job across groups once --groups-per-coordinator
+    defaulted to 2. It now hands the job to `mab.top_k` groups at random and records the
+    decision as `random` — a real, context-blind choice the oracle scores."""
     a = make_agent()
     _timed_snapshots(a, [1, 2, 3], {1: 4.0, 2: 4.0, 3: 4.0})
-    assert a._delegate_child_groups(_Job(), [1, 2, 3]) == [1, 2, 3]
-    assert a.decision_log.summary()["by_policy"] == {"all": 1}
+    selected = a._delegate_child_groups(_Job(), [1, 2, 3])
+    assert len(selected) == 1 and selected[0] in (1, 2, 3)
+    assert a.decision_log.summary()["by_policy"] == {"random": 1}
 
 
 def test_the_age_recorded_covers_the_time_the_inference_took():

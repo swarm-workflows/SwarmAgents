@@ -421,8 +421,10 @@ every journal cell with `mab.enabled: false` — duplicates every job across two
 passes `--groups-per-coordinator 1` explicitly. That is now a paper-blocking decision, not a
 recorded curiosity: `CCGRID27_PAPER_PLAN.md` §4 (2026-09-18 row) gives the two options — pass
 G=1 on every analytic cell, or make the no-bandit path pick one group at random (the LLM path's
-own fallback already does exactly this) — and argues for the second. It has to land before E0
-either way, because the reference cell is what every other number is compared against.
+own fallback already does exactly this) — and argues for the second. **Landed 2026-09-18 (option b):** `ResourceAgent._select_child_groups` without a bandit now picks
+`mab.top_k` groups at random and records the decision as `random`, which the oracle scores — so the
+analytic cells double as the context-blind delegation baseline. `all` survives only where the fan-out
+covers every candidate. `tests/test_fanout_default.py`.
 `run_meta.json` records the fan-out and coordinator type *observed* in the generated configs
 (since 2026-09-18), so a cell that got the wrong one is detectable; check both at E0.
 

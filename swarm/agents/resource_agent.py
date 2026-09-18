@@ -3074,8 +3074,19 @@ class ResourceAgent(Agent):
         keeping it as one method is what makes bandit and LLM delegation directly comparable
         for E4, since both see exactly the same candidate list.
 
-        Default (*top_k* None): the bandit if one is configured, otherwise every capable group
-        — the pre-MAB behaviour, unchanged.
+        Default (*top_k* None): the bandit if one is configured, otherwise `mab.top_k` groups
+        chosen at random (recorded as `random`). One fan-out key for both paths.
+
+        It used to be every capable group when no bandit was configured — the pre-MAB
+        behaviour. That was harmless while every coordinator led one group (G=1), and became
+        the default failure mode when `--groups-per-coordinator` moved to 2 on 2026-09-18:
+        the job is saved once per selected group under a group-scoped key and each group
+        executes its own copy (the exactly-once claim is per group), so every analytic
+        hierarchical run — E0 and the analytic half of E1' — ran every job twice. Measured on
+        `p11-oracle3` before the fan-out default changed: 400 jobs, 952 leaf completions, up to
+        6 executions of one job. A scheduler that hands every job to everyone is a broadcast,
+        not a baseline; a context-blind random pick at the configured fan-out is the honest
+        no-learning arm, and the oracle scores it (unlike `all`, which it excludes).
 
         *top_k* is passed by another policy falling back to this one, and it means "whatever
         you decide, hand the job to this many groups". Fan-out is a load and fairness variable
@@ -3099,9 +3110,6 @@ class ResourceAgent(Agent):
                 self.metrics.mab_selections[g] = \
                     self.metrics.mab_selections.get(g, 0) + 1
             return selected_groups
-        if top_k is None:
-            self._note_decision_policy("all")
-            return capable_groups
         # No bandit and no model: nothing here ranks groups, so choose at random rather than
         # by list order. `capable_groups[:k]` would send every job of a sustained LLM outage
         # to the lowest group id, and that hot spot would read as a placement effect in E4.
