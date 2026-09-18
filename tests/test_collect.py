@@ -812,3 +812,138 @@ class TestMixedRoleRuns(unittest.TestCase):
             metrics = run_metrics(run_dir, expected_jobs=1)
             self.assertEqual(metrics["llm_failure_agent_coverage"], 0.0)
             self.assertTrue(metrics["llm_plane_unchecked"])
+
+
+class TestCoverageDenominatorIsTheLaunchedFleet(unittest.TestCase):
+    """`expected_llm_agent_ids` used to iterate the payload dict, i.e. the agents that
+    REPORTED. An agent that wrote no metrics.json was therefore not in the denominator at all —
+    10 silent agents out of 30 read as coverage 1.00 — which is the exact blindness the
+    docstring says the set exists to catch. The population is now every launched id
+    (run_meta.json `agents` + `dynamic_agents`); a silent one whose level is known from
+    all_agents.csv counts as uncovered, and one whose level is unknown blocks the verdict."""
+
+    ROWS = "j1,1,1,2,2,9,0,1,0.1,0.5\n"
+
+    def _run(self, root: Path, agents: dict, meta: dict, levels: list) -> Path:
+        import json
+        run_dir = write_run(root, "hier-30/run01", self.ROWS)
+        (run_dir / "metrics.json").write_text(json.dumps(agents))
+        (run_dir / "run_meta.json").write_text(json.dumps(meta))
+        (run_dir / "all_agents.csv").write_text(json.dumps(levels))
+        return run_dir
+
+    @staticmethod
+    def _llm_agent():
+        return {"instrumentation": {"llm": {"bid": {
+            "calls": 35, "failures": 0, "input_tokens": 0, "output_tokens": 0}}}}
+
+    def test_ten_silent_llm_agents_are_not_full_coverage(self):
+        agents = {str(i): self._llm_agent() for i in range(1, 21)}     # 20 of 30 report
+        levels = [{"agent_id": i, "level": 0} for i in range(1, 31)]  # all 30 registered
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._run(Path(tmp), agents,
+                                {"agent_type": "llm", "topology": "mesh", "agents": 30,
+                                 "dynamic_agents": 0}, levels)
+            metrics = run_metrics(run_dir, expected_jobs=1)
+            self.assertAlmostEqual(metrics["llm_failure_agent_coverage"], 20 / 30, places=3)
+            self.assertTrue(metrics["llm_plane_unchecked"])
+
+    def test_the_same_fleet_fully_reporting_is_covered(self):
+        agents = {str(i): self._llm_agent() for i in range(1, 31)}
+        levels = [{"agent_id": i, "level": 0} for i in range(1, 31)]
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._run(Path(tmp), agents,
+                                {"agent_type": "llm", "topology": "mesh", "agents": 30,
+                                 "dynamic_agents": 0}, levels)
+            metrics = run_metrics(run_dir, expected_jobs=1)
+            self.assertAlmostEqual(metrics["llm_failure_agent_coverage"], 1.0)
+
+    def test_a_silent_hierarchical_agent_with_a_known_level_is_a_hole(self):
+        levels = [{"agent_id": i, "level": 0 if i <= 27 else 1} for i in range(1, 31)]
+        # Analytic leaves report (no LLM block); the three LLM coordinators report nothing.
+        agents = {str(i): {"instrumentation": {}} for i in range(1, 28)}
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._run(Path(tmp), agents,
+                                {"agent_type": "resource", "topology": "hierarchical",
+                                 "hierarchical_level1_agent_type": "llm", "agents": 30,
+                                 "dynamic_agents": 0}, levels)
+            metrics = run_metrics(run_dir, expected_jobs=1)
+            # The three LLM coordinators are the whole expected set and none reported.
+            self.assertEqual(metrics["llm_failure_agent_coverage"], 0.0)
+            self.assertTrue(metrics["llm_plane_unchecked"])
+
+
+class TestAbsentIsNotZero(unittest.TestCase):
+    """Two places the collector read 'we have no data' as 'the data says zero'."""
+
+    def test_a_missing_pending_file_is_unknown_not_an_empty_backlog(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = write_run(Path(tmp), "mesh-30/run01", "j1,1,1,2,2,9,0,1,0.1,0.5\n")
+            metrics = run_metrics(run_dir, expected_jobs=1)
+            self.assertIsNone(metrics["pending_count"])
+            self.assertIsNone(metrics["pending_l0_count"])
+
+    def test_absent_validity_columns_are_unknown_not_clean(self):
+        """`_numeric` gives all-NaN for a missing column and NaN sums to 0, so decision rows
+        written without the validity fields read as a run whose staleness axis was checked
+        and found clean. The reader of `ctx_skewed_ages == 0` assumes the check ran."""
+        import json
+        row = {"ts": 1.0, "job_id": "j", "job_type": "cpu", "policy": "bandit",
+               "n_candidates": 2, "candidates": [1, 2], "selected": [1], "decide_s": 0.01,
+               "ctx_age_mean": 1.0, "ctx_age_chosen": 1.0}   # no ctx_age_unknown/skewed
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = write_run(Path(tmp), "hier-30/run01", "j1,1,1,2,2,9,0,1,0.1,0.5\n")
+            (run_dir / "metrics.json").write_text(json.dumps(
+                {"1": {"id": 1, "instrumentation": {}, "delegation_decisions": [row]}}))
+            metrics = run_metrics(run_dir, expected_jobs=1)
+            self.assertEqual(metrics["delegations"], 1)
+            self.assertIsNone(metrics["ctx_unknown_groups"])
+            self.assertIsNone(metrics["ctx_skewed_ages"])
+            self.assertIsNone(metrics["ctx_skew_max_s"])
+
+
+class TestAgentsThatNeverRegisteredAreNotCertified(unittest.TestCase):
+    """The startup-death case: a coordinator on a host without the API key dies before it
+    registers, so it is in neither metrics.json nor all_agents.csv and has no level. Role
+    attribution then fails and the collector fell back to "every reporting agent carried an
+    LLM block, so the fleet is covered" — 27 LLM leaves reporting, 3 LLM coordinators dead,
+    coverage 1.00. The fallback now also requires that every launched agent reported."""
+
+    ROWS = "j1,1,1,2,2,9,0,1,0.1,0.5\n"
+
+    @staticmethod
+    def _llm_agent():
+        return {"instrumentation": {"llm": {"bid": {
+            "calls": 35, "failures": 0, "input_tokens": 0, "output_tokens": 0}}}}
+
+    def _run(self, root, agents, meta, levels):
+        import json
+        run_dir = write_run(root, "hier-30/run01", self.ROWS)
+        (run_dir / "metrics.json").write_text(json.dumps(agents))
+        (run_dir / "run_meta.json").write_text(json.dumps(meta))
+        (run_dir / "all_agents.csv").write_text(json.dumps(levels))
+        return run_dir
+
+    def test_dead_coordinators_absent_from_every_artefact_block_the_verdict(self):
+        agents = {str(i): self._llm_agent() for i in range(1, 28)}       # 27 leaves report
+        levels = [{"agent_id": i, "level": 0} for i in range(1, 28)]     # coordinators never registered
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._run(Path(tmp), agents,
+                                {"agent_type": "llm", "topology": "hierarchical",
+                                 "hierarchical_level1_agent_type": "llm",
+                                 "agents": 30, "dynamic_agents": 0}, levels)
+            metrics = run_metrics(run_dir, expected_jobs=1)
+            self.assertTrue(metrics["llm_plane_unchecked"])
+            self.assertNotEqual(metrics.get("llm_failure_agent_coverage"), 1.0)
+
+    def test_the_same_fleet_with_everyone_registered_and_reporting_is_covered(self):
+        agents = {str(i): self._llm_agent() for i in range(1, 31)}
+        levels = [{"agent_id": i, "level": 0 if i <= 27 else 1} for i in range(1, 31)]
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._run(Path(tmp), agents,
+                                {"agent_type": "llm", "topology": "hierarchical",
+                                 "hierarchical_level1_agent_type": "llm",
+                                 "agents": 30, "dynamic_agents": 0}, levels)
+            metrics = run_metrics(run_dir, expected_jobs=1)
+            self.assertAlmostEqual(metrics["llm_failure_agent_coverage"], 1.0)
+            self.assertFalse(metrics["llm_plane_unchecked"])

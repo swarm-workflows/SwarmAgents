@@ -308,6 +308,16 @@ def read_run_meta(run_dir: Path) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
+def launched_agent_count(meta: dict | None) -> int:
+    """How many agents the run launched, from run_meta.json (`agents` + `dynamic_agents`);
+    0 when the run predates those fields. Ids are 1..N."""
+    meta = meta or {}
+    try:
+        return int(meta.get("agents") or 0) + int(meta.get("dynamic_agents") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def expected_llm_agent_ids(agents: dict[str, dict], meta: dict | None,
                            levels: dict[str, int], observed: set[str]) -> set[str] | None:
     """Ids of the agents that ran the LLM plane, or None if unknowable.
@@ -332,9 +342,18 @@ def expected_llm_agent_ids(agents: dict[str, dict], meta: dict | None,
     leaf_type = meta.get("agent_type")
     if leaf_type is None:
         return None
+    # The population is every agent the run LAUNCHED, not every agent that reported. Until
+    # 2026-09-18 this iterated the payload dict, so an agent that wrote no metrics.json was
+    # not in the denominator at all — 10 silent agents out of 30 read as coverage 1.00, the
+    # exact blindness the docstring says this set exists to catch. run_meta.json records the
+    # launched counts (ids are 1..agents+dynamic); without them the payloads are all there is.
+    population = set(map(str, agents))
+    launched = launched_agent_count(meta)
+    if launched > 0:
+        population |= {str(i) for i in range(1, launched + 1)}
     hierarchical = (meta.get("topology") == "hierarchical")
     if not hierarchical:
-        return (set(map(str, agents)) if leaf_type == "llm" else set()) | observed
+        return (population if leaf_type == "llm" else set()) | observed
 
     coord_type = meta.get("hierarchical_level1_agent_type")
     if coord_type is None or not levels:
@@ -343,10 +362,13 @@ def expected_llm_agent_ids(agents: dict[str, dict], meta: dict | None,
         # guessing "resource" hides unmeasured agents.
         return None
     declared = set()
-    for agent_id in agents:
+    for agent_id in sorted(population, key=lambda a: (len(a), a)):
         level = levels.get(str(agent_id))
         if level is None:
-            return None          # cannot attribute this agent to a role; do not guess
+            # A launched agent whose level nobody knows — usually one that reported nothing,
+            # since levels come from the payloads. Its role cannot be attributed, so no
+            # verdict; `metrics_complete` on the same row says why.
+            return None
         if (leaf_type if level == 0 else coord_type) == "llm":
             declared.add(str(agent_id))
     return declared | observed
@@ -618,7 +640,13 @@ def instrumentation_metrics(agents: dict[str, dict], meta: dict | None = None,
         # exact blindness this gate exists to prevent — 10 instrumented agents out of 30 would
         # read as 1.00 coverage. The observed set is only trustworthy when there is nothing
         # unattributed left over, i.e. every reporting agent carried an LLM block.
-        if agents_with_llm == len(agents):
+        # ... AND only when every launched agent is among the reporters. An agent that died
+        # at startup is in neither the payloads nor all_agents.csv, so it has no level and lands
+        # here; if the survivors all carried LLM blocks this branch used to certify the fleet
+        # at 1.00 — three LLM coordinators dead on hosts without the API key, 27 LLM leaves
+        # reporting, coverage 1.00. That is the startup-death case the run-level completeness
+        # gate exists for, and this gate must not contradict it.
+        if agents_with_llm == len(agents) and len(agents) >= launched_agent_count(meta):
             expected_llm_agents = agents_with_llm
             covered = agents_with_failure_counter
         else:
@@ -644,7 +672,11 @@ def instrumentation_metrics(agents: dict[str, dict], meta: dict | None = None,
     deciding = [(c, f) for c, f, total in signals
                 if total and c / total >= LLM_COVERAGE_MIN and c and agent_ok]
     if not deciding:
-        if have_bidding or have_llm:
+        # `expected_llm_agents` is in this condition on purpose: a run whose DECLARED LLM tier
+        # reported nothing at all carries no LLM block anywhere, so `have_llm`/`have_bidding`
+        # are both False and, gated on those alone, the collector said nothing — an entirely
+        # silent LLM coordinator tier read as a clean analytic run rather than as unchecked.
+        if have_bidding or have_llm or expected_llm_agents:
             out["llm_plane_unchecked"] = True
     else:
         out["llm_plane_unchecked"] = False
@@ -664,14 +696,23 @@ def instrumentation_metrics(agents: dict[str, dict], meta: dict | None = None,
         # End-to-end, including propagation from the child, but straddling two clocks.
         out.update(_dist("ctx_age_remote", _numeric(frame, "ctx_age_remote_mean")))
         out.update(_dist("decide_s", _numeric(frame, "decide_s")))
-        out["ctx_unknown_groups"] = int(_numeric(frame, "ctx_age_unknown").sum())
-        # Validity, not results. Non-zero skew means child and coordinator clocks disagree,
-        # so ctx_age_remote_* from this run is biased by up to ctx_skew_max_s; the headline
-        # ctx_age_* is taken on one clock and is unaffected. Reported as a MAX, not a sum: a
-        # count cannot separate a 1 ms artefact from a 1.1 s free-running clock.
-        out["ctx_skewed_ages"] = int(_numeric(frame, "ctx_age_skewed").sum())
+        # Validity columns, not results — and an ABSENT validity column is not a clean one.
+        # `_numeric` returns all-NaN for a missing column and NaN sums to 0, so decision rows
+        # written without these fields (an older agent revision, an instrumentation gap) read
+        # as "0 unknown groups, 0 skewed ages", i.e. as a run whose staleness axis is
+        # trustworthy. Unknown is recorded as None, which is what "we could not check" looks
+        # like in the CSV; a reader that sees 0 assumes the check ran.
+        def _validity_sum(column: str):
+            col = _numeric(frame, column)
+            return int(col.sum()) if col.notna().any() else None
+        out["ctx_unknown_groups"] = _validity_sum("ctx_age_unknown")
+        # Non-zero skew means child and coordinator clocks disagree, so ctx_age_remote_* from
+        # this run is biased by up to ctx_skew_max_s; the headline ctx_age_* is taken on one
+        # clock and is unaffected. Reported as a MAX, not a sum: a count cannot separate a
+        # 1 ms artefact from a 1.1 s free-running clock.
+        out["ctx_skewed_ages"] = _validity_sum("ctx_age_skewed")
         skew_max = _numeric(frame, "ctx_age_skew_max_s").max()
-        out["ctx_skew_max_s"] = float(skew_max) if pd.notna(skew_max) else 0.0
+        out["ctx_skew_max_s"] = float(skew_max) if pd.notna(skew_max) else None
         for policy, count in frame["policy"].value_counts().items():
             out[f"delegations_{policy}"] = int(count)
     return out
@@ -852,7 +893,9 @@ def run_metrics(run_dir: Path, expected_jobs: int | None) -> dict[str, Any]:
         ("pending_l1", "pending_level1_jobs.csv"),
     ):
         pending_df = read_jobs_csv(run_dir / filename)
-        metrics[f"{level_name}_count"] = 0 if pending_df is None else int(len(pending_df))
+        # None means the file is absent or unreadable, which is not "no backlog": a run that
+        # died before dumping its pending set would otherwise read as one that drained it.
+        metrics[f"{level_name}_count"] = None if pending_df is None else int(len(pending_df))
 
     # P0-4 instrumentation, from the per-agent payloads rather than the job CSVs.
     metrics.update(instrumentation_metrics(
