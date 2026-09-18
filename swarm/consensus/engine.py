@@ -23,6 +23,7 @@
 #
 # Author: Komal Thareja(kthare10@renci.org)
 import time
+from collections import OrderedDict
 
 from swarm.consensus.messages.proposal_info import ProposalContainer, ProposalInfo
 from swarm.consensus.messages.proposal import Proposal
@@ -74,6 +75,21 @@ class ConsensusEngine:
         # rather than by object so that adopting a better proposal (which resets the object
         # to PREPARE) still commits, and so does a re-proposal after a reselection timeout.
         self._commits_sent: set[tuple[str, str]] = set()
+        # (object_id, p_id) pairs this agent has already FINALIZED, kept after the object
+        # leaves the containers. Finalization used to erase every trace of a decision at once
+        # (`_forget_object`), and that is exactly when the stragglers arrive: every tier wider
+        # than its quorum produces (n - quorum) late PREPAREs and COMMITs per job. A late
+        # PREPARE then found the object with empty containers and no dedupe entry, re-adopted
+        # the proposal with the SENDER's wire vote list and broadcast a second COMMIT; a late
+        # COMMIT re-adopted it with a wire `commits` list already at quorum and finalized the
+        # decision a second time — `finalized_count` and `votes_` doubled, and the proposer ran
+        # the participant branch with the straggler recorded as leader. Both bias the
+        # PBFT-versus-Snow figures against PBFT. Bounded by count, not by objects in flight,
+        # because the whole point is to remember decisions the containers have forgotten; the
+        # host tells us when an object is genuinely up for election again (`forget_decision`),
+        # and a new election carries a new p_id anyway.
+        self._finalized: "OrderedDict[tuple[str, str], float]" = OrderedDict()
+        self._finalized_max = 8192
         self._proposed_at: dict[str, float] = {}
         self._proposed_at_max = 8192
         self.time_to_finalize = RunningStats()
@@ -212,6 +228,12 @@ class ConsensusEngine:
                     self.incoming.remove_object(object_id=proposal.object_id)
                 continue
 
+            if self._already_finalized(proposal.object_id, proposal.p_id):
+                # A straggler (or a ring/star forward) of a proposal this agent has already
+                # finalized. Adopting it would re-run the decision from its wire vote lists.
+                self.host.log_debug(f"Skip proposal {proposal.p_id} for {proposal.object_id} (finalized)")
+                continue
+
             # Basic dominance check using your existing helpers
             my_better = self.outgoing.has_better_proposal(proposal)
             peer_better = self.incoming.has_better_proposal(proposal)
@@ -257,6 +279,15 @@ class ConsensusEngine:
                     self.outgoing.remove_object(object_id=p.object_id)
                     self.incoming.remove_object(object_id=p.object_id)
                     self.host.log_debug(f"Skip prepare {p.p_id}/{p.object_id} (complete)")
+                continue
+
+            if self._already_finalized(p.object_id, p.p_id):
+                # Straggler PREPARE after our finalization. Before this check it re-adopted the
+                # proposal below with the sender's wire `prepares` (>= quorum), found no
+                # `_commits_sent` entry (forgotten at finalize) and broadcast a second COMMIT —
+                # the 2026-09-15 COMMIT-inflation defect, reintroduced by the cleanup that
+                # fixed it. Pinned by tests/test_pbft_stragglers.py.
+                self.host.log_debug(f"Skip prepare {p.p_id}/{p.object_id} (finalized)")
                 continue
 
             # I have sent this proposal
@@ -345,6 +376,30 @@ class ConsensusEngine:
         for k in stale:
             self._commits_sent.discard(k)
 
+    def _note_finalized(self, object_id: str, p_id: str, now: float) -> None:
+        key = (object_id, p_id)
+        self._finalized[key] = now
+        self._finalized.move_to_end(key)
+        while len(self._finalized) > self._finalized_max:
+            self._finalized.popitem(last=False)
+
+    def _already_finalized(self, object_id: str, p_id: str) -> bool:
+        return (object_id, p_id) in self._finalized
+
+    def forget_decision(self, object_id: str) -> None:
+        """The host says *object_id* is up for election again (a reassignment after its
+        assignee died, a reselection reset). Drop the memory of its PAST decisions.
+
+        Only `_finalized` is touched. `_commits_sent` is keyed by (object, p_id) and a new
+        election carries a new p_id, so the old entries are inert and are released at the next
+        finalize anyway. Clearing it here was a defect: the host calls this from its periodic
+        pending-job scan, which also sees every job whose election is merely IN FLIGHT (the
+        record stays PENDING in Redis until the leader persists READY), so the dedupe was
+        being erased mid-election every 0.5 s and the next PREPARE past quorum broadcast a
+        fresh COMMIT — the very duplication this file exists to prevent."""
+        for key in [k for k in self._finalized if k[0] == object_id]:
+            self._finalized.pop(key, None)
+
     def on_commit(self, msg: Commit) -> None:
         for p in msg.proposals:
             object = self.host.get_object(p.object_id)
@@ -357,6 +412,14 @@ class ConsensusEngine:
                     self.incoming.remove_object(object_id=p.object_id)
                     self._forget_object(p.object_id)
                     self.host.log_debug(f"Skipped commit {p.p_id}/{p.object_id} (missing)")
+                continue
+
+            if self._already_finalized(p.object_id, p.p_id):
+                # Straggler COMMIT after our finalization. It carries the sender's wire
+                # `commits` list, already at quorum, so adopting it finalized the decision a
+                # second time: `finalized_count` and `votes_` doubled, and the proposer took
+                # the participant branch with the straggler recorded as leader.
+                self.host.log_debug(f"Skip commit {p.p_id}/{p.object_id} (finalized)")
                 continue
 
             # I have sent this proposal
@@ -396,6 +459,9 @@ class ConsensusEngine:
             self.host.log_debug(f"Is quorum? /{quorum}")
             if len(proposal.commits) >= quorum:
                 self.host.log_debug("Is quorum!!")
+                # Remembered BEFORE the containers are cleared, so the stragglers that follow
+                # are recognised as such rather than re-adopted.
+                self._note_finalized(proposal.object_id, proposal.p_id, time.time())
                 self._record_finalize(proposal)
                 # leader vs participant path
                 if proposal.agent_id == self.agent_id and self.outgoing.contains(object_id=proposal.object_id, p_id=proposal.p_id):
@@ -405,7 +471,11 @@ class ConsensusEngine:
                     self.host.on_leader_elected(object, proposal.p_id)
                 else:
                     self.host.log_info(f"[CON_PART] Object:{proposal.object_id} Leader:{proposal.agent_id} p:{proposal.p_id}")
-                    self.host.on_participant_commit(object, msg.agents[0].agent_id, proposal.p_id)
+                    # The leader is the PROPOSER, not whoever's COMMIT happened to reach quorum
+                    # last. `msg.agents[0]` was passed here, so every participant recorded the
+                    # sender of the final COMMIT as the job's assignee in `job_assignments` —
+                    # a different peer per participant, and the wrong one for all of them.
+                    self.host.on_participant_commit(object, proposal.agent_id, proposal.p_id)
                 self.outgoing.remove_object(object_id=proposal.object_id)
                 self.incoming.remove_object(object_id=proposal.object_id)
                 self._forget_object(proposal.object_id)

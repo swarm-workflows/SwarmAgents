@@ -101,8 +101,7 @@ def make_leaf():
     a.executor = _Executor()
     a.queues = MagicMock()
     a.engine = MagicMock()
-    a.completed_jobs_set = set()
-    a.completed_lock = threading.RLock()
+    a._init_decision_state()   # the shipped dedupe state, not a hand-built copy
     a.failure_sim_enabled = False
     a.measurement_layer = None
     a.consumer_timeout_s = 1.0

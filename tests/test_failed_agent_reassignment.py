@@ -128,8 +128,7 @@ def _agent(repo, agent_id=1):
     a.queues = MagicMock()
     a.engine = MagicMock()
     a.job_assignments = ThreadSafeDict()
-    a.completed_jobs_set = set()
-    a.completed_lock = threading.RLock()
+    a._init_decision_state()   # the shipped dedupe state, not a hand-built copy
     a.pending_proposals = {}
     a.pending_prepares = {}
     a.pending_commits = {}

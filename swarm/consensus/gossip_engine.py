@@ -255,6 +255,12 @@ class GossipConsensusEngine:
     def on_prepare(self, msg) -> None: pass
     def on_commit(self, msg) -> None: pass
 
+    def forget_decision(self, object_id: str) -> None:
+        """API parity with `ConsensusEngine`: the agent calls this when a job is up for
+        election again. Snow's decision memory is the Redis claim, which the agent releases
+        itself (`release_assignment`), so there is nothing engine-side to drop."""
+        return None
+
     # ---- Snow-message handlers (called from inbound thread) ------------- #
 
     def _answer_query(self, query_id, job_id, q_preferred, q_cost) -> Optional[dict]:

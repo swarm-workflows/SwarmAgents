@@ -157,8 +157,17 @@ class _HostAdapter(ConsensusHost):
 
     def is_agreement_achieved(self, object_id: str): return self.agent.is_job_completed(object_id)
     def calculate_quorum(self): return self.agent.calculate_quorum()
-    def on_leader_elected(self, obj: Object, proposal_id: str): self.agent.select_job(obj)
+    def on_leader_elected(self, obj: Object, proposal_id: str):
+        # Decided is a LOCAL fact from this instant. `select_job` only persists READY, and the
+        # consensus dedupe set is fed by `schedule_job` (~0.5 s later at a leaf) or by the
+        # periodic Redis scan — and at a coordinator not until the delegation monitor marks the
+        # job COMPLETE. In that window every straggler message for the job found it "not
+        # achieved" and re-ran the decision (see ConsensusEngine._finalized). Recording it here
+        # closes the window on the host side too, whichever engine is running.
+        self.agent._note_decided(obj.object_id)
+        self.agent.select_job(obj)
     def on_participant_commit(self, obj: Object, leader_id: int, proposal_id: str):
+        self.agent._note_decided(obj.object_id)
         obj.state = ObjectState.COMMIT
         # If proposal was committed and leader is a peer (not self)
         self.agent.job_assignments.set(obj.object_id, int(leader_id))
@@ -406,8 +415,7 @@ class ResourceAgent(Agent):
 
         self._load = 0
         self.metrics = Metrics()
-        self.completed_lock = threading.RLock()
-        self.completed_jobs_set = set()
+        self._init_decision_state()
         self.queues = ResourceAgentQueues()
 
         self.threads.update({
@@ -971,8 +979,12 @@ class ResourceAgent(Agent):
 
     def _update_pending_jobs(self, jobs: list[str]):
         # One MGET for every job we don't have locally — the per-id get() loop paid a
-        # WAN round-trip per pending job on every periodic tick.
-        missing = [j for j in jobs if j not in self.queues.pending_queue]
+        # WAN round-trip per pending job on every periodic tick. Decided jobs are fetched
+        # too, even when held locally: their record is the only evidence of whether the
+        # PENDING is a reset (see _reset_evidence).
+        with self.completed_lock:
+            decided = set(self._decided_jobs)
+        missing = [j for j in jobs if j not in self.queues.pending_queue or j in decided]
         fetched = self.repository.get_many(
             missing, key_prefix=Repository.KEY_JOB,
             level=self.topology.level, group=self.topology.group) if missing else {}
@@ -984,6 +996,14 @@ class ResourceAgent(Agent):
             with self.completed_lock:
                 self.completed_jobs_set.discard(job_id)
             job = fetched.get(job_id)
+            if job_id in decided:
+                # A decision this agent witnessed, and Redis still says PENDING. That is a
+                # reset only if the record says so; otherwise it is a leader that has not
+                # persisted READY yet, and the local object (COMMIT) must not be replaced by
+                # the stale PENDING record or the decision forgotten.
+                if not self._reset_evidence(job_id, job):
+                    continue
+                self._forget_decided(job_id)
             if job:
                 job_obj = Job()
                 job_obj.from_dict(job)
@@ -1069,6 +1089,9 @@ class ResourceAgent(Agent):
 
     def _update_completed_jobs(self, jobs: list[str]):
         self.update_jobs(jobs, self.completed_jobs_set, self.completed_lock)
+        with self.completed_lock:
+            for j in jobs:
+                self._decided_jobs.pop(j, None)          # promoted; no need to hold both
         for j in jobs:
             self.engine.incoming.remove_object(object_id=j)
             self.engine.outgoing.remove_object(object_id=j)
@@ -1085,8 +1108,9 @@ class ResourceAgent(Agent):
                 job.state = ObjectState.PENDING
                 self.engine.outgoing.remove_object(object_id=job.job_id)
                 self.engine.incoming.remove_object(object_id=job.job_id)
-                if job.job_id in self.completed_jobs_set:
-                    self.completed_jobs_set.remove(job.job_id)
+                with self.completed_lock:
+                    self.completed_jobs_set.discard(job.job_id)
+                self._forget_decided(job.job_id)
                 job_id = job.job_id
                 self.metrics.restarts[job_id] = self.metrics.restarts.get(job_id, 0) + 1
 
@@ -1386,8 +1410,10 @@ class ResourceAgent(Agent):
                         pass
                 return
 
-            # Reset job state to PENDING for parent level
+            # Reset job state to PENDING for parent level — and forget that it was decided, or
+            # the fresh election's messages are skipped as stragglers of the old one.
             job_obj.state = ObjectState.PENDING
+            self._forget_decided(job_id)
 
             # Add back to parent's pending queue if not already there
             if job_id not in self.queues.pending_queue:
@@ -2832,8 +2858,72 @@ class ResourceAgent(Agent):
         with lock:
             job_set.update(jobs)
 
+    def _init_decision_state(self) -> None:
+        """The consensus dedupe state, assembled in one place.
+
+        `completed_jobs_set` is the set consensus deduplicates on — a job in it is out of
+        election, whatever its execution outcome. `_decided_jobs` holds jobs this agent has
+        seen FINALIZED (as leader or participant) that have not reached that set yet:
+        `select_job` only persists READY, the set is fed by `schedule_job` ~0.5 s later at a
+        leaf, and at a coordinator not until the delegation monitor marks the job COMPLETE.
+        In that window every straggler consensus message found the job "not achieved" and
+        re-ran the decision. Both are read by `is_job_completed`, and a job is discarded from
+        both wherever it is genuinely up for election again.
+
+        One method, called by `__init__` and by every test double built with `__new__`, so a
+        double cannot exercise a differently-assembled state than the one that ships.
+        """
+        self.completed_lock = threading.RLock()
+        self.completed_jobs_set = set()
+        self._decided_jobs: dict = {}      # job_id -> time.monotonic() at finalize
+
     def is_job_completed(self, job_id: str) -> bool:
-        return job_id in self.completed_jobs_set
+        return job_id in self.completed_jobs_set or job_id in self._decided_jobs
+
+    #: Slack when comparing a Redis record's `last_transition_at` (another host's wall clock)
+    #: with this agent's decision time. The two events this separates are a write latency
+    #: apart on one side and a failure-detection window (30-60 s) apart on the other, so a
+    #: second of slack costs nothing and absorbs any residual clock offset.
+    _RESET_EVIDENCE_SLACK_S = 1.0
+
+    def _note_decided(self, job_id: str) -> None:
+        # Wall clock, deliberately: it is compared with `last_transition_at` in job records
+        # written by other hosts, which is wall clock too.
+        with self.completed_lock:
+            self._decided_jobs[job_id] = time.time()
+
+    def _forget_decided(self, job_id: str) -> None:
+        """The job is up for election again: drop the local decision memory here AND in the
+        engine, or its next election's messages are skipped as stragglers of the last one."""
+        with self.completed_lock:
+            self._decided_jobs.pop(job_id, None)
+        forget = getattr(self.engine, "forget_decision", None)
+        if callable(forget):
+            forget(job_id)
+
+    def _reset_evidence(self, job_id: str, record: Optional[dict]) -> bool:
+        """Does this PENDING *record* prove the job was returned to the pool AFTER we saw it
+        decided? Evidence, not elapsed time.
+
+        Elapsed time was tried first and is the wrong discriminator: a leader delayed before
+        persisting READY — Redis slow under exactly the load that also delays the stragglers —
+        leaves the same old PENDING record in place however long it takes, and forgetting the
+        decision on a timer re-opened the straggler window at the worst moment. What a reset
+        actually does is WRITE the record: every path that returns a job to the pool sets
+        `state = PENDING` through the `Object.state` setter, which stamps
+        `last_transition_at`, so a reset record carries a transition time later than our
+        decision, and the untouched pre-election record carries one earlier. Absent evidence
+        (no record, no stamp) keeps the decision: a guess in either direction is the defect.
+        """
+        with self.completed_lock:
+            decided_at = self._decided_jobs.get(job_id)
+        if decided_at is None or not record:
+            return False
+        try:
+            transitioned_at = float(record.get("last_transition_at") or 0.0)
+        except (TypeError, ValueError):
+            return False
+        return transitioned_at > decided_at + self._RESET_EVIDENCE_SLACK_S
 
     def _get_child_groups_for_job(self, job: Job) -> list[int]:
         """
@@ -3938,6 +4028,7 @@ class ResourceAgent(Agent):
                 self.engine.incoming.remove_object(object_id=job_id)
                 with self.completed_lock:
                     self.completed_jobs_set.discard(job_id)
+                self._forget_decided(job_id)
 
                 self.metrics.reassignments[job_id] = {
                     'failed_agent': failed_agent_id,
