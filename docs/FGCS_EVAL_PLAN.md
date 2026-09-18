@@ -426,6 +426,16 @@ either way, because the reference cell is what every other number is compared ag
 `run_meta.json` records the fan-out and coordinator type *observed* in the generated configs
 (since 2026-09-18), so a cell that got the wrong one is detectable; check both at E0.
 
+### 0.12 Code review of 2026-09-18 — see `docs/CODE_REVIEW_2026-09-18.md`
+
+A read of the code base end to end. Three findings change campaign numbers and are owed before
+E0, all recorded in `CCGRID27_PAPER_PLAN.md` §4: PBFT stragglers after quorum re-finalize and
+re-broadcast COMMIT (the 2026-09-15 fix undone by its own `_forget_object`; demonstrated in
+`tests/test_pbft_stragglers.py`); hierarchical latency columns exclude the coordinator tier by
+construction; the selection startup barrier has no timeout. Journal-side: `LlmAgent.selection_main`
+has no DAG gating and no infeasible handling; SWIM false-fails silence consensus traffic to live
+peers under `broadcast()` although the docs call it advisory; `selection_threshold_pct` is inert.
+
 ### 0.11 Five more defects from the same review pass, all FIXED 2026-09-15
 
 None was found by a failing run; all five bias a number one of the papers reports. Pinned by
