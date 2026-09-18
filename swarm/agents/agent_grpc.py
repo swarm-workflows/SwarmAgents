@@ -136,14 +136,10 @@ class Agent(Observer):
         from swarm.execution import runner
 
         cfg = (self.runtime_config.get("execution") or {}) if self.runtime_config else {}
-        mode = str(cfg.get("mode", "simulate")).lower()
-        if mode not in ("simulate", "real"):
-            # Same rule as consensus.protocol: an unknown value raises rather than becoming
-            # the default, because the two modes produce results that cannot be compared and
-            # nothing in the run would say which one had been used.
-            raise ValueError(
-                f"runtime.execution.mode {mode!r} is not 'simulate' or 'real'. Refused "
-                "rather than defaulted: the two produce results that cannot be compared.")
+        # Resolved in runner.resolve_mode, which owns the default and the refusal — anything
+        # else that needs to know what this run will do (run_test.py's bundle validation) asks
+        # the same function rather than re-deriving it.
+        mode = runner.resolve_mode(cfg)
 
         work_dir = str(cfg.get("work_dir", "") or "")
         # A shared scratch per run, so logical file names resolve between jobs of one DAG

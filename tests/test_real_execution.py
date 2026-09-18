@@ -990,3 +990,25 @@ class TestUnresolvableRelativePaths(PolicyTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestModeHasOneDefault(unittest.TestCase):
+    """`runtime.execution.mode` is resolved in exactly one place. It was briefly resolved twice
+    with different defaults — the agent defaulting an absent key to `simulate`, and run_test's
+    bundle validation reading absent as "assume it executes" — which refused ordinary simulated
+    replays."""
+
+    def test_absent_means_simulate(self):
+        from swarm.execution.runner import resolve_mode
+        self.assertEqual(resolve_mode(None), "simulate")
+        self.assertEqual(resolve_mode({}), "simulate")
+
+    def test_an_explicit_value_is_honoured_and_case_insensitive(self):
+        from swarm.execution.runner import resolve_mode
+        self.assertEqual(resolve_mode({"mode": "REAL"}), "real")
+        self.assertEqual(resolve_mode({"mode": "simulate"}), "simulate")
+
+    def test_an_unknown_value_raises(self):
+        from swarm.execution.runner import resolve_mode
+        with self.assertRaises(ValueError):
+            resolve_mode({"mode": "dry-run"})

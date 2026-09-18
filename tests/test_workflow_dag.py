@@ -460,3 +460,123 @@ def test_the_predicate_survives_a_round_trip_through_redis():
     back = Job()
     back.from_dict(j.to_dict())
     assert back.data_predicate == {"kind": "files", "files": ["a.csv", "b.json"]}
+
+
+class TestCollidingOutputsAcrossWorkflows:
+    """Converting several workflows into one bundle shares one flat working directory and one
+    producer map, and generic names recur across unrelated workflows.
+    """
+
+    def test_a_name_produced_by_two_jobs_is_reported(self):
+        from pegasus_to_swarm_converter import colliding_outputs
+        jobs = [
+            {"id": "wfA_split", "data_in": [], "data_out": [{"file": "output.csv"}]},
+            {"id": "wfB_extract", "data_in": [], "data_out": [{"file": "output.csv"}]},
+            {"id": "wfB_merge", "data_in": [{"file": "output.csv"}], "data_out": []},
+        ]
+        assert colliding_outputs(jobs) == {"output.csv": ["wfA_split", "wfB_extract"]}
+
+    def test_disjoint_workflows_report_nothing(self):
+        from pegasus_to_swarm_converter import colliding_outputs
+        jobs = [
+            {"id": "wfA_split", "data_in": [], "data_out": [{"file": "a.csv"}]},
+            {"id": "wfB_split", "data_in": [], "data_out": [{"file": "b.csv"}]},
+        ]
+        assert colliding_outputs(jobs) == {}
+
+    def test_the_edge_it_warns_about_is_real(self):
+        """Not hypothetical: gating keys the producer map by name, so the consumer of a
+        colliding name is gated on whichever job was seen last."""
+        from pegasus_to_swarm_converter import apply_dag_gating
+        jobs = [
+            {"id": "wfA_split", "data_in": [], "data_out": [{"file": "output.csv"}]},
+            {"id": "wfB_extract", "data_in": [], "data_out": [{"file": "output.csv"}]},
+            {"id": "wfB_merge", "data_in": [{"file": "output.csv"}], "data_out": []},
+        ]
+        apply_dag_gating(jobs)
+        assert jobs[2]["data_predicate"] == {"kind": "files", "files": ["output.csv"]}
+
+
+class TestNamesAreDecidedByTheWorkDir:
+    """The working directory is flat and `stage_inputs` reduces a declared name to its
+    basename, so the basename is the name a file actually gets."""
+
+    def test_two_directories_one_file_name_collide(self):
+        from pegasus_to_swarm_converter import colliding_outputs
+        jobs = [
+            {"id": "wfA_x", "data_out": [{"file": "runA/out.csv"}]},
+            {"id": "wfB_y", "data_out": [{"file": "runB/out.csv"}]},
+        ]
+        # Keyed by the recorded string these are two names and nothing is reported; keyed by
+        # the basename they are one file, written twice.
+        assert colliding_outputs(jobs) == {"out.csv": ["wfA_x", "wfB_y"]}
+
+
+class TestStagedInputsThatSomeJobProduces:
+    def test_a_cross_workflow_conflict_is_flagged(self):
+        from pegasus_to_swarm_converter import conflicting_replicas
+        pairs = [
+            ({"id": "wfA_split", "workflow": "wfA", "data_out": [{"file": "data.csv"}]}, {}),
+            ({"id": "wfB_load", "workflow": "wfB", "data_in": [{"file": "data.csv"}]},
+             {"replicas_db": {"data.csv": "/wfB/data.csv"}}),
+        ]
+        out = conflicting_replicas(pairs)
+        assert out["data.csv"]["cross_workflow"] is True
+        assert out["data.csv"]["produced_by"] == ["wfA_split"]
+
+    def test_within_one_workflow_it_is_reported_but_not_cross_workflow(self):
+        from pegasus_to_swarm_converter import conflicting_replicas
+        pairs = [
+            ({"id": "wfA_fetch", "workflow": "wfA", "data_out": [{"file": "data.csv"}]}, {}),
+            ({"id": "wfA_load", "workflow": "wfA", "data_in": [{"file": "data.csv"}]},
+             {"replicas_db": {"data.csv": "/wfA/data.csv"}}),
+        ]
+        assert conflicting_replicas(pairs)["data.csv"]["cross_workflow"] is False
+
+    def test_a_replica_nothing_produces_is_not_a_conflict(self):
+        from pegasus_to_swarm_converter import conflicting_replicas
+        pairs = [({"id": "wfA_load", "workflow": "wfA", "data_in": [{"file": "seed.json"}]},
+                  {"replicas_db": {"seed.json": "/wfA/seed.json"}})]
+        assert conflicting_replicas(pairs) == {}
+
+
+class TestCrossWorkflowEdges:
+    """Two workflows have no data relationship, so a name they share is a coincidence. Both
+    mechanisms that act on names act on it anyway."""
+
+    def test_a_name_one_workflow_writes_and_another_reads(self):
+        from pegasus_to_swarm_converter import cross_workflow_edges
+        jobs = [
+            {"id": "wfA_split", "workflow": "wfA", "data_out": [{"file": "out.csv"}]},
+            {"id": "wfB_load", "workflow": "wfB", "data_in": [{"file": "out.csv"}]},
+        ]
+        assert cross_workflow_edges(jobs) == {
+            "out.csv": {"read_by": ["wfB_load"], "produced_by": ["wfA_split"]}}
+
+    def test_a_real_edge_inside_one_workflow_is_not_reported(self):
+        from pegasus_to_swarm_converter import cross_workflow_edges
+        jobs = [
+            {"id": "wfA_split", "workflow": "wfA", "data_out": [{"file": "out.csv"}]},
+            {"id": "wfA_load", "workflow": "wfA", "data_in": [{"file": "out.csv"}]},
+        ]
+        assert cross_workflow_edges(jobs) == {}
+
+    def test_it_does_not_depend_on_a_replica_catalog(self):
+        """The check this replaced compared declared replicas, which most profiles do not
+        carry — the replica catalog is not in the stampede DB — so the common case reported
+        nothing at all."""
+        from pegasus_to_swarm_converter import cross_workflow_edges, conflicting_replicas
+        jobs = [
+            {"id": "wfA_split", "workflow": "wfA", "data_out": [{"file": "out.csv"}]},
+            {"id": "wfB_load", "workflow": "wfB", "data_in": [{"file": "out.csv"}]},
+        ]
+        assert conflicting_replicas([(j, {}) for j in jobs]) == {}      # no replicas_db
+        assert cross_workflow_edges(jobs)                               # still caught
+
+    def test_directories_do_not_hide_it(self):
+        from pegasus_to_swarm_converter import cross_workflow_edges
+        jobs = [
+            {"id": "wfA_split", "workflow": "wfA", "data_out": [{"file": "a/out.csv"}]},
+            {"id": "wfB_load", "workflow": "wfB", "data_in": [{"file": "b/out.csv"}]},
+        ]
+        assert "out.csv" in cross_workflow_edges(jobs)

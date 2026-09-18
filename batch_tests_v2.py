@@ -86,8 +86,10 @@ def main():
     ap.add_argument("--agents", type=int, required=True, help="Total number of agents")
     ap.add_argument("--topology", required=True, choices=["mesh", "ring", "star", "hierarchical"])
     ap.add_argument("--hierarchical-level1-agent-type", type=str,
-                    choices=["llm", "resource"], default="llm",
-                    help="Agent type for level 1 (parent) agents in hierarchical topology (default: llm)")
+                    choices=["llm", "resource"], default="resource",
+                    help="Agent type for level 1 (parent) agents in hierarchical topology "
+                         "(default: resource). It does NOT follow --agent-type: an all-LLM "
+                         "hierarchy needs this set to llm as well.")
     ap.add_argument("--jobs", type=int, required=True)
     ap.add_argument("--db-host", required=True)
 
@@ -128,12 +130,13 @@ def main():
     # Co-parent support for hierarchical topology
     ap.add_argument("--co-parents", type=int, default=1,
                     help="Number of co-parents per child group in hierarchical topology (default: 1)")
-    ap.add_argument("--groups-per-coordinator", type=int, default=1,
-                    help="Child groups each Level-1 coordinator exclusively parents (default: 1). "
-                         "Above 1 is required for any delegation measurement: at 1 a coordinator "
-                         "has a single candidate, so the MAB and delegation.policy=llm are both "
-                         "inert. Freed coordinator slots become Level-0 agents, so the fleet size "
-                         "is unchanged. Two-level hierarchies only.")
+    ap.add_argument("--groups-per-coordinator", type=int, default=None,
+                    help="Child groups each Level-1 coordinator exclusively parents (default: 2). "
+                         "At 1 a coordinator has a single candidate, so the MAB and "
+                         "delegation.policy=llm are inert and every delegation records as "
+                         "trivial. Freed coordinator slots become Level-0 agents, so the fleet "
+                         "size is unchanged. Two-level hierarchies only: a three-level fleet "
+                         "(100, 990, 1000) refuses an explicit >1 and steps the default down to 1.")
 
     # Fleet reproducibility (v2) — both are required for a comparable scale ladder; see
     # docs/FGCS_EVAL_PLAN.md section 0.2.
@@ -270,7 +273,10 @@ def main():
             cmd += ["--hierarchical-level1-agent-type", args.hierarchical_level1_agent_type]
             if hasattr(args, 'co_parents') and args.co_parents > 1:
                 cmd += ["--co-parents", str(args.co_parents)]
-            if getattr(args, 'groups_per_coordinator', 1) > 1:
+            # Forwarded whenever it was GIVEN, not only when > 1: an explicit 1 that is not
+            # forwarded lets generate_configs apply its own default (2) instead, so the
+            # launcher's idea of the fan-out and the generated fleet's would differ.
+            if getattr(args, 'groups_per_coordinator', None) is not None:
                 cmd += ["--groups-per-coordinator", str(args.groups_per_coordinator)]
         if args.delegation_policy:
             cmd += ["--delegation-policy", args.delegation_policy]

@@ -278,6 +278,10 @@ def map_profile(profile: dict, job_number: int,
 
     job = {
         "id": job_id,
+        # Which workflow (and which run of it) this job came from. Nothing in the scheduler
+        # reads it yet — Job.from_dict ignores unknown keys — but every name collision below
+        # is only decidable with it, and a per-workflow working directory would key on it.
+        "workflow": run_name,
         "wall_time": round(wall_time, 4),
         "capacities": capacities,
         "data_in": data_in if data_in else [],
@@ -377,6 +381,125 @@ def apply_dag_gating(jobs: List[dict]) -> Tuple[int, List[str]]:
         else:
             roots.append(job["id"])
     return edges, roots
+
+
+def colliding_outputs(jobs: List[dict]) -> Dict[str, List[str]]:
+    """Logical file names that more than one job claims to produce.
+
+    Two things make this worth reporting rather than resolving. The jobs of a run share ONE
+    working directory — `data_in`/`data_out` are bare names, which is how job B finds job A's
+    output — so two jobs producing `results.csv` overwrite each other on disk. And with
+    `--dag-gating` the producer map is keyed by name, so whichever job is seen last becomes
+    the producer and every consumer of that name waits on it, no matter which job it actually
+    reads from.
+
+    Within one workflow this is rare. Converting SEVERAL workflows into one bundle is where it
+    bites: generic names (`output.csv`, `merged.dat`) recur across workflows that have nothing
+    to do with each other, and the result is a cross-workflow edge nobody wrote — a job held
+    until an unrelated workflow finishes, then reading that workflow's file.
+
+    Returns {file name: [job ids]} for the collisions only.
+    """
+    producers: Dict[str, List[str]] = {}
+    for job in jobs:
+        for dn in (job.get("data_out") or []):
+            f = dn.get("file")
+            if f:
+                # Keyed by BASENAME, because that is the name the file actually gets: the
+                # working directory is flat and `stage_inputs` reduces every declared name to
+                # its basename. Keying by the recorded string missed the case that matters
+                # most — `runA/out.csv` and `runB/out.csv` are two keys and one file.
+                producers.setdefault(os.path.basename(str(f)), []).append(job["id"])
+    return {f: sorted(set(ids)) for f, ids in producers.items() if len(set(ids)) > 1}
+
+
+def cross_workflow_edges(jobs: List[dict]) -> Dict[str, dict]:
+    """File names one workflow produces and another workflow reads.
+
+    This is the general form of every name collision in a multi-workflow bundle, and the only
+    one that cannot be anything but a mistake: two workflows have no data relationship, so a
+    name they share is a coincidence, not a dependency. Both mechanisms that act on names act
+    on it anyway —
+
+    * `--dag-gating` keys its producer map by name, so the reader is gated on the other
+      workflow's job and waits for a run it has nothing to do with;
+    * the working directory is flat and shared, so whichever job gets there first decides what
+      the reader reads. `stage_inputs` never overwrites, and a producer writes directly.
+
+    Checking `data_in` against `data_out` catches this whatever the name's provenance. An
+    earlier version compared only the *declared replicas*, which are absent from most profiles
+    (the replica catalog is not in the stampede DB), so the common case reported nothing.
+
+    Keyed by basename, like everything else that decides a working-directory name.
+    Returns {basename: {"read_by": [...], "produced_by": [...]}}.
+    """
+    produced: Dict[str, List[dict]] = {}
+    for job in jobs:
+        for dn in (job.get("data_out") or []):
+            f = dn.get("file")
+            if f:
+                produced.setdefault(os.path.basename(str(f)), []).append(job)
+
+    out: Dict[str, dict] = {}
+    for job in jobs:
+        for dn in (job.get("data_in") or []):
+            f = dn.get("file")
+            if not f:
+                continue
+            name = os.path.basename(str(f))
+            foreign = [p for p in produced.get(name, [])
+                       if p.get("workflow") != job.get("workflow")]
+            if not foreign:
+                continue
+            entry = out.setdefault(name, {"read_by": [], "produced_by": []})
+            entry["read_by"].append(job["id"])
+            entry["produced_by"].extend(p["id"] for p in foreign)
+    for entry in out.values():
+        entry["read_by"] = sorted(set(entry["read_by"]))
+        entry["produced_by"] = sorted(set(entry["produced_by"]))
+    return out
+
+
+def conflicting_replicas(jobs_and_profiles) -> Dict[str, dict]:
+    """Names a job expects to be STAGED from the bundle while another job PRODUCES them.
+
+    A declared replica is a file the run does not make: it is carried in `inputs/` and copied
+    into the working directory before the job starts. If some other job also writes that name,
+    the two are indistinguishable afterwards, and which one the consumer reads depends on who
+    got there first — `stage_inputs` never overwrites, and a producer writes directly.
+
+    With `--dag-gating` it is worse than a race: the producer map is keyed by name, so the
+    consumer is gated on that job and waits for a workflow it has nothing to do with.
+
+    Returns {basename: {"expected_by": [...], "produced_by": [...], "cross_workflow": bool}}.
+    """
+    produced: Dict[str, List[dict]] = {}
+    for job, _profile in jobs_and_profiles:
+        for dn in (job.get("data_out") or []):
+            f = dn.get("file")
+            if f:
+                produced.setdefault(os.path.basename(str(f)), []).append(job)
+
+    out: Dict[str, dict] = {}
+    for job, profile in jobs_and_profiles:
+        for lfn in (profile.get("replicas_db") or {}):
+            name = os.path.basename(str(lfn))
+            others = [p for p in produced.get(name, []) if p["id"] != job["id"]]
+            if not others:
+                continue
+            entry = out.setdefault(name, {"expected_by": [], "produced_by": [],
+                                          "cross_workflow": False})
+            entry["expected_by"].append(job["id"])
+            entry["produced_by"].extend(p["id"] for p in others)
+            # Within one workflow this can be deliberate (a pre-seeded intermediate, which is
+            # how a job that cannot run here — an external API call — is stood in for). Across
+            # workflows it is never deliberate: they simply picked the same name.
+            if any(p.get("workflow") != job.get("workflow") for p in others):
+                entry["cross_workflow"] = True
+    for entry in out.values():
+        entry["expected_by"] = sorted(set(entry["expected_by"]))
+        entry["produced_by"] = sorted(set(entry["produced_by"]))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -494,46 +617,18 @@ def generate_agent_configs(jobs: List[dict], num_agents: int,
     Agents are sized from the standard flavor pool and given every DTN site
     that appears in the converted jobs so all jobs pass feasibility checks.
     """
-    # Collect all DTN site names referenced by jobs
-    required_sites: Dict[str, str] = {}  # name -> first file seen
-    max_core = 0.0
-    max_ram = 0.0
-    max_disk = 0.0
-    max_gpu = 0
+    # What the jobs need, and the DTNs they name. Computed in swarm/utils/fleet_sizing.py and
+    # nowhere else: generate_configs.py --size-to-jobs sizes a fleet the same way, and two
+    # copies of "can this agent host this job" would drift into disagreeing about it.
+    from swarm.utils.fleet_sizing import (dtn_base_scores, dtn_entries, fit_flavor,
+                                          job_requirements)
 
-    for job in jobs:
-        c = job["capacities"]
-        max_core = max(max_core, c["core"])
-        max_ram = max(max_ram, c["ram"])
-        max_disk = max(max_disk, c["disk"])
-        max_gpu = max(max_gpu, c["gpu"])
-        for dn in (job.get("data_in") or []) + (job.get("data_out") or []):
-            if dn["name"] not in required_sites:
-                required_sites[dn["name"]] = dn.get("file", "")
-
-    # Build DTN list that every agent gets
-    dtn_list = []
-    for i, (site_name, _) in enumerate(sorted(required_sites.items()), 1):
-        dtn_list.append({
-            "name": site_name,
-            "ip": f"192.168.200.{i}",
-            "user": f"dtn_user_{site_name}",
-            "connectivity_score": 1.0,
-        })
-
-    # Assign flavors
-    flavors = _pick_flavor(num_agents)
-
-    # Ensure every flavor can handle the largest job
-    for flavor in flavors:
-        if flavor["core"] < max_core:
-            flavor["core"] = int(math.ceil(max_core))
-        if flavor["ram"] < max_ram:
-            flavor["ram"] = int(math.ceil(max_ram))
-        if flavor["disk"] < max_disk:
-            flavor["disk"] = int(math.ceil(max_disk))
-        if flavor["gpu"] < max_gpu:
-            flavor["gpu"] = max_gpu
+    req = job_requirements(jobs)
+    # One base score per DTN, one set of entries per agent: every agent holds every name (no
+    # job is infeasible anywhere, so a failed agent's work can go to any other) with its own
+    # connectivity to it. Feasibility tests the name, the cost model tests the score.
+    dtn_bases = dtn_base_scores(req.dtns)
+    flavors = [fit_flavor(f, req) for f in _pick_flavor(num_agents)]
 
     # Build profiles dict
     profiles: Dict[str, dict] = {}
@@ -544,7 +639,7 @@ def generate_agent_configs(jobs: List[dict], num_agents: int,
             "ram": f["ram"],
             "disk": f["disk"],
             "gpu": f["gpu"],
-            "dtns": copy.deepcopy(dtn_list),
+            "dtns": dtn_entries(req.dtns, base_scores=dtn_bases),
         }
 
     # Write agent_profiles.json
@@ -586,8 +681,10 @@ def generate_agent_configs(jobs: List[dict], num_agents: int,
                 "mtu": 0,
             }
 
-            # DTNs
-            cfg["dtns"] = copy.deepcopy(dtn_list)
+            # DTNs — the SAME entries this agent's profile carries, not a fresh draw: the
+            # fleet-fit check reads the per-agent config and the DTN pool reads the profile,
+            # so a config and a profile that disagreed would describe two different agents.
+            cfg["dtns"] = copy.deepcopy(profiles[str(agent_id)]["dtns"])
 
             # Topology — simple mesh or ring
             if topology == "ring":
@@ -629,12 +726,12 @@ def generate_agent_configs(jobs: List[dict], num_agents: int,
         "configs_dir": configs_dir if base_config_path else None,
         "num_agents": num_agents,
         "flavors_used": sorted({f["name"] for f in flavors}),
-        "dtn_sites": list(required_sites.keys()),
+        "dtn_sites": sorted(req.dtns),
         "max_job_requirements": {
-            "core": max_core,
-            "ram": max_ram,
-            "disk": max_disk,
-            "gpu": max_gpu,
+            "core": req.core,
+            "ram": req.ram,
+            "disk": req.disk,
+            "gpu": req.gpu,
         },
     }
 
@@ -739,6 +836,28 @@ def convert_pegasus_profiles(
 
     dag_edges, dag_roots = (apply_dag_gating([j for _, j, _, _ in mapped])
                             if dag_gating else (0, []))
+    # Reported, never resolved: the converter cannot know which of two same-named outputs a
+    # consumer meant, and picking one silently is how an unrelated workflow's file ends up
+    # feeding a job. See colliding_outputs().
+    dag_collisions = colliding_outputs([j for _, j, _, _ in mapped])
+    if dag_collisions:
+        print(f"  WARNING:     {len(dag_collisions)} output file name(s) are produced by more "
+              f"than one job; they share one flat working directory and, with --dag-gating, "
+              f"one producer map. Listed in conversion_summary.json -> dag.colliding_outputs.")
+    replica_conflicts = conflicting_replicas([(j, p) for _, j, p, _ in mapped])
+    if replica_conflicts:
+        crossing = sum(1 for v in replica_conflicts.values() if v["cross_workflow"])
+        print(f"  WARNING:     {len(replica_conflicts)} staged input name(s) are also produced "
+              f"by a job ({crossing} of them by a different workflow). Listed in "
+              f"conversion_summary.json -> dag.replica_conflicts.")
+    foreign_edges = cross_workflow_edges([j for _, j, _, _ in mapped])
+    if foreign_edges:
+        print(f"  WARNING:     {len(foreign_edges)} file name(s) are produced by one workflow "
+              f"and read by another. Listed in conversion_summary.json -> "
+              f"dag.cross_workflow_edges.")
+    # Whether the names are acted upon at all: a simulated replay with no gating never touches
+    # a filesystem and never consults a producer map, so its names are inert.
+    execution_jobs = sum(1 for _, j, _, _ in mapped if j.get("execution"))
 
     # The payload is built in a staging directory and only promoted once everything that
     # can fail has succeeded. Clearing first — which is what this did — destroyed a working
@@ -814,6 +933,10 @@ def convert_pegasus_profiles(
             "edges": dag_edges,
             "roots": dag_roots,
             "note": dag_note,
+            "colliding_outputs": dag_collisions,
+            "replica_conflicts": replica_conflicts,
+            "cross_workflow_edges": foreign_edges,
+            "execution_jobs": execution_jobs,
         },
         "warnings_count": warnings_count,
         "warnings": all_warnings,
@@ -1076,7 +1199,9 @@ def bundle_payload(jobs_and_profiles, output_dir: str, source_root: Optional[str
     # pfn is what actually identifies the executable.
     pfn_to_transformations = {}
     replicas_wanted = {}
+    replicas_conflicting = {}
     _dest_owner = {}
+    _image_dest_owner = {}
 
     for job, profile in jobs_and_profiles:
         execution = job.get("execution") or {}
@@ -1085,7 +1210,14 @@ def bundle_payload(jobs_and_profiles, output_dir: str, source_root: Optional[str
         if pfn:
             pfn_to_transformations.setdefault(pfn, set()).add(transformation)
         for lfn, host_path in (profile.get("replicas_db") or {}).items():
-            replicas_wanted.setdefault(lfn, host_path)
+            # setdefault ALONE was a silent drop: two workflows declaring the same logical
+            # name for different files kept the first and never mentioned the second, so the
+            # collision check below (which compares destinations) never saw a second source
+            # and the loser's job was staged the winner's bytes. Same name, different file, is
+            # a conflict — record it as one.
+            previous = replicas_wanted.setdefault(lfn, host_path)
+            if previous != host_path:
+                replicas_conflicting.setdefault(lfn, {previous}).add(host_path)
 
     # A transformation name serving several distinct pfns needs distinct directories, or one
     # copy overwrites the other and every job of that name gets the survivor.
@@ -1135,6 +1267,15 @@ def bundle_payload(jobs_and_profiles, output_dir: str, source_root: Optional[str
 
     # --- root inputs -----------------------------------------------------------------
     for lfn, host_path in sorted(replicas_wanted.items()):
+        if lfn in replicas_conflicting:
+            # One logical name, several files. Whichever is carried, the jobs expecting the
+            # others are staged it and run to completion on the wrong data.
+            manifest["missing"].append({
+                "kind": "input", "lfn": lfn, "path": host_path, "collision": True,
+                "reason": "declared by more than one workflow with different files "
+                          f"({', '.join(sorted(replicas_conflicting[lfn]))}); one logical name "
+                          "cannot carry both"})
+            continue
         src = _resolve(host_path)
         if not os.path.isfile(src):
             manifest["missing"].append({"kind": "input", "lfn": lfn, "path": host_path})
@@ -1147,10 +1288,16 @@ def bundle_payload(jobs_and_profiles, output_dir: str, source_root: Optional[str
         # the wrong file and says nothing. Report it and keep the first.
         previous = _dest_owner.get(dest)
         if previous is not None and previous != src:
+            # Not merely "one of them is absent". The loser's job still names this file in its
+            # data_in, and the runner resolves a bare name under roots.inputs — so it would be
+            # staged the WINNER's bytes and run to completion on another workflow's data.
+            # Flagged rather than described, so run_test.py can refuse the bundle instead of
+            # leaving it to whoever reads manifest.json.
             manifest["missing"].append({
-                "kind": "input", "lfn": lfn, "path": host_path,
+                "kind": "input", "lfn": lfn, "path": host_path, "collision": True,
                 "reason": f"basename collides with {previous!r}; the working directory is "
-                          f"flat so both cannot be staged"})
+                          f"flat so both cannot be staged, and the job that loses would be "
+                          f"staged the other file rather than none"})
             continue
         _dest_owner[dest] = src
         shutil.copy2(src, dest)
@@ -1176,6 +1323,20 @@ def bundle_payload(jobs_and_profiles, output_dir: str, source_root: Optional[str
                 images_dir = os.path.join(output_dir, BUNDLE_IMAGES)
                 os.makedirs(images_dir, exist_ok=True)
                 dest = os.path.join(images_dir, os.path.basename(local))
+                # Images land under their basename, and two workflows converted together can
+                # each ship a `container.sif` built from different recipes. Copying the second
+                # over the first runs one workflow's jobs inside the other's image — which
+                # succeeds, and produces plausible output. Same rule as the replicas above:
+                # report it, keep the first, and leave the loser pointing at its own path.
+                previous = _image_dest_owner.get(dest)
+                if previous is not None and previous != local:
+                    manifest["missing"].append({
+                        "kind": "image", "name": name, "path": local, "collision": True,
+                        "reason": f"basename collides with {previous!r}; bundled images are "
+                                  f"flat so both cannot be carried"})
+                    manifest["images"][name] = entry
+                    continue
+                _image_dest_owner[dest] = local
                 shutil.copy2(local, dest)
                 entry["bundled"] = os.path.relpath(dest, output_dir)
                 entry["root_relative"] = os.path.relpath(dest, images_dir)
@@ -1330,6 +1491,28 @@ def convert(args: argparse.Namespace):
 
     dag_edges, dag_roots = (apply_dag_gating([j for _, j, _, _ in mapped])
                             if args.dag_gating else (0, []))
+    # Reported, never resolved: the converter cannot know which of two same-named outputs a
+    # consumer meant, and picking one silently is how an unrelated workflow's file ends up
+    # feeding a job. See colliding_outputs().
+    dag_collisions = colliding_outputs([j for _, j, _, _ in mapped])
+    if dag_collisions:
+        print(f"  WARNING:     {len(dag_collisions)} output file name(s) are produced by more "
+              f"than one job; they share one flat working directory and, with --dag-gating, "
+              f"one producer map. Listed in conversion_summary.json -> dag.colliding_outputs.")
+    replica_conflicts = conflicting_replicas([(j, p) for _, j, p, _ in mapped])
+    if replica_conflicts:
+        crossing = sum(1 for v in replica_conflicts.values() if v["cross_workflow"])
+        print(f"  WARNING:     {len(replica_conflicts)} staged input name(s) are also produced "
+              f"by a job ({crossing} of them by a different workflow). Listed in "
+              f"conversion_summary.json -> dag.replica_conflicts.")
+    foreign_edges = cross_workflow_edges([j for _, j, _, _ in mapped])
+    if foreign_edges:
+        print(f"  WARNING:     {len(foreign_edges)} file name(s) are produced by one workflow "
+              f"and read by another. Listed in conversion_summary.json -> "
+              f"dag.cross_workflow_edges.")
+    # Whether the names are acted upon at all: a simulated replay with no gating never touches
+    # a filesystem and never consults a producer map, so its names are inert.
+    execution_jobs = sum(1 for _, j, _, _ in mapped if j.get("execution"))
 
     # See the note in convert_pegasus_profiles: staged, then promoted, so a conversion that
     # fails leaves the previous bundle intact.
@@ -1416,6 +1599,10 @@ def convert(args: argparse.Namespace):
             "edges": dag_edges,
             "roots": dag_roots,
             "note": dag_note,
+            "colliding_outputs": dag_collisions,
+            "replica_conflicts": replica_conflicts,
+            "cross_workflow_edges": foreign_edges,
+            "execution_jobs": execution_jobs,
         },
         "warnings_count": sum(len(w["warnings"]) for w in all_warnings),
         "warnings": all_warnings,

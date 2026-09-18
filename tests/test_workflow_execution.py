@@ -488,6 +488,38 @@ class TestBundling(unittest.TestCase):
             self.assertIsNone(manifest["images"]["c"]["bundled"])
             self.assertFalse(os.path.exists(os.path.join(out, "images")))
 
+    def test_two_images_with_one_basename_do_not_overwrite_each_other(self):
+        """Converting several workflows together: each may ship a `container.sif` built from a
+        different recipe. Copying the second over the first runs one workflow's jobs inside the
+        other's image, which succeeds and produces plausible output."""
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "a")); os.makedirs(os.path.join(tmp, "b"))
+            Path(tmp, "a", "container.sif").write_text("A")
+            Path(tmp, "b", "container.sif").write_text("B")
+            pairs = [({"id": f"j{i}", "execution": {"transformation": f"t{i}", "pfn": None,
+                       "container": {"name": n,
+                                     "image": f"file://{os.path.join(tmp, d, 'container.sif')}"}}},
+                      {}) for i, (n, d) in enumerate((("ca", "a"), ("cb", "b")))]
+            out = os.path.join(tmp, "out"); os.makedirs(out)
+            manifest = bundle_payload(pairs, out, include_images=True)
+            self.assertEqual(Path(out, "images", "container.sif").read_text(), "A")
+            self.assertEqual([m["kind"] for m in manifest["missing"]], ["image"])
+            # The loser is still described (and checksummed), just not carried.
+            self.assertIsNone(manifest["images"]["cb"]["bundled"])
+            self.assertEqual(len(manifest["images"]["cb"]["sha256"]), 64)
+
+    def test_the_same_image_used_by_two_workflows_is_carried_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "container.sif").write_text("A")
+            image = f"file://{os.path.join(tmp, 'container.sif')}"
+            pairs = [({"id": f"j{i}", "execution": {"transformation": f"t{i}", "pfn": None,
+                       "container": {"name": n, "image": image}}}, {})
+                     for i, n in enumerate(("ca", "cb"))]
+            out = os.path.join(tmp, "out"); os.makedirs(out)
+            manifest = bundle_payload(pairs, out, include_images=True)
+            self.assertEqual(manifest["missing"], [])
+            self.assertEqual(os.listdir(os.path.join(out, "images")), ["container.sif"])
+
     def test_every_copied_file_is_checksummed(self):
         """A path says where code was, not which code it was: edit a script after a run and
         a replayed job silently executes a different program than the baseline's."""
@@ -1012,3 +1044,35 @@ class TestBundling(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestReplicaNameDeclaredTwice(unittest.TestCase):
+    """Two workflows declaring one logical name for different files. `setdefault` alone kept
+    the first and never mentioned the second, so the collision check below never saw a second
+    source and the losing job was staged the winner's bytes."""
+
+    def test_same_lfn_different_files_is_reported_not_deduped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "a")); os.makedirs(os.path.join(tmp, "b"))
+            Path(tmp, "a", "data.csv").write_text("A")
+            Path(tmp, "b", "data.csv").write_text("B")
+            pairs = [({"id": "wfA_j", "execution": None},
+                      {"replicas_db": {"data.csv": os.path.join(tmp, "a", "data.csv")}}),
+                     ({"id": "wfB_j", "execution": None},
+                      {"replicas_db": {"data.csv": os.path.join(tmp, "b", "data.csv")}})]
+            out = os.path.join(tmp, "out"); os.makedirs(out)
+            manifest = bundle_payload(pairs, out)
+            self.assertEqual(manifest["inputs"], {})
+            self.assertEqual([m["kind"] for m in manifest["missing"]], ["input"])
+            self.assertTrue(manifest["missing"][0]["collision"])
+
+    def test_the_same_file_declared_twice_is_carried_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "data.csv").write_text("A")
+            src = os.path.join(tmp, "data.csv")
+            pairs = [({"id": f"wf{n}_j", "execution": None},
+                      {"replicas_db": {"data.csv": src}}) for n in ("A", "B")]
+            out = os.path.join(tmp, "out"); os.makedirs(out)
+            manifest = bundle_payload(pairs, out)
+            self.assertEqual(manifest["missing"], [])
+            self.assertEqual(list(manifest["inputs"]), ["data.csv"])

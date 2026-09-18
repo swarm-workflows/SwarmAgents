@@ -139,6 +139,29 @@ class ExecutionPolicy:
 #: The live policy. Replaced wholesale by `configure()` so a half-applied config is not
 #: reachable from another thread mid-update.
 _POLICY = ExecutionPolicy()
+
+DEFAULT_MODE = "simulate"
+
+
+def resolve_mode(execution_cfg: Optional[dict]) -> str:
+    """`runtime.execution.mode`, resolved in ONE place.
+
+    The default lives here and nowhere else. It was briefly resolved twice — the agent
+    defaulting an absent key to `simulate` (correct) and `run_test.py`'s bundle validation
+    treating an absent key as "cannot tell, assume it executes" — so a perfectly ordinary
+    simulated replay, read through a config with no execution block, was refused for a
+    file-name collision that could never be acted on.
+
+    An unknown value raises rather than defaulting, for the same reason `consensus.protocol`
+    does: the two modes produce results that cannot be compared, and nothing in the run would
+    say which one had been used.
+    """
+    mode = str((execution_cfg or {}).get("mode", DEFAULT_MODE)).lower()
+    if mode not in ("simulate", "real"):
+        raise ValueError(
+            f"runtime.execution.mode {mode!r} is not 'simulate' or 'real'. Refused "
+            "rather than defaulted: the two produce results that cannot be compared.")
+    return mode
 logger = logging.getLogger(__name__)
 
 
