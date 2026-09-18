@@ -50,7 +50,14 @@ python run_test.py --mode remote --agents 30 --agents-per-host 5 --topology ring
   ```
   **`StrictHostKeyChecking=accept-new` is not optional here.** A host that returns from a rebuild has a new host key, and plain `ssh` under `BatchMode` then fails with "Host key verification failed" — indistinguishable from a timeout in a pass/fail sweep. That is exactly how AMST was recorded as down while all 7 nodes were up and answering. `accept-new` trusts a first key but still refuses a *changed* one, so a genuinely swapped host reports `KEY` instead of passing silently (which `=no` would do). `run_test.py` and `stop_agents_v2.sh` pass `StrictHostKeyChecking=no` on every hop, so runs themselves were never affected — only the sweep.
 - **Clocks: check them before any run whose numbers compare two nodes.** The stock image points chrony at public NTP pools that most sites here cannot reach; on 2026-09-14, 66 of 92 nodes showed `Reach 0` / `LastRx 30d` and were free-running **0.4–1.1 s apart** (two hosts on the same LAN, ~930 ms). Nothing surfaces this on its own — `chronyc tracking` keeps printing the microsecond offset of its last sample, which is a month old. The one reliable indicator is `timedatectl`'s `System clock synchronized`. Repair with `./fix_slice_clocks.sh` (run as root on the database node; `--check` reports and changes nothing), which points every agent at `database` as its time source and steps rather than slews. A rebuilt slice gets the same thing from `notebooks/db_node_setup/07_ntp.sh`, wired into `setup_all.sh`; both read their chrony config from `notebooks/db_node_setup/ntp_conf.sh`. The delegation context age's headline series is immune by design, but `ctx_age_remote_*` and every cross-node latency are biased by the full offset.
-- **Level-1 agents default to `llm`.** `--agent-type resource` does *not* cover them: `--hierarchical-level1-agent-type` is separate and defaults to `llm`, and `LlmAgent.__init__` builds an `LlmBidder` eagerly, which needs `OPENAI_API_KEY`. That variable is present on only some agent hosts, so a coordinator dies at startup depending on where placement happens to put it — two log lines and then silence, with the run looking busy until the cap expires. Pass `--hierarchical-level1-agent-type resource` for any non-LLM run.
+- **Level-1 agents default to `resource`** (changed 2026-09-18; the default was `llm`). It is
+  still a *separate* key from `--agent-type` and does not follow it, so an all-LLM hierarchy
+  needs `--hierarchical-level1-agent-type llm` explicitly — and every host that might get a
+  coordinator then needs `OPENAI_API_KEY`, since `LlmAgent.__init__` builds its bidder eagerly.
+  Under the old default a coordinator died at startup wherever placement put it on a host
+  without the key: two log lines then silence, with the run looking busy until the cap expired.
+  Every launcher script in the tree already passed `resource`, so the default was only ever
+  reached by accident. Pinned by `tests/test_fleet_sizing.py::TestCoordinatorTypeDefault`.
 - `agent_hosts.txt` lists all agent hostnames, one per line. It is **deleted by `cleanup_between_runs`** unless it is the resolved `--agent-hosts-file`, so it will often be absent on the database node and must be regenerated before a remote run.
 - Remote-mode tests are launched from this node with `--db-host database`, e.g.:
 ```bash
@@ -74,9 +81,16 @@ python generate_configs.py 30 10 ./config_swarm_multi.yml configs mesh localhost
 # StrictHostKeyChecking=accept-new, so a node returning from a rebuild is not misread as down.
 python make_agent_hosts.py --count 80 --out agent_hosts.txt --sites-out agent_sites.txt
 # Hierarchical only: --groups-per-coordinator G gives each Level-1 coordinator G child groups
-# exclusively (default 1). Required for ANY delegation measurement — at 1 a coordinator has a
-# single candidate, so the MAB and delegation.policy=llm are both inert. Freed coordinator slots
-# become Level-0 agents, so the fleet size is unchanged; two-level hierarchies only.
+# exclusively. DEFAULT 2 since 2026-09-18 (was 1). At 1 a coordinator has a single candidate, so
+# the MAB and delegation.policy=llm are both inert and every delegation records as `trivial` —
+# no delegation measurement is possible from such a fleet. Freed coordinator slots become
+# Level-0 agents, so the fleet size is unchanged. Two-level hierarchies only: a three-level
+# fleet (100, 990, 1000) refuses an explicit >1 and steps the DEFAULT down to 1, printing a
+# NOTE — a default must not break a size that always generated. Nor may it shrink an
+# explicit --co-parents: a wider fan-out means fewer coordinators and co-parents are
+# capped at that count, so the DEFAULT fan-out narrows to keep the requested redundancy
+# (two explicit values that cannot both hold are refused). run_meta.json records the
+# fan-out OBSERVED in the generated configs, not the request.
 python generate_configs.py 90 10 ./config_swarm_multi.yml configs hierarchical localhost 600 --seed 42 --groups-per-coordinator 3
 # Supported hierarchical fleet sizes: 30, 60, 80, 90, 100, 110, 120, 250, 270, 990, 1000.
 # Hier-80 (8 groups of 9 + 8 coordinators) is the stand-in for Hier-90 while PSC is down: it

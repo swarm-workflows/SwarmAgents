@@ -1,350 +1,259 @@
 # SwarmAgents
 
-A framework for greedy distributed consensus and selection algorithms, designed for scalable, resilient decision-making across multiple agents. Agents reach consensus on job assignments using cost-based selection with a choice of consensus protocols: a PBFT-like three-phase protocol or a Snow/Avalanche-style sampling protocol backed by SWIM membership and epidemic state dissemination.
+A framework for distributed, consensus-based job scheduling. Agents score jobs against their own
+resources and agree on who runs what — over gRPC, with Redis for shared state — using either a
+PBFT-like three-phase protocol or a Snow/Avalanche-style sampling protocol backed by SWIM
+membership and gossip. It runs synthetic workloads, replays real Pegasus workflow traces, and can
+**actually execute** those workflows in their own containers for comparison against Pegasus.
 
-## Table of Contents
+- **Agents**: rule-based (`ResourceAgent`), LLM-scored (`LlmAgent`), Colmena integration
+- **Topologies**: ring, mesh, star, hierarchical (with bandit-based delegation)
+- **Consensus**: PBFT or Snow; SWIM failure detection; epidemic state dissemination
+- **Workloads**: synthetic, replayed Pegasus traces, real workflow execution, quantum/hybrid jobs
 
-- [Key Features](#key-features)
-- [Core Modules](#core-modules)
-- [Job Selection](#job-selection)
-- [Network Topologies](#network-topologies)
-- [Testing](#testing)
-- [Running a Real Workflow](#running-a-real-workflow-for-real-soilmoisture)
-- [Results](#results)
-- [Agent Failure Handling](#agent-failure-handling)
-- [Dynamic Agent Addition](#dynamic-agent-addition)
+## Contents
+
+- [Quick start](#quick-start)
+- [Running experiments](#running-experiments)
+- [Running a real Pegasus workflow](#running-a-real-pegasus-workflow)
+- [Results and plots](#results-and-plots)
+- [Configuration](#configuration)
+- [How it works](#how-it-works)
 - [Utilities](#utilities)
-- [Additional Documentation](#additional-documentation)
+- [Documentation](#documentation)
 
-## Key Features
-
-- Greedy distributed selection and consensus algorithms
-- PBFT-like consensus with cost-based self-selection and dominance filtering
-- Snow/Avalanche-style gossip consensus (`consensus.protocol: snow`) with SWIM failure detection and epidemic state dissemination — scales past the PBFT broadcast ceiling
-- Multiple network topologies: Ring, Mesh, Star, Hierarchical
-- LLM-enhanced agents (OpenAI/Ollama) alongside rule-based resource agents
-- Multi-Armed Bandit (Epsilon-Greedy, UCB1) and contextual bandit (LinUCB, LinTS) reinforcement learning for hierarchical delegation
-- Hybrid quantum-classical job support: quantum backends on agents, qubit-aware feasibility/cost, and split producer/consumer co-scheduling over a Redis-streams measurement layer
-- Replay of real Pegasus workflow executions as swarm workloads (extractor + converter pipeline)
-- **Real execution** of those workflows — the workflow's own executables, arguments and container — for like-for-like comparison against Pegasus
-- Agent failure detection, job reassignment, and dynamic agent addition
-- Extensible for other distributed resource allocation problems
-
-## Core Modules
-
-### Consensus Engine (`swarm/consensus/engine.py`)
-
-A generic PBFT-like consensus engine for distributed agreement. Framework-agnostic — uses host, transport, and router adapters for I/O and side effects.
-
-- Agents broadcast proposals for objects (e.g., jobs) to peers
-- Peers respond with prepare and commit messages, tracked by the engine
-- Quorum-based rounds trigger selection or commit actions
-- See `resource_agent.py` for integration via adapter classes
-
-### Snow Consensus Engine (`swarm/consensus/gossip_engine.py`)
-
-A Snow/Avalanche-style alternative to PBFT, selected via `consensus.protocol: snow`. Replaces the three-phase broadcast with repeated k-peer sampling and finalizes exactly-once through Redis `SET NX`. Tunables under `consensus.snow.{k,alpha,beta,max_rounds,round_timeout_ms,tick_interval_ms}`.
-
-Runs alongside two supporting layers (usable independently):
-- **SWIM membership** (`swarm/membership/swim.py`) — probe/indirect-probe failure detection, `failure_detection.protocol: swim`
-- **Gossip dissemination** (`swarm/gossip/disseminator.py`) — epidemic state spread, `gossip.{enabled,fanout,period_ms,state_ttl_s}`
-
-See [GOSSIP_CONSENSUS_DESIGN.md](docs/GOSSIP_CONSENSUS_DESIGN.md).
-
-### Selection Engine (`swarm/selection/engine.py`)
-
-A cache-enabled engine for assigning candidates to assignees based on feasibility and cost functions.
-
-- Computes cost matrices for all candidate-assignee pairs (infeasible = infinity)
-- Greedy or thresholded selection with tie-breaking and acceptance criteria
-- Internal LRU caches for repeated feasibility and cost checks; live (non-cached) penalty helpers in `swarm/selection/penalties.py`
-
-## Job Selection
-
-SwarmAgents implements distributed job selection through two agent variants:
-
-- **ResourceAgent** — rule-based, computes feasibility and cost deterministically using configured weights and thresholds
-- **LLMAgent** — LLM-enhanced, leverages a language model to evaluate and explain job-selection decisions
-
-Both share the same consensus, selection, and topology logic.
-
-### Cost Computation
-
-#### Resource Agent
-
-$$
-\text{cost} = w_{cpu} \cdot \text{CPU}_{util} + w_{ram} \cdot \text{RAM}_{util} + w_{disk} \cdot \text{Disk}_{util} + w_{gpu} \cdot \text{GPU}_{util} + \text{penalties}
-$$
-
-- Weights dynamically adjust per job type (CPU-intensive, memory-heavy, DTN/data-transfer, etc.)
-- Penalties: long job penalty (`long_job_threshold`), connectivity penalty (`connectivity_penalty_factor`)
-- See `compute_job_cost` in `resource_agent.py`
-
-#### LLM Agent
-
-Each LLM agent independently evaluates jobs using LLM reasoning, producing a single-column cost view per agent. This decentralized approach reduces inter-agent overhead while incorporating contextual reasoning.
-
-### Job Feasibility
-
-Both agents perform a feasibility check before cost computation:
-- Sufficient CPU, RAM, Disk, GPU capacity
-- DTN connectivity for data-dependent jobs
-- Resource overcommitment prevention
-
-For LLMAgent, feasibility remains deterministic; only cost ranking uses LLM input.
-
-### Cost Matrix and Selection
-
-The selection engine builds a cost matrix (agents x jobs), then selects the minimum-cost agent per job. Selection is thresholded via `selection_threshold_pct` to control the candidate pool.
-
-### Consensus Protocol
-
-**PBFT (default):**
-1. Agents broadcast proposals for job assignments
-2. Peers respond with prepare and commit messages
-3. Quorum reached (`ceil((n+1)/2)`) finalizes assignment
-4. Dynamic quorum adjusts based on live agent count
-
-**Snow (`consensus.protocol: snow`):** each undecided agent repeatedly samples `k` live peers for their preferred assignee; a candidate seen by ≥ `alpha` of the sample increments confidence, and `beta` consecutive successful rounds finalize the decision via an atomic Redis claim. Message load scales with `k`, not the agent count.
-
-See [COMPLEXITY.md](docs/COMPLEXITY.md) for detailed message complexity analysis.
-
-### Job Execution
-
-After consensus, jobs are scheduled and executed by selected agents. States and metrics are managed via Redis and the `Metrics` class. Communication uses gRPC for inter-agent messaging.
-
-## Network Topologies
-
-### Ring
-Circular structure where agents communicate with immediate neighbors. Minimizes communication overhead; higher latency for distant consensus. Best for 10-50 agents.
-
-### Mesh
-Fully connected network. Fastest consensus but highest communication overhead. Best for 5-30 agents and benchmarking.
-
-### Star
-Central coordinator communicates with all agents. Simple coordination but single point of failure. Best for small deployments with a clear leader.
-
-### Hierarchical
-
-Multi-level tree with parent-child relationships for scalable coordination:
-- **Level 0 (Leaf agents)**: Workers organized into groups (5-10 per group)
-- **Level 1+ (Coordinators)**: Parent agents that coordinate groups
-
-Supports mixed agent types (LLM coordinators + Resource workers), co-parent failover, and MAB-based delegation.
-
-| Agents | Tiers | Job Entry Level | Flow |
-|--------|-------|-----------------|------|
-| 30, 110 | 2-tier | Level 1 | L1 -> L0 |
-| 100, 1000 | 3-tier | Level 2 | L2 -> L1 -> L0 |
-
-See detailed guides:
-- [docs/HIERARCHICAL_LLM_AGENTS.md](docs/HIERARCHICAL_LLM_AGENTS.md) — LLM/Resource agent mixing
-- [docs/CO_PARENT_USAGE.md](docs/CO_PARENT_USAGE.md) — Multi-parent shared parenting and failover
-- [docs/MAB_README.md](docs/MAB_README.md) — Multi-Armed Bandit delegation for hierarchical topologies
-
-## Testing
-
-### Prerequisites
+## Quick start
 
 ```bash
 pip install -r requirements.txt
-docker run -d -p 6379:6379 redis
+docker run -d -p 6379:6379 redis          # required for every run
+
+python -m pytest tests/                   # unit tests
+
+# 20 agents in a mesh, 100 jobs, all on this machine
+python run_test.py --mode local --agent-type resource --agents 20 --topology mesh \
+    --jobs 100 --jobs-per-interval 10 --db-host localhost --run-dir runs/test-001
 ```
 
-### Unit Tests
+A run generates agent configs, starts the agents, feeds jobs into Redis, waits, stops everything,
+and writes results to `--run-dir`: `metrics.json`, per-agent logs (`agent-<id>.log`),
+`run_meta.json`, and plots. It exits non-zero if any agent failed to report metrics, so a batch
+driver never averages in a broken cell.
+
+**Start with mesh.** Every agent talks to every other, so consensus finishes in one hop and a
+small run completes quickly. Ring and star forward messages through neighbours or a hub, so the
+same fleet takes noticeably longer to settle — they are worth running when the topology is what
+you are measuring, not for a first look. Mesh's message count grows with the square of the fleet,
+so past a few tens of agents move to hierarchical.
+
+## Running experiments
+
+### Resource agents
 
 ```bash
-python -m pytest tests/   # consensus (Snow/PBFT), SWIM, gossip, bandits, quantum, repository, broadcast
+# local
+python run_test.py --mode local --agent-type resource --agents 30 --topology mesh \
+    --jobs 500 --db-host localhost --run-dir runs/mesh-30
+
+# hierarchical (pass the coordinator type explicitly — it defaults to llm)
+python run_test.py --mode local --agent-type resource --agents 30 --topology hierarchical \
+    --hierarchical-level1-agent-type resource --jobs 500 --db-host localhost --run-dir runs/hier-30
+
+# remote: agents spread over hosts listed one per line, passwordless SSH required
+python run_test.py --mode remote --agent-type resource --agents 30 --agents-per-host 5 \
+    --topology mesh --jobs 1000 --db-host <db-host> --agent-hosts-file agent_hosts.txt \
+    --run-dir runs/remote-30
 ```
 
-### Resource Agents
+Hierarchical fleet sizes are presets (30, 60, 80, 90, 100, 110, 120, 250, 270, 990, 1000) —
+anything else is refused rather than silently dropping agents. Add
+`--groups-per-coordinator G` for any delegation measurement: at the default of 1 a coordinator
+has a single candidate, so neither the bandit nor an LLM policy ever chooses.
+
+### LLM agents
 
 ```bash
-# Single-host test (30 agents, ring, 100 jobs)
-python run_test.py --mode local --agent-type resource --agents 30 --topology ring --jobs 100 --db-host localhost --jobs-per-interval 10 --run-dir runs/test-001
-
-# Advanced test runner (local mode)
-python run_test.py --mode local --agent-type resource --agents 30 --topology mesh --jobs 500 --db-host localhost --run-dir runs/v2-test
-
-python run_test.py --mode local --agent-type resource --agents 30 --topology hierarchical --hierarchical-level1-agent-type resource --jobs 500 --db-host localhost --run-dir runs/v2-test
-
-# Remote mode (multiple hosts, requires passwordless SSH)
-python run_test.py --mode remote --agent-type resource --agents 30 --agents-per-host 5 --topology ring --jobs 1000 --db-host 10.0.0.5 --agent-hosts-file hosts.txt --run-dir runs/remote-test
+export OPENAI_API_KEY=sk-...                        # or: export LLM_BASE_URL=http://localhost:11434/v1
+python run_test.py --mode local --agent-type llm --agents 10 --topology mesh \
+    --jobs 200 --jobs-per-interval 20 --db-host localhost --run-dir runs/llm-001
 ```
 
-### LLM Agents
+### Repeated runs, dynamic agents, failures
 
 ```bash
-# OpenAI
-export OPENAI_API_KEY=sk-xxxx
-python run_test.py --agent-type llm --agents 10 --topology mesh --jobs 200 --db-host localhost --jobs-per-interval 20 --run-dir runs/llm-001
+# 10 runs of the same cell, with statistics across them
+python batch_tests_v2.py --runs 10 --base-out runs/batch --mode local --agent-type resource \
+    --agents 20 --topology mesh --jobs 500 --db-host localhost
 
-# Ollama
-export LLM_BASE_URL=http://localhost:11434/v1
-python run_test.py --agent-type llm --agents 5 --topology ring --jobs 100 --db-host localhost --jobs-per-interval 10 --run-dir runs/llm-002
+# add 5 agents 30s in (also --dynamic-trigger bucket | jobs-completed)
+python run_test.py --mode local --agent-type resource --agents 20 --dynamic-agents 5 \
+    --dynamic-trigger time --dynamic-delay 30 --topology mesh --jobs 500 \
+    --db-host localhost --run-dir runs/dynamic-time
+
+# kill agents mid-run to exercise detection and reassignment
+python kill_agents.py --mode local --count 5 --random
+grep -e "RESTART: Job" -e "detected as FAILED" runs/*/agent-*.log
 ```
 
-### Batch Testing
+A run that deliberately kills agents must declare it (`--expect-silent-agents 3,7`), or the
+metrics-completeness gate fails the run.
+
+### Quantum / hybrid jobs
 
 ```bash
-python batch_tests_v2.py --runs 10 --base-out runs/batch --mode local --agent-type resource --agents 20 --topology mesh --jobs 500 --db-host localhost
+python run_test.py --mode local --agent-type resource --agents 20 --topology mesh --jobs 200 \
+    --db-host localhost --run-dir runs/quantum \
+    --quantum-agents-pct 0.25 --quantum-fraction 0.2 --hybrid-fraction 0.1 [--split-hybrid]
 ```
 
-### Replaying Pegasus Workflows
+`--split-hybrid` decomposes hybrid jobs into co-scheduled quantum-producer / classical-consumer
+sub-jobs. See [QUANTUM_HYBRID_DESIGN.md](docs/QUANTUM_HYBRID_DESIGN.md).
 
-Real Pegasus workflow executions can be replayed as swarm workloads. Extract job profiles on the Pegasus submit host, then feed them to the test runner:
+## Running a real Pegasus workflow
+
+Two modes:
+
+- **Replay** — the trace's jobs are scheduled for real, each sleeping its recorded wall time.
+- **Real execution** — the workflow's own executables run in its own container.
+
+Both follow the same four steps: **convert → copy → generate the fleet → run.** Full reference,
+including the validated results and the limits, in
+[WORKFLOW_EXECUTION.md](docs/WORKFLOW_EXECUTION.md).
+
+### Replay (simulated jobs)
 
 ```bash
-# On the Pegasus submit host
-python3 pegasus_profile_extractor.py --root /path/to/workflows --output all_runs_jobs_profile.json
+# 1. convert, on the Pegasus submit host (copy the two scripts there; they need only Python 3)
+python3 pegasus_profile_extractor.py --root /path/to/workflows --output profiles.json
+python3 pegasus_to_swarm_converter.py --input profiles.json --input-type json \
+    --output-dir replay_jobs/ --dag-gating --dtn-names local --dtn-scope job
 
-# Replay through swarm
-python run_test.py --mode local --agents 10 --topology mesh --jobs <N> --db-host localhost \
-    --run-dir runs/pegasus-replay --pegasus-profiles all_runs_jobs_profile.json --pegasus-input-type json
+# 2. copy the bundle to wherever Redis is
+rsync -a --delete replay_jobs/ <redis-host>:<repo>/replay_jobs/
+
+# 3. generate the fleet, once, from those jobs
+python3 generate_configs.py 20 10 ./config_swarm_multi.yml configs mesh localhost 0 \
+    --dtns --skip-jobs --seed 42 --size-to-jobs replay_jobs/
+
+# 4. run, as often as you like — the same fleet every time
+python run_test.py --mode local --agent-type resource --agents 20 --topology mesh \
+    --db-host localhost --run-dir runs/replay --pegasus-jobs-dir replay_jobs/ \
+    --use-config-dir --config-dir configs
 ```
 
-See [PEGASUS_TO_SWARM.md](docs/PEGASUS_TO_SWARM.md) for the full pipeline, DTN naming options, and field mappings.
+The bundle is self-contained: job records, executables in `code/`, root inputs in `inputs/`,
+and `manifest.json` with a sha256 per file. Add `--bundle-images` and the same directory runs
+for real, no reconversion.
 
-### Running a Real Workflow For Real (soilmoisture)
+### Real execution
 
-Replay (above) simulates each job's wall time, which is what the scheduling results are built
-on. SWARM can also **actually run** a workflow's executables in the workflow's own container,
-which is what an apples-to-apples comparison against Pegasus needs. Default stays `simulate`;
-nothing below changes an ordinary run.
-
-Worked example, end to end, using the `soilmoisture` workflow (5 jobs). Full detail and the
-validated results are in [WORKFLOW_EXECUTION.md](docs/WORKFLOW_EXECUTION.md).
-
-**0. Get the workflow.** It is public:
+`simulate` is the default, so nothing here changes an ordinary run. You need a **completed**
+Pegasus run: the `*.stampede.db` carries the durations and exit codes, and the catalogs hold
+absolute submit-host paths, so extraction and conversion happen there.
 
 ```bash
-git clone https://github.com/pegasus-isi/soilmoisture-workflow.git
+# 1. once per slice
+sudo ./setup_apptainer.sh          # run the workflow's own .sif natively
+sudo ./setup_nfs_workflow.sh       # one shared work dir at the same path on every node
+sudo chown nobody:nogroup /export/swarm-wf/work && sudo chmod 1777 /export/swarm-wf/work
+
+# 2. extract and convert, on the Pegasus submit host
+python3 pegasus_profile_extractor.py --submit-dir <run dir>/     # → all_runs_jobs_profile.json
+python3 pegasus_to_swarm_converter.py --input all_runs_jobs_profile.json --input-type json \
+    --output-dir converted_jobs/ \
+    --bundle-images --dag-gating --dtn-names local --dtn-scope job
+    # --bundle-source-root <tree>   # only if the workflow tree has moved since the run
+
+# 3. copy the bundle to the shared export
+rsync -a --delete converted_jobs/ <db-host>:/export/swarm-wf/converted_jobs/
+ssh <db-host> sudo chown -R nobody:nogroup /export/swarm-wf/converted_jobs
 ```
 
-The clone gives you the five executables (`fetch_soil_data.py` and `bin/*.py`), the root input
-`polygons.json`, and both container recipes (`Apptainer/SoilMoisture_Container.def`,
-`Docker/SoilMoisture_Dockerfile`). It does **not** contain three things you need, because each
-is generated rather than committed:
-
-| needed | where it comes from |
-|---|---|
-| `workflow.yml`, `transformations.yml`, `replicas.yml` | `python workflow_generator.py` — these carry **absolute** pfn paths, baked in at generation time |
-| `SoilMoisture_Container.sif` | `apptainer build SoilMoisture_Container.sif Apptainer/SoilMoisture_Container.def` |
-| `*.stampede.db` | **an actual Pegasus run.** There is no way around this one |
-
-That last row is the important one. This pipeline replays a *completed Pegasus run* and
-compares against it, so its input is a run, not a workflow definition — the stampede DB is
-where the per-job durations, exit codes and the baseline makespan come from. Cloning and
-planning the workflow is not a substitute for having run it under Pegasus at least once.
-
-A useful consequence of the catalogs being generated: if you generate them **on the machine
-where the code will live**, their pfn paths already point at the right place and
-`path_rewrites` (step 6) can be empty. Rewrites are needed when the run happened somewhere
-else, which is the usual case when comparing against an existing run.
-
-**1. Extract on the Pegasus submit host.** Executable, arguments and container all come out
-here — arguments from the abstract `workflow.yml`, *not* from the stampede DB's `argv`, which
-is empty for these jobs.
-
-```bash
-python3 pegasus_profile_extractor.py \
-    --submit-dir ~/soilmoisture-workflow/ubuntu/pegasus/soilmoisture/run0001 \
-    --output soil_profiles.json
-```
-
-**2. Check the conversion** before involving a fleet. This is also how you convert for a
-local run; step 5 repeats it onto the shared export for a remote one:
-
-```bash
-python pegasus_to_swarm_converter.py --input soil_profiles.json \
-    --input-type json --output-dir converted_jobs/ --dag-gating
-```
-
-Read `conversion_summary.json` → `dag.edges` and `dag.roots`, and `manifest.json` → `missing`.
-A partial DAG and an incomplete bundle both still look healthy from the outside.
-
-**3. Prepare the fleet** (once). Both scripts verify by *doing* the thing — running a real
-container, performing a real write — and both exit non-zero on a partial fleet:
-
-```bash
-sudo ./setup_apptainer.sh          # apptainer on every agent, so the workflow's .sif runs as itself
-sudo ./setup_nfs_workflow.sh       # one shared work dir, identical path on every node
-```
-
-**4. Stage the workflow and the image.** The workflow tree goes somewhere the database node
-can read it (the converter copies the executables out of it into the bundle); the multi-GB
-image goes on each agent's **local** disk, never the export — a WAN read of it per job start
-would dominate every measurement. Stage the tree **from the submit host**, not a fresh clone:
-its generated catalogs must match the run you extracted.
-
-```bash
-tar czf - --exclude=Apptainer soilmoisture-workflow | \
-    ssh database 'sudo tar xzf - -C /export/swarm-wf/workflows'
-sudo ./setup_nfs_workflow.sh --stage-image /path/to/SoilMoisture_Container.sif
-# the script prints the directory it staged to — use that as roots.images below
-```
-
-**5. Build the bundle on the shared export**, so every agent resolves the same code:
-
-```bash
-python3 pegasus_to_swarm_converter.py --input soil_profiles.json --input-type json \
-    --output-dir /export/swarm-wf/jobs --dag-gating \
-    --data-nodes per-file --dtn-names local --dtn-scope job \
-    --bundle-source-root /export/swarm-wf/workflows/soilmoisture-workflow
-sudo chown -R nobody:nogroup /export/swarm-wf/jobs
-```
-
-**6. Point the config at it** (`config_swarm_multi.yml`). `roots` covers code and inputs,
-which the bundle carries. The container image is *not* bundled, so its absolute submit-host
-path is redirected with a rewrite — `roots.images` only applies to relative image names:
+**4. Configure execution** on the database node, in `config_swarm_multi.yml`. Every per-agent
+config is a copy of it, so this comes *before* step 5. Skip it and the jobs simulate — the one
+failure here that looks like success:
 
 ```yaml
 runtime:
   execution:
-    mode: real
-    work_dir: /export/swarm-wf/work
+    mode: real                            # `simulate` is the default
+    work_dir: /export/swarm-wf/work       # shared, so job B finds job A's output
     container_runtime: auto
-    path_rewrites:
-      - {from: /home/ubuntu/soilmoisture-workflow/Apptainer, to: /export/images}
-    roots:
-      code:   /export/swarm-wf/jobs/code
-      inputs: /export/swarm-wf/jobs/inputs
-      images: /export/images
+    bundle: /export/swarm-wf/converted_jobs
 ```
 
-The work directory must be writable by the **squashed** NFS user, or every job refuses with
-`Permission denied`:
-
 ```bash
-sudo chown nobody:nogroup /export/swarm-wf/work && sudo chmod 1777 /export/swarm-wf/work
-```
+# 5. generate the fleet, once
+python3 generate_configs.py 5 10 ./config_swarm_multi.yml configs mesh database 0 \
+    --skip-jobs --seed 42 --size-to-jobs /export/swarm-wf/converted_jobs
 
-**7. Run.** `--pegasus-dag-gating` is not optional for a workflow: without it no job carries a
-data predicate, nothing waits for its parents, and a child fails on a file that has not been
-written yet.
-
-```bash
+# 6. run
 python3 run_test.py --mode remote --agent-type resource --agents 5 --agents-per-host 1 \
-    --topology mesh --jobs 4 --jobs-per-interval 4 --db-host database \
+    --topology mesh --jobs-per-interval 4 --db-host database \
     --agent-hosts-file agent_hosts.txt --run-dir runs/soil-real \
-    --pegasus-profiles soil_profiles.json --pegasus-input-type json \
-    --pegasus-data-nodes per-file --pegasus-dtn-names local --pegasus-dag-gating \
-    --pegasus-bundle-source-root /export/swarm-wf/workflows/soilmoisture-workflow \
-    --runtime 420
+    --pegasus-jobs-dir /export/swarm-wf/converted_jobs \
+    --use-config-dir --config-dir configs --runtime 420
 ```
 
-A job that cannot be run properly is **refused and fails loudly** — it never silently falls
-back to simulating, because a run mixing executed and simulated jobs with nothing to tell them
-apart is worse than one that stops. Refusals log at `ERROR` with the reason, in the agent's own
-log (`swarm-multi/agent-N.log`).
+**Before quoting timings**, move the image off the export — a multi-GB `.sif` read over the WAN
+at every job start dominates the measurement. `setup_nfs_workflow.sh --stage-image <file>.sif`,
+then add `roots: {images: <that dir>}`.
 
-**Note on this particular workflow:** `fetch_soil_data` calls `archive-api.open-meteo.com`,
-which is unreachable from the FABRIC slice (generic HTTPS is fine; that host times out). The
-run above converts the other four jobs and supplies its output, `field1_soil_data.csv`, as a
-root input. A job whose runtime is an external service's latency is a poor comparison subject
-in any case.
+### What the flags do
 
-**Measured on the slice** — 5 agents, mesh, real execution, DAG order respected:
+| flag | why |
+|---|---|
+| `--dag-gating` | jobs wait for their parents' output; without it a child fails on a file nobody has written |
+| `--bundle-images` | the copied directory is then everything the jobs need |
+| `--dtn-names local --dtn-scope job` | makes the jobs data-location-free, which is what you want on one shared mount |
+| `--bundle-source-root` | pass it (absolute, or `OLD=NEW`) only when the workflow tree has moved since the run |
+| `--size-to-jobs` | every agent can run every job — so a failed agent's work can go to any other. It raises capacity to a *floor* and gives every agent the jobs' DTNs at its own connectivity score, so the fleet stays heterogeneous ([why](docs/WORKFLOW_EXECUTION.md#27-sizing-the-fleet-to-the-workflow)) |
+| `--skip-jobs` | the job pool comes from the bundle; do not synthesize one |
+| `--seed` | pins the fleet draw, so a regeneration reproduces it |
+| `--use-config-dir` | reuse that fleet instead of redrawing it every run. Local reads `./configs` literally; remote copies `--config-dir` to each host |
+| `--pegasus-jobs-dir` | publish the bundle as it is; `--jobs` comes from its record count |
+| `rsync --delete` | a plain copy does not sweep, and leftovers from a bigger conversion get published too |
+
+**Generate the fleet once.** Left to `run_test.py`, `configs/`, `agent_profiles.json` and
+`agent_dtns.json` are redrawn every run, so two runs of the "same" cell are two different
+fleets. Skipping `--size-to-jobs` is for when the fleet itself is the experiment — expect
+`run_test.py` to refuse the run if some job then fits nowhere.
+
+### Hierarchical fleets
+
+Steps 1-4 are unchanged; steps 5 and 6 both differ. The agent count must match the fleet you
+generated, and it has to be one of the presets:
+
+```bash
+# 5. generate the fleet, once
+python3 generate_configs.py 30 10 ./config_swarm_multi.yml configs hierarchical database 0 \
+    --hierarchical-level1-agent-type resource --skip-jobs --seed 42 \
+    --size-to-jobs /export/swarm-wf/converted_jobs
+
+# 6. run
+python3 run_test.py --mode remote --agent-type resource --agents 30 --agents-per-host 1 \
+    --topology hierarchical --hierarchical-level1-agent-type resource \
+    --jobs-per-interval 4 --db-host database --agent-hosts-file agent_hosts.txt \
+    --run-dir runs/wf-hier --pegasus-jobs-dir /export/swarm-wf/converted_jobs \
+    --use-config-dir --config-dir configs --runtime 900
+```
+
+Three things to know:
+
+- The converter's `--generate-agent-configs` writes flat topologies only, so this is the one
+  route to a hierarchical fleet.
+- Coordinators are `resource` by default and do **not** follow `--agent-type`: an all-LLM
+  hierarchy needs `--hierarchical-level1-agent-type llm` on both commands, and every
+  coordinator host then needs `OPENAI_API_KEY`.
+- No DTN pool is generated for hierarchical, so convert with `--dtn-names local` or let
+  `--size-to-jobs` attach the names the jobs use.
+
+Supported fleet sizes are presets — 30, 60, 80, 90, 100, 110, 120, 250, 270, 990, 1000 — and
+anything else is refused. Jobs enter at the top tier and are delegated down.
+
+### Validated
+
+FABRIC slice, 5 agents, mesh, DAG order respected, image on local disk:
 
 | job | SWARM | Pegasus `remote_duration` |
 |---|---|---|
@@ -353,152 +262,122 @@ in any case.
 | predict_irrigation | 3.772s | 4.487s |
 | visualize_moisture | 2.219s | 2.459s |
 
-All exit 0, and the computational outputs are byte-identical to the original Pegasus run
-(2073 / 1270 / 222002 / 831 bytes); the PNG differs by font rendering. Before quoting any of
-this as a comparison, read the limits — no stage-in, NFS flattens data locality, the
-substrates differ, and Pegasus's 351s makespan is queueing and staging rather than compute:
-[WORKFLOW_EXECUTION.md](docs/WORKFLOW_EXECUTION.md#4-known-limits).
+All exit 0, outputs byte-identical to the Pegasus run. Read
+[the limits](docs/WORKFLOW_EXECUTION.md#4-known-limits) before using it as a comparison: no
+stage-in, NFS flattens data locality, the substrates differ.
 
-### Quantum / Hybrid Jobs
+`run_test.py` refuses to start on leftover records from an earlier conversion, file-name
+collisions between workflows, or a fleet where no agent can run some job. At run time, a job
+that cannot execute fails loudly at `ERROR` in `swarm-multi/agent-<id>.log` — it never falls
+back to simulating.
+
+### Several workflows
+
+One bundle and one run per workflow is the safe default: each run scopes its own working
+directory and readiness registry. Combining them works only if their file names are disjoint —
+logical names are not namespaced, and the DAG, the readiness registry and the shared working
+directory all key on them, so two workflows both writing `output.csv` get an edge nobody wrote.
+The converter reports it and `run_test.py` refuses such a bundle. Renaming is not a fix: the
+names are in the jobs' command lines. See
+[WORKFLOW_EXECUTION.md §2.8](docs/WORKFLOW_EXECUTION.md).
+
+## Results and plots
+
+Every run writes `metrics.json`, `run_meta.json`, per-agent logs and plots under `--run-dir`.
+All plotting lives in the `plotting/` package; the top-level scripts are thin CLI wrappers
+(`--help` on any of them).
 
 ```bash
-python run_test.py --mode local --agents 20 --topology mesh --jobs 200 --db-host localhost \
-    --run-dir runs/quantum --quantum-agents-pct 0.25 --quantum-fraction 0.2 --hybrid-fraction 0.1 [--split-hybrid]
-```
-
-`--split-hybrid` decomposes hybrid jobs into co-scheduled quantum producer / classical consumer sub-jobs. See [QUANTUM_HYBRID_DESIGN.md](docs/QUANTUM_HYBRID_DESIGN.md).
-
-### Visualizations
-
-All plotting functionality lives in the `plotting/` package. Top-level scripts are thin CLI wrappers for backward compatibility.
-
-```bash
-# Single-run analysis (latency, conflicts, failures, loads, hierarchical)
 python plot_latency_jobs.py --output_dir runs/test-001 --agents 30 --db_host localhost [--hierarchical]
-
-# Multi-run statistical comparison across topologies/scales
 python plot_multi_run_results.py --base-dir runs/single-site --output-dir runs/single-site/plots
-
-# Scheduler comparison (SWARM vs baselines)
 python plot_comparison.py --swarm-dir runs/swarm --greedy-dir runs/greedy --output-dir runs/comparison
-
-# MAB/hierarchical delegation analysis
 python plot_mab_results.py --db-host localhost --output-dir runs/mab-test
 ```
 
-Generated plots include scheduling latency histograms, jobs per agent, agent load summaries, and (with `--hierarchical`) topology visualizations, agent type comparisons, and LLM overhead analysis.
+Published evaluation data for **SWARM (CCGrid'25)** and **SWARM+ (eScience'26)** is
+[here](https://github.com/swarm-workflows/swarm-evaluation-data).
 
-## Results
+## Configuration
 
-**Evaluation Data** for **SWARM (CCGrid'25)** and **SWARM+ (CCGrid'26)** can be found [here](https://github.com/swarm-workflows/swarm-evaluation-data). Every run also produces its own plots under `<run-dir>/` (see [Visualizations](#visualizations)).
+Runs are driven by `config_swarm_multi.yml`; `generate_configs.py` derives one config per agent
+from it. The knobs you are most likely to touch:
 
-## Agent Failure Handling
+| key | what it does |
+|---|---|
+| `job_selection.cost_weights` | CPU/RAM/disk/GPU weights in the cost function (sum ≈ 1.0) |
+| `job_selection.selection_threshold_pct` | how far above the minimum cost an agent still bids |
+| `consensus.protocol` | `pbft`, `snow`, or `hybrid`; Snow tuning under `consensus.snow.*` |
+| `failure_detection.protocol` | `heartbeat` or `swim` (SWIM runs alongside heartbeat) |
+| `gossip.enabled` | epidemic state dissemination, so peer load reaches cost estimates |
+| `runtime.wall_time_scale` / `_min_s` / `_max_s` | how a simulated job's sleep maps to its recorded wall time |
+| `runtime.reselection_timeout_s` | how long a job may sit in consensus before going back to PENDING |
+| `runtime.execution.*` | real execution: `mode`, `work_dir`, `bundle`, `roots`, `path_rewrites` |
+| `mab.algorithm` / `delegation.policy` | who picks the child group a coordinator delegates to |
+| `llm.provider` / `llm.model` | LLM backing for `--agent-type llm` |
 
-### Detection Mechanisms
+Unknown values raise rather than silently defaulting, and duplicate keys are rejected on load.
 
-1. **Peer Expiry** — Agents not updating within `peer_expiry_seconds` (default: 300s) are marked stale
-2. **gRPC Health Checking** — Channel-down events trigger peer status callbacks
-3. **Job Reselection Timeout** — Jobs stuck in PREPARE/COMMIT beyond `reselection_timeout_s` (default: 60s) reset to PENDING
-4. **Dynamic Quorum** — `quorum = (live_agents // 2) + 1`, adjusts as agents fail
+## How it works
 
-### Configuration
+Five layers, each usable on its own:
 
-```yaml
-runtime:
-  peer_expiry_seconds: 300
-  reselection_timeout_s: 60
-  failure_threshold_seconds: 30
-  max_failed_agents: 10
-  job_reassignment_enabled: true
-```
+| layer | where | does |
+|---|---|---|
+| Agent | `swarm/agents/` | scores jobs, runs them, owns all side effects |
+| Consensus | `swarm/consensus/` | PBFT (`engine.py`) or Snow (`gossip_engine.py`) agreement on assignments |
+| Selection | `swarm/selection/` | cost matrix over candidate jobs and agents, with caching |
+| Communication | `swarm/comm/` | gRPC transport (`consensus.proto`) |
+| Data | `swarm/database/` | Redis persistence for jobs, agents and consensus state |
 
-### Simulating Failures
+Agents talk to the consensus and selection engines through adapters, so the engines stay
+framework-agnostic. Topologies (ring, mesh, star, hierarchical) live in `swarm/topology/`, SWIM in
+`swarm/membership/`, gossip in `swarm/gossip/`, bandits in `swarm/rl/`.
+
+[ARCHITECTURE.md](docs/ARCHITECTURE.md) has the job lifecycle, the cost formula, the threading
+model and the invariants; [COMPLEXITY.md](docs/COMPLEXITY.md) the message complexity;
+[GOSSIP_CONSENSUS_DESIGN.md](docs/GOSSIP_CONSENSUS_DESIGN.md) the Snow/SWIM/gossip stack.
+
+Debugging a stuck run: set `log-level: DEBUG`, then inspect Redis with
+`python dump_db.py --host localhost --type redis`. For PBFT, check `engine.conflicts` and the
+quorum; for Snow, grep for `[snow] consensus engine started` and `[SNOW_LEADER]`, and confirm the
+exactly-once claims (`repository.try_claim_assignment`).
+
+If you change `swarm/comm/consensus.proto`:
 
 ```bash
-python kill_agents.py --mode local --count 1 --random           # Single failure
-python kill_agents.py --mode local --count 10 --interval 30 --random  # Cascading
-python kill_agents.py --mode local --count 7 --random           # Catastrophic (25%)
+python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. swarm/comm/consensus.proto
 ```
-
-### Monitoring
-
-```bash
-grep "RESTART: Job" <run-dir>/agent-*.log
-grep "Agent.*detected as FAILED" <run-dir>/agent-*.log
-```
-
-## Dynamic Agent Addition
-
-Add agents during execution via three trigger types:
-
-```bash
-# Time-based: add 5 agents after 30 seconds
-python run_test.py --mode local --agents 20 --dynamic-agents 5 \
-    --dynamic-trigger time --dynamic-delay 30 \
-    --topology mesh --jobs 500 --db-host localhost --run-dir runs/dynamic-time
-
-# Bucket-based: add agents when Redis bucket reaches threshold
-python run_test.py --mode local --agents 20 --dynamic-agents 10 \
-    --dynamic-trigger bucket --dynamic-trigger-bucket 1 --dynamic-trigger-threshold 50 \
-    --topology ring --jobs 500 --db-host localhost --run-dir runs/dynamic-bucket
-
-# Job-completion-based: add agents after N jobs complete
-python run_test.py --mode local --agents 15 --dynamic-agents 5 \
-    --dynamic-trigger jobs-completed --dynamic-trigger-jobs 100 \
-    --topology hierarchical --jobs 300 --db-host localhost --run-dir runs/dynamic-jobs
-```
-
-Dynamic agents are pre-configured, started when the trigger fires, and join the topology via Redis peer discovery.
 
 ## Utilities
 
-| Script | Purpose |
-|--------|---------|
-| `job_generator.py` | Generate synthetic job descriptions matching agent profiles |
-| `generate_configs.py` | Create agent configs for different topologies and agent counts |
-| `job_distributor.py` | Distribute jobs to Redis at a controlled rate |
-| `pegasus_profile_extractor.py` | Extract job profiles from Pegasus runs (runs on the submit host) |
-| `pegasus_to_swarm_converter.py` | Convert Pegasus profiles into swarm job files (+ optional agent configs) |
-| `dump_db.py` | Inspect Redis database state for debugging |
-| `kill_agents.py` | Simulate agent failures (local/remote, gradual/instant) |
-
-### Plotting (`plotting/` package)
-
-| Module | CLI Wrapper | Purpose |
-|--------|-------------|---------|
-| `plotting/single_run.py` | `plot_latency_jobs.py` | Single-run analysis: latency, conflicts, failures, hierarchical |
-| `plotting/multi_run.py` | `plot_multi_run_results.py` | Multi-run statistical comparison across topologies and scales |
-| `plotting/comparison.py` | `plot_comparison.py` | Scheduler comparison (SWARM vs baselines) |
-| `plotting/mab.py` | `plot_mab_results.py` | MAB learning curves and delegation patterns |
-| `plotting/data.py` | — | Shared data loading/saving (Redis, CSV, JSON) |
-| `plotting/stats.py` | — | Shared statistics helpers (Jain's fairness, safe aggregations) |
-
-Run any CLI wrapper with `--help` for full usage details.
+| script | purpose |
+|---|---|
+| `generate_configs.py` | per-agent configs for a topology and fleet size |
+| `job_generator.py` | synthetic jobs matching the agent profiles |
+| `job_distributor.py` | feed jobs into Redis at a controlled rate |
+| `pegasus_profile_extractor.py` | extract job profiles from a Pegasus run (submit host) |
+| `pegasus_to_swarm_converter.py` | turn those profiles into a runnable job bundle (+ agent configs) |
+| `make_agent_hosts.py` | build the hosts file for a remote run |
+| `dump_db.py` | inspect Redis state |
+| `kill_agents.py` | simulate agent failures |
+| `setup_apptainer.sh`, `setup_nfs_workflow.sh` | prepare a slice for real execution |
 
 ## Documentation
 
-All documentation lives in the [`docs/`](docs/) directory.
+**Architecture** — [ARCHITECTURE.md](docs/ARCHITECTURE.md) ·
+[COMPLEXITY.md](docs/COMPLEXITY.md) ·
+[GOSSIP_CONSENSUS_DESIGN.md](docs/GOSSIP_CONSENSUS_DESIGN.md) ·
+[DECENTRALIZED_POOL_DESIGN.md](docs/DECENTRALIZED_POOL_DESIGN.md)
 
-### Architecture & Design
-- [ARCHITECTURE.md](docs/ARCHITECTURE.md) — System architecture, five-layer design, and adapter patterns
-- [COMPLEXITY.md](docs/COMPLEXITY.md) — PBFT message complexity analysis for mesh and hierarchical topologies
-- [GOSSIP_CONSENSUS_DESIGN.md](docs/GOSSIP_CONSENSUS_DESIGN.md) — Gossip-based consensus stack (SWIM + gossip + Snow), implemented through Phase 4 (hybrid hierarchical) and validated at scale
-- [DECENTRALIZED_POOL_DESIGN.md](docs/DECENTRALIZED_POOL_DESIGN.md) — Proposed design for removing Redis from the control plane (p2p job pool, referee-based exactly-once claims, replicated job state)
+**Workflows** — [PEGASUS_TO_SWARM.md](docs/PEGASUS_TO_SWARM.md) (replay) ·
+[WORKFLOW_EXECUTION.md](docs/WORKFLOW_EXECUTION.md) (real execution)
 
-### Quantum & Workloads
-- [QUANTUM_HYBRID_DESIGN.md](docs/QUANTUM_HYBRID_DESIGN.md) — Hybrid quantum-classical job taxonomy, models, and split co-scheduling design
-- [QUANTUM_HYBRID_IMPLEMENTATION.md](docs/QUANTUM_HYBRID_IMPLEMENTATION.md) — Code-level walkthrough of the quantum support
-- [PEGASUS_TO_SWARM.md](docs/PEGASUS_TO_SWARM.md) — Replaying real Pegasus workflow executions as swarm workloads
-- [WORKFLOW_EXECUTION.md](docs/WORKFLOW_EXECUTION.md) — Running a real Pegasus workflow **for real**: where the executable, pfn, container and arguments each live, slice setup, validated soilmoisture results, and the limits that matter before quoting a number
+**Quantum** — [QUANTUM_HYBRID_DESIGN.md](docs/QUANTUM_HYBRID_DESIGN.md) ·
+[QUANTUM_HYBRID_IMPLEMENTATION.md](docs/QUANTUM_HYBRID_IMPLEMENTATION.md)
 
-### Hierarchical Topology & Delegation
-- [HIERARCHICAL_LLM_AGENTS.md](docs/HIERARCHICAL_LLM_AGENTS.md) — LLM agents as Level-1 coordinators in hierarchical topology
-- [CO_PARENT_USAGE.md](docs/CO_PARENT_USAGE.md) — Multi-parent shared parenting and coordinator failover
-- [MAB_README.md](docs/MAB_README.md) — Multi-Armed Bandit configuration and tuning for delegation
-- [CONTEXTUAL_BANDIT_DESIGN.md](docs/CONTEXTUAL_BANDIT_DESIGN.md) — Contextual bandit (LinUCB/LinTS) delegation with deployment validation
+**Hierarchy and delegation** — [HIERARCHICAL_LLM_AGENTS.md](docs/HIERARCHICAL_LLM_AGENTS.md) ·
+[CO_PARENT_USAGE.md](docs/CO_PARENT_USAGE.md) · [MAB_README.md](docs/MAB_README.md) ·
+[CONTEXTUAL_BANDIT_DESIGN.md](docs/CONTEXTUAL_BANDIT_DESIGN.md)
 
-### Baselines & Evaluation
-- [DISTRIBUTED_BASELINE_DESIGN.md](docs/DISTRIBUTED_BASELINE_DESIGN.md) — Design for distributed baseline schedulers with remote execution
-
-### Project Planning
-- [ROADMAP.md](docs/ROADMAP.md) — Identified improvements and feature roadmap
+**Baselines and planning** — [DISTRIBUTED_BASELINE_DESIGN.md](docs/DISTRIBUTED_BASELINE_DESIGN.md) ·
+[ROADMAP.md](docs/ROADMAP.md)

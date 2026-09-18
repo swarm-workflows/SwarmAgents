@@ -11,25 +11,55 @@ this document exists for: **run the same workflow on Pegasus and on SWARM, and c
 
 Simulation remains the default. Nothing here changes a run that does not ask for it.
 
+**The step-by-step runbook is in the [README](../README.md#real-execution)** — six commands, in
+order, for a workflow you just want to run. This document is the reference behind it: where each
+piece of a Pegasus job lives, what the bundle is, what the runner refuses and why, what has been
+validated, and what you must not quote a number from yet.
+
+| | |
+|---|---|
+| [1. The shape of the pipeline](#1-the-shape-of-the-pipeline) | the four places a job's parts live, and why two paths are needed rather than one |
+| [2.1 What you need, and where](#21-what-you-need-and-where) | the completed Pegasus run, and which machine does what |
+| [2.2 Slice setup](#22-slice-setup-once) | apptainer and the shared work dir |
+| [2.3 Extract and convert](#23-extract-and-convert-on-the-submit-host) | the two commands, flag by flag |
+| [2.4 The bundle](#24-the-bundle-is-the-deliverable) | what the output directory holds, and why it is a bundle rather than paths |
+| [2.5 Configuring execution](#25-configuring-execution) | `runtime.execution`, and what `path_rewrites` is still for |
+| [2.6 Running it](#26-running-it) | `--pegasus-jobs-dir`, and what is refused before the run starts |
+| [2.7 Sizing the fleet](#27-sizing-the-fleet-to-the-workflow) | jobs the fleet cannot run are never scheduled and never fail |
+| [2.8 Several workflows](#28-several-workflows) | file names are the one thing a bundle does not namespace |
+| [2.9 Roots and image resolution](#29-roots-and-image-resolution--for-jobs-you-author-yourself) | for jobs written by hand; the full image-reference matrix |
+| [3. What has been validated](#3-what-has-been-validated) | the soilmoisture numbers, and what they do not yet say |
+| [4. Known limits](#4-known-limits) | read before quoting anything |
+| [5. Rules this code follows](#5-rules-this-code-follows-and-why) | refuse rather than approximate, verify by doing |
+| [6. What still needs building](#6-what-real-execution-still-needs) | staging, a controlled substrate, per-workflow work dirs |
+
 ---
 
 ## 1. The shape of the pipeline
 
 ```
-Pegasus submit host                    SwarmAgents
-───────────────────                    ───────────
+Pegasus submit host                              SwarmAgents fleet
+───────────────────                              ─────────────────
 *.stampede.db   ─┐
 workflow.yml     ├─> pegasus_profile_extractor.py ──> profiles JSON
 transformations.yml ┘                                      │
                                                            v
                                         pegasus_to_swarm_converter.py
                                                            │
-                                                   job_N.json  (execution block)
+                                     converted_jobs/  (job records + code/ inputs/ images/)
+                                                           │
+                                        rsync -a --delete  │
                                                            v
-                                              Job  ──>  swarm/execution/runner.py
+                                              run_test.py --pegasus-jobs-dir
+                                                           │
+                                                   Job  ──>  swarm/execution/runner.py
                                                            │
                                                    apptainer exec … / docker run …
 ```
+
+Both extraction and conversion run **on the submit host** — that is where the catalogs'
+absolute paths resolve, so it is the only machine that can collect the code, the inputs and the
+image into one directory. What crosses to the fleet is that directory.
 
 Four things have to travel, and **each lives in a different place**. Getting this wrong is the
 main way the pipeline fails, so it is worth stating precisely.
@@ -103,7 +133,7 @@ guard) and `ordered_task_ids` (order-preserving and unique, for accumulation).
 
 ## 2. Running it
 
-### 2.0 Getting the workflow
+### 2.1 What you need, and where
 
 `soilmoisture` is public: `git clone https://github.com/pegasus-isi/soilmoisture-workflow.git`.
 The clone carries the five executables, `polygons.json`, and both container recipes. Three
@@ -117,28 +147,65 @@ input is a completed Pegasus run, not a workflow definition** — the DB is wher
 durations, exit codes and the baseline makespan come from, and comparing against a run means
 having that run. Cloning and planning is not a substitute.
 
-One consequence worth knowing: because the catalogs are generated with absolute paths,
-generating them *on the machine where the code will live* makes `path_rewrites` unnecessary.
-Rewrites exist for the normal case, where the run happened somewhere else.
+One consequence shapes everything below: because the catalogs carry absolute submit-host paths,
+they resolve on the submit host and nowhere else. So the conversion runs *there* and produces a
+self-contained bundle (§2.4) — which is why no path on this fleet has to be mapped back to one
+on that one.
 
-### 2.1 Extract and convert
+That splits the work across three machines:
+
+| machine | does | needs |
+|---|---|---|
+| Pegasus submit host | extract, convert, size the fleet (§2.3) | `pegasus_profile_extractor.py`, `pegasus_to_swarm_converter.py`, `config_swarm_multi.yml`, Python 3 — no Redis, no agents, no rest of the repo |
+| database node | holds Redis and the shared export, launches the run (§2.6) | the repo, the bundle copied in, the execution config (§2.5) |
+| agent hosts | run the jobs | apptainer and the shared mount (§2.2); the bundle is read from the export |
+
+### 2.2 Slice setup (once)
 
 ```bash
-# On the Pegasus submit host
-python3 pegasus_profile_extractor.py \
-    --submit-dir ~/soilmoisture-workflow/ubuntu/pegasus/soilmoisture/run0001 \
-    --output soil_profiles.json
-
-# On the SwarmAgents side
-python pegasus_to_swarm_converter.py --input soil_profiles.json \
-    --input-type json --output-dir converted_jobs/ --dag-gating
+sudo ./setup_apptainer.sh               # all 92 agents; verifies by RUNNING a container
+sudo ./setup_nfs_workflow.sh            # shared work dir at an identical path everywhere
 ```
 
-`--dag-gating` reconstructs the dependency graph as per-job `data_predicate`s; see
-`CLAUDE.md` and `tests/test_workflow_dag.py`. Check `conversion_summary.json`'s `dag.edges`
-and `dag.roots` — a partial DAG still runs and looks healthy.
+Both exit non-zero on a partial fleet. Both verify by doing the thing, not by asking whether a
+binary or a mount exists — see §5.
 
-### 2.1a The output directory is the deliverable
+### 2.3 Extract and convert, on the submit host
+
+Two commands, and everything after them is a copy.
+
+```bash
+python3 pegasus_profile_extractor.py \
+    --submit-dir soilmoisture-workflow/ubuntu/pegasus/soilmoisture/run0001/ \
+    --output soil_profiles.json
+
+python3 pegasus_to_swarm_converter.py \
+    --input soil_profiles.json --input-type json \
+    --output-dir converted_jobs/ \
+    --bundle-images --dag-gating \
+    --dtn-names local --dtn-scope job
+```
+
+* `--dag-gating` reconstructs the dependency graph as per-job `data_predicate`s (see
+  `tests/test_workflow_dag.py`). It forces `--data-nodes per-file`, because per-site collapses
+  a job's inputs and loses edges. Without it nothing waits for its parents and a child fails on
+  a file that has not been written.
+* `--bundle-images` carries the container image too, so the copied directory is everything the
+  jobs need. See §4.3 before quoting timings from a run that executes it off the export.
+* `--dtn-names local --dtn-scope job` makes the jobs data-location-free — `local` is excluded
+  from a job's required DTNs — which is what you want when every agent reads one shared mount.
+* `--bundle-source-root` is only needed when converting somewhere the recorded paths do not
+  resolve. It is a prefix replacement, and a relative value resolves against the current
+  directory, so pass it absolute.
+
+Then read `conversion_summary.json` → `dag.edges`, `dag.roots` and `dag.colliding_outputs`, and
+`manifest.json` → `missing`. A partial DAG and an incomplete bundle both look healthy from the
+outside.
+
+### 2.4 The bundle is the deliverable
+
+> The output directory is the unit you copy, and the reason it is a directory of files rather
+> than a set of paths. Skip to §2.5 if you only need to run it.
 
 The converter writes a **self-contained bundle**: job records plus the executables they run
 plus the root inputs they read. Copy the directory anywhere, point one config key at it, and
@@ -159,8 +226,23 @@ runtime:
   execution:
     bundle: /export/swarm-wf/converted_jobs
     roots:
-      images: /root/wf-images        # images are referenced, not carried
+      images: /root/wf-images        # only when the image is NOT bundled, or is staged local
 ```
+
+Copying it onto the shared export is the whole hand-off — there is no workflow tree to stage
+and no `path_rewrites` to work out:
+
+```bash
+rsync -a --delete converted_jobs/ <swarm-db-host>:/export/swarm-wf/converted_jobs/
+sudo chown -R nobody:nogroup /export/swarm-wf/converted_jobs      # on the database node
+```
+
+`--delete` is load-bearing. The converter replaces its own output directory, but a copy does
+not sweep: restaging a 4-job workflow into a directory holding a previous 400-job conversion
+leaves 404 records and the distributor publishes all of them. `run_test.py` compares the record
+count against `conversion_summary.json` and refuses the mismatch, so this fails loudly — but
+`--delete` is what avoids it. `rsync -a` (or `tar`) also matters for the **mode bits**: nothing
+on the agent side chmods or checks the executables.
 
 Why this rather than paths into a staged tree:
 
@@ -257,17 +339,7 @@ relative to the bundle (for reading and auditing), `root_relative` is relative t
 is what goes in the job record — `roots.code` already names `code/`, so using the bundle-relative
 form put `code/` in the path twice and every job refused.
 
-### 2.2 Slice setup
-
-```bash
-sudo ./setup_apptainer.sh               # all 92 agents; verifies by RUNNING a container
-sudo ./setup_nfs_workflow.sh            # shared work dir at an identical path everywhere
-```
-
-Both exit non-zero on a partial fleet. Both verify by doing the thing, not by asking whether a
-binary or a mount exists — see §5.
-
-### 2.3 Config
+### 2.5 Configuring execution
 
 ```yaml
 runtime:
@@ -276,24 +348,308 @@ runtime:
     work_dir: /export/swarm-wf/work
     container_runtime: auto
     timeout_s: 3600.0
-    path_rewrites:
-      - from: /home/ubuntu/soilmoisture-workflow
-        to:   /export/swarm-wf/workflows/soilmoisture-workflow
-      - from: /home/ubuntu/soilmoisture-workflow/Apptainer
-        to:   /root/wf-images
+    bundle: /export/swarm-wf/converted_jobs
 ```
 
-### 2.4 Roots — for jobs you author yourself
+The work directory must be writable by the **squashed** NFS user, or every job refuses with
+`Permission denied`:
 
-`path_rewrites` exists because a Pegasus catalog records **absolute** submit-host paths that do
-not exist on this fleet. A job written by hand has no such history and should not have to
-invent one. For those, say where the three kinds of thing live:
+```bash
+sudo chown nobody:nogroup /export/swarm-wf/work && sudo chmod 1777 /export/swarm-wf/work
+```
+
+`path_rewrites` is for records converted with `--no-bundle`, which describe their code by
+absolute submit-host path and need those prefixes mapped onto wherever it was staged. A bundle
+carries the code, so there is nothing to rewrite. The one pairing that remains common is
+`bundle` plus `roots.images`, when the image is staged to each agent's local disk (§4.3) rather
+than read off the export — explicit `roots` entries win over `bundle`, and a bundled image is
+recorded by bare basename, so a local directory holding the same file name drops straight in.
+
+### 2.6 Running it
+
+```bash
+python3 run_test.py --mode remote --agent-type resource --agents 5 --agents-per-host 1 \
+    --topology mesh --jobs-per-interval 4 --db-host database \
+    --agent-hosts-file agent_hosts.txt --run-dir runs/soil-real \
+    --pegasus-jobs-dir /export/swarm-wf/converted_jobs \
+    --runtime 420
+```
+
+`--pegasus-jobs-dir` publishes the bundle as it is: no conversion runs, no synthetic jobs are
+generated, and the directory is never cleaned between runs (it is usually the copy on the
+export, so `cleanup_between_runs` deleting it would destroy the workflow). The gating came from
+the converter, so `--pegasus-dag-gating` — which applies only when `run_test.py` converts —
+is not used on this path, and the two flags are mutually exclusive.
+
+`--jobs` is not passed here. It sets the agents' expected job count and drives the completion
+checks, and the bundle knows it exactly — `run_test.py` counts the `job_*.json` records, which is
+the same set `job_distributor.py` publishes. Pass it only to override, and it warns when the two
+disagree. (It stays required for every other kind of run, where nothing can count for you.)
+
+`run_test.py` refuses outright on the things that would run the wrong work: surplus records from
+an earlier conversion, the name collisions in §2.8, and a fleet that cannot run the jobs
+(§2.7).
+
+### 2.7 Sizing the fleet to the workflow
+
+The converted jobs carry the resources they really needed on Pegasus. The fleet is sized
+independently — `generate_configs.py` draws from its own flavour pool — and with
+`--pegasus-jobs-dir` the conversion ran on a machine that knew nothing about this fleet. Nothing
+reconciled the two: the old convert-here path aligned the *DTN names* (it converted jobs onto
+the DTNs the fleet held) and never the capacities, and a copied bundle aligns neither.
+
+The failure is silent by construction. `is_job_feasible` returns False for every agent, so the
+job is never proposed, never fails, and never appears anywhere except as still-pending at the
+end — which looks like a scheduling problem and sends you to the consensus logs.
+
+`run_test.py` therefore compares the two before starting (`check_fleet_fits_jobs`) and refuses
+the run, naming an example job, what it needs, and what the largest agent has. Two details that
+decide whether the check is worth anything:
+
+* It compares **whole profiles**, not per-dimension maxima. A fleet with a big-CPU agent and a
+  big-RAM agent satisfies neither a job needing both — one agent has to satisfy every dimension
+  at once.
+* It requires **one agent holding every DTN** a job names (`local` excluded, since it means the
+  local filesystem). Two agents holding one DTN each do not place a job that needs both.
+* It describes the fleet from the **per-agent configs this run launches** — the files each
+  agent actually loads, ids 1..agents+dynamic, in the directory that mode launches from (§2.6).
+  `agent_profiles.json` is a local artefact of the last generation: under `--use-config-dir` it
+  need not describe these configs at all, and either way it lists every agent ever generated, so
+  a 270-agent generation left lying around satisfied the check for a 30-agent run that then
+  stalled. It is consulted only when no config describes any agent, restricted to the same ids.
+* **Absent and unparseable are different, and absence means different things per mode.** A
+  local run launches through `swarm-multi-start.sh`, which iterates the configs that *exist* and
+  skips ids outside its range: a missing config is one fewer agent, not fleet, and not a reason
+  to stop describing the rest. A remote run copies each id's config to its host and
+  `start_agents_remote` raises on the first one missing, so the run does not start at all and
+  any verdict about job sizes would describe a fleet that never exists — there, a missing config
+  stops the check instead. Falling back to
+  `agent_profiles.json` on a missing config was worse than useless: that file can describe an
+  older generation, so one gap swapped every agent's real capacities for a stale guess. A config
+  that is present and *will not parse* skips the check with a report rather than deciding it —
+  the agent that did not parse may be the only one that fits. The execution-mode lookup follows
+  the same rule and had the same bug: a missing config made it answer "cannot tell", refusing
+  runs whose every launched agent was perfectly readable.
+
+**In practice a replay converted with real DTN names is refused without sizing, and the reason
+is DTNs, not capacity.** Feasibility requires a single agent holding *every* DTN a job names,
+while `--dtns` gives each agent 1-4 random picks from a ten-name pool. Measured on this repo's
+`converted_jobs/`: 19,542 of 25,331 jobs name two DTNs and 908 name three to five, so a default
+20-agent fleet places none of them — the check refuses with 12,627 unplaceable. The jobs
+themselves are small (4 cores / 14 GB / 6.2 GB / 1 GPU at the top) against a 2-core / 8 GB
+smallest flavour.
+
+**Sizing makes every job runnable on every agent, and that is the point** — a failure test only
+means something if a dead agent's work can go to any other, rather than being stranded because
+it fitted only the agent that died. **It does not make the fleet uniform**, and the two
+dimensions that carry the variability are exactly the two that do not decide feasibility:
+
+* **Capacity is raised to a floor.** An agent already larger than the largest job keeps its
+  flavour. Measured on a 20-agent mesh sized to this bundle: five distinct profiles, 4 cores /
+  14 GB (8 agents) through 32 cores / 128 GB (1 agent).
+* **Locality is `connectivity_score`.** `is_job_feasible` tests DTN *names*; the score feeds
+  the cost model. So every agent holds every required name — no job is infeasible anywhere —
+  while each is differently well connected to it. One base score per name (drawn 0.6-0.95, as
+  the standard pool is), jittered per agent.
+
+Until 2026-09-18 sized DTNs were pinned at `connectivity_score: 1.0`, which removed locality
+altogether and did it in the flattering direction: an agent's organically assigned DTNs score
+0.6-0.95, so every bolted-on one outscored them. `swarm/utils/fleet_sizing.py` now draws them.
+
+**What sizing still costs.** The floor is raised, so a sized fleet is not the standard flavour
+pool and a run on it is not comparable with results measured on one. For a run whose subject
+*is* the fleet, keep the standard pool and stay feasible the other way: convert with
+`--dtn-scope job` onto names the fleet already holds — one DTN per job, an agent really has it,
+locality untouched. `run_test.py --pegasus-profiles` does this automatically; a bundle converted
+elsewhere cannot, which is why `--pegasus-jobs-dir` normally wants `--size-to-jobs`.
+
+To make them meet rather than merely discover that they do not, generate the fleet *from* the
+jobs. **Generate it once, with `generate_configs.py`, for every topology and both modes**, and
+pass `--use-config-dir` to every run:
+
+```bash
+python3 generate_configs.py 5 10 ./config_swarm_multi.yml configs mesh database 0 \
+    --skip-jobs --seed 42 --size-to-jobs /export/swarm-wf/converted_jobs
+```
+
+Left to `run_test.py` the fleet is regenerated on every run, which re-draws flavours and DTNs and
+makes two runs of the "same" cell incomparable. `--use-config-dir` is what stops that: it skips
+generation and stops `cleanup_between_runs` from deleting `configs/`, `agent_profiles.json` and
+`agent_dtns.json`; Redis is still flushed. Generate with `--skip-jobs` (no synthetic jobs), with
+the execution block (§2.5) already in the base config since these are copies of it, and with
+`--seed` so the fleet is reproducible. The starter globs `./configs` for a local run;
+`--config-dir` is what a remote run copies across (§2.6). Keep `agent_profiles.json` in the repo
+root, which is where the check reads the fleet from.
+
+`--size-to-jobs` is what sizes the fleet from the bundle: every agent raised to the largest job
+and given every DTN the jobs name. Without it the flavour pool tops out at 32 cores / 128 GB /
+1 TB and the check above is the whole safety net.
+
+**The converter can do the same thing in the conversion pass, for flat topologies only:**
+
+```bash
+python3 pegasus_to_swarm_converter.py --input soil_profiles.json --input-type json \
+    --output-dir converted_jobs/ --bundle-images --dag-gating \
+    --dtn-names local --dtn-scope job \
+    --generate-agent-configs --num-agents 5 --base-config ./config_swarm_multi.yml \
+    --topology mesh --db-host database
+```
+
+It writes `agent_profiles.json` and `configs/config_swarm_multi_<id>.yml` into the bundle, sized
+the same way — both routes compute "can this agent host this job" from
+`swarm/utils/fleet_sizing.py`, so a fleet sized either way means the same thing. It saves a step
+when the bundle is being built anyway, at the cost of two: the base config it copies on the
+submit host must already carry the execution block, and `configs/` and `agent_profiles.json` have
+to be copied to the database node with it. `--generate-agent-configs` writes `mesh`, `ring` or
+`star`; a hierarchical fleet has no route but `generate_configs.py`.
+
+Note that a hierarchical fleet gets **no generated DTN pool** (`--dtns` is not passed for it):
+agents carry only what the base config's `dtns:` lists and `agent_dtns.json` is not written, so a
+job hashed onto a generated DTN name has no holder — convert with `--dtn-names local`, or let
+`--size-to-jobs` attach the names in use.
+
+`--pegasus-profiles` converts at run time instead of publishing a bundle, and it is compatible
+with `--use-config-dir`: the conversion takes its DTN pool from the per-agent configs of the
+agents **this run launches** — the same source and the same id range as the fleet check above,
+and for the same reason. `agent_dtns.json` is not consulted (except when nothing on disk
+describes a fleet at all): it is a repo-root artefact of the last generation, so under
+`--use-config-dir` it can describe a fleet generated on another machine, and it lists every
+agent ever generated — hashing a job onto a DTN only agent 200 holds leaves it infeasible for
+every agent that starts. If the launched fleet cannot be described, the conversion drops to
+`local` (no DTN requirement) and says so, rather than naming DTNs nobody may hold. Two earlier
+shapes of this: the combination used to skip the conversion entirely, so the run published
+whatever `jobs/` already held.
+
+### 2.8 Several workflows
+
+> One bundle and one run per workflow is the safe default. This section is why, and what is
+> checked if you combine them anyway.
+
+Job ids are namespaced by run (`<dax_label>_<run dir>_<job name>`) and never collide. **Logical
+file names are not namespaced**, and three things key on them: the DAG producer map
+(`apply_dag_gating` matches a consumer's input against *any* job's output), the run's readiness
+registry (`data_ready:<run id>:0:names`, one flat set), and the shared working directory (bare
+names, one directory). Two workflows that both produce `output.csv` therefore get a
+cross-workflow edge nobody wrote, and then two jobs writing one file.
+
+This is not hypothetical, and it does not need two different workflows. Converting this repo's
+`pegasus_subset_profiles.json` (7 runs, 174 jobs) reports **73 colliding output names**, all of
+them between two runs of the *same* workflow — which is the obvious way to scale a replay up.
+
+So the default is **one bundle and one run per workflow**: each run mints its own
+`SWARM_RUN_ID`, which scopes both the working directory and the readiness registry, so nothing
+one workflow produces can release another's jobs. Combining several into one run is fine only
+when their file names are disjoint, and that is checked rather than assumed:
+
+| what collides | where it is recorded | what happens |
+|---|---|---|
+| a name one workflow produces and another **reads** | `conversion_summary.json` → `dag.cross_workflow_edges` | refused whenever the run acts on names (gating, or anything executing) |
+| an output name produced by more than one job | `conversion_summary.json` → `dag.colliding_outputs` | refused when the bundle is DAG-gated; a warning otherwise |
+| a staged input name that some job also produces | `conversion_summary.json` → `dag.replica_conflicts` | refused across workflows; a warning within one workflow |
+| one logical name declared by two workflows for different files | `manifest.json` → `missing`, flagged `collision` | refused |
+| a replica or container image whose basename collides | `manifest.json` → `missing`, flagged `collision` | refused |
+
+**The first row is the general case and the one to understand**; the rest are narrower shapes of
+it. Two workflows have no data relationship, so a name they share is a coincidence — and both
+mechanisms that act on names act on it anyway: gating keys its producer map by name, so the
+reader waits for the other workflow's job; the working directory is flat and shared, so whoever
+gets there first decides what the reader reads. It is checked as `data_in` against `data_out`,
+which needs nothing but the job records. An earlier version compared the *declared replicas*
+instead, and most profiles carry none — the replica catalog is not in the stampede DB — so the
+common case reported nothing: on this repo's own 7-run profile, that check finds **0** conflicts
+where this one finds **62**.
+
+**"Acts on names" is the condition**, not "is a workflow" — and it is decided per run, not per
+bundle, because every one of these is a warning or a refusal depending on it:
+
+* **Gating** consults a producer map keyed by name, so a name decides scheduling order.
+* **Execution** reads and writes those names in one shared directory. This takes *both* the
+  run's configured `runtime.execution.mode` (which a bundle cannot know, so `run_test.py` reads
+  the config the agents will use) and jobs that actually carry something to execute — a
+  synthetic job in a `real` run still simulates, so one half alone would refuse ordinary
+  replays. The mode is resolved by `runner.resolve_mode` and nowhere else: **an absent key means
+  `simulate`**, so a config with no execution block describes a run that touches nothing.
+  Re-deriving that default as "absent, so assume it executes" refused ordinary replays for a
+  collision they could never act on — the same one-key-one-default rule `consensus.protocol`
+  follows.
+
+  **A config that cannot be *read* is a third state, not the default.** Absent is an answer;
+  unparseable is not — and under `--use-config-dir` the run starts regardless, because the
+  agents read their own per-agent files and never this process's copy. So an unreadable config
+  is reported and the checks are applied as if the jobs will execute. Collapsing it into
+  `simulate` skipped them for a reused config that says `mode: real` and happened not to parse
+  (a duplicate key, which `yaml_strict` refuses, is the likeliest way). For the same reason the
+  answer under `--use-config-dir` comes from that directory and never falls back to the base
+  config: those are the files the agents will read — **all** of them, since they need not agree
+  and one agent configured `real` makes the run one that executes, and only
+  `config_swarm_multi_*.yml`, since an unrelated file in the directory has no runtime block and
+  would otherwise answer `simulate` on behalf of configs that say `real` — and only the ids this
+  run launches (1..agents+dynamic), because a config directory outlives the run that generated
+  it, so an agent nobody starts must not decide what this run is. Which directory that is
+  differs by mode and is not always `--config-dir`: `swarm-multi-start.sh` globs `configs/`
+  literally, so a local run launches from `./configs` whatever `--config-dir` says, while a
+  remote run launches from each host's own `configs/`, filled by copying `--config-dir` across.
+
+An ungated simulated replay does neither: its names are inert, and it is warned about rather
+than refused. That is exactly what the shipped multi-workflow profile is — 62 cross-workflow
+names and 73 colliding outputs, refused as a gated or executing run and merely reported as the
+replay it has always been. The reverse also holds, and was a real gap: a `real` run *without*
+`--dag-gating` has no producer map but still has one flat directory, so two jobs writing one
+name are refused there too.
+
+A bundle converted before these checks existed carries no record of them, and silence from a
+check that never ran reads exactly like a clean bill of health. That case is named as such and
+refused when the names are live: re-convert it.
+
+Rows three and four read as harmless and are not. The converter carries one file and reports the
+loser — but the losing **job still names that file** in its `data_in`, and `stage_inputs`
+resolves a bare name under `roots.inputs`, so it is staged the *other* workflow's bytes and runs
+to completion on them. An image collision is safer only by accident: the loser keeps its
+original absolute path, which does not exist on the fleet, so it refuses loudly.
+
+Every one of these is decided on the **basename**, not the recorded name, because that is the
+name the file actually gets: the working directory is flat and `stage_inputs` reduces a declared
+name to its basename. Comparing the recorded strings misses the case that matters most —
+`runA/out.csv` and `runB/out.csv` are two names and one file.
+
+#### Why not prefix the names instead
+
+The obvious fix — rename `data.csv` to `wfA_data.csv` on the way into the bundle — does not
+work, for a reason that is specific to running real code. **A file name is not only an
+identifier here; it is part of the command line.** The arguments come from the abstract
+workflow (`--input field1_soil_data.csv`, §1.2), and a workflow's code also opens files by name
+internally and writes its outputs under names it chose. Rename the staged file and the job
+cannot find it; rename it back afterwards and you have to know which argument strings were file
+names, which is not decidable from a catalog.
+
+So the namespace has to be something the job never sees: a **directory**. Give each workflow its
+own working directory — which is what Pegasus does with its per-workflow scratch dir — and the
+names inside it stay exactly as the workflow wrote them. That is genuinely the right fix, and
+it is not what the code does today: `work_dir` is per *run* (`<work_dir>/<SWARM_RUN_ID>`), shared
+by every job in it, because a shared directory is how job B finds job A's output. Per workflow
+is the finer scope that keeps that property and removes the collisions; it needs the runner to
+key on the job's `workflow` field (now carried on every converted record), the readiness
+registry to be scoped the same way, and DAG matching to stay inside a workflow.
+
+Until then, one run per workflow **is** that namespace — `SWARM_RUN_ID` already scopes both the
+working directory and the readiness registry — and a bundle that would need the finer scope is
+refused rather than quietly resolved.
+
+### 2.9 Roots and image resolution — for jobs you author yourself
+
+> Reference. A converted bundle needs none of this: `bundle` sets the three roots and the
+> records are already relative.
+
+A converted bundle needs none of this: `bundle` sets the three roots and the records are already
+relative. Roots are for the other case — a job written by hand, or a `--no-bundle` conversion
+whose absolute submit-host paths `path_rewrites` maps onto wherever the code was staged. For
+those, say where the three kinds of thing live:
 
 ```yaml
 runtime:
   execution:
     roots:
-      code:   /export/swarm-wf/workflows/soilmoisture-workflow
+      code:   /export/swarm-wf/code
       inputs: /export/swarm-wf/inputs
       images: /root/wf-images
 ```
@@ -399,11 +755,11 @@ rather than given an invented name. Per-file conversion, which `--dag-gating` al
 is what produces stageable nodes. A declared name is reduced to its basename, so a workflow
 cannot name a path that escapes the working directory.
 
-**Two rewrites, deliberately.** A catalog's paths are all under the workflow root, but the
-code and the image want to live in different places: code on the shared export (small, and
-every agent must see the same bytes), the multi-gigabyte image on each agent's **local disk**.
-Longest prefix wins, so the image rule takes precedence regardless of the order they are
-written in — which is exactly why the rule exists.
+**Code and image want different homes.** Code must be identical on every agent (the export, or
+the bundle on it); the multi-gigabyte image belongs on each agent's **local disk** (§4.3). With
+a bundle that is `bundle` plus a `roots.images` override. With `--no-bundle` records it is two
+`path_rewrites` entries under one workflow root, where **longest prefix wins** — so the image
+rule takes precedence regardless of the order they are written in, which is why the rule exists.
 
 ---
 
@@ -436,13 +792,18 @@ Two things this does *not* yet say:
 
 ## 4. Known limits
 
-### 4.1 No stage-in, so a root input must be placed by hand
+### 4.1 Staging is local, not distributed
 
-The runner has no staging step; `execute()`'s two staging TODOs are still TODOs. Jobs run with
-the **shared** work dir as cwd, and `data_in`/`data_out` are bare logical names, so job B finds
-job A's output because both ran in the same directory. What nothing provides is the workflow's
-*declared replicas* — files listed in `replicas.yml` that no job produces. Copy them into the
-work dir before the run.
+Jobs run with the **shared** work dir as cwd, and `data_in`/`data_out` are bare logical names,
+so job B finds job A's output because both ran in the same directory. The workflow's *declared
+replicas* — the files `replicas.yml` lists and no job produces — are carried in the bundle's
+`inputs/` and copied into the work dir by `stage_inputs` before a job starts (§2.9), so nothing
+has to be placed by hand any more.
+
+What still does not exist is **transfer between agents**: staging is a copy from a root the
+agent can already see, which on this slice means the shared export. A run whose agents did not
+share a filesystem would have nothing to stage from. That is the same limit as §4.2, from the
+other side.
 
 `fetch_soil_data` additionally calls a live external API, and
 `archive-api.open-meteo.com` is **unreachable from the slice** (generic HTTPS is fine —
@@ -496,15 +857,21 @@ invisible until a job lands on the host nobody remembers skipping.
 
 ## 6. What real execution still needs
 
-1. **Stage-in / stage-out**, so declared replicas arrive and outputs leave without a shared
-   filesystem. This is the last thing standing between the current setup and a defensible
-   makespan comparison.
+1. **Transfer, and stage-out.** Declared replicas now travel in the bundle and are copied into
+   the working directory by `stage_inputs` (§4.1), but that is a local copy from a root the
+   agent can already see. Nothing moves data *between* agents, and outputs never leave the
+   working directory. This is the last thing standing between the current setup and a
+   defensible makespan comparison.
 2. **A controlled substrate** — Pegasus and SWARM on the same hardware — before any published
    number.
 3. **Per-job resource enforcement.** The catalog carries `memory`/`cores` requests; the runner
    does not pass them to the container runtime, so a job can exceed what it asked for.
-4. **Clustered jobs**, which currently refuse (§1.3). Supporting them means representing a job
+4. **A per-workflow working directory**, so several workflows can share one run without their
+   file names colliding (§2.8). The records already carry `workflow`; the runner, the readiness
+   registry and the DAG matcher would all key on it.
+5. **Clustered jobs**, which currently refuse (§1.3). Supporting them means representing a job
    as an ordered list of invocations rather than one command line.
 
-Tests: `tests/test_workflow_execution.py` (27), `tests/test_real_execution.py` (38).
+Tests: `tests/test_workflow_execution.py` (74), `tests/test_real_execution.py` (76),
+`tests/test_workflow_dag.py` (29), `tests/test_pegasus_jobs_dir.py` (19).
 Related: `docs/QUANTUM_HYBRID_DESIGN.md` for the other execution path (`_execute_quantum`).
