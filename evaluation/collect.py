@@ -224,17 +224,36 @@ def read_jobs_csv(path: Path) -> pd.DataFrame | None:
         return None
 
 
-def dedup_jobs(df: pd.DataFrame) -> pd.DataFrame:
-    """One row per job_id, preferring the row that shows completion.
+#: Progress columns, least to most advanced. A job that reached a later stage carries the
+#: earlier stages' stamps too, so sorting on this tuple puts the fullest record last.
+_PROGRESS_COLUMNS = ("completed_at", "started_at", "assigned_at", "selection_total",
+                     "selection_started_at")
 
-    Reselection and re-proposal leave several records per job; the completed one is the
-    outcome of record. Sorting by completed_at puts it last, so keep='last' picks it.
+
+def dedup_jobs(df: pd.DataFrame) -> pd.DataFrame:
+    """One row per job_id, preferring the most ADVANCED record.
+
+    Reselection and re-proposal leave several records per job, and on a hierarchical run the
+    combined export holds one record per TIER: the coordinator's copy (persisted READY at
+    delegation, level-1 stamps only) and the leaf's (every level's stamps, and the only one
+    that ever completes). Sorting on `completed_at` alone was enough while a job was finished
+    — the leaf record wins — but two records of a job still RUNNING at teardown both carry
+    `completed_at = 0`, and the stable sort then kept whichever came last in the file: the
+    coordinator's, listed after the leaves by `plotting/single_run.py`. Its `selection_total`
+    covers one tier, so a run's mean silently undercounted (measured: 2 s coordinator + 1 s
+    leaf reported as 2.0). The fuller record also carries the earlier stages' stamps, so the
+    progress tuple picks it.
     """
     if "job_id" not in df.columns:
         return df
-    ordered = df.assign(_completed=_numeric(df, "completed_at").fillna(0.0))
-    ordered = ordered.sort_values("_completed", kind="stable")
-    return ordered.drop_duplicates(subset="job_id", keep="last").drop(columns="_completed")
+    keys = []
+    ordered = df
+    for i, column in enumerate(_PROGRESS_COLUMNS):
+        key = f"_progress_{i}"
+        ordered = ordered.assign(**{key: _numeric(ordered, column).fillna(0.0)})
+        keys.append(key)
+    ordered = ordered.sort_values(keys, kind="stable")
+    return ordered.drop_duplicates(subset="job_id", keep="last").drop(columns=keys)
 
 
 # ----------------------------------------------------------------------------- metrics

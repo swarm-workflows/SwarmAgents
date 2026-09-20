@@ -991,3 +991,32 @@ class TestSelectionTotalColumn(unittest.TestCase):
             run_dir = write_run(Path(tmp), "hier-30/run01", "j1,1,1,2,2,9,0,1,0.1,0.5\n")
             metrics = run_metrics(run_dir, expected_jobs=1)
             self.assertTrue(math.isnan(metrics["selection_total_mean"]))
+
+
+class TestDedupKeepsTheMostAdvancedRecord(unittest.TestCase):
+    """A hierarchical export holds one record per tier. For a job still RUNNING at teardown both
+    have completed_at = 0, and sorting on completion alone kept whichever came last in the
+    file — the coordinator's copy, whose `selection_total` covers one tier. 2 s at the
+    coordinator + 1 s at the leaf reported as 2.0."""
+
+    HEADER_WITH_TOTAL = HEADER.rstrip("\n") + ",selection_total\n"
+
+    def _metrics(self, rows):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "hier-30/run01"; run_dir.mkdir(parents=True)
+            (run_dir / "all_jobs.csv").write_text(self.HEADER_WITH_TOTAL + rows)
+            return run_metrics(run_dir, expected_jobs=1)
+
+    def test_a_running_jobs_leaf_record_wins_over_its_coordinator_copy(self):
+        # job_id,submitted,sel_started,assigned,started,completed,exit,leader,reasoning,sched,total
+        leaf = "j1,100,151,152,153,0,0,7,0.1,52,3.0\n"          # started, every tier's stamps
+        coordinator = "j1,100,101,103,0,0,0,7,0.1,3,2.0\n"      # persisted READY at delegation
+        metrics = self._metrics(leaf + coordinator)             # coordinator listed LAST
+        self.assertEqual(metrics["jobs_seen"], 1)
+        self.assertAlmostEqual(metrics["selection_total_mean"], 3.0)
+
+    def test_a_completed_record_still_wins_over_a_running_one(self):
+        running = "j1,100,151,152,153,0,0,7,0.1,52,3.0\n"
+        done = "j1,100,151,152,153,160,0,7,0.1,52,3.0\n"
+        metrics = self._metrics(done + running)
+        self.assertEqual(metrics["jobs_completed"], 1)
