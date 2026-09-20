@@ -134,7 +134,8 @@ def load_jobs_csv(csv_path: str) -> pd.DataFrame:
     """Load an all_jobs.csv file and return a DataFrame with numeric columns."""
     df = pd.read_csv(csv_path)
     for col in ["submitted_at", "selection_started_at", "assigned_at",
-                 "started_at", "completed_at", "scheduling_latency", "reasoning_time"]:
+                 "started_at", "completed_at", "scheduling_latency", "reasoning_time",
+                 "selection_total"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
@@ -263,12 +264,34 @@ def save_jobs(jobs: list[Any], path: str, level: int | None = None):
             started_at = started_at_dict.get(level, started_at_dict.get(0, 0))
             completed_at = completed_at_dict.get(level, completed_at_dict.get(0, 0))
         else:
-            # Backward compatible: use last timestamps (max values)
-            submitted_at = submitted_at_dict.get(0, 0) if submitted_at_dict else 0
+            # The combined export. Timestamps are per LEVEL on a hierarchical job, and which
+            # level each column takes from decides what the derived metrics mean:
+            #
+            # * `submitted_at` is the EARLIEST stamp — the job's arrival at the top tier. It
+            #   used to be the level-0 stamp, which on a hierarchical run is set at DELEGATION
+            #   (`scheduling_main` moves the job to level-1 and calls `mark_submitted`), so
+            #   scheduling latency, job latency, makespan and throughput all silently excluded
+            #   the coordinator tier — the tier where PBFT collapses. On a flat run there is
+            #   only level 0 and nothing changes.
+            # * `selection_started_at`/`assigned_at` stay the LAST stamps: the leaf tier's
+            #   consensus, which is what `selection_*` has always reported (per-tier numbers
+            #   are in level<N>_jobs.csv). `selection_total` below is the sum over tiers.
+            # * `started_at`/`completed_at` are the last stamps: execution happens at a leaf.
+            submitted_at = min(submitted_at_dict.values()) if submitted_at_dict else 0
             selection_started_at = max(selection_started_at_dict.values()) if selection_started_at_dict else 0
             assigned_at = max(assigned_at_dict.values()) if assigned_at_dict else 0
             started_at = max(started_at_dict.values()) if started_at_dict else 0
             completed_at = max(completed_at_dict.values()) if completed_at_dict else 0
+
+        # Consensus time summed over every tier the job passed through: each level's own
+        # (assigned - selection_started), for levels that have both stamps. On a flat run this
+        # equals the leaf-tier selection time; on a hierarchical run it is the end-to-end
+        # consensus cost the leaf-tier `selection_*` column leaves out.
+        selection_total = 0.0
+        for lvl, started in selection_started_at_dict.items():
+            done = assigned_at_dict.get(lvl)
+            if started and done and done >= started:
+                selection_total += done - started
 
         # Calculate scheduling latency for this level
         scheduling_latency = assigned_at - submitted_at if assigned_at and submitted_at else 0
@@ -286,6 +309,7 @@ def save_jobs(jobs: list[Any], path: str, level: int | None = None):
             leader_id,
             reasoning_time,
             scheduling_latency,
+            selection_total,
             ])
         else:
             detailed_latency.append([
@@ -299,6 +323,7 @@ def save_jobs(jobs: list[Any], path: str, level: int | None = None):
                 leader_id,
                 reasoning_time,
                 scheduling_latency,
+                selection_total,
             ])
 
     file_name = f"{path}/all_jobs.csv" if level is None else f"{path}/level{level}_jobs.csv"
@@ -308,6 +333,7 @@ def save_jobs(jobs: list[Any], path: str, level: int | None = None):
         writer.writerow([
             'job_id', 'submitted_at', 'selection_started_at', 'assigned_at',
             'started_at', 'completed_at', 'exit_status', 'leader_id', 'reasoning_time', 'scheduling_latency',
+            'selection_total',
         ])
         writer.writerows(detailed_latency)
 
@@ -316,5 +342,6 @@ def save_jobs(jobs: list[Any], path: str, level: int | None = None):
         writer.writerow([
             'job_id', 'submitted_at', 'selection_started_at', 'assigned_at',
             'started_at', 'completed_at', 'exit_status', 'leader_id', 'reasoning_time', 'scheduling_latency',
+            'selection_total',
         ])
         writer.writerows(pending_jobs)

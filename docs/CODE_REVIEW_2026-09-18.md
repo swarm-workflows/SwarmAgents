@@ -81,7 +81,9 @@ and the analytic half of E1′ now duplicate every job unless they pass `--group
 Recommended: the no-bandit path picks one group at random (`_select_child_groups` already has the
 random pick as the LLM fallback). Decide before E0.
 
-## 3. Hierarchical latency columns exclude the coordinator tier by construction — **HIGH, measurement**
+## 3. Hierarchical latency columns exclude the coordinator tier by construction — **HIGH, measurement — FIXED 2026-09-20**
+
+*Status:* `plotting/data.py save_jobs(level=None)` now takes `submitted_at` as the earliest stamp (arrival at the top tier), so `scheduling_latency`, `job_latency_*`, `makespan_s` and `throughput_jobs_per_s` include the coordinator tier; a new `selection_total` column sums consensus time over every tier, summarised by `collect.py` as `selection_total_*`. `selection_*` stays the leaf tier's, as documented. Flat runs are unchanged. `tests/test_all_jobs_export.py`. Every hierarchical `all_jobs.csv` written before 2026-09-20 carries the delegation-time `submitted_at`; re-export from Redis dumps where they exist, or do not compare its latency columns with new runs.
 
 `plotting/data.py:267-268`, `swarm/models/job.py` (`mark_submitted` stamps `self.level`),
 `swarm/agents/resource_agent.py` `scheduling_main` (sets `job.level = level−1` then
@@ -150,7 +152,9 @@ and `_job_sig` do), so every `--dtn-names local` job scores `local` at 0.0 on ev
 is unaffected; absolute costs, the LLM-vs-analytic 0–100 comparison and the tie-break reference
 (`tie_break_ref_cost: 11.85`) are shifted for exactly the workflow replay/real cells. One-line fix.
 
-## 9. Completion % counts failed jobs — **MEDIUM, definition**
+## 9. Completion % counts failed jobs — **MEDIUM, definition — FIXED 2026-09-20**
+
+*Status:* `collect.py` now reports `jobs_succeeded`, `success_pct` and `success_pct_of_seen` beside the completion columns; `completion_pct` keeps meaning *finished* (the right denominator for latency and makespan). A caption says which.
 
 `evaluation/collect.py:792`: `is_complete = completed_at > 0`, exit status ignored. Injected exit
 failures count as completed; so does a job `_reassign_delegated_job` retires after

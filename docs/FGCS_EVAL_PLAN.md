@@ -956,6 +956,14 @@ Every figure regenerated from `evaluation/collect.py` output — no hand-copied 
 - `sched_latency_*` = the agent-reported `scheduling_latency` column — includes queueing ahead of
   selection. This is what the LLM coordinator table reported.
 
+Three more definitions, fixed 2026-09-20 (`CODE_REVIEW_2026-09-18.md` §3, §9): on a hierarchical run
+`selection_*` is the **leaf tier's** consensus, `l1_selection_*` the coordinator tier's, and
+`selection_total_*` the sum over tiers; `sched_latency`, `job_latency` and `makespan` run from the job's
+arrival at the **top** tier (`submitted_at` was the delegation time before that date, which excluded the
+coordinator tier from all three — do not mix older hierarchical exports into a new table). And
+`completion_pct` means *finished* (a non-zero exit is complete); `success_pct` means exit 0. Every caption
+names which of each pair it plots.
+
 `collect.py` emits both under distinct names. **Pick `selection_*` as the paper's "selection time"**
 (it isolates the coordination cost the paper is about) and report `sched_latency_*` separately as
 end-to-end scheduling latency. State both definitions explicitly in the evaluation setup — a reviewer

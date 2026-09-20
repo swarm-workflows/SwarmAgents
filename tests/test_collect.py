@@ -10,6 +10,7 @@ livelocked run, guessing a completion denominator, and mis-parsing hyphenated fa
 """
 
 import sys
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -947,3 +948,46 @@ class TestAgentsThatNeverRegisteredAreNotCertified(unittest.TestCase):
             metrics = run_metrics(run_dir, expected_jobs=1)
             self.assertAlmostEqual(metrics["llm_failure_agent_coverage"], 1.0)
             self.assertFalse(metrics["llm_plane_unchecked"])
+
+
+class TestSuccessBesideCompletion(unittest.TestCase):
+    """`completion_pct` counts FINISHED jobs — a non-zero exit is complete. Injected failures
+    and jobs retired after exhausting their delegation attempts (persisted COMPLETE with
+    exit_status 1) all count. Right for latency and makespan, wrong for a figure about
+    outcomes, so `success_pct` is reported beside it and a caption has to say which."""
+
+    ROWS = ("j1,1,1,2,2,9,0,1,0.1,0.5\n"      # completed, exit 0
+            "j2,1,1,2,2,9,1,1,0.1,0.5\n"      # completed, exit 1 (injected or retired)
+            "j3,1,1,2,2,0,0,1,0.1,0.5\n")     # never completed
+
+    def test_success_is_a_separate_column(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = write_run(Path(tmp), "mesh-30/run01", self.ROWS)
+            metrics = run_metrics(run_dir, expected_jobs=4)
+            self.assertEqual(metrics["jobs_completed"], 2)
+            self.assertEqual(metrics["jobs_succeeded"], 1)
+            self.assertAlmostEqual(metrics["completion_pct"], 50.0)
+            self.assertAlmostEqual(metrics["success_pct"], 25.0)
+            self.assertAlmostEqual(metrics["success_pct_of_seen"], 100.0 / 3, places=3)
+
+
+class TestSelectionTotalColumn(unittest.TestCase):
+    """The end-to-end consensus time over every tier, when the export carries it; a CSV from
+    before the column existed still collects."""
+
+    HEADER_WITH_TOTAL = HEADER.rstrip("\n") + ",selection_total\n"
+
+    def test_it_is_summarised_when_present(self):
+        rows = "j1,1,1,2,2,9,0,1,0.1,0.5,3.0\nj2,1,1,2,2,9,0,1,0.1,0.5,5.0\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "hier-30/run01"; run_dir.mkdir(parents=True)
+            (run_dir / "all_jobs.csv").write_text(self.HEADER_WITH_TOTAL + rows)
+            metrics = run_metrics(run_dir, expected_jobs=2)
+            self.assertAlmostEqual(metrics["selection_total_mean"], 4.0)
+            self.assertAlmostEqual(metrics["selection_mean"], 1.0, msg="leaf tier, unchanged")
+
+    def test_an_older_export_without_the_column_still_collects(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = write_run(Path(tmp), "hier-30/run01", "j1,1,1,2,2,9,0,1,0.1,0.5\n")
+            metrics = run_metrics(run_dir, expected_jobs=1)
+            self.assertTrue(math.isnan(metrics["selection_total_mean"]))

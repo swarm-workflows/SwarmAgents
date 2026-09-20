@@ -792,6 +792,13 @@ def run_metrics(run_dir: Path, expected_jobs: int | None) -> dict[str, Any]:
     is_complete = completed_at.notna() & (completed_at > 0)
     n_unique = int(len(jobs))
     n_completed = int(is_complete.sum())
+    # "Completed" means FINISHED — a job that ran and exited non-zero is complete. That is the
+    # right denominator for latency and makespan (the work was done) and the wrong one for a
+    # figure about outcomes: injected failures, and jobs retired after exhausting their
+    # delegation attempts (persisted COMPLETE with exit_status 1), all count as completed. So
+    # both are reported, and a caption has to say which it plots.
+    is_success = is_complete & exit_status.notna() & (exit_status == 0)
+    n_succeeded = int(is_success.sum())
 
     # Per-agent metrics (load, utilisation, fairness, MAB and delegation counts) come from
     # metrics.json, which run_test.py only fills once every agent has reported for THIS run.
@@ -815,6 +822,7 @@ def run_metrics(run_dir: Path, expected_jobs: int | None) -> dict[str, Any]:
         "job_records": int(len(raw)),
         "jobs_seen": n_unique,
         "jobs_completed": n_completed,
+        "jobs_succeeded": n_succeeded,
         # Reselection/re-proposal churn: >1.0 means jobs were scheduled more than once.
         "reselection_multiplier": round(len(raw) / n_unique, 4) if n_unique else float("nan"),
         "exit_failures": int((exit_status.notna() & (exit_status != 0) & is_complete).sum()),
@@ -827,13 +835,18 @@ def run_metrics(run_dir: Path, expected_jobs: int | None) -> dict[str, Any]:
         metrics["jobs_expected"] = expected_jobs
         metrics["completion_basis"] = "declared"
         metrics["completion_pct"] = round(100.0 * n_completed / expected_jobs, 4)
+        metrics["success_pct"] = round(100.0 * n_succeeded / expected_jobs, 4)
     else:
         metrics["jobs_expected"] = float("nan")
         metrics["completion_basis"] = "unknown"
         metrics["completion_pct"] = float("nan")
+        metrics["success_pct"] = float("nan")
     # Always available: completion among the jobs this run actually touched.
     metrics["completion_pct_of_seen"] = (
         round(100.0 * n_completed / n_unique, 4) if n_unique else float("nan")
+    )
+    metrics["success_pct_of_seen"] = (
+        round(100.0 * n_succeeded / n_unique, 4) if n_unique else float("nan")
     )
 
     # Latency decomposition. Each stage is only defined for jobs that reached it.
@@ -842,7 +855,14 @@ def run_metrics(run_dir: Path, expected_jobs: int | None) -> dict[str, Any]:
     # selection_started_at (consensus/selection only); sched_latency = the agent-reported
     # scheduling_latency column (includes queueing ahead of selection). Pick one
     # definition per figure and say which.
+    # Level semantics, hierarchical runs: `selection_*` is the LEAF tier's consensus (the last
+    # per-level stamps; per-tier numbers are `l<N>_selection_*` below); `selection_total_*`
+    # is the sum over every tier the job passed through, written by plotting/data.py since
+    # 2026-09-20; `sched_latency`, `job_latency` and `makespan` run from the job's arrival at
+    # the TOP tier (`submitted_at` = earliest stamp — it was the delegation time before
+    # 2026-09-20, which excluded the coordinator tier from all three).
     metrics.update(selection_metrics(jobs, "selection"))
+    metrics.update(_dist("selection_total", _positive(_numeric(jobs, "selection_total"))))
     metrics.update(_dist("sched_latency", _positive(_numeric(jobs, "scheduling_latency"))))
     metrics.update(_dist("reasoning", _positive(_numeric(jobs, "reasoning_time"))))
 
