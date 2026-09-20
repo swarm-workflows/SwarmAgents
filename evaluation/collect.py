@@ -478,6 +478,11 @@ def instrumentation_metrics(agents: dict[str, dict], meta: dict | None = None,
     # ratio. A mixed-revision fleet where a third of the agents carry the new blocks reads as
     # 1.00 call coverage while two thirds of the bidding was never measured.
     levels = levels or {}
+    # Agents that started selection SHORT of their configured group (the bounded startup
+    # barrier timed out). Every consensus number such an agent produced is from a smaller
+    # group than the cell claims, so it is a validity column beside `metrics_complete`.
+    barrier_short_agents = 0
+    barrier_short_max = 0
     agents_with_llm = agents_with_failure_counter = 0
     reported_failure_ids: set[str] = set()
     observed_llm_ids: set[str] = set()
@@ -489,6 +494,14 @@ def instrumentation_metrics(agents: dict[str, dict], meta: dict | None = None,
     # function counts with, and an id field that disagrees with it would silently shrink every
     # coverage intersection.
     for agent_id, payload in agents.items():
+        barrier = payload.get("startup_barrier") or {}
+        try:
+            short = int(barrier.get("short") or 0)
+        except (TypeError, ValueError):
+            short = 0
+        if short > 0:
+            barrier_short_agents += 1
+            barrier_short_max = max(barrier_short_max, short)
         agent_id = str(agent_id)
         instr = payload.get("instrumentation") or {}
         llm_block = instr.get("llm") if isinstance(instr.get("llm"), dict) else {}
@@ -734,6 +747,9 @@ def instrumentation_metrics(agents: dict[str, dict], meta: dict | None = None,
         out["ctx_skew_max_s"] = float(skew_max) if pd.notna(skew_max) else None
         for policy, count in frame["policy"].value_counts().items():
             out[f"delegations_{policy}"] = int(count)
+    if barrier_short_agents:
+        out["barrier_short_agents"] = barrier_short_agents
+        out["barrier_short_max"] = barrier_short_max
     return out
 
 

@@ -1240,10 +1240,9 @@ class LlmAgent(ResourceAgent):
 
     def selection_main(self):
         self.logger.info(f"Starting agent: {self}")
-        while self.live_agent_count != self.configured_agent_count:
-            time.sleep(0.5)
-            self.logger.info(f"[SEL_WAIT] Waiting for Peer map to be populated: "
-                             f"{self.live_agent_count}/{self.configured_agent_count}!")
+        # The bounded barrier is ResourceAgent's; a second copy of the loop here is how the
+        # LLM agent kept the unbounded one after the base class lost it.
+        self.startup_barrier = self._await_peers()
 
         while not self.shutdown:
             try:

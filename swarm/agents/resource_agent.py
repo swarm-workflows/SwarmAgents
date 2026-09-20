@@ -2405,12 +2405,58 @@ class ResourceAgent(Agent):
             if logger is not None:
                 logger.debug(f"proposal counters unavailable: {exc}")
 
+    @property
+    def selection_barrier_s(self) -> float:
+        """How long `selection_main` waits for the whole group to register before starting.
+
+        Defaults to `failure_threshold_seconds`: a peer that has not shown up within the time
+        this run would take to declare a live peer dead is treated the same way. One key
+        governs both judgements.
+        """
+        configured = self.runtime_config.get("selection_barrier_s")
+        return float(configured if configured is not None else self.failure_threshold_seconds)
+
+    def _await_peers(self) -> dict:
+        """Wait for the group to register, then start — with a bound.
+
+        The barrier used to be `while live != configured: sleep`, with no timeout. One agent
+        that never registered — a crash at startup, a coordinator on a host without the LLM
+        API key — left EVERY other agent in its group here for the whole run: no selection
+        ever started, and the run looked busy until the cap expired. It was also an equality
+        test, so a group that came up one agent OVER (a dynamic agent registering early)
+        never released either.
+
+        Now: release as soon as at least `configured_agent_count` agents are live, or once
+        `selection_barrier_s` has elapsed, whichever is first; on timeout say who is missing,
+        at WARNING, and proceed with the peers there are. Quorum is computed from the live
+        set anyway, so starting short is what the protocol already does after a failure.
+        Returns what happened, for the metrics payload.
+        """
+        deadline = time.monotonic() + max(0.0, self.selection_barrier_s)
+        waited_from = time.monotonic()
+        last_log = 0.0
+        while not self.shutdown and self.live_agent_count < self.configured_agent_count:
+            now = time.monotonic()
+            if now >= deadline:
+                missing = self.configured_agent_count - self.live_agent_count
+                self.logger.warning(
+                    f"[SEL_BARRIER] {self.live_agent_count}/{self.configured_agent_count} "
+                    f"agents registered after {self.selection_barrier_s:.0f}s; starting "
+                    f"selection {missing} short. Missing agents never registered in Redis — "
+                    f"check their logs (a crash at startup looks like this).")
+                return {"waited_s": round(now - waited_from, 3), "live": self.live_agent_count,
+                        "configured": self.configured_agent_count, "short": missing}
+            if now - last_log >= 5.0:
+                last_log = now
+                self.logger.info(f"[SEL_WAIT] Waiting for Peer map to be populated: "
+                                 f"{self.live_agent_count}/{self.configured_agent_count}")
+            time.sleep(0.5)
+        return {"waited_s": round(time.monotonic() - waited_from, 3), "live": self.live_agent_count,
+                "configured": self.configured_agent_count, "short": 0}
+
     def selection_main(self):
         self.logger.info(f"Starting agent: {self}")
-        while self.live_agent_count != self.configured_agent_count:
-            time.sleep(0.5)
-            self.logger.info(f"[SEL_WAIT] Waiting for Peer map to be populated: "
-                             f"{self.live_agent_count}/{self.configured_agent_count}!")
+        self.startup_barrier = self._await_peers()
 
         while not self.shutdown:
             try:
@@ -2706,6 +2752,10 @@ class ResourceAgent(Agent):
             # so the oracle (P1-1) cannot resolve which phase a decision fell in from the run
             # start alone -- it would misattribute every decision near a phase boundary.
             "failure_sim_start": getattr(self, "failure_sim_start", None),
+            # How the selection barrier resolved: `short` > 0 means this agent started with
+            # fewer peers than the topology promised, and every consensus number it produced
+            # is from a smaller group than the cell claims.
+            "startup_barrier": getattr(self, "startup_barrier", None),
         }
         if self.mab_enabled and self.mab_manager:
             agent_metrics["mab_stats"] = copy.deepcopy(self.mab_manager.get_stats())

@@ -102,7 +102,9 @@ silent, and E1′'s "selection/decision latency" will read as leaf-tier only.
 `submitted_at_top` column), a `selection_total` = sum over levels, and a sentence per figure
 naming which level's selection it plots.
 
-## 4. The selection barrier has no timeout — **HIGH, robustness**
+## 4. The selection barrier has no timeout — **HIGH, robustness — FIXED 2026-09-20**
+
+*Status:* `_await_peers()` (one implementation, both agents) releases at `live >= configured` or after `runtime.selection_barrier_s` (default `failure_threshold_seconds`), logs `[SEL_BARRIER]` with who is missing, records `startup_barrier` in the metrics payload, and `collect.py` surfaces `barrier_short_agents`/`barrier_short_max`. `tests/test_selection_barrier.py` (6 tests).
 
 `swarm/agents/resource_agent.py:2384`, `swarm/agents/llm/llm_agent.py:1243`:
 `while live_agent_count != configured_agent_count: sleep(0.5)`. One agent in a group that never

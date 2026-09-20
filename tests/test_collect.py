@@ -1020,3 +1020,32 @@ class TestDedupKeepsTheMostAdvancedRecord(unittest.TestCase):
         done = "j1,100,151,152,153,160,0,7,0.1,52,3.0\n"
         metrics = self._metrics(done + running)
         self.assertEqual(metrics["jobs_completed"], 1)
+
+
+class TestStartupBarrierIsAValidityColumn(unittest.TestCase):
+    """An agent whose selection barrier timed out started with fewer peers than the topology
+    promised; every consensus number it produced is from a smaller group than the cell claims."""
+
+    ROWS = "j1,1,1,2,2,9,0,1,0.1,0.5\n"
+
+    def _run(self, root, payloads):
+        import json
+        run_dir = write_run(root, "hier-30/run01", self.ROWS)
+        (run_dir / "metrics.json").write_text(json.dumps(payloads))
+        return run_dir
+
+    def test_short_starts_are_counted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._run(Path(tmp), {
+                "1": {"instrumentation": {}, "startup_barrier": {"short": 2, "live": 28, "configured": 30}},
+                "2": {"instrumentation": {}, "startup_barrier": {"short": 0, "live": 30, "configured": 30}},
+                "3": {"instrumentation": {}, "startup_barrier": {"short": 1}},
+            })
+            metrics = run_metrics(run_dir, expected_jobs=1)
+            self.assertEqual(metrics["barrier_short_agents"], 2)
+            self.assertEqual(metrics["barrier_short_max"], 2)
+
+    def test_a_complete_start_adds_no_column(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._run(Path(tmp), {"1": {"instrumentation": {}, "startup_barrier": {"short": 0}}})
+            self.assertNotIn("barrier_short_agents", run_metrics(run_dir, expected_jobs=1))
