@@ -364,12 +364,14 @@ The consensus engine is selected via `config_swarm_multi.yml`:
 
 ```yaml
 consensus:
-  protocol: "pbft"         # "pbft" (default) or "snow"
+  protocol: "snow"         # "pbft" | "snow" | "hybrid". Shipped default is "snow";
+                           # the code fallback when the key is absent is "pbft".
   snow:
-    k: 20                  # Sample size per Snow query round
+    k: 10                  # Sample size per Snow query round
     alpha: 0.7             # Supermajority threshold (fraction of k)
-    beta: 20               # Consecutive rounds for commitment
-    max_rounds: 100        # Max rounds before fallback to PBFT
+    beta: 6                # Consecutive rounds for commitment
+    max_rounds: 100        # Max rounds before abandoning the attempt
+    round_timeout_ms: 300  # Per-round upper bound (rounds end early once all k reply)
   gossip:
     fanout: 3              # Peers per gossip round
     period_ms: 1000        # Gossip interval in milliseconds
@@ -379,6 +381,11 @@ consensus:
     k_req: 3               # Indirect probe fanout
     suspect_timeout_s: 8   # Suspect → failed timeout
 ```
+
+The values above mirror what `config_swarm_multi.yml` actually ships, which is
+tuned for a **20-agent flat mesh** (see §7.4). `failure_detection.protocol: swim`
+and `gossip.enabled: true` ship alongside it, since Snow's cost estimates and
+live-peer sample both depend on fresh peer state.
 
 Engine instantiation in `ResourceAgent.__init__`:
 
@@ -584,10 +591,26 @@ Snow achieves roughly constant per-job message cost regardless of total agent co
 
 | Deployment Size | Protocol | k | α | β | Gossip Fanout | Notes |
 |----------------|----------|---|---|---|---------------|-------|
-| < 50 agents | PBFT | — | — | — | — | PBFT is optimal for small clusters |
+| < 50 agents | PBFT, or Snow with small k/β | 8-10 | 0.7 | 4-8 | 3 | PBFT has lower latency here; Snow is viable and is what `config_swarm_multi.yml` ships (see below) |
 | 50-200 agents | Snow or Hybrid | 10-15 | 0.6-0.7 | 10-15 | 3 | Snow provides modest improvement |
 | 200-1000 agents | Snow | 15-20 | 0.7 | 15-20 | 3-5 | Significant reduction in messages |
 | 1000+ agents | Hybrid (PBFT intra + Snow inter) | 20-30 | 0.7-0.8 | 20-30 | 5 | Best of both: strong intra-group, scalable inter-group |
+
+**Shipped default (`config_swarm_multi.yml`): Snow tuned for a 20-agent flat mesh** —
+`k: 10`, `alpha: 0.7`, `beta: 6`, `round_timeout_ms: 300`, `send_workers`/`max_inflight: 16`,
+with `failure_detection.protocol: swim` and `gossip.enabled: true`. Rationale:
+
+- `k = 10` is half the pool. `k = 20` would query every peer every round, degenerating
+  Snow into a broadcast and forfeiting its message-complexity advantage. The engine caps
+  `k` to the live peer count, so this stays correct as agents fail or join.
+- `beta = 6` rather than 20: at n=20 the candidate set is tiny and converges within a few
+  rounds, so the extra rounds only add latency (validated at Hier-60 level-1: β=6 → 0.96s
+  selection, ~3x faster). The trade is a per-decision disagreement probability of
+  ≈ (1-α)^β ≈ 7e-4 instead of ≈ 1e-30 — acceptable **only** because the Redis `SET NX`
+  claim in `repository.try_claim_assignment` is the hard exactly-once backstop, so a
+  disagreement costs a wasted round rather than a double assignment. Raise β to 10-12 for
+  more headroom ahead of the CAS.
+- Above ~100 agents, move `k` and `beta` back toward the 15-20 rows above.
 
 **Parameter tuning guidance:**
 - **Increasing k** improves confidence per round but increases per-round message cost.
@@ -693,7 +716,9 @@ The migration is designed as four incremental phases, each independently useful 
 **Risk:** Snow requires β rounds to commit, which may be slower than PBFT's 3-round protocol for small clusters.
 
 **Mitigation:**
-- Configuration guidance: recommend PBFT for deployments < 50 agents.
+- Configuration guidance: PBFT is the lower-latency choice for deployments < 50 agents. Where
+  Snow is wanted at that scale anyway — as in the shipped 20-agent mesh config — shrink `k` and
+  `beta` (see §7.4) so convergence costs a few rounds rather than 20.
 - The `consensus.protocol` config toggle makes this a deployment-time decision, not a code change.
 - Hybrid mode allows PBFT within small groups while using Snow only at scale.
 
