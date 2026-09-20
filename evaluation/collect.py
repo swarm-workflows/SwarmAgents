@@ -483,6 +483,7 @@ def instrumentation_metrics(agents: dict[str, dict], meta: dict | None = None,
     # group than the cell claims, so it is a validity column beside `metrics_complete`.
     barrier_short_agents = 0
     barrier_short_max = 0
+    barrier_reported = 0          # agents whose payload carries the field at all
     agents_with_llm = agents_with_failure_counter = 0
     reported_failure_ids: set[str] = set()
     observed_llm_ids: set[str] = set()
@@ -495,6 +496,8 @@ def instrumentation_metrics(agents: dict[str, dict], meta: dict | None = None,
     # coverage intersection.
     for agent_id, payload in agents.items():
         barrier = payload.get("startup_barrier") or {}
+        if barrier:
+            barrier_reported += 1
         try:
             short = int(barrier.get("short") or 0)
         except (TypeError, ValueError):
@@ -747,7 +750,11 @@ def instrumentation_metrics(agents: dict[str, dict], meta: dict | None = None,
         out["ctx_skew_max_s"] = float(skew_max) if pd.notna(skew_max) else None
         for policy, count in frame["policy"].value_counts().items():
             out[f"delegations_{policy}"] = int(count)
-    if barrier_short_agents:
+    # Emitted as 0 for every run whose agents REPORT the barrier, not only when it fired:
+    # `aggregate()` drops NaN, so a column present only on the short runs would average a
+    # cell over its failures alone and read as if every run started short. Absent only when
+    # no payload carries the field (a run from before it existed), which is "unknown", not 0.
+    if barrier_reported:
         out["barrier_short_agents"] = barrier_short_agents
         out["barrier_short_max"] = barrier_short_max
     return out

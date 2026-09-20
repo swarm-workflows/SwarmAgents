@@ -1045,7 +1045,17 @@ class TestStartupBarrierIsAValidityColumn(unittest.TestCase):
             self.assertEqual(metrics["barrier_short_agents"], 2)
             self.assertEqual(metrics["barrier_short_max"], 2)
 
-    def test_a_complete_start_adds_no_column(self):
+    def test_a_complete_start_reports_zero_so_aggregates_include_it(self):
+        """`aggregate()` drops NaN: a column present only on the runs that started short would
+        average a cell over its failures alone. A run whose agents report the barrier and all
+        started complete must say 0, not nothing."""
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = self._run(Path(tmp), {"1": {"instrumentation": {}, "startup_barrier": {"short": 0}}})
+            metrics = run_metrics(run_dir, expected_jobs=1)
+            self.assertEqual(metrics["barrier_short_agents"], 0)
+            self.assertEqual(metrics["barrier_short_max"], 0)
+
+    def test_a_run_from_before_the_field_existed_is_unknown_not_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._run(Path(tmp), {"1": {"instrumentation": {}}})
             self.assertNotIn("barrier_short_agents", run_metrics(run_dir, expected_jobs=1))
