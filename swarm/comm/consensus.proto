@@ -18,3 +18,31 @@ message Ack {
   bool success = 1;
   string info = 2;
 }
+
+// ---------------------------------------------------------------------------
+// Data staging. A SEPARATE service, served on a SEPARATE port from
+// ConsensusService, so a multi-megabyte transfer never queues behind — or ahead
+// of — the consensus messages whose latency the evaluation measures, and so the
+// transport's message counters keep counting consensus alone. Same host as
+// consensus, so transfers traverse the same measured data-plane paths.
+// ---------------------------------------------------------------------------
+service DataTransferService {
+  // Stream one produced file. The server answers only for names it has itself
+  // published in `run_id`; an unknown name is refused by name, never joined onto
+  // a directory, so there is no path-traversal surface.
+  rpc Fetch(FetchRequest) returns (stream DataChunk);
+}
+
+message FetchRequest {
+  string name = 1;       // logical file name, as declared in Job.data_out
+  string run_id = 2;     // refused unless it matches the server's run
+  string requester = 3;  // agent id, for logging only
+}
+
+message DataChunk {
+  bytes content = 1;
+  uint64 size = 2;       // total file size; set on the first chunk
+  bool last = 3;
+  string sha256 = 4;     // digest of the whole stream; set on the last chunk
+  string error = 5;      // set INSTEAD of content when the file cannot be served
+}

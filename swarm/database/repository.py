@@ -74,7 +74,8 @@ class Repository:
 
     def save(self, obj: dict, key_prefix: str = KEY_JOB, key: Optional[str] = None,
              level: int = 0, group: int = 0, max_retries: int = 10,
-             produced_data: Optional[List[str]] = None):
+             produced_data: Optional[List[str]] = None,
+             produced_locations: Optional[Dict[str, dict]] = None):
         """
         Save a generic object into Redis under the given key.
 
@@ -97,6 +98,14 @@ class Repository:
                 or neither, and a job that is not COMPLETE is reselected by the existing
                 machinery. Pass it only on a *successful* terminal write; a failed job's
                 outputs do not exist.
+            produced_locations (Optional[Dict[str, dict]]): Where each of those names can be
+                fetched from — `{name: {agent_id, host, port, produced_at}}` — written into the
+                location registry **inside the same MULTI** as the names themselves. It rides
+                the same transaction for the same reason `produced_data` does, one step further
+                on: a descendant that can see a name as ready but cannot find out where it is
+                would be released and then refuse to stage, which looks like a staging bug and
+                is really a torn write. Either both landed or neither. Ignored when staging is
+                off, where the shared mount is the location.
         """
         if not key:
             obj_id = obj.get("id") or obj.get(f"{key_prefix}_id")
@@ -116,6 +125,11 @@ class Repository:
                 if produced_data:
                     pipeline.sadd(self._data_ready_key(),
                                   *[str(n) for n in produced_data if n])
+                if produced_locations:
+                    pipeline.hset(
+                        self._data_loc_key(),
+                        mapping={str(n): json.dumps(loc)
+                                 for n, loc in produced_locations.items() if n})
 
                 # Maintain secondary index by state
                 new_state = obj.get(self.KEY_STATE)
@@ -368,6 +382,40 @@ class Repository:
         not inherit readiness. It is the same reason metrics payloads are run-stamped.
         """
         return f"{self.KEY_DATA_READY}:{self.run_id}:0:names"
+
+    #: Where each produced name can be fetched from. A HASH beside the readiness SET rather
+    #: than fields inside it, because the two are read on completely different paths: readiness
+    #: is `smismember` for every gated job on every scheduling pass and must stay one round
+    #: trip, while a location is read only when a file is actually about to be staged.
+    KEY_DATA_LOC = "data_loc"
+
+    def _data_loc_key(self) -> str:
+        """Run-scoped and `prefix:a:b:c`-shaped for the same two reasons as the readiness key:
+        `delete_all("*")` must reach it between runs, and a cell that skipped cleanup must not
+        inherit a previous run's locations — which would point a fetch at an agent that is not
+        serving that file any more, or worse, at one that is serving a stale copy."""
+        return f"{self.KEY_DATA_LOC}:{self.run_id}:0:names"
+
+    def data_locations(self, names: List[str]) -> Dict[str, dict]:
+        """`{name: location}` for the names that have one. One round trip, like readiness.
+
+        A name present in the readiness registry but absent here means the run is staging-less
+        (the shared mount is the location) — the caller distinguishes those two cases, because
+        "nowhere to fetch from" and "no fetching needed" call for opposite responses.
+        """
+        names = [str(n) for n in names if n]
+        if not names:
+            return {}
+        raw = self.redis.hmget(self._data_loc_key(), names)
+        out: Dict[str, dict] = {}
+        for name, value in zip(names, raw):
+            if not value:
+                continue
+            try:
+                out[name] = json.loads(value)
+            except (ValueError, TypeError):
+                continue                    # a corrupt entry is treated as absent, never guessed
+        return out
 
     def mark_data_available(self, names: List[str]) -> None:
         """Record that *names* now exist. Called once a job has actually completed."""

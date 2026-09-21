@@ -265,10 +265,15 @@ def test_a_persistence_failure_does_not_become_an_execution_failure():
 
     assert job.exit_status == 0, "a failure to persist is not a failure to execute"
     assert a._unpersisted_completions, "the completion must be kept for retry"
-    payload, produced = a._unpersisted_completions["producer"]
+    # A 3-tuple since staging landed: the queued record carries where each output can be
+    # fetched from as well as its name. Both ride the completion for the same reason — a
+    # descendant released by a name it cannot locate refuses to stage, which looks like a
+    # staging bug and is really a torn write.
+    payload, produced, locations = a._unpersisted_completions["producer"]
     assert payload["exit_status"] == 0
     assert sorted(produced) == ["catalog.csv", "index.json"], \
         "the outputs are retried WITH the completion, not separately"
+    assert locations == {}, "staging is off here, so the shared mount is the location"
 
 
 def test_the_queued_completion_is_re_persisted_with_its_outputs():

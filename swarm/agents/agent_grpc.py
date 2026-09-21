@@ -178,6 +178,68 @@ class Agent(Observer):
                 "work_dir=%s timeout=%ss runtime=%s", work_dir,
                 cfg.get("timeout_s", 3600.0), cfg.get("container_runtime", "auto"))
 
+        self._configure_staging(cfg, work_dir, mode)
+
+    def _configure_staging(self, execution_cfg: dict, work_dir: str, mode: str) -> None:
+        """Install the staging policy and, when it is on, start this agent's data endpoint.
+
+        Off by default, so an existing run is untouched: `stage_inputs` then resolves an input
+        in the working directory or under `roots.inputs` exactly as before, and nothing here
+        listens. See `docs/STAGING_DESIGN.md`.
+        """
+        from swarm.execution import staging
+
+        cfg = dict((execution_cfg or {}).get("staging", {}) or {})
+        try:
+            pol = staging.configure(**cfg)
+        except ValueError as exc:
+            # A misspelled staging key is refused rather than ignored, for the same reason an
+            # unknown `mode` is: a run that looks staged and is not cannot be told apart
+            # afterwards from one that never asked.
+            self.logger.error("[STAGE] %s", exc)
+            raise
+
+        if not pol.enabled:
+            return
+        if mode != "real":
+            self.logger.warning(
+                "[STAGE] staging is enabled but runtime.execution.mode=%s, so no job produces "
+                "a file to stage; nothing will be served.", mode)
+
+        if str(self.grpc_host) in ("0.0.0.0", "::", ""):
+            # The location record advertises this address to peers, and it is the same field
+            # consensus already dials, so a wildcard here is broken for both. Worth saying out
+            # loud at startup: as a location it fails at the far end, one fetch at a time.
+            self.logger.error(
+                "[STAGE] grpc.host is %r — a wildcard cannot be dialled by a peer, so every "
+                "location this agent publishes will be unusable. Set it to the address peers "
+                "reach this agent on.", self.grpc_host)
+
+        self.staged_files = staging.PublishedFiles()
+        staging.set_context(locator=self.repository.data_locations,
+                            run_id=os.environ.get("SWARM_RUN_ID", ""),
+                            agent_id=str(self.agent_id),
+                            published=self.staged_files)
+        port = staging.data_port(self.grpc_port, pol)
+        self.transfer_server = staging.TransferServer(
+            self.staged_files, self.grpc_host, port,
+            run_id=os.environ.get("SWARM_RUN_ID", ""), pol=pol)
+        try:
+            self.transfer_server.start()
+        except Exception as exc:                # noqa: BLE001
+            # Refuse loudly: with staging on and no endpoint, this agent's outputs are
+            # unreachable and every descendant of every job it runs would refuse to stage —
+            # which reads as a workflow fault a long way from its cause.
+            self.logger.error(
+                "[STAGE] could not start the data endpoint on %s:%d (%s). With staging on, "
+                "this agent's outputs would be unreachable to every peer.",
+                self.grpc_host, port, exc)
+            raise
+        self.logger.warning(
+            "[STAGE] staging ON — outputs are served from this agent on %s:%d and fetched from "
+            "peers on demand. The work dir must be LOCAL (%s); a shared one makes every fetch a "
+            "no-op and measures nothing.", self.grpc_host, port, work_dir)
+
     @property
     def live_agent_count(self) -> int:
         """Returns the count of all known agents including self."""

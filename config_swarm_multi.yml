@@ -129,6 +129,33 @@ runtime:
     # decision with real consequences for what is measured, so it is stated here and never
     # inferred from whatever the host happens to have installed.
     image_overrides: {}
+    # ---- Data staging: move a workflow's files between agents -------------------------
+    # OFF by default, and off is the behaviour every measurement so far used: an input is
+    # resolved in the working directory or under `roots.inputs`, which on the slice is one
+    # NFS export mounted at the same path everywhere. That works, but it makes every agent
+    # equidistant from every file — exactly the variable the DTN penalties price — so no
+    # data-movement number can come from it.
+    #
+    # ON: a job's outputs stay on the agent that produced them, the location registry says
+    # which agent that is, and a consumer elsewhere fetches them over a SECOND gRPC port on
+    # the same host consensus uses (`grpc.port + port_offset`). Same host, so transfers
+    # traverse the same measured data-plane paths; separate port, so a multi-megabyte
+    # transfer never queues behind — or ahead of — the consensus messages whose latency the
+    # evaluation measures.
+    #
+    # With staging on the work_dir above must be LOCAL to each agent. A shared one makes
+    # every fetch a no-op and measures nothing.
+    #
+    # NOT YET BUILT, and it decides whether a cell is valid (docs/STAGING_DESIGN.md §6):
+    # a dead producer's outputs are gone, its job is COMPLETE so nothing re-runs it, and
+    # every descendant is released and then refuses to stage. **Do not enable this on a
+    # failure-injection cell** until that is resolved.
+    staging:
+      enabled: false
+      port_offset: 1000         # data port = grpc.port + this
+      chunk_bytes: 1048576      # 1 MiB
+      timeout_s: 300.0          # per fetch
+      verify: true              # digest the stream, check it at the receiver
     #   soilmoisture_container: swarm/soilmoisture:1.0
   # How long past delegation_timeout_s a coordinator keeps waiting for a job its children have
   # already scheduled (persisted RUNNING) to finish before dropping it from delegation tracking

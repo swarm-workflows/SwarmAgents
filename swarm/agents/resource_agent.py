@@ -3457,7 +3457,7 @@ class ResourceAgent(Agent):
         # child on its parent's failure would run it against inputs never written.
         produced = ([d.file for d in (job.data_out or []) if getattr(d, "file", None)]
                     if job.exit_status == 0 else None)
-        self._persist_completion(job, produced)
+        self._persist_completion(job, produced, self._publish_locations(job, produced))
 
         try:
             self.queues.ready_queue.remove(job_id)
@@ -3468,7 +3468,52 @@ class ResourceAgent(Agent):
         except Exception as e:
             self.logger.error(f"Post-completion bookkeeping failed for {job_id}: {e}")
 
-    def _persist_completion(self, job: Job, produced: Optional[list]) -> bool:
+    def _publish_locations(self, job: Job, produced: Optional[list]) -> dict:
+        """Make this job's outputs fetchable, and say where they are.
+
+        Returns `{name: location}` for `_persist_completion` to write in the same transaction
+        as the completion — the same one-write rule the names themselves follow, one step
+        further on. A descendant that could see a name as ready but not find out where it is
+        would be released and then refuse to stage, which reads as a staging bug and is really
+        a torn write.
+
+        Empty when staging is off, which is the shipped default: the shared mount is then the
+        location and there is nothing to serve.
+        """
+        if not produced:
+            return {}
+        from swarm.execution import runner as _runner
+        from swarm.execution import staging as _staging
+
+        if not _staging.policy().enabled:
+            return {}
+        published = getattr(self, "staged_files", None)
+        if published is None:
+            return {}
+
+        work_dir = _runner.policy().work_dir
+        locations: dict = {}
+        for name in produced:
+            path = os.path.join(work_dir, os.path.basename(str(name)))
+            if not os.path.isfile(path):
+                # The job exited 0 and declared this output but did not write it. That is a
+                # workflow (or converter) fault, and here is where it is visible; the location
+                # is still recorded so a consumer's refusal names this agent and this path
+                # rather than trailing off into "not found anywhere".
+                self.logger.error(
+                    "[STAGE] job %s exited 0 and declared output %r, but %s does not exist. "
+                    "Descendants will refuse to stage it.", job.job_id, name, path)
+            published.publish(str(name), path)
+            locations[str(name)] = {
+                "agent_id": str(self.agent_id),
+                "host": self.grpc_host,
+                "port": _staging.data_port(self.grpc_port),
+                "produced_at": time.time(),
+            }
+        return locations
+
+    def _persist_completion(self, job: Job, produced: Optional[list],
+                            locations: Optional[dict] = None) -> bool:
         """Write a finished job's outcome, with its outputs, in one transaction.
 
         On failure the *whole* record is queued and retried on the periodic tick — the
@@ -3484,6 +3529,7 @@ class ResourceAgent(Agent):
                 level=self.topology.level,
                 group=self.topology.group,
                 produced_data=produced,
+                produced_locations=locations or None,
             )
             if produced:
                 self.logger.debug(f"[DATA_READY] {job.job_id} produced {produced}")
@@ -3492,7 +3538,8 @@ class ResourceAgent(Agent):
             try:
                 with self._unpublished_lock:
                     self._unpersisted_completions[job.job_id] = (job.to_dict(),
-                                                                 list(produced or []))
+                                                                 list(produced or []),
+                                                                 dict(locations or {}))
                     pending = len(self._unpersisted_completions)
                 self.logger.warning(
                     f"Failed to persist completion of {job.job_id}: {e} — queued for retry "
@@ -3507,7 +3554,7 @@ class ResourceAgent(Agent):
             if not self._unpersisted_completions:
                 return
             pending = list(self._unpersisted_completions.items())
-        for job_id, (payload, produced) in pending:
+        for job_id, (payload, produced, locations) in pending:
             try:
                 self.repository.save(
                     obj=payload,
@@ -3515,6 +3562,7 @@ class ResourceAgent(Agent):
                     level=self.topology.level,
                     group=self.topology.group,
                     produced_data=produced or None,
+                    produced_locations=locations or None,
                 )
             except Exception as e:
                 self.logger.debug(f"[DATA_READY] completion retry for {job_id} failed: {e}")

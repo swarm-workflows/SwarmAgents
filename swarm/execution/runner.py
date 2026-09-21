@@ -460,11 +460,31 @@ def build_command(spec: ExecutionSpec, work_dir: str,
 
 
 def stage_inputs(data_in, work_dir: str,
-                 pol: Optional[ExecutionPolicy] = None) -> Tuple[List[str], str]:
+                 pol: Optional[ExecutionPolicy] = None,
+                 locator=None, run_id: str = "", requester: str = "") -> Tuple[List[str], str]:
     """Put the job's declared inputs in the working directory. Returns (staged, refusal).
 
     Driven by `Job.data_in`, which already records what a job reads — there is no second list
     to keep in step with it.
+
+    Four sources are tried per input, **in this order**, and the order is load-bearing:
+
+    1. **Already in the working directory** — a parent job that ran on this agent, or another
+       agent's copy under a shared mount.
+    2. **Produced by this run, on another agent** — resolved through *locator* and fetched
+       (`swarm/execution/staging.py`). This is deliberately ahead of the inputs root: a name in
+       the location registry was produced *by this run*, and a file of the same name sitting in
+       the inputs root is a collision, not a copy. Workflow file names are a flat namespace —
+       62 colliding names were measured in the shipped profile — so preferring the run's own
+       output is the difference between a child reading its parent's result and reading last
+       week's file of the same name.
+    3. **The inputs root** — the run's curated root inputs, which by definition no job produces.
+       This is the shared-mount path and is unchanged.
+    4. Otherwise refuse, naming which of the three it was.
+
+    *locator* is `repository.data_locations`, injected rather than imported so this module keeps
+    no dependency on the data layer; passing None (the default, and what every simulated run
+    does) collapses this back to exactly the previous behaviour.
 
     Three rules, and each is a way this would otherwise go quietly wrong:
 
@@ -481,6 +501,34 @@ def stage_inputs(data_in, work_dir: str,
     """
     pol = pol or _POLICY
     staged: List[str] = []
+
+    # One lookup for the whole job's inputs rather than one per name: staging runs on the
+    # execution path of every job in a workflow, and a round trip per DAG edge would put the
+    # WAN into it. Absent locator (simulated runs, staging off) costs nothing at all.
+    locations: dict = {}
+    if locator is None or not run_id:
+        # Fall back to the process-wide staging context, which is how a `Job` — rebuilt from
+        # Redis with no route back to the agent — reaches the lookup at all.
+        try:
+            from swarm.execution import staging
+            ctx = staging.context()
+            if staging.policy().enabled:
+                locator = locator or ctx.locator
+                run_id = run_id or ctx.run_id
+                requester = requester or ctx.agent_id
+        except Exception:                   # noqa: BLE001 - staging is optional
+            pass
+    if locator is not None:
+        wanted = [os.path.basename(str(getattr(n, "file", "") or ""))
+                  for n in (data_in or []) if getattr(n, "file", None)]
+        wanted = [w for w in wanted if w and w not in (".", "..")]
+        if wanted:
+            try:
+                locations = locator(wanted) or {}
+            except Exception as exc:       # noqa: BLE001 - a lookup failure must not crash a job
+                logger.warning("[STAGE] location lookup failed (%s); "
+                               "falling back to local sources", exc)
+
     for node in data_in or []:
         # `DataNode.name` is the SITE (`local`, `dtn3`); `file` is the logical file name.
         # Only `file` may be used here — falling back to `name` would try to stage a file
@@ -499,6 +547,21 @@ def stage_inputs(data_in, work_dir: str,
         dest = os.path.join(work_dir, name)
         if os.path.exists(dest):
             continue                        # parent output, or already staged
+
+        # Produced by this run on another agent: fetch it before considering the inputs root.
+        loc = locations.get(name)
+        if loc:
+            from swarm.execution import staging          # local import: keeps the data path optional
+            result = staging.fetch(name, loc, work_dir, run_id=run_id, requester=requester)
+            if result.ok:
+                staged.append(name)
+                continue
+            # A produced file we cannot fetch is a refusal, not a reason to fall back to a
+            # same-named file elsewhere: that is precisely how a child would silently read the
+            # wrong input. The reason names the producer, because the usual cause is that it died.
+            return staged, (f"input {name!r} was produced by agent "
+                            f"{loc.get('agent_id', '?')} but could not be staged: {result.reason}")
+
         src = resolve_under_root(name, "inputs", pol)
         if not src:
             return staged, (f"input {name!r} is not in the working directory and "
@@ -538,7 +601,8 @@ def run(spec: ExecutionSpec, job_id: str,
         work_dir: Optional[str] = None,
         timeout_s: Optional[float] = None,
         pol: Optional[ExecutionPolicy] = None,
-        data_in=None) -> ExecutionResult:
+        data_in=None,
+        locator=None, run_id: str = "", requester: str = "") -> ExecutionResult:
     """Execute one job and return its real outcome.
 
     Never raises: a refusal and a crash are both reported as an `ExecutionResult`, because
@@ -563,7 +627,9 @@ def run(spec: ExecutionSpec, job_id: str,
 
     # Inputs first: a missing one is a configuration problem, and finding that out before
     # starting a container is both faster and a clearer error than after.
-    _staged, staging_refusal = stage_inputs(data_in, work_dir, pol)
+    _staged, staging_refusal = stage_inputs(data_in, work_dir, pol,
+                                            locator=locator, run_id=run_id,
+                                            requester=requester)
     if staging_refusal:
         return ExecutionResult(exit_status=1, refused=True, reason=staging_refusal)
 
