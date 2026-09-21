@@ -324,6 +324,62 @@ def test_staging_on_with_no_lookup_configured_refuses(tmp_path):
     assert "no location lookup is configured" in refusal
 
 
+# The first version of that refusal returned before any name was examined, which rejected jobs
+# that could not possibly read a stale file. The ambiguity is per name, so the guard is too.
+
+def test_a_job_with_no_inputs_is_not_refused_when_the_lookup_is_unavailable(tmp_path):
+    """Nothing to resolve, so nothing to get wrong. This was refused outright."""
+    work = str(tmp_path / "work")
+    os.makedirs(work)
+    staging.configure(enabled=True)
+    staging.set_context()                    # no locator
+    runner.configure(mode="real")
+
+    for empty in ([], None):
+        staged, refusal = runner.stage_inputs(empty, work)
+        assert refusal == "", refusal
+        assert staged == []
+
+
+def test_inputs_already_in_the_work_dir_are_not_refused_when_the_lookup_is_unavailable(tmp_path):
+    """A parent that ran on this very agent already wrote them. The inputs root is never
+    consulted, so there is no stale file to read — and this was refused outright."""
+    work = str(tmp_path / "work")
+    _write(os.path.join(work, "parent.out"), b"written by the parent here")
+    inputs_root = str(tmp_path / "inputs")
+    _write(os.path.join(inputs_root, "parent.out"), b"stale collision")
+    staging.configure(enabled=True)
+    staging.set_context()                    # no locator
+    runner.configure(mode="real", roots={"inputs": inputs_root})
+
+    staged, refusal = runner.stage_inputs([_Node("parent.out")], work)
+
+    assert refusal == "", refusal
+    assert open(os.path.join(work, "parent.out"), "rb").read() == b"written by the parent here"
+
+
+def test_only_the_name_that_would_read_the_root_is_refused(tmp_path):
+    """The mixed case, which is the point of moving the guard into the loop: one input is
+    already local and fine, the other would fall through to the root and is the ambiguous one."""
+    work = str(tmp_path / "work")
+    _write(os.path.join(work, "here.txt"), b"local")
+    inputs_root = str(tmp_path / "inputs")
+    _write(os.path.join(inputs_root, "elsewhere.txt"), b"possibly stale")
+    staging.configure(enabled=True)
+    staging.set_context()
+    runner.configure(mode="real", roots={"inputs": inputs_root})
+
+    staged, refusal = runner.stage_inputs(
+        [_Node("here.txt"), _Node("elsewhere.txt")], work)
+
+    # Quote the name so the check is exact: "elsewhere.txt" contains "here.txt" as a substring,
+    # which is how the first version of this assertion fooled itself.
+    assert "'elsewhere.txt'" in refusal
+    assert "'here.txt'" not in refusal, "the already-local input is not what was refused"
+    assert not os.path.exists(os.path.join(work, "elsewhere.txt"))
+    assert open(os.path.join(work, "here.txt"), "rb").read() == b"local"
+
+
 def test_with_staging_off_a_lookup_failure_is_still_harmless(tmp_path):
     """Off, there are no produced-elsewhere names to confuse it with, so the local resolve is
     the right answer and a failed lookup is genuinely nothing to fail a job over."""

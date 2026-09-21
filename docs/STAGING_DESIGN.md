@@ -107,6 +107,15 @@ permissive than the path it stood in for, which is the shape of at least four de
 plausible numbers. Staging *off* keeps the old, harmless behaviour, because with no
 produced-elsewhere names there is nothing to confuse a local resolve with.
 
+**The refusal is per name, not per job.** Its first version returned before any input was
+examined, which rejected jobs that could not possibly read a stale file: one with no declared
+inputs at all, and one whose inputs a parent on this very agent had already written into the
+working directory. Neither consults the inputs root, so neither is ambiguous. The guard now sits
+exactly where a name has fallen past the working directory and is about to be resolved from the
+root — the one place the ambiguity is real. The residual conservatism is narrow and deliberate: a
+genuine DAG-root input, present only in `roots.inputs`, is refused while the registry is
+unreachable, because nothing available at that moment distinguishes it from a produced name.
+
 A fetch failure is a refusal, not a job failure: it is a configuration or fleet problem that will
 repeat, and the existing refusal path already reports it that way.
 

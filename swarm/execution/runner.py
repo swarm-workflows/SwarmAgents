@@ -520,16 +520,15 @@ def stage_inputs(data_in, work_dir: str,
     except Exception:                       # noqa: BLE001 - staging is optional
         staging_on = False
 
+    # Why the registry could not be consulted, or "" when it could. **Recorded here and acted on
+    # per name, inside the loop** — not returned from here. Refusing up front rejected jobs that
+    # never needed the registry at all: one with no declared inputs, and one whose inputs a
+    # parent on this very agent had already written into the working directory. Neither can read
+    # a stale file, because neither reads the inputs root. The ambiguity this guards against is
+    # narrower than the whole function, so the guard has to be too.
+    lookup_unavailable = ""
     if staging_on and locator is None:
-        # **Refuse rather than fall back.** With staging on, a name a parent produced lives on
-        # another agent, and the only thing that knows which is the lookup. Falling through to
-        # `roots.inputs` would resolve it from a same-named file there — which is exactly the
-        # stale-collision read the source order below exists to prevent, arrived at through the
-        # error path instead of the happy one. A refusal is loud and retryable; a stale input is
-        # silent and produces plausible numbers.
-        return staged, ("staging is enabled but no location lookup is configured, so a name "
-                        "produced by another agent cannot be resolved; refusing rather than "
-                        "falling back to a same-named file in the inputs root")
+        lookup_unavailable = "no location lookup is configured"
 
     if locator is not None:
         wanted = [os.path.basename(str(getattr(n, "file", "") or ""))
@@ -540,14 +539,10 @@ def stage_inputs(data_in, work_dir: str,
                 locations = locator(wanted) or {}
             except Exception as exc:       # noqa: BLE001
                 if staging_on:
-                    # Same reasoning as above: with staging on, "I could not ask where this
-                    # file is" must not become "so I will use whatever file of that name is
-                    # lying around". The job is refused and the scheduler may retry it.
-                    return staged, (f"staging is enabled but the location lookup failed "
-                                    f"({exc}); refusing rather than resolving a produced name "
-                                    f"from the inputs root")
-                logger.warning("[STAGE] location lookup failed (%s); staging is off, so "
-                               "resolving inputs locally as usual", exc)
+                    lookup_unavailable = f"the location lookup failed ({exc})"
+                else:
+                    logger.warning("[STAGE] location lookup failed (%s); staging is off, so "
+                                   "resolving inputs locally as usual", exc)
 
     for node in data_in or []:
         # `DataNode.name` is the SITE (`local`, `dtn3`); `file` is the logical file name.
@@ -581,6 +576,18 @@ def stage_inputs(data_in, work_dir: str,
             # wrong input. The reason names the producer, because the usual cause is that it died.
             return staged, (f"input {name!r} was produced by agent "
                             f"{loc.get('agent_id', '?')} but could not be staged: {result.reason}")
+
+        if lookup_unavailable:
+            # This name is not in the working directory, so the next step would resolve it from
+            # the inputs root — and with staging on, a name a parent produced lives on another
+            # agent while a same-named file in the root is a collision, not a copy. Without the
+            # registry the two are indistinguishable, so this is the one place the ambiguity is
+            # real. Note the refusal is reached only for a name that would otherwise have been
+            # read from the root: a job whose inputs are all already local never gets here.
+            return staged, (f"input {name!r} is not in the working directory and staging is "
+                            f"enabled but {lookup_unavailable}, so a name produced by another "
+                            f"agent cannot be told apart from a same-named file in the inputs "
+                            f"root; refusing rather than risking a stale input")
 
         src = resolve_under_root(name, "inputs", pol)
         if not src:
