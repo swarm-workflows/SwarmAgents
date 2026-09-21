@@ -186,3 +186,9 @@ cc-usage-log.md
 
 # Jupyter checkpoints
 .ipynb_checkpoints/
+
+# Paper plans are local-only (decision 2026-09-21): followable on their own, not published.
+# History up to ab5ee074 still carries earlier revisions of both.
+docs/CCGRID27_PAPER_PLAN.md
+docs/FGCS_EVAL_PLAN.md
+docs/.plan-backups/

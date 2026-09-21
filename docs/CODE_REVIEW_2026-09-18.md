@@ -74,7 +74,7 @@ two xfail tests become the regression tests.
 
 *Status:* the no-bandit path in `_select_child_groups` now delegates to `mab.top_k` groups chosen at random, recorded as `random` (a fan-out covering every candidate is still `all`). One fan-out key for both paths. `tests/test_fanout_default.py` (7 tests).
 
-Recorded today in `CCGRID27_PAPER_PLAN.md` §4 and `FGCS_EVAL_PLAN.md` §0.10: with `mab.enabled:
+Recorded today in `CCGRID27_PAPER_PLAN.md` §4 and `FGCS_EVAL_PLAN.md` Appendix A.10: with `mab.enabled:
 false` a coordinator delegates to every capable group and each group executes the job (job key is
 `job:<level>:<group>:<id>`, `repository.py:340`; the CAS is per group). At G=1 that was latent. E0
 and the analytic half of E1′ now duplicate every job unless they pass `--groups-per-coordinator 1`.
