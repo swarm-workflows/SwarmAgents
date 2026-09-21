@@ -2020,13 +2020,9 @@ class ResourceAgent(Agent):
         if self.topology.children and agent.agent_id in job.delegation_failed_agents:
             return False
 
-        # Cache required DTNs for efficiency (computed once, reused multiple times)
-        # Combines data_in and data_out DTN requirements into a single frozenset
-        # "local" DTN is excluded — it means local filesystem, not a remote data transfer node
-        if not hasattr(job, "_required_dtns_cache"):
-            rin = {e.name for e in (job.data_in or [])}
-            rout = {e.name for e in (job.data_out or [])}
-            job._required_dtns_cache = frozenset((rin | rout) - {"local"})
+        # Required DTNs, `local` excluded — Job.required_dtns is the one definition of that
+        # set (cost used to keep its own, and disagreed; code review §8).
+        required_dtns = job.required_dtns()
 
         # Special handling when checking feasibility for self as a parent agent
         # Parent agents must verify that at least ONE actual child can execute the job
@@ -2050,8 +2046,7 @@ class ResourceAgent(Agent):
                     continue  # Skip this child, try next
 
                 # Check child DTN connectivity only if job requires DTNs
-                # Jobs without DTN requirements (empty _required_dtns_cache) skip this check
-                if job._required_dtns_cache:
+                if required_dtns:
                     # Extract child's available DTN names (handle dict vs list formats)
                     if isinstance(child_info.dtns, dict):
                         child_dtn_names = child_info.dtns.keys()
@@ -2060,7 +2055,7 @@ class ResourceAgent(Agent):
                                           for x in (child_info.dtns or [])]
 
                     # Check if child has ALL required DTNs
-                    if not all(d in child_dtn_names for d in job._required_dtns_cache):
+                    if not all(d in child_dtn_names for d in required_dtns):
                         continue  # Skip this child, try next
 
                 # Found a feasible child: has sufficient capacity AND all required DTNs (if any)
@@ -2130,11 +2125,11 @@ class ResourceAgent(Agent):
             agent_dtn_names = [getattr(x, "name", None) or (x.get("name") if isinstance(x, dict) else None)
                                for x in (agent.dtns or [])]
 
-        for d in job._required_dtns_cache:
+        for d in required_dtns:
             if d not in agent_dtn_names:
                 self.logger.debug(
                     f"[DTN] Agent {agent.agent_id} missing DTN '{d}' for Job {job.job_id}. "
-                    f"Job requires: {job._required_dtns_cache}, Agent has: {set(agent_dtn_names)}"
+                    f"Job requires: {required_dtns}, Agent has: {set(agent_dtn_names)}"
                 )
                 return False
 
@@ -2157,12 +2152,6 @@ class ResourceAgent(Agent):
         return self.resource_usage_score(allocated=allocations, total=self.capacities)
 
     def _job_sig(self, job: Job) -> tuple:
-        # Required DTNs can be expensive to rebuild; compute once and reuse
-        # "local" DTN is excluded — it means local filesystem, not a remote data transfer node
-        if not hasattr(job, "_required_dtns_cache"):
-            rin = {e.name for e in (job.data_in or [])}
-            rout = {e.name for e in (job.data_out or [])}
-            job._required_dtns_cache = frozenset((rin | rout) - {"local"})
         caps = job.capacities
         spec = job.quantum
         quantum_sig = None
@@ -2192,7 +2181,7 @@ class ResourceAgent(Agent):
             round(getattr(caps, "qubits", 0.0), 3),
             round(job.wall_time or 0.0, 3),
             job.job_type or "",
-            job._required_dtns_cache,
+            job.required_dtns(),
             quantum_sig,
             job.sub_role,
             pred_sig,
@@ -2363,16 +2352,21 @@ class ResourceAgent(Agent):
         else:
             time_penalty = 1 + (effective_wall_time / long_job_threshold) ** 2
 
-        # DTN connectivity penalty
+        # DTN connectivity penalty. `Job.required_dtns` excludes `local`, which is the whole
+        # point: this block used to build the set itself and keep it, so a job naming `local`
+        # scored 0.0 there on every agent (nobody holds a DTN by that name), `avg_conn` went to
+        # 0 and the penalty to its maximum — every cost in a converted-workflow run multiplied
+        # by `1 + connectivity_penalty_factor`, i.e. doubled at the shipped factor of 1.0,
+        # while feasibility was meanwhile treating `local` as no requirement at all
+        # (code review 2026-09-18, §8). A job with no remote DTN now keeps `avg_conn = 1.0`
+        # and pays no connectivity penalty, which is what "the data is already here" means.
         avg_conn = 1.0
-        if hasattr(job, "data_in") or hasattr(job, "data_out"):
-            required_dtns = {entry.name for entry in (job.data_in or [])} | \
-                            {entry.name for entry in (job.data_out or [])}
+        required_dtns = job.required_dtns()
+        if required_dtns:
             agent_dtn_scores = {dtn.name: getattr(dtn, "connectivity_score", 1.0)
                                 for dtn in dtns.values()}
             scores = [agent_dtn_scores.get(dtn, 0.0) for dtn in required_dtns]
-            if scores:
-                avg_conn = sum(scores) / len(scores)
+            avg_conn = sum(scores) / len(scores)
 
         connectivity_penalty = 1 + connectivity_penalty_factor * (1 - avg_conn)
 
@@ -3067,12 +3061,15 @@ class ResourceAgent(Agent):
         if not self.topology.children:
             return []
 
-        # Extract required DTNs from job
-        required_dtns = set()
-        if hasattr(job, 'data_in') and job.data_in:
-            required_dtns.update(e.name for e in job.data_in)
-        if hasattr(job, 'data_out') and job.data_out:
-            required_dtns.update(e.name for e in job.data_out)
+        # `Job.required_dtns` excludes `local`, and this site used to rebuild the set without
+        # that exclusion — the same defect as in `compute_job_cost` but with a worse outcome
+        # (code review 2026-09-18, §8). No child holds a DTN named `local`, so an all-local
+        # converted-workflow job matched NO group, fell through to the "delegate to all active
+        # groups" fallback, and logged two warnings per job — one of them blaming the
+        # feasibility check, which had correctly ignored `local` all along. The capability
+        # filter was therefore off for every job in a workflow cell, so the bandit's candidate
+        # set was the whole fleet rather than the DTN-capable subset.
+        required_dtns = job.required_dtns()
 
         # If no DTN requirements, all active groups can handle it
         if not required_dtns:

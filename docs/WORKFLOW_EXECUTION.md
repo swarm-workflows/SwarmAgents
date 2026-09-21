@@ -456,6 +456,18 @@ Until 2026-09-18 sized DTNs were pinned at `connectivity_score: 1.0`, which remo
 altogether and did it in the flattering direction: an agent's organically assigned DTNs score
 0.6-0.95, so every bolted-on one outscored them. `swarm/utils/fleet_sizing.py` now draws them.
 
+**And until 2026-09-20 the `--dtn-names local` route had no locality either, in the other
+direction.** `local` is a Pegasus *site*, not a data transfer node, and no agent holds one by
+that name; feasibility subtracted it, but `compute_job_cost` did not, so it scored 0.0 — the
+worst connectivity there is — on every agent. Every cost in such a run was multiplied by
+`1 + connectivity_penalty_factor`, i.e. **doubled** at the shipped 1.0, which moves the
+LLM-vs-analytic 0–100 comparison and the `tie_break_ref_cost: 11.85` calibration. A job naming
+`local` beside a real DTN had the real score halved, and that part was *not* a uniform shift.
+On hierarchical runs it was worse than a shift: `_get_child_groups_for_job` had the same
+omission, so an all-local job matched no child group and delegation fell back to every active
+group with the DTN filter off. `Job.required_dtns()` is now the single definition of the set.
+Code review §8; `tests/test_local_dtn_cost.py`.
+
 **What sizing still costs.** The floor is raised, so a sized fleet is not the standard flavour
 pool and a run on it is not comparable with results measured on one. For a run whose subject
 *is* the fleet, keep the standard pool and stay feasible the other way: convert with

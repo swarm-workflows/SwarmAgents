@@ -227,13 +227,39 @@ agent proposes only when it is its own argmin — which is *tighter* than they c
 neither analysis weakens. The measured ~3.7 bidders/job comes from agents' views of their peers
 differing, not from any tolerance.
 
-## 8. The connectivity term prices `local` at zero — **MEDIUM, workflow cells**
+## 8. The connectivity term prices `local` at zero — **MEDIUM, workflow cells — FIXED 2026-09-20**
 
 `resource_agent.py:2296`: `compute_job_cost` does not exclude `local` from required DTNs (feasibility
 and `_job_sig` do), so every `--dtn-names local` job scores `local` at 0.0 on every agent →
 `avg_conn = 0` → `connectivity_penalty = 1 + factor` → **every cost doubled**, uniformly. Ranking
 is unaffected; absolute costs, the LLM-vs-analytic 0–100 comparison and the tie-break reference
 (`tie_break_ref_cost: 11.85`) are shifted for exactly the workflow replay/real cells. One-line fix.
+
+**Fixed 2026-09-20** (`tests/test_local_dtn_cost.py`, 13 tests; 9 fail against the pre-fix
+tree). Not a one-line fix in the end, because routing the set through one definition turned up
+a **second site with the same bug and a worse outcome**.
+
+* `Job.required_dtns()` is now the only definition, and nothing outside it reads the
+  `_required_dtns_cache` behind it — the cache is populated lazily, so a direct reader that ran
+  first would raise. Feasibility, `_job_sig`, `compute_job_cost` and the child-group filter all
+  call it. The set had **six** derivations (those four plus `fleet_sizing` and the runner's
+  shape summary) and two of them disagreed.
+* `_get_child_groups_for_job` built the same inline set without the exclusion. No child holds a
+  DTN named `local`, so an all-local converted-workflow job matched **no** group, fell through
+  the "delegate to all active groups" fallback, and logged two warnings per job — one of them
+  saying "feasibility check may have passed incorrectly", blaming the component that had
+  correctly ignored `local` all along. So on a hierarchical workflow cell the DTN capability
+  filter was inert and the bandit's candidate set was every active group rather than the
+  capable subset. That is a C1 measurement, not just a cost shift.
+* **The mixed case was never a uniform shift.** The finding says ranking is unaffected, which
+  holds for an all-local job. A job naming `local` *and* a real DTN averaged the real score
+  with 0.0, halving it — the penalty still varied per agent, so two agents differing in both
+  base cost and connectivity could reorder. Pinned by a test.
+
+Consequence for the plans: every converted-workflow cell, replay and real. Absolute costs were
+doubled at the shipped `connectivity_penalty_factor: 1.0`, which moves the LLM-vs-analytic
+0–100 comparison and the `tie_break_ref_cost: 11.85` reference; hierarchical workflow cells
+additionally delegated without the DTN filter.
 
 ## 9. Completion % counts failed jobs — **MEDIUM, definition — FIXED 2026-09-20**
 
@@ -304,4 +330,4 @@ ordering; `run_test.py` guards changed this week (launched-config scoping, three
    failure behaviour, so they had to land before E0/E2b.
 5. ~~§6 (SWIM advisory)~~ — done 2026-09-20.
 6. ~~§7 (inert threshold)~~ — done 2026-09-20.
-7. §8 — small, and it touches every workflow cell.
+7. ~~§8 (local priced at zero)~~ — done 2026-09-20. It was two sites, not one.

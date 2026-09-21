@@ -457,6 +457,32 @@ class Job(Object):
         with self.lock:
             return list(self.data_out)
 
+    #: Pegasus's name for the submit host's own filesystem. It is a *site*, not a data transfer
+    #: node: a job reading a file there needs no remote transfer and no agent can "hold" it.
+    LOCAL_DATA_NODE = "local"
+
+    def required_dtns(self) -> frozenset:
+        """DTN names this job genuinely needs an agent to hold, `local` excluded.
+
+        **One definition, because there were six and one of them disagreed.** Feasibility,
+        `_job_sig`, `fleet_sizing` and the runner's shape summary all subtracted `local`; only
+        `compute_job_cost` rebuilt the set inline and kept it (code review 2026-09-18, §8). No
+        agent holds a DTN called `local`, so it scored 0.0 — the worst connectivity there is —
+        on every agent, driving `avg_conn` to 0 and the penalty to its maximum. The result was
+        that feasibility said "this is not a DTN" while cost said "this is a DTN nobody can
+        reach", and every cost in a converted-workflow run was multiplied by `1 + factor`,
+        which at the shipped factor of 1.0 is exactly doubled.
+
+        Cached on the instance: this is called per (job, agent) pair inside the cost matrix.
+        """
+        cached = getattr(self, "_required_dtns_cache", None)
+        if cached is None:
+            names = {e.name for e in (self.data_in or [])} | \
+                    {e.name for e in (self.data_out or [])}
+            cached = frozenset(names - {self.LOCAL_DATA_NODE})
+            self._required_dtns_cache = cached
+        return cached
+
     # ---------- State ----------
     def on_state_changed(self, old_state: ObjectState, new_state: ObjectState):
         self.logger.debug("Transitioning job %s from %s to %s", self.job_id, old_state, new_state)
