@@ -115,7 +115,7 @@ early) never releases either. This is the fleet-wide form of the "two log lines 
 symptom in CLAUDE.md. Fix: a bounded wait (`peer_expiry_seconds` is the natural bound) that then
 proceeds with whoever is live, logging who is missing; and `>=` rather than `!=`.
 
-## 5. Coordinators never detect child failures by staleness — **MEDIUM-HIGH, E2b/F5 interpretation**
+## 5. Coordinators never detect child failures by staleness — **MEDIUM-HIGH, E2b/F5 interpretation — FIXED 2026-09-20**
 
 `resource_agent.py:1565` (`_refresh_agent_map`: an existing entry is only *updated* when Redis
 has a fresher record; it is removed only when the key is **gone**), `:756`
@@ -128,6 +128,29 @@ liveness gate does not gate. What actually steers the bandit away is its own tim
 learning plus Redis TTL, not liveness detection**, and Scenario C's dog-piling fix is weaker than
 the design doc says. Fix: apply the `peer_expiry_seconds` staleness test to existing entries in
 `_refresh_agent_map` (children and neighbors alike).
+
+**Fixed 2026-09-20** (`tests/test_child_staleness.py`, 11 tests; 7 fail against the pre-fix
+tree). An existing entry whose Redis record has stopped moving is now evicted at the staleness
+threshold rather than at the key's TTL, and its `_agent_seen_at` stamp goes with it; the
+insertion path already refuses a record that old, so a group returns only when it writes a
+fresh one, which is exactly a rejoin. Two things the straightforward version got wrong and
+that the tests pin:
+
+* **The same tier has an owner already.** `_detect_failed_agents` scans `neighbor_map` at
+  `failure_threshold_seconds` and is the only thing that reassigns a dead peer's jobs.
+  Evicting an entry before the detector has judged it removes the peer with no failure ever
+  recorded and strands every job it held — the 2026-09-15 defect reopened from the other end.
+  The shipped config orders the two safely (60 s vs 300 s) but nothing enforced it, and
+  `peer_expiry_seconds` was silently 45 s under the duplicate-key bug, which is the inverted
+  order. `_staleness_eviction_threshold` floors the own-tier threshold at the detector's,
+  jitter headroom included; child tiers use `peer_expiry_seconds` as written.
+* **A re-read of an unchanged record must not re-stamp `_agent_seen_at`**, or the context-age
+  column reads zero for a peer that has gone silent. That invariant predates this change and
+  is now asserted here too.
+
+Consequence for the plans: F5 measures liveness detection from this revision on. Any earlier
+time-to-re-adoption number is delegation-timeout learning plus a 600 s Redis TTL and is not
+comparable.
 
 ## 6. SWIM is not advisory for consensus traffic — **MEDIUM**
 
@@ -219,6 +242,6 @@ ordering; `run_test.py` guards changed this week (launched-config scoping, three
 2. §2 (fan-out default) — one decision, ~20 lines.
 3. §3 (top-level `submitted_at`, per-level selection naming) and §9 (completion definition) —
    collector/plotting only; no agent code, but E0's numbers depend on them.
-4. §4 (barrier timeout) and §5 (child staleness) — both change failure behaviour, so they belong
-   before E0/E2b, not after.
+4. ~~§4 (barrier timeout) and §5 (child staleness)~~ — both done 2026-09-20; both changed
+   failure behaviour, so they had to land before E0/E2b.
 5. §7, §8 — small, and §8 touches every workflow cell.

@@ -763,7 +763,8 @@ class ResourceAgent(Agent):
 
     def _get_live_child_groups(self) -> set:
         """Groups with at least one fresh child heartbeat in the children map
-        (stale entries are pruned by peer expiry). Used to gate delegation:
+        (stale entries are pruned by `_refresh_agent_map` at `peer_expiry_seconds`,
+        for existing entries too since 2026-09-20). Used to gate delegation:
         a dead group must not be offered to the bandit at all — idle-default
         features plus an empty failure history make it look attractive
         (Scenario C dog-piling). Genuinely new groups do heartbeat, so
@@ -1524,6 +1525,19 @@ class ResourceAgent(Agent):
         Updates the target map with agents that are fresh and present in Redis,
         and removes agents that are stale or no longer in the store.
 
+        Staleness is ONE test — ``current_time - last_updated > peer_expiry_seconds`` — and it
+        applies to existing entries as well as new ones. Until 2026-09-20 it applied only at
+        insertion: an existing entry was *updated* when Redis had a fresher record and *removed*
+        only when the key was gone, and the key's TTL is ``2 × peer_expiry_seconds`` (600 s
+        shipped). A child that died therefore stayed in ``children`` for ten minutes with a frozen
+        record whose headroom read idle, ``_get_live_child_groups`` did not gate it, and the
+        bandit was steered away from the dead group only by its own delegation timeouts — so
+        F5 "time-to-re-adoption" measured timeout learning plus Redis TTL, not liveness
+        detection (code review 2026-09-18, §5). The test uses the record's own wall-clock
+        stamp against this host's, as the insertion path always has: the offsets measured on
+        the slice (≤1.1 s) are noise against a 300 s threshold, and a record whose clock is off
+        by more than the threshold is already refused at insertion, so this adds no failure mode.
+
         :param current_time: The current timestamp for evaluating staleness.
         :type current_time: float
         :param target_dict: A thread-safe dictionary mapping agent IDs to AgentInfo objects.
@@ -1534,6 +1548,7 @@ class ResourceAgent(Agent):
         :type groups: list[int]
         """
         active_ids = set()
+        stale_after = self._staleness_eviction_threshold(level)
 
         for group in groups:
             agent_dicts = self.repository.get_all_objects(
@@ -1596,6 +1611,23 @@ class ResourceAgent(Agent):
                     # would keep reporting an age of zero and the staleness metric would say
                     # the coordinator's view is perfect right up until the peer is evicted.
                     self._note_agent_seen(agent.agent_id)
+                elif agent.agent_id != self.agent_id \
+                        and current_time - existing.last_updated > stale_after:
+                    # Existing agent whose record has stopped moving: the key is still in
+                    # Redis (TTL is twice the expiry threshold) but the peer is not writing
+                    # it. Evict it here rather than when the key expires, and drop it from
+                    # active_ids so the sweep below does not read "present in Redis" as alive.
+                    # The insertion path above refuses a record this old, so it will not be
+                    # re-added until the peer writes a fresh one — which is exactly a rejoin.
+                    active_ids.discard(agent.agent_id)
+                    target_dict.remove(agent.agent_id)
+                    self._agent_seen_at.pop(agent.agent_id, None)
+                    self.logger.warning(
+                        f"Removed stale agent {agent.agent_id} from map (level {level}, "
+                        f"group {agent.group}): no update for "
+                        f"{current_time - existing.last_updated:.1f}s, "
+                        f"threshold {stale_after:.1f}s; key still in Redis"
+                    )
 
         # Remove agents from map that are no longer active in Redis
         # (but keep agents that are still being processed/committed)
@@ -1606,6 +1638,26 @@ class ResourceAgent(Agent):
                 self.logger.info(
                     f"Removed agent {agent_id} from map (no longer in Redis)"
                 )
+
+    def _staleness_eviction_threshold(self, level: int) -> float:
+        """How long an existing map entry may go without a fresher Redis record before it is
+        evicted.
+
+        `peer_expiry_seconds` for a child tier. For this agent's OWN tier it is floored at the
+        failure detector's threshold plus its jitter headroom, because `_detect_failed_agents`
+        scans `neighbor_map` and is the only thing that reassigns a dead peer's jobs: evicting
+        an entry before the detector has judged it would remove the peer silently, no failure
+        would ever be recorded, and every job that peer held would be stranded for the run —
+        the defect closed on 2026-09-15, reopened from the other end. The shipped config
+        already orders them safely (60 s detection, 300 s expiry), but nothing enforced it, and
+        `peer_expiry_seconds` has been silently 45 s before now (the duplicate-key bug), which
+        is exactly the inverted order. The detector's jitter reaches 1.1x, plus one tick of
+        slack so a threshold equal on paper does not race.
+        """
+        base = float(self.peer_expiry_seconds)
+        if level != self.topology.level:
+            return base
+        return max(base, float(self.failure_threshold_seconds) * 1.1 + 1.0)
 
     def _note_agent_seen(self, agent_id: int) -> None:
         """Record, on this agent's own monotonic clock, that a fresher record arrived.

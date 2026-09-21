@@ -43,10 +43,15 @@ runtime:
   ready_queue_threshold: 100.00
   max_time_load_zero: 300
   restart_job_selection: 30
-  # Staleness filter for peers newly read from Redis; NOT the failure detector (heartbeat and
-  # SWIM are authoritative for that). This key was defined twice in this block — 300 here and 45
-  # eight lines down — so YAML kept 45 and every run of the campaign used a value the file and
-  # CLAUDE.md both denied. Duplicate keys now raise (swarm/utils/yaml_strict.py).
+  # Staleness filter for peers read from Redis; NOT the failure detector (heartbeat and SWIM
+  # are authoritative for that). Since 2026-09-20 it also evicts an entry ALREADY in the map
+  # whose record has stopped moving — a child group used to survive its own death until the
+  # agent key's TTL (2x this value) expired. On the agent's own tier the eviction threshold is
+  # floored at failure_threshold_seconds, because _detect_failed_agents owns that map and is
+  # what reassigns a dead peer's jobs; keep this above that key. This key was defined twice in
+  # this block — 300 here and 45 eight lines down — so YAML kept 45 and every run of the
+  # campaign used a value the file and CLAUDE.md both denied, which is exactly the inverted
+  # order that floor now guards. Duplicate keys raise (swarm/utils/yaml_strict.py).
   peer_expiry_seconds: 300
   empty_timeout_seconds: 300
   reselection_timeout_s: 300          # NOTE: the code default when this key is absent is 60
