@@ -124,18 +124,41 @@ repeat, and the existing refusal path already reports it that way.
 - **Stage-out.** A run's final outputs live wherever they were produced. There is no collection to
   a destination. Cheap to add once a destination is chosen (another agent, the database node, an
   external endpoint), and it is the second half of any Pegasus comparison.
-- **Producer durability — the one that changes correctness.** Under the shared mount a dead agent's
-  outputs survive. With per-agent storage they do not: the producing job is COMPLETE, so nothing
-  re-runs it, its name is in the readiness registry, so every descendant is released — and then
-  refuses to stage. The system would deadlock on a dead producer in a way that looks like a staging
-  bug. Three options, in increasing cost: **(a)** treat an unreachable producer as a reason to
-  reset the producing job to PENDING and let the existing reassignment machinery re-run it (needs
-  the readiness name retracted in the same transaction, and is only correct for a deterministic
-  job); **(b)** replicate each output to *k* peers at publish time, which costs bandwidth on the
-  critical path; **(c)** write outputs to the shared export and use staging only for locality
-  measurement, which is honest but gives up the durability argument. **Until one is chosen, do not
-  run a failure-injection cell with staging enabled** — E2b and E6 kill agents, and a killed
-  producer is exactly this case.
+- ~~**Producer durability**~~ — **BUILT 2026-09-21 as eager stage-out, and measured on the
+  slice.** The problem it solved: under the shared mount a dead agent's outputs survive; with
+  per-agent storage they do not, and since the producing job is COMPLETE nothing re-runs it,
+  its name is in the readiness registry, so every descendant is released and then refuses.
+  Three options were weighed. **(a) Re-run the dead producer** — only correct for a
+  deterministic job, needs the readiness name retracted in the same transaction, and
+  *cascades*: the producer's own inputs may be gone too, so a deep DAG re-runs a subtree.
+  **(b) Replicate to k peers** — k uploads for a guarantee one gives. **(c) Eager stage-out to
+  a staging site** — chosen. One upload, no cascade, and it is what Pegasus itself does, which
+  matters for a comparison against Pegasus.
+
+  As built: each output is pushed to the site **before its name is published**, so a name is
+  never visible without a durable copy behind it — the same one-write rule the completion
+  follows, extended one step. A consumer tries the **producer first** and the store only on
+  failure, so the common case stays one hop; store-first would make every DAG edge pay two WAN
+  hops for a guarantee it does not need while the producer is alive. The location registry
+  therefore holds a preference-ordered list. A failed push costs durability for that file, not
+  the run, and is logged at ERROR.
+
+  **Measured end to end on the slice, 2026-09-21** (`runs/soil-stageout-20260921`, soilmoisture,
+  5 agents, local work dirs, site on the database node):
+
+  | | |
+  |---|---|
+  | Run | 4/4 jobs exit 0, makespan 36.3 s, metrics complete |
+  | Stage-out | 5 outputs, 831 B – 228 KB, **0.035–0.097 s each, 0.244 s total** |
+  | Share of makespan | **~0.7 %** |
+  | Store fallback | producer unreachable → 228 KB served from the site in **0.19 s** |
+
+  So the upload cost is noise at this workflow's output sizes. It would **not** be noise for
+  multi-hundred-megabyte outputs, and the push is synchronous on the completion path, so a
+  workflow with large intermediates should measure it again before quoting a makespan.
+  **Failure-injection cells are no longer blocked on this** — but see the accounting gap below
+  before quoting a data-movement number from one.
+
 - **Transfer accounting.** Bytes moved per job, per link, are not yet in `collect.py`. The figure
   that would make staging a *result* rather than a capability needs it.
 
