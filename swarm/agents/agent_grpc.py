@@ -215,16 +215,20 @@ class Agent(Observer):
                 "location this agent publishes will be unusable. Set it to the address peers "
                 "reach this agent on.", self.grpc_host)
 
-        if pol.store_host and not os.environ.get("SWARM_RUN_ID", ""):
-            # A store is keyed by (run, name) and refuses an upload carrying no run, so without
-            # this every stage-out would fail one file at a time and the run would finish with
-            # no durable copy of anything. Refused at startup instead: it is a configuration
-            # fault that repeats for every job, which is the same reason an unknown execution
-            # mode raises rather than defaulting.
+        if not os.environ.get("SWARM_RUN_ID", ""):
+            # Required whenever staging is on, not only when a store is configured. Two
+            # separate failures ride on it. An agent that does not know its run cannot tell
+            # whether a fetch belongs to it, and this repo documents agents outliving their
+            # run — so it would serve a later run its predecessor's file of the same name.
+            # And a staging site files uploads under the run, so every stage-out would be
+            # refused one file at a time and the run would end with no durable copy of
+            # anything. Refused at startup: a configuration fault that repeats for every job,
+            # the same reason an unknown execution mode raises rather than defaulting.
             raise ValueError(
-                "runtime.execution.staging.store_host is set but SWARM_RUN_ID is empty. A "
-                "staging site files uploads under the run, and would refuse every one of them. "
-                "run_test.py exports SWARM_RUN_ID; an agent started by hand must too.")
+                "runtime.execution.staging.enabled is true but SWARM_RUN_ID is empty. An agent "
+                "that does not know its run cannot tell a fetch for this run from one for a "
+                "previous run's identically named file, and a staging site would refuse every "
+                "upload. run_test.py exports SWARM_RUN_ID; an agent started by hand must too.")
 
         self.staged_files = staging.PublishedFiles()
         staging.set_context(locator=self.repository.data_locations,

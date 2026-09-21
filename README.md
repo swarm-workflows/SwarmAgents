@@ -182,8 +182,10 @@ python3 pegasus_to_swarm_converter.py --input all_runs_jobs_profile.json --input
 rsync -a --delete converted_jobs/ <db-host>:/export/swarm-wf/converted_jobs/
 ssh <db-host> sudo chown -R nobody:nogroup /export/swarm-wf/converted_jobs
 
-# 4. start the staging site, on a node every agent can reach (typically the database node)
-export SWARM_RUN_ID=...             # the same value the run will use; see step 7
+# 4. start the staging site ONCE, on a node every agent can reach (the database node).
+#    Leave it running across runs: the store is keyed by (run, name), so one site backs a
+#    whole campaign without runs colliding. Do NOT pass --run-id — run_test.py mints the run
+#    id at launch (it ends in a uuid), so it is not knowable in advance.
 python3 staging_site.py --store-dir /export/swarm-wf/store --port 21000
 ```
 
@@ -246,6 +248,13 @@ reaches its own localhost. Measured on the slice 2026-09-21: every consensus fin
 such a run reads `reason=single-node`, meaning no agent ever reached another, and staging
 locations are unusable for the same reason. With the flag each agent advertises `agent-N`,
 which `/etc/hosts` resolves to its data-plane address.
+
+**The run id is minted per run and every agent needs it.** `run_test.py` builds it from the
+run directory, a timestamp and a uuid, exports it as `SWARM_RUN_ID`, and re-exports it over ssh
+to each agent — so a normal remote run needs nothing from you. An agent started **by hand** with
+staging on must export it too, and refuses at startup if it is missing: an agent that does not
+know its run cannot tell a fetch for this run from one for a previous run's identically named
+file, and this fleet has had agents outlive their run.
 
 **Checking staging actually did something.** `[STAGE_OUT]` in an agent log gives bytes and
 seconds per pushed file; `[STAGE_SITE]` on the site gives `stored` / `served` counts. If a

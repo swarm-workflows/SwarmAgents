@@ -31,8 +31,13 @@ def main() -> int:
     ap.add_argument("--store-dir", required=True, help="where uploaded files are kept")
     ap.add_argument("--host", default="0.0.0.0", help="bind address (default: all interfaces)")
     ap.add_argument("--port", type=int, default=21000)
-    ap.add_argument("--run-id", default=os.environ.get("SWARM_RUN_ID", ""),
-                    help="refuse traffic for any other run (default: $SWARM_RUN_ID)")
+    ap.add_argument("--run-id", default="",
+                    help="restrict the site to ONE run (default: accept any). Rarely wanted: "
+                         "the store is keyed by (run, name), so one site serves many runs "
+                         "safely, and run_test.py mints the run id at launch — it is not "
+                         "knowable in advance, so pinning it here usually just refuses "
+                         "everything. Deliberately NOT defaulted from $SWARM_RUN_ID, which "
+                         "would silently pin the site to a stale value.")
     ap.add_argument("--chunk-bytes", type=int, default=staging.DEFAULT_CHUNK_BYTES)
     ap.add_argument("--no-verify", action="store_true",
                     help="skip the stream digest (not recommended: a truncated upload then "

@@ -211,13 +211,28 @@ class _Servicer(consensus_pb2_grpc.DataTransferServiceServicer):
 
     def Fetch(self, request, context):  # noqa: N802 (gRPC naming)
         name = str(request.name or "")
-        if request.run_id and self.run_id and request.run_id != self.run_id:
-            # The same guard the run-scoped registry key gives: a stale location record from a
-            # previous run must not be answered with this run's file of the same name.
-            yield from self._refuse(
-                f"{name!r} requested for run {request.run_id!r} but this agent serves "
-                f"{self.run_id!r}")
-            return
+        # **Fail closed on an unknown run.** The first version required BOTH sides to be
+        # non-empty before comparing, so an agent whose SWARM_RUN_ID was empty skipped the
+        # check and served its names to *any* run. This repo already documents agents
+        # outliving their run — `stop_agents_v2.sh` can report a host it could not reach and
+        # the runner carries on — so run 1's agent, still listening, would answer a run-2
+        # consumer with run 1's file of the same name. Silently stale, and the names collide by
+        # construction: 62 colliding names measured in the shipped profile.
+        #
+        # A store is exempt because its namespace is already (run, name): it files each
+        # upload under the requesting run and looks it up the same way, which is what lets one
+        # site serve many runs.
+        if not self.store_dir:
+            if not self.run_id:
+                yield from self._refuse(
+                    f"{name!r} refused: this agent does not know its run (SWARM_RUN_ID is "
+                    f"empty), so it cannot tell whether the request belongs to it")
+                return
+            if str(request.run_id or "") != self.run_id:
+                yield from self._refuse(
+                    f"{name!r} requested for run {request.run_id!r} but this agent serves "
+                    f"{self.run_id!r}")
+                return
         # At a staging site the namespace is (run, name), not name: one store serves many
         # runs and workflow file names are a flat namespace — 62 colliding names measured in
         # the shipped profile — so `x.txt` from another run is a different file that happens

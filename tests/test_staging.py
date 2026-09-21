@@ -994,3 +994,87 @@ def test_an_agent_still_serves_bare_names(tmp_path):
         assert open(os.path.join(dest, "x.txt"), "rb").read() == b"agent output"
     finally:
         server.stop(0)
+
+
+# --------------------------------------------------------------------------------------------
+# an agent that does not know its run must fail closed — found by the stop-time review gate
+# --------------------------------------------------------------------------------------------
+
+def test_an_agent_with_no_run_id_serves_nothing(tmp_path):
+    """The guard used to require BOTH sides non-empty before comparing, so an agent whose
+    SWARM_RUN_ID was empty skipped it and served its names to *any* run. This repo documents
+    agents outliving their run, so run 1's agent — still listening — would answer a run-2
+    consumer with run 1's file of the same name. The names collide by construction."""
+    src = _write(str(tmp_path / "p" / "x.txt"), b"run one output")
+    server, loc = _serve(tmp_path, {"x.txt": src}, run_id="")      # agent does not know its run
+    dest = str(tmp_path / "c"); os.makedirs(dest)
+    try:
+        out = staging.fetch("x.txt", loc, dest, run_id="run-2")
+        assert not out.ok
+        assert "does not know its run" in out.reason
+        assert not os.path.exists(os.path.join(dest, "x.txt"))
+    finally:
+        server.stop(0)
+
+
+def test_an_agent_refuses_a_fetch_that_names_no_run(tmp_path):
+    """The other half of the same short circuit: an empty *request* run used to skip the check
+    too, so anyone omitting it got served."""
+    src = _write(str(tmp_path / "p" / "x.txt"), b"mine")
+    server, loc = _serve(tmp_path, {"x.txt": src}, run_id="run-1")
+    dest = str(tmp_path / "c"); os.makedirs(dest)
+    try:
+        out = staging.fetch("x.txt", loc, dest, run_id="")
+        assert not out.ok and "but this agent serves" in out.reason
+    finally:
+        server.stop(0)
+
+
+def test_a_store_still_serves_many_runs(tmp_path):
+    """A store is exempt from that rule and must stay exempt: its namespace is already
+    (run, name), which is what lets one site back a whole campaign."""
+    server, port, _ = _store(tmp_path, run_id="")
+    try:
+        staging.configure(enabled=True, store_host="127.0.0.1", store_port=port)
+        for run, body in (("run-1", b"one"), ("run-2", b"two")):
+            src = _write(str(tmp_path / run / "x.txt"), body)
+            assert staging.put("x.txt", src, run_id=run).ok
+        for run, body in (("run-1", b"one"), ("run-2", b"two")):
+            dest = str(tmp_path / f"c-{run}"); os.makedirs(dest)
+            out = staging.fetch("x.txt", {"host": "127.0.0.1", "port": port}, dest, run_id=run)
+            assert out.ok and open(os.path.join(dest, "x.txt"), "rb").read() == body
+    finally:
+        server.stop(0)
+
+
+def test_staging_without_a_run_id_is_refused_at_startup(tmp_path, monkeypatch):
+    """Not just when a store is configured: an agent that does not know its run cannot serve
+    safely either, so the whole feature requires it."""
+    from unittest.mock import MagicMock
+
+    from swarm.agents.resource_agent import ResourceAgent
+    monkeypatch.delenv("SWARM_RUN_ID", raising=False)
+    a = ResourceAgent.__new__(ResourceAgent)
+    a.logger = MagicMock()
+    a.agent_id = 1
+    a.grpc_config = {"host": "127.0.0.1", "port": 20001}
+    a.repository = MagicMock()
+
+    with pytest.raises(ValueError) as exc:
+        a._configure_staging({"staging": {"enabled": True}}, "/tmp/w", "real")
+    assert "SWARM_RUN_ID is empty" in str(exc.value)
+
+
+def test_staging_off_needs_no_run_id(tmp_path, monkeypatch):
+    """The shipped default must not start demanding an environment variable."""
+    from unittest.mock import MagicMock
+
+    from swarm.agents.resource_agent import ResourceAgent
+    monkeypatch.delenv("SWARM_RUN_ID", raising=False)
+    a = ResourceAgent.__new__(ResourceAgent)
+    a.logger = MagicMock()
+    a.agent_id = 1
+    a.grpc_config = {"host": "127.0.0.1", "port": 20001}
+    a.repository = MagicMock()
+
+    a._configure_staging({"staging": {"enabled": False}}, "/tmp/w", "simulate")   # no raise

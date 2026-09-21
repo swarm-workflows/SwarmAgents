@@ -86,7 +86,14 @@ anything else is refused by name. The server never joins a request onto a direct
 traversal surface: an unknown name has no path at all.
 
 A request also carries the run id and is refused if it does not match, which is the same guard the
-readiness registry's run-scoped key provides.
+readiness registry's run-scoped key provides. **An agent fails closed on an unknown run**: the
+first version compared the two ids only when both were non-empty, so an agent whose
+`SWARM_RUN_ID` was empty skipped the check and served its names to any run — and agents do
+outlive their runs here, so run 1's agent would answer a run-2 consumer with run 1's file of the
+same name. Staging therefore refuses to start without `SWARM_RUN_ID`. A **store** is exempt from
+the equality check and only from that, because its namespace is already `(run, name)`: it files
+each upload under the requesting run and looks it up the same way, which is what lets one site
+back a whole campaign.
 
 ## 5. Staging in
 
