@@ -823,7 +823,20 @@ GitHub answers in 0.2 s — that one host times out). Its real output from the o
 stands in for it. A job whose runtime is an external service's latency is a poor comparison
 subject anyway.
 
-### 4.2 NFS is scaffolding
+### 4.2 NFS is scaffolding — and since 2026-09-21 it is the *alternative*, not the path
+
+**Staging is the default now** (`runtime.execution.staging.enabled: true`,
+`docs/STAGING_DESIGN.md`). A job's outputs stay on the agent that produced them and a consumer
+elsewhere fetches them over a second gRPC port on the same host consensus uses, with a staging
+site holding a durable copy so an output survives its producer. The work dir is then **local**
+to each agent; a shared one makes every fetch a no-op and measures nothing.
+
+Everything below about NFS still applies when you deliberately choose the shared-mount mode —
+it is simpler, and it is what every result before 2026-09-21 was measured on — but it is no
+longer what a fresh run does. The bundle's *code* and the DAG's *root inputs* still come from a
+path every agent can read; it is the *produced* files that now travel.
+
+### 4.2.1 Why NFS was scaffolding in the first place
 
 `setup_nfs_workflow.sh` makes execution possible without building distributed staging first.
 It is not a configuration any published number comes from: it removes transfer time, makes
@@ -869,7 +882,12 @@ invisible until a job lands on the host nobody remembers skipping.
 
 ## 6. What real execution still needs
 
-1. **Transfer, and stage-out.** Declared replicas now travel in the bundle and are copied into
+1. ~~**Transfer, and stage-out.**~~ **BUILT 2026-09-21** — see `docs/STAGING_DESIGN.md`, and
+   §6 there for what is measured and what is still missing (transfer accounting per job and
+   per link, which is what a data-movement *result* would need). The paragraph below describes
+   the state before that.
+
+   Historical: declared replicas now travel in the bundle and are copied into
    the working directory by `stage_inputs` (§4.1), but that is a local copy from a root the
    agent can already see. Nothing moves data *between* agents, and outputs never leave the
    working directory. This is the last thing standing between the current setup and a

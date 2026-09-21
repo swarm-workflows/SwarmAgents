@@ -151,11 +151,24 @@ for real, no reconversion.
 Pegasus run: the `*.stampede.db` carries the durations and exit codes, and the catalogs hold
 absolute submit-host paths, so extraction and conversion happen there.
 
+**Two ways to get a job its inputs, and the default changed on 2026-09-21.**
+
+| | **Staging (default)** | Shared mount (still supported) |
+|---|---|---|
+| Where outputs live | on the agent that produced them, plus a staging site | one NFS export every agent mounts |
+| How a consumer gets one | fetches it from the producer, or the site if the producer is gone | it is already there |
+| Work dir | **local** to each agent | shared, same path everywhere |
+| Data movement | real, measured, over the same paths consensus uses | none — every agent is equidistant from every file |
+| Use it for | anything reporting data movement or locality | a quick functional check; it is simpler |
+
+The shared mount is why every agent looks equally close to every file, which is exactly the
+variable the scheduler's DTN penalties price — so **no data-movement or locality number can
+come from it.** Staging is the default for that reason. It is also the slower of the two, and
+honestly so.
+
 ```bash
 # 1. once per slice
 sudo ./setup_apptainer.sh          # run the workflow's own .sif natively
-sudo ./setup_nfs_workflow.sh       # one shared work dir at the same path on every node
-sudo chown nobody:nogroup /export/swarm-wf/work && sudo chmod 1777 /export/swarm-wf/work
 
 # 2. extract and convert, on the Pegasus submit host
 python3 pegasus_profile_extractor.py --submit-dir <run dir>/     # → all_runs_jobs_profile.json
@@ -164,40 +177,83 @@ python3 pegasus_to_swarm_converter.py --input all_runs_jobs_profile.json --input
     --bundle-images --dag-gating --dtn-names local --dtn-scope job
     # --bundle-source-root <tree>   # only if the workflow tree has moved since the run
 
-# 3. copy the bundle to the shared export
+# 3. put the bundle somewhere every agent can read (code and the DAG's ROOT inputs only —
+#    produced files travel by staging, not by this)
 rsync -a --delete converted_jobs/ <db-host>:/export/swarm-wf/converted_jobs/
 ssh <db-host> sudo chown -R nobody:nogroup /export/swarm-wf/converted_jobs
+
+# 4. start the staging site, on a node every agent can reach (typically the database node)
+export SWARM_RUN_ID=...             # the same value the run will use; see step 7
+python3 staging_site.py --store-dir /export/swarm-wf/store --port 21000
 ```
 
-**4. Configure execution** on the database node, in `config_swarm_multi.yml`. Every per-agent
-config is a copy of it, so this comes *before* step 5. Skip it and the jobs simulate — the one
+**5. Configure execution** on the database node, in `config_swarm_multi.yml`. Every per-agent
+config is a copy of it, so this comes *before* step 6. Skip it and the jobs simulate — the one
 failure here that looks like success:
 
 ```yaml
 runtime:
   execution:
     mode: real                            # `simulate` is the default
+    work_dir: /var/tmp/swarm-wf/work      # LOCAL per agent — a shared one makes every
+                                          # fetch a no-op and measures nothing
+    container_runtime: auto
+    bundle: /export/swarm-wf/converted_jobs
+    staging:
+      enabled: true
+      store_host: database                # the staging site from step 4
+      store_port: 21000
+```
+
+<details>
+<summary>Shared-mount alternative (no staging)</summary>
+
+Simpler, and the path every result before 2026-09-21 was measured on. Add
+`sudo ./setup_nfs_workflow.sh` to step 1, skip step 4, and use:
+
+```yaml
+runtime:
+  execution:
+    mode: real
     work_dir: /export/swarm-wf/work       # shared, so job B finds job A's output
     container_runtime: auto
     bundle: /export/swarm-wf/converted_jobs
+    staging:
+      enabled: false
 ```
 
-```bash
-# 5. generate the fleet, once
-python3 generate_configs.py 5 10 ./config_swarm_multi.yml configs mesh database 0 \
-    --skip-jobs --seed 42 --size-to-jobs /export/swarm-wf/converted_jobs
+Every agent is then equidistant from every file. Do not quote a data-movement, locality or
+makespan number from such a run.
+</details>
 
-# 6. run
+```bash
+# 6. generate the fleet, once
+python3 generate_configs.py 5 10 ./config_swarm_multi.yml configs mesh database 0 \
+    --skip-jobs --seed 42 --size-to-jobs /export/swarm-wf/converted_jobs \
+    --agent-hosts-file agent_hosts.txt --agents-per-host 1
+
+# 7. run
 python3 run_test.py --mode remote --agent-type resource --agents 5 --agents-per-host 1 \
     --topology mesh --jobs-per-interval 4 --db-host database \
     --agent-hosts-file agent_hosts.txt --run-dir runs/soil-real \
     --pegasus-jobs-dir /export/swarm-wf/converted_jobs \
-    --use-config-dir --config-dir configs --runtime 420
+    --use-config-dir --config-dir configs --runtime 600
 ```
 
-**Before quoting timings**, move the image off the export — a multi-GB `.sif` read over the WAN
-at every job start dominates the measurement. `setup_nfs_workflow.sh --stage-image <file>.sif`,
-then add `roots: {images: <that dir>}`.
+**`--agent-hosts-file` on step 6 is not optional.** Without it every agent advertises
+`grpc.host` verbatim from the base config — `0.0.0.0` as shipped — and a peer dialling that
+reaches its own localhost. Measured on the slice 2026-09-21: every consensus finalization in
+such a run reads `reason=single-node`, meaning no agent ever reached another, and staging
+locations are unusable for the same reason. With the flag each agent advertises `agent-N`,
+which `/etc/hosts` resolves to its data-plane address.
+
+**Checking staging actually did something.** `[STAGE_OUT]` in an agent log gives bytes and
+seconds per pushed file; `[STAGE_SITE]` on the site gives `stored` / `served` counts. If a
+whole DAG lands on one agent, every child finds its parent's output locally and **nothing is
+transferred** — that is a real outcome, not a failure, but it means the run measured no data
+movement. Measured for soilmoisture on 5 agents: 5 outputs of 831 B–228 KB pushed in
+0.035–0.097 s each, 0.244 s total against a 36.3 s makespan (~0.7%), and a 228 KB file served
+from the site in 0.19 s with the producer unreachable.
 
 ### What the flags do
 
@@ -205,7 +261,7 @@ then add `roots: {images: <that dir>}`.
 |---|---|
 | `--dag-gating` | jobs wait for their parents' output; without it a child fails on a file nobody has written |
 | `--bundle-images` | the copied directory is then everything the jobs need |
-| `--dtn-names local --dtn-scope job` | makes the jobs data-location-free, which is what you want on one shared mount |
+| `--dtn-names local --dtn-scope job` | makes the jobs data-location-free. Right for both modes: under staging, *where* a file is comes from the location registry, not from a DTN name |
 | `--bundle-source-root` | pass it (absolute, or `OLD=NEW`) only when the workflow tree has moved since the run |
 | `--size-to-jobs` | every agent can run every job — so a failed agent's work can go to any other. It raises capacity to a *floor* and gives every agent the jobs' DTNs at its own connectivity score, so the fleet stays heterogeneous ([why](docs/WORKFLOW_EXECUTION.md#27-sizing-the-fleet-to-the-workflow)) |
 | `--skip-jobs` | the job pool comes from the bundle; do not synthesize one |
@@ -213,6 +269,9 @@ then add `roots: {images: <that dir>}`.
 | `--use-config-dir` | reuse that fleet instead of redrawing it every run. Local reads `./configs` literally; remote copies `--config-dir` to each host |
 | `--pegasus-jobs-dir` | publish the bundle as it is; `--jobs` comes from its record count |
 | `rsync --delete` | a plain copy does not sweep, and leftovers from a bigger conversion get published too |
+| `--agent-hosts-file` (step 6) | each agent advertises `agent-N` instead of the base config's `0.0.0.0`. Without it a peer dials its own localhost: consensus degrades to `single-node` and every staging location is unusable |
+| `staging.enabled` | outputs stay on the producer and move on demand. **The default.** Needs a local `work_dir` |
+| `staging.store_host` | the staging site an output is pushed to as it is produced, so it survives its producer. Empty means peer-only, which is **not durable** |
 
 **Generate the fleet once.** Left to `run_test.py`, `configs/`, `agent_profiles.json` and
 `agent_dtns.json` are redrawn every run, so two runs of the "same" cell are two different
