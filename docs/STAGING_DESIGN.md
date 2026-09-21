@@ -67,6 +67,19 @@ What is deliberately *not* in a location record:
 
 ## 4. Serving: a published map, never an arbitrary path
 
+**A staging site's namespace is `(run, name)`, not `name`.** Files are stored under
+`<store_dir>/<run_id>/<name>` and looked up the same way. The first version was flat, and
+because placement is never-overwrite, a second run producing the same file name hit the
+existing copy, kept the *older* one, reported a clean store of bytes it had discarded, and then
+served run 1's content to run 2's consumers. The registry keys are run-scoped
+(`data_ready:<run>`, `data_loc:<run>`) but the store directory was not, and workflow file names
+are a flat namespace — 62 colliding names measured in the shipped profile — so two runs of the
+same workflow is the expected case, not a corner. An upload carrying no run id is refused,
+because there is nowhere to file it; an agent, which serves one run's outputs and already
+checks the run for equality, still serves bare names. Within a single run, a second upload of
+the same name with *different* bytes keeps the first copy and logs at ERROR, rather than
+reporting success for bytes that were dropped.
+
 The transfer server answers only for names **this agent has published in this run**. It keeps
 `name → absolute path` in memory, populated as the agent publishes its outputs, and a request for
 anything else is refused by name. The server never joins a request onto a directory, so there is no

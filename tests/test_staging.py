@@ -705,7 +705,9 @@ def test_an_output_is_pushed_to_the_staging_site(tmp_path):
         assert result.ok, result.reason
         assert result.bytes_sent == os.path.getsize(src)
         assert result.elapsed_s >= 0.0, "the cost is measured, not assumed"
-        assert open(os.path.join(store_dir, "out.json"), "rb").read() == open(src, "rb").read()
+        # Keyed by (run, name): the store serves many runs and workflow names collide.
+        assert open(os.path.join(store_dir, "run-1", "out.json"), "rb").read() \
+            == open(src, "rb").read()
         assert server.stats()["stored"] == 1
     finally:
         server.stop(0)
@@ -766,7 +768,7 @@ def test_a_re_upload_is_idempotent_and_never_truncates(tmp_path):
         second = _write(str(tmp_path / "w2" / "out.txt"), b"second")
         assert staging.put("out.txt", second, run_id="run-1").ok
 
-        assert open(os.path.join(store_dir, "out.txt"), "rb").read() == b"first copy"
+        assert open(os.path.join(store_dir, "run-1", "out.txt"), "rb").read() == b"first copy"
     finally:
         server.stop(0)
 
@@ -848,8 +850,11 @@ def test_no_recorded_location_is_its_own_message(tmp_path):
 # the producer stages out BEFORE the name is published
 # --------------------------------------------------------------------------------------------
 
-def test_the_producer_records_peer_then_store(tmp_path):
-    server, port, store_dir = _store(tmp_path)
+def test_the_producer_records_peer_then_store(tmp_path, monkeypatch):
+    # `_publish_locations` takes the run from the environment, as the agent does; a store is
+    # keyed by (run, name) and refuses an upload that carries no run.
+    monkeypatch.setenv("SWARM_RUN_ID", "run-1")
+    server, port, store_dir = _store(tmp_path, run_id="run-1")
     try:
         work = str(tmp_path / "work")
         _write(os.path.join(work, "out.json"), b"{}")
@@ -860,7 +865,7 @@ def test_the_producer_records_peer_then_store(tmp_path):
         entries = a._publish_locations(_Job(), ["out.json"])["out.json"]
 
         assert [e["agent_id"] for e in entries] == ["7", "store"], "peer first, store last"
-        assert os.path.isfile(os.path.join(store_dir, "out.json")), \
+        assert os.path.isfile(os.path.join(store_dir, "run-1", "out.json")), \
             "the push happens before the caller publishes the name, or the window it insures " \
             "against is exactly the window left open"
     finally:
@@ -881,3 +886,111 @@ def test_a_failed_stage_out_loses_durability_not_the_run(tmp_path):
     assert [e["agent_id"] for e in entries] == ["7"], "no store entry for a push that failed"
     logged = " ".join(str(c.args) for c in a.logger.error.call_args_list)
     assert "STAGE_OUT" in logged and "every descendant will refuse" in logged
+
+
+# --------------------------------------------------------------------------------------------
+# the store's namespace is (run, name) — found by the stop-time review gate
+# --------------------------------------------------------------------------------------------
+
+def test_two_runs_producing_the_same_name_do_not_collide(tmp_path):
+    """**The stale-serve bug.** The registry keys are run-scoped but the store directory was
+    flat, so run 2's `x.txt` hit the never-overwrite rule against run 1's — and that collision
+    resolves silently in favour of the OLDER file, which the store then serves to run 2's
+    consumers. Workflow file names are a flat namespace (62 colliding names measured in the
+    shipped profile), so two runs of the same workflow is the *expected* case, not a corner."""
+    server, port, store_dir = _store(tmp_path, run_id="")      # a site serving any run
+    try:
+        staging.configure(enabled=True, store_host="127.0.0.1", store_port=port)
+        first = _write(str(tmp_path / "r1" / "x.txt"), b"run one output")
+        second = _write(str(tmp_path / "r2" / "x.txt"), b"run two output")
+        assert staging.put("x.txt", first, run_id="run-1").ok
+        assert staging.put("x.txt", second, run_id="run-2").ok
+
+        assert open(os.path.join(store_dir, "run-1", "x.txt"), "rb").read() == b"run one output"
+        assert open(os.path.join(store_dir, "run-2", "x.txt"), "rb").read() == b"run two output"
+
+        # And each run fetches its own, not whichever was stored first.
+        for run, expected in (("run-1", b"run one output"), ("run-2", b"run two output")):
+            dest = str(tmp_path / f"c-{run}"); os.makedirs(dest)
+            out = staging.fetch("x.txt", {"host": "127.0.0.1", "port": port}, dest, run_id=run)
+            assert out.ok, out.reason
+            assert open(os.path.join(dest, "x.txt"), "rb").read() == expected
+    finally:
+        server.stop(0)
+
+
+def test_a_store_refuses_an_upload_with_no_run(tmp_path):
+    """Without a run there is no namespace to file it under, and a flat store is exactly the
+    bug above."""
+    server, port, _ = _store(tmp_path, run_id="")
+    try:
+        staging.configure(enabled=True, store_host="127.0.0.1", store_port=port)
+        src = _write(str(tmp_path / "w" / "x.txt"), b"x")
+        result = staging.put("x.txt", src, run_id="")
+        assert not result.ok and "no run_id" in result.reason
+    finally:
+        server.stop(0)
+
+
+def test_a_within_run_collision_is_reported_not_silently_discarded(tmp_path, caplog):
+    """Keeping the first copy is the never-overwrite rule — something may be reading it — but
+    two different bodies under one name inside a single run is a real collision, and reporting
+    a clean store of bytes that were discarded is how it would stay invisible."""
+    import logging
+    server, port, store_dir = _store(tmp_path, run_id="run-1")
+    try:
+        staging.configure(enabled=True, store_host="127.0.0.1", store_port=port)
+        a = _write(str(tmp_path / "a" / "out.txt"), b"first body")
+        b = _write(str(tmp_path / "b" / "out.txt"), b"second body, different")
+        assert staging.put("out.txt", a, run_id="run-1").ok
+        with caplog.at_level(logging.ERROR, logger="swarm.execution.staging"):
+            assert staging.put("out.txt", b, run_id="run-1").ok
+
+        assert open(os.path.join(store_dir, "run-1", "out.txt"), "rb").read() == b"first body"
+        assert "DIFFERENT content" in caplog.text
+    finally:
+        server.stop(0)
+
+
+def test_an_identical_re_upload_is_silent(tmp_path, caplog):
+    """A deterministic re-run after reassignment uploads the same bytes; that is not a
+    collision and must not be reported as one."""
+    import logging
+    server, port, _ = _store(tmp_path, run_id="run-1")
+    try:
+        staging.configure(enabled=True, store_host="127.0.0.1", store_port=port)
+        src = _write(str(tmp_path / "w" / "out.txt"), b"same bytes")
+        assert staging.put("out.txt", src, run_id="run-1").ok
+        with caplog.at_level(logging.ERROR, logger="swarm.execution.staging"):
+            assert staging.put("out.txt", src, run_id="run-1").ok
+        assert "DIFFERENT content" not in caplog.text
+    finally:
+        server.stop(0)
+
+
+def test_a_run_id_cannot_climb_out_of_the_store(tmp_path):
+    """The run id reaches the store over the wire and is joined onto a directory, so it gets
+    the same containment rule the file names get."""
+    server, port, store_dir = _store(tmp_path, run_id="")
+    try:
+        staging.configure(enabled=True, store_host="127.0.0.1", store_port=port)
+        src = _write(str(tmp_path / "w" / "x.txt"), b"x")
+        assert staging.put("x.txt", src, run_id="../../escape").ok
+        assert not os.path.exists(os.path.join(os.path.dirname(store_dir), "escape"))
+        assert os.path.isfile(os.path.join(store_dir, "escape", "x.txt"))
+    finally:
+        server.stop(0)
+
+
+def test_an_agent_still_serves_bare_names(tmp_path):
+    """Only a store is keyed by (run, name). An agent serves one run's outputs, and the run
+    equality check already guards it — the key must not change underneath it."""
+    src = _write(str(tmp_path / "p" / "x.txt"), b"agent output")
+    server, loc = _serve(tmp_path, {"x.txt": src}, run_id="run-1")
+    dest = str(tmp_path / "c"); os.makedirs(dest)
+    try:
+        out = staging.fetch("x.txt", loc, dest, run_id="run-1")
+        assert out.ok, out.reason
+        assert open(os.path.join(dest, "x.txt"), "rb").read() == b"agent output"
+    finally:
+        server.stop(0)

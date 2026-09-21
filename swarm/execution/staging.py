@@ -179,6 +179,14 @@ def context() -> StagingContext:
     return _CONTEXT
 
 
+def _safe_run_dir(run_id: str) -> str:
+    """A run id as one directory component. Run ids are minted by `run_test.py`, but they reach
+    the store over the wire, so the same containment rule the file names get applies: this is
+    joined onto the store directory and must not climb out of it."""
+    safe = os.path.basename(str(run_id))
+    return safe if safe and safe not in (".", "..") else "_unnamed"
+
+
 class _Servicer(consensus_pb2_grpc.DataTransferServiceServicer):
     def __init__(self, published: PublishedFiles, run_id: str,
                  pol: Optional[StagingPolicy] = None, store_dir: Optional[str] = None):
@@ -210,7 +218,12 @@ class _Servicer(consensus_pb2_grpc.DataTransferServiceServicer):
                 f"{name!r} requested for run {request.run_id!r} but this agent serves "
                 f"{self.run_id!r}")
             return
-        path = self.published.path_for(name)
+        # At a staging site the namespace is (run, name), not name: one store serves many
+        # runs and workflow file names are a flat namespace — 62 colliding names measured in
+        # the shipped profile — so `x.txt` from another run is a different file that happens
+        # to share a spelling. An agent serves one run's outputs and needs no such key.
+        path = self.published.path_for(
+            f"{request.run_id}/{name}" if self.store_dir else name)
         if not path:
             yield from self._refuse(
                 f"{name!r} was not produced by this agent in this run "
@@ -283,8 +296,20 @@ class _Servicer(consensus_pb2_grpc.DataTransferServiceServicer):
                             ok=False,
                             error=f"upload for run {chunk.run_id!r} but this store serves "
                                   f"{self.run_id!r}")
+                    run = str(chunk.run_id or "")
+                    if not run:
+                        # Without a run there is no namespace to put this in, and a flat store
+                        # would let the next run's file of the same name collide with it — and
+                        # since the placement rule is never-overwrite, the collision resolves
+                        # *silently in favour of the older file*, which the store then serves.
+                        self.put_refused += 1
+                        return consensus_pb2.PutAck(
+                            ok=False, error="upload carries no run_id; a store is keyed by "
+                                            "(run, name) and cannot file it")
+                    run_dir = os.path.join(self.store_dir, _safe_run_dir(run))
+                    os.makedirs(run_dir, exist_ok=True)
                     tmp = os.path.join(
-                        self.store_dir,
+                        run_dir,
                         f".{local}.put.{os.getpid()}.{threading.get_ident()}")
                     fh = open(tmp, "wb")
                 if chunk.content:
@@ -307,18 +332,33 @@ class _Servicer(consensus_pb2_grpc.DataTransferServiceServicer):
                 return consensus_pb2.PutAck(ok=False, error="empty upload")
             fh.close()
             fh = None
-            dest = os.path.join(self.store_dir, local)
+            dest = os.path.join(run_dir, local)
             try:
                 os.link(tmp, dest)
             except FileExistsError:
-                pass                        # already stored; a re-upload is a no-op
+                # Already stored *for this run*. Keeping the first copy is the never-overwrite
+                # rule — something may be reading it — but within one run two different bodies
+                # under one name is a real collision, so say so rather than report a clean
+                # store of bytes that were discarded.
+                if digest is not None:
+                    try:
+                        with open(dest, "rb") as held:
+                            existing = hashlib.sha256(held.read()).hexdigest()
+                        if existing != digest.hexdigest():
+                            logger.error(
+                                "[STAGE_STORE] %s/%s already held with DIFFERENT content "
+                                "(held %s… vs offered %s…); the held copy stands and the "
+                                "upload was discarded", run, local,
+                                existing[:12], digest.hexdigest()[:12])
+                    except OSError:
+                        pass
             # Stored files are servable: the store is a peer like any other from a consumer's
             # point of view, which is what makes it a fallback rather than a special case.
-            self.published.publish(local, dest)
+            self.published.publish(f"{run}/{local}", dest)
             self.stored += 1
             self.bytes_stored += received
-            logger.info("[STAGE_STORE] %s from %s (%d bytes)", local, chunk.sender or "?",
-                        received)
+            logger.info("[STAGE_STORE] %s/%s from %s (%d bytes)", run, local,
+                        chunk.sender or "?", received)
             return consensus_pb2.PutAck(ok=True, bytes=received)
         except OSError as exc:
             self.put_refused += 1

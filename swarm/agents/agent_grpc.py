@@ -215,6 +215,17 @@ class Agent(Observer):
                 "location this agent publishes will be unusable. Set it to the address peers "
                 "reach this agent on.", self.grpc_host)
 
+        if pol.store_host and not os.environ.get("SWARM_RUN_ID", ""):
+            # A store is keyed by (run, name) and refuses an upload carrying no run, so without
+            # this every stage-out would fail one file at a time and the run would finish with
+            # no durable copy of anything. Refused at startup instead: it is a configuration
+            # fault that repeats for every job, which is the same reason an unknown execution
+            # mode raises rather than defaulting.
+            raise ValueError(
+                "runtime.execution.staging.store_host is set but SWARM_RUN_ID is empty. A "
+                "staging site files uploads under the run, and would refuse every one of them. "
+                "run_test.py exports SWARM_RUN_ID; an agent started by hand must too.")
+
         self.staged_files = staging.PublishedFiles()
         staging.set_context(locator=self.repository.data_locations,
                             run_id=os.environ.get("SWARM_RUN_ID", ""),

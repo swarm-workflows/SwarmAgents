@@ -49,9 +49,20 @@ def main() -> int:
     published = staging.PublishedFiles()
     # Anything already in the store is servable at startup, so a restarted site does not lose
     # what it is holding — which would defeat the point of it being the durable copy.
-    existing = {n: os.path.join(args.store_dir, n)
-                for n in os.listdir(args.store_dir)
-                if os.path.isfile(os.path.join(args.store_dir, n)) and not n.startswith(".")}
+    # The store is keyed by (run, name), so re-publishing walks one level down. A flat store
+    # would let the next run's file of the same name collide with a previous run's — and since
+    # placement is never-overwrite, that collision resolves silently in favour of the OLDER
+    # file, which the store then serves. Workflow file names are a flat namespace (62 colliding
+    # names measured in the shipped profile), so this is not a corner case.
+    existing = {}
+    for run in sorted(os.listdir(args.store_dir)):
+        run_dir = os.path.join(args.store_dir, run)
+        if not os.path.isdir(run_dir) or run.startswith("."):
+            continue
+        for n in os.listdir(run_dir):
+            full = os.path.join(run_dir, n)
+            if os.path.isfile(full) and not n.startswith("."):
+                existing[f"{run}/{n}"] = full
     published.publish_all(existing)
 
     server = staging.TransferServer(published, args.host, args.port, run_id=args.run_id,
