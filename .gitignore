@@ -195,3 +195,6 @@ docs/CONFERENCE_PAPER_PLAN.md
 docs/CCGRID27_PAPER_PLAN.md
 docs/FGCS_EVAL_PLAN.md
 docs/.plan-backups/
+
+# Local reviews of the local-only plans
+docs/*.review-*.md
