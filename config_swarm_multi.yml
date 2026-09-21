@@ -293,8 +293,10 @@ job_selection:
   # in both CLAUDE.md files and in the README as the candidate-pool control, and it never did
   # anything: the value was tested against the column best that had just been selected, so the
   # comparison asked whether best > best. An agent whose config still sets it logs a [CONFIG]
-  # warning and ignores it. To control how many agents bid on a job use designate_bidder below,
-  # which is measured (bidders_per_job / designate_forced_share).
+  # warning and ignores it. There is no replacement: a rule-based agent proposes exactly when it
+  # computes itself the cheapest assignee, and nothing widens or narrows that. designate_bidder
+  # below narrows bidders per job and is measured (bidders_per_job / designate_forced_share),
+  # but it is read only by LlmAgent — on a resource agent it is a no-op too.
 
   # Which assignees a hierarchical coordinator (level > 0) scores a job against. Leaf agents
   # (level 0) are unaffected by this key.

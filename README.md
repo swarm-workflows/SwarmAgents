@@ -305,7 +305,7 @@ from it. The knobs you are most likely to touch:
 | key | what it does |
 |---|---|
 | `job_selection.cost_weights` | CPU/RAM/disk/GPU weights in the cost function (sum ≈ 1.0) |
-| `job_selection.designate_bidder` | whether one agent per job bids, instead of every agent that thinks it is cheapest |
+| `job_selection.designate_bidder` | whether one agent per job bids, instead of every agent that thinks it is cheapest. **LLM agents only** — resource agents do not read it |
 | `consensus.protocol` | `pbft`, `snow`, or `hybrid`; Snow tuning under `consensus.snow.*` |
 | `failure_detection.protocol` | `heartbeat` or `swim` (SWIM runs alongside heartbeat) |
 | `gossip.enabled` | epidemic state dissemination, so peer load reaches cost estimates |

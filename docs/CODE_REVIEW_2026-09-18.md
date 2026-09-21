@@ -209,7 +209,10 @@ real effect would silently change the bidding regime of every one of them, which
   next to a TODO to read it from config. `accept_if`, the *absolute* gate, was never broken
   and stays.
 * An agent whose config still sets the key logs `[CONFIG] ... is IGNORED and always was` once
-  at startup, via `_warn_removed_job_selection_keys`, and is pointed at `designate_bidder`.
+  at startup, via `_warn_removed_job_selection_keys`. The message says there is **no**
+  replacement for a rule-based fleet, and names `designate_bidder` only with its restriction:
+  `_designate_bidders` runs in `LlmAgent.selection_main` alone, so recommending it flatly
+  would have answered one silently-inert key with a second one.
   Presence is tested with `is not None`, because `0.0` is falsy and that is exactly the config
   that believed it had disabled the pool.
 * It was **worse than inert at the edge**: `sel_cost` and `best` are the same number, so the

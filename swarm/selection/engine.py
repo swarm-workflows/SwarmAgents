@@ -244,8 +244,11 @@ class SelectionEngine:
         at the edge: with a negative best the inequality flips and it would have rejected every
         assignment. A tolerance around the best is only meaningful for a function that returns a
         *pool*; this one returns one winner per column, so the parameter had no correct form
-        here. `job_selection.designate_bidder` is the knob that actually decides how many agents
-        bid on a job, and it is measured (`bidders_per_job`, `designate_forced_share`).
+        here. What bounds bidders per job is the caller's own rule — an agent proposes only
+        when this function names it — and for a rule-based agent that is the whole story, with
+        no knob either way. `job_selection.designate_bidder` narrows it further and is measured
+        (`bidders_per_job`, `designate_forced_share`), but `_designate_bidders` runs only in
+        `LlmAgent.selection_main`, so it is not a replacement for a `ResourceAgent` fleet.
 
         :param accept_if: Optional final predicate on the selected score (e.g., ``lambda s: s < 1e9``).
             This is the *absolute* gate and it works: it is evaluated on the selected score

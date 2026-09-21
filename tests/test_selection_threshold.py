@@ -113,12 +113,30 @@ class TestTheConfigKeyIsAnnounced:
         a._warn_removed_job_selection_keys(job_cfg)
         return a.logger.warning.call_args_list
 
-    def test_an_old_config_is_told_and_pointed_somewhere_useful(self):
+    def test_an_old_config_is_told(self):
         calls = self._warn_for({"selection_threshold_pct": 10.0})
         assert len(calls) == 1
         rendered = str(calls[0].args[0]) % tuple(calls[0].args[1:])
-        assert "selection_threshold_pct=10.0" in rendered
-        assert "IGNORED" in rendered and "designate_bidder" in rendered
+        assert "selection_threshold_pct=10.0" in rendered and "IGNORED" in rendered
+
+    def test_the_advice_is_not_a_second_no_op(self):
+        """`designate_bidder` is read only by `LlmAgent`, so answering a dead key by telling a
+        resource-agent operator to set it would have replaced one silently-inert knob with
+        another — and since the coordinator default became `resource` on 2026-09-18, that is
+        most of a hierarchical fleet. The message must say there is no replacement, and may
+        name `designate_bidder` only with its restriction attached."""
+        from swarm.agents.llm.llm_agent import LlmAgent
+        from swarm.agents.resource_agent import ResourceAgent
+
+        # The premise, checked rather than asserted from memory.
+        assert hasattr(LlmAgent, "_designate_bidders")
+        assert not hasattr(ResourceAgent, "_designate_bidders")
+
+        rendered = str(
+            ResourceAgent._REMOVED_JOB_SELECTION_KEYS["selection_threshold_pct"])
+        assert "no replacement" in rendered
+        if "designate_bidder" in rendered:
+            assert "LlmAgent" in rendered, "named without its restriction"
 
     def test_a_clean_config_is_silent(self):
         assert self._warn_for({}) == []

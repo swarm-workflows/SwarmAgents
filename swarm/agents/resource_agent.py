@@ -2965,9 +2965,11 @@ class ResourceAgent(Agent):
     _REMOVED_JOB_SELECTION_KEYS = {
         "selection_threshold_pct": (
             "it was compared against the very cost it selected, so it could never reject "
-            "anything (code review 2026-09-20, §7). To control how many agents bid on a job "
-            "use job_selection.designate_bidder, which is measured as bidders_per_job / "
-            "designate_forced_share"
+            "anything (code review 2026-09-20, §7). There is no replacement for a rule-based "
+            "agent: it proposes exactly when it computes itself the cheapest assignee, and "
+            "nothing widens or narrows that. job_selection.designate_bidder narrows bidders "
+            "per job (measured as bidders_per_job / designate_forced_share) but is read only "
+            "by LlmAgent, so setting it on a resource agent does nothing either"
         ),
     }
 
