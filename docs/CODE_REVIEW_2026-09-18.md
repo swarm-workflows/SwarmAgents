@@ -271,14 +271,38 @@ failures count as completed; so does a job `_reassign_delegated_job` retires aft
 "failure-injection completion % is lower and honest" holds only for jobs that never finish. Define
 it in the plans (finished vs succeeded) or add `jobs_succeeded`.
 
-## 10. Exactly-once is a Snow property; PBFT has none under partition — **E6 scoping**
+## 10. Exactly-once is a Snow property; PBFT has none under partition — **E6 scoping — RESOLVED (scoped) 2026-09-20**
 
 `calculate_quorum` (`resource_agent.py:4073`) is `live//2 + 1` with a floor of 1, from each agent's
 own `neighbor_map`. Under a partition both sides reach quorum; PBFT has no CAS. Expect > 0 double
 assignments in PBFT partition cells and say so; the claim "safety comes from the CAS" is true of
 Snow only.
 
-## 11. Smaller
+**Scoped 2026-09-20.** Re-checked in the tree first, because the claim is about what the paper
+may assert: `try_claim_assignment` has exactly one caller, `gossip_engine.py:577`. PBFT's
+`select_job` persists the job READY and claims nothing. `calculate_quorum` is
+`live_agent_count // 2 + 1` with `max(1, …)`, over each agent's *own* `neighbor_map` — so a
+two-way split of 20 agents leaves each side with 10 live, each side's quorum at 6, and each side
+able to reach it alone. The floor means a fully isolated agent has quorum 1.
+
+So the statement E6 was going to make is a **Snow** statement, and making it protocol-neutral
+would be a safety claim the system does not have. Written into `FGCS_EVAL_PLAN.md` §E6 and the
+conference plan: the exactly-once argument is scoped to Snow, the PBFT partition cell is
+reported as a measurement rather than a guarantee, and a non-zero count there is the expected
+result rather than a failed run.
+
+**The audit has a vacuity trap and it is now recorded as an obligation.** E6 audits
+double-assignment "via the Redis `SET NX` claim keys". PBFT writes no claim keys, so that audit
+returns 0 for every PBFT cell — *absent* read as *zero*, which is the same mistake as the
+validity columns in §9 and §4. No double-assignment number may be reported for a PBFT cell from
+a claim-key audit; detecting it there needs evidence that two agents executed the same job,
+which no per-agent metric carries today (checked: `Metrics` records no per-job id list). Either
+that evidence gets added before E6, or the PBFT column says "not measured", never "0".
+
+Related: §5 shortened partition *detection* (a peer now goes stale at `peer_expiry_seconds`
+rather than at the Redis key TTL), so E6's heal-time numbers are on the new behaviour.
+
+## 11. Smaller — **ALL ADDRESSED 2026-09-20**
 
 * `gossip_engine.py:580` — a Snow CAS claim followed by `get_object() is None` fires no callback and
   is counted nowhere (only exceptions reach `finalize_errors`). Recoverable only if the winner
@@ -294,6 +318,46 @@ Snow only.
 * `_restart_selection` mutates `completed_jobs_set` without `completed_lock`; Snow's `conflicts`
   dict is unbounded where PBFT caps it; `TopologyType` members are 1-tuples (trailing commas) —
   harmless, compared by name.
+
+**All five addressed 2026-09-20** (`tests/test_review_smaller_items.py`, 13 tests; 9 fail
+against the pre-fix tree, plus updates to three tests in `test_review_fixes.py`).
+
+1. **The lost Snow finalization is now its own outcome.** It was worse than uncounted: it was
+   counted as a *finalize*. `finalize_lost` counts a decision whose CAS won but whose object
+   could not be read, it stays out of `finalized` and out of the rounds/queries/time
+   distributions (those describe decisions that placed a job), and the warning says whether the
+   idle claim is held by this agent. `finalized + abandoned + errors + lost` is the population.
+   `collect.py` carries `consensus_finalize_lost`. An existing test asserted the old behaviour
+   on the grounds that a vanished object "is not an error" — still true, and why it is a third
+   counter rather than folded into `finalize_errors`; the test is rewritten to say so.
+2. **PBFT no longer reports `abandoned` at all.** A hard-coded 0 stood next to Snow's measured
+   count, so the column compared a measurement against a placeholder. It is absent for the same
+   reason `rounds_*` already was, and `collect.py` reports the column only when some agent
+   reported it — a measured 0 still prints as 0.
+3. **`baselines/scheduler.py` had both halves of §8**, not just feasibility. `is_feasible`
+   rejected every `--dtn-names local` job, so E7 could not take a workflow bundle at all; and
+   `compute_cost` doubled it, while its docstring promises a formula identical to the agent's.
+   Both now call `Job.required_dtns()`, so the promise holds.
+4. **Snow's `conflicts` is bounded** at the same 4096 as PBFT's, through a `_bump_conflict`
+   mirroring it. It was unbounded on the engine that runs by default, and the two protocols'
+   conflict columns were not counted the same way.
+5. **`_restart_selection` already takes `completed_lock`** — it came with the §1 work, verified
+   rather than assumed. **`TopologyType`** no longer has trailing commas; `Ring`/`Star`/`Mesh`
+   were `(1,)`/`(2,)`/`(3,)` while `Hierarchical` was `4`. Nothing reads `.value` (checked), so
+   this changed no behaviour.
+
+**The LLM agent now honours the DAG.** `LlmAgent.selection_main` overrides the whole selection
+loop and had no `_data_predicate_ready` gate, so an LLM-agent run of a DAG-gated workflow could
+schedule a child before its parent wrote the files it reads. The gate is extracted as
+`_gate_on_data_predicates` and called from both loops — two copies is how one of them came to be
+missing — and in the LLM loop it runs *before* designation, so a job whose parents have not
+finished spends no inference. It filters by identity, not `in`: two jobs comparing equal would
+otherwise both vanish when one was gated.
+
+**The BLOCKED/infeasible half is deliberately left alone.** The LLM loop keeps such a job
+PENDING rather than BLOCKED, and says why in place: `_restore_infeasible_jobs` is called only by
+`ResourceAgent.selection_main`, so a BLOCKED job set here would never come back. Changing that
+would strand jobs, not fix them.
 
 ## 12. Found by the Codex pass and fixed today (commit `a02c0f84`, earlier commits)
 
@@ -331,3 +395,23 @@ ordering; `run_test.py` guards changed this week (launched-config scoping, three
 5. ~~§6 (SWIM advisory)~~ — done 2026-09-20.
 6. ~~§7 (inert threshold)~~ — done 2026-09-20.
 7. ~~§8 (local priced at zero)~~ — done 2026-09-20. It was two sites, not one.
+8. ~~§10 (E6 scoping)~~ and ~~§11 (smaller)~~ — done 2026-09-20.
+
+**All twelve findings are closed as of 2026-09-20.** §10 was resolved by scoping the claim
+rather than by code: the exactly-once argument is Snow's and the paper now says so. Everything
+else landed as a fix with tests that fail against the pre-fix tree.
+
+Three of them were larger than the finding described, which is worth remembering the next time
+one of these reads as "one-line":
+
+* §7's replacement advice was itself a no-op — `designate_bidder` is read only by `LlmAgent`,
+  so a resource-agent operator told to use it would have been handed a second dead key.
+* §8 was two sites, and the second one disabled the DTN capability filter for hierarchical
+  workflow delegation rather than merely shifting a cost.
+* §11's first bullet said the lost Snow finalization was "counted nowhere". It was counted as a
+  *success*, which is the opposite of nowhere and worse.
+
+**Numbers invalidated by this pass**, collected in one place: E5/F2 message and finalization
+counts (§1, §6), every hierarchical latency and completion column (§3, §9), F5 re-adoption
+(§5), and every converted-workflow cost, LLM-vs-analytic comparison and hierarchical workflow
+delegation (§8). `docs/FGCS_EVAL_PLAN.md` rows F-19 through F-23 carry the detail.

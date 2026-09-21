@@ -61,6 +61,7 @@ the paper's threats-to-validity section will want.
 
 | # | Bug | Why it matters to *this* plan | Fix as landed |
 |---|---|---|---|
+| F-23 | Five smaller review items (§11): a Snow decision whose CAS won but whose object could not be read was counted as a **finalize**; PBFT reported a hard-coded `abandoned: 0`; `baselines/scheduler.py` had both halves of the `local` defect; Snow's `conflicts` dict was unbounded; `LlmAgent.selection_main` had no data-predicate gate | The first inflates Snow's `finalized` while hiding lost assignments; the second compares a measurement against a placeholder across protocols; the third meant **E7 could not take a workflow bundle at all**; the fifth meant an LLM-agent run of a DAG-gated workflow ignored the DAG | ✅ 2026-09-20: `finalize_lost` is its own outcome and its own column, excluded from `finalized` and from the latency distributions; PBFT reports neither Snow-only field and `collect.py` distinguishes absent from a measured 0; the baseline calls `Job.required_dtns()`; `conflicts` is capped at 4096 like PBFT's; `_gate_on_data_predicates` is shared by both selection loops and runs before designation. `tests/test_review_smaller_items.py` (13; 9 fail pre-fix) |
 | F-22 | `local` is a Pegasus *site*, not a DTN, and five places subtracted it from a job's required DTNs while `compute_job_cost` and `_get_child_groups_for_job` rebuilt the set inline and kept it | No agent holds a DTN named `local`, so it scored 0.0 on every agent: **every cost in a converted-workflow run was doubled** at the shipped `connectivity_penalty_factor: 1.0`, moving the LLM-vs-analytic 0–100 comparison and the `tie_break_ref_cost: 11.85` reference. On hierarchical cells an all-local job matched no child group, so the DTN capability filter was inert and the bandit's candidate set was every active group — a C1 measurement, not just a cost shift | ✅ 2026-09-20: `Job.required_dtns()` is the single definition and nothing reads the cache behind it. `tests/test_local_dtn_cost.py` (13; 9 fail pre-fix) |
 | F-21 | `job_selection.selection_threshold_pct` was compared against the column best that had just been selected, so the test reduced to `best > best` | A knob documented in the shipped config, both CLAUDE.md files, the README, `COMPLEXITY.md` and `GOSSIP_CONSENSUS_DESIGN.md` as *the* candidate-pool control selected nothing; two of those documents built message-complexity arguments on it | ✅ 2026-09-20: deleted rather than implemented — a tolerance around the best needs a function returning a pool, and giving the shipped `10.0` an effect would silently change the bidding regime of the 57 generated configs carrying it. The parameter now raises instead of being a no-op; an old config logs `[CONFIG] ... is IGNORED` and is told there is no replacement for a rule-based fleet (`designate_bidder` is named with its `LlmAgent`-only restriction, not as a substitute). Both analyses re-stated on the argmin rule, which is *tighter* than they claimed. `tests/test_selection_threshold.py` (10; 5 fail pre-fix) |
 | F-20 | SWIM's FAILED set gated consensus `broadcast` while `calculate_quorum` counted `neighbor_map`, which still held those peers; and `_merge_one` ranked claims by severity alone, so a refutation could never clear a FAILED | A SWIM false positive removed a live voter without lowering the quorum it had to clear — under PBFT the job waited out a reselection timeout — and SWIM false-fails **under consensus bursts**, i.e. in the collapse cell E5/F2 is about. The verdict was also permanent, costing that peer its place in Snow's live sample and the gossip fan-out for the rest of the run | ✅ 2026-09-20: `Agent.consensus_skip_set` is heartbeat's failed set alone, a subset of what `neighbor_map` already excludes, so the set an agent talks to and the set it counts are one by construction; `_supersedes` orders claims by incarnation first and severity only within one incarnation. `tests/test_swim_advisory.py` (16; 10 fail pre-fix) |
@@ -865,12 +866,29 @@ for free — include a per-node network-bytes panel as a figure.
 - Repeats: 3 (low variance).
 
 ### E6 — Safety and correctness (cheap, defuses a known reviewer attack)
+- **The exactly-once argument is a Snow argument and the paper must say so** (code review §10,
+  scoped 2026-09-20). `try_claim_assignment` has one caller, `swarm/consensus/gossip_engine.py`;
+  PBFT's `select_job` persists the job READY and claims nothing. `calculate_quorum` is
+  `live_agent_count // 2 + 1` with a floor of 1, taken over each agent's *own* `neighbor_map`, so
+  a two-way split of 20 agents gives each side 10 live and a quorum of 6, which each side reaches
+  alone; an isolated agent has quorum 1. Under PBFT, **both sides of a partition finalize the same
+  job and nothing prevents it.** Report that as a measurement, not a failure: a non-zero count in
+  the PBFT partition cell is the expected result, and a protocol-neutral "safety comes from the
+  CAS" sentence would assert a property the system does not have.
 - Zero double-assignment audit via the Redis `SET NX` claim keys (`try_claim_assignment`) across
   **every** run in the campaign — report as an aggregate ("0 double-assignments in N jobs across M runs").
+  **Snow cells only.** PBFT writes no claim keys, so this audit returns 0 for every PBFT cell by
+  construction — *absent* read as *zero*, the same mistake as the §4 and §9 validity columns.
+  Detecting it under PBFT needs evidence that two agents executed the same job, which no
+  per-agent metric carries today (`Metrics` records no per-job id list). Until that exists the
+  PBFT column reads **"not measured"**, never 0.
 - A dedicated partition test: split the 17 sites into two groups with iptables/netem blackhole, verify
-  no two sub-groups both finalize the same job, and report behavior on heal. The eScience reviewer
-  explicitly questioned quorum under partition with Redis-inferred `n_live` — answer it with data plus
-  a short argument (safety comes from the Redis CAS claim, not from quorum inference; state that).
+  no two sub-groups both finalize the same job **under Snow**, and report behavior on heal. The
+  eScience reviewer explicitly questioned quorum under partition with Redis-inferred `n_live` —
+  answer it with data plus a short argument (under Snow, safety comes from the Redis CAS claim and
+  not from quorum inference; under PBFT it does not hold and the measurement says so). Note §5
+  shortened partition *detection*: a peer now goes stale at `peer_expiry_seconds` rather than at
+  the agent key's TTL, so heal-time numbers are on the new behaviour.
 - **Tooling gap (2026-09-14):** no partition driver exists. The only iptables/netem in the tree is
   a netplan firewall setup script; blackholing one site group from another and healing it on a
   timer is a small script, but it has to be written and rehearsed at Hier-30 before the freeze.
@@ -936,7 +954,7 @@ reviewer repeated them independently. Design them out now:
 | "No comparison with state of the art" (R2/R3/R4, and repeated by the eScience reviewer) | E7 with a real distributed baseline, not just your own priors. Implement one sampling-based scheduler (Sparrow-style late binding, ~200 LOC on top of `baselines/`) and discuss Firmament / Omega / Sparrow / Ray-style placement in related work with a positioning table. **Non-negotiable.** |
 | "Only high-performance network / geo-distribution not really tested" | E3a — 17 sites, per-RTT-bin results, including transatlantic (AMST) and Hawaii. |
 | "Synthetic workloads too easy; failure paths never exercised" | Pegasus-derived workloads throughout; E2b and E6 drive real churn and partition; report reselection counts explicitly. |
-| "Safety argument is informal; Redis undermines the decentralization claim" | E6 partition test + explicit safety statement (exactly-once rests on a CAS claim, not on quorum inference). Also state the Redis role honestly and cite `DECENTRALIZED_POOL_DESIGN.md` as the direction of travel. |
+| "Safety argument is informal; Redis undermines the decentralization claim" | E6 partition test + explicit safety statement, **scoped to Snow**: exactly-once rests on the Redis CAS claim rather than on quorum inference, and `try_claim_assignment` has one caller — the Snow engine. PBFT claims nothing and its quorum is a per-agent majority of `neighbor_map` with a floor of 1, so both sides of a partition finalize; that is reported as a measured property of the PBFT arm, not hidden. Claiming it protocol-neutrally is the one thing that would turn a defensible answer into an overclaim. Also state the Redis role honestly and cite `DECENTRALIZED_POOL_DESIGN.md` as the direction of travel. |
 | "Three features stapled together" (the *new* risk) | §1 thesis and E1's factorial. Every section must point back to the interaction claim. |
 
 ---

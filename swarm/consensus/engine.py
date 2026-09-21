@@ -129,11 +129,18 @@ class ConsensusEngine:
         is fixed, so a column of 3s would invite a comparison of round counts across
         protocols that means nothing. Compare `finalize_s_*` and the transport's message
         counts instead.
+
+        `abandoned` is absent for the same reason, and used to be a hard-coded 0 (code review
+        §11). PBFT does not abandon: a stuck object is left to the reselection timeout, so
+        there is no count to report. Zero is the answer to "how many were abandoned", and PBFT
+        cannot answer it — absent, not zero, or a cross-protocol `abandoned` column reads as
+        though PBFT abandoned nothing where Snow abandoned some, which is a comparison of a
+        measurement against a constant. `finalize_lost` is absent here too; it is the Snow CAS
+        path and PBFT has no CAS.
         """
         stats: dict = {
             "protocol": "pbft",
             "finalized": self.finalized_count,
-            "abandoned": 0,  # PBFT leaves stuck objects to the reselection timeout
             "reproposals": self.reproposals,
             "conflict_rounds": sum(self.conflicts.values()),
             "conflict_objects": len(self.conflicts),

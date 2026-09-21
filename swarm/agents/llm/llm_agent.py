@@ -1254,6 +1254,14 @@ class LlmAgent(ResourceAgent):
                 proposals = []
                 jobs = []
 
+                # Data-triggered gating, shared with `ResourceAgent.selection_main`. It runs
+                # BEFORE designation so a job whose parents have not produced their files
+                # neither bids nor spends an LLM call on being designated.
+                pending_jobs = self._gate_on_data_predicates(pending_jobs)
+                if not pending_jobs:
+                    time.sleep(0.5)
+                    continue
+
                 # Step 0 (optional): decide who *should* bid on each job using the cheap analytic
                 # model, and drop the rest. This is the only step that reduces LLM calls per
                 # placed job; everything below still scores only this agent.

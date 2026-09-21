@@ -25,9 +25,13 @@ import enum
 
 
 class TopologyType(enum.Enum):
-    Ring = enum.auto(),
-    Star = enum.auto(),
-    Mesh = enum.auto(),
+    # No trailing commas: they made Ring/Star/Mesh 1-TUPLES `(1,)` while Hierarchical was the
+    # bare int `4` (code review §11). Harmless while members are only compared by identity and
+    # resolved by name, which is all this codebase does — checked — but a `.value` that is
+    # sometimes a tuple and sometimes an int is a trap for anything that serializes one.
+    Ring = enum.auto()
+    Star = enum.auto()
+    Mesh = enum.auto()
     Hierarchical = enum.auto()
 
     def __repr__(self):

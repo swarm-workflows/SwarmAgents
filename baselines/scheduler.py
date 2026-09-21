@@ -111,12 +111,12 @@ class BaselineScheduler(ABC):
         if not agent.can_fit(job.capacities):
             return False
 
-        # DTN connectivity check
-        required_dtns = set()
-        for dn in (job.data_in or []):
-            required_dtns.add(dn.name)
-        for dn in (job.data_out or []):
-            required_dtns.add(dn.name)
+        # DTN connectivity check. `Job.required_dtns()` is the one definition of that set and
+        # excludes `local`, which is a Pegasus *site* rather than a data transfer node. This
+        # was ported from `ResourceAgent` without the exclusion, so a `--dtn-names local`
+        # bundle was infeasible everywhere and E7 could not run a converted workflow at all
+        # (code review §11). Campaign jobs carry real DTN names, so it bit only workflow input.
+        required_dtns = job.required_dtns()
 
         if required_dtns:
             agent_dtn_names = set(agent.dtns.keys())
@@ -209,12 +209,11 @@ class BaselineScheduler(ABC):
         else:
             time_penalty = 1 + (wall_time / long_job_threshold) ** 2
 
-        # DTN connectivity penalty
-        required_dtns = set()
-        for dn in (job.data_in or []):
-            required_dtns.add(dn.name)
-        for dn in (job.data_out or []):
-            required_dtns.add(dn.name)
+        # DTN connectivity penalty. Same single definition as feasibility above — this block
+        # had the agent's §8 defect too, scoring `local` at 0.0 on every agent and doubling
+        # every cost, which would have made the baseline's costs incomparable with the
+        # scheduler's on exactly the workflow cells E7 compares them on.
+        required_dtns = job.required_dtns()
 
         if required_dtns:
             agent_dtn_scores = {

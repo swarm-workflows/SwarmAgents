@@ -466,7 +466,12 @@ def instrumentation_metrics(agents: dict[str, dict], meta: dict | None = None,
         return out
 
     sent = sent_bytes = recv = recv_bytes = dropped = 0
-    finalized = abandoned = 0
+    finalized = abandoned = lost = 0
+    # `abandoned` and `finalize_lost` are Snow-only: PBFT does not abandon (a stuck object goes
+    # to the reselection timeout) and has no CAS to lose one on. Reported only if some agent
+    # actually reported them, so a pure-PBFT cell reads absent rather than a confident 0 next
+    # to Snow's measured count (code review §11).
+    have_abandoned = have_lost = False
     protocols: set[str] = set()
     llm_calls = llm_failures = llm_in = llm_out = 0
     bid_jobs = bid_calls = designated = forced = claimed_jobs = 0
@@ -528,7 +533,12 @@ def instrumentation_metrics(agents: dict[str, dict], meta: dict | None = None,
             have_consensus = True
             protocols.add(str(consensus.get("protocol", "")))
             finalized += int(consensus.get("finalized", 0) or 0)
-            abandoned += int(consensus.get("abandoned", 0) or 0)
+            if consensus.get("abandoned") is not None:
+                have_abandoned = True
+                abandoned += int(consensus.get("abandoned") or 0)
+            if consensus.get("finalize_lost") is not None:
+                have_lost = True
+                lost += int(consensus.get("finalize_lost") or 0)
             # Per-agent p50s, weighted equally on purpose: each is one agent's typical
             # finalize, and the figure compares agents' experience across protocols.
             for key, sink in (("finalize_s_p50", finalize_s), ("rounds_p50", rounds)):
@@ -589,7 +599,11 @@ def instrumentation_metrics(agents: dict[str, dict], meta: dict | None = None,
     if have_consensus:
         out["consensus_protocol"] = "/".join(sorted(p for p in protocols if p)) or float("nan")
         out["consensus_finalized"] = finalized
-        out["consensus_abandoned"] = abandoned
+        out["consensus_abandoned"] = abandoned if have_abandoned else None
+        # A decision whose CAS won but whose object could not be read: no leader elected, no
+        # participant commit, no assignment. Non-zero means work was lost, so it belongs on the
+        # row beside `finalized` rather than in a log.
+        out["consensus_finalize_lost"] = lost if have_lost else None
         out.update(_dist("finalize_s", pd.Series(finalize_s, dtype=float)))
         out.update(_dist("rounds", pd.Series(rounds, dtype=float)))
     if have_llm:

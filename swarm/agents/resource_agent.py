@@ -803,6 +803,24 @@ class ResourceAgent(Agent):
             return False
         return True
 
+    def _gate_on_data_predicates(self, pending_jobs: list) -> list:
+        """Drop jobs whose data predicate is not satisfied yet, and send them to the back of
+        the pending queue so they are retried rather than lost.
+
+        A method rather than inline loop code because `LlmAgent.selection_main` is a full
+        override of the selection loop and had no gate at all, so an LLM-agent run of a
+        DAG-gated workflow **ignored the DAG** and could schedule a child before its parent
+        wrote the files it reads (code review §11). Two copies of a gate is how that happened;
+        one copy is the fix.
+        """
+        gated = [j for j in pending_jobs if not self._data_predicate_ready(j)]
+        if not gated:
+            return pending_jobs
+        for job in gated:
+            self.queues.pending_queue.move_to_end(job)
+        blocked = {id(j) for j in gated}
+        return [j for j in pending_jobs if id(j) not in blocked]
+
     def _data_predicate_ready(self, job: Job) -> bool:
         """
         True when the job's data predicate is satisfied (or absent). Gated jobs are not
@@ -2516,17 +2534,10 @@ class ResourceAgent(Agent):
                     self.queues.pending_event.clear()
                     continue
 
-                # Data-triggered gating: jobs whose data predicate isn't
-                # satisfied yet (e.g. "at least N snapshots from experiment X")
-                # stay PENDING at the back of the queue until the data exists
-                gated = [j for j in pending_jobs if not self._data_predicate_ready(j)]
-                if gated:
-                    for job in gated:
-                        self.queues.pending_queue.move_to_end(job)
-                    pending_jobs = [j for j in pending_jobs if j not in gated]
-                    if not pending_jobs:
-                        time.sleep(0.5)
-                        continue
+                pending_jobs = self._gate_on_data_predicates(pending_jobs)
+                if not pending_jobs:
+                    time.sleep(0.5)
+                    continue
 
                 proposals = []
                 jobs = []

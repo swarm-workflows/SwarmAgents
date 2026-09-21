@@ -117,7 +117,7 @@ All from `FGCS_EVAL_PLAN.md` §5, with the decision-plane axis restricted to `{a
 | E2 | Delegation quality + E2a non-stationarity + E2b churn | C1 in full. This is the paper's deepest experiment |
 | E3a | Per-RTT-bin analysis over E1′ runs | C3 on the real WAN. Analysis only — **but see §4: nothing measures RTT yet** |
 | E5 | Coordination overhead | The mechanism behind C3: messages/job, rounds to finalize |
-| E6 | Safety and correctness | Defuses "did your gossip protocol double-assign anything" |
+| E6 | Safety and correctness | Defuses "did your gossip protocol double-assign anything". **Scoped to Snow** (code review §10): `try_claim_assignment` has one caller, the Snow engine; PBFT claims nothing and its quorum is a per-agent majority of `neighbor_map` floored at 1, so both sides of a partition finalize. The PBFT partition cell reports a count, not a guarantee, and a claim-key audit reads 0 there by construction — that column says "not measured" |
 | E7 | External baselines | See §7 — not optional at this venue. **Sparrow-style baseline is not written** |
 
 **Fleet (re-revised 2026-09-14: PSC is back, 92 of 92 VMs up).** The 2026-09-10 revision

@@ -161,6 +161,13 @@ class GossipConsensusEngine:
         self.outgoing = ProposalContainer()
         self.incoming = ProposalContainer()
         self.conflicts: Dict[str, int] = {}
+        # Same cap and the same reason as the PBFT engine: `conflicts` is diagnostic (it feeds
+        # `conflict_rounds`/`conflict_objects`), and it was unbounded here while PBFT capped it
+        # — so a long, high-churn run grew it without limit on exactly the engine that runs by
+        # default, and the two protocols' conflict columns were not counted the same way
+        # (code review §11). Oldest entries are evicted first; the aggregates stay exact for
+        # everything still tracked.
+        self._conflicts_max = 4096
 
         self._lock = threading.RLock()
         # Counter lock, deliberately separate from `_lock`. These are incremented from the
@@ -182,6 +189,8 @@ class GossipConsensusEngine:
         self.finalized_count = 0
         self.abandoned_count = 0
         self.finalize_errors = 0
+        # CAS won, object unreadable: no assignment produced. Never folded into `finalized`.
+        self.finalize_lost = 0
 
     def _alpha_threshold(self, sample_size: int) -> int:
         """Supermajority vote count required, relative to the peers actually sampled
@@ -508,9 +517,7 @@ class GossipConsensusEngine:
                 state.last_choice = top_choice
             else:
                 state.confidence = 0
-                self.conflicts[state.proposal.object_id] = (
-                    self.conflicts.get(state.proposal.object_id, 0) + 1
-                )
+                self._bump_conflict(state.proposal.object_id)
 
             ready_to_commit = state.confidence >= self.beta
 
@@ -584,20 +591,36 @@ class GossipConsensusEngine:
             f"queried={state.queried} elapsed={elapsed:.3f}s reason={reason}"
         )
         obj = self.host.get_object(state.proposal.object_id)
-        if obj is not None:
-            if int(winner) == self.agent_id:
-                self.host.log_info(
-                    f"[SNOW_LEADER] Object:{state.proposal.object_id} "
-                    f"agent:{self.agent_id} reason={reason}"
-                )
-                obj.leader_id = self.agent_id
-                self.host.on_leader_elected(obj, state.proposal.p_id)
-            else:
-                self.host.log_info(
-                    f"[SNOW_PART] Object:{state.proposal.object_id} "
-                    f"leader:{winner} reason={reason}"
-                )
-                self.host.on_participant_commit(obj, int(winner), state.proposal.p_id)
+        if obj is None:
+            # The CAS succeeded — the claim key now names `winner` — but the object is in
+            # neither the local pending queue nor Redis, so no leader is elected and no
+            # participant commits. The decision produced no assignment, and until 2026-09-20
+            # it was still counted in `finalized`: a flattering overcount, and the loss was
+            # visible nowhere (only an exception reaches `finalize_errors`). Recoverable only
+            # if the winner re-proposes, and if the winner is *this* agent the claim key is
+            # now held by an agent that will not act on it (code review §11).
+            with self._stats_lock:
+                self.finalize_lost += 1
+            self.host.log_warn(
+                f"[snow] finalize of {state.proposal.object_id} LOST: claim went to "
+                f"{winner} but the object could not be read"
+                f"{' (that is this agent, so the claim is held and idle)' if int(winner) == self.agent_id else ''}"
+                f"; reason={reason}")
+            return
+
+        if int(winner) == self.agent_id:
+            self.host.log_info(
+                f"[SNOW_LEADER] Object:{state.proposal.object_id} "
+                f"agent:{self.agent_id} reason={reason}"
+            )
+            obj.leader_id = self.agent_id
+            self.host.on_leader_elected(obj, state.proposal.p_id)
+        else:
+            self.host.log_info(
+                f"[SNOW_PART] Object:{state.proposal.object_id} "
+                f"leader:{winner} reason={reason}"
+            )
+            self.host.on_participant_commit(obj, int(winner), state.proposal.p_id)
 
         # Counted last, and only here: `_finalize_work` charges any exception to
         # `finalize_errors`, so incrementing before the host callbacks reported a single
@@ -612,6 +635,13 @@ class GossipConsensusEngine:
         if elapsed >= 0:
             self.time_to_finalize.add(elapsed)
 
+    def _bump_conflict(self, object_id: str) -> None:
+        """Count one round that failed the alpha threshold, bounded. Mirrors the PBFT engine's
+        `_bump_conflict` so the two protocols' conflict columns mean the same thing."""
+        if object_id not in self.conflicts and len(self.conflicts) >= self._conflicts_max:
+            self.conflicts.pop(next(iter(self.conflicts)), None)   # evict oldest
+        self.conflicts[object_id] = self.conflicts.get(object_id, 0) + 1
+
     def consensus_stats(self) -> Dict[str, object]:
         """Per-agent finalization accounting, in the shape the PBFT engine also emits.
 
@@ -624,8 +654,13 @@ class GossipConsensusEngine:
             "finalized": self.finalized_count,
             "abandoned": self.abandoned_count,
             # Decisions that left the pending set without reaching either outcome: the CAS or
-            # a host callback raised. finalized + abandoned + errors is the whole population.
+            # a host callback raised.
             "finalize_errors": self.finalize_errors,
+            # Decisions whose CAS succeeded but whose object could not be read, so no
+            # assignment was produced. Deliberately NOT in `finalized`, and not in the
+            # rounds/queries/time distributions either — those describe decisions that placed
+            # a job. finalized + abandoned + errors + lost is the whole population.
+            "finalize_lost": self.finalize_lost,
             "sends_dropped": self.sends_dropped,
             "conflict_rounds": sum(self.conflicts.values()),
             "conflict_objects": len(self.conflicts),

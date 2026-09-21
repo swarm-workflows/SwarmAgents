@@ -231,7 +231,29 @@ def test_finalize_counter_is_taken_under_the_lock():
     state.queried = 1
     eng._finalize_work_inner(state, candidate=1, reason="t")
     assert eng._stats_lock.acquisitions == 1
-    assert eng.finalized_count == 1
+    # `get_object -> None` is the LOST path since 2026-09-20 (code review §11): the CAS won but
+    # no assignment was produced, so it is neither `finalized` nor an error. The subject here is
+    # still the lock — one acquisition, whichever counter it guards.
+    assert (eng.finalize_lost, eng.finalized_count) == (1, 0)
+
+
+def test_the_success_path_takes_the_lock_once_too():
+    # The companion the lock tests were missing: both of them reached the counter through
+    # `get_object -> None`, which is now a different outcome from a real finalize.
+    eng = _snow()
+    eng._stats_lock = _CountingLock()
+    eng.host.try_claim_assignment.return_value = 1
+    eng.host.get_object.return_value = MagicMock()
+    state = MagicMock()
+    state.proposal.object_id = "j1"
+    state.started_at = 0.0
+    state.round_no = 1
+    state.queried = 1
+
+    eng._finalize_work_inner(state, candidate=1, reason="t")
+
+    assert eng._stats_lock.acquisitions == 1
+    assert (eng.finalized_count, eng.finalize_lost, eng.finalize_errors) == (1, 0, 0)
 
 
 def test_finalize_counter_totals_correctly_across_threads():
@@ -255,7 +277,8 @@ def test_finalize_counter_totals_correctly_across_threads():
     for t in threads:
         t.join()
 
-    assert eng.finalized_count == 2000
+    assert eng.finalize_lost == 2000      # the no-object path; see the test above
+    assert eng.finalized_count == 0
 
 
 def test_a_finalize_that_raises_is_counted_not_just_logged():
@@ -303,8 +326,14 @@ def test_a_failed_host_callback_is_an_error_not_also_a_finalize():
     assert stats["finalized"] + stats["abandoned"] + stats["finalize_errors"] == 1
 
 
-def test_a_finalize_with_no_object_still_counts_as_finalized():
-    """The CAS happened; the object merely went away. That is not an error."""
+def test_a_finalize_with_no_object_is_neither_a_success_nor_an_error():
+    """The CAS happened; the object merely went away. That is not an error — which is what
+    this test asserted when it was written, and still is. But it is not a *finalize* either,
+    and counting it as one was a flattering overcount: no leader was elected, no participant
+    committed, and the claim key now names an agent that will not act on it, so the job is
+    recoverable only if the winner re-proposes. It is its own outcome (code review §11), and
+    `finalized + abandoned + errors + lost` is the whole population.
+    """
     eng = _snow()
     eng.host.try_claim_assignment.return_value = 1
     eng.host.get_object.return_value = None
@@ -316,7 +345,32 @@ def test_a_finalize_with_no_object_still_counts_as_finalized():
 
     eng._finalize_work(state, candidate=1, reason="test")
 
-    assert (eng.finalized_count, eng.finalize_errors) == (1, 0)
+    assert (eng.finalized_count, eng.finalize_errors, eng.finalize_lost) == (0, 0, 1)
+    stats = eng.consensus_stats()
+    assert stats["finalized"] + stats["abandoned"] + stats["finalize_errors"] \
+        + stats["finalize_lost"] == 1
+    assert eng.host.on_leader_elected.call_count == 0
+    assert eng.host.on_participant_commit.call_count == 0
+
+
+def test_a_lost_finalize_stays_out_of_the_latency_distributions():
+    """`rounds_*` and `finalize_s_*` describe decisions that placed a job. A decision that
+    placed none must not enter them, or the summaries describe a population they are not
+    counted with."""
+    eng = _snow()
+    eng.host.try_claim_assignment.return_value = 1
+    eng.host.get_object.return_value = None
+    state = MagicMock()
+    state.proposal.object_id = "j1"
+    state.started_at = 0.0
+    state.round_no = 9
+    state.queried = 9
+
+    eng._finalize_work(state, candidate=1, reason="test")
+
+    assert eng.rounds_to_finalize.count == 0
+    assert eng.queries_to_finalize.count == 0
+    assert eng.time_to_finalize.count == 0
 
 
 def test_unknown_engine_name_is_refused():
