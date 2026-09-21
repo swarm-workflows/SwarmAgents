@@ -398,24 +398,44 @@ class Agent(Observer):
         except Exception as e:
             self.logger.debug(f"Failed to enqueue message: {message}, error: {e}")
 
-    def broadcast(self, message: Message):
-        # Skip peers known to be FAILED (SWIM failed set and/or heartbeat detection) —
-        # otherwise every consensus phase pays full send timeouts for dead peers.
-        # SWIM SUSPECT peers still receive traffic so they can refute the suspicion.
-        peers = self.topology.peers
-        skip = set()
-        swim = getattr(self, "swim", None)
-        if swim is not None:
-            try:
-                skip.update(swim.failed_agents())
-            except Exception:
-                pass
+    def consensus_skip_set(self) -> set:
+        """Peers a consensus phase must NOT send to.
+
+        Exactly the peers heartbeat detection has declared failed — the same authority
+        `calculate_quorum` counts through, since `_remove_failed_agents` takes them out of
+        `neighbor_map` and `_refresh_agent_map` refuses to re-add them while they are in here.
+        The two sets are therefore the same set by construction, which is the point: **an agent
+        must never silence a peer it still counts towards quorum.**
+
+        **SWIM is deliberately not consulted** (code review 2026-09-18, §6). It used to be, and
+        a SWIM false-FAILED then removed a live peer from every consensus phase while quorum
+        went on being computed over `neighbor_map`, which still contained it. Under PBFT that
+        peer could not vote and the job waited out a reselection timeout; under Snow it merely
+        abstained. SWIM false-fails precisely under consensus bursts — acks queue behind the
+        single inbound consumer and blow the probe window, which is why `live_peer_ids` already
+        treats an empty SWIM live set as a false reading — so the regime where the skip cost
+        the most was the regime it fired most in, and the collapse cell was biased against
+        PBFT for a reason that is not PBFT. The docs say heartbeat is authoritative; this is
+        what makes that true for `broadcast` as well as for reassignment. SWIM keeps its real
+        jobs: Snow's live-peer sample and gossip fan-out, neither of which is a quorum.
+
+        The efficiency this gives up is small. Skipping was introduced in the same commit as
+        the fire-and-forget broadcast pool (`85f26208`), and it is the pool that removed the
+        ~8.7 s serial block per dead peer per phase; what remains is pool slots held for a
+        dead peer's send timeout until heartbeat evicts it, which the bounded semaphore already
+        sheds and counts rather than letting it block.
+        """
         failed_map = getattr(self, "failed_agents", None)
-        if failed_map is not None:
-            try:
-                skip.update(failed_map.keys())
-            except Exception:
-                pass
+        if failed_map is None:
+            return set()
+        try:
+            return set(failed_map.keys())
+        except Exception:
+            return set()
+
+    def broadcast(self, message: Message):
+        peers = self.topology.peers
+        skip = self.consensus_skip_set()
         if skip:
             peers = [p for p in peers if p not in skip]
         self.transport.broadcast(payload=message,
@@ -432,7 +452,10 @@ class Agent(Observer):
                       timeout=timeout, retries=retries)
 
     def calculate_quorum(self) -> int:
-        # Simple majority quorum calculation
+        # Simple majority over the live set. `live_agent_count` is `len(neighbor_map)`, and
+        # `consensus_skip_set` is a subset of what that map already excludes — see the note
+        # there: the peers we refuse to talk to and the peers we count must be one set, or a
+        # quorum can be made unreachable by construction.
         return (self.live_agent_count // 2) + 1
 
 

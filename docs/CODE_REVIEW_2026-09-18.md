@@ -152,7 +152,7 @@ Consequence for the plans: F5 measures liveness detection from this revision on.
 time-to-re-adoption number is delegation-timeout learning plus a 600 s Redis TTL and is not
 comparable.
 
-## 6. SWIM is not advisory for consensus traffic — **MEDIUM**
+## 6. SWIM is not advisory for consensus traffic — **MEDIUM — FIXED 2026-09-20**
 
 `swarm/agents/agent_grpc.py:410` (`broadcast` skips `swim.failed_agents()`),
 `swarm/membership/swim.py:524` (`_merge_one` accepts FAILED over ALIVE by rank regardless of
@@ -161,6 +161,32 @@ consensus traffic to a live peer while quorum is still computed from `neighbor_m
 includes it: under PBFT the peer cannot vote and the job waits for reselection; under Snow it merely
 abstains. The docs say heartbeat is authoritative; for `broadcast` it is not. Either skip only
 peers in `failed_agents` (heartbeat), or make `calculate_quorum` use the same live set.
+
+**Fixed 2026-09-20** (`tests/test_swim_advisory.py`, 16 tests; 10 fail against the pre-fix
+behaviour). Took the first option, and fixed the merge as well — the two are one defect seen
+from either end.
+
+* **`broadcast` no longer consults SWIM.** `Agent.consensus_skip_set` is heartbeat's failed
+  set alone, which is a subset of what `neighbor_map` already excludes, so the peers an agent
+  refuses to talk to and the peers it counts towards quorum are one set by construction.
+  Lowering the quorum instead was the wrong half of the choice: SWIM's view differs per agent
+  and false-fails in bursts, so subtracting it from the denominator would let two disjoint
+  quorums form under exactly the conditions §10 already says PBFT has no exactly-once for.
+  The efficiency given up is small — the skip and the fire-and-forget broadcast pool landed in
+  the same commit (`85f26208`), and it is the pool that removed the ~8.7 s serial block per
+  dead peer per phase; what is left is pool slots held until heartbeat evicts the peer, which
+  the bounded semaphore sheds and counts.
+* **`_merge_one` compares incarnation first, severity second** (`_supersedes`). Rank dominance
+  alone rejected the ALIVE-at-incarnation+1 that `_maybe_refute` emits, so a FAILED verdict was
+  permanent — and since `_pick_probe_target` never probes a FAILED peer, there was no second
+  route back. A false positive removed a live peer from Snow's sample and the gossip fan-out
+  for the rest of the run. A stale rumour below the subject's current incarnation is now
+  dropped however severe, which is the same rule the widely deployed implementation uses.
+
+Consequence for the plans: SWIM was capable of silently shrinking the effective voter set of a
+PBFT tier under load, and the regime it fired in most is the collapse cell. **No E5/F2 message
+or finalization number measured before this is citable** — which is already true of that cell
+for §1.
 
 ## 7. `job_selection.selection_threshold_pct` is inert — **MEDIUM, documented knob does nothing**
 
@@ -244,4 +270,5 @@ ordering; `run_test.py` guards changed this week (launched-config scoping, three
    collector/plotting only; no agent code, but E0's numbers depend on them.
 4. ~~§4 (barrier timeout) and §5 (child staleness)~~ — both done 2026-09-20; both changed
    failure behaviour, so they had to land before E0/E2b.
-5. §7, §8 — small, and §8 touches every workflow cell.
+5. ~~§6 (SWIM advisory)~~ — done 2026-09-20.
+6. §7, §8 — small, and §8 touches every workflow cell.

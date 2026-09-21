@@ -4280,6 +4280,12 @@ class ResourceAgent(Agent):
 
         Logs warnings when failure rate exceeds 33%.
 
+        The population is `neighbor_map`, and `Agent.consensus_skip_set` — the peers a
+        broadcast refuses to send to — is a subset of what that map already excludes. The
+        two must stay one set: a skip set wider than this denominator makes quorum
+        unreachable by construction, which is what SWIM's failed set did here until
+        2026-09-20 (code review §6).
+
         :return: Required quorum size for consensus
         """
         live_count = self.live_agent_count

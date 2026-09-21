@@ -56,12 +56,40 @@ JOINED = MembershipUpdate.STATUS_JOINED
 SUSPECT = MembershipUpdate.STATUS_SUSPECT
 FAILED = MembershipUpdate.STATUS_FAILED
 
-# Rank for merge: failed dominates suspect dominates alive/joined.
+# Rank for merge: failed dominates suspect dominates alive/joined — AT THE SAME INCARNATION.
+# Incarnation is checked first; see `_supersedes`.
 _STATUS_RANK = {ALIVE: 0, JOINED: 0, SUSPECT: 1, FAILED: 2}
 
 
 def _rank(status: str) -> int:
     return _STATUS_RANK.get(status, -1)
+
+
+def _supersedes(new_status: str, new_inc: int, cur_status: str, cur_inc: int) -> bool:
+    """Whether an incoming membership claim replaces the one already held.
+
+    **Incarnation first, severity second.** Only the subject itself ever raises its own
+    incarnation (`_maybe_refute` bumps past whatever it was accused at), so a strictly higher
+    incarnation is first-hand word from the subject and outranks any second-hand rumour; a
+    strictly lower one is a rumour from before that word and is dropped. Within one
+    incarnation nobody has heard from the subject since, so the most severe claim wins.
+
+    Until 2026-09-20 this was rank dominance alone (code review 2026-09-18, §6), which broke
+    SWIM's recovery path outright: `_maybe_refute` emitted ALIVE at incarnation+1, and every
+    peer rejected it because ALIVE outranks nothing. A FAILED verdict was therefore permanent.
+    That matters because SWIM false-fails precisely under consensus bursts — acks queue behind
+    the single inbound consumer and blow the probe window — and a FAILED peer is never probed
+    again (`_pick_probe_target` skips it), so there was no second route back either. The peer
+    stayed out of Snow's live sample and out of the gossip fan-out for the rest of the run.
+
+    The dropped-stale-rumour half is the same rule the widely deployed implementation uses: a
+    suspicion or a confirmation older than what the subject has since refuted must not undo it.
+    """
+    if new_inc < cur_inc:
+        return False
+    if new_inc > cur_inc:
+        return True
+    return _rank(new_status) > _rank(cur_status)
 
 
 # -------- Host adapter protocol -------------------------------------------- #
@@ -521,8 +549,7 @@ class SwimMembership:
                 ))
                 joined_callback = status in (ALIVE, JOINED)
             else:
-                if _rank(status) > _rank(m.status) or \
-                        (_rank(status) == _rank(m.status) and incarnation > m.incarnation):
+                if _supersedes(status, incarnation, m.status, m.incarnation):
                     prior = m.status
                     m.status = status if status in (ALIVE, JOINED, SUSPECT, FAILED) else m.status
                     m.incarnation = max(m.incarnation, incarnation)
