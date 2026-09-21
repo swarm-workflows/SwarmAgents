@@ -1,6 +1,7 @@
 # Consensus Scaling Plan — Hybrid engine + Snow latency fix + topology-aware sampling
 
-> Approved implementation plan (2026-07-01). Companion to `SNOW_GOSSIP_PAPER_PLAN.md` (experiments)
+> Approved implementation plan (2026-07-01). Companion to the Snow-only paper plan of 2026-07-01
+> (experiments; merged 2026-09-21 into the local-only conference plan as its Appendix B and removed from the repo)
 > and `GOSSIP_CONSENSUS_DESIGN.md` (Phase 1–4 design). Tracks the Phase 4 hybrid work + two Snow
 > improvements motivated by the 4-site FABRIC testbed results.
 
