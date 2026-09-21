@@ -114,7 +114,7 @@ class _Selector:
         return np.ones((len(assignees), len(candidates)), dtype=float)
 
     def pick_agent_per_candidate(self, assignees, candidates, cost_matrix, objective,
-                                threshold_pct, tie_break_key):
+                                tie_break_key):
         return [self._designate(job, assignees) for job in candidates]
 
 
@@ -125,7 +125,6 @@ def make_agent(agent_id, peer_ids, designate, fallback_s=30.0):
     a.neighbor_map = {i: _Agent(i) for i in peer_ids}
     a.analytic_selector = _Selector(designate)
     a.queues = _Queues()
-    a.selection_threshold_pct = 10.0
     a.designate_bidder_fallback_s = fallback_s
     a.designate_bidder = True
     a._projected_load_factor = lambda ag: 1.0
@@ -387,7 +386,6 @@ def test_column_independence_holds_with_threshold_and_tiebreak():
     cands = [_Job("t1"), _Job("t2"), _Job("t3")]
     kwargs = dict(
         objective="min",
-        threshold_pct=10.0,
         tie_break_key=lambda ag, s, cand: tiebreak_rank(
             getattr(cand, "job_id", ""), getattr(ag, "agent_id", "")),
     )

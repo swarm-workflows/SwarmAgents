@@ -219,7 +219,6 @@ class SelectionEngine:
             cost_matrix: np.ndarray,
             *,
             objective: Objective = "min",
-            threshold_pct: float | None = None,
             accept_if: Callable[[float], bool] | None = None,
             tie_break_key: Callable[[Assignee, float, Candidate], Any] | None = None,
     ) -> list[tuple[Assignee | None, float]]:
@@ -234,11 +233,23 @@ class SelectionEngine:
         :param candidates: Column sequence aligned with matrix cols.
         :param cost_matrix: 2D array [rows=assignees, cols=candidates]; use +inf for infeasible.
         :param objective: ``"min"`` to minimize cost or ``"max"`` to maximize score.
-        :param threshold_pct: Optional tolerance around the column-wise best:
-            - For ``"min"``: keep only if selected <= best * (1 + pct/100).
-            - For ``"max"``: keep only if selected >= best * (1 - pct/100).
-            Note: if the selected index is the true best, this threshold never rejects it.
+
+        There is deliberately **no relative threshold parameter** here, and passing one is a
+        ``TypeError`` rather than a no-op (code review 2026-09-18, §7). One used to exist and
+        was compared against ``per_cand_best``, which is the column's own best — the very value
+        this function just selected. ``sel_cost > best * (1 + pct/100)`` therefore asked
+        whether ``best > best``, false for every non-negative cost and every non-negative
+        percentage, so the knob selected nothing while `config_swarm_multi.yml`, both CLAUDE.md
+        files and the README all described it as *the* candidate-pool control. Worse than inert
+        at the edge: with a negative best the inequality flips and it would have rejected every
+        assignment. A tolerance around the best is only meaningful for a function that returns a
+        *pool*; this one returns one winner per column, so the parameter had no correct form
+        here. `job_selection.designate_bidder` is the knob that actually decides how many agents
+        bid on a job, and it is measured (`bidders_per_job`, `designate_forced_share`).
+
         :param accept_if: Optional final predicate on the selected score (e.g., ``lambda s: s < 1e9``).
+            This is the *absolute* gate and it works: it is evaluated on the selected score
+            without reference to the value it was selected by.
         :param tie_break_key: Optional deterministic key for breaking exact-score ties,
             called as ``tie_break_key(assignee, score, candidate)``. It takes the candidate
             because a key over the assignee alone is a *ranking of assignees*: whichever one
@@ -251,10 +262,6 @@ class SelectionEngine:
         out: list[tuple[Assignee | None, float]] = []
         if A == 0 or C == 0:
             return [(None, float("inf")) for _ in range(C)]
-
-        # Column-wise best values for threshold checks (min or max).
-        # You *could* use _best on each column; vector ops are faster:
-        per_cand_best = cost_matrix.min(axis=0) if objective == "min" else cost_matrix.max(axis=0)
 
         for ci in range(C):
             col = cost_matrix[:, ci]
@@ -284,16 +291,6 @@ class SelectionEngine:
 
             sel_cost = float(col[best_idx])
             sel_agent = assignees[best_idx]
-
-            # Threshold relative to the per-column best (objective-aware)
-            if threshold_pct is not None and np.isfinite(sel_cost):
-                best = float(per_cand_best[ci])
-                if objective == "min":
-                    if not np.isfinite(best) or sel_cost > best * (1.0 + threshold_pct / 100.0):
-                        sel_agent, sel_cost = None, float("inf")
-                else:
-                    if not np.isfinite(best) or sel_cost < best * (1.0 - threshold_pct / 100.0):
-                        sel_agent, sel_cost = None, float("inf")
 
             # Optional absolute acceptance gate
             if accept_if is not None and sel_agent is not None:

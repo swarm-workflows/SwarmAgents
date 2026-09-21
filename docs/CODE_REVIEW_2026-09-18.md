@@ -188,12 +188,41 @@ PBFT tier under load, and the regime it fired in most is the collapse cell. **No
 or finalization number measured before this is citable** — which is already true of that cell
 for §1.
 
-## 7. `job_selection.selection_threshold_pct` is inert — **MEDIUM, documented knob does nothing**
+## 7. `job_selection.selection_threshold_pct` is inert — **MEDIUM, documented knob does nothing — FIXED (deleted) 2026-09-20**
 
 `swarm/selection/engine.py:292`: the threshold is tested against the argmin's own cost, so
 `sel_cost > best × (1 + pct)` is never true (the docstring admits it). CLAUDE.md and the README
 describe it as the candidate-pool tuning knob. Either implement "within pct of best" as a pool or
 delete the key; today it selects nothing.
+
+**Deleted 2026-09-20** (`tests/test_selection_threshold.py`, 10 tests; 5 fail against the
+pre-fix tree, and the call-site check names all four). Not implemented, for two reasons. A
+tolerance around the best only means anything for a function that returns a *pool*, and
+`pick_agent_per_candidate` returns one winner per column — the parameter had no correct form
+there. And 57 generated config files carry `selection_threshold_pct: 10.0`; giving that value a
+real effect would silently change the bidding regime of every one of them, which is the drift
+"one key, one default" exists to prevent.
+
+* The parameter is **gone from the signature**, so a surviving call site is a `TypeError` at
+  the first selection pass rather than a stale no-op. All four call sites are updated —
+  resource, LLM ×2 (including the P0-8 designation path), and colmena, which hardcoded `10.0`
+  next to a TODO to read it from config. `accept_if`, the *absolute* gate, was never broken
+  and stays.
+* An agent whose config still sets the key logs `[CONFIG] ... is IGNORED and always was` once
+  at startup, via `_warn_removed_job_selection_keys`, and is pointed at `designate_bidder`.
+  Presence is tested with `is not None`, because `0.0` is falsy and that is exactly the config
+  that believed it had disabled the pool.
+* It was **worse than inert at the edge**: `sel_cost` and `best` are the same number, so the
+  comparison reduces to `best > best × (1 + pct/100)` — false for a non-negative best, *true*
+  for a negative one, where it would have discarded every assignment. Costs are 0-100 today,
+  so this was latent.
+
+Two documents were making load-bearing claims on it: `docs/COMPLEXITY.md` cited it as the
+second of two mechanisms bounding proposals per job, and `docs/GOSSIP_CONSENSUS_DESIGN.md` said
+it "ensures that typically only 1-3 agents propose". Both now say what actually bounds it — an
+agent proposes only when it is its own argmin — which is *tighter* than they claimed, so
+neither analysis weakens. The measured ~3.7 bidders/job comes from agents' views of their peers
+differing, not from any tolerance.
 
 ## 8. The connectivity term prices `local` at zero — **MEDIUM, workflow cells**
 
@@ -271,4 +300,5 @@ ordering; `run_test.py` guards changed this week (launched-config scoping, three
 4. ~~§4 (barrier timeout) and §5 (child staleness)~~ — both done 2026-09-20; both changed
    failure behaviour, so they had to land before E0/E2b.
 5. ~~§6 (SWIM advisory)~~ — done 2026-09-20.
-6. §7, §8 — small, and §8 touches every workflow cell.
+6. ~~§7 (inert threshold)~~ — done 2026-09-20.
+7. §8 — small, and it touches every workflow cell.

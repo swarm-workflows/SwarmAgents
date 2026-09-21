@@ -289,7 +289,12 @@ job_selection:
   long_job_threshold: 20.0            # Execution time (in seconds) beyond which jobs incur extra penalty
   connectivity_penalty_factor: 1.0    # Multiplier for DTN connectivity penalty (0=no effect, >1 increases penalty severity)
   quantum_penalty_factor: 1.0         # Multiplier for quantum backend quality penalty (error rate + calibration downtime)
-  selection_threshold_pct: 10.0       # % above min cost allowed in candidate selection (lower = stricter, higher = more agents considered)
+  # selection_threshold_pct was REMOVED on 2026-09-20 (code review §7). It was documented here,
+  # in both CLAUDE.md files and in the README as the candidate-pool control, and it never did
+  # anything: the value was tested against the column best that had just been selected, so the
+  # comparison asked whether best > best. An agent whose config still sets it logs a [CONFIG]
+  # warning and ignores it. To control how many agents bid on a job use designate_bidder below,
+  # which is measured (bidders_per_job / designate_forced_share).
 
   # Which assignees a hierarchical coordinator (level > 0) scores a job against. Leaf agents
   # (level 0) are unaffected by this key.

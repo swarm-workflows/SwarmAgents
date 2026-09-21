@@ -445,8 +445,7 @@ class ResourceAgent(Agent):
         self.connectivity_penalty_factor = job_cfg.get("connectivity_penalty_factor", 1.0)
         # Multiplier for quantum backend quality penalty (error rate + calibration downtime)
         self.quantum_penalty_factor = job_cfg.get("quantum_penalty_factor", 1.0)
-        # % above min cost allowed in candidate selection (lower = stricter, higher = more agents considered)
-        self.selection_threshold_pct = job_cfg.get("selection_threshold_pct", 10.0)
+        self._warn_removed_job_selection_keys(job_cfg)
         # Which assignees a coordinator (level > 0) scores a job against.
         #   "self"  - this agent only. The shipped behaviour and the one behind every
         #             hierarchical number measured so far: each coordinator proposes itself
@@ -2557,7 +2556,6 @@ class ResourceAgent(Agent):
                     candidates=pending_jobs,
                     cost_matrix=cost_matrix_with_penalities,
                     objective="min",
-                    threshold_pct=self.selection_threshold_pct,  # e.g., 10 means within +10% of best
                     tie_break_key=lambda ag, s, cand: tiebreak_rank(
                         getattr(cand, "job_id", ""), getattr(ag, "agent_id", ""))
                 )
@@ -2959,6 +2957,33 @@ class ResourceAgent(Agent):
     def update_jobs(jobs: list[str], job_set: set, lock: threading.RLock):
         with lock:
             job_set.update(jobs)
+
+    # Keys that were documented, are still present in generated configs, and are read by
+    # nothing. An operator is told once at startup rather than left to infer it from behaviour
+    # that does not change — silence is exactly how `selection_threshold_pct` survived being
+    # described as the candidate-pool control in three places while selecting nothing.
+    _REMOVED_JOB_SELECTION_KEYS = {
+        "selection_threshold_pct": (
+            "it was compared against the very cost it selected, so it could never reject "
+            "anything (code review 2026-09-20, §7). To control how many agents bid on a job "
+            "use job_selection.designate_bidder, which is measured as bidders_per_job / "
+            "designate_forced_share"
+        ),
+    }
+
+    def _warn_removed_job_selection_keys(self, job_cfg: dict) -> None:
+        """Log any `job_selection` key this agent no longer honours.
+
+        57 generated config files carry `selection_threshold_pct`, so removing it quietly would
+        leave every one of them reading as if it tuned something. Nothing here changes
+        behaviour: these keys had none.
+        """
+        for key, why in self._REMOVED_JOB_SELECTION_KEYS.items():
+            value = job_cfg.get(key)
+            if value is None:
+                continue
+            self.logger.warning(
+                "[CONFIG] job_selection.%s=%s is IGNORED and always was: %s.", key, value, why)
 
     def _init_decision_state(self) -> None:
         """The consensus dedupe state, assembled in one place.

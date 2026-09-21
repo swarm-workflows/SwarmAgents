@@ -1154,7 +1154,6 @@ class LlmAgent(ResourceAgent):
             candidates=pending_jobs,
             cost_matrix=matrix,
             objective="min",
-            threshold_pct=self.selection_threshold_pct,
             tie_break_key=lambda ag, s, cand: tiebreak_rank(
                 getattr(cand, "job_id", ""), getattr(ag, "agent_id", "")),
         )
@@ -1303,7 +1302,6 @@ class LlmAgent(ResourceAgent):
                     candidates=pending_jobs,
                     cost_matrix=cost_matrix_with_penalities,
                     objective="min",
-                    threshold_pct=self.selection_threshold_pct,  # e.g., 10 means within +10% of best
                     tie_break_key=lambda ag, s, cand: tiebreak_rank(
                         getattr(cand, "job_id", ""), getattr(ag, "agent_id", ""))
                 )
