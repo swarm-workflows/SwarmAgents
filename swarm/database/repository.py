@@ -396,8 +396,13 @@ class Repository:
         serving that file any more, or worse, at one that is serving a stale copy."""
         return f"{self.KEY_DATA_LOC}:{self.run_id}:0:names"
 
-    def data_locations(self, names: List[str]) -> Dict[str, dict]:
-        """`{name: location}` for the names that have one. One round trip, like readiness.
+    def data_locations(self, names: List[str]) -> Dict[str, List[dict]]:
+        """`{name: [location, ...]}` for the names that have one. One round trip, like readiness.
+
+        A **list, in preference order**: the peer that produced the file first, the staging site
+        last. The producer sets that order and the consumer walks it, which is what gives the
+        fast path (one hop, straight from the producer) and durability (the store, when the
+        producer has gone) without every edge paying two WAN hops.
 
         A name present in the readiness registry but absent here means the run is staging-less
         (the shared mount is the location) — the caller distinguishes those two cases, because
@@ -407,14 +412,21 @@ class Repository:
         if not names:
             return {}
         raw = self.redis.hmget(self._data_loc_key(), names)
-        out: Dict[str, dict] = {}
+        out: Dict[str, List[dict]] = {}
         for name, value in zip(names, raw):
             if not value:
                 continue
             try:
-                out[name] = json.loads(value)
+                parsed = json.loads(value)
             except (ValueError, TypeError):
                 continue                    # a corrupt entry is treated as absent, never guessed
+            if isinstance(parsed, dict):
+                # A single location, which is what the first revision of staging wrote. Kept
+                # readable because a rolling deploy genuinely mixes the two: on 2026-09-21 the
+                # staging code was on 5 of 92 agents.
+                parsed = [parsed]
+            if isinstance(parsed, list) and parsed:
+                out[name] = [p for p in parsed if isinstance(p, dict)]
         return out
 
     def mark_data_available(self, names: List[str]) -> None:

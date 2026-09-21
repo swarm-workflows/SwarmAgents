@@ -37,6 +37,7 @@ import hashlib
 import logging
 import os
 import threading
+import time
 from concurrent import futures
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
@@ -65,6 +66,16 @@ class StagingPolicy:
     port_offset: int = 1000
     chunk_bytes: int = DEFAULT_CHUNK_BYTES
     timeout_s: float = 300.0
+    #: The staging site an output is pushed to as it is produced, so it outlives the agent that
+    #: made it. Empty disables stage-out and leaves staging peer-only — fast, and **not durable**:
+    #: a dead producer's outputs are gone, its job is COMPLETE so nothing re-runs it, and every
+    #: descendant is released and then refuses (`docs/STAGING_DESIGN.md` §6).
+    store_host: str = ""
+    store_port: int = 21000
+    #: How long a stage-out may take before the producer gives up and keeps going. A failed push
+    #: costs durability for that file, not the job: the peer location still works until the
+    #: producer dies, which is exactly the window the push was insuring against.
+    store_timeout_s: float = 120.0
     #: Digest the stream at the sender and check it at the receiver. On by default: it costs
     #: nothing when nothing is transferred, and it catches the one failure that is otherwise
     #: invisible — a truncated transfer, which yields a short file that a job will happily read.
@@ -170,13 +181,20 @@ def context() -> StagingContext:
 
 class _Servicer(consensus_pb2_grpc.DataTransferServiceServicer):
     def __init__(self, published: PublishedFiles, run_id: str,
-                 pol: Optional[StagingPolicy] = None):
+                 pol: Optional[StagingPolicy] = None, store_dir: Optional[str] = None):
         self.published = published
         self.run_id = str(run_id or "")
         self.pol = pol or _POLICY
+        #: Set only on a staging site. An ordinary agent serves what it produced and takes no
+        #: uploads, so `Put` has nowhere to write and says so — the capability is granted by
+        #: configuration rather than assumed from the request.
+        self.store_dir = store_dir
         self.served = 0
         self.bytes_served = 0
         self.refused = 0
+        self.stored = 0
+        self.bytes_stored = 0
+        self.put_refused = 0
 
     def _refuse(self, reason: str):
         self.refused += 1
@@ -229,16 +247,109 @@ class _Servicer(consensus_pb2_grpc.DataTransferServiceServicer):
             yield from self._refuse(f"could not read {name!r}: {exc}")
 
 
+    def Put(self, request_iterator, context):  # noqa: N802 (gRPC naming)
+        """Accept one uploaded file into the store.
+
+        Placement follows the same two rules a fetch does, for the same reasons: a unique
+        temporary file first, then **`os.link`, not `os.replace`** — a second upload of the
+        same name (a re-run after reassignment, say) must not truncate a copy something is
+        already reading. A re-upload is therefore idempotent and harmless.
+        """
+        if not self.store_dir:
+            self.put_refused += 1
+            return consensus_pb2.PutAck(
+                ok=False, error="this server is not a staging site; it takes no uploads")
+
+        name = local = None
+        digest = hashlib.sha256() if self.pol.verify else None
+        received = 0
+        tmp = None
+        fh = None
+        try:
+            for chunk in request_iterator:
+                if name is None:
+                    name = str(chunk.name or "")
+                    # Containment where the path is built, exactly as in `fetch`: the name is
+                    # workflow-supplied, and joined onto the store a traversing name writes
+                    # outside it.
+                    local = os.path.basename(name)
+                    if not local or local in (".", "..") or local != name:
+                        self.put_refused += 1
+                        return consensus_pb2.PutAck(
+                            ok=False, error=f"{name!r} is not a plain file name")
+                    if chunk.run_id and self.run_id and chunk.run_id != self.run_id:
+                        self.put_refused += 1
+                        return consensus_pb2.PutAck(
+                            ok=False,
+                            error=f"upload for run {chunk.run_id!r} but this store serves "
+                                  f"{self.run_id!r}")
+                    tmp = os.path.join(
+                        self.store_dir,
+                        f".{local}.put.{os.getpid()}.{threading.get_ident()}")
+                    fh = open(tmp, "wb")
+                if chunk.content:
+                    fh.write(chunk.content)
+                    received += len(chunk.content)
+                    if digest is not None:
+                        digest.update(chunk.content)
+                if chunk.last:
+                    if digest is not None and chunk.sha256:
+                        got = digest.hexdigest()
+                        if got != chunk.sha256:
+                            self.put_refused += 1
+                            return consensus_pb2.PutAck(
+                                ok=False,
+                                error=(f"{name!r} failed verification: sender "
+                                       f"{chunk.sha256[:12]}… store {got[:12]}…"))
+                    break
+            if fh is None:
+                self.put_refused += 1
+                return consensus_pb2.PutAck(ok=False, error="empty upload")
+            fh.close()
+            fh = None
+            dest = os.path.join(self.store_dir, local)
+            try:
+                os.link(tmp, dest)
+            except FileExistsError:
+                pass                        # already stored; a re-upload is a no-op
+            # Stored files are servable: the store is a peer like any other from a consumer's
+            # point of view, which is what makes it a fallback rather than a special case.
+            self.published.publish(local, dest)
+            self.stored += 1
+            self.bytes_stored += received
+            logger.info("[STAGE_STORE] %s from %s (%d bytes)", local, chunk.sender or "?",
+                        received)
+            return consensus_pb2.PutAck(ok=True, bytes=received)
+        except OSError as exc:
+            self.put_refused += 1
+            return consensus_pb2.PutAck(ok=False, error=f"could not store {name!r}: {exc}")
+        finally:
+            if fh is not None:
+                try:
+                    fh.close()
+                except OSError:
+                    pass
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+
+
 class TransferServer:
     """The agent's data-transfer endpoint. Started beside the consensus server, on its own port."""
 
     def __init__(self, published: PublishedFiles, bind_host: str, port: int, run_id: str,
-                 max_workers: int = 8, pol: Optional[StagingPolicy] = None):
+                 max_workers: int = 8, pol: Optional[StagingPolicy] = None,
+                 store_dir: Optional[str] = None):
         self.published = published
         self.bind_host = bind_host
         self.port = int(port)
         self.pol = pol or _POLICY
-        self.servicer = _Servicer(published, run_id, self.pol)
+        if store_dir:
+            os.makedirs(store_dir, exist_ok=True)
+        self.store_dir = store_dir
+        self.servicer = _Servicer(published, run_id, self.pol, store_dir=store_dir)
         # A modest pool on purpose: this shares a host with an agent that is running jobs, and
         # an unbounded pool would let a fan-in of fetches compete with the work being measured.
         self._server = grpc.server(
@@ -265,6 +376,9 @@ class TransferServer:
         return {"served": self.servicer.served,
                 "bytes_served": self.servicer.bytes_served,
                 "refused": self.servicer.refused,
+                "stored": self.servicer.stored,
+                "bytes_stored": self.servicer.bytes_stored,
+                "put_refused": self.servicer.put_refused,
                 "published": len(self.published)}
 
 
@@ -369,3 +483,105 @@ def fetch(name: str, location: dict, dest_dir: str, run_id: str, requester: str 
             os.unlink(tmp)
         except OSError:
             pass
+
+
+@dataclass
+class PutResult:
+    ok: bool
+    reason: str = ""
+    bytes_sent: int = 0
+    elapsed_s: float = 0.0
+
+
+def put(name: str, path: str, run_id: str, sender: str = "",
+        pol: Optional[StagingPolicy] = None) -> PutResult:
+    """Push one produced file to the staging site, so it outlives the agent that made it.
+
+    This is the durability half of staging (`docs/STAGING_DESIGN.md` §6). Peer-to-peer fetch
+    alone is fast and **not durable**: a dead producer's outputs are gone, its job is COMPLETE
+    so nothing re-runs it, and every descendant is released and then refuses. Pushing each
+    output as it is produced removes that without the cascading re-runs that re-running the
+    producer would cause — its own inputs may be gone too.
+
+    **It costs an upload on the critical path of every DAG edge**, which lands on makespan.
+    `elapsed_s` is returned so that cost is a measured number rather than an assumption.
+    """
+    pol = pol or _POLICY
+    if not pol.store_host:
+        return PutResult(False, "no staging site configured (staging.store_host is empty)")
+    local = os.path.basename(str(name))
+    if not local or local in (".", "..") or local != str(name):
+        return PutResult(False, f"{name!r} is not a plain file name; refusing to stage it out")
+    if not os.path.isfile(path):
+        return PutResult(False, f"{name!r} is not on disk at {path}")
+
+    target = f"{pol.store_host}:{int(pol.store_port)}"
+    started = time.time()
+    try:
+        size = os.path.getsize(path)
+        digest = hashlib.sha256() if pol.verify else None
+
+        def _chunks():
+            sent = 0
+            with open(path, "rb") as fh:
+                while True:
+                    block = fh.read(pol.chunk_bytes)
+                    if not block:
+                        break
+                    if digest is not None:
+                        digest.update(block)
+                    sent += len(block)
+                    yield consensus_pb2.PutChunk(
+                        name=local, run_id=str(run_id or ""), content=block,
+                        last=False, sender=str(sender or ""))
+            # A final, empty chunk carries the digest, so the sender never has to know which
+            # read was the last one.
+            yield consensus_pb2.PutChunk(
+                name=local, run_id=str(run_id or ""), last=True,
+                sha256=digest.hexdigest() if digest else "", sender=str(sender or ""))
+
+        with grpc.insecure_channel(
+                target,
+                options=[("grpc.max_send_message_length", pol.chunk_bytes * 4),
+                         ("grpc.max_receive_message_length", pol.chunk_bytes * 4)]) as channel:
+            stub = consensus_pb2_grpc.DataTransferServiceStub(channel)
+            ack = stub.Put(_chunks(), timeout=pol.store_timeout_s)
+        elapsed = time.time() - started
+        if not ack.ok:
+            return PutResult(False, f"{target} refused {name!r}: {ack.error}", 0, elapsed)
+        return PutResult(True, "", int(ack.bytes or size), elapsed)
+    except grpc.RpcError as exc:
+        code = exc.code() if hasattr(exc, "code") else "?"
+        return PutResult(False, f"could not reach staging site {target} for {name!r}: {code}",
+                         0, time.time() - started)
+    except OSError as exc:
+        return PutResult(False, f"could not read {name!r} to stage it out: {exc}",
+                         0, time.time() - started)
+
+
+def fetch_any(name: str, locations, dest_dir: str, run_id: str, requester: str = "",
+              pol: Optional[StagingPolicy] = None) -> FetchResult:
+    """Fetch *name* from the first location that answers, **in the order given**.
+
+    The order is the preference and it is set by the producer: the peer that made the file
+    first, the staging site last. That gives the fast path normally — one hop, straight from
+    the producer — and durability exactly when it is needed, which is when the producer has
+    gone. Falling straight to the store instead would make every edge pay two WAN hops.
+
+    Every location's reason is kept and reported together on total failure. With one location
+    that reads exactly as `fetch` did; with several, "could not reach agent-4" alone would hide
+    that the store refused it too, which is the difference between a dead agent and a file that
+    was never stored.
+    """
+    if isinstance(locations, dict):          # a single location, as an earlier revision wrote
+        locations = [locations]
+    reasons = []
+    for loc in locations or []:
+        result = fetch(name, loc, dest_dir, run_id=run_id, requester=requester, pol=pol)
+        if result.ok:
+            return result
+        reasons.append(f"{loc.get('agent_id', loc.get('host', '?'))}: {result.reason}")
+    if not reasons:
+        return FetchResult(False, f"no location is recorded for {name!r}")
+    return FetchResult(False, f"{name!r} could not be fetched from any of "
+                              f"{len(reasons)} location(s) — " + "; ".join(reasons))

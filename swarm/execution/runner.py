@@ -564,18 +564,22 @@ def stage_inputs(data_in, work_dir: str,
             continue                        # parent output, or already staged
 
         # Produced by this run on another agent: fetch it before considering the inputs root.
-        loc = locations.get(name)
-        if loc:
+        locs = locations.get(name)
+        if locs:
             from swarm.execution import staging          # local import: keeps the data path optional
-            result = staging.fetch(name, loc, work_dir, run_id=run_id, requester=requester)
+            # Peer first, staging site last — the producer sets that order (see
+            # `Repository.data_locations`), so the common case is one hop and the store is
+            # reached only when the producer cannot answer.
+            result = staging.fetch_any(name, locs, work_dir, run_id=run_id, requester=requester)
             if result.ok:
                 staged.append(name)
                 continue
             # A produced file we cannot fetch is a refusal, not a reason to fall back to a
             # same-named file elsewhere: that is precisely how a child would silently read the
             # wrong input. The reason names the producer, because the usual cause is that it died.
-            return staged, (f"input {name!r} was produced by agent "
-                            f"{loc.get('agent_id', '?')} but could not be staged: {result.reason}")
+            producers = ", ".join(str(l.get("agent_id", l.get("host", "?"))) for l in locs)
+            return staged, (f"input {name!r} was produced by agent {producers} but could not "
+                            f"be staged: {result.reason}")
 
         if lookup_unavailable:
             # This name is not in the working directory, so the next step would resolve it from

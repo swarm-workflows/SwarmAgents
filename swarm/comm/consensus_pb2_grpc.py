@@ -118,6 +118,11 @@ class DataTransferServiceStub(object):
                 request_serializer=swarm_dot_comm_dot_consensus__pb2.FetchRequest.SerializeToString,
                 response_deserializer=swarm_dot_comm_dot_consensus__pb2.DataChunk.FromString,
                 _registered_method=True)
+        self.Put = channel.stream_unary(
+                '/swarm.DataTransferService/Put',
+                request_serializer=swarm_dot_comm_dot_consensus__pb2.PutChunk.SerializeToString,
+                response_deserializer=swarm_dot_comm_dot_consensus__pb2.PutAck.FromString,
+                _registered_method=True)
 
 
 class DataTransferServiceServicer(object):
@@ -139,6 +144,18 @@ class DataTransferServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def Put(self, request_iterator, context):
+        """Upload one produced file to a staging site, so an output outlives the agent
+        that made it. Accepted ONLY by a server configured with a store directory --
+        an ordinary agent serves what it produced and takes no uploads. Name and
+        run_id are repeated on every chunk rather than sent once in a header: a few
+        bytes against a 1 MiB payload, and it removes an entire class of "what if the
+        first chunk never arrived" handling from the server.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_DataTransferServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -146,6 +163,11 @@ def add_DataTransferServiceServicer_to_server(servicer, server):
                     servicer.Fetch,
                     request_deserializer=swarm_dot_comm_dot_consensus__pb2.FetchRequest.FromString,
                     response_serializer=swarm_dot_comm_dot_consensus__pb2.DataChunk.SerializeToString,
+            ),
+            'Put': grpc.stream_unary_rpc_method_handler(
+                    servicer.Put,
+                    request_deserializer=swarm_dot_comm_dot_consensus__pb2.PutChunk.FromString,
+                    response_serializer=swarm_dot_comm_dot_consensus__pb2.PutAck.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -182,6 +204,33 @@ class DataTransferService(object):
             '/swarm.DataTransferService/Fetch',
             swarm_dot_comm_dot_consensus__pb2.FetchRequest.SerializeToString,
             swarm_dot_comm_dot_consensus__pb2.DataChunk.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Put(request_iterator,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.stream_unary(
+            request_iterator,
+            target,
+            '/swarm.DataTransferService/Put',
+            swarm_dot_comm_dot_consensus__pb2.PutChunk.SerializeToString,
+            swarm_dot_comm_dot_consensus__pb2.PutAck.FromString,
             options,
             channel_credentials,
             insecure,

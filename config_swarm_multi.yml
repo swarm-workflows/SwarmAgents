@@ -156,6 +156,24 @@ runtime:
       chunk_bytes: 1048576      # 1 MiB
       timeout_s: 300.0          # per fetch
       verify: true              # digest the stream, check it at the receiver
+      # ---- Stage-out: the durability half -------------------------------------------
+      # Peer-to-peer fetch alone is fast and NOT durable. A dead producer's outputs are
+      # gone, its job is COMPLETE so nothing re-runs it, and every descendant is released
+      # and then refuses. Pushing each output to a staging site as it is produced removes
+      # that, without the cascading re-runs that re-running the producer would cause --
+      # its own inputs may be gone too. It is also what Pegasus itself does.
+      #
+      # The push happens BEFORE the name is published, so a name is never visible without
+      # a durable copy behind it. That puts an upload on the critical path of every DAG
+      # edge, which lands on makespan: `[STAGE_OUT]` logs the bytes and seconds per file
+      # so the cost is a measured number rather than an assumption.
+      #
+      # A consumer tries the producer FIRST and the store only if that fails, so the
+      # common case stays one hop. Empty store_host leaves stage-out off (peer-only).
+      # Start the site with:  python3 staging_site.py --store-dir <dir> --port 21000
+      store_host: ""            # e.g. "database"; empty = no stage-out, not durable
+      store_port: 21000
+      store_timeout_s: 120.0    # per push; a failure costs durability, not the job
     #   soilmoisture_container: swarm/soilmoisture:1.0
   # How long past delegation_timeout_s a coordinator keeps waiting for a job its children have
   # already scheduled (persisted RUNNING) to finish before dropping it from delegation tracking

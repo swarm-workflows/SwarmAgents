@@ -31,6 +31,29 @@ service DataTransferService {
   // published in `run_id`; an unknown name is refused by name, never joined onto
   // a directory, so there is no path-traversal surface.
   rpc Fetch(FetchRequest) returns (stream DataChunk);
+
+  // Upload one produced file to a staging site, so an output outlives the agent
+  // that made it. Accepted ONLY by a server configured with a store directory --
+  // an ordinary agent serves what it produced and takes no uploads. Name and
+  // run_id are repeated on every chunk rather than sent once in a header: a few
+  // bytes against a 1 MiB payload, and it removes an entire class of "what if the
+  // first chunk never arrived" handling from the server.
+  rpc Put(stream PutChunk) returns (PutAck);
+}
+
+message PutChunk {
+  string name = 1;       // logical file name, as declared in Job.data_out
+  string run_id = 2;     // refused unless it matches the store's run
+  bytes content = 3;
+  bool last = 4;
+  string sha256 = 5;     // digest of the whole stream; set on the last chunk
+  string sender = 6;     // agent id, for logging only
+}
+
+message PutAck {
+  bool ok = 1;
+  string error = 2;
+  uint64 bytes = 3;
 }
 
 message FetchRequest {

@@ -3491,6 +3491,8 @@ class ResourceAgent(Agent):
         if published is None:
             return {}
 
+        pol = _staging.policy()
+        run_id = os.environ.get("SWARM_RUN_ID", "")
         work_dir = _runner.policy().work_dir
         locations: dict = {}
         for name in produced:
@@ -3504,12 +3506,45 @@ class ResourceAgent(Agent):
                     "[STAGE] job %s exited 0 and declared output %r, but %s does not exist. "
                     "Descendants will refuse to stage it.", job.job_id, name, path)
             published.publish(str(name), path)
-            locations[str(name)] = {
+
+            # Peer first: one hop, straight from here, which is the common case.
+            entries = [{
                 "agent_id": str(self.agent_id),
                 "host": self.grpc_host,
                 "port": _staging.data_port(self.grpc_port),
                 "produced_at": time.time(),
-            }
+            }]
+
+            # Then the staging site, pushed **now**, before the caller publishes the name.
+            # The order is the whole guarantee: a name becomes visible only once a durable copy
+            # exists, so a descendant released by it can always be served even if this agent
+            # dies a moment later. Doing it after the publish would leave exactly the window
+            # the push is insuring against.
+            if pol.store_host and os.path.isfile(path):
+                result = _staging.put(str(name), path, run_id=run_id,
+                                      sender=str(self.agent_id))
+                if result.ok:
+                    entries.append({
+                        "agent_id": "store",
+                        "host": pol.store_host,
+                        "port": int(pol.store_port),
+                        "produced_at": time.time(),
+                    })
+                    # Logged with the elapsed time because stage-out sits on the critical path
+                    # of every DAG edge and therefore lands on makespan. It is a measured cost,
+                    # not an assumed one.
+                    self.logger.info(
+                        "[STAGE_OUT] %s (%d bytes) to %s:%s in %.3fs",
+                        name, result.bytes_sent, pol.store_host, pol.store_port,
+                        result.elapsed_s)
+                else:
+                    # Durability is lost for this file; the run is not. The peer location still
+                    # works until this agent dies, which is precisely the risk being taken.
+                    self.logger.error(
+                        "[STAGE_OUT] %s could NOT be staged out (%s). Its only copy is on this "
+                        "agent, so if this agent dies every descendant will refuse to stage it.",
+                        name, result.reason)
+            locations[str(name)] = entries
         return locations
 
     def _persist_completion(self, job: Job, produced: Optional[list],

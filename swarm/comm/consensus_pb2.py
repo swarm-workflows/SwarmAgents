@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x1aswarm/comm/consensus.proto\x12\x05swarm\"t\n\x10\x43onsensusMessage\x12\x11\n\tsender_id\x18\x01 \x01(\t\x12\x13\n\x0breceiver_id\x18\x02 \x01(\t\x12\x14\n\x0cmessage_type\x18\x03 \x01(\t\x12\x0f\n\x07payload\x18\x04 \x01(\t\x12\x11\n\ttimestamp\x18\x05 \x01(\x03\"$\n\x03\x41\x63k\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x0c\n\x04info\x18\x02 \x01(\t\"?\n\x0c\x46\x65tchRequest\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x0e\n\x06run_id\x18\x02 \x01(\t\x12\x11\n\trequester\x18\x03 \x01(\t\"W\n\tDataChunk\x12\x0f\n\x07\x63ontent\x18\x01 \x01(\x0c\x12\x0c\n\x04size\x18\x02 \x01(\x04\x12\x0c\n\x04last\x18\x03 \x01(\x08\x12\x0e\n\x06sha256\x18\x04 \x01(\t\x12\r\n\x05\x65rror\x18\x05 \x01(\t2F\n\x10\x43onsensusService\x12\x32\n\x0bSendMessage\x12\x17.swarm.ConsensusMessage\x1a\n.swarm.Ack2G\n\x13\x44\x61taTransferService\x12\x30\n\x05\x46\x65tch\x12\x13.swarm.FetchRequest\x1a\x10.swarm.DataChunk0\x01\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x1aswarm/comm/consensus.proto\x12\x05swarm\"t\n\x10\x43onsensusMessage\x12\x11\n\tsender_id\x18\x01 \x01(\t\x12\x13\n\x0breceiver_id\x18\x02 \x01(\t\x12\x14\n\x0cmessage_type\x18\x03 \x01(\t\x12\x0f\n\x07payload\x18\x04 \x01(\t\x12\x11\n\ttimestamp\x18\x05 \x01(\x03\"$\n\x03\x41\x63k\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x0c\n\x04info\x18\x02 \x01(\t\"g\n\x08PutChunk\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x0e\n\x06run_id\x18\x02 \x01(\t\x12\x0f\n\x07\x63ontent\x18\x03 \x01(\x0c\x12\x0c\n\x04last\x18\x04 \x01(\x08\x12\x0e\n\x06sha256\x18\x05 \x01(\t\x12\x0e\n\x06sender\x18\x06 \x01(\t\"2\n\x06PutAck\x12\n\n\x02ok\x18\x01 \x01(\x08\x12\r\n\x05\x65rror\x18\x02 \x01(\t\x12\r\n\x05\x62ytes\x18\x03 \x01(\x04\"?\n\x0c\x46\x65tchRequest\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x0e\n\x06run_id\x18\x02 \x01(\t\x12\x11\n\trequester\x18\x03 \x01(\t\"W\n\tDataChunk\x12\x0f\n\x07\x63ontent\x18\x01 \x01(\x0c\x12\x0c\n\x04size\x18\x02 \x01(\x04\x12\x0c\n\x04last\x18\x03 \x01(\x08\x12\x0e\n\x06sha256\x18\x04 \x01(\t\x12\r\n\x05\x65rror\x18\x05 \x01(\t2F\n\x10\x43onsensusService\x12\x32\n\x0bSendMessage\x12\x17.swarm.ConsensusMessage\x1a\n.swarm.Ack2p\n\x13\x44\x61taTransferService\x12\x30\n\x05\x46\x65tch\x12\x13.swarm.FetchRequest\x1a\x10.swarm.DataChunk0\x01\x12\'\n\x03Put\x12\x0f.swarm.PutChunk\x1a\r.swarm.PutAck(\x01\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -35,12 +35,16 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_CONSENSUSMESSAGE']._serialized_end=153
   _globals['_ACK']._serialized_start=155
   _globals['_ACK']._serialized_end=191
-  _globals['_FETCHREQUEST']._serialized_start=193
-  _globals['_FETCHREQUEST']._serialized_end=256
-  _globals['_DATACHUNK']._serialized_start=258
-  _globals['_DATACHUNK']._serialized_end=345
-  _globals['_CONSENSUSSERVICE']._serialized_start=347
-  _globals['_CONSENSUSSERVICE']._serialized_end=417
-  _globals['_DATATRANSFERSERVICE']._serialized_start=419
-  _globals['_DATATRANSFERSERVICE']._serialized_end=490
+  _globals['_PUTCHUNK']._serialized_start=193
+  _globals['_PUTCHUNK']._serialized_end=296
+  _globals['_PUTACK']._serialized_start=298
+  _globals['_PUTACK']._serialized_end=348
+  _globals['_FETCHREQUEST']._serialized_start=350
+  _globals['_FETCHREQUEST']._serialized_end=413
+  _globals['_DATACHUNK']._serialized_start=415
+  _globals['_DATACHUNK']._serialized_end=502
+  _globals['_CONSENSUSSERVICE']._serialized_start=504
+  _globals['_CONSENSUSSERVICE']._serialized_end=574
+  _globals['_DATATRANSFERSERVICE']._serialized_start=576
+  _globals['_DATATRANSFERSERVICE']._serialized_end=688
 # @@protoc_insertion_point(module_scope)
