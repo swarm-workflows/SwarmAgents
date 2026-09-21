@@ -4,7 +4,7 @@ Fan-out-to-all was the pre-MAB behaviour and was harmless while every coordinato
 group. When `--groups-per-coordinator` moved to 2 (2026-09-18) it became the default for every
 analytic hierarchical run: the job is saved once per selected group under a group-scoped key and
 each group executes its own copy — E0 and the analytic half of E1' would have run every job
-twice (`FGCS_EVAL_PLAN.md` §0.10: 400 jobs, 952 leaf completions on `p11-oracle3`). A random
+twice (`FGCS_EVAL_PLAN.md` Appendix A.10: 400 jobs, 952 leaf completions on `p11-oracle3`). A random
 pick at the configured fan-out is the honest context-blind arm; the oracle scores it, where it
 excludes `all`.
 """
