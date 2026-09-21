@@ -4,7 +4,14 @@ matplotlib
 seaborn
 scipy
 redis
-protobuf
+# Regenerating swarm/comm/consensus.proto stamps the generated modules with the toolchain's
+# version and makes them call ValidateProtobufRuntimeVersion, which RAISES when the installed
+# runtime is OLDER than the gencode. Adding the data-transfer service on 2026-09-21 regenerated
+# them with protobuf 6.31.1, silently lifting the floor from 5.29.0 — and consensus_pb2 is
+# imported by the transport, so too old a runtime breaks every agent, not just staging. The floor
+# is stated here rather than implied by whoever last ran protoc. Measured on the slice the same
+# day: agents 7.35.1, database node 7.36.1, both fine. Re-check this line after any protoc run.
+protobuf>=6.31.1
 grpcio
 grpcio-tools
 confluent-kafka

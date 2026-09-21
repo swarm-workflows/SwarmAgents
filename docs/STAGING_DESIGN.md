@@ -77,16 +77,35 @@ readiness registry's run-scoped key provides.
 
 ## 5. Staging in
 
-`stage_inputs` keeps its three rules and gains a fourth step, in order:
+`stage_inputs` keeps its three rules and gains a source, in this order — and **the order is
+load-bearing**, not a preference:
 
-1. Already in the working directory → nothing to do (a parent on this agent, or another agent's
-   copy).
-2. Resolvable under `roots.inputs` → the existing local copy. **This is the shared-mount path and
-   is unchanged**, so a run configured as today behaves exactly as today.
-3. Otherwise, if staging is enabled, look the name up in the location registry and fetch it from
-   the agent that produced it, into a temp file, verify the digest, then `os.link` it into place —
+1. **Already in the working directory** → nothing to do (a parent that ran on this agent, or
+   another agent's copy under a shared mount).
+2. **Produced by this run, on another agent** → look the name up in the location registry and
+   fetch it from the producer into a temp file, verify the digest, then `os.link` it into place —
    the same never-overwrite, atomic rule the local path uses, for the same reason.
+3. **Resolvable under `roots.inputs`** → the existing local copy. **This is the shared-mount path
+   and is otherwise unchanged**, so a run configured as today behaves exactly as today.
 4. Otherwise refuse, naming which of the three it was.
+
+**Step 2 deliberately precedes step 3**, which is the reverse of the first draft of this document.
+Workflow file names are a flat namespace — 62 colliding names measured in the shipped profile — so
+a name in the location registry was produced *by this run*, and a file of the same name sitting in
+the inputs root is a collision, not a copy. Taking the root would feed a child last week's file and
+look entirely healthy. A produced file that cannot be fetched is therefore a **refusal naming the
+producer**, never a fall back to step 3.
+
+**A lookup that is unavailable or fails is a refusal, not a fall back to step 3.** The first
+version of this warned and resolved locally — a brief Redis outage should not fail a job whose
+input is sitting on disk. That reasoning does not survive staging being on: a name a parent
+produced lives on another agent, the lookup is the only thing that knows which, and resolving it
+from a same-named file in the inputs root is precisely the stale-collision read this ordering
+exists to prevent, reached through the error path instead of the happy one. The fallback was more
+permissive than the path it stood in for, which is the shape of at least four defects already in
+`CODE_REVIEW_2026-09-18.md`. Refusing is loud and retryable; a stale input is silent and produces
+plausible numbers. Staging *off* keeps the old, harmless behaviour, because with no
+produced-elsewhere names there is nothing to confuse a local resolve with.
 
 A fetch failure is a refusal, not a job failure: it is a configuration or fleet problem that will
 repeat, and the existing refusal path already reports it that way.
@@ -110,6 +129,16 @@ repeat, and the existing refusal path already reports it that way.
   producer is exactly this case.
 - **Transfer accounting.** Bytes moved per job, per link, are not yet in `collect.py`. The figure
   that would make staging a *result* rather than a capability needs it.
+
+## 6a. A dependency the regeneration moved
+
+Adding `DataTransferService` regenerated `consensus_pb2.py`, which stamps the toolchain version
+into `ValidateProtobufRuntimeVersion` — and that **raises** when the installed runtime is older
+than the gencode. The floor went from 5.29.0 to 6.31.1 as a side effect, and that module is
+imported by the consensus transport, so too old a runtime stops every agent rather than just
+staging. `requirements.txt` states `protobuf>=6.31.1` instead of leaving it implied. Verified on
+the slice 2026-09-21: agents 7.35.1, database node 7.36.1, module imports cleanly on both.
+**Re-check the pin after any protoc run.**
 
 ## 7. Configuration
 

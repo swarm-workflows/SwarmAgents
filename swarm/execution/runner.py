@@ -506,18 +506,31 @@ def stage_inputs(data_in, work_dir: str,
     # execution path of every job in a workflow, and a round trip per DAG edge would put the
     # WAN into it. Absent locator (simulated runs, staging off) costs nothing at all.
     locations: dict = {}
-    if locator is None or not run_id:
-        # Fall back to the process-wide staging context, which is how a `Job` — rebuilt from
-        # Redis with no route back to the agent — reaches the lookup at all.
-        try:
-            from swarm.execution import staging
+    staging_on = False
+    try:
+        from swarm.execution import staging
+        staging_on = staging.policy().enabled
+        if staging_on and (locator is None or not run_id):
+            # The process-wide context is how a `Job` — rebuilt from Redis with no route back
+            # to the agent — reaches the lookup at all.
             ctx = staging.context()
-            if staging.policy().enabled:
-                locator = locator or ctx.locator
-                run_id = run_id or ctx.run_id
-                requester = requester or ctx.agent_id
-        except Exception:                   # noqa: BLE001 - staging is optional
-            pass
+            locator = locator or ctx.locator
+            run_id = run_id or ctx.run_id
+            requester = requester or ctx.agent_id
+    except Exception:                       # noqa: BLE001 - staging is optional
+        staging_on = False
+
+    if staging_on and locator is None:
+        # **Refuse rather than fall back.** With staging on, a name a parent produced lives on
+        # another agent, and the only thing that knows which is the lookup. Falling through to
+        # `roots.inputs` would resolve it from a same-named file there — which is exactly the
+        # stale-collision read the source order below exists to prevent, arrived at through the
+        # error path instead of the happy one. A refusal is loud and retryable; a stale input is
+        # silent and produces plausible numbers.
+        return staged, ("staging is enabled but no location lookup is configured, so a name "
+                        "produced by another agent cannot be resolved; refusing rather than "
+                        "falling back to a same-named file in the inputs root")
+
     if locator is not None:
         wanted = [os.path.basename(str(getattr(n, "file", "") or ""))
                   for n in (data_in or []) if getattr(n, "file", None)]
@@ -525,9 +538,16 @@ def stage_inputs(data_in, work_dir: str,
         if wanted:
             try:
                 locations = locator(wanted) or {}
-            except Exception as exc:       # noqa: BLE001 - a lookup failure must not crash a job
-                logger.warning("[STAGE] location lookup failed (%s); "
-                               "falling back to local sources", exc)
+            except Exception as exc:       # noqa: BLE001
+                if staging_on:
+                    # Same reasoning as above: with staging on, "I could not ask where this
+                    # file is" must not become "so I will use whatever file of that name is
+                    # lying around". The job is refused and the scheduler may retry it.
+                    return staged, (f"staging is enabled but the location lookup failed "
+                                    f"({exc}); refusing rather than resolving a produced name "
+                                    f"from the inputs root")
+                logger.warning("[STAGE] location lookup failed (%s); staging is off, so "
+                               "resolving inputs locally as usual", exc)
 
     for node in data_in or []:
         # `DataNode.name` is the SITE (`local`, `dtn3`); `file` is the logical file name.

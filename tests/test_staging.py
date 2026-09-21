@@ -282,13 +282,56 @@ def test_a_file_already_in_the_work_dir_is_never_fetched(tmp_path):
     assert open(os.path.join(work, "parent.out"), "rb").read() == b"already here"
 
 
-def test_a_lookup_failure_falls_back_to_local_sources_rather_than_failing_the_job(tmp_path):
-    """Redis being briefly unreachable is not a reason to fail a job whose input is on disk."""
+def test_a_lookup_failure_refuses_rather_than_reading_a_same_named_local_file(tmp_path):
+    """The first version of this fell back to the inputs root "because Redis being briefly
+    unreachable is not a reason to fail a job whose input is on disk". That reasoning is wrong
+    with staging on, and wrong in the way this codebase keeps being bitten by: the *fallback*
+    path was more permissive than the path it stood in for. A name a parent produced lives on
+    another agent, the lookup is the only thing that knows which, and resolving it from a
+    same-named file in the inputs root is exactly the stale-collision read the source order
+    exists to prevent — reached through the error path instead of the happy one. A refusal is
+    loud and retryable; a stale input is silent and produces plausible numbers."""
+    inputs_root = str(tmp_path / "inputs")
+    _write(os.path.join(inputs_root, "seed.csv"), b"stale same-named file")
+    work = str(tmp_path / "work")
+    os.makedirs(work)
+    staging.configure(enabled=True)
+    runner.configure(mode="real", roots={"inputs": inputs_root})
+
+    def _boom(names):
+        raise RuntimeError("redis down")
+
+    staged, refusal = runner.stage_inputs([_Node("seed.csv")], work,
+                                          locator=_boom, run_id="run-1")
+    assert staged == []
+    assert "location lookup failed" in refusal and "inputs root" in refusal
+    assert not os.path.exists(os.path.join(work, "seed.csv"))
+
+
+def test_staging_on_with_no_lookup_configured_refuses(tmp_path):
+    """The silent version of the same hole: staging enabled, context never installed, so every
+    produced name resolved from the inputs root with no warning at all."""
+    inputs_root = str(tmp_path / "inputs")
+    _write(os.path.join(inputs_root, "seed.csv"), b"stale")
+    work = str(tmp_path / "work")
+    os.makedirs(work)
+    staging.configure(enabled=True)
+    staging.set_context()                    # no locator
+    runner.configure(mode="real", roots={"inputs": inputs_root})
+
+    staged, refusal = runner.stage_inputs([_Node("seed.csv")], work)
+    assert staged == []
+    assert "no location lookup is configured" in refusal
+
+
+def test_with_staging_off_a_lookup_failure_is_still_harmless(tmp_path):
+    """Off, there are no produced-elsewhere names to confuse it with, so the local resolve is
+    the right answer and a failed lookup is genuinely nothing to fail a job over."""
     inputs_root = str(tmp_path / "inputs")
     _write(os.path.join(inputs_root, "seed.csv"), b"x")
     work = str(tmp_path / "work")
     os.makedirs(work)
-    staging.configure(enabled=True)
+    staging.configure(enabled=False)
     runner.configure(mode="real", roots={"inputs": inputs_root})
 
     def _boom(names):
