@@ -55,9 +55,9 @@ so past a few tens of agents move to hierarchical.
 python run_test.py --mode local --agent-type resource --agents 30 --topology mesh \
     --jobs 500 --db-host localhost --run-dir runs/mesh-30
 
-# hierarchical (pass the coordinator type explicitly — it defaults to llm)
+# hierarchical
 python run_test.py --mode local --agent-type resource --agents 30 --topology hierarchical \
-    --hierarchical-level1-agent-type resource --jobs 500 --db-host localhost --run-dir runs/hier-30
+    --jobs 500 --db-host localhost --run-dir runs/hier-30
 
 # remote: agents spread over hosts listed one per line, passwordless SSH required
 python run_test.py --mode remote --agent-type resource --agents 30 --agents-per-host 5 \
