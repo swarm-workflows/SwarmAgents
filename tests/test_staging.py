@@ -1078,3 +1078,59 @@ def test_staging_off_needs_no_run_id(tmp_path, monkeypatch):
     a.repository = MagicMock()
 
     a._configure_staging({"staging": {"enabled": False}}, "/tmp/w", "simulate")   # no raise
+
+
+def test_an_explicit_store_restriction_binds_downloads_too(tmp_path):
+    """`--run-id` is an operator saying "this site is for one run". Exempting the store from
+    the equality check — correct for the *namespace* — silently dropped that restriction on
+    downloads, so a site restarted with a restriction still served every run it had already
+    accumulated, because startup re-publishes them all."""
+    # A site that already holds two runs' files, then is restricted to one.
+    open_site, port, store_dir = _store(tmp_path, run_id="")
+    try:
+        staging.configure(enabled=True, store_host="127.0.0.1", store_port=port)
+        for run, body in (("run-1", b"one"), ("run-2", b"two")):
+            src = _write(str(tmp_path / run / "x.txt"), body)
+            assert staging.put("x.txt", src, run_id=run).ok
+    finally:
+        open_site.stop(0)
+
+    published = staging.PublishedFiles()
+    published.publish_all({f"run-1/x.txt": os.path.join(store_dir, "run-1", "x.txt"),
+                           f"run-2/x.txt": os.path.join(store_dir, "run-2", "x.txt")})
+    import socket
+    s = socket.socket(); s.bind(("127.0.0.1", 0)); port2 = s.getsockname()[1]; s.close()
+    restricted = staging.TransferServer(published, "127.0.0.1", port2, run_id="run-2",
+                                        store_dir=store_dir)
+    restricted.start()
+    try:
+        staging.configure(enabled=True, store_host="127.0.0.1", store_port=port2)
+        dest = str(tmp_path / "c"); os.makedirs(dest)
+
+        out = staging.fetch("x.txt", {"host": "127.0.0.1", "port": port2}, dest, run_id="run-1")
+        assert not out.ok, "a restricted site must not serve another run"
+        assert "restricted to" in out.reason
+
+        out = staging.fetch("x.txt", {"host": "127.0.0.1", "port": port2}, dest, run_id="run-2")
+        assert out.ok and open(os.path.join(dest, "x.txt"), "rb").read() == b"two"
+
+        src = _write(str(tmp_path / "r3" / "x.txt"), b"three")
+        assert not staging.put("x.txt", src, run_id="run-3").ok, "and must not take one either"
+    finally:
+        restricted.stop(0)
+
+
+def test_an_unrestricted_store_still_serves_every_run(tmp_path):
+    """The default. The (run, name) namespace is what keeps it safe, so the restriction must
+    stay optional rather than become required."""
+    server, port, _ = _store(tmp_path, run_id="")
+    try:
+        staging.configure(enabled=True, store_host="127.0.0.1", store_port=port)
+        for run, body in (("run-1", b"one"), ("run-9", b"nine")):
+            src = _write(str(tmp_path / run / "y.txt"), body)
+            assert staging.put("y.txt", src, run_id=run).ok
+            dest = str(tmp_path / f"c{run}"); os.makedirs(dest)
+            out = staging.fetch("y.txt", {"host": "127.0.0.1", "port": port}, dest, run_id=run)
+            assert out.ok and open(os.path.join(dest, "y.txt"), "rb").read() == body
+    finally:
+        server.stop(0)

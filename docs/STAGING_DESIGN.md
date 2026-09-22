@@ -90,10 +90,13 @@ readiness registry's run-scoped key provides. **An agent fails closed on an unkn
 first version compared the two ids only when both were non-empty, so an agent whose
 `SWARM_RUN_ID` was empty skipped the check and served its names to any run — and agents do
 outlive their runs here, so run 1's agent would answer a run-2 consumer with run 1's file of the
-same name. Staging therefore refuses to start without `SWARM_RUN_ID`. A **store** is exempt from
-the equality check and only from that, because its namespace is already `(run, name)`: it files
-each upload under the requesting run and looks it up the same way, which is what lets one site
-back a whole campaign.
+same name. Staging therefore refuses to start without `SWARM_RUN_ID`. A **store** needs no equality
+check to be *safe*, because its namespace is already `(run, name)`: it files each upload under
+the requesting run and looks it up the same way, which is what lets one site back a whole
+campaign. But `--run-id` on the site is an operator saying "this one is for one run", and that
+binds **downloads as well as uploads** — exempting the store from the check outright dropped it
+on the download side, so a site restarted with a restriction still served every run it had
+already accumulated, because startup re-publishes them all.
 
 ## 5. Staging in
 

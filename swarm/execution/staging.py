@@ -219,10 +219,20 @@ class _Servicer(consensus_pb2_grpc.DataTransferServiceServicer):
         # consumer with run 1's file of the same name. Silently stale, and the names collide by
         # construction: 62 colliding names measured in the shipped profile.
         #
-        # A store is exempt because its namespace is already (run, name): it files each
-        # upload under the requesting run and looks it up the same way, which is what lets one
-        # site serve many runs.
-        if not self.store_dir:
+        # A store needs no *equality* check to be safe, because its namespace is already
+        # (run, name): it files each upload under the requesting run and looks it up the same
+        # way, which is what lets one site serve a whole campaign. But `--run-id` is an
+        # operator saying "this site is for one run", and that has to bind downloads as well as
+        # uploads — otherwise a site restarted with a restriction still serves every run it had
+        # accumulated, because startup re-publishes them all. Honoured here when set; when
+        # unset (the documented default) the namespace does the work.
+        if self.store_dir:
+            if self.run_id and str(request.run_id or "") != self.run_id:
+                yield from self._refuse(
+                    f"{name!r} requested for run {request.run_id!r} but this store is "
+                    f"restricted to {self.run_id!r}")
+                return
+        else:
             if not self.run_id:
                 yield from self._refuse(
                     f"{name!r} refused: this agent does not know its run (SWARM_RUN_ID is "
@@ -305,13 +315,14 @@ class _Servicer(consensus_pb2_grpc.DataTransferServiceServicer):
                         self.put_refused += 1
                         return consensus_pb2.PutAck(
                             ok=False, error=f"{name!r} is not a plain file name")
-                    if chunk.run_id and self.run_id and chunk.run_id != self.run_id:
+                    run = str(chunk.run_id or "")
+                    if run and self.run_id and run != self.run_id:
+                        # Same restriction as the download side, checked the same way.
                         self.put_refused += 1
                         return consensus_pb2.PutAck(
                             ok=False,
-                            error=f"upload for run {chunk.run_id!r} but this store serves "
+                            error=f"upload for run {run!r} but this store is restricted to "
                                   f"{self.run_id!r}")
-                    run = str(chunk.run_id or "")
                     if not run:
                         # Without a run there is no namespace to put this in, and a flat store
                         # would let the next run's file of the same name collide with it — and
