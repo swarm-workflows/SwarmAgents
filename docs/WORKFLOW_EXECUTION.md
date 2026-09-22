@@ -182,7 +182,7 @@ python3 pegasus_profile_extractor.py \
 python3 pegasus_to_swarm_converter.py \
     --input soil_profiles.json --input-type json \
     --output-dir converted_jobs/ \
-    --bundle-images --dag-gating \
+    --dag-gating \
     --dtn-names local --dtn-scope job
 ```
 
@@ -190,10 +190,14 @@ python3 pegasus_to_swarm_converter.py \
   `tests/test_workflow_dag.py`). It forces `--data-nodes per-file`, because per-site collapses
   a job's inputs and loses edges. Without it nothing waits for its parents and a child fails on
   a file that has not been written.
-* `--bundle-images` carries the container image too, so the copied directory is everything the
-  jobs need. See §4.3 before quoting timings from a run that executes it off the export.
+* `--bundle-images` is deliberately **not** used: it copies the container image into the
+  bundle, and into every copy of the bundle, and images are gigabytes. Stage the image to each
+  agent's local disk instead (§4.3) and point `roots.images` at it; the manifest records its
+  checksum either way. Use `--bundle-images` only when a fully portable directory is worth the
+  size.
 * `--dtn-names local --dtn-scope job` makes the jobs data-location-free — `local` is excluded
-  from a job's required DTNs — which is what you want when every agent reads one shared mount.
+  from a job's required DTNs. Right in both modes: under staging, *where* a produced file lives
+  comes from the location registry, not from a DTN name.
 * `--bundle-source-root` is only needed when converting somewhere the recorded paths do not
   resolve. It is a prefix replacement, and a relative value resolves against the current
   directory, so pass it absolute.
@@ -341,22 +345,65 @@ form put `code/` in the path twice and every job refused.
 
 ### 2.5 Configuring execution
 
+**Staging is the default since 2026-09-21** (`docs/STAGING_DESIGN.md`). A job's outputs stay on
+the agent that produced them and a consumer elsewhere fetches them, with a staging site holding
+a durable copy; the work directory is therefore **local** to each agent, and a shared one would
+make every fetch a no-op and measure nothing.
+
 ```yaml
 runtime:
   execution:
     mode: real
-    work_dir: /export/swarm-wf/work
+    work_dir: /var/tmp/swarm-wf/work       # LOCAL per agent
     container_runtime: auto
     timeout_s: 3600.0
-    bundle: /export/swarm-wf/converted_jobs
+    bundle: /export/swarm-wf/converted_jobs   # code + root inputs, read-only
+    roots:
+      images: /export/images               # each agent's LOCAL disk (§4.3)
+    staging:
+      enabled: true
+      store_host: database                 # staging_site.py, started once
+      store_port: 21000
 ```
 
-The work directory must be writable by the **squashed** NFS user, or every job refuses with
+Start the site once, on a node every agent can reach, and leave it running — the store is keyed
+by `(run, name)`, so one site backs a whole campaign without runs colliding. Do **not** pin it
+with `--run-id`: `run_test.py` mints the run id at launch and it ends in a uuid, so it is not
+knowable in advance.
+
+```bash
+python3 staging_site.py --store-dir /export/swarm-wf/store --port 21000
+```
+
+Every agent needs `SWARM_RUN_ID`, which `run_test.py` exports and re-exports over ssh; staging
+refuses to start without it, because an agent that does not know its run cannot tell a fetch for
+this run from one for a previous run's identically named file.
+
+The export still carries the bundle — the executable and the DAG's root inputs — because a job
+needs those before it can start. What staging moves is the files jobs **produce**.
+
+<details>
+<summary>Shared-mount alternative (<code>staging.enabled: false</code>)</summary>
+
+Simpler, fewer moving parts, and what every result before 2026-09-21 was measured on. The work
+directory goes back on the export, shared so job B finds job A's output:
+
+```yaml
+    work_dir: /export/swarm-wf/work
+    staging:
+      enabled: false
+```
+
+It must then be writable by the **squashed** NFS user, or every job refuses with
 `Permission denied`:
 
 ```bash
 sudo chown nobody:nogroup /export/swarm-wf/work && sudo chmod 1777 /export/swarm-wf/work
 ```
+
+Every agent is then equidistant from every produced file, which is exactly the variable the DTN
+penalties price — so no data-movement, locality or makespan number may come from such a run.
+</details>
 
 `path_rewrites` is for records converted with `--no-bundle`, which describe their code by
 absolute submit-host path and need those prefixes mapped onto wherever it was staged. A bundle
@@ -481,8 +528,16 @@ pass `--use-config-dir` to every run:
 
 ```bash
 python3 generate_configs.py 5 10 ./config_swarm_multi.yml configs mesh database 0 \
-    --skip-jobs --seed 42 --size-to-jobs /export/swarm-wf/converted_jobs
+    --skip-jobs --seed 42 --size-to-jobs /export/swarm-wf/converted_jobs \
+    --agent-hosts-file agent_hosts.txt --agents-per-host 1
 ```
+
+**`--agent-hosts-file` is not optional on a remote run.** Without it every agent advertises
+`grpc.host` verbatim from the base config — `0.0.0.0` as shipped — and a peer dialling that
+reaches its own localhost. Measured on the slice 2026-09-21: every consensus finalization in
+such a run reads `reason=single-node`, meaning no agent ever reached another, and every staging
+location is unusable for the same reason. With the flag each agent advertises `agent-N`, which
+`/etc/hosts` resolves to its data-plane address.
 
 Left to `run_test.py` the fleet is regenerated on every run, which re-draws flavours and DTNs and
 makes two runs of the "same" cell incomparable. `--use-config-dir` is what stops that: it skips
@@ -501,7 +556,7 @@ and given every DTN the jobs name. Without it the flavour pool tops out at 32 co
 
 ```bash
 python3 pegasus_to_swarm_converter.py --input soil_profiles.json --input-type json \
-    --output-dir converted_jobs/ --bundle-images --dag-gating \
+    --output-dir converted_jobs/ --dag-gating \
     --dtn-names local --dtn-scope job \
     --generate-agent-configs --num-agents 5 --base-config ./config_swarm_multi.yml \
     --topology mesh --db-host database
@@ -637,8 +692,10 @@ names, which is not decidable from a catalog.
 So the namespace has to be something the job never sees: a **directory**. Give each workflow its
 own working directory — which is what Pegasus does with its per-workflow scratch dir — and the
 names inside it stay exactly as the workflow wrote them. That is genuinely the right fix, and
-it is not what the code does today: `work_dir` is per *run* (`<work_dir>/<SWARM_RUN_ID>`), shared
-by every job in it, because a shared directory is how job B finds job A's output. Per workflow
+it is not what the code does today: `work_dir` is per *run* (`<work_dir>/<SWARM_RUN_ID>`) and
+shared by every job of that run **on the same agent** — which under the shared mount is how job
+B finds job A's output, and under staging is the reason a child already co-located with its
+parent fetches nothing. Per workflow
 is the finer scope that keeps that property and removes the collisions; it needs the runner to
 key on the job's `workflow` field (now carried on every converted record), the readiness
 registry to be scoped the same way, and DAG matching to stay inside a workflow.
@@ -812,10 +869,12 @@ replicas* — the files `replicas.yml` lists and no job produces — are carried
 `inputs/` and copied into the work dir by `stage_inputs` before a job starts (§2.9), so nothing
 has to be placed by hand any more.
 
-What still does not exist is **transfer between agents**: staging is a copy from a root the
-agent can already see, which on this slice means the shared export. A run whose agents did not
-share a filesystem would have nothing to stage from. That is the same limit as §4.2, from the
-other side.
+**Transfer between agents exists since 2026-09-21** (`docs/STAGING_DESIGN.md`): a produced file
+stays on the agent that made it, the location registry says which agent that is, and a consumer
+elsewhere fetches it over a second gRPC port on the same host consensus uses. The sentence that
+stood here — that staging is only a copy from a root the agent can already see, so agents not
+sharing a filesystem would have nothing to stage from — described the state before that, and is
+still true of the shared-mount mode.
 
 `fetch_soil_data` additionally calls a live external API, and
 `archive-api.open-meteo.com` is **unreachable from the slice** (generic HTTPS is fine —
@@ -887,11 +946,13 @@ invisible until a job lands on the host nobody remembers skipping.
    per link, which is what a data-movement *result* would need). The paragraph below describes
    the state before that.
 
-   Historical: declared replicas now travel in the bundle and are copied into
-   the working directory by `stage_inputs` (§4.1), but that is a local copy from a root the
-   agent can already see. Nothing moves data *between* agents, and outputs never leave the
-   working directory. This is the last thing standing between the current setup and a
-   defensible makespan comparison.
+   *What stood here before, kept because it is what the pre-2026-09-21 results were measured
+   on:* declared replicas travel in the bundle and are copied into the working directory by
+   `stage_inputs` (§4.1), but that is a local copy from a root the agent can already see.
+   Nothing moves data between agents, and outputs never leave the working directory. That was
+   the last thing standing between the setup and a defensible makespan comparison; what remains
+   of it is transfer **accounting** (bytes per job and per link in `collect.py`), without which
+   staging is a capability rather than a result.
 2. **A controlled substrate** — Pegasus and SWARM on the same hardware — before any published
    number.
 3. **Per-job resource enforcement.** The catalog carries `memory`/`cores` requests; the runner
