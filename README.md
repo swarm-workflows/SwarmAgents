@@ -141,9 +141,11 @@ python run_test.py --mode local --agent-type resource --agents 20 --topology mes
     --use-config-dir --config-dir configs
 ```
 
-The bundle is self-contained: job records, executables in `code/`, root inputs in `inputs/`,
-and `manifest.json` with a sha256 per file. Add `--bundle-images` and the same directory runs
-for real, no reconversion.
+The bundle is self-contained apart from the container image: job records, executables in
+`code/`, root inputs in `inputs/`, and `manifest.json` with a sha256 per file. The image is
+referenced rather than copied — it is gigabytes, and a bundle is copied around — so it is staged
+to each agent's local disk separately and the manifest records its checksum. `--bundle-images`
+does copy it in, for the rare case where a fully portable directory is worth the size.
 
 ### Real execution
 
@@ -153,32 +155,52 @@ absolute submit-host paths, so extraction and conversion happen there.
 
 **Two ways to get a job its inputs, and the default changed on 2026-09-21.**
 
+Both modes read the jobs' code, root inputs and image from somewhere every agent can reach.
+They differ only in what happens to the files jobs **produce**.
+
 | | **Staging (default)** | Shared mount (still supported) |
 |---|---|---|
-| Where outputs live | on the agent that produced them, plus a staging site | one NFS export every agent mounts |
+| Where a produced file lives | on the agent that produced it, plus a staging site | the NFS export, visible to all |
 | How a consumer gets one | fetches it from the producer, or the site if the producer is gone | it is already there |
 | Work dir | **local** to each agent | shared, same path everywhere |
-| Data movement | real, measured, over the same paths consensus uses | none — every agent is equidistant from every file |
-| Use it for | anything reporting data movement or locality | a quick functional check; it is simpler |
+| Data movement | real, measured, over the same paths consensus uses | none — every agent is equidistant from every produced file |
+| Survives a dead producer | yes, from the staging site | yes, the export is elsewhere |
+| Use it for | anything reporting data movement or locality | a quick functional check; it is simpler and has fewer moving parts |
 
-The shared mount is why every agent looks equally close to every file, which is exactly the
-variable the scheduler's DTN penalties price — so **no data-movement or locality number can
+Under the shared mount every agent looks equally close to every produced file, which is exactly
+the variable the scheduler's DTN penalties price — so **no data-movement or locality number can
 come from it.** Staging is the default for that reason. It is also the slower of the two, and
-honestly so.
+honestly so: measured on soilmoisture, the stage-out push cost about 0.7% of makespan.
+
+**Staging does not remove the shared mount; it changes what the mount is for.** A job still
+needs its *executable*, the DAG's *root inputs* and its *container image* before it can start,
+and those come from somewhere every agent can read. What staging moves is the files jobs
+**produce**. So the export stays, carrying read-only inputs to the workflow, and the image goes
+to each agent's local disk because a multi-gigabyte `.sif` pulled over a WAN mount at every job
+start would dominate every timing you take.
+
+Pass the host list to both setup scripts if only part of the fleet will run workflow jobs —
+without it they act on every host, and `--check` on either reports without changing anything.
 
 ```bash
-# 1. once per slice
-sudo ./setup_apptainer.sh          # run the workflow's own .sif natively
+# 1. once per slice, on the hosts that will run workflow jobs
+sudo ./setup_apptainer.sh agent-1 agent-2 agent-3 agent-4 agent-5       # run the .sif natively
+sudo ./setup_nfs_workflow.sh agent-1 agent-2 agent-3 agent-4 agent-5    # export for code+inputs
+sudo ./setup_nfs_workflow.sh --stage-image /root/wf-images/<image>.sif \
+     agent-1 agent-2 agent-3 agent-4 agent-5      # image to each agent's LOCAL disk
 
-# 2. extract and convert, on the Pegasus submit host
+# 2. extract and convert, on the Pegasus submit host.
+#    NOT --bundle-images: that copies a multi-GB image into the bundle, and into every copy of
+#    it. Images are referenced and staged separately (step 1); the manifest records the
+#    checksum either way.
 python3 pegasus_profile_extractor.py --submit-dir <run dir>/     # → all_runs_jobs_profile.json
 python3 pegasus_to_swarm_converter.py --input all_runs_jobs_profile.json --input-type json \
     --output-dir converted_jobs/ \
-    --bundle-images --dag-gating --dtn-names local --dtn-scope job
+    --dag-gating --dtn-names local --dtn-scope job
     # --bundle-source-root <tree>   # only if the workflow tree has moved since the run
 
-# 3. put the bundle somewhere every agent can read (code and the DAG's ROOT inputs only —
-#    produced files travel by staging, not by this)
+# 3. put the bundle on the export — the jobs' code and the DAG's ROOT inputs.
+#    Produced files do NOT travel this way: that is what staging is for.
 rsync -a --delete converted_jobs/ <db-host>:/export/swarm-wf/converted_jobs/
 ssh <db-host> sudo chown -R nobody:nogroup /export/swarm-wf/converted_jobs
 
@@ -186,6 +208,8 @@ ssh <db-host> sudo chown -R nobody:nogroup /export/swarm-wf/converted_jobs
 #    Leave it running across runs: the store is keyed by (run, name), so one site backs a
 #    whole campaign without runs colliding. Do NOT pass --run-id — run_test.py mints the run
 #    id at launch (it ends in a uuid), so it is not knowable in advance.
+#    The store keeps one directory per run and nothing prunes it, so sweep old runs between
+#    campaigns if disk is tight.
 python3 staging_site.py --store-dir /export/swarm-wf/store --port 21000
 ```
 
@@ -200,18 +224,25 @@ runtime:
     work_dir: /var/tmp/swarm-wf/work      # LOCAL per agent — a shared one makes every
                                           # fetch a no-op and measures nothing
     container_runtime: auto
-    bundle: /export/swarm-wf/converted_jobs
+    bundle: /export/swarm-wf/converted_jobs   # sets roots.code and roots.inputs
+    roots:
+      images: /export/images              # each agent's LOCAL disk, from step 1
     staging:
       enabled: true
       store_host: database                # the staging site from step 4
       store_port: 21000
 ```
 
+`bundle` expands to the bundle's `code/` and `inputs/`; `roots.images` is set explicitly beside
+it because the image is deliberately *not* in the bundle. An explicit `roots` entry always wins
+over the bundle, so this pairing is the expected one rather than an exception.
+
 <details>
 <summary>Shared-mount alternative (no staging)</summary>
 
-Simpler, and the path every result before 2026-09-21 was measured on. Add
-`sudo ./setup_nfs_workflow.sh` to step 1, skip step 4, and use:
+Simpler, and the path every result before 2026-09-21 was measured on. Step 1 is unchanged (the
+export and the staged image are needed either way); skip step 4, and use a **shared** work dir
+on the export instead of a local one:
 
 ```yaml
 runtime:
@@ -269,7 +300,7 @@ from the site in 0.19 s with the producer unreachable.
 | flag | why |
 |---|---|
 | `--dag-gating` | jobs wait for their parents' output; without it a child fails on a file nobody has written |
-| `--bundle-images` | the copied directory is then everything the jobs need |
+| `--bundle-images` | copies the container image into the bundle. **Normally wrong**: images are gigabytes, and every copy of the bundle carries one. Stage the image to each agent's local disk instead (step 1) and let `roots.images` point at it; the manifest records its checksum either way |
 | `--dtn-names local --dtn-scope job` | makes the jobs data-location-free. Right for both modes: under staging, *where* a file is comes from the location registry, not from a DTN name |
 | `--bundle-source-root` | pass it (absolute, or `OLD=NEW`) only when the workflow tree has moved since the run |
 | `--size-to-jobs` | every agent can run every job — so a failed agent's work can go to any other. It raises capacity to a *floor* and gives every agent the jobs' DTNs at its own connectivity score, so the fleet stays heterogeneous ([why](docs/WORKFLOW_EXECUTION.md#27-sizing-the-fleet-to-the-workflow)) |
@@ -289,16 +320,19 @@ fleets. Skipping `--size-to-jobs` is for when the fleet itself is the experiment
 
 ### Hierarchical fleets
 
-Steps 1-4 are unchanged; steps 5 and 6 both differ. The agent count must match the fleet you
-generated, and it has to be one of the presets:
+Steps 1-5 are unchanged; steps 6 and 7 both differ. The agent count must match the fleet you
+generated, and it has to be one of the presets. Note the hosts file is passed to **both**
+commands, for different reasons: `generate_configs.py` needs it to give each agent the address
+its peers dial, and `run_test.py` needs it to place them.
 
 ```bash
-# 5. generate the fleet, once
+# 6. generate the fleet, once
 python3 generate_configs.py 30 10 ./config_swarm_multi.yml configs hierarchical database 0 \
     --hierarchical-level1-agent-type resource --skip-jobs --seed 42 \
-    --size-to-jobs /export/swarm-wf/converted_jobs
+    --size-to-jobs /export/swarm-wf/converted_jobs \
+    --agent-hosts-file agent_hosts.txt --agents-per-host 1
 
-# 6. run
+# 7. run
 python3 run_test.py --mode remote --agent-type resource --agents 30 --agents-per-host 1 \
     --topology hierarchical --hierarchical-level1-agent-type resource \
     --jobs-per-interval 4 --db-host database --agent-hosts-file agent_hosts.txt \
@@ -315,6 +349,8 @@ Three things to know:
   coordinator host then needs `OPENAI_API_KEY`.
 - No DTN pool is generated for hierarchical, so convert with `--dtn-names local` or let
   `--size-to-jobs` attach the names the jobs use.
+- Every host that can receive a job needs step 1 done to it — apptainer, the export and the
+  staged image. A 30-agent hierarchical fleet is 30 hosts, not the 5 the flat example uses.
 
 Supported fleet sizes are presets — 30, 60, 80, 90, 100, 110, 120, 250, 270, 990, 1000 — and
 anything else is refused. Jobs enter at the top tier and are delegated down.
