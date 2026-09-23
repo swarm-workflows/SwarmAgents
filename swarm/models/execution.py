@@ -93,6 +93,14 @@ class ExecutionSpec(JSONField):
         self.pfn = ""                       # host path of the code staged to `path`
         self.pfn_type = ""                  # stageable | installed
         self.arguments: Optional[List[str]] = []
+        # How many tasks Pegasus clustered into this one Condor job, when it did. `None` or 1
+        # means an ordinary single-task job. It is carried because it is the DIFFERENCE
+        # between two jobs that otherwise look identical: both arrive with `arguments = None`
+        # and both are refused, but one is a designed refusal (a cluster has no single
+        # command line — see docs/WORKFLOW_EXECUTION.md 1.3) and the other is a parsing
+        # failure worth investigating. Without it the artifact cannot explain its own
+        # refusal, and the correct behaviour reads as a bug to be fixed.
+        self.clustered_tasks: Optional[int] = None
         # NOTE: there is deliberately no `inputs` field here. The files a job needs are
         # already `Job.data_in`, which the converter populates from the workflow; a second
         # list would be a second source of truth for the same fact, and the two would drift.
@@ -118,8 +126,8 @@ class ExecutionSpec(JSONField):
                     raise ExecutionModelException(report)
         return self
 
-    def runnable(self) -> bool:
-        """True when this job can actually be executed, as opposed to merely described.
+    def refusal_reason(self) -> Optional[str]:
+        """Why this job cannot be executed, or ``None`` when it can.
 
         Deliberately strict, and every clause is a way a run could otherwise produce numbers
         that look like a comparison but are not one:
@@ -132,14 +140,32 @@ class ExecutionSpec(JSONField):
 
         ``pfn`` is *not* required: an ``installed`` transformation lives in the image already
         and has nothing to stage.
+
+        The *reason* is produced here rather than at the call site so there is one wording of
+        each refusal, and so the clustered case can say what it is. A caller that composes its
+        own message from a bare boolean cannot distinguish a cluster (correct, permanent, not
+        a defect) from an unparseable argv (a real extraction problem), and both then read as
+        the same bug.
         """
         if not self.path:
-            return False
+            return "no in-container path to invoke"
         if self.arguments is None:
-            return False
+            if (self.clustered_tasks or 1) > 1:
+                return (f"clustered job wrapping {self.clustered_tasks} tasks: Pegasus ran "
+                        f"them as separate sequential invocations, so no single command line "
+                        f"describes it (docs/WORKFLOW_EXECUTION.md 1.3). Not a defect")
+            return "arguments could not be parsed, and the job is not clustered"
         if self.container is not None and not self.container.image:
-            return False
-        return True
+            return f"container {self.container.name!r} is named but has no image"
+        return None
+
+    def runnable(self) -> bool:
+        """True when this job can actually be executed, as opposed to merely described.
+
+        One definition, in `refusal_reason` — a second copy of the clauses here would drift
+        from the wording that explains them.
+        """
+        return self.refusal_reason() is None
 
     def to_dict(self) -> Optional[dict]:
         """Serialise, nesting the container rather than flattening it.
@@ -156,6 +182,10 @@ class ExecutionSpec(JSONField):
         # survives the round trip and keeps refusing to run at the far end.
         if self.arguments is None or self.arguments:
             out["arguments"] = self.arguments
+        # Only when it says something: 1 is what an ordinary job is, and emitting it on every
+        # record would add a field to thousands of jobs to state the default.
+        if (self.clustered_tasks or 1) > 1:
+            out["clustered_tasks"] = self.clustered_tasks
         if self.container is not None:
             container = self.container.to_dict()
             if container:

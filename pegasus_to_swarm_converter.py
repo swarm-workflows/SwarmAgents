@@ -241,7 +241,24 @@ def _map_data_nodes(files_list: Optional[list],
     if not seen_sites:
         return None
 
-    return [{"name": name, "file": lfn} for name, lfn in seen_sites.items()]
+    # The size of the lfn this node kept, carried like the per-file branch does. Dropping it
+    # was silent data loss: `size_bytes` is the only per-file volume signal a job record has,
+    # and per-site is the DEFAULT mode, so a workload converted without --dag-gating had none
+    # at all (measured: 1549 of 1549 trace nodes bare, against 5194 of 5194 populated in a
+    # per-file conversion of the same shape). The node already names one file; withholding
+    # that file's size while keeping its name was arbitrary.
+    sizes = {}
+    for f in files_list:
+        lfn = f.get("lfn", "")
+        if lfn not in sizes and f.get("size_bytes") is not None:
+            sizes[lfn] = f["size_bytes"]
+    nodes = []
+    for name, lfn in seen_sites.items():
+        node = {"name": name, "file": lfn}
+        if sizes.get(lfn) is not None:
+            node["size_bytes"] = sizes[lfn]
+        nodes.append(node)
+    return nodes
 
 
 # ---------------------------------------------------------------------------
@@ -294,8 +311,57 @@ def map_profile(profile: dict, job_number: int,
     execution = _map_execution(profile)
     if execution:
         job["execution"] = execution
+        # A conversion that yields jobs which cannot execute must say so. Until now the only
+        # per-job warning was wall-time clamping, so the 809-job trace reported
+        # `warnings_count: 0` while holding 132 unrunnable jobs and 26 with no data at all —
+        # a partial artifact describing itself as whole, which is the failure this project
+        # guards against everywhere else. The same conversion now emits 158 warnings.
+        refusal = _execution_refusal(execution)
+        if refusal:
+            warnings.append(f"NOT EXECUTABLE: {refusal}")
+
+    # Reported for every job, executable or not: with no data nodes a job is feasible
+    # everywhere, exercises no DTN or connectivity term, and contributes no DAG edge — so a
+    # workload of them measures none of the things it appears to. Silence here is how the
+    # eScience 547-job set reached a paper with `sites_seen: {}`.
+    if not data_in and not data_out:
+        warnings.append("no data nodes: neither inputs nor outputs were recorded, so this "
+                        "job expresses no locality and can carry no DAG edge")
 
     return job, warnings
+
+
+def _execution_refusal(execution: dict) -> Optional[str]:
+    """Why the runner will refuse this execution block, or None when it will run it.
+
+    This is a **deliberate second copy** of `ExecutionSpec.refusal_reason()`, and the
+    duplication is forced: this script runs standalone on the Pegasus submit host, where the
+    `swarm` package does not exist (verified — `import swarm` is a ModuleNotFoundError there),
+    so importing the model would break the converter exactly where it is used.
+
+    The first version of this warning was not a copy but a SUBSET — it tested only
+    `arguments is None` and said nothing about a container declared with no image, which
+    `runnable()` also refuses. A job like that converted "cleanly" and then refused at run
+    time. A partial copy of a rule is worse than an honest one, because it looks like the
+    rule.
+
+    `tests/test_workflow_execution.py::TestRefusalRulesAgree` runs both over a matrix and
+    fails if they ever disagree, which is the only thing that keeps two copies honest.
+    """
+    if not execution.get("path"):
+        return "no in-container path to invoke"
+    if execution.get("arguments") is None:
+        n = execution.get("clustered_tasks")
+        if n and int(n) > 1:
+            return (f"clustered job wrapping {n} tasks: Pegasus ran them as separate "
+                    f"sequential invocations, so no single command line describes it "
+                    f"(docs/WORKFLOW_EXECUTION.md 1.3). Not a defect")
+        return ("argv could not be parsed and the job is not clustered; the extraction is "
+                "incomplete for this job")
+    container = execution.get("container")
+    if container is not None and not container.get("image"):
+        return f"container {container.get('name', '')!r} is named but has no image"
+    return None
 
 
 def _map_execution(profile: dict) -> Optional[dict]:
@@ -320,6 +386,13 @@ def _map_execution(profile: dict) -> Optional[dict]:
         "path": path,
         "arguments": profile.get("argv_db"),
     }
+    # Carried so the refusal that follows can explain itself. A clustered job and a job whose
+    # argv could not be parsed both arrive with `arguments: None` and both are refused, but
+    # only one of them is a defect. Without this the record cannot tell them apart and the
+    # designed refusal is investigated as a bug — which is exactly what happened.
+    clustered = profile.get("clustered_tasks_db")
+    if clustered and int(clustered) > 1:
+        execution["clustered_tasks"] = int(clustered)
     pfn = profile.get("pfn_db")
     if pfn:
         execution["pfn"] = pfn
@@ -858,6 +931,18 @@ def convert_pegasus_profiles(
     # Whether the names are acted upon at all: a simulated replay with no gating never touches
     # a filesystem and never consults a producer map, so its names are inert.
     execution_jobs = sum(1 for _, j, _, _ in mapped if j.get("execution"))
+    # A corpus that can EXECUTE but was converted per-site is the dangerous combination, and
+    # until now nothing said so: --dag-gating forces per-file, but a conversion with execution
+    # blocks and no gating kept the per-site default and silently collapsed each job's file
+    # list to one file per site. Measured on the 809-job trace: 1549 data nodes and 112 jobs
+    # whose command line named a sibling's output they did not declare, against 119,596 nodes
+    # and 0 such jobs from the same profiles per-file — 3 runs with a complete DAG rather than
+    # 18. The jobs run either way, which is what makes it worth shouting about.
+    if execution_jobs and data_nodes_mode != "per-file":
+        print(f"  WARNING:     {execution_jobs} job(s) carry an execution block but "
+              f"--data-nodes is {data_nodes_mode!r}. per-site keeps ONE file per site, so "
+              f"these records under-declare what their jobs read and any DAG built from them "
+              f"is incomplete. Use --data-nodes per-file for a corpus meant to execute.")
 
     # The payload is built in a staging directory and only promoted once everything that
     # can fail has succeeded. Clearing first — which is what this did — destroyed a working
@@ -1513,6 +1598,18 @@ def convert(args: argparse.Namespace):
     # Whether the names are acted upon at all: a simulated replay with no gating never touches
     # a filesystem and never consults a producer map, so its names are inert.
     execution_jobs = sum(1 for _, j, _, _ in mapped if j.get("execution"))
+    # A corpus that can EXECUTE but was converted per-site is the dangerous combination, and
+    # until now nothing said so: --dag-gating forces per-file, but a conversion with execution
+    # blocks and no gating kept the per-site default and silently collapsed each job's file
+    # list to one file per site. Measured on the 809-job trace: 1549 data nodes and 112 jobs
+    # whose command line named a sibling's output they did not declare, against 119,596 nodes
+    # and 0 such jobs from the same profiles per-file — 3 runs with a complete DAG rather than
+    # 18. The jobs run either way, which is what makes it worth shouting about.
+    if execution_jobs and data_nodes_mode != "per-file":
+        print(f"  WARNING:     {execution_jobs} job(s) carry an execution block but "
+              f"--data-nodes is {data_nodes_mode!r}. per-site keeps ONE file per site, so "
+              f"these records under-declare what their jobs read and any DAG built from them "
+              f"is incomplete. Use --data-nodes per-file for a corpus meant to execute.")
 
     # See the note in convert_pegasus_profiles: staged, then promoted, so a conversion that
     # fails leaves the previous bundle intact.

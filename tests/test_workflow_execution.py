@@ -1076,3 +1076,209 @@ class TestReplicaNameDeclaredTwice(unittest.TestCase):
             manifest = bundle_payload(pairs, out)
             self.assertEqual(manifest["missing"], [])
             self.assertEqual(list(manifest["inputs"]), ["data.csv"])
+
+
+class TestClusteredTasksSurviveConversion(unittest.TestCase):
+    """A refusal has to be able to explain itself.
+
+    A clustered job and a job whose `argv` could not be parsed both reach the runner with
+    `arguments is None` and both are refused. Only one of them is a defect. Until the cluster
+    count was carried through, the record held no evidence of the difference, so the correct
+    refusal was investigated as a bug — twice in one session, once by a review tool and once
+    by the author.
+    """
+
+    CLUSTERED = {
+        "run_name": "s2_run0003", "job_name": "merge_s2_vis_00",
+        "transformation_db": "compute_cloud_fraction",
+        "executable_db": "/srv/compute_cloud_fraction",
+        "argv_db": None, "clustered_tasks_db": 135,
+        "pfn_db": "/home/u/bin/compute_cloud_fraction.py", "pfn_type_db": "stageable",
+    }
+
+    def test_converter_carries_the_cluster_count(self):
+        spec = _map_execution(self.CLUSTERED)
+        self.assertEqual(spec["clustered_tasks"], 135)
+        self.assertIsNone(spec["arguments"], "the unknown-argv value must survive")
+
+    def test_an_ordinary_job_carries_no_count(self):
+        """1 is what every unclustered job is; emitting it would state the default thousands
+        of times and invite a reader to think it meant something."""
+        for value in (None, 0, 1):
+            profile = dict(self.CLUSTERED, clustered_tasks_db=value, argv_db=["--x"])
+            self.assertNotIn("clustered_tasks", _map_execution(profile),
+                             f"clustered_tasks_db={value!r} should emit nothing")
+
+    def test_round_trip_through_the_job_record(self):
+        spec = ExecutionSpec(**_map_execution(self.CLUSTERED))
+        reloaded = ExecutionSpec(**spec.to_dict())
+        self.assertEqual(reloaded.clustered_tasks, 135)
+        self.assertIsNone(reloaded.arguments)
+        self.assertFalse(reloaded.runnable())
+
+    def test_refusal_names_clustering_rather_than_a_parse_failure(self):
+        clustered = ExecutionSpec(**_map_execution(self.CLUSTERED))
+        unparsed = ExecutionSpec(**_map_execution(dict(self.CLUSTERED,
+                                                       clustered_tasks_db=None)))
+        self.assertFalse(clustered.runnable())
+        self.assertFalse(unparsed.runnable())
+
+        self.assertIn("clustered", clustered.refusal_reason())
+        self.assertIn("135", clustered.refusal_reason())
+        self.assertIn("not a defect", clustered.refusal_reason().lower())
+
+        self.assertIn("could not be parsed", unparsed.refusal_reason())
+        self.assertNotIn("clustered job", unparsed.refusal_reason())
+
+    def test_runnable_and_refusal_reason_cannot_disagree(self):
+        """`runnable()` is defined as "no reason", so a future clause added to one cannot be
+        missing from the other."""
+        cases = [
+            ExecutionSpec(path="", arguments=[]),
+            ExecutionSpec(path="/srv/x", arguments=None),
+            ExecutionSpec(path="/srv/x", arguments=[],
+                          container={"name": "c", "kind": "singularity", "image": ""}),
+            ExecutionSpec(path="/srv/x", arguments=[]),
+        ]
+        for spec in cases:
+            self.assertEqual(spec.runnable(), spec.refusal_reason() is None)
+
+
+class TestPerSiteKeepsFileSizes(unittest.TestCase):
+    """`per-site` dropped `size_bytes` while keeping the file name it belongs to.
+
+    It is the DEFAULT data-node mode, so a conversion run without `--dag-gating` produced a
+    workload with no per-file volume information at all — measured at 1549 of 1549 bare nodes
+    on one corpus against 5194 of 5194 populated on another of the same shape. Nothing reads
+    the field in the scheduler yet; it is the only per-file volume signal a job record has,
+    and the transfer accounting staging still lacks would need exactly it.
+    """
+
+    FILES = [
+        {"lfn": "a.csv", "site": "dtn1", "size_bytes": 4096},
+        {"lfn": "b.csv", "site": "dtn1", "size_bytes": 99},     # same site, later lfn
+        {"lfn": "c.csv", "site": "dtn2", "size_bytes": 512},
+    ]
+
+    def _nodes(self, mode, files=None):
+        from pegasus_to_swarm_converter import _map_data_nodes
+        return _map_data_nodes(files if files is not None else self.FILES, mode, None) or []
+
+    def test_per_site_carries_the_size_of_the_file_it_kept(self):
+        by_name = {n["name"]: n for n in self._nodes("per-site")}
+        self.assertEqual(by_name["dtn1"]["file"], "a.csv", "first lfn per site wins")
+        self.assertEqual(by_name["dtn1"]["size_bytes"], 4096,
+                         "the size must be the kept file's, not another file's on that site")
+        self.assertEqual(by_name["dtn2"]["size_bytes"], 512)
+
+    def test_per_file_is_unchanged(self):
+        nodes = self._nodes("per-file")
+        self.assertEqual([n["size_bytes"] for n in nodes], [4096, 99, 512])
+
+    def test_a_missing_size_is_omitted_not_zeroed(self):
+        """Absent is not zero. A node with no recorded size must carry no key, so a consumer
+        can tell "not measured" from "an empty file"."""
+        files = [{"lfn": "a.csv", "site": "dtn1"}]
+        for mode in ("per-site", "per-file"):
+            node = self._nodes(mode, files)[0]
+            self.assertNotIn("size_bytes", node, mode)
+
+
+class TestConversionWarnsAboutWhatMatters(unittest.TestCase):
+    """`warnings_count: 0` on a conversion that produced 132 unrunnable jobs.
+
+    Before this the only per-job warning was wall-time clamping, so a summary could report a
+    clean conversion of a corpus that was substantially unusable — a partial artifact
+    describing itself as whole.
+    """
+
+    BASE = {
+        "run_name": "r", "job_name": "j", "transformation_db": "t",
+        "remote_duration_sec_db": 5.0,
+        "input_files_db": [{"lfn": "in.csv", "site": "dtn1", "size_bytes": 1}],
+        "output_files_db": [{"lfn": "out.csv", "site": "dtn1", "size_bytes": 2}],
+    }
+
+    def _warnings(self, **over):
+        from pegasus_to_swarm_converter import map_profile
+        _job, warnings = map_profile(dict(self.BASE, **over), 1)
+        return warnings
+
+    def test_clean_job_warns_about_nothing(self):
+        self.assertEqual(self._warnings(), [])
+
+    def test_clustered_job_is_reported_as_expected_not_broken(self):
+        w = " ".join(self._warnings(executable_db="/srv/t", argv_db=None,
+                                    clustered_tasks_db=135))
+        self.assertIn("NOT EXECUTABLE", w)
+        self.assertIn("135", w)
+        self.assertIn("not a defect", w.lower())
+
+    def test_unparsed_argv_is_reported_as_an_extraction_problem(self):
+        w = " ".join(self._warnings(executable_db="/srv/t", argv_db=None))
+        self.assertIn("NOT EXECUTABLE", w)
+        self.assertIn("incomplete", w)
+        self.assertNotIn("clustered job", w)
+
+    def test_a_job_with_no_data_nodes_is_reported(self):
+        w = " ".join(self._warnings(input_files_db=[], output_files_db=[]))
+        self.assertIn("no data nodes", w)
+
+    def test_a_simulated_job_with_data_is_not_reported(self):
+        """No execution block is the normal case for a replay corpus and must stay silent, or
+        the warning list becomes noise nobody reads."""
+        self.assertEqual(self._warnings(), [])
+
+
+class TestRefusalRulesAgree(unittest.TestCase):
+    """The converter's refusal check and the model's must never disagree.
+
+    They are two copies on purpose: `pegasus_to_swarm_converter.py` runs standalone on the
+    Pegasus submit host, where the `swarm` package is not installed, so it cannot import
+    `ExecutionSpec`. Two copies are only safe if something proves they agree, and the first
+    version of the converter's copy was a *subset* — it caught an unparseable argv and missed
+    a container declared with no image, so such a job converted without a warning and then
+    refused at run time. Caught by the stop-time review gate.
+    """
+
+    CASES = [
+        {"path": "/srv/x", "arguments": []},                       # runnable
+        {"path": "/srv/x", "arguments": ["--a", "b"]},              # runnable
+        {"path": "", "arguments": []},                              # no path
+        {"path": "/srv/x", "arguments": None},                      # unparsed argv
+        {"path": "/srv/x", "arguments": None, "clustered_tasks": 135},   # clustered
+        {"path": "/srv/x", "arguments": [],
+         "container": {"name": "c", "kind": "singularity", "image": ""}},     # imageless
+        {"path": "/srv/x", "arguments": [],
+         "container": {"name": "c", "kind": "singularity", "image": "file:///i.sif"}},
+        {"path": "", "arguments": None, "clustered_tasks": 2},      # several at once
+    ]
+
+    def test_the_two_copies_agree_on_every_case(self):
+        from pegasus_to_swarm_converter import _execution_refusal
+        for case in self.CASES:
+            with self.subTest(case=case):
+                model = ExecutionSpec(**case)
+                self.assertEqual(
+                    _execution_refusal(case) is None, model.runnable(),
+                    f"converter and model disagree on {case}")
+
+    def test_an_imageless_container_is_warned_about(self):
+        """The specific gap: it refuses at run time, so it must not convert silently."""
+        from pegasus_to_swarm_converter import _execution_refusal, map_profile
+        execution = {"path": "/srv/x", "arguments": [],
+                     "container": {"name": "c", "kind": "singularity", "image": ""}}
+        self.assertIsNotNone(_execution_refusal(execution))
+        self.assertFalse(ExecutionSpec(**execution).runnable())
+
+        _job, warnings = map_profile({
+            "run_name": "r", "job_name": "j", "transformation_db": "t",
+            "remote_duration_sec_db": 5.0,
+            "executable_db": "/srv/x", "argv_db": [],
+            "container_db": {"name": "c", "type": "singularity", "image": ""},
+            "input_files_db": [{"lfn": "in.csv", "site": "dtn1"}],
+            "output_files_db": [{"lfn": "out.csv", "site": "dtn1"}],
+        }, 1)
+        joined = " ".join(warnings)
+        self.assertIn("NOT EXECUTABLE", joined)
+        self.assertIn("no image", joined)

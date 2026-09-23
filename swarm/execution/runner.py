@@ -641,10 +641,14 @@ def run(spec: ExecutionSpec, job_id: str,
     configuration problem as a failed job and hide it in the workflow's own failure count.
     """
     pol = pol or _POLICY
-    if not spec.runnable():
+    spec_refusal = spec.refusal_reason()
+    if spec_refusal:
+        # The precise reason, from the model that decided it. The old message listed every
+        # clause at once, so a clustered job (a designed refusal) and an unparseable argv (a
+        # real extraction defect) produced identical log lines and were investigated as the
+        # same problem.
         return ExecutionResult(exit_status=1, refused=True,
-                               reason="execution spec is not runnable "
-                                      "(missing path, unknown arguments, or imageless container)")
+                               reason=f"execution spec is not runnable: {spec_refusal}")
     work_dir = work_dir or pol.work_dir
     if not work_dir:
         return ExecutionResult(exit_status=1, refused=True,
