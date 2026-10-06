@@ -5,7 +5,7 @@ Second critical read of the code base, against the same question as the 2026-09-
 anything in the run saying so?** Everything found there is excluded here. Ranked by that
 question; within a rank, by how many cells it touches. Every finding names the file and line,
 the failing scenario, the metric it moves and the direction, and whether a test in `tests/` would
-catch it (none of the HIGH items has one). **Status (2026-10-06): every HIGH item and every MEDIUM item has been addressed; each heading carries its own FIXED / PARTLY FIXED note.** Regression tests are in `tests/test_review_2026_10_05_*.py` (13 files); where a file's tests could run against the pre-fix code, the commit message says how many failed there. **Still partly open:** and the §G config-drift table's remaining rows.
+catch it (none of the HIGH items has one). **Status (2026-10-06): every HIGH item and every MEDIUM item has been addressed; each heading carries its own FIXED / PARTLY FIXED note.** Regression tests are in `tests/test_review_2026_10_05_*.py` (19 files); where a file's tests could run against the pre-fix code, the commit message says how many failed there. **Nothing is left open:** the §G drift rows and the smaller robustness items closed last (2026-10-06, `tests/test_review_2026_10_05_drift.py`); the converter-default rows (`--pegasus-data-nodes`, `dtn_scope`) and `llm.timeout_seconds`/`mab.pending_ttl_s` closed with their own sections.
 
 **Method.** Six independent read-only passes, one per subsystem (consensus + membership; agent
 core + repository + selection; execution + staging; metrics + collection + plotting; run tooling
@@ -766,6 +766,27 @@ returns `{}` and says the caller must tell the cases apart; no test checks that 
 ---
 
 ## G. Config drift — one key, two defaults
+
+> **FIXED (2026-10-06).** Every row now resolves from one place equal to the shipped file, and a
+> test reads the file to pin it: `SNOW_DEFAULTS` (`gossip_engine.py`, used by the constructor and
+> the agent), `SWIM_DEFAULTS` (`swim.py`, likewise), `UCB1Policy.DEFAULT_EXPLORATION_WEIGHT` (the
+> manager no longer falls back to 1.41), `RESELECTION_TIMEOUT_DEFAULT_S = 300` and — found while
+> fixing this — `FAILURE_THRESHOLD_DEFAULT_S = 60` (the fallback was 30 against a shipped 60).
+> `aggressive_failure_detection` was settled under §4. The paragraph below: `alpha_k` and
+> `_reset_orphaned_jobs` deleted; the `_note_decided` comment already said wall clock; a
+> peer-decided finalize now leaves `_lock` before `_finalize`; claim (`assignee:`) and
+> `reassign:` keys carry the run id; the agent-key TTL is floored at twice the own-tier eviction
+> threshold; stashed out-of-order messages expire after 300 s when the stash is full
+> (`pending_consensus_expired`, separate from `dropped`); an evicted gossip entry is tombstoned
+> at its version so only a newer one readmits it; the tick cleans up only newly settled ids
+> (the SMEMBERS stays — `_purge_vanished_jobs` needs the full present set); the won-but-unscheduled
+> backlog counts in `proposed_load` (not in `load`, which is also the utilisation metric); the
+> selection cache signature carries `delegation_failed_agents`. **Also found:**
+> `resource_usage_score` returned 0 when `allocated == total`, so an agent at exactly full
+> capacity advertised itself idle; each dimension is now guarded on its own zero total.
+> **Moves numbers:** a config omitting Snow/SWIM/runtime keys now runs the shipped regime;
+> projected-load costs rise for agents with a selected backlog; a fully allocated agent no longer
+> attracts work. Runs from shipped configs are otherwise unaffected.
 
 | Key | Code default | Shipped `config_swarm_multi.yml` | Documented |
 |---|---|---|---|

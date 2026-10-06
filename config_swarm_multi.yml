@@ -54,7 +54,7 @@ runtime:
   # order that floor now guards. Duplicate keys raise (swarm/utils/yaml_strict.py).
   peer_expiry_seconds: 300
   empty_timeout_seconds: 300
-  reselection_timeout_s: 300          # NOTE: the code default when this key is absent is 60
+  reselection_timeout_s: 300          # also the code default when the key is absent (was 60 until 2026-10-06)
   results_dir: swarm-multi
   shutdown_mode: manual
   total_agents: 5                     # placeholder; generate_configs.py overwrites per fleet

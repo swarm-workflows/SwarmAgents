@@ -125,6 +125,7 @@ def _make_engine(agent_id=1, peers=(2, 3, 4), my_cost=1.0, cas=None,
         agent_id=agent_id, host=host, transport=transport, router=router,
         k=k, alpha=alpha, beta=beta, max_rounds=20,
         round_timeout_s=0.5, tick_interval_s=0.01,
+        max_inflight=32,     # pinned: batching tests coalesce 20 jobs and must not hit the cap
         # Tests drive _tick(now=...) with a synthetic timeline starting at 0.0; the
         # engine's own clock must match or propose() stamps wall-clock deadlines that
         # the _tick send gate compares against synthetic `now`.

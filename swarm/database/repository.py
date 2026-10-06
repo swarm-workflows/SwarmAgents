@@ -366,7 +366,7 @@ class Repository:
         Snow/Avalanche engine to finalize a probabilistic decision into an
         exactly-once assignment.
         """
-        key = f"{self.KEY_ASSIGNEE}:{level}:{group}:{job_id}"
+        key = self._claim_key(level, group, job_id)
         # `nx=True` returns True iff we set the key; otherwise read the existing value.
         if self.redis.set(key, str(int(agent_id)), nx=True):
             return int(agent_id)
@@ -527,7 +527,7 @@ class Repository:
 
     def get_assignment(self, job_id: str, level: int = 0, group: int = 0):
         """Return the committed assignee for ``job_id``, or None if unclaimed."""
-        key = f"{self.KEY_ASSIGNEE}:{level}:{group}:{job_id}"
+        key = self._claim_key(level, group, job_id)
         v = self.redis.get(key)
         return int(v) if v is not None else None
 
@@ -537,7 +537,7 @@ class Repository:
         job_ids = [str(j) for j in job_ids if j]
         if not job_ids:
             return {}
-        keys = [f"{self.KEY_ASSIGNEE}:{level}:{group}:{j}" for j in job_ids]
+        keys = [self._claim_key(level, group, j) for j in job_ids]
         return {j: int(v) for j, v in zip(job_ids, self.redis.mget(keys)) if v is not None}
 
     def release_assignment(self, job_id: str, level: int = 0, group: int = 0) -> bool:
@@ -551,7 +551,14 @@ class Repository:
         longer running anywhere, which is exactly the failed-agent case; it must never be
         called on a live assignment, or two agents could execute the same job.
         """
-        return bool(self.redis.delete(f"{self.KEY_ASSIGNEE}:{level}:{group}:{job_id}"))
+        return bool(self.redis.delete(self._claim_key(level, group, job_id)))
+
+    def _claim_key(self, level, group, job_id) -> str:
+        """The exactly-once claim key, run-scoped like `data_ready` (§G). Unscoped, a run that
+        skipped the between-run flush inherited the previous run's claims: a Snow finalize of a
+        same-id job lost its CAS to an agent of the PREVIOUS run, so nobody here ran it.
+        `delete_all("*")` still reaches the key, so the ordinary cleanup is unchanged."""
+        return f"{self.KEY_ASSIGNEE}:{self.run_id}:{level}:{group}:{job_id}"
 
     KEY_REASSIGN = "reassign"
 
@@ -568,7 +575,7 @@ class Repository:
         The TTL matters: if the winner dies mid-reassignment, the right has to become
         available again, or the job is stranded by the very mechanism meant to rescue it.
         """
-        key = f"{self.KEY_REASSIGN}:{level}:{group}:{job_id}:{int(failed_agent_id)}"
+        key = f"{self.KEY_REASSIGN}:{self.run_id}:{level}:{group}:{job_id}:{int(failed_agent_id)}"
         return bool(self.redis.set(key, "1", nx=True, ex=int(ttl_s)))
 
     def delete_all(self, key_prefix: str = KEY_JOB):

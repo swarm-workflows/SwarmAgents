@@ -176,7 +176,9 @@ class MABManager:
             )
         if algorithm == "ucb1":
             return UCB1Policy(
-                exploration_weight=config.get("exploration_weight", 1.41),
+                # One default: the policy's own (√2). The manager used to fall back to 1.41.
+                exploration_weight=config.get("exploration_weight",
+                                              UCB1Policy.DEFAULT_EXPLORATION_WEIGHT),
                 step_size=step_size,
             )
         # default: epsilon-greedy

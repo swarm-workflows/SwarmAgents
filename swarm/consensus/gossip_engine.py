@@ -102,6 +102,24 @@ class _SnowState:
     ignore_decided_hints: bool = False
 
 
+#: The ONE default for every `consensus.snow.*` key (code review 2026-10-05 §G). The agent's
+#: fallbacks and this constructor's defaults used to be 20/20/500/32/32 while the shipped config
+#: says 10/6/300/16/16, so a config without the block silently ran a different regime from the
+#: one the shipped file documents. These equal the shipped values; a test pins the agreement.
+SNOW_DEFAULTS = {
+    "k": 10,
+    "alpha": 0.7,
+    "beta": 6,
+    "max_rounds": 100,
+    "round_timeout_ms": 300,
+    "tick_interval_ms": 50,
+    "local_sample_frac": 1.0,
+    "send_workers": 16,
+    "send_timeout_ms": 300,
+    "max_inflight": 16,
+}
+
+
 class GossipConsensusEngine:
     """
     Snow consensus driver.
@@ -123,16 +141,16 @@ class GossipConsensusEngine:
         host: SnowHost,
         transport: SnowTransport,
         router: TopologyRouter,
-        k: int = 20,
-        alpha: float = 0.7,
-        beta: int = 20,
-        max_rounds: int = 100,
-        round_timeout_s: float = 0.5,
-        tick_interval_s: float = 0.05,
-        local_sample_frac: float = 1.0,
-        send_workers: int = 32,
-        send_timeout_s: float = 0.3,
-        max_inflight: int = 32,
+        k: int = SNOW_DEFAULTS["k"],
+        alpha: float = SNOW_DEFAULTS["alpha"],
+        beta: int = SNOW_DEFAULTS["beta"],
+        max_rounds: int = SNOW_DEFAULTS["max_rounds"],
+        round_timeout_s: float = SNOW_DEFAULTS["round_timeout_ms"] / 1000.0,
+        tick_interval_s: float = SNOW_DEFAULTS["tick_interval_ms"] / 1000.0,
+        local_sample_frac: float = SNOW_DEFAULTS["local_sample_frac"],
+        send_workers: int = SNOW_DEFAULTS["send_workers"],
+        send_timeout_s: float = SNOW_DEFAULTS["send_timeout_ms"] / 1000.0,
+        max_inflight: int = SNOW_DEFAULTS["max_inflight"],
         # Monotonic by default (§38): every use is a duration or a deadline inside this process,
         # and a stepped wall clock moved round deadlines and finalize latencies.
         time_fn: Callable[[], float] = time.monotonic,
@@ -143,7 +161,6 @@ class GossipConsensusEngine:
         self.router = router
         self.k = int(k)
         self.alpha = float(alpha)
-        self.alpha_k = max(1, int(round(alpha * k)))
         self.beta = int(beta)
         self.max_rounds = int(max_rounds)
         self.round_timeout_s = float(round_timeout_s)
@@ -380,9 +397,12 @@ class GossipConsensusEngine:
                 already_decided=bool(already_decided)))
             # If a peer reports the job is already decided, fast-finalize — VERIFIED against
             # the authoritative claim in `_finalize_work_inner`, never on the peer's word.
-            if (already_decided and preferred_agent is not None
-                    and not state.ignore_decided_hints):
-                self._finalize(state, int(preferred_agent), reason="peer-decided")
+            fast = (already_decided and preferred_agent is not None
+                    and not state.ignore_decided_hints)
+        # Outside `_lock`: with no pool (after `stop()`) `_finalize` runs the Redis CAS and the
+        # host callbacks inline, and those must never run holding the engine lock.
+        if fast:
+            self._finalize(state, int(preferred_agent), reason="peer-decided")
 
     def on_snow_response(self, msg: SnowResponse) -> None:
         self._absorb_response(msg.job_id, msg.query_id, msg.preferred_agent,

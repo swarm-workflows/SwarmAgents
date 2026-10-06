@@ -150,6 +150,17 @@ class _PiggyEntry:
 
 # -------- SWIM membership manager ----------------------------------------- #
 
+#: The ONE default for every `failure_detection.swim.*` key (code review 2026-10-05 §G). There
+#: were three: this constructor (0.3 s probe / 8 s suspect), the agent's fallbacks (1 s / 20 s) and
+#: the shipped config (1 s / 60 s). These equal the shipped values; a test pins the agreement.
+SWIM_DEFAULTS = {
+    "period_ms": 1000,
+    "probe_timeout_ms": 1000,
+    "k_req": 3,
+    "suspect_timeout_s": 60.0,
+}
+
+
 class SwimMembership:
     """
     SWIM failure detector with infection-style update dissemination.
@@ -163,10 +174,10 @@ class SwimMembership:
     def __init__(
         self,
         host: SwimHost,
-        period_s: float = 1.0,
-        probe_timeout_s: float = 0.3,
-        k_req: int = 3,
-        suspect_timeout_s: float = 8.0,
+        period_s: float = SWIM_DEFAULTS["period_ms"] / 1000.0,
+        probe_timeout_s: float = SWIM_DEFAULTS["probe_timeout_ms"] / 1000.0,
+        k_req: int = SWIM_DEFAULTS["k_req"],
+        suspect_timeout_s: float = SWIM_DEFAULTS["suspect_timeout_s"],
         piggyback_count: int = 3,
         piggyback_max_per_msg: int = 8,
         time_fn: Callable[[], float] = time.time,

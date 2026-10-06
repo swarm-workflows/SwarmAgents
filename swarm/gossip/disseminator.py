@@ -86,6 +86,8 @@ class GossipStateDisseminator:
 
         self._lock = threading.RLock()
         self._cache: Dict[int, _CachedEntry] = {}
+        # agent_id -> version evicted as stale; refuses a relayed copy that is no newer.
+        self._evicted_version: Dict[int, int] = {}
         self._self_version: int = 0
 
         self._stop = threading.Event()
@@ -158,7 +160,15 @@ class GossipStateDisseminator:
     def _merge_entry(self, entry: AgentStateEntry) -> None:
         with self._lock:
             existing = self._cache.get(int(entry.agent_id))
+            # An entry evicted here as stale must not come back on a peer's copy of the SAME
+            # (or an older) version — that copy is no fresher, only relayed later, and accepting
+            # it restarted the TTL of a dead agent's last state (§G). Only a newer version, which
+            # the subject alone can mint, readmits it.
+            tomb = self._evicted_version.get(int(entry.agent_id))
+            if existing is None and tomb is not None and entry.version <= tomb:
+                return
             if existing is None or entry.version > existing.entry.version:
+                self._evicted_version.pop(int(entry.agent_id), None)
                 # Don't accept stale snapshots about ourselves (we own that record).
                 if int(entry.agent_id) == int(self.host.agent_id):
                     if entry.version <= self._self_version:
@@ -192,6 +202,7 @@ class GossipStateDisseminator:
                 and (now - c.received_at) > self.state_ttl_s
             ]
             for aid in stale:
+                self._evicted_version[aid] = int(self._cache[aid].entry.version)
                 del self._cache[aid]
         if stale:
             self.host.log_debug(f"[gossip] evicted stale entries: {stale}")

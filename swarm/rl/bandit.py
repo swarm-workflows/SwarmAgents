@@ -201,7 +201,9 @@ class EpsilonGreedyPolicy(BanditPolicy):
 
 
 class UCB1Policy(BanditPolicy):
-    def __init__(self, exploration_weight: float = math.sqrt(2),
+    DEFAULT_EXPLORATION_WEIGHT = math.sqrt(2)
+
+    def __init__(self, exploration_weight: float = DEFAULT_EXPLORATION_WEIGHT,
                  step_size: Optional[float] = None):
         super().__init__(step_size=step_size)
         self.exploration_weight = exploration_weight

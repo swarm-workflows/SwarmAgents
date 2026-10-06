@@ -20,6 +20,7 @@
 #
 # Author: Komal Thareja(kthare10@renci.org)
 import copy
+import math
 import os
 import random
 import threading
@@ -29,7 +30,7 @@ from concurrent.futures.thread import ThreadPoolExecutor
 from typing import Optional
 
 from swarm.consensus.engine import ConsensusEngine
-from swarm.consensus.gossip_engine import GossipConsensusEngine
+from swarm.consensus.gossip_engine import SNOW_DEFAULTS, GossipConsensusEngine
 from swarm.consensus.interfaces import ConsensusHost, ConsensusTransport, TopologyRouter
 from swarm.consensus.messages.message import MessageType
 from swarm.consensus.messages.gossip_state import GossipState
@@ -40,7 +41,7 @@ from swarm.consensus.messages.swim_ack import SwimAck
 from swarm.consensus.messages.swim_ping import SwimPing
 from swarm.consensus.messages.swim_ping_req import SwimPingReq
 from swarm.gossip.disseminator import GossipStateDisseminator
-from swarm.membership.swim import SwimMembership
+from swarm.membership.swim import SWIM_DEFAULTS, SwimMembership
 from swarm.models.data_node import DataNode
 from swarm.models.object import Object
 from swarm.selection.engine import SelectionEngine
@@ -98,6 +99,12 @@ def resolve_coordinator_cost_matrix(job_cfg: dict) -> str:
     return mode
 
 
+
+#: `runtime.reselection_timeout_s` when the key is absent; equal to the shipped config.
+RESELECTION_TIMEOUT_DEFAULT_S = 300.0
+#: `runtime.failure_threshold_seconds` when the key is absent; equal to the shipped config.
+FAILURE_THRESHOLD_DEFAULT_S = 60
+
 class _HostAdapter(ConsensusHost):
     def __init__(self, agent: "ResourceAgent"):
         self.agent = agent
@@ -140,15 +147,40 @@ class _HostAdapter(ConsensusHost):
         # Under the agent's stash lock: setdefault-then-append on the inbound thread raced the
         # periodic thread's pop of the same bucket, and a vote appended to a bucket just popped
         # was lost with nothing counting it (code review 2026-10-05 §9).
-        with self.agent._pending_lock:
+        agent = self.agent
+        with agent._pending_lock:
+            stashed_at = agent.__dict__.setdefault("_pending_stashed_at", {})
             if object_id not in store and len(store) >= self._PENDING_MAX_OBJECTS:
-                self.agent.pending_consensus_dropped += 1
+                self._expire_stash_locked(stashed_at)
+            if object_id not in store and len(store) >= self._PENDING_MAX_OBJECTS:
+                agent.pending_consensus_dropped += 1
                 return
+            stashed_at.setdefault(object_id, time.monotonic())
             bucket = store.setdefault(object_id, [])
             if len(bucket) >= self._PENDING_MAX_PER_OBJECT:
                 self.agent.pending_consensus_dropped += 1
                 return
             bucket.append(msg)
+
+    #: How long a stashed message waits for its job (§G). Only a job id appearing in the PENDING
+    #: scan drained the stash, so messages for a job that never becomes PENDING here (a child
+    #: copy withdrawn by its coordinator) lived forever, and once 2048 such objects had
+    #: accumulated every later out-of-order vote was dropped. Far above any delivery lag.
+    _PENDING_STASH_TTL_S = 300.0
+
+    def _expire_stash_locked(self, stashed_at: dict) -> int:
+        """Drop every object stashed longer than the TTL, from all three stores. Caller holds
+        `_pending_lock`. Counted in `pending_consensus_expired`, never in `dropped`."""
+        agent = self.agent
+        cutoff = time.monotonic() - self._PENDING_STASH_TTL_S
+        old = [oid for oid, t in stashed_at.items() if t < cutoff]
+        for oid in old:
+            stashed_at.pop(oid, None)
+            for store in (agent.pending_proposals, agent.pending_prepares, agent.pending_commits):
+                store.pop(oid, None)
+        if old:
+            agent.pending_consensus_expired = getattr(agent, "pending_consensus_expired", 0) + len(old)
+        return len(old)
 
     def set_pending_proposal(self, proposal, object_id: str):
         self._stash_pending(self.agent.pending_proposals, object_id, proposal)
@@ -362,21 +394,24 @@ class ResourceAgent(Agent):
                     "have been PBFT throughout, and nothing in the run would say so.")
             if engine_name == "snow":
                 snow_cfg = consensus_cfg.get("snow", {})
+
+                def snow_get(key):
+                    return snow_cfg.get(key, SNOW_DEFAULTS[key])
                 return GossipConsensusEngine(
                     agent_id=agent_id,
                     host=host,
                     transport=transport,
                     router=router,
-                    k=int(snow_cfg.get("k", 20)),
-                    alpha=float(snow_cfg.get("alpha", 0.7)),
-                    beta=int(snow_cfg.get("beta", 20)),
-                    max_rounds=int(snow_cfg.get("max_rounds", 100)),
-                    round_timeout_s=float(snow_cfg.get("round_timeout_ms", 500)) / 1000.0,
-                    tick_interval_s=float(snow_cfg.get("tick_interval_ms", 50)) / 1000.0,
-                    local_sample_frac=float(snow_cfg.get("local_sample_frac", 1.0)),
-                    send_workers=int(snow_cfg.get("send_workers", 32)),
-                    send_timeout_s=float(snow_cfg.get("send_timeout_ms", 300)) / 1000.0,
-                    max_inflight=int(snow_cfg.get("max_inflight", 32)),
+                    k=int(snow_get("k")),
+                    alpha=float(snow_get("alpha")),
+                    beta=int(snow_get("beta")),
+                    max_rounds=int(snow_get("max_rounds")),
+                    round_timeout_s=float(snow_get("round_timeout_ms")) / 1000.0,
+                    tick_interval_s=float(snow_get("tick_interval_ms")) / 1000.0,
+                    local_sample_frac=float(snow_get("local_sample_frac")),
+                    send_workers=int(snow_get("send_workers")),
+                    send_timeout_s=float(snow_get("send_timeout_ms")) / 1000.0,
+                    max_inflight=int(snow_get("max_inflight")),
                 )
             return ConsensusEngine(agent_id, host, transport, router=router)
 
@@ -509,6 +544,8 @@ class ResourceAgent(Agent):
         self.pending_prepares: dict[str, list] = {}
         self.pending_commits: dict[str, list] = {}
         self.pending_consensus_dropped = 0
+        self.pending_consensus_expired = 0
+        self._pending_stashed_at: dict[str, float] = {}   # object_id -> monotonic first stash
 
         # Latest AgentInfo snapshot (refreshed each periodic tick). Hot paths — e.g.
         # per-SnowQuery cost answers on the inbound thread — reuse this instead of
@@ -572,13 +609,13 @@ class ResourceAgent(Agent):
             swim_cfg = fd_cfg.get("swim", {})
             self.swim = SwimMembership(
                 host=_SwimAdapter(self),
-                period_s=float(swim_cfg.get("period_ms", 1000)) / 1000.0,
+                period_s=float(swim_cfg.get("period_ms", SWIM_DEFAULTS["period_ms"])) / 1000.0,
                 # WAN-realistic defaults: acks can queue behind consensus bursts on the
                 # single inbound consumer, so a LAN-tuned 300ms probe window false-fails
                 # healthy peers (observed as constant late-ack flapping).
-                probe_timeout_s=float(swim_cfg.get("probe_timeout_ms", 1000)) / 1000.0,
-                k_req=int(swim_cfg.get("k_req", 3)),
-                suspect_timeout_s=float(swim_cfg.get("suspect_timeout_s", 20.0)),
+                probe_timeout_s=float(swim_cfg.get("probe_timeout_ms", SWIM_DEFAULTS["probe_timeout_ms"])) / 1000.0,
+                k_req=int(swim_cfg.get("k_req", SWIM_DEFAULTS["k_req"])),
+                suspect_timeout_s=float(swim_cfg.get("suspect_timeout_s", SWIM_DEFAULTS["suspect_timeout_s"])),
             )
 
         # Gossip state dissemination (Phase 2). Off by default; turn on with
@@ -603,7 +640,9 @@ class ResourceAgent(Agent):
 
     @property
     def reselection_timeout_s(self) -> float:
-        return self.runtime_config.get("reselection_timeout_s", 60.00)
+        # One default (§G): the shipped config's 300. The fallback was 60, so a config without
+        # the key ran a 5x shorter timeout — and delegation_timeout_s derives from this one.
+        return self.runtime_config.get("reselection_timeout_s", RESELECTION_TIMEOUT_DEFAULT_S)
 
     @property
     def shutdown_drain_timeout_s(self) -> float:
@@ -898,11 +937,14 @@ class ResourceAgent(Agent):
 
     @staticmethod
     def resource_usage_score(allocated: Capacities, total: Capacities):
-        if allocated == total:
-            return 0
-        core = (allocated.core / total.core) * 100
-        ram = (allocated.ram / total.ram) * 100
-        disk = (allocated.disk / total.disk) * 100
+        # Each dimension guarded on its own total. This used to return 0 when `allocated ==
+        # total` — meant for the empty/empty case, it also made an agent allocated EXACTLY to
+        # capacity advertise load 0, i.e. idle, at the moment it was fullest (§G).
+        def pct(a, t):
+            return (float(a or 0) / float(t)) * 100 if t else 0.0
+        core = pct(allocated.core, total.core)
+        ram = pct(allocated.ram, total.ram)
+        disk = pct(allocated.disk, total.disk)
 
         return round((core + ram + disk) / 3, 2)
 
@@ -915,8 +957,10 @@ class ResourceAgent(Agent):
         - Too low (< 15s): False positives from temporary network issues
         - Too high (> 60s): Slow failure detection, jobs stuck longer
         - Recommended: 30s for local, 45-60s for remote deployments
+
+        Falls back to the shipped 60 s (§G; the fallback was 30 while the shipped file said 60).
         """
-        return self.runtime_config.get("failure_threshold_seconds", 30)
+        return self.runtime_config.get("failure_threshold_seconds", FAILURE_THRESHOLD_DEFAULT_S)
 
     @property
     def max_failed_agents(self) -> int:
@@ -1083,6 +1127,9 @@ class ResourceAgent(Agent):
             proposals = self.pending_proposals.pop(job_id, [])
             prepares = self.pending_prepares.pop(job_id, [])
             commits = self.pending_commits.pop(job_id, [])
+            stashed_at = self.__dict__.get("_pending_stashed_at")
+            if stashed_at is not None:
+                stashed_at.pop(job_id, None)
         for msg in proposals:
             try:
                 self.engine.on_proposal(msg)
@@ -1228,8 +1275,16 @@ class ResourceAgent(Agent):
         self.logger.info(f"[DATA_READY] republished {len(pending)} name(s) after an earlier failure")
 
     def _update_completed_jobs(self, jobs: list[str]):
-        self.update_jobs(jobs, self.completed_jobs_set, self.completed_lock)
+        # Only ids not already settled here (§G). The periodic scan passes EVERY RUNNING and
+        # COMPLETE id on every 0.5 s tick, and three container operations per id made the tick
+        # O(completed) on the thread that also does READY removal and failure detection. An id
+        # already in the set has had this cleanup; a reset discards it from the set first
+        # (`_update_pending_jobs`, `_restart_selection`), so a re-settled job is cleaned again.
         with self.completed_lock:
+            jobs = [j for j in jobs if j not in self.completed_jobs_set]
+            if not jobs:
+                return
+            self.completed_jobs_set.update(jobs)
             for j in jobs:
                 self._decided_jobs.pop(j, None)          # promoted; no need to hold both
         for j in jobs:
@@ -2104,9 +2159,15 @@ class ResourceAgent(Agent):
 
     def _agent_key_ttl_s(self) -> int:
         """TTL for this agent's Redis key: comfortably above the peer-expiry threshold
-        (refreshed every ~0.5s tick, so only a dead agent's key ever expires)."""
+        (refreshed every ~0.5s tick, so only a dead agent's key ever expires).
+
+        Also floored at twice the own-tier eviction threshold (§G). A peer whose key expires is
+        gone from the next Redis refresh, so a TTL below the failure detector's threshold lets a
+        dead peer vanish before `_detect_failed_agents` has judged it — no failure recorded, its
+        jobs stranded. The shipped 300 s expiry / 60 s detection is safe; nothing enforced it."""
         expiry = int(self.runtime_config.get("peer_expiry_seconds", 300))
-        return max(60, expiry * 2)
+        detector = float(self.failure_threshold_seconds) * 1.1 + 1.0
+        return int(max(60, expiry * 2, math.ceil(detector * 2)))
 
     def _should_full_neighbor_refresh(self, now: float) -> bool:
         """Full (Redis) neighbor refresh cadence. Per-tick without gossip (status quo);
@@ -2243,6 +2304,7 @@ class ResourceAgent(Agent):
                 f"inbound_q={self.queues.message_queue.qsize()}",
                 f"msgs_dropped={self.messages_dropped}",
                 f"pending_consensus_dropped={self.pending_consensus_dropped}",
+                f"pending_consensus_expired={self.pending_consensus_expired}",
                 f"watch_retries={self.repository.watch_retries}/{self.repository.saves} saves",
             ]
             t = getattr(self, "transport", None)
@@ -2462,7 +2524,14 @@ class ResourceAgent(Agent):
         return self.resource_usage_score(allocated=allocations, total=self.capacities)
 
     def compute_proposed_load(self):
+        """Load this agent has committed to but is not yet running: its open proposals AND the
+        jobs it has won and not yet scheduled (`selected_queue`). The selected backlog counted
+        in neither this nor `load` (§G), so an agent with a deep won-but-waiting backlog
+        advertised "merely full" and peers' projected load factor kept steering work to it.
+        `load` itself stays actual allocation — it is also the utilisation metric."""
         allocations = Capacities()
+        for job in self.queues.selected_queue.gets():
+            allocations += job.capacities
         for j in self.engine.outgoing.objects():
             if j not in self.queues.ready_queue and j not in self.queues.selected_queue:
                 job = self.queues.pending_queue.get(j)
@@ -2505,6 +2574,10 @@ class ResourceAgent(Agent):
             quantum_sig,
             job.sub_role,
             pred_sig,
+            # Feasibility reads it (a coordinator that failed to delegate a job bars itself), so
+            # the cache must too (§G). It was safe only while the 60 s cache TTL was shorter than
+            # the delegation timeout — a coincidence of two config values, not a rule.
+            tuple(sorted(int(a) for a in (job.delegation_failed_agents or ()))),
             #job.state.value,  # flips when PENDING→READY/COMPLETE, invalidates cache automatically
         )
 
@@ -2937,10 +3010,6 @@ class ResourceAgent(Agent):
                 # Periodically restore BLOCKED infeasible jobs back to PENDING
                 # This allows them to be retried after other jobs have been processed
                 self._restore_infeasible_jobs()
-
-                # Periodically check for orphaned jobs (in consensus states but no active proposals)
-                # This handles jobs stuck due to agent failures where consensus was cleared
-                #self._reset_orphaned_jobs()
 
                 # Skip the inter-batch wait ONLY when this iteration proposed something
                 # AND the batch came back full (real backlog likely behind it). Skipping
@@ -4592,54 +4661,6 @@ class ResourceAgent(Agent):
 
         if restored_count > 0:
             self.logger.info(f"Restored {restored_count} infeasible jobs to PENDING for retry")
-
-    def _reset_orphaned_jobs(self) -> None:
-        """
-        Reset orphaned jobs back to PENDING state.
-
-        Orphaned jobs are those stuck in consensus states (PRE_PREPARE, PREPARE, COMMIT)
-        but have no active proposals in engine.incoming or engine.outgoing.
-        This can happen when:
-        - An agent fails mid-consensus and proposals are cleared
-        - Consensus clearing happens but job states aren't reset
-        - Network partitions cause proposal loss
-
-        This method periodically scans for such jobs and resets them to PENDING
-        so they can go through selection again.
-        """
-        orphaned_states = [ObjectState.PRE_PREPARE, ObjectState.PREPARE, ObjectState.COMMIT]
-        reset_count = 0
-
-        # Get all jobs in consensus states
-        for state in orphaned_states:
-            jobs_in_state = self.queues.pending_queue.gets(
-                states=[state],
-                count=100  # Check up to 100 jobs per state per iteration
-            )
-
-            for job in jobs_in_state:
-                job_id = job.job_id
-                if job_id in self.completed_jobs_set:
-                    continue
-
-                # Check if job has active proposals
-                has_incoming = self.engine.incoming.contains(object_id=job_id) and len(self.engine.incoming.get_proposals_by_object_id(job_id)) > 0
-                has_outgoing = self.engine.outgoing.contains(object_id=job_id) and len(self.engine.outgoing.get_proposals_by_object_id(job_id)) > 0
-
-                if not has_incoming and not has_outgoing:
-                    # Job is orphaned - no active proposals
-                    old_state = job.state
-                    job.state = ObjectState.PENDING
-                    self.queues.pending_queue.update(job)
-                    reset_count += 1
-
-                    self.logger.warning(
-                        f"Reset orphaned job {job_id} from {old_state} to PENDING "
-                        f"(no active proposals found in consensus engine)"
-                    )
-
-        if reset_count > 0:
-            self.logger.info(f"Reset {reset_count} orphaned jobs to PENDING state")
 
     def invalidate_agent_cache(self, agent_id: int) -> bool:
         """
