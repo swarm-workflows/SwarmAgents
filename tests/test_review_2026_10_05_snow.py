@@ -536,3 +536,80 @@ def test_a_verified_claim_is_used_without_a_cas():
     eng._finalize_work_inner(eng._states["job-r"], 9, "peer-decided")
     assert cas.get("job-r") is None       # nothing re-claimed for the dead agent
     host.try_claim_assignment.assert_not_called()
+
+
+class TestStaleDecisionIsNotCommittedLocally:
+    """Stop-time review: a claim read just before the failed-agent path released it was
+    committed locally ("decided for the corpse"), and the reset — stamped BEFORE that commit —
+    never counted as evidence against it, so the agent ignored the job for the rest of the run."""
+
+    def test_a_dead_winner_is_not_committed_here(self):
+        eng, host, transport, cas = _make_engine(agent_id=1, peers=(2, 3, 4))
+        host.is_agent_live = lambda a: a != 9
+        eng.propose([ProposalInfo(p_id="p", object_id="job-s", cost=10.0, agent_id="1")])
+        cas.claim("job-s", 9)
+        eng._finalize_work_inner(eng._states["job-s"], 9, "peer-decided")
+        assert host.participant_events == [] and host.leader_events == []
+
+    def test_an_unclaimed_pending_record_forgets_the_decision_under_snow(self):
+        import time as _time
+        from swarm.consensus.gossip_engine import GossipConsensusEngine
+        from swarm.database.repository import Repository
+        from swarm.queue.simple_queue import SimpleQueue
+        from swarm.models.object import ObjectState
+        from test_failed_agent_reassignment import _FakeRedis
+        repo = Repository(_FakeRedis(), run_id="t")
+        j = Job()
+        j.job_id = "j1"
+        j.state = ObjectState.PENDING                       # the reset, stamped NOW...
+        repo.save(obj=j.to_dict(), level=0, group=0)
+        a = ResourceAgent.__new__(ResourceAgent)
+        a.logger = MagicMock()
+        a.agent_id = 4
+        a.topology = MagicMock(level=0, group=0)
+        a.repository = repo
+        a._init_decision_state()
+        a.queues = MagicMock()
+        a.queues.pending_queue = SimpleQueue()
+        a.engine = GossipConsensusEngine.__new__(GossipConsensusEngine)
+        a.engine.forget_decision = lambda oid: None
+        a.pending_proposals, a.pending_prepares, a.pending_commits = {}, {}, {}
+        import threading
+        a._pending_lock = threading.Lock()
+        _time.sleep(0.01)
+        a._note_decided("j1")                               # ...decided AFTER it: no evidence
+        assert not a._reset_evidence("j1", repo.get("j1", level=0, group=0))
+        a._update_pending_jobs(["j1"])                      # no claim in Redis → reset
+        assert not a.is_job_completed("j1")
+        assert "j1" in a.queues.pending_queue
+
+    def test_a_claimed_pending_record_keeps_the_decision(self):
+        """A leader that won the CAS but has not persisted READY yet: the record is still the
+        old PENDING one, and the claim exists. Not a reset."""
+        from swarm.consensus.gossip_engine import GossipConsensusEngine
+        from swarm.database.repository import Repository
+        from swarm.queue.simple_queue import SimpleQueue
+        from swarm.models.object import ObjectState
+        from test_failed_agent_reassignment import _FakeRedis
+        import threading
+        repo = Repository(_FakeRedis(), run_id="t")
+        j = Job()
+        j.job_id = "j1"
+        j.state = ObjectState.PENDING
+        repo.save(obj=j.to_dict(), level=0, group=0)
+        repo.try_claim_assignment("j1", 7, level=0, group=0)
+        a = ResourceAgent.__new__(ResourceAgent)
+        a.logger = MagicMock()
+        a.agent_id = 4
+        a.topology = MagicMock(level=0, group=0)
+        a.repository = repo
+        a._init_decision_state()
+        a.queues = MagicMock()
+        a.queues.pending_queue = SimpleQueue()
+        a.engine = GossipConsensusEngine.__new__(GossipConsensusEngine)
+        a.engine.forget_decision = lambda oid: None
+        a.pending_proposals, a.pending_prepares, a.pending_commits = {}, {}, {}
+        a._pending_lock = threading.Lock()
+        a._note_decided("j1")
+        a._update_pending_jobs(["j1"])
+        assert a.is_job_completed("j1")

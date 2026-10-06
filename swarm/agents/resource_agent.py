@@ -1029,6 +1029,22 @@ class ResourceAgent(Agent):
         fetched = self.repository.get_many(
             missing, key_prefix=Repository.KEY_JOB,
             level=self.topology.level, group=self.topology.group) if missing else {}
+        # Under Snow a decision IS a claim, so a PENDING record with no claim was reset, whatever
+        # its timestamp says. The timestamp rule alone missed a reset that landed just BEFORE
+        # this agent recorded the decision (it read a claim, the claim was released and the job
+        # reset, then the commit landed): the reset's stamp is earlier than the decision, so the
+        # job stayed "decided" here for the rest of the run (stop-time review). PBFT writes no
+        # claims, so it keeps the timestamp rule alone.
+        unclaimed: set = set()
+        if isinstance(self.engine, GossipConsensusEngine):
+            decided_pending = [j for j in jobs if j in decided]
+            if decided_pending:
+                try:
+                    claims = self.repository.get_assignments(
+                        decided_pending, level=self.topology.level, group=self.topology.group)
+                    unclaimed = {j for j in decided_pending if j not in claims}
+                except Exception as e:
+                    self.logger.debug(f"Claim check for decided jobs skipped: {e}")
         for job_id in jobs:
             # Redis says this job is up for election again — a reassignment after an agent
             # failure, or any other return to the pool. Drop it from the consensus dedupe set
@@ -1042,7 +1058,7 @@ class ResourceAgent(Agent):
                 # reset only if the record says so; otherwise it is a leader that has not
                 # persisted READY yet, and the local object (COMMIT) must not be replaced by
                 # the stale PENDING record or the decision forgotten.
-                if not self._reset_evidence(job_id, job):
+                if not (job_id in unclaimed or self._reset_evidence(job_id, job)):
                     continue
                 self._forget_decided(job_id)
             if job:

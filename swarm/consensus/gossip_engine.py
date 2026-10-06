@@ -661,6 +661,18 @@ class GossipConsensusEngine:
             f"[SNOW_TIMING] Object:{state.proposal.object_id} rounds={state.round_no} "
             f"queried={state.queried} elapsed={elapsed:.3f}s reason={reason}"
         )
+        if int(winner) != self.agent_id and not self._candidate_live(int(winner)):
+            # The decision names an agent this agent believes dead (a claim not yet released by
+            # the failed-agent path, or one read just before it was). Do not commit to it here:
+            # a local "decided for a corpse" stops this agent proposing the job, and if the reset
+            # has already landed nothing would ever undo it. Leave the job undecided; the
+            # failed-agent path releases the claim and returns it to the pool.
+            with self._stats_lock:
+                self.dead_candidate_refusals += 1
+            self.host.log_info(
+                f"[SNOW_DEAD_WINNER] Object:{state.proposal.object_id} decided for {winner}, "
+                f"which is not live here; not committing locally")
+            return
         obj = self.host.get_object(state.proposal.object_id)
         if obj is None:
             # The CAS succeeded — the claim key now names `winner` — but the object is in
