@@ -1008,6 +1008,12 @@ def run_metrics(run_dir: Path, expected_jobs: int | None) -> dict[str, Any]:
     shortfall_path = run_dir / "metrics_shortfall.json"
     metrics_complete = not shortfall_path.exists()
     missing_agents = 0
+    if metrics_complete and not (run_dir / "metrics.json").is_file():
+        # No shortfall file AND no metrics at all is not "complete": it is a run from before
+        # the completeness gate existed, or one whose plotting step failed. Unknown, so the
+        # column is None rather than a confident True (code review 2026-10-05 §44).
+        metrics_complete = None
+        missing_agents = None
     if not metrics_complete:
         try:
             shortfall = json.loads(shortfall_path.read_text())

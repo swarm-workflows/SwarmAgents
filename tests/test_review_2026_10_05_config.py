@@ -105,3 +105,26 @@ class TestDeclaredKillRunsAreComplete:
         with tempfile.TemporaryDirectory() as tmp:
             m = run_metrics(_run_with_shortfall(tmp, {"missing_agents": [2]}), expected_jobs=1)
         assert m["metrics_complete"] is False
+
+
+def test_a_run_with_no_metrics_file_is_unknown_not_complete():
+    from evaluation.collect import run_metrics
+    from test_collect import HEADER
+    with tempfile.TemporaryDirectory() as tmp:
+        run = Path(tmp) / "mesh-3" / "run01"
+        run.mkdir(parents=True)
+        (run / "all_jobs.csv").write_text(HEADER + "j1,1,1,2,2,3,0,1,0,1\n")
+        assert run_metrics(run, expected_jobs=1)["metrics_complete"] is None
+        (run / "metrics.json").write_text("{}")
+        assert run_metrics(run, expected_jobs=1)["metrics_complete"] is True
+
+
+def test_durations_are_monotonic():
+    src = {p: open(os.path.join(REPO, p)).read() for p in
+           ("swarm/consensus/engine.py", "swarm/consensus/gossip_engine.py",
+            "swarm/rl/mab_manager.py")}
+    assert "time.time()" not in src["swarm/rl/mab_manager.py"]
+    assert "time_fn: Callable[[], float] = time.monotonic," in src["swarm/consensus/gossip_engine.py"]
+    assert "self.time_to_finalize.add(time.monotonic() - started)" in src["swarm/consensus/engine.py"]
+    ra = open(os.path.join(REPO, "swarm/agents/resource_agent.py")).read()
+    assert "'delegated_mono': time.monotonic()," in ra

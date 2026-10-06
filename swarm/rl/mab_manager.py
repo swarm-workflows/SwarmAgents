@@ -227,7 +227,7 @@ class MABManager:
             except Exception as e:
                 self.logger.warning(f"Group snapshot provider failed: {e}")
 
-        now = time.time()
+        now = time.monotonic()
         # The agent's delegated-jobs dict undercounts during reassignment
         # churn (timeout handling removes entries) — take the max with the
         # bandit's own unresolved selections (Scenario C fix).
@@ -273,7 +273,7 @@ class MABManager:
         job_id = getattr(job, "job_id", None)
         if job_id is None or not self.contextual:
             return
-        now = time.time()
+        now = time.monotonic()
         with self._lock:
             self._sweep_pending(now)
             # Prefer the caller's snapshots: they are the state the *decision* was made on. An
@@ -322,7 +322,7 @@ class MABManager:
 
         job_id = getattr(job, "job_id", None)
         job_type = getattr(job, "job_type", None)
-        now = time.time()
+        now = time.monotonic()
 
         with self._lock:
             self._sweep_pending(now)
@@ -395,7 +395,7 @@ class MABManager:
                     # Liveness signal, not job-type fit: feed the time-decayed
                     # timeout score and keep the failure windows clean
                     # (Scenario C poisoned-window fix).
-                    self._record_timeout(group_id, time.time())
+                    self._record_timeout(group_id, time.monotonic())
                 else:
                     outcome = 0.0 if success else 1.0
                     self._group_windows.setdefault(
@@ -421,7 +421,7 @@ class MABManager:
 
         # Periodic persistence
         if self._persist_to_redis:
-            now = time.time()
+            now = time.monotonic()
             if now - self._last_persist_time >= self._persist_interval:
                 self.save_state()
                 self._last_persist_time = now
@@ -488,7 +488,7 @@ class MABManager:
                         for (g, t), w in self._type_windows.items()
                     },
                     "timeout_rates": {
-                        g: self._timeout_rate(g, time.time())
+                        g: self._timeout_rate(g, time.monotonic())
                         for g in self._timeout_scores
                     },
                 }

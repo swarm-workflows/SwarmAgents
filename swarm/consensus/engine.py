@@ -127,7 +127,7 @@ class ConsensusEngine:
         self.finalized_count += 1
         self.votes_to_finalize.add(len(proposal.commits))
         if started is not None:
-            self.time_to_finalize.add(time.time() - started)
+            self.time_to_finalize.add(time.monotonic() - started)
 
     def consensus_stats(self) -> dict:
         """Per-agent finalization accounting, in the same shape the Snow engine emits.
@@ -219,7 +219,7 @@ class ConsensusEngine:
         msg = Proposal(source=self.agent_id,
                        agents=[AgentInfo(agent_id=self.agent_id)],
                        proposals=proposals)
-        now = time.time()
+        now = time.monotonic()          # durations only, this process (§38)
         for proposal in proposals:
             # Proposer implicitly prepares its own proposal
             self._add_vote(proposal.prepares)
@@ -473,7 +473,7 @@ class ConsensusEngine:
                 return False
             # Remembered BEFORE the containers are cleared, so the stragglers that follow
             # are recognised as such rather than re-adopted.
-            self._note_finalized(proposal.object_id, proposal.p_id, time.time())
+            self._note_finalized(proposal.object_id, proposal.p_id, time.monotonic())
         self.host.log_debug("Is quorum!!")
         self._record_finalize(proposal)
         # Leader vs participant. The leader is whoever PROPOSED — agent ids are unique, so a

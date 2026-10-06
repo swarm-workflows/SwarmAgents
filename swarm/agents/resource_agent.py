@@ -1306,7 +1306,8 @@ class ResourceAgent(Agent):
         if not self.topology.children:
             return
 
-        current_time = time.time()
+        current_time = time.time()            # exported with rewards; NOT used for durations
+        now_mono = time.monotonic()
         jobs_to_reassign = []
         jobs_processed = []
         mab_active = self.mab_enabled and self.mab_manager is not None
@@ -1335,7 +1336,13 @@ class ResourceAgent(Agent):
                 self.delegated_jobs.remove(job_id)
                 continue
 
-            time_since_delegation = current_time - delegated_at
+            # Monotonic when the delegation recorded it: an NTP step (the slice steps at 0.1 s of
+            # drift) between delegation and now would otherwise move a timeout and the shaped
+            # latency (code review 2026-10-05 §33). Entries without it fall back to wall time.
+            if delegation_info.get('delegated_mono') is not None:
+                time_since_delegation = now_mono - float(delegation_info['delegated_mono'])
+            else:
+                time_since_delegation = current_time - delegated_at
             timed_out = time_since_delegation > self.delegation_timeout_s
 
             # When MAB is disabled and timeout hasn't elapsed, skip checking
@@ -1522,6 +1529,7 @@ class ResourceAgent(Agent):
         # Track delegated job for monitoring
         self.delegated_jobs.set(job_id, {
             'delegated_at': time.time(),
+            'delegated_mono': time.monotonic(),
             'groups': selected_groups
         })
 
@@ -3305,7 +3313,7 @@ class ResourceAgent(Agent):
         """
         self.completed_lock = threading.RLock()
         self.completed_jobs_set = set()
-        self._decided_jobs: dict = {}      # job_id -> time.monotonic() at finalize
+        self._decided_jobs: dict = {}      # job_id -> time.time() at finalize (wall: see _note_decided)
 
     def is_job_completed(self, job_id: str) -> bool:
         return job_id in self.completed_jobs_set or job_id in self._decided_jobs

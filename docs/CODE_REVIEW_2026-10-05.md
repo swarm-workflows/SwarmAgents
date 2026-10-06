@@ -5,7 +5,7 @@ Second critical read of the code base, against the same question as the 2026-09-
 anything in the run saying so?** Everything found there is excluded here. Ranked by that
 question; within a rank, by how many cells it touches. Every finding names the file and line,
 the failing scenario, the metric it moves and the direction, and whether a test in `tests/` would
-catch it (none of the HIGH items has one). **Status (2026-10-06): every HIGH item and every MEDIUM item has been addressed; each heading carries its own FIXED / PARTLY FIXED note.** Regression tests are in `tests/test_review_2026_10_05_*.py` (13 files); where a file's tests could run against the pre-fix code, the commit message says how many failed there. **Still partly open:** §44 (a run with no metrics.json reads `metrics_complete`), §46 (validate()'s last-row-wins join; plotting Redis readers), §56 (`--pegasus-dag-gating` defaults off), §64 (names with a directory component are refused, not supported), §65 (`_retry_unpersisted_completions` re-saves a stale payload), §67 (an input already in the work dir wins over the registry), §72 (apptainer's `docker://` conversion is inside the job's time), §33/§38 (delegation and consensus durations on `time.time()`), and the §G config-drift table's remaining rows.
+catch it (none of the HIGH items has one). **Status (2026-10-06): every HIGH item and every MEDIUM item has been addressed; each heading carries its own FIXED / PARTLY FIXED note.** Regression tests are in `tests/test_review_2026_10_05_*.py` (13 files); where a file's tests could run against the pre-fix code, the commit message says how many failed there. **Still partly open:** §46 (validate()'s last-row-wins join; plotting Redis readers), §56 (`--pegasus-dag-gating` defaults off), §64 (names with a directory component are refused, not supported), §65 (`_retry_unpersisted_completions` re-saves a stale payload), §67 (an input already in the work dir wins over the registry), §72 (apptainer's `docker://` conversion is inside the job's time), and the §G config-drift table's remaining rows.
 
 **Method.** Six independent read-only passes, one per subsystem (consensus + membership; agent
 core + repository + selection; execution + staging; metrics + collection + plotting; run tooling
@@ -406,7 +406,7 @@ LLM arm of E4. Only the per-row `policy` column in `decisions.csv` tells the tru
   at `llm_bidder.py:~248` and `llm_delegator.rank`): timeouts and pydantic-ai validation retries
   record 0 tokens, so the cost reported for P0-3/E4 is lowest in the runs with the most failures.
   `Bid` and `GroupRanking` also ask the model to fill `reasoning_time`.
-- **33. [FIXED 2026-10-06 for `top_k` — refused below 1; wall-clock delegation timing still OPEN]** `mab.top_k: 0` silently drops jobs (`random.sample(..., 0)`, `select_top_k(..., 0)`,
+- **33. [FIXED 2026-10-06 — `top_k` below 1 is refused; delegation durations use a monotonic stamp (`delegated_mono`), and the bandit's in-memory clock is monotonic]** `mab.top_k: 0` silently drops jobs (`random.sample(..., 0)`, `select_top_k(..., 0)`,
   `ranked[:0]` → `[]`; monitor discards on `any([])`). Delegation timing uses `time.time()`
   throughout (`delegated_at` at `:3333`, the monitor, the pending TTL, the timeout decay).
 
@@ -469,7 +469,7 @@ in `metrics.json`; it is simply not surfaced.
 
 ### 38. `consensus_finalized` and `finalize_s_*` mean different things under PBFT and Snow — **MEDIUM — FIXED 2026-10-06**
 
-*Status:* both engines report `won`; Snow's rounds/queries/time distributions now describe won decisions only (PBFT's always did). Collector: `consensus_won`; the over-agents median distribution is renamed `finalize_s_agent_median_*` / `rounds_agent_median_*`, and `finalize_s_p95_worst_agent` is the nearest honest tail. Durations still on `time.time()`.
+*Status:* both engines report `won`; Snow's rounds/queries/time distributions now describe won decisions only (PBFT's always did). Collector: `consensus_won`; the over-agents median distribution is renamed `finalize_s_agent_median_*` / `rounds_agent_median_*`, and `finalize_s_p95_worst_agent` is the nearest honest tail. PBFT proposal-to-finalize and Snow round/finalize times are on a monotonic clock since 2026-10-06.
 
 PBFT counts once per job at the winning proposer (`engine.py:115-123`); Snow creates a
 `_SnowState` per proposing agent (`gossip_engine.py:250`) and counts every instance that converges
@@ -511,7 +511,7 @@ true index over the fleet is 0.33. The plan defines fairness "over per-agent loa
   run reports 0 s selection time; `completed_jobs`/`success_rate` (`multi_run.py:222-224`) test
   `exit_status == 0` but `save_jobs` writes None as 0 (`data.py:308, 322`), so READY and RUNNING
   jobs count as successes; no hierarchical dedup; coordinators guessed as the top 10 % of ids.
-- **44. [PARTLY FIXED 2026-10-06 — the shortfall file carries `accounted`, and a kill run whose silent agents are exactly the declared ones reads complete; a run with no metrics.json still reads True]** `metrics_complete` is three-state data stored as a boolean. `collect.py:864` computes
+- **44. [FIXED 2026-10-06 — the shortfall file carries `accounted` (a kill run whose silent agents are exactly the declared ones reads complete), and a run with no metrics.json reads `metrics_complete: None`, unknown]** `metrics_complete` is three-state data stored as a boolean. `collect.py:864` computes
   `not shortfall.exists()`, so a run with **no** `metrics.json` reads True (covers a plotting
   failure under `run_blocking(check=False)` and every pre-gate run); `run_test.py:1610` writes the
   shortfall file even when every silent agent was declared, so every correctly measured E2b/E6

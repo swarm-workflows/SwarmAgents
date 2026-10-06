@@ -132,6 +132,8 @@ class TestRunMetrics(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             run_dir = write_run(root, "run01", "1,100,100.1,100.2,100.3,105,0,3,0.1,0.2\n")
+            # A complete run HAS a metrics.json; with none at all the column is unknown (§44).
+            (run_dir / "metrics.json").write_text("{}")
             metrics = run_metrics(run_dir, expected_jobs=1)
             self.assertTrue(metrics["metrics_complete"])
             self.assertEqual(metrics["agents_missing_metrics"], 0)

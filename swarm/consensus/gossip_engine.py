@@ -133,7 +133,9 @@ class GossipConsensusEngine:
         send_workers: int = 32,
         send_timeout_s: float = 0.3,
         max_inflight: int = 32,
-        time_fn: Callable[[], float] = time.time,
+        # Monotonic by default (§38): every use is a duration or a deadline inside this process,
+        # and a stepped wall clock moved round deadlines and finalize latencies.
+        time_fn: Callable[[], float] = time.monotonic,
     ):
         self.agent_id = int(agent_id)
         self.host = host

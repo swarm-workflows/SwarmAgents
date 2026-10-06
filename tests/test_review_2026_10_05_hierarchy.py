@@ -297,7 +297,8 @@ class TestPurge:
 class TestMonitor:
     def _age(self, coord, job_id, seconds):
         info = coord.delegated_jobs.get(job_id)
-        coord.delegated_jobs.set(job_id, dict(info, delegated_at=time.time() - seconds))
+        coord.delegated_jobs.set(job_id, dict(info, delegated_at=time.time() - seconds,
+                                              delegated_mono=time.monotonic() - seconds))
 
     def test_a_running_copy_is_not_pulled_back_by_an_unpicked_one(self):
         repo = Repository(_FakeRedis(), run_id="t")
