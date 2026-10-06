@@ -515,3 +515,24 @@ class TestNoClaimForADeadAgent:
         agent.failed_agents.set(9, 1.0)
         host = _HostAdapter(agent)
         assert host.is_agent_live(3) and not host.is_agent_live(9) and not host.is_agent_live(5)
+
+
+def test_a_verified_claim_is_used_without_a_cas():
+    """Stop-time review: the peer-decided path passed the claimed agent to the CAS. A claim
+    released between the read and the CAS left a freed key, and the CAS claimed it for the
+    agent the stale claim named."""
+    eng, host, transport, cas = _make_engine(agent_id=1, peers=(2, 3, 4))
+    host.is_agent_live = lambda a: a != 9
+    eng.propose([ProposalInfo(p_id="p", object_id="job-r", cost=10.0, agent_id="1")])
+    cas.claim("job-r", 9)
+    real_get = host.get_assignment
+
+    def read_then_release(oid):
+        got = real_get(oid)
+        cas.store.pop(oid, None)          # the reassigner releases the dead agent's claim
+        return got
+    host.get_assignment = read_then_release
+    host.try_claim_assignment = MagicMock(side_effect=AssertionError("CAS must not run"))
+    eng._finalize_work_inner(eng._states["job-r"], 9, "peer-decided")
+    assert cas.get("job-r") is None       # nothing re-claimed for the dead agent
+    host.try_claim_assignment.assert_not_called()

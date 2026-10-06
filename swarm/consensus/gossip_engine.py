@@ -635,7 +635,11 @@ class GossipConsensusEngine:
                     f"decided for {candidate} but no claim exists; re-opening the vote")
                 self._reopen(state)
                 return
-            candidate = int(existing)
+            # The claim IS the decision: use it read-only. Passing it to the CAS as a candidate
+            # (as this did) re-opened the hole — a reassigner releasing the claim between the
+            # read above and the CAS left a freed key, and the CAS claimed it for the agent the
+            # stale claim named (stop-time review).
+            winner = int(existing)
         elif int(candidate) != self.agent_id and not self._candidate_live(int(candidate)):
             # Never claim a job FOR an agent this agent believes dead: the claim is permanent
             # until someone releases it, and the dead agent will not run the job. Re-open and
@@ -647,7 +651,8 @@ class GossipConsensusEngine:
                 f"{candidate}, which is not live here; re-opening the vote")
             self._reopen(state)
             return
-        winner = self.host.try_claim_assignment(state.proposal.object_id, candidate)
+        else:
+            winner = self.host.try_claim_assignment(state.proposal.object_id, candidate)
 
         # Per-decision latency instrumentation: separates Snow round time from any
         # downstream queue/serialization tax so the ~9s selection cost can be diagnosed.
