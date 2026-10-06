@@ -290,6 +290,9 @@ def map_profile(profile: dict, job_number: int,
     data_out = _map_data_nodes(profile.get("output_files_db"), data_nodes_mode,
                                dtn_resolver, group_key=job_id)
 
+    # An outcome the extractor could not read is None. Replayed as a success (should_fail False)
+    # because a simulated job needs some outcome, but WARNED below, never silent (§57).
+    exit_unknown = "exitcode_db" in profile and profile.get("exitcode_db") is None
     exitcode = int(profile.get("exitcode_db", 0) or 0)
     should_fail = exitcode != 0
 
@@ -308,7 +311,19 @@ def map_profile(profile: dict, job_number: int,
         "target_agent": None,
     }
 
+    if exit_unknown:
+        warnings.append("outcome unknown: the run recorded no exit code for this job, so it "
+                        "replays as a success")
+
     execution = _map_execution(profile)
+    if execution and profile.get("catalog_error_db"):
+        # The transformation catalog could not be parsed, so whether this job ran in a
+        # container — and which — is unknown. An imageless container is the shape the refusal
+        # rules already reject; leaving the container off would run the job on the host (§57).
+        execution["container"] = {"name": "<transformation catalog unreadable>", "kind": "",
+                                  "image": "", "image_site": ""}
+        warnings.append(f"transformation catalog unreadable ({profile['catalog_error_db']}): "
+                        f"container unknown, execution refused")
     if execution:
         job["execution"] = execution
         # A conversion that yields jobs which cannot execute must say so. Until now the only

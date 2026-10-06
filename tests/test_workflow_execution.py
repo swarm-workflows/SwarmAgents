@@ -110,12 +110,17 @@ class TestTransformationCatalog(unittest.TestCase):
             transformations, containers = load_transformation_catalog(tmp)
         self.assertEqual((transformations, containers), ({}, {}))
 
-    def test_a_malformed_catalog_does_not_abort_the_run(self):
+    def test_a_malformed_catalog_does_not_abort_the_run_and_says_so(self):
+        """It used to return ({}, {}) — indistinguishable from "no containers", so every job
+        would run on the host's libraries with nothing saying so (code review 2026-10-05 §57).
+        It still does not abort; it reports the parse error under CATALOG_ERROR_KEY."""
+        from pegasus_profile_extractor import CATALOG_ERROR_KEY
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             write_catalog(root, "catalogs/transformations.yml", "{{{ not yaml")
             transformations, containers = load_transformation_catalog(str(root))
-        self.assertEqual((transformations, containers), ({}, {}))
+        self.assertEqual(containers, {})
+        self.assertIn("error", transformations[CATALOG_ERROR_KEY])
 
     def test_a_transformation_with_no_container_has_none(self):
         with tempfile.TemporaryDirectory() as tmp:

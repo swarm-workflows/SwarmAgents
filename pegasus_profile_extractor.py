@@ -210,8 +210,11 @@ def load_transformation_catalog(run_dir: str) -> Tuple[Dict[str, dict], Dict[str
     try:
         with open(path) as fh:
             tc = yaml.safe_load(fh) or {}
-    except Exception:  # noqa: BLE001 - a malformed catalog must not abort the whole run
-        return {}, {}
+    except Exception as exc:  # noqa: BLE001 - a malformed catalog must not abort the whole run
+        # ...but it must not read as "no containers" either: every job would then run on the
+        # host's own libraries with nothing saying so (code review 2026-10-05 §57). The
+        # sentinel rides on every profile and the converter refuses execution on it.
+        return {CATALOG_ERROR_KEY: {"error": f"{path}: {exc}"}}, {}
 
     containers: Dict[str, dict] = {}
     for entry in tc.get("containers", []) or []:
@@ -238,14 +241,63 @@ def load_transformation_catalog(run_dir: str) -> Tuple[Dict[str, dict], Dict[str
         site = next((s for s in sites if s.get("name") not in (None, "local")), None)
         if site is None:
             site = sites[0] if sites else {}
-        transformations[name] = {
-            "name": name,
-            "pfn": site.get("pfn"),
-            "type": site.get("type"),
-            "site": site.get("name"),
-            "container": site.get("container"),
-        }
+
+        def _entry(s):
+            return {"name": name, "pfn": s.get("pfn"), "type": s.get("type"),
+                    "site": s.get("name"), "container": s.get("container")}
+        transformations[name] = _entry(site)
+        # Every site's entry too: the one that describes a job is the site it RAN on
+        # (`job_instance.site`), which `catalog_entry_for` prefers. "First non-local" is only
+        # the fallback — with two execution sites it could pick a pfn or container Pegasus did
+        # not use for this job (§57).
+        transformations[name]["by_site"] = {s.get("name"): _entry(s) for s in sites
+                                            if s.get("name")}
     return transformations, containers
+
+
+def resolve_arguments(clustered: bool, declared: List[str], resolved: bool,
+                      argv_raw: str, argv_list):
+    """(argument list, raw string) for one job. `None` means UNKNOWN and is refused at execution;
+    `[]` means the job genuinely takes none.
+
+    * A cluster has no single command line (several tasks run in sequence): unknown.
+    * The abstract workflow's declaration wins over the recorded argv, which is empty for every
+      compute job in these workflows.
+    * Nothing declared and nothing recorded — no workflow.yml, no PyYAML, or this job's abstract
+      id is not in it: unknown, not "none". `[]` is runnable and would run the job with no
+      arguments, the substitution the None/[] rule exists to prevent (code review §57).
+    * Otherwise the recorded argv as parsed (None when it could not be parsed).
+    """
+    if clustered:
+        return None, ""
+    if declared:
+        return list(declared), " ".join(declared)
+    if not resolved and not (argv_raw or "").strip():
+        return None, argv_raw or ""
+    return argv_list, argv_raw
+
+
+#: Key under which `load_transformation_catalog` reports a catalog it could not parse.
+CATALOG_ERROR_KEY = "__catalog_error__"
+
+
+def catalog_entry_for(transformations: Dict[str, dict], name: str, site: str) -> dict:
+    """The catalog entry for `name` at the site the job ran on, else the default choice."""
+    entry = transformations.get(name) or {}
+    return (entry.get("by_site") or {}).get(site) or {
+        k: v for k, v in entry.items() if k != "by_site"}
+
+
+def container_for(entry: dict, containers: Dict[str, dict]) -> Optional[dict]:
+    """The container a catalog entry names. A name the catalog does not define is returned as
+    an IMAGELESS container, not as None: None means "runs on the host", and a dangling name
+    would otherwise run the job on the host's own libraries silently. The imageless form is
+    exactly what `ExecutionSpec.runnable()` refuses (§57)."""
+    name = (entry or {}).get("container")
+    if not name:
+        return None
+    return containers.get(name) or {"name": name, "type": None, "image": None,
+                                    "image_site": None}
 
 
 def load_replica_catalog(run_dir: str) -> Dict[str, str]:
@@ -413,7 +465,9 @@ def extract_run(run_dir: str, job_types: List[str],
         return {
             "lfn": lfn,
             "site": cache_sites.get(lfn, fallback_site),
-            "size_bytes": lfn_sizes.get(lfn, 0),
+            # Absent when unknown — not 0. The converter keeps an absent size absent; an explicit
+            # 0 defeated that rule upstream and under-counted every job's data volume (§57).
+            "size_bytes": lfn_sizes.get(lfn),
         }
 
     # --- network aggregates from stage-in/stage-out transfer jobs ---
@@ -512,8 +566,9 @@ def extract_run(run_dir: str, job_types: List[str],
             # over, but silently returning [] would fabricate an argument-free job. Keep the
             # raw string so the converter can refuse it rather than run something wrong.
             argv_list = None
-        tc_entry = transformations_tc.get(transformation, {})
-        container = containers_tc.get(tc_entry.get("container")) if tc_entry else None
+        catalog_error = (transformations_tc.get(CATALOG_ERROR_KEY) or {}).get("error")
+        tc_entry = catalog_entry_for(transformations_tc, transformation, site)
+        container = container_for(tc_entry, containers_tc)
 
         # Abstract job id(s) -> input/output files from workflow.yml.
         # Prefer the DB's abs_task_id (handles custom job ids and clustered
@@ -553,19 +608,13 @@ def extract_run(run_dir: str, job_types: List[str],
         # clusters exactly when the workflow metadata is missing.
         task_ids = cluster_task_ids(main_tasks)
         clustered = len(task_ids) > 1
-        if clustered:
-            argv_list = None
-            argv_raw = ""
-        elif uses["arguments"]:
-            # The abstract workflow's declaration wins over the recorded argv, which is empty
-            # for every compute job in these workflows. Falling back the other way keeps a run
-            # whose abstract workflow is missing from losing arguments it did record.
-            argv_list = uses["arguments"]
-            argv_raw = " ".join(uses["arguments"])
+        argv_list, argv_raw = resolve_arguments(clustered, uses["arguments"], bool(abs_ids),
+                                                argv_raw, argv_list)
         input_files = [file_entry(lfn, site) for lfn in uses["input"]]
         output_files = [file_entry(lfn, site) for lfn in uses["output"]]
-        total_in = sum(f["size_bytes"] for f in input_files)
-        total_out = sum(f["size_bytes"] for f in output_files)
+        total_in = sum(f["size_bytes"] or 0 for f in input_files)
+        total_out = sum(f["size_bytes"] or 0 for f in output_files)
+        sizes_known = all(f["size_bytes"] is not None for f in input_files + output_files)
 
         # Condor resource requests
         req = sub_requests.get(exec_job_id, {})
@@ -621,7 +670,11 @@ def extract_run(run_dir: str, job_types: List[str],
             "total_input_size_bytes_db": total_in,
             "total_output_size_bytes_db": total_out,
             # outcome
-            "exitcode_db": int(exitcode) if exitcode is not None else 0,
+            # None when the stampede DB recorded no outcome — not 0, which read as a success
+            # (and `should_fail: False`) for a job whose result is unknown (§57).
+            "exitcode_db": int(exitcode) if exitcode is not None else None,
+            "catalog_error_db": catalog_error,
+            "sizes_known_db": sizes_known,
             "execution_site_db": site,
             # retries / stats
             "try_number_stats": len(instances),
