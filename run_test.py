@@ -705,10 +705,15 @@ def start_agents_remote(args, agent_hosts_list: list[str], agent_count: int = No
         # of this process, so it inherits nothing, and an unstamped payload is indistinguishable
         # from an older run's leftover.
         run_id = os.environ.get("SWARM_RUN_ID", "")
+        # The staging token crosses the ssh boundary the same way the run id does, when this
+        # shell has one; otherwise the remote ~/.profile is the only source (§70).
+        token = os.environ.get("SWARM_STAGING_TOKEN", "")
+        token_export = f"export SWARM_STAGING_TOKEN={shlex.quote(token)} && " if token else ""
         start_cmd = (
             #f"source ~/.bash_profile && "
             f"source ~/.profile && "
             f"export SWARM_RUN_ID={shlex.quote(run_id)} && "
+            f"{token_export}"
             f"cd {shlex.quote(args.remote_repo_dir)} && "
             f"nohup bash {shlex.quote(starter)} "
             f"{shlex.quote(args.agent_type)} {count} {shlex.quote(args.topology)} {args.jobs} "

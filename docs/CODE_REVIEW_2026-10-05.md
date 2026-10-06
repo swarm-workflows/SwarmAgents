@@ -5,7 +5,7 @@ Second critical read of the code base, against the same question as the 2026-09-
 anything in the run saying so?** Everything found there is excluded here. Ranked by that
 question; within a rank, by how many cells it touches. Every finding names the file and line,
 the failing scenario, the metric it moves and the direction, and whether a test in `tests/` would
-catch it (none of the HIGH items has one). **Status: §1–§6, §13–§17, §20, §22–§23, §34–§39, §41, §47–§52, §62–§63 and the §H double-execution metric FIXED 2026-10-06** (§60 partly) — all six recommended-order steps complete; second batch: §9, §19, §24, §25, §30, §33, §44 (partly), §53; §61 retry; §7, §8; §42, §43; §40; §57; §64–§67 (`tests/test_review_2026_10_05_snow.py`, 31 tests, 23 fail on the pre-fix tree; `tests/test_review_2026_10_05_pbft.py`, 13 tests, 8 fail on the pre-fix tree; `tests/test_review_2026_10_05_hierarchy.py`, 23 tests on the new write/monitor/purge paths; `tests/test_review_2026_10_05_collect.py`, 15 tests, all 15 fail on the pre-fix tree; `tests/test_review_2026_10_05_runner.py`, 21 tests on the new launch/drain paths; `tests/test_review_2026_10_05_delegation.py`, 12; `tests/test_review_2026_10_05_execution.py`, 15); everything else OPEN.
+catch it (none of the HIGH items has one). **Status: §1–§6, §13–§17, §20, §22–§23, §34–§39, §41, §47–§52, §62–§63 and the §H double-execution metric FIXED 2026-10-06** (§60 partly) — all six recommended-order steps complete; second batch: §9, §19, §24, §25, §30, §33, §44 (partly), §53; §61 retry; §7, §8; §42, §43; §40; §57; §64–§67; §69–§70 (`tests/test_review_2026_10_05_snow.py`, 31 tests, 23 fail on the pre-fix tree; `tests/test_review_2026_10_05_pbft.py`, 13 tests, 8 fail on the pre-fix tree; `tests/test_review_2026_10_05_hierarchy.py`, 23 tests on the new write/monitor/purge paths; `tests/test_review_2026_10_05_collect.py`, 15 tests, all 15 fail on the pre-fix tree; `tests/test_review_2026_10_05_runner.py`, 21 tests on the new launch/drain paths; `tests/test_review_2026_10_05_delegation.py`, 12; `tests/test_review_2026_10_05_execution.py`, 15); everything else OPEN.
 
 **Method.** Six independent read-only passes, one per subsystem (consensus + membership; agent
 core + repository + selection; execution + staging; metrics + collection + plotting; run tooling
@@ -733,12 +733,12 @@ returns `{}` and says the caller must tell the cases apart; no test checks that 
   `runtime.execution.timeout_s` (3600 s) and never by `wall_time_max_s`. A coordinator drops any
   real job longer than `delegation_timeout_s + 120 s` with no bandit outcome — the bandit never
   sees long jobs.
-- **69. The apptainer invocation is not isolated** (`runner.py:455-458`): no `--containall`,
+- **69. [FIXED 2026-10-06 — `--containall` by default (no $HOME or host /tmp bind, clean environment, as docker); staged code bound `:ro`. Escape hatch `runtime.execution.apptainer_containall: false`]** The apptainer invocation is not isolated (`runner.py:455-458`): no `--containall`,
   `--no-home` or `--cleanenv`, so `$HOME` and `/tmp` are bound — and if agents run as root (the
   remote launch suggests so; unconfirmed) `/root/.ssh` and the root-mesh key are readable by
   workflow code, which makes `job_environment` scrubbing moot. The staged-code bind is read-write
   under apptainer but `:ro` under docker, so a job can modify the code bundle every agent runs.
-- **70. The data service has no authentication** (`staging.py:288-391, 431, 498, 609`;
+- **70. [FIXED 2026-10-06 — shared token in `SWARM_STAGING_TOKEN`, sent as gRPC metadata and checked with `hmac.compare_digest` on Fetch and Put; `staging_site.py --token`; `run_test.py` forwards it to remote agents. Unset means open, with a startup warning on agents and the site. Transport is still plaintext gRPC and the site has no quota]** The data service has no authentication (`staging.py:288-391, 431, 498, 609`;
   `staging_site.py:32`). `Put` accepts any `(run, name)` from any host; combined with first-wins, a
   pre-seeded or rogue upload becomes the durable copy and the real producer's push is discarded.
   The site binds `0.0.0.0` and serves every run to anyone with a guessable run id. No quota.

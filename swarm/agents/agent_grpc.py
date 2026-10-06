@@ -170,6 +170,7 @@ class Agent(Observer):
             path_rewrites=cfg.get("path_rewrites", ()) or (),
             image_overrides=dict(cfg.get("image_overrides", {}) or {}),
             capture_output=bool(cfg.get("capture_output", True)),
+            apptainer_containall=bool(cfg.get("apptainer_containall", True)),
             roots=roots,
         )
         if mode == "real":
@@ -205,6 +206,12 @@ class Agent(Observer):
             self.logger.warning(
                 "[STAGE] staging is enabled but runtime.execution.mode=%s, so no job produces "
                 "a file to stage; nothing will be served.", mode)
+
+        if not staging.token():
+            self.logger.warning(
+                "[STAGE] %s is not set: this agent's data endpoint accepts any request, so any "
+                "host that can reach it can read this run's files. Export a shared token on "
+                "every agent and the staging site.", staging.TOKEN_ENV)
 
         if str(self.grpc_host) in ("0.0.0.0", "::", ""):
             # The location record advertises this address to peers, and it is the same field

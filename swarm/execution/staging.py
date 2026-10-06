@@ -34,6 +34,7 @@ runs and `stage_inputs` behaves exactly as it did: local work dir, then the inpu
 from __future__ import annotations
 
 import hashlib
+import hmac
 import logging
 import os
 import threading
@@ -233,6 +234,21 @@ def _safe_run_dir(run_id: str) -> str:
     return safe if safe and safe not in (".", "..") else "_unnamed"
 
 
+#: Environment variable holding the shared staging token. Agents, the staging site and the
+#: runner read the same one; empty means the data service is unauthenticated.
+TOKEN_ENV = "SWARM_STAGING_TOKEN"
+_TOKEN_HEADER = "x-swarm-staging-token"
+
+
+def token() -> str:
+    return os.environ.get(TOKEN_ENV, "")
+
+
+def _auth_metadata():
+    tok = token()
+    return [(_TOKEN_HEADER, tok)] if tok else None
+
+
 class _Servicer(consensus_pb2_grpc.DataTransferServiceServicer):
     def __init__(self, published: PublishedFiles, run_id: str,
                  pol: Optional[StagingPolicy] = None, store_dir: Optional[str] = None):
@@ -243,6 +259,10 @@ class _Servicer(consensus_pb2_grpc.DataTransferServiceServicer):
         #: uploads, so `Put` has nowhere to write and says so — the capability is granted by
         #: configuration rather than assumed from the request.
         self.store_dir = store_dir
+        # The shared token this endpoint requires, captured once. Insecure gRPC with no auth let
+        # any host fetch a run's files and PUT any (run, name) — and with first-wins storage a
+        # pre-seeded upload became the durable copy (code review 2026-10-05 §70).
+        self.token = token()
         self.served = 0
         self.bytes_served = 0
         self.refused = 0
@@ -255,7 +275,16 @@ class _Servicer(consensus_pb2_grpc.DataTransferServiceServicer):
         logger.warning("[STAGE_SERVE] refused: %s", reason)
         yield consensus_pb2.DataChunk(error=reason, last=True)
 
+    def _authorised(self, context) -> bool:
+        if not self.token:
+            return True
+        got = dict(context.invocation_metadata() or ()).get(_TOKEN_HEADER, "")
+        return hmac.compare_digest(str(got), self.token)
+
     def Fetch(self, request, context):  # noqa: N802 (gRPC naming)
+        if not self._authorised(context):
+            yield from self._refuse("staging token missing or wrong")
+            return
         name = str(request.name or "")
         # **Fail closed on an unknown run.** The first version required BOTH sides to be
         # non-empty before comparing, so an agent whose SWARM_RUN_ID was empty skipped the
@@ -338,7 +367,11 @@ class _Servicer(consensus_pb2_grpc.DataTransferServiceServicer):
         temporary file first, then **`os.link`, not `os.replace`** — a second upload of the
         same name (a re-run after reassignment, say) must not truncate a copy something is
         already reading. A re-upload is therefore idempotent and harmless.
+        Refused outright without the staging token, when one is configured (§70).
         """
+        if not self._authorised(context):
+            self.put_refused += 1
+            return consensus_pb2.PutAck(ok=False, error="staging token missing or wrong")
         if not self.store_dir:
             self.put_refused += 1
             return consensus_pb2.PutAck(
@@ -559,7 +592,8 @@ def fetch(name: str, location: dict, dest_dir: str, run_id: str, requester: str 
             request = consensus_pb2.FetchRequest(
                 name=str(name), run_id=str(run_id or ""), requester=str(requester or ""))
             with open(tmp, "wb") as out:
-                for chunk in stub.Fetch(request, timeout=pol.timeout_s):
+                for chunk in stub.Fetch(request, timeout=pol.timeout_s,
+                                        metadata=_auth_metadata()):
                     if chunk.error:
                         return FetchResult(False, f"{target} refused {name!r}: {chunk.error}")
                     if chunk.size:
@@ -667,7 +701,8 @@ def put(name: str, path: str, run_id: str, sender: str = "",
                 options=[("grpc.max_send_message_length", pol.chunk_bytes * 4),
                          ("grpc.max_receive_message_length", pol.chunk_bytes * 4)]) as channel:
             stub = consensus_pb2_grpc.DataTransferServiceStub(channel)
-            ack = stub.Put(_chunks(), timeout=put_deadline_s(size, pol))
+            ack = stub.Put(_chunks(), timeout=put_deadline_s(size, pol),
+                           metadata=_auth_metadata())
         elapsed = time.time() - started
         if not ack.ok:
             return PutResult(False, f"{target} refused {name!r}: {ack.error}", 0, elapsed)

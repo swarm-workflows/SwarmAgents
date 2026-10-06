@@ -132,6 +132,12 @@ class ExecutionPolicy:
     path_rewrites: Tuple[Tuple[str, str], ...] = ()
     image_overrides: Dict[str, str] = field(default_factory=dict)
     capture_output: bool = True
+    # Run apptainer with `--containall`: no $HOME or host /tmp bind, a clean environment and
+    # private IPC/PID namespaces. Without it apptainer bound $HOME and /tmp — on a root-run agent
+    # that exposed /root/.ssh (the root mesh key) to workflow code and made `job_environment`'s
+    # scrubbing moot, and the job saw the whole host environment where docker gave it none
+    # (code review 2026-10-05 §69). Escape hatch for a workflow that needs the host home.
+    apptainer_containall: bool = True
     # Where to find the three kinds of thing a job needs, for jobs that name them RELATIVELY.
     # They map onto fields that already exist rather than introducing new ones:
     #   code   <- ExecutionSpec.pfn          (the executable)
@@ -462,9 +468,14 @@ def build_command(spec: ExecutionSpec, work_dir: str,
         local = resolve_under_root(image, "images", pol)
         image = local if (local and os.path.exists(local)) else "docker://" + image
         # (apptainer only -- see the note in `resolve_image`.)
-    cmd = [runtime, "exec", "--bind", f"{work_dir}:{work_dir}", "--pwd", work_dir]
+    cmd = [runtime, "exec"]
+    if pol.apptainer_containall:
+        cmd.append("--containall")
+    cmd += ["--bind", f"{work_dir}:{work_dir}", "--pwd", work_dir]
     for host, inside in binds:
-        cmd += ["--bind", f"{host}:{inside}"]
+        # Read-only, as under docker: the staged code bundle is shared by every agent of the
+        # run, and a job must not be able to change the code the next job runs (§69).
+        cmd += ["--bind", f"{host}:{inside}:ro"]
     cmd += [image, spec.path] + args
     return cmd, ""
 

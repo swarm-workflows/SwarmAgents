@@ -42,12 +42,22 @@ def main() -> int:
     ap.add_argument("--no-verify", action="store_true",
                     help="skip the stream digest (not recommended: a truncated upload then "
                          "becomes a short file that a job reads happily)")
+    ap.add_argument("--token", default=None,
+                    help="shared staging token clients must present (default: "
+                         "$SWARM_STAGING_TOKEN). Without one the site accepts uploads and "
+                         "serves every run to any host that can reach it.")
     ap.add_argument("--stats-every", type=float, default=30.0,
                     help="seconds between stats lines; 0 to print none")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
+    if args.token is not None:
+        os.environ[staging.TOKEN_ENV] = args.token
+    if not staging.token():
+        logging.warning("[STAGE_STORE] no staging token: any host that reaches %s:%s can "
+                        "upload and read files (set --token or $%s)",
+                        args.host, args.port, staging.TOKEN_ENV)
     staging.configure(enabled=True, chunk_bytes=args.chunk_bytes, verify=not args.no_verify)
 
     os.makedirs(args.store_dir, exist_ok=True)
