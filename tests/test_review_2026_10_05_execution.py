@@ -383,3 +383,58 @@ def test_retry_releases_the_claim_before_the_record_reads_pending():
     assert a._retry_refused(j) is True
     pending = j.state.__class__.PENDING.value
     assert order.index(("release",)) < order.index(("save", pending))
+
+
+# --------------------------------------------------------------------------- §65
+class TestCompletionOnlyOverOurOwnRecord:
+    def _setup(self, record_state, leader):
+        from swarm.database.repository import Repository
+        sys.path.insert(0, os.path.join(REPO, "tests"))
+        from test_failed_agent_reassignment import _FakeRedis
+        repo = Repository(_FakeRedis(), run_id="t")
+        a = _retry_agent(repo)
+        a._unpublished_lock = __import__("threading").Lock()
+        a._unpersisted_completions = {}
+        rec = _refused_job(repo)
+        rec.state = record_state
+        rec.leader_id = leader
+        repo.save(obj=rec.to_dict(), level=0, group=0)
+        done = Job()
+        done.job_id = "j1"
+        done.leader_id = 5
+        done.state = done.state.__class__.COMPLETE
+        done.exit_status = 0
+        return repo, a, done
+
+    def test_our_running_record_is_completed(self):
+        from swarm.models.object import ObjectState
+        repo, a, done = self._setup(ObjectState.RUNNING, 5)
+        a._persist_completion(done, None)
+        assert repo.get("j1", level=0, group=0)["state"] == ObjectState.COMPLETE.value
+
+    def test_a_reassigned_record_is_not_overwritten(self):
+        from swarm.models.object import ObjectState
+        repo, a, done = self._setup(ObjectState.RUNNING, 7)      # now agent 7's
+        a._persist_completion(done, None)
+        rec = repo.get("j1", level=0, group=0)
+        assert rec["state"] == ObjectState.RUNNING.value and rec["leader_id"] == 7
+
+    def test_a_reset_record_is_not_overwritten(self):
+        from swarm.models.object import ObjectState
+        repo, a, done = self._setup(ObjectState.PENDING, None)
+        a._persist_completion(done, None)
+        assert repo.get("j1", level=0, group=0)["state"] == ObjectState.PENDING.value
+
+    def test_a_queued_retry_is_dropped_once_the_record_moved_on(self):
+        from swarm.models.object import ObjectState
+        repo, a, done = self._setup(ObjectState.RUNNING, 7)
+        a._unpersisted_completions["j1"] = (done.to_dict(), [], {})
+        a._retry_unpersisted_completions()
+        assert a._unpersisted_completions == {}
+        assert repo.get("j1", level=0, group=0)["leader_id"] == 7
+
+    def test_a_record_without_a_leader_is_still_completed(self):
+        from swarm.models.object import ObjectState
+        repo, a, done = self._setup(ObjectState.RUNNING, None)
+        a._persist_completion(done, None)
+        assert repo.get("j1", level=0, group=0)["state"] == ObjectState.COMPLETE.value

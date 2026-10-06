@@ -76,7 +76,8 @@ class Repository:
              level: int = 0, group: int = 0, max_retries: int = 10,
              produced_data: Optional[List[str]] = None,
              produced_locations: Optional[Dict[str, dict]] = None,
-             require_existing: bool = False) -> bool:
+             require_existing: bool = False,
+             precondition=None) -> bool:
         """
         Save a generic object into Redis under the given key.
 
@@ -119,6 +120,12 @@ class Repository:
             try:
                 pipeline.watch(key)
                 old_data = pipeline.get(key)
+                if precondition is not None and not precondition(
+                        json.loads(old_data) if old_data else None):
+                    # The record moved on since the caller decided to write (§65): refused
+                    # under the same WATCH, so the check and the write are one decision.
+                    pipeline.unwatch()
+                    return False
                 if require_existing and not old_data:
                     # The record was deleted — a coordinator WITHDREW this copy. Re-creating it
                     # here would run a job its coordinator has already handed elsewhere. The

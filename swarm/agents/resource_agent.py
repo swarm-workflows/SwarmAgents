@@ -3945,6 +3945,22 @@ class ResourceAgent(Agent):
                 still.append(item)
         self._pending_stage_out = still
 
+    def _still_ours(self, record: Optional[dict]) -> bool:
+        """A completion may be written only over a record that still names this agent as the
+        job's leader and is not already COMPLETE. Otherwise the job was reset or reassigned while
+        this agent ran it — a false failure verdict, a withdrawal — and this outcome is a
+        duplicate's: writing it would overwrite the new leader's record, and a retry queued
+        earlier would re-save a stale payload over a newer one (code review 2026-10-05 §65)."""
+        # Refuse only on POSITIVE evidence that the record moved on. A missing leader is not
+        # such evidence — refusing it would leave a job RUNNING for ever on any path that did
+        # not stamp one.
+        if not record:
+            return False                                   # withdrawn
+        if record.get("state") in (ObjectState.COMPLETE.value, ObjectState.PENDING.value):
+            return False                                   # finished elsewhere, or reset
+        leader = record.get("leader_id")
+        return leader is None or str(leader) == str(self.agent_id)
+
     def _persist_completion(self, job: Job, produced: Optional[list],
                             locations: Optional[dict] = None) -> bool:
         """Write a finished job's outcome, with its outputs, in one transaction.
@@ -3956,14 +3972,20 @@ class ResourceAgent(Agent):
         already run, and its result must not depend on Redis being reachable at this instant.
         """
         try:
-            self.repository.save(
+            written = self.repository.save(
                 obj=job.to_dict(),
                 key_prefix=Repository.KEY_JOB,
                 level=self.topology.level,
                 group=self.topology.group,
                 produced_data=produced,
                 produced_locations=locations or None,
+                precondition=self._still_ours,
             )
+            if written is False:
+                self.logger.warning(
+                    f"[COMPLETE] {job.job_id}: the record no longer names this agent as its "
+                    f"leader (reset or reassigned while it ran); this outcome is not recorded")
+                return True
             if produced:
                 self.logger.debug(f"[DATA_READY] {job.job_id} produced {produced}")
             return True
@@ -3989,21 +4011,27 @@ class ResourceAgent(Agent):
             pending = list(self._unpersisted_completions.items())
         for job_id, (payload, produced, locations) in pending:
             try:
-                self.repository.save(
+                written = self.repository.save(
                     obj=payload,
                     key_prefix=Repository.KEY_JOB,
                     level=self.topology.level,
                     group=self.topology.group,
                     produced_data=produced or None,
                     produced_locations=locations or None,
+                    precondition=self._still_ours,
                 )
             except Exception as e:
                 self.logger.debug(f"[DATA_READY] completion retry for {job_id} failed: {e}")
                 continue
             with self._unpublished_lock:
                 self._unpersisted_completions.pop(job_id, None)
-            self.logger.info(
-                f"[DATA_READY] re-persisted completion of {job_id} after an earlier failure")
+            if written is False:
+                self.logger.warning(
+                    f"[DATA_READY] dropped the queued completion of {job_id}: the record has "
+                    f"moved on (reset or reassigned) since it was queued")
+            else:
+                self.logger.info(
+                    f"[DATA_READY] re-persisted completion of {job_id} after an earlier failure")
 
     def _maybe_push_post_process(self, job: Job):
         """

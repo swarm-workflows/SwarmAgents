@@ -197,3 +197,34 @@ def test_a_job_that_does_not_rewrite_its_output_does_not_publish_a_stale_one(tmp
                      data_out=[_Node("out.csv")])
     assert res.exit_status == 0
     assert not os.path.exists(stale)
+
+
+# --------------------------------------------------------------------------- §67 (inputs)
+class TestAStaleLocalInputIsReplaced:
+    def _locator(self, sha):
+        return lambda names: {"in.csv": [{"agent_id": "1", "host": "127.0.0.1", "port": 1,
+                                          "sha256": sha}]}
+
+    def test_a_matching_local_copy_is_used(self, tmp_path):
+        work = str(tmp_path / "w")
+        path = _write(os.path.join(work, "in.csv"), b"the producer's bytes")
+        staging.configure(enabled=True)
+        runner.configure(mode="real")
+        staged, refusal = runner.stage_inputs([_Node("in.csv")], work,
+                                              locator=self._locator(staging.file_sha256(path)),
+                                              run_id="r1")
+        assert refusal == "" and staged == []
+
+    def test_a_mismatching_local_copy_is_removed_and_fetched(self, tmp_path, monkeypatch):
+        work = str(tmp_path / "w")
+        _write(os.path.join(work, "in.csv"), b"a stale copy")
+        good = b"the producer's bytes"
+        want = __import__("hashlib").sha256(good).hexdigest()
+        staging.configure(enabled=True)
+        runner.configure(mode="real")
+        monkeypatch.setattr(staging, "fetch", lambda name, loc, dest_dir, **k: (
+            _write(os.path.join(dest_dir, name), good), staging.FetchResult(True))[1])
+        staged, refusal = runner.stage_inputs([_Node("in.csv")], work,
+                                              locator=self._locator(want), run_id="r1")
+        assert refusal == "" and staged == ["in.csv"]
+        assert open(os.path.join(work, "in.csv"), "rb").read() == good

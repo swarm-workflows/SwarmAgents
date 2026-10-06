@@ -5,7 +5,7 @@ Second critical read of the code base, against the same question as the 2026-09-
 anything in the run saying so?** Everything found there is excluded here. Ranked by that
 question; within a rank, by how many cells it touches. Every finding names the file and line,
 the failing scenario, the metric it moves and the direction, and whether a test in `tests/` would
-catch it (none of the HIGH items has one). **Status (2026-10-06): every HIGH item and every MEDIUM item has been addressed; each heading carries its own FIXED / PARTLY FIXED note.** Regression tests are in `tests/test_review_2026_10_05_*.py` (13 files); where a file's tests could run against the pre-fix code, the commit message says how many failed there. **Still partly open:** §46 (validate()'s last-row-wins join; plotting Redis readers), §56 (`--pegasus-dag-gating` defaults off), §64 (names with a directory component are refused, not supported), §65 (`_retry_unpersisted_completions` re-saves a stale payload), §67 (an input already in the work dir wins over the registry), §72 (apptainer's `docker://` conversion is inside the job's time), and the §G config-drift table's remaining rows.
+catch it (none of the HIGH items has one). **Status (2026-10-06): every HIGH item and every MEDIUM item has been addressed; each heading carries its own FIXED / PARTLY FIXED note.** Regression tests are in `tests/test_review_2026_10_05_*.py` (13 files); where a file's tests could run against the pre-fix code, the commit message says how many failed there. **Still partly open:** §46 (validate()'s last-row-wins join; plotting Redis readers), §56 (`--pegasus-dag-gating` defaults off), §64 (names with a directory component are refused, not supported), §72 (apptainer's `docker://` conversion is inside the job's time), and the §G config-drift table's remaining rows.
 
 **Method.** Six independent read-only passes, one per subsystem (consensus + membership; agent
 core + repository + selection; execution + staging; metrics + collection + plotting; run tooling
@@ -706,7 +706,7 @@ returns `{}` and says the caller must tell the cases apart; no test checks that 
   stale read if the basename exists there, else a refusal. The producer also checks and serves
   `work/out.csv` while the job may have written `work/runA/out.csv`. The converter emits raw LFNs
   (`:225, 257`) and itself acknowledges slash-bearing names (`:481-485`).
-- **65. [FIXED 2026-10-06 — the store REFUSES a different body under an existing (run, name); every location carries the producer's sha256 and `fetch_any` rejects a served copy that does not match it, trying the next. `_retry_unpersisted_completions` re-saving a stale payload is still open]** One name can be served as up to three different copies and every check passes. The
+- **65. [FIXED 2026-10-06 — the store REFUSES a different body under an existing (run, name); every location carries the producer's sha256 and `fetch_any` rejects a served copy that does not match it, trying the next. a completion — first write and queued retry — is written only while the record still names this agent (or no leader) and is not COMPLETE or reset (`Repository.save(precondition=…)`, `_still_ours`)]** One name can be served as up to three different copies and every check passes. The
   store keeps the first copy per `(run, name)` but acks `ok=True` for a *different* body, logging
   ERROR only (`staging.py:362-388`); `HSET` on the location is last-writer-wins
   (`repository.py:128-132`); the registry carries no content digest, so the sha256 proves the
@@ -723,7 +723,7 @@ returns `{}` and says the caller must tell the cases apart; no test checks that 
   `test_a_failed_stage_out_loses_durability_not_the_run` pins it. `store_timeout_s = 120` is a
   deadline for the whole stream, so any output taking > 120 s to upload *always* loses durability —
   exactly the large intermediates — and the synchronous wait adds to latency and makespan.
-- **67. [PARTLY FIXED 2026-10-06 — declared outputs are removed from the work dir before a real job runs; an input already in the work dir still wins over the registry]** A file already in the work dir wins over the registry, and outputs are never cleared
+- **67. [FIXED 2026-10-06 — declared outputs are removed from the work dir before a real job runs; with staging on, an input already in the work dir whose digest does not match the producer's is replaced by a fetch]** A file already in the work dir wins over the registry, and outputs are never cleared
   before a run (`runner.py:562-564`; `resource_agent.py:3499-3508`). A job that exits 0 without
   rewriting an output gets the old file published; a false-failed agent's copy of a reassigned
   producer still writes into the shared dir; a container orphaned by §62 writes after its timeout.

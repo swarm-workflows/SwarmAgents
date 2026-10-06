@@ -634,7 +634,32 @@ def stage_inputs(data_in, work_dir: str,
             continue
         dest = os.path.join(work_dir, name)
         if os.path.exists(dest):
-            continue                        # parent output, or already staged
+            # Normally a parent's output or an earlier stage — kept, never overwritten. But with
+            # staging on, the registry carries the producer's digest, and a local copy that does
+            # not match it is known-stale: a falsely-failed producer's copy of a reassigned job,
+            # or a previous attempt's. It used to win over the registry silently (code review
+            # 2026-10-05 §67); it is replaced by a fetch of the published file instead.
+            locs_here = locations.get(name) or []
+            if isinstance(locs_here, dict):            # a single location, as earlier records were
+                locs_here = [locs_here]
+            want = next((l.get("sha256") for l in locs_here
+                         if isinstance(l, dict) and l.get("sha256")), None) if staging_on else None
+            if not want:
+                continue                    # parent output, or already staged
+            from swarm.execution import staging as _st
+            try:
+                current = _st.file_sha256(dest)
+            except OSError:
+                current = None
+            if current == want:
+                continue
+            logger.warning("[STAGE] %s in the work dir does not match the producer's digest; "
+                           "replacing it with the published copy", name)
+            try:
+                os.unlink(dest)
+            except OSError as exc:
+                return staged, (f"input {name!r} is stale in the working directory and could "
+                                f"not be removed: {exc}")
 
         # Produced by this run on another agent: fetch it before considering the inputs root.
         locs = locations.get(name)
