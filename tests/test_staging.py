@@ -759,14 +759,15 @@ def test_a_traversing_name_is_refused_by_the_store(tmp_path):
 
 def test_a_re_upload_is_idempotent_and_never_truncates(tmp_path):
     """A re-run after reassignment uploads the same name again. `os.link`, not `os.replace`:
-    the stored copy something may already be reading must not be truncated."""
+    the stored copy something may already be reading must not be truncated. A DIFFERENT body
+    is refused rather than acknowledged since code review 2026-10-05 §65."""
     server, port, store_dir = _store(tmp_path)
     try:
         staging.configure(enabled=True, store_host="127.0.0.1", store_port=port)
         first = _write(str(tmp_path / "w" / "out.txt"), b"first copy")
         assert staging.put("out.txt", first, run_id="run-1").ok
         second = _write(str(tmp_path / "w2" / "out.txt"), b"second")
-        assert staging.put("out.txt", second, run_id="run-1").ok
+        assert not staging.put("out.txt", second, run_id="run-1").ok
 
         assert open(os.path.join(store_dir, "run-1", "out.txt"), "rb").read() == b"first copy"
     finally:
@@ -872,20 +873,23 @@ def test_the_producer_records_peer_then_store(tmp_path, monkeypatch):
         server.stop(0)
 
 
-def test_a_failed_stage_out_loses_durability_not_the_run(tmp_path):
-    """The peer location still works until this agent dies, which is precisely the risk being
-    taken — so the job completes and the operator is told loudly."""
+def test_a_failed_stage_out_withholds_the_name_until_a_retry_succeeds(tmp_path):
+    """This used to publish the name with a peer-only location, breaking the guarantee stage-out
+    exists for: a name is never visible without a durable copy (code review 2026-10-05 §66).
+    The name is now withheld and queued; `_retry_stage_out` publishes it once a push lands."""
     work = str(tmp_path / "work")
     _write(os.path.join(work, "out.json"), b"{}")
     staging.configure(enabled=True, store_host="127.0.0.1", store_port=1, store_timeout_s=1.0)
     runner.configure(mode="real", work_dir=work)
     a = _agent(tmp_path)
 
-    entries = a._publish_locations(_Job(), ["out.json"])["out.json"]
+    locations = a._publish_locations(_Job(), ["out.json"])
 
-    assert [e["agent_id"] for e in entries] == ["7"], "no store entry for a push that failed"
+    assert "out.json" not in locations, "a name without a durable copy must not be published"
+    assert a._last_withheld == ["out.json"]
+    assert [p["name"] for p in a._pending_stage_out] == ["out.json"]
     logged = " ".join(str(c.args) for c in a.logger.error.call_args_list)
-    assert "STAGE_OUT" in logged and "every descendant will refuse" in logged
+    assert "STAGE_OUT" in logged and "withholding" in logged
 
 
 # --------------------------------------------------------------------------------------------
@@ -932,10 +936,11 @@ def test_a_store_refuses_an_upload_with_no_run(tmp_path):
         server.stop(0)
 
 
-def test_a_within_run_collision_is_reported_not_silently_discarded(tmp_path, caplog):
+def test_a_within_run_collision_is_refused_not_acknowledged(tmp_path, caplog):
     """Keeping the first copy is the never-overwrite rule — something may be reading it — but
-    two different bodies under one name inside a single run is a real collision, and reporting
-    a clean store of bytes that were discarded is how it would stay invisible."""
+    two different bodies under one name inside a single run is a real collision. It used to be
+    logged and ACKNOWLEDGED, so the uploader believed its bytes were durable when the store
+    held another's; it is refused now (code review 2026-10-05 §65)."""
     import logging
     server, port, store_dir = _store(tmp_path, run_id="run-1")
     try:
@@ -944,7 +949,8 @@ def test_a_within_run_collision_is_reported_not_silently_discarded(tmp_path, cap
         b = _write(str(tmp_path / "b" / "out.txt"), b"second body, different")
         assert staging.put("out.txt", a, run_id="run-1").ok
         with caplog.at_level(logging.ERROR, logger="swarm.execution.staging"):
-            assert staging.put("out.txt", b, run_id="run-1").ok
+            result = staging.put("out.txt", b, run_id="run-1")
+            assert not result.ok and "different content" in result.reason
 
         assert open(os.path.join(store_dir, "run-1", "out.txt"), "rb").read() == b"first body"
         assert "DIFFERENT content" in caplog.text

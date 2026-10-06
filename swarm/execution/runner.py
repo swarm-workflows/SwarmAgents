@@ -586,6 +586,12 @@ def stage_inputs(data_in, work_dir: str,
         name = getattr(node, "file", None)
         if not name:
             continue
+        if staging_on and "/" in str(name):
+            from swarm.execution import staging as _st
+            if _st.plain_name(name) is None:
+                return staged, (f"input {name!r} has a directory component, which staging does "
+                                f"not support: the producer and this consumer would key it "
+                                f"differently")
         # basename is the traversal guard: a declared name may not escape the working
         # directory, whatever the workflow says.
         name = os.path.basename(str(name))
@@ -674,7 +680,8 @@ def run(spec: ExecutionSpec, job_id: str,
         timeout_s: Optional[float] = None,
         pol: Optional[ExecutionPolicy] = None,
         data_in=None,
-        locator=None, run_id: str = "", requester: str = "") -> ExecutionResult:
+        locator=None, run_id: str = "", requester: str = "",
+        data_out=None) -> ExecutionResult:
     """Execute one job and return its real outcome.
 
     Never raises: a refusal and a crash are both reported as an `ExecutionResult`, because
@@ -713,6 +720,8 @@ def run(spec: ExecutionSpec, job_id: str,
     cmd, refusal = build_command(spec, work_dir, pol)
     if not cmd:
         return ExecutionResult(exit_status=1, refused=True, reason=refusal)
+
+    _clear_declared_outputs(data_out, work_dir, job_id)
 
     # Output goes to files, never to pipes. A chatty job piped into memory would grow without
     # bound in the agent's own process, and the executor runs several jobs at once.
@@ -823,6 +832,33 @@ def terminate_all() -> int:
     for proc, container in live:
         _kill_group(proc, container)
     return len(live)
+
+
+def _clear_declared_outputs(data_out, work_dir: str, job_id: str) -> None:
+    """Remove this job's declared outputs from the working directory before it runs.
+
+    The working directory is shared and outlives jobs, so a declared output can already be
+    there — this job's earlier attempt, or a copy left by an agent that was judged failed while
+    still running. A job that then exits 0 WITHOUT rewriting it had the stale file published as
+    its output, and every descendant read it (code review 2026-10-05 §67). With the old file
+    gone, a missing output is the visible "exited 0 but did not write it" error instead.
+    """
+    for node in data_out or []:
+        name = getattr(node, "file", None)
+        if not name:
+            continue
+        local = os.path.basename(str(name))
+        if not local or local in (".", ".."):
+            continue
+        path = os.path.join(work_dir, local)
+        if os.path.isfile(path):
+            try:
+                os.unlink(path)
+                logger.info("[EXEC] %s: removed pre-existing declared output %s before running",
+                            job_id, local)
+            except OSError as exc:
+                logger.warning("[EXEC] %s: could not remove stale output %s (%s)",
+                               job_id, local, exc)
 
 
 def _kill_group(proc, container: Optional[str] = None) -> None:

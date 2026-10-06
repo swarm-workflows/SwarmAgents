@@ -2155,6 +2155,7 @@ class ResourceAgent(Agent):
 
         self._export_textfile_metrics()
         self._retry_unpublished_data()
+        self._retry_stage_out()
         self._retry_unpersisted_completions()
         self._restart_selection()
         self._monitor_delegated_jobs()
@@ -3763,7 +3764,11 @@ class ResourceAgent(Agent):
         # child on its parent's failure would run it against inputs never written.
         produced = ([d.file for d in (job.data_out or []) if getattr(d, "file", None)]
                     if job.exit_status == 0 else None)
-        self._persist_completion(job, produced, self._publish_locations(job, produced))
+        locations = self._publish_locations(job, produced)
+        withheld = set(getattr(self, "_last_withheld", []) or [])
+        if produced and withheld:
+            produced = [n for n in produced if str(n) not in withheld]
+        self._persist_completion(job, produced, locations)
 
         try:
             self.queues.ready_queue.remove(job_id)
@@ -3801,7 +3806,15 @@ class ResourceAgent(Agent):
         run_id = os.environ.get("SWARM_RUN_ID", "")
         work_dir = _runner.policy().work_dir
         locations: dict = {}
+        self._last_withheld = []
         for name in produced:
+            if _staging.plain_name(name) is None:
+                # Consumers refuse such names under staging (`plain_name`, §64); publishing a
+                # location under a key nobody will look up would only hide that.
+                self.logger.error(
+                    "[STAGE] job %s output %r has a directory component, which staging does "
+                    "not support; it gets no location", job.job_id, name)
+                continue
             path = os.path.join(work_dir, os.path.basename(str(name)))
             if not os.path.isfile(path):
                 # The job exited 0 and declared this output but did not write it. That is a
@@ -3812,6 +3825,9 @@ class ResourceAgent(Agent):
                     "[STAGE] job %s exited 0 and declared output %r, but %s does not exist. "
                     "Descendants will refuse to stage it.", job.job_id, name, path)
             published.publish(str(name), path)
+            # The digest of what THIS producer wrote, on every location: the consumer checks
+            # what it was served against it, which the transfer digest alone cannot do (§65).
+            sha = _staging.file_sha256(path) if os.path.isfile(path) else None
 
             # Peer first: one hop, straight from here, which is the common case.
             entries = [{
@@ -3819,6 +3835,7 @@ class ResourceAgent(Agent):
                 "host": self.grpc_host,
                 "port": _staging.data_port(self.grpc_port),
                 "produced_at": time.time(),
+                "sha256": sha,
             }]
 
             # Then the staging site, pushed **now**, before the caller publishes the name.
@@ -3835,6 +3852,7 @@ class ResourceAgent(Agent):
                         "host": pol.store_host,
                         "port": int(pol.store_port),
                         "produced_at": time.time(),
+                        "sha256": sha,
                     })
                     # Logged with the elapsed time because stage-out sits on the critical path
                     # of every DAG edge and therefore lands on makespan. It is a measured cost,
@@ -3844,14 +3862,60 @@ class ResourceAgent(Agent):
                         name, result.bytes_sent, pol.store_host, pol.store_port,
                         result.elapsed_s)
                 else:
-                    # Durability is lost for this file; the run is not. The peer location still
-                    # works until this agent dies, which is precisely the risk being taken.
+                    # WITHHELD, not published peer-only. Publishing it anyway broke the one
+                    # guarantee stage-out exists for — a name is never visible without a durable
+                    # copy (code review 2026-10-05 §66). The completion is still written; the
+                    # name is published by `_retry_stage_out` once a push succeeds, and its
+                    # descendants wait until then rather than risk a copy that dies with us.
                     self.logger.error(
-                        "[STAGE_OUT] %s could NOT be staged out (%s). Its only copy is on this "
-                        "agent, so if this agent dies every descendant will refuse to stage it.",
-                        name, result.reason)
+                        "[STAGE_OUT] %s could NOT be staged out (%s); withholding it until a "
+                        "retry succeeds", name, result.reason)
+                    self._last_withheld.append(str(name))
+                    pending = getattr(self, "_pending_stage_out", None)
+                    if pending is None:
+                        pending = self._pending_stage_out = []
+                    pending.append({"job_id": job.job_id, "name": str(name), "path": path,
+                                    "peer": entries[0], "sha256": sha, "attempts": 1})
+                    continue
             locations[str(name)] = entries
         return locations
+
+    def _retry_stage_out(self) -> None:
+        """Re-push outputs whose stage-out failed; publish each once a durable copy exists.
+
+        Names and locations are written together (`Repository.publish_data`, one MULTI), the
+        same one-write rule the completion follows. A push that keeps failing keeps the name
+        withheld — its descendants wait, visibly, rather than run against a copy that dies
+        with this agent (§66)."""
+        pending = getattr(self, "_pending_stage_out", None)
+        if not pending:
+            return
+        from swarm.execution import staging as _staging
+        pol = _staging.policy()
+        run_id = os.environ.get("SWARM_RUN_ID", "")
+        still = []
+        for item in pending:
+            result = _staging.put(item["name"], item["path"], run_id=run_id,
+                                  sender=str(self.agent_id))
+            if not result.ok:
+                item["attempts"] += 1
+                if item["attempts"] % 20 == 0:
+                    self.logger.error("[STAGE_OUT] %s still not staged out after %d attempts "
+                                      "(%s); its descendants are waiting",
+                                      item["name"], item["attempts"], result.reason)
+                still.append(item)
+                continue
+            entries = [item["peer"], {"agent_id": "store", "host": pol.store_host,
+                                      "port": int(pol.store_port), "produced_at": time.time(),
+                                      "sha256": item["sha256"]}]
+            try:
+                self.repository.publish_data([item["name"]], {item["name"]: entries})
+                self.logger.info("[STAGE_OUT] %s staged out on retry %d and published",
+                                 item["name"], item["attempts"])
+            except Exception as e:
+                self.logger.warning(f"[STAGE_OUT] publishing {item['name']} failed: {e}")
+                still.append(item)
+        self._pending_stage_out = still
 
     def _persist_completion(self, job: Job, produced: Optional[list],
                             locations: Optional[dict] = None) -> bool:

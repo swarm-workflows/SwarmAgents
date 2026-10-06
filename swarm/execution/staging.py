@@ -76,6 +76,10 @@ class StagingPolicy:
     #: costs durability for that file, not the job: the peer location still works until the
     #: producer dies, which is exactly the window the push was insuring against.
     store_timeout_s: float = 120.0
+    #: The slowest upload rate a stage-out is expected to sustain; the deadline grows by
+    #: size / this. 1 MB/s by default: generous for a WAN, and it only lengthens the wait for
+    #: a large file rather than shortening anything.
+    store_min_rate_bps: float = 1_000_000.0
     #: Digest the stream at the sender and check it at the receiver. On by default: it costs
     #: nothing when nothing is transferred, and it catches the one failure that is otherwise
     #: invisible — a truncated transfer, which yields a short file that a job will happily read.
@@ -101,6 +105,41 @@ def configure(**kwargs) -> StagingPolicy:
 
 def policy() -> StagingPolicy:
     return _POLICY
+
+
+def plain_name(name) -> Optional[str]:
+    """The staging key for a logical file name, or None when it cannot be staged.
+
+    ONE rule for producer and consumer. The producer registered the raw LFN while the consumer
+    looked up its basename, so a name with a directory component (`runA/out.csv`) was published
+    under one key and sought under another: a miss, then a fall through to the inputs root —
+    a stale read when a same-named file sat there (code review 2026-10-05 §64). Directory
+    components are not supported under staging; both sides refuse them by this test.
+    """
+    name = str(name or "")
+    if not name or "/" in name or name in (".", ".."):
+        return None
+    return name
+
+
+def file_sha256(path: str, chunk: int = 1 << 20) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        while True:
+            block = fh.read(chunk)
+            if not block:
+                break
+            h.update(block)
+    return h.hexdigest()
+
+
+def put_deadline_s(size_bytes: int, pol: Optional["StagingPolicy"] = None) -> float:
+    """A stage-out deadline that scales with the file: `store_timeout_s` plus the time the
+    file takes at `store_min_rate_bps`. A flat deadline over the whole stream meant any output
+    slower than that to upload ALWAYS lost durability — exactly the large intermediates (§66)."""
+    pol = pol or _POLICY
+    rate = float(pol.store_min_rate_bps or 0)
+    return float(pol.store_timeout_s) + (float(size_bytes) / rate if rate > 0 else 0.0)
 
 
 def data_port(grpc_port: int, pol: Optional[StagingPolicy] = None) -> int:
@@ -375,16 +414,26 @@ class _Servicer(consensus_pb2_grpc.DataTransferServiceServicer):
                 # store of bytes that were discarded.
                 if digest is not None:
                     try:
-                        with open(dest, "rb") as held:
-                            existing = hashlib.sha256(held.read()).hexdigest()
-                        if existing != digest.hexdigest():
-                            logger.error(
-                                "[STAGE_STORE] %s/%s already held with DIFFERENT content "
-                                "(held %s… vs offered %s…); the held copy stands and the "
-                                "upload was discarded", run, local,
-                                existing[:12], digest.hexdigest()[:12])
+                        existing = file_sha256(dest)
                     except OSError:
-                        pass
+                        existing = None
+                    if existing is not None and existing != digest.hexdigest():
+                        # REFUSED, not acknowledged. Acking left the producer believing its
+                        # bytes were durable when the store held someone else's — a crashed
+                        # attempt's, or a non-deterministic re-run's — so a consumer could be
+                        # served either body and verify both (code review 2026-10-05 §65).
+                        logger.error(
+                            "[STAGE_STORE] %s/%s already held with DIFFERENT content "
+                            "(held %s… vs offered %s…); refusing the upload", run, local,
+                            existing[:12], digest.hexdigest()[:12])
+                        try:
+                            os.unlink(tmp)
+                        except OSError:
+                            pass
+                        self.put_refused += 1
+                        return consensus_pb2.PutAck(
+                            ok=False, error=(f"{local!r} is already stored for this run with "
+                                             f"different content"))
             # Stored files are servable: the store is a peer like any other from a consumer's
             # point of view, which is what makes it a fallback rather than a special case.
             self.published.publish(f"{run}/{local}", dest)
@@ -618,7 +667,7 @@ def put(name: str, path: str, run_id: str, sender: str = "",
                 options=[("grpc.max_send_message_length", pol.chunk_bytes * 4),
                          ("grpc.max_receive_message_length", pol.chunk_bytes * 4)]) as channel:
             stub = consensus_pb2_grpc.DataTransferServiceStub(channel)
-            ack = stub.Put(_chunks(), timeout=pol.store_timeout_s)
+            ack = stub.Put(_chunks(), timeout=put_deadline_s(size, pol))
         elapsed = time.time() - started
         if not ack.ok:
             return PutResult(False, f"{target} refused {name!r}: {ack.error}", 0, elapsed)
@@ -652,6 +701,19 @@ def fetch_any(name: str, locations, dest_dir: str, run_id: str, requester: str =
     for loc in locations or []:
         result = fetch(name, loc, dest_dir, run_id=run_id, requester=requester, pol=pol)
         if result.ok:
+            # The transfer digest proves the stream arrived intact; THIS proves it is the file
+            # the producer published. A store holding another attempt's body, or a peer serving
+            # a stale copy, both pass the first check (§65).
+            want = loc.get("sha256")
+            dest = os.path.join(dest_dir, os.path.basename(str(name)))
+            if want and os.path.isfile(dest) and file_sha256(dest) != want:
+                try:
+                    os.unlink(dest)
+                except OSError:
+                    pass
+                reasons.append(f"{loc.get('agent_id', loc.get('host', '?'))}: served content "
+                               f"does not match the producer's digest")
+                continue
             return result
         reasons.append(f"{loc.get('agent_id', loc.get('host', '?'))}: {result.reason}")
     if not reasons:

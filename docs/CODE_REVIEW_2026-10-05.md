@@ -5,7 +5,7 @@ Second critical read of the code base, against the same question as the 2026-09-
 anything in the run saying so?** Everything found there is excluded here. Ranked by that
 question; within a rank, by how many cells it touches. Every finding names the file and line,
 the failing scenario, the metric it moves and the direction, and whether a test in `tests/` would
-catch it (none of the HIGH items has one). **Status: §1–§6, §13–§17, §20, §22–§23, §34–§39, §41, §47–§52, §62–§63 and the §H double-execution metric FIXED 2026-10-06** (§60 partly) — all six recommended-order steps complete; second batch: §9, §19, §24, §25, §30, §33, §44 (partly), §53; §61 retry; §7, §8; §42, §43; §40; §57 (`tests/test_review_2026_10_05_snow.py`, 31 tests, 23 fail on the pre-fix tree; `tests/test_review_2026_10_05_pbft.py`, 13 tests, 8 fail on the pre-fix tree; `tests/test_review_2026_10_05_hierarchy.py`, 23 tests on the new write/monitor/purge paths; `tests/test_review_2026_10_05_collect.py`, 15 tests, all 15 fail on the pre-fix tree; `tests/test_review_2026_10_05_runner.py`, 21 tests on the new launch/drain paths; `tests/test_review_2026_10_05_delegation.py`, 12; `tests/test_review_2026_10_05_execution.py`, 15); everything else OPEN.
+catch it (none of the HIGH items has one). **Status: §1–§6, §13–§17, §20, §22–§23, §34–§39, §41, §47–§52, §62–§63 and the §H double-execution metric FIXED 2026-10-06** (§60 partly) — all six recommended-order steps complete; second batch: §9, §19, §24, §25, §30, §33, §44 (partly), §53; §61 retry; §7, §8; §42, §43; §40; §57; §64–§67 (`tests/test_review_2026_10_05_snow.py`, 31 tests, 23 fail on the pre-fix tree; `tests/test_review_2026_10_05_pbft.py`, 13 tests, 8 fail on the pre-fix tree; `tests/test_review_2026_10_05_hierarchy.py`, 23 tests on the new write/monitor/purge paths; `tests/test_review_2026_10_05_collect.py`, 15 tests, all 15 fail on the pre-fix tree; `tests/test_review_2026_10_05_runner.py`, 21 tests on the new launch/drain paths; `tests/test_review_2026_10_05_delegation.py`, 12; `tests/test_review_2026_10_05_execution.py`, 15); everything else OPEN.
 
 **Method.** Six independent read-only passes, one per subsystem (consensus + membership; agent
 core + repository + selection; execution + staging; metrics + collection + plotting; run tooling
@@ -700,13 +700,13 @@ returns `{}` and says the caller must tell the cases apart; no test checks that 
 
 ### 64–73. Staging and execution, medium and low
 
-- **64. LFNs containing `/` break the registry and the paths.** The producer writes `data_ready`
+- **64. [FIXED 2026-10-06 — one rule, `staging.plain_name`: under staging a name with a directory component gets no location from the producer and is refused by the consumer (no silent fall through to the inputs root). Supporting such names is open]** LFNs containing `/` break the registry and the paths. The producer writes `data_ready`
   and `data_loc` under the raw `d.file` (`resource_agent.py:3458, 3499, 3508, 3547`); the consumer
   looks up by `basename` (`runner.py:534-536, 559, 567`), misses, and falls to `roots.inputs` — a
   stale read if the basename exists there, else a refusal. The producer also checks and serves
   `work/out.csv` while the job may have written `work/runA/out.csv`. The converter emits raw LFNs
   (`:225, 257`) and itself acknowledges slash-bearing names (`:481-485`).
-- **65. One name can be served as up to three different copies and every check passes.** The
+- **65. [FIXED 2026-10-06 — the store REFUSES a different body under an existing (run, name); every location carries the producer's sha256 and `fetch_any` rejects a served copy that does not match it, trying the next. `_retry_unpersisted_completions` re-saving a stale payload is still open]** One name can be served as up to three different copies and every check passes. The
   store keeps the first copy per `(run, name)` but acks `ok=True` for a *different* body, logging
   ERROR only (`staging.py:362-388`); `HSET` on the location is last-writer-wins
   (`repository.py:128-132`); the registry carries no content digest, so the sha256 proves the
@@ -717,14 +717,14 @@ returns `{}` and says the caller must tell the cases apart; no test checks that 
   until B dies, then `x`, and both verify. `test_a_within_run_collision_is_reported_not_silently_
   discarded` **pins** the `ok` ack. The memory note records the non-deterministic re-run case as
   unguarded; this is its full shape.
-- **66. A failed stage-out still publishes the name** (`resource_agent.py:3523-3547`), with a
+- **66. [FIXED 2026-10-06 — a failed push WITHHOLDS the name (the completion is written without it); `_retry_stage_out` re-pushes each tick and publishes name and location in one MULTI (`Repository.publish_data`). The push deadline is `store_timeout_s + size / store_min_rate_bps`. The push is still synchronous on the completion path]** A failed stage-out still publishes the name (`resource_agent.py:3523-3547`), with a
   peer-only location. CLAUDE.md and `config_swarm_multi.yml:166` say "a name is never visible
   without a durable copy"; `STAGING_DESIGN.md` §6 documents the opposite, and
   `test_a_failed_stage_out_loses_durability_not_the_run` pins it. `store_timeout_s = 120` is a
   deadline for the whole stream, so any output taking > 120 s to upload *always* loses durability —
   exactly the large intermediates — and the synchronous wait adds to latency and makespan.
-- **67. A file already in the work dir wins over the registry, and outputs are never cleared
-  before a run** (`runner.py:562-564`; `resource_agent.py:3499-3508`). A job that exits 0 without
+- **67. [PARTLY FIXED 2026-10-06 — declared outputs are removed from the work dir before a real job runs; an input already in the work dir still wins over the registry]** A file already in the work dir wins over the registry, and outputs are never cleared
+  before a run (`runner.py:562-564`; `resource_agent.py:3499-3508`). A job that exits 0 without
   rewriting an output gets the old file published; a false-failed agent's copy of a reassigned
   producer still writes into the shared dir; a container orphaned by §62 writes after its timeout.
   `test_a_file_already_in_the_work_dir_is_never_fetched` pins the first half.

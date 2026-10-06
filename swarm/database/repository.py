@@ -437,6 +437,21 @@ class Repository:
                 out[name] = [p for p in parsed if isinstance(p, dict)]
         return out
 
+    def publish_data(self, names: List[str], locations: Dict[str, list]) -> None:
+        """Make *names* ready and record where they are, in ONE transaction — for an output
+        published after its job's completion (a stage-out that succeeded on retry). The same
+        rule as the completion write: a name visible without its location is a torn write."""
+        names = [str(n) for n in names if n]
+        if not names:
+            return
+        pipe = self.redis.pipeline()
+        pipe.multi()
+        pipe.sadd(self._data_ready_key(), *names)
+        if locations:
+            pipe.hset(self._data_loc_key(),
+                      mapping={str(n): json.dumps(loc) for n, loc in locations.items() if n})
+        pipe.execute()
+
     def mark_data_available(self, names: List[str]) -> None:
         """Record that *names* now exist. Called once a job has actually completed."""
         names = [str(n) for n in names if n]

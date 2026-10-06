@@ -611,7 +611,8 @@ class Job(Object):
 
         # `data_in` is the job's own declaration of what it reads; the runner stages from
         # it rather than from a second list on the execution spec.
-        result = runner.run(self._execution, self.job_id, data_in=self.data_in)
+        result = runner.run(self._execution, self.job_id, data_in=self.data_in,
+                            data_out=self.data_out)
         self._refusal_reason = (result.reason or "refused") if result.refused else None
         self._refusal_transient = bool(result.refused and result.transient)
         if result.refused:
