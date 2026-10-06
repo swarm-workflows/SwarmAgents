@@ -5,7 +5,7 @@ Second critical read of the code base, against the same question as the 2026-09-
 anything in the run saying so?** Everything found there is excluded here. Ranked by that
 question; within a rank, by how many cells it touches. Every finding names the file and line,
 the failing scenario, the metric it moves and the direction, and whether a test in `tests/` would
-catch it (none of the HIGH items has one). **Status: §1–§6, §13–§17, §20, §22–§23, §34–§39, §41, §47–§52, §62–§63 and the §H double-execution metric FIXED 2026-10-06** (§60 partly) — all six recommended-order steps complete; second batch: §9, §19, §24, §25, §30, §33, §44 (partly), §53; §61 retry; §7, §8; §42, §43; §40; §57; §64–§67; §69–§73 (`tests/test_review_2026_10_05_snow.py`, 31 tests, 23 fail on the pre-fix tree; `tests/test_review_2026_10_05_pbft.py`, 13 tests, 8 fail on the pre-fix tree; `tests/test_review_2026_10_05_hierarchy.py`, 23 tests on the new write/monitor/purge paths; `tests/test_review_2026_10_05_collect.py`, 15 tests, all 15 fail on the pre-fix tree; `tests/test_review_2026_10_05_runner.py`, 21 tests on the new launch/drain paths; `tests/test_review_2026_10_05_delegation.py`, 12; `tests/test_review_2026_10_05_execution.py`, 15); everything else OPEN.
+catch it (none of the HIGH items has one). **Status: §1–§6, §13–§17, §20, §22–§23, §34–§39, §41, §47–§52, §62–§63 and the §H double-execution metric FIXED 2026-10-06** (§60 partly) — all six recommended-order steps complete; second batch: §9, §19, §24, §25, §30, §33, §44 (partly), §53; §61 retry; §7, §8; §42, §43; §40; §57; §64–§67; §69–§73; §26–§29, §31, §32 (`tests/test_review_2026_10_05_snow.py`, 31 tests, 23 fail on the pre-fix tree; `tests/test_review_2026_10_05_pbft.py`, 13 tests, 8 fail on the pre-fix tree; `tests/test_review_2026_10_05_hierarchy.py`, 23 tests on the new write/monitor/purge paths; `tests/test_review_2026_10_05_collect.py`, 15 tests, all 15 fail on the pre-fix tree; `tests/test_review_2026_10_05_runner.py`, 21 tests on the new launch/drain paths; `tests/test_review_2026_10_05_delegation.py`, 12; `tests/test_review_2026_10_05_execution.py`, 15); everything else OPEN.
 
 **Method.** Six independent read-only passes, one per subsystem (consensus + membership; agent
 core + repository + selection; execution + staging; metrics + collection + plotting; run tooling
@@ -375,34 +375,34 @@ LLM arm of E4. Only the per-row `policy` column in `decisions.csv` tells the tru
   `provider: none`, documented as the off switch (`config_swarm_multi.yml:492`, CLAUDE.md), makes
   `build_model` raise (`llm_bidder.py:85`) and the bidder is built unguarded (`llm_agent.py:97`),
   so the LlmAgent dies at startup.
-- **26. The LLM verdict cache drops a guard the base class has.** `native_cost_for_job`
+- **26. [FIXED 2026-10-06 — answers go through `wire_cost_for_job` (§1), which requires the job pending and feasible; a reset drops the cached verdict (`LlmAgent._forget_decided`)]** The LLM verdict cache drops a guard the base class has. `native_cost_for_job`
   (`llm_agent.py:933-961`) is keyed by `job_id` only, 300 s TTL, never cleared on reset,
   `_forget_decided` or delegation failure; the base version answers only for jobs in
   `pending_queue` (`resource_agent.py:3793`). A coordinator barred by `delegation_failed_agents`
   still answers with its earlier low cost for 300 s > the 120 s delegation timeout — it votes for
   itself on a job it would refuse to propose.
-- **27. Uniform pacing holds real LLM verdicts from consensus but not fallbacks**
+- **27. [FIXED 2026-10-06 — a fallback verdict is cached after its pacing wait, as a real one is]** Uniform pacing holds real LLM verdicts from consensus but not fallbacks
   (`llm_agent.py:213-221` vs `:287-295`): on the success path `_pace_bid` runs before
   `_remember_cost`; on the fallback path the cost is cached first. Under Snow a peer querying
   during the hold gets a miss (an endorsement, §3) for a genuine bid and a cost for an analytic
   fallback — timing information in the one arm meant to remove it.
-- **28. A failed delegation write loses the job** (`:3315` removes from `selected_queue` before
+- **28. [FIXED 2026-10-06 by §19 — `_delegate_to_children` writes the parent record and child copies before touching local state]** A failed delegation write loses the job (`:3315` removes from `selected_queue` before
   the per-group save at `:3320` and `delegated_jobs.set` at `:3332`): a Redis error leaves the job
   untracked, the parent record READY under a live leader, the decision record already written.
-- **29. Shaped reward turns successful long jobs into failures** (`mab_manager.py:338` divides
+- **29. [FIXED 2026-10-06 — shaped rewards are normalised over the outcome horizon (timeout + execution grace) when the agent supplies it]** Shaped reward turns successful long jobs into failures (`mab_manager.py:338` divides
   `time_since_delegation` — execution-inclusive since P0-9 — by `delegation_timeout_s`, a
   selection bound; `bandit.py:126` counts reward ≤ 0 as failure). Any successful job ≥ ~120 s
   scores 0. Default `shaped: false`.
 - **30. [FIXED 2026-10-06 — refused; matched case-insensitively]** Unknown `mab.algorithm` becomes epsilon-greedy and reports the configured name**
   (`mab_manager.py:133-162`, `:441`) — including `"LinUCB"`, the spelling CLAUDE.md uses.
   `consensus.protocol` and `bid_pacing` raise on an unknown value; this key should too.
-- **31. `LlmAgent.selection_main` still lacks parts of the base loop** beyond the DAG gate fixed
+- **31. [FIXED 2026-10-06 — unwon jobs rotate to the back of the queue; the base loop's backlog-aware wait replaces the fixed 0.5 s sleep; `coordinator_cost_matrix: peers` is refused on an LLM coordinator rather than ignored]** `LlmAgent.selection_main` still lacks parts of the base loop beyond the DAG gate fixed
   2026-09-20: it scores `[self]` (`llm_agent.py:1276`) instead of `_selection_assignees()`
   (`resource_agent.py:2440`), so `coordinator_cost_matrix: peers` is a no-op on LLM coordinators;
   it never rotates unwon jobs to the back of the queue (head-of-line blocking with
   `designate_bidder` off); it always sleeps 0.5 s where the base skips the wait on a full backlog —
   LLM-vs-analytic throughput is confounded by loop cadence.
-- **32. Token accounting misses failed calls** (`LlmUsage.record(..., failed=True)` without usage
+- **32. [FIXED 2026-10-06 — calls with unknown usage are counted (`usage_unknown_calls` → `llm_usage_unknown_calls`), marking the token totals as a lower bound; the `reasoning_time` schema field remains]** Token accounting misses failed calls (`LlmUsage.record(..., failed=True)` without usage
   at `llm_bidder.py:~248` and `llm_delegator.rank`): timeouts and pydantic-ai validation retries
   record 0 tokens, so the cost reported for P0-3/E4 is lowest in the runs with the most failures.
   `Bid` and `GroupRanking` also ask the model to fill `reasoning_time`.

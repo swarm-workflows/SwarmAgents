@@ -94,6 +94,12 @@ class LlmAgent(ResourceAgent):
         # Load LLM configuration
         self.llm_cfg = LlmConfig.from_dict(self.config.get("llm", {}))
         self._refuse_llm_switched_off(self.config.get("llm") or {})
+        if int(self.topology.level) > 0 and self.coordinator_cost_matrix == "peers":
+            # The LLM plane scores only itself at every level, so `peers` would be silently
+            # ignored on an LLM coordinator — a second inert key beside `designate_bidder` on a
+            # resource agent (§31). Refused so a `peers` cell cannot be an LLM cell by accident.
+            raise ValueError("job_selection.coordinator_cost_matrix: peers has no effect on an "
+                             "LLM coordinator (the LLM plane scores only itself)")
 
         self.bidder: Optional[LlmBidder] = LlmBidder(self.llm_cfg, logger=self.logger)
 
@@ -285,15 +291,16 @@ class LlmAgent(ResourceAgent):
             # CALIBRATE differently (analytic median 11.85 against a typical LLM bid of 25), so
             # a fallback bid is systematically a little cheaper. That is a real, ~2x effect for
             # E4 to measure, not a units error to correct away.
-            if getattr(agent, "agent_id", None) == self.agent_id:
-                self._remember_cost(job.job_id, float(analytical_cost), CostScale.ANALYTIC)
             # Hold the fallback until it has cost what a real bid costs. Without this an agent
             # whose LLM is down bids in ~0s and out-races the healthy majority still reasoning:
-            # 8 LLM-blind agents took 280 of 300 jobs, 38.5x the healthy rate. Note this happens
-            # AFTER the analytic cost is computed and cached, so a peer querying us mid-wait
-            # still gets a usable answer — the wait delays only our own proposal.
+            # 8 LLM-blind agents took 280 of 300 jobs, 38.5x the healthy rate.
             if self.bid_pacing in (self.PACING_FALLBACK, self.PACING_UNIFORM):
                 self._pace_bid(bid_started_at, f"fallback job={job.job_id}")
+            # Cached AFTER the wait, exactly as a real verdict is. It used to be cached first, so
+            # a peer querying mid-wait got a cost from a fallback and a miss (an abstention)
+            # from a real bid — timing information in the very arm meant to remove it (§27).
+            if getattr(agent, "agent_id", None) == self.agent_id:
+                self._remember_cost(job.job_id, float(analytical_cost), CostScale.ANALYTIC)
             return analytical_cost
 
     # ------------------------------------------------------------------------------------------
@@ -951,6 +958,16 @@ class LlmAgent(ResourceAgent):
             while len(self._cost_cache) > self._cost_cache_max:
                 self._cost_cache.popitem(last=False)
 
+    def _forget_decided(self, job_id: str) -> None:
+        """A job back up for election also loses its cached verdict: the verdict priced a load
+        picture from before the reset, and it used to keep answering votes for up to
+        `cost_cache_ttl_s` (300 s) after it (code review 2026-10-05 §26)."""
+        super()._forget_decided(job_id)
+        lock = getattr(self, "_cost_cache_lock", None)
+        if lock is not None:
+            with lock:
+                self._cost_cache.pop(job_id, None)
+
     def native_cost_for_job(self, object_id: str):
         """Answer an inbound consensus query from the LLM verdict, never by calling the model.
 
@@ -1357,6 +1374,13 @@ class LlmAgent(ResourceAgent):
                             f"Cost={cost:.2f} FinalCost={proposal.cost:.2f} "
                             f"ReasoningTime={reasoning_time:.3f}s"
                         )
+                    else:
+                        # This plane scores only itself, so "not won" means this agent cannot
+                        # run the job (infinite cost) — not that nobody can, which is why it is
+                        # rotated rather than BLOCKED. Without the rotation such a job held its
+                        # place in the `gets()` window on every pass: head-of-line blocking the
+                        # base loop never had (code review 2026-10-05 §31).
+                        self.queues.pending_queue.move_to_end(job)
 
                 if len(proposals):
                     self.logger.info(
@@ -1370,10 +1394,19 @@ class LlmAgent(ResourceAgent):
                     # only itself by design — so the width recorded is 1 and the tier's
                     # proposers-per-job is what `designate_bidder` is trying to bring down.
                     self._note_proposals(proposals, assignees=len(agents))
+                    proposed_this_iter = True
                     self.engine.propose(proposals=proposals)
                     proposals.clear()
+                else:
+                    proposed_this_iter = False
 
-                time.sleep(0.5)
+                # The base loop's wait, so LLM-vs-analytic throughput is not confounded by how
+                # often each loop runs: skip the wait only when this pass proposed AND the batch
+                # came back full (§31). It always slept 0.5 s.
+                backlog_full = len(pending_jobs) >= self.proposal_job_batch_size
+                if not (proposed_this_iter and backlog_full):
+                    self.queues.pending_event.wait(timeout=0.5)
+                    self.queues.pending_event.clear()
             except Exception as e:
                 self.logger.exception(f"Error occurred while executing e: {e}")
         self.logger.info(f"Agent: {self} stopped with restarts: {self.metrics.restarts}!")

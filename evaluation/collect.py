@@ -520,6 +520,8 @@ def instrumentation_metrics(agents: dict[str, dict], meta: dict | None = None,
     restarted_ids: set[str] = set()
     restarts_total = 0
     have_restarts = False
+    llm_usage_unknown = 0
+    have_usage_unknown = False
     finalize_p95: list[float] = []
     finalized = abandoned = lost = 0
     # `abandoned` and `finalize_lost` are Snow-only: PBFT does not abandon (a stuck object goes
@@ -661,6 +663,9 @@ def instrumentation_metrics(agents: dict[str, dict], meta: dict | None = None,
                     llm_calls_paired += site_calls
                 llm_in += int(site.get("input_tokens", 0) or 0)
                 llm_out += int(site.get("output_tokens", 0) or 0)
+                if "usage_unknown_calls" in site:
+                    have_usage_unknown = True
+                    llm_usage_unknown += int(site.get("usage_unknown_calls") or 0)
 
     out["agents_reporting"] = len(agents)
     out.update(execution_evidence(agents))
@@ -709,6 +714,8 @@ def instrumentation_metrics(agents: dict[str, dict], meta: dict | None = None,
         out["llm_failures"] = llm_failures
         out["llm_input_tokens"] = llm_in
         out["llm_output_tokens"] = llm_out
+        # The token totals are a lower bound by this many calls (failures return no usage).
+        out["llm_usage_unknown_calls"] = llm_usage_unknown if have_usage_unknown else None
         # Derived HERE and not only from the `bidding` block, because that block exists only
         # in payloads written after P0-8. Every LlmAgent run has this one, so a run archived
         # before then showed `llm_calls` and `llm_failures` as two unremarkable integers among

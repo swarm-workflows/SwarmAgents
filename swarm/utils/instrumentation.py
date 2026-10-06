@@ -497,6 +497,11 @@ class LlmUsage:
         self.input_tokens = 0
         self.output_tokens = 0
         self.requests = 0          # provider requests, which retries make > calls
+        # Calls whose token usage is unknown — a failure raises before any usage is returned.
+        # The token totals are a LOWER BOUND by this many calls, and the gap is largest exactly
+        # in the runs with the most failures, which is why it is counted rather than left
+        # implicit (code review 2026-10-05 §32).
+        self.usage_unknown = 0
         self._latency = RunningStats()
 
     def record(self, elapsed_s: float, usage: Any = None, failed: bool = False) -> None:
@@ -504,7 +509,9 @@ class LlmUsage:
             self.calls += 1
             if failed:
                 self.failures += 1
-            if usage is not None:
+            if usage is None:
+                self.usage_unknown += 1
+            else:
                 self.input_tokens += int(getattr(usage, "input_tokens", 0) or 0)
                 self.output_tokens += int(getattr(usage, "output_tokens", 0) or 0)
                 self.requests += int(getattr(usage, "requests", 0) or 0)
@@ -518,6 +525,7 @@ class LlmUsage:
                 "failures": self.failures,
                 "input_tokens": self.input_tokens,
                 "output_tokens": self.output_tokens,
+                "usage_unknown_calls": self.usage_unknown,
                 "provider_requests": self.requests,
             }
         out.update(self._latency.summary("latency_"))

@@ -100,3 +100,70 @@ class TestRunnerRefusesBeforeLaunch:
     def test_flat_topologies_and_bandit_are_unaffected(self):
         run_test.check_delegation_policy_is_honoured(self._args(topology="mesh"))
         run_test.check_delegation_policy_is_honoured(self._args(delegation_policy="bandit"))
+
+
+# --------------------------------------------------------------------------- §29
+class TestShapedRewardSpan:
+    def test_a_long_successful_job_is_not_scored_as_a_failure(self):
+        """Delegation-to-completion of 300 s with a 120 s selection timeout scored 0 — a
+        failure to ArmStats — although the job succeeded well inside the outcome horizon."""
+        m = make_manager(linucb_config(reward={"shaped": True}), delegation_timeout_s=120.0,
+                         outcome_horizon_s=1920.0)
+        assert m._shape_reward(True, 300.0, False) == pytest.approx(1 - 300 / 1920)
+        assert m._shape_reward(True, 300.0, False) > 0
+
+    def test_without_a_horizon_the_old_span_is_kept(self):
+        m = make_manager(linucb_config(reward={"shaped": True}), delegation_timeout_s=60.0)
+        assert m._shape_reward(True, 15.0, False) == pytest.approx(0.75)
+
+
+# --------------------------------------------------------------------------- §26, §27, §31
+class TestLlmPlaneConsistency:
+    def test_a_reset_drops_the_cached_verdict(self):
+        import threading
+        from collections import OrderedDict
+        a = LlmAgent.__new__(LlmAgent)
+        a.engine = MagicMock()
+        a._init_decision_state()
+        a._cost_cache = OrderedDict({"j1": (12.0, "llm", time.time())})
+        a._cost_cache_lock = threading.Lock()
+        a._forget_decided("j1")
+        assert "j1" not in a._cost_cache
+
+    def test_a_fallback_is_cached_only_after_its_pacing_wait(self):
+        src = open(os.path.join(REPO, "swarm/agents/llm/llm_agent.py")).read()
+        i = src.index('self._pace_bid(bid_started_at, f"fallback job={job.job_id}")')
+        j = src.index("self._remember_cost(job.job_id, float(analytical_cost), CostScale.ANALYTIC)")
+        assert i < j
+
+    def test_an_unwon_job_is_rotated(self):
+        src = open(os.path.join(REPO, "swarm/agents/llm/llm_agent.py")).read()
+        body = src[src.index("    def selection_main"):]
+        assert "self.queues.pending_queue.move_to_end(job)" in body
+        assert "backlog_full = len(pending_jobs) >= self.proposal_job_batch_size" in body
+
+    def test_peers_matrix_is_refused_on_an_llm_coordinator(self):
+        src = open(os.path.join(REPO, "swarm/agents/llm/llm_agent.py")).read()
+        assert ('raise ValueError("job_selection.coordinator_cost_matrix: peers has no effect '
+                'on an "') in src
+
+
+# --------------------------------------------------------------------------- §32
+def test_calls_with_unknown_usage_are_counted():
+    from swarm.utils.instrumentation import LlmUsage
+    u = LlmUsage("bid")
+    u.record(1.0, usage=MagicMock(input_tokens=100, output_tokens=20, requests=1))
+    u.record(6.0, failed=True)                       # timed out: no usage came back
+    snap = u.snapshot()
+    assert snap["input_tokens"] == 100 and snap["usage_unknown_calls"] == 1
+
+
+def test_the_collector_says_the_token_total_is_a_lower_bound():
+    from evaluation.collect import instrumentation_metrics
+    out = instrumentation_metrics({"1": {"instrumentation": {"llm": {"bid": {
+        "calls": 2, "failures": 1, "input_tokens": 100, "output_tokens": 20,
+        "usage_unknown_calls": 1}}}}})
+    assert out["llm_usage_unknown_calls"] == 1
+    old = instrumentation_metrics({"1": {"instrumentation": {"llm": {"bid": {
+        "calls": 1, "input_tokens": 10, "output_tokens": 2}}}}})
+    assert old["llm_usage_unknown_calls"] is None    # unmeasured, not clean

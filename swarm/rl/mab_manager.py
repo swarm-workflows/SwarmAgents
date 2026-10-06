@@ -97,6 +97,12 @@ class MABManager:
         # the arm's counters still moved, and the per-type failure window — the C1 feature —
         # trained on short jobs only (code review 2026-10-05 §22).
         horizon = float(outcome_horizon_s) if outcome_horizon_s else 0.0
+        # The span shaped rewards are normalised over: the whole outcome horizon when the agent
+        # supplies it. `latency_s` runs from delegation to COMPLETION (P0-9), so dividing by the
+        # selection timeout scored every successful job that ran past it as 0 — counted as a
+        # failure by ArmStats — and the arm statistics measured job length, not group quality
+        # (code review 2026-10-05 §29).
+        self._shaping_span_s = horizon if horizon > 0 else self.delegation_timeout_s
         self._pending_ttl_s = config.get(
             "pending_ttl_s", max(2 * delegation_timeout_s, horizon + delegation_timeout_s))
 
@@ -355,7 +361,7 @@ class MABManager:
         if success:
             if latency_s is None:
                 return self.REWARD_SUCCESS
-            return 1.0 - min(1.0, max(0.0, latency_s) / self.delegation_timeout_s)
+            return 1.0 - min(1.0, max(0.0, latency_s) / self._shaping_span_s)
         return self._reward_timeout if timed_out else self._reward_exit_failure
 
     def report_outcome(self, group_id: int, job_id: str, success: bool,
