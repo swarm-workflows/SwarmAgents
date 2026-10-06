@@ -128,10 +128,33 @@ class TestDataServiceToken:
             remote_repo_dir="/root/SwarmAgents", groups=None, group_size=None, debug=False,
             agent_type="resource", topology="mesh", jobs=1, db_host="database",
             jobs_per_proposal=1)
-        cmds = []
-        monkeypatch.setattr(run_test, "ssh_check", lambda host, cmd: cmds.append(cmd))
+        calls = []
+        monkeypatch.setattr(run_test, "ssh_check",
+                            lambda host, cmd, stdin_text=None: calls.append((cmd, stdin_text)))
         monkeypatch.setattr(run_test, "scp_to", lambda *a: None)
         monkeypatch.setenv("SWARM_STAGING_TOKEN", "s3cret")
         run_test.start_agents_remote(args, ["h1"])
-        start = [c for c in cmds if "nohup bash" in c][0]
-        assert "export SWARM_STAGING_TOKEN=s3cret && " in start
+        cmd, stdin = [c for c in calls if "nohup bash" in c[0]][0]
+        # Over stdin, never in the command: a command line is logged and visible in `ps`.
+        assert "s3cret" not in cmd
+        assert stdin == "s3cret\n"
+        assert cmd.startswith("IFS= read -r _SWARM_TOK; ")
+        assert 'export SWARM_STAGING_TOKEN="$_SWARM_TOK" && ' in cmd
+
+    def test_the_token_never_reaches_the_run_log(self, monkeypatch, capsys):
+        import run_test
+        monkeypatch.setattr(run_test.subprocess, "run", lambda *a, **k: None)
+        run_test.run_blocking(["ssh", "h", "echo hi"], stdin_text="s3cret\n")
+        assert "s3cret" not in capsys.readouterr().out
+
+    def test_the_read_happens_before_the_background_chain(self):
+        """A background job in a non-interactive shell reads /dev/null, so a `read` inside the
+        backgrounded chain would get nothing. Run the real shell shape locally."""
+        import subprocess
+        script = ('IFS= read -r _SWARM_TOK; ( export SWARM_STAGING_TOKEN="$_SWARM_TOK" && '
+                  'echo "$SWARM_STAGING_TOKEN" ) > "$OUT" 2>&1 & wait')
+        import tempfile
+        with tempfile.NamedTemporaryFile() as out:
+            subprocess.run(["bash", "-c", script], input="s3cret\n", text=True,
+                           env={**os.environ, "OUT": out.name}, check=True)
+            assert open(out.name).read().strip() == "s3cret"

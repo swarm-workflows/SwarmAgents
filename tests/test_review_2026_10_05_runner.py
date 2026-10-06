@@ -160,7 +160,7 @@ def _write_configs(cfg_dir: Path, hosts_by_agent: dict):
 class TestRemotePlacement:
     def _launch(self, tmp_path, monkeypatch, args, hosts, start_offset=0, count=None):
         placed = {}
-        monkeypatch.setattr(run_test, "ssh_check", lambda host, cmd: None)
+        monkeypatch.setattr(run_test, "ssh_check", lambda host, cmd, **k: None)
         monkeypatch.setattr(run_test, "scp_to",
                             lambda host, src, dst: placed.setdefault(
                                 int(Path(src).stem.rsplit("_", 1)[1]), host))
@@ -191,7 +191,7 @@ class TestRemotePlacement:
         hosts = ["h1", "h2"]
         args = _args(tmp_path, agents=1, dynamic_agents=1)
         _write_configs(Path(args.config_dir), {1: "h1", 2: "h2"})
-        monkeypatch.setattr(run_test, "ssh_check", lambda host, cmd: cmds.append(cmd))
+        monkeypatch.setattr(run_test, "ssh_check", lambda host, cmd, **k: cmds.append(cmd))
         monkeypatch.setattr(run_test, "scp_to", lambda *a: None)
         run_test.start_agents_remote(args, hosts)
         run_test.start_agents_remote(args, hosts, agent_count=1, start_offset=1)

@@ -65,7 +65,8 @@ BASE_CONFIG = "./config_swarm_multi.yml"
 def log(msg: str) -> None:
     print(f"[{datetime.now():%H:%M:%S}] {msg}", flush=True)
 
-def run_blocking(cmd: list[str] | str, log_file: str | None = None, check: bool = True) -> subprocess.CompletedProcess:
+def run_blocking(cmd: list[str] | str, log_file: str | None = None, check: bool = True,
+                 stdin_text: str | None = None) -> subprocess.CompletedProcess:
     """
     Run a command to completion. If log_file is provided, write stdout/stderr there; else inherit.
     """
@@ -76,12 +77,16 @@ def run_blocking(cmd: list[str] | str, log_file: str | None = None, check: bool 
         shell = False
         printable = " ".join(shlex.quote(c) for c in cmd)
 
+    # `stdin_text` is how a secret reaches a command without appearing in its argv — and so
+    # without appearing in this log line or in `ps` (code review 2026-10-05 §70, stop-time
+    # review). It is never logged.
     log(f"$ {printable}")
     if log_file:
         with open(log_file, "w") as f:
-            return subprocess.run(cmd, shell=shell, stdout=f, stderr=subprocess.STDOUT, text=True, check=check)
+            return subprocess.run(cmd, shell=shell, stdout=f, stderr=subprocess.STDOUT, text=True,
+                                  check=check, input=stdin_text)
     else:
-        return subprocess.run(cmd, shell=shell, text=True, check=check)
+        return subprocess.run(cmd, shell=shell, text=True, check=check, input=stdin_text)
 
 def run_once(cmd: list[str] | str) -> str:
     p = subprocess.run(cmd, shell=isinstance(cmd, str), capture_output=True, text=True, check=False)
@@ -135,7 +140,7 @@ def ssh(host: str, cmd: str) -> int:
         cmd
     ])
 
-def ssh_check(host: str, cmd: str) -> None:
+def ssh_check(host: str, cmd: str, stdin_text: str | None = None) -> None:
     run_blocking([
         "ssh",
         "-o", "StrictHostKeyChecking=no",
@@ -143,7 +148,7 @@ def ssh_check(host: str, cmd: str) -> None:
         "-o", "BatchMode=yes",
         host,
         cmd
-    ], check=True)
+    ], check=True, stdin_text=stdin_text)
 
 def scp_to(host: str, src: str, dst: str) -> None:
     run_blocking([
@@ -705,11 +710,16 @@ def start_agents_remote(args, agent_hosts_list: list[str], agent_count: int = No
         # of this process, so it inherits nothing, and an unstamped payload is indistinguishable
         # from an older run's leftover.
         run_id = os.environ.get("SWARM_RUN_ID", "")
-        # The staging token crosses the ssh boundary the same way the run id does, when this
-        # shell has one; otherwise the remote ~/.profile is the only source (§70).
+        # The staging token crosses the ssh boundary over STDIN, never in the command: a command
+        # line is logged by run_blocking and visible in `ps` on both hosts (stop-time review of
+        # §70). The read runs in the FOREGROUND, before the backgrounded chain — a background job
+        # in a non-interactive shell has /dev/null for stdin — and the variable it sets is
+        # inherited by that chain's subshell. Without a local token the remote ~/.profile is the
+        # only source.
         token = os.environ.get("SWARM_STAGING_TOKEN", "")
-        token_export = f"export SWARM_STAGING_TOKEN={shlex.quote(token)} && " if token else ""
-        start_cmd = (
+        token_read = "IFS= read -r _SWARM_TOK; " if token else ""
+        token_export = 'export SWARM_STAGING_TOKEN="$_SWARM_TOK" && ' if token else ""
+        start_cmd = token_read + (
             #f"source ~/.bash_profile && "
             f"source ~/.profile && "
             f"export SWARM_RUN_ID={shlex.quote(run_id)} && "
@@ -721,7 +731,7 @@ def start_agents_remote(args, agent_hosts_list: list[str], agent_count: int = No
             f"--use-config-dir " + " ".join(shlex.quote(x) for x in forwarded) +
             f" > agent_{start_idx}_start.log 2>&1 &"
         )
-        ssh_check(host, start_cmd)
+        ssh_check(host, start_cmd, stdin_text=(token + "\n") if token else None)
 
     phase = "initial" if start_offset == 0 else "dynamic"
     log(f"Launched {agent_count} {phase} '{args.agent_type}' agents across {len(ranges)} remote host(s).")

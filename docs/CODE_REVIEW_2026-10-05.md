@@ -738,7 +738,7 @@ returns `{}` and says the caller must tell the cases apart; no test checks that 
   remote launch suggests so; unconfirmed) `/root/.ssh` and the root-mesh key are readable by
   workflow code, which makes `job_environment` scrubbing moot. The staged-code bind is read-write
   under apptainer but `:ro` under docker, so a job can modify the code bundle every agent runs.
-- **70. [FIXED 2026-10-06 — shared token in `SWARM_STAGING_TOKEN`, sent as gRPC metadata and checked with `hmac.compare_digest` on Fetch and Put; `staging_site.py --token`; `run_test.py` forwards it to remote agents. Unset means open, with a startup warning on agents and the site. Transport is still plaintext gRPC and the site has no quota]** The data service has no authentication (`staging.py:288-391, 431, 498, 609`;
+- **70. [FIXED 2026-10-06 — shared token in `SWARM_STAGING_TOKEN`, sent as gRPC metadata and checked with `hmac.compare_digest` on Fetch and Put; `staging_site.py --token`; `run_test.py` forwards it to remote agents over ssh stdin, so it never appears in the run log or `ps`. Unset means open, with a startup warning on agents and the site. Transport is still plaintext gRPC and the site has no quota]** The data service has no authentication (`staging.py:288-391, 431, 498, 609`;
   `staging_site.py:32`). `Put` accepts any `(run, name)` from any host; combined with first-wins, a
   pre-seeded or rogue upload becomes the durable copy and the real producer's push is discarded.
   The site binds `0.0.0.0` and serves every run to anyone with a guessable run id. No quota.
