@@ -183,7 +183,8 @@ def test_a_restarted_agent_is_readmitted_at_once():
     assert peer.get(7) is not None and peer.get(7).load == 5.0
 
 
-def test_a_tombstone_expires_after_one_ttl():
+def test_a_dead_agent_stays_out_however_long_its_copy_circulates():
+    """Codex review: an expiring tombstone readmitted the relayed dead copy on the next relay."""
     from swarm.gossip.disseminator import GossipStateDisseminator
     clock = [0.0]
     d = GossipStateDisseminator(host=MagicMock(agent_id=1), state_ttl_s=10.0,
@@ -191,9 +192,10 @@ def test_a_tombstone_expires_after_one_ttl():
     d._merge_entry(AgentStateEntry(agent_id=7, load=50.0, version=4))
     clock[0] = 20.0
     d._evict_expired()
-    clock[0] = 31.0
-    d._merge_entry(AgentStateEntry(agent_id=7, load=1.0, version=1))
-    assert d.get(7) is not None
+    for t in (31.0, 300.0, 3600.0):
+        clock[0] = t
+        d._merge_entry(AgentStateEntry(agent_id=7, load=50.0, version=4))
+        assert d.get(7) is None
 
 
 # --------------------------------------------------------------------------- completed sweep
