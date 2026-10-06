@@ -139,8 +139,18 @@ class MABManager:
                if self.extractor else "")
         )
 
+    #: Every algorithm `_create_policy` implements. Anything else is refused: it used to fall
+    #: through to epsilon-greedy while `get_stats` reported the configured name, so a run
+    #: configured `LinUCB` (the spelling CLAUDE.md used) ran epsilon-greedy under the LinUCB
+    #: label (code review 2026-10-05 §30). Matched case-insensitively for that reason.
+    ALGORITHMS = ("epsilon_greedy", "ucb1", "linucb", "lin_ts")
+
     def _create_policy(self, config: dict) -> BanditPolicy:
-        algorithm = config.get("algorithm", "epsilon_greedy")
+        algorithm = str(config.get("algorithm", "epsilon_greedy")).strip().lower()
+        if algorithm not in self.ALGORITHMS:
+            raise ValueError(f"mab.algorithm {config.get('algorithm')!r} is not one of "
+                             f"{', '.join(self.ALGORITHMS)}")
+        config["algorithm"] = algorithm
         step_size = config.get("step_size", None)
         if algorithm in ("linucb", "lin_ts"):
             self.extractor = ContextExtractor(config.get("context", {}))

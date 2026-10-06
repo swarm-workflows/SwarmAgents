@@ -5,7 +5,7 @@ Second critical read of the code base, against the same question as the 2026-09-
 anything in the run saying so?** Everything found there is excluded here. Ranked by that
 question; within a rank, by how many cells it touches. Every finding names the file and line,
 the failing scenario, the metric it moves and the direction, and whether a test in `tests/` would
-catch it (none of the HIGH items has one). **Status: §1–§6, §13–§17, §20, §22–§23, §34–§39, §41, §47–§52, §62–§63 and the §H double-execution metric FIXED 2026-10-06** (§19, §60, §61 partly) — all six recommended-order steps complete (`tests/test_review_2026_10_05_snow.py`, 31 tests, 23 fail on the pre-fix tree; `tests/test_review_2026_10_05_pbft.py`, 13 tests, 8 fail on the pre-fix tree; `tests/test_review_2026_10_05_hierarchy.py`, 23 tests on the new write/monitor/purge paths; `tests/test_review_2026_10_05_collect.py`, 15 tests, all 15 fail on the pre-fix tree; `tests/test_review_2026_10_05_runner.py`, 21 tests on the new launch/drain paths; `tests/test_review_2026_10_05_delegation.py`, 12; `tests/test_review_2026_10_05_execution.py`, 15); everything else OPEN.
+catch it (none of the HIGH items has one). **Status: §1–§6, §13–§17, §20, §22–§23, §34–§39, §41, §47–§52, §62–§63 and the §H double-execution metric FIXED 2026-10-06** (§60, §61 partly) — all six recommended-order steps complete; second batch: §9, §19, §24, §25, §30, §33, §44 (partly), §53 (`tests/test_review_2026_10_05_snow.py`, 31 tests, 23 fail on the pre-fix tree; `tests/test_review_2026_10_05_pbft.py`, 13 tests, 8 fail on the pre-fix tree; `tests/test_review_2026_10_05_hierarchy.py`, 23 tests on the new write/monitor/purge paths; `tests/test_review_2026_10_05_collect.py`, 15 tests, all 15 fail on the pre-fix tree; `tests/test_review_2026_10_05_runner.py`, 21 tests on the new launch/drain paths; `tests/test_review_2026_10_05_delegation.py`, 12; `tests/test_review_2026_10_05_execution.py`, 15); everything else OPEN.
 
 **Method.** Six independent read-only passes, one per subsystem (consensus + membership; agent
 core + repository + selection; execution + staging; metrics + collection + plotting; run tooling
@@ -201,7 +201,7 @@ Same shape as the 2026-09-18 straggler defect, one container over.
   the claim and resets J; a peer that has not yet detected answers `already_decided = X`; the CAS
   on the freed key gives J to the dead X; `try_claim_reassignment`'s 300 s TTL is spent, so J is
   stranded.
-- **9. The PBFT engine has no lock** and is driven from the inbound thread (`_process`), the
+- **9. [FIXED 2026-10-06 — the quorum check and `_note_finalized` are one locked step (host callbacks outside it); the stash and its replay pops share a lock. A test that widens the race window fails on the old engine]** The PBFT engine has no lock and is driven from the inbound thread (`_process`), the
   periodic thread (`_replay_pending_consensus` at `resource_agent.py:1031-1049`, `remove_object`
   at `:1053, 1114, 1127, 4255`, `_clear_consensus_for_failed_agent`) and the selection thread
   (`propose`, `:2624`). A replayed COMMIT and an inbound COMMIT for one job can both pass the
@@ -312,7 +312,7 @@ single-group.
   Snow variant: a leader that dies between winning the CAS and persisting READY leaves a PENDING
   record; reassignment scans READY/RUNNING only, the claim is never released, every re-proposal
   finalizes to the corpse, once per 300 s.
-- **19. [PARTLY FIXED 2026-10-06 — the delegation save: parent record, then child copies, then local state (`_delegate_to_children`); `select_job`/`schedule_job` still OPEN]** Local state is mutated before the Redis write in `select_job` (`:3379-3383`),
+- **19. [FIXED 2026-10-06 — delegation: parent record, child copies, then local state; `select_job` and `schedule_job` write first (`require_existing`), and a failed `schedule_job` write returns the job to `selected_queue`]** Local state is mutated before the Redis write in `select_job` (`:3379-3383`),
   `schedule_job` (`:3360-3373`: `ready_queue` and the completed set before the RUNNING save) and
   the delegation save (`:3314-3326`: `selected_queue.remove` before the per-group save and
   `delegated_jobs.set`). A write failure leaves a job that holds capacity and is tracked by
@@ -366,11 +366,11 @@ LLM arm of E4. Only the per-row `policy` column in `decisions.csv` tells the tru
 
 ### 24–33. LLM plane, medium and low
 
-- **24. `llm.timeout_seconds` is truncated to int** (`llm_config.py:32`): `0.5` → `0`, which means
+- **24. [FIXED 2026-10-06 — parsed as float]** `llm.timeout_seconds` is truncated to int (`llm_config.py:32`): `0.5` → `0`, which means
   "disabled" in `llm_bidder.py:196` and `llm_delegator.py`; model calls on the selection and
   scheduling threads become unbounded, and pacing's bootstrap (`llm_agent.py:738`) becomes 0 so
   pacing does nothing.
-- **25. Three LLM keys do not do what they say.** `llm.enabled` (default `False`) and
+- **25. [FIXED 2026-10-06 — an LLM agent refuses `enabled: false`, `use_for_selection: false` (both were ignored) and `provider: none` at startup, with a message naming `--agent-type resource`]** Three LLM keys do not do what they say. `llm.enabled` (default `False`) and
   `llm.use_for_selection` are parsed and never read (`enabled: false` still calls the model).
   `provider: none`, documented as the off switch (`config_swarm_multi.yml:492`, CLAUDE.md), makes
   `build_model` raise (`llm_bidder.py:85`) and the bidder is built unguarded (`llm_agent.py:97`),
@@ -393,7 +393,7 @@ LLM arm of E4. Only the per-row `policy` column in `decisions.csv` tells the tru
   `time_since_delegation` — execution-inclusive since P0-9 — by `delegation_timeout_s`, a
   selection bound; `bandit.py:126` counts reward ≤ 0 as failure). Any successful job ≥ ~120 s
   scores 0. Default `shaped: false`.
-- **30. Unknown `mab.algorithm` becomes epsilon-greedy and reports the configured name**
+- **30. [FIXED 2026-10-06 — refused; matched case-insensitively]** Unknown `mab.algorithm` becomes epsilon-greedy and reports the configured name**
   (`mab_manager.py:133-162`, `:441`) — including `"LinUCB"`, the spelling CLAUDE.md uses.
   `consensus.protocol` and `bid_pacing` raise on an unknown value; this key should too.
 - **31. `LlmAgent.selection_main` still lacks parts of the base loop** beyond the DAG gate fixed
@@ -406,7 +406,7 @@ LLM arm of E4. Only the per-row `policy` column in `decisions.csv` tells the tru
   at `llm_bidder.py:~248` and `llm_delegator.rank`): timeouts and pydantic-ai validation retries
   record 0 tokens, so the cost reported for P0-3/E4 is lowest in the runs with the most failures.
   `Bid` and `GroupRanking` also ask the model to fill `reasoning_time`.
-- **33. `mab.top_k: 0` silently drops jobs** (`random.sample(..., 0)`, `select_top_k(..., 0)`,
+- **33. [FIXED 2026-10-06 for `top_k` — refused below 1; wall-clock delegation timing still OPEN]** `mab.top_k: 0` silently drops jobs (`random.sample(..., 0)`, `select_top_k(..., 0)`,
   `ranked[:0]` → `[]`; monitor discards on `any([])`). Delegation timing uses `time.time()`
   throughout (`delegated_at` at `:3333`, the monitor, the pending TTL, the timeout decay).
 
@@ -511,7 +511,7 @@ true index over the fleet is 0.33. The plan defines fairness "over per-agent loa
   run reports 0 s selection time; `completed_jobs`/`success_rate` (`multi_run.py:222-224`) test
   `exit_status == 0` but `save_jobs` writes None as 0 (`data.py:308, 322`), so READY and RUNNING
   jobs count as successes; no hierarchical dedup; coordinators guessed as the top 10 % of ids.
-- **44. `metrics_complete` is three-state data stored as a boolean.** `collect.py:864` computes
+- **44. [PARTLY FIXED 2026-10-06 — the shortfall file carries `accounted`, and a kill run whose silent agents are exactly the declared ones reads complete; a run with no metrics.json still reads True]** `metrics_complete` is three-state data stored as a boolean. `collect.py:864` computes
   `not shortfall.exists()`, so a run with **no** `metrics.json` reads True (covers a plotting
   failure under `run_blocking(check=False)` and every pre-gate run); `run_test.py:1610` writes the
   shortfall file even when every silent agent was declared, so every correctly measured E2b/E6
@@ -597,7 +597,7 @@ different door: consensus silently runs single-node or to the wrong peers.
   `swarm-multi-start.sh:97` and `main.py:72` read `./configs` literally; `run_meta` and the
   fleet-fit checks also read `./configs`, so everything is internally consistent about the wrong
   fleet).
-- **53. `--expect-silent-agents` passes when a subset of the kills took** (`run_test.py:1588-1621`:
+- **53. [FIXED 2026-10-06 — any declared agent that reported fails the run (`kills_not_taken` in the shortfall file), including the all-reported case that only warned]** `--expect-silent-agents` passes when a subset of the kills took (`run_test.py:1588-1621`:
   "accounted" means missing ⊆ declared; the "did not take effect" warning fires only when nothing
   is missing). `kill_agents.py --agent-ids` warns about ids it cannot find and kills the rest with
   exit 0; its remote ssh has no BatchMode or host-key options and a 10 s timeout, so a host that

@@ -16,7 +16,9 @@ class LlmConfig:
     # `score_scale` is the range the model is asked for; the cost is normalised back to 0..100.
     score_scale: int = 100
     temperature: float = 0.0
-    timeout_seconds: int = 6
+    # A float: `int()` turned 0.5 into 0, which every caller reads as "no timeout", so model
+    # calls on the selection and scheduling threads became unbounded (code review §24).
+    timeout_seconds: float = 6.0
     use_for_selection: bool = True
     prompts: Dict[str, str] = None
 
@@ -29,7 +31,7 @@ class LlmConfig:
             base_url=str(d.get("base_url", "")),
             score_scale=int(d.get("score_scale", 100) or 100),
             temperature=float(d.get("temperature", 0.0)),
-            timeout_seconds=int(d.get("timeout_seconds", 6)),
+            timeout_seconds=float(d.get("timeout_seconds", 6)),
             use_for_selection=bool(d.get("use_for_selection", True)),
             prompts=dict(d.get("prompts", {})),
         )

@@ -447,3 +447,46 @@ class TestWithdrawalRaces:
         assert "j9" not in repo.get_all_ids_multi(          # the state index is cleaned too
             level=0, group=1, states=[ObjectState.PENDING.value]).get(ObjectState.PENDING.value, [])
         assert repo.delete_if_state("j9", ObjectState.PENDING, level=0, group=1) is True
+
+
+# --------------------------------------------------------------------------- §19
+class TestScheduleWritesFirst:
+    def _leaf_with_job(self, repo):
+        leaf = _leaf(repo, group=1)
+        leaf.queues.ready_queue = SimpleQueue()
+        leaf.executor = MagicMock()
+        leaf.end_idle = lambda: None
+        leaf._update_completed_jobs = MagicMock()
+        job = _job("j1", ObjectState.READY, leader=5)
+        repo.save(obj=job.to_dict(), level=CHILD_LEVEL, group=1)
+        return leaf, job
+
+    def test_a_failed_write_changes_nothing_local_and_retries(self):
+        repo = Repository(_FakeRedis(), run_id="t")
+        leaf, job = self._leaf_with_job(repo)
+
+        def boom(*a, **k):
+            raise ConnectionError("redis blip")
+        repo.save = boom
+        leaf.schedule_job(job)
+        assert "j1" not in leaf.queues.ready_queue
+        assert "j1" in leaf.queues.selected_queue
+        assert job.state == ObjectState.READY
+        leaf.executor.submit.assert_not_called()
+        leaf._update_completed_jobs.assert_not_called()
+
+    def test_a_withdrawn_record_is_not_run(self):
+        repo = Repository(_FakeRedis(), run_id="t")
+        leaf, job = self._leaf_with_job(repo)
+        repo.delete("j1", level=CHILD_LEVEL, group=1)
+        leaf.schedule_job(job)
+        leaf.executor.submit.assert_not_called()
+        assert _record(repo, "j1", CHILD_LEVEL, 1) is None
+
+    def test_the_normal_path_still_runs(self):
+        repo = Repository(_FakeRedis(), run_id="t")
+        leaf, job = self._leaf_with_job(repo)
+        leaf.schedule_job(job)
+        leaf.executor.submit.assert_called_once()
+        assert _record(repo, "j1", CHILD_LEVEL, 1)["state"] == ObjectState.RUNNING.value
+        assert "j1" in leaf.queues.ready_queue

@@ -137,14 +137,18 @@ class _HostAdapter(ConsensusHost):
     _PENDING_MAX_PER_OBJECT = 32
 
     def _stash_pending(self, store: dict, object_id: str, msg) -> None:
-        if object_id not in store and len(store) >= self._PENDING_MAX_OBJECTS:
-            self.agent.pending_consensus_dropped += 1
-            return
-        bucket = store.setdefault(object_id, [])
-        if len(bucket) >= self._PENDING_MAX_PER_OBJECT:
-            self.agent.pending_consensus_dropped += 1
-            return
-        bucket.append(msg)
+        # Under the agent's stash lock: setdefault-then-append on the inbound thread raced the
+        # periodic thread's pop of the same bucket, and a vote appended to a bucket just popped
+        # was lost with nothing counting it (code review 2026-10-05 §9).
+        with self.agent._pending_lock:
+            if object_id not in store and len(store) >= self._PENDING_MAX_OBJECTS:
+                self.agent.pending_consensus_dropped += 1
+                return
+            bucket = store.setdefault(object_id, [])
+            if len(bucket) >= self._PENDING_MAX_PER_OBJECT:
+                self.agent.pending_consensus_dropped += 1
+                return
+            bucket.append(msg)
 
     def set_pending_proposal(self, proposal, object_id: str):
         self._stash_pending(self.agent.pending_proposals, object_id, proposal)
@@ -487,6 +491,7 @@ class ResourceAgent(Agent):
 
         # Consensus messages that arrived before their job (see _HostAdapter.set_pending_*).
         # Replayed by _replay_pending_consensus once the job lands in the pending queue.
+        self._pending_lock = threading.Lock()
         self.pending_proposals: dict[str, list] = {}
         self.pending_prepares: dict[str, list] = {}
         self.pending_commits: dict[str, list] = {}
@@ -515,7 +520,12 @@ class ResourceAgent(Agent):
         mab_cfg = self.config.get("mab", {})
         self.mab_enabled = mab_cfg.get("enabled", False)
         self.mab_config = mab_cfg
-        self.mab_top_k = mab_cfg.get("top_k", 1)
+        self.mab_top_k = int(mab_cfg.get("top_k", 1))
+        if self.mab_top_k < 1:
+            # 0 delegated every job to NO group: `random.sample(.., 0)`, `select_top_k(.., 0)`
+            # and `ranked[:0]` all return [], and the monitor then discarded the entry because
+            # `any([])` is false — jobs vanished with no error (code review 2026-10-05 §33).
+            raise ValueError(f"mab.top_k must be at least 1, got {self.mab_top_k}")
         self.mab_manager = None  # Lazily initialised in _init_mab() once children are known
 
         # Failure simulation for MAB testing
@@ -1039,17 +1049,22 @@ class ResourceAgent(Agent):
         self.queues.pending_event.set()
 
     def _replay_pending_consensus(self, job_id: str) -> None:
-        for msg in self.pending_proposals.pop(job_id, []):
+        lock = getattr(self, "_pending_lock", None) or threading.Lock()
+        with lock:
+            proposals = self.pending_proposals.pop(job_id, [])
+            prepares = self.pending_prepares.pop(job_id, [])
+            commits = self.pending_commits.pop(job_id, [])
+        for msg in proposals:
             try:
                 self.engine.on_proposal(msg)
             except Exception as e:
                 self.logger.warning(f"Replaying pending proposal for {job_id} failed: {e}")
-        for msg in self.pending_prepares.pop(job_id, []):
+        for msg in prepares:
             try:
                 self.engine.on_prepare(msg)
             except Exception as e:
                 self.logger.warning(f"Replaying pending prepare for {job_id} failed: {e}")
-        for msg in self.pending_commits.pop(job_id, []):
+        for msg in commits:
             try:
                 self.engine.on_commit(msg)
             except Exception as e:
@@ -3473,20 +3488,41 @@ class ResourceAgent(Agent):
     def schedule_job(self, job: Job):
         self.end_idle()
         self.logger.info(f"[SCHEDULED]: {job.job_id} on agent: {self.agent_id}")
-        # Add the job to the list of allocated jobs
-        self.queues.ready_queue.add(job)
 
-        # Out of consensus from here on (the local "completed" set is the consensus dedupe
-        # set, not the execution outcome), but NOT persisted as COMPLETE: the persisted state
-        # is what the parent coordinator's delegation monitor reads, and `exit_status` is
-        # still at its default of 0 until `execute_job` finishes. Writing COMPLETE here made
-        # the monitor credit the bandit with a success the moment the job was scheduled,
-        # and it never saw the real outcome (P0-9: on `p11-oracle2` the leaves injected 83
-        # failures and the bandit recorded 19). Only `execute_job` may write COMPLETE.
-        self._update_completed_jobs(jobs=[job.job_id])
+        # Persisted RUNNING, not COMPLETE: the persisted state is what the parent
+        # coordinator's delegation monitor reads, and `exit_status` is still at its default of
+        # 0 until `execute_job` finishes. Writing COMPLETE here made the monitor credit the
+        # bandit with a success the moment the job was scheduled (P0-9: on `p11-oracle2` the
+        # leaves injected 83 failures and the bandit recorded 19). Only `execute_job` may
+        # write COMPLETE.
+        #
+        # And written BEFORE any local state changes (code review 2026-10-05 §19). The job used
+        # to enter `ready_queue` and the completed set first, so a failed write left a job that
+        # held capacity, was never submitted, and sat READY in Redis under a live leader — a
+        # state no recovery path covers. `scheduling_main` has already taken it out of
+        # `selected_queue`, so a failed write puts it back there for the next pass.
         job.state = ObjectState.RUNNING
-        self.repository.save(obj=job.to_dict(), key_prefix=Repository.KEY_JOB,
-                             level=self.topology.level, group=self.topology.group)
+        try:
+            saved = self.repository.save(obj=job.to_dict(), key_prefix=Repository.KEY_JOB,
+                                         level=self.topology.level, group=self.topology.group,
+                                         require_existing=True)
+        except Exception as e:
+            job.state = ObjectState.READY
+            self.queues.selected_queue.add(job)
+            self.logger.error(f"[SCHEDULED] could not persist {job.job_id} RUNNING ({e}); "
+                              f"will retry")
+            return
+        if saved is False:
+            self.logger.info(f"[SCHEDULED] {job.job_id} was withdrawn before it could run "
+                             f"here; dropping it")
+            self.queues.pending_queue.remove(job.job_id)
+            self._forget_decided(job.job_id)
+            return
+
+        self.queues.ready_queue.add(job)
+        # Out of consensus from here on (the local "completed" set is the consensus dedupe
+        # set, not the execution outcome).
+        self._update_completed_jobs(jobs=[job.job_id])
         self.executor.submit(self.execute_job, job)
 
     def select_job(self, job: Job):

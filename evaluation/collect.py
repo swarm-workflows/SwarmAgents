@@ -964,12 +964,18 @@ def run_metrics(run_dir: Path, expected_jobs: int | None) -> dict[str, Any]:
     missing_agents = 0
     if not metrics_complete:
         try:
-            missing_agents = len(json.loads(shortfall_path.read_text()).get("missing_agents", []))
+            shortfall = json.loads(shortfall_path.read_text())
+            missing_agents = len(shortfall.get("missing_agents", []))
+            # A failure-injection run whose silent agents are exactly the declared ones is
+            # complete: its aggregates cover the agents meant to survive. Writing the file for
+            # it anyway made every correctly measured E2b/E6 kill run read incomplete (§44).
+            metrics_complete = bool(shortfall.get("accounted"))
         except (OSError, ValueError):
             missing_agents = -1  # present but unreadable
-        print(f"  WARNING: {run_dir.name} has metrics_shortfall.json "
-              f"({missing_agents} agents silent) -- per-agent aggregates are partial",
-              file=sys.stderr)
+        if not metrics_complete:
+            print(f"  WARNING: {run_dir.name} has metrics_shortfall.json "
+                  f"({missing_agents} agents silent) -- per-agent aggregates are partial",
+                  file=sys.stderr)
 
     metrics: dict[str, Any] = {
         "metrics_complete": metrics_complete,

@@ -93,6 +93,7 @@ class LlmAgent(ResourceAgent):
         super().__init__(agent_id=agent_id, config_file=config_file, debug=debug)
         # Load LLM configuration
         self.llm_cfg = LlmConfig.from_dict(self.config.get("llm", {}))
+        self._refuse_llm_switched_off(self.config.get("llm") or {})
 
         self.bidder: Optional[LlmBidder] = LlmBidder(self.llm_cfg, logger=self.logger)
 
@@ -391,6 +392,24 @@ class LlmAgent(ResourceAgent):
     DELEGATE_BANDIT = "bandit"
     DELEGATE_LLM = "llm"
     SUPPORTS_LLM_DELEGATION = True
+
+    @staticmethod
+    def _refuse_llm_switched_off(raw: dict) -> None:
+        """An LLM agent configured not to use the LLM is a contradiction, and every way of
+        saying so used to be ignored or misreported (code review 2026-10-05 §25):
+        `llm.enabled: false` and `llm.use_for_selection: false` were parsed and never read —
+        the model was called anyway — and `provider: none`, documented as the off switch,
+        crashed deep inside the bidder with an unhelpful message. A run that wants no LLM
+        launches resource agents; anything else would be measured under the wrong label."""
+        for key in ("enabled", "use_for_selection"):
+            if key in raw and raw[key] is False:
+                raise ValueError(
+                    f"llm.{key}: false on an LLM agent. The key never switched the model off "
+                    f"(it was ignored); launch --agent-type resource for an analytic run.")
+        if str(raw.get("provider", "none")).strip().lower() == "none":
+            raise ValueError(
+                "llm.provider is 'none' on an LLM agent: there is no model to bid with. Set a "
+                "provider (openai, ollama, gemini), or launch --agent-type resource.")
 
     def _init_delegation(self) -> None:
         """Read who decides where a job goes. Config only — no provider connection here.

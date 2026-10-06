@@ -272,3 +272,33 @@ def test_own_proposal_dropped_from_outgoing_still_elects_self_as_leader():
     bus.run()
     assert hosts[1].leader_of == ["j1"]
     assert "j1" not in hosts[1].assignee
+
+
+# --------------------------------------------------------------------------- §9
+def test_concurrent_finalizes_of_one_proposal_finalize_once():
+    """The engine is driven from three threads; two that both saw quorum both finalized."""
+    import threading
+    bus, hosts = _cluster(3)
+    eng = bus.engines[1]
+    p = ProposalInfo(p_id="px", object_id="j1", cost=1.0, agent_id=1,
+                     prepares=[1, 2, 3], commits=[1, 2, 3])
+    eng.outgoing.add_proposal(p)
+    obj = hosts[1].objects["j1"]
+    barrier = threading.Barrier(8)
+    # Widen the window deterministically: in the unlocked engine the quorum lookup sat between
+    # the "already finalized?" check and the mark, so a host call that yields let every thread
+    # through. Under the GIL the natural window is too narrow to hit reliably.
+    import time as _time
+    real_quorum = hosts[1].calculate_quorum
+    hosts[1].calculate_quorum = lambda: (_time.sleep(0.05), real_quorum())[1]
+
+    def go():
+        barrier.wait()
+        eng._finalize_if_quorum(obj, p)
+    threads = [threading.Thread(target=go) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert hosts[1].leader_of == ["j1"]
+    assert eng.finalized_count == 1

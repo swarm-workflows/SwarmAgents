@@ -22,6 +22,7 @@
 # SOFTWARE.
 #
 # Author: Komal Thareja(kthare10@renci.org)
+import threading
 import time
 from collections import OrderedDict
 
@@ -50,6 +51,12 @@ class ConsensusEngine:
         self.router = router
 
         # Local state
+        # Guards the quorum check and `_note_finalized` as ONE step. The engine is driven from
+        # the inbound thread, the periodic thread (replayed stashed messages) and the selection
+        # thread (`propose`), so two threads could both pass the check for one proposal and both
+        # finalize it — two `_record_finalize`, two `select_job` (code review 2026-10-05 §9).
+        # Host callbacks run outside it.
+        self._finalize_lock = threading.Lock()
         self.outgoing = ProposalContainer()  # proposals initiated by me
         self.incoming = ProposalContainer()  # proposals initiated by peers
         self.conflicts = {}
@@ -445,16 +452,17 @@ class ConsensusEngine:
             self._finalize_if_quorum(object, proposal)
 
     def _finalize_if_quorum(self, object, proposal) -> bool:
-        if self._already_finalized(proposal.object_id, proposal.p_id):
-            return False
         quorum = self.host.calculate_quorum()
         self.host.log_debug(f"Is quorum? /{quorum}")
-        if len(proposal.commits) < quorum:
-            return False
+        with self._finalize_lock:
+            if self._already_finalized(proposal.object_id, proposal.p_id):
+                return False
+            if len(proposal.commits) < quorum:
+                return False
+            # Remembered BEFORE the containers are cleared, so the stragglers that follow
+            # are recognised as such rather than re-adopted.
+            self._note_finalized(proposal.object_id, proposal.p_id, time.time())
         self.host.log_debug("Is quorum!!")
-        # Remembered BEFORE the containers are cleared, so the stragglers that follow
-        # are recognised as such rather than re-adopted.
-        self._note_finalized(proposal.object_id, proposal.p_id, time.time())
         self._record_finalize(proposal)
         # Leader vs participant. The leader is whoever PROPOSED — agent ids are unique, so a
         # proposal naming us is ours whichever container it now sits in. This used to also

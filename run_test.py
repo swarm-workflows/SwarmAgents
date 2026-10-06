@@ -1834,16 +1834,17 @@ def report_metrics_completeness(args, expected_ids: set[int], run_id: str,
     if foreign:
         log(f"NOTE: {len(foreign)} metrics payload(s) in Redis belong to another run and will "
             f"be ignored: " + ", ".join(f"agent {a} (run_id={r})" for a, r in sorted(foreign.items())))
-    if not missing:
-        if declared:
-            # Their metrics being present means the kill did not take — the fault the run was
-            # measuring never happened, which is a worse outcome than a missing payload.
-            log(f"WARNING: --expect-silent-agents named {sorted(declared)} but every agent "
-                f"reported metrics; the intended kills did not take effect")
+    if not missing and not declared:
         log(f"Metrics complete: all {len(expected_ids)} agents reported for run_id={run_id}")
         return True
 
     unexpected = missing - declared if declared else set()
+    # Declared silent but reported anyway: that kill did not take, so the fault this run
+    # reports never happened to that agent. This used to be accepted whenever SOME declared
+    # agent was missing — declare 3,7, only 3 dies, and the run passed as a two-failure cell —
+    # and only warned when none was (code review 2026-10-05 §53).
+    not_taken = declared - missing
+    accounted = bool(declared) and not unexpected and not not_taken
 
     shortfall = {
         "run_id": run_id,
@@ -1853,6 +1854,11 @@ def report_metrics_completeness(args, expected_ids: set[int], run_id: str,
         "allow_missing_metrics": allowed,
         "expect_silent_agents": sorted(declared),
         "unexpectedly_silent": sorted(unexpected),
+        "kills_not_taken": sorted(not_taken),
+        # Every silent agent was declared and every declared agent was silent: the per-agent
+        # aggregates cover exactly the agents the experiment meant to leave running. The
+        # collector reads this, so a correct kill run is not reported as incomplete (§44).
+        "accounted": accounted,
         "stopped_cleanly": stopped_cleanly,
         "waited_seconds": args.metrics_wait_seconds,
     }
@@ -1863,13 +1869,17 @@ def report_metrics_completeness(args, expected_ids: set[int], run_id: str,
     # silent ones. A failure test that kills 3 and 5 but finds 7 and 9 silent measured a
     # different fault than the one it reported.
     if declared:
-        accounted = not unexpected
         if accounted:
             log(f"Metrics complete apart from the {len(missing)} agent(s) declared silent "
                 f"({sorted(missing)}) for run_id={run_id}")
             return True
-        log(f"ERROR: {sorted(unexpected)} reported no metrics but were not declared silent "
-            f"(declared: {sorted(declared)}). Wrote {args.run_dir}/metrics_shortfall.json.")
+        if not_taken:
+            log(f"ERROR: --expect-silent-agents named {sorted(not_taken)} but they reported "
+                f"metrics — those kills did not take, so this run did not inject the fault it "
+                f"declares. Wrote {args.run_dir}/metrics_shortfall.json.")
+        if unexpected:
+            log(f"ERROR: {sorted(unexpected)} reported no metrics but were not declared silent "
+                f"(declared: {sorted(declared)}). Wrote {args.run_dir}/metrics_shortfall.json.")
         return False
 
     level = "WARNING" if len(missing) <= allowed else "ERROR"

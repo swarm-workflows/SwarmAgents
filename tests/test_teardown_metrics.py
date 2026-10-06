@@ -207,11 +207,27 @@ class TestDeclaredSilentAgents:
         assert shortfall["unexpectedly_silent"] == [1, 4]
         assert shortfall["expect_silent_agents"] == [2, 3]
 
-    def test_kills_that_did_not_take_are_called_out(self, tmp_path, monkeypatch, capsys):
+    def test_kills_that_did_not_take_fail_the_run(self, tmp_path, monkeypatch, capsys):
+        """This used to pass with a warning. The run never injected the fault it declares,
+        so it cannot be a cell of that experiment (code review 2026-10-05 §53)."""
         monkeypatch.setattr(run_test, "_metrics_in_redis", lambda a, r: ({1, 2, 3}, {}))
         assert run_test.report_metrics_completeness(
-            _args(tmp_path, expect_silent_agents="2"), {1, 2, 3}, "now", True) is True
-        assert "did not take effect" in capsys.readouterr().out
+            _args(tmp_path, expect_silent_agents="2"), {1, 2, 3}, "now", True) is False
+        assert "kills did not take" in capsys.readouterr().out
+
+    def test_a_subset_of_the_kills_taking_fails_the_run(self, tmp_path, monkeypatch, capsys):
+        """Declare 2,3; only 2 dies. This passed as a two-failure cell."""
+        monkeypatch.setattr(run_test, "_metrics_in_redis", lambda a, r: ({1, 3}, {}))
+        assert run_test.report_metrics_completeness(
+            _args(tmp_path, expect_silent_agents="2,3"), {1, 2, 3}, "now", True) is False
+        import json as _json
+        shortfall = _json.loads((tmp_path / "metrics_shortfall.json").read_text())
+        assert shortfall["kills_not_taken"] == [3] and shortfall["accounted"] is False
+
+    def test_exactly_the_declared_kills_is_accounted(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(run_test, "_metrics_in_redis", lambda a, r: ({1}, {}))
+        args = _args(tmp_path, expect_silent_agents="2,3")
+        assert run_test.report_metrics_completeness(args, {1, 2, 3}, "now", True) is True
 
 
 class TestHostsFileForStop:
