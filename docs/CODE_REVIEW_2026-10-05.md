@@ -5,7 +5,7 @@ Second critical read of the code base, against the same question as the 2026-09-
 anything in the run saying so?** Everything found there is excluded here. Ranked by that
 question; within a rank, by how many cells it touches. Every finding names the file and line,
 the failing scenario, the metric it moves and the direction, and whether a test in `tests/` would
-catch it (none of the HIGH items has one). **Status (2026-10-06): every HIGH item and every MEDIUM item has been addressed; each heading carries its own FIXED / PARTLY FIXED note.** Regression tests are in `tests/test_review_2026_10_05_*.py` (13 files); where a file's tests could run against the pre-fix code, the commit message says how many failed there. **Still partly open:** §46 (validate()'s last-row-wins join; plotting Redis readers), §56 (`--pegasus-dag-gating` defaults off), §64 (names with a directory component are refused, not supported), §72 (apptainer's `docker://` conversion is inside the job's time), and the §G config-drift table's remaining rows.
+catch it (none of the HIGH items has one). **Status (2026-10-06): every HIGH item and every MEDIUM item has been addressed; each heading carries its own FIXED / PARTLY FIXED note.** Regression tests are in `tests/test_review_2026_10_05_*.py` (13 files); where a file's tests could run against the pre-fix code, the commit message says how many failed there. **Still partly open:** §46 (validate()'s last-row-wins join; plotting Redis readers), §56 (`--pegasus-dag-gating` defaults off), and the §G config-drift table's remaining rows.
 
 **Method.** Six independent read-only passes, one per subsystem (consensus + membership; agent
 core + repository + selection; execution + staging; metrics + collection + plotting; run tooling
@@ -700,7 +700,7 @@ returns `{}` and says the caller must tell the cases apart; no test checks that 
 
 ### 64–73. Staging and execution, medium and low
 
-- **64. [FIXED 2026-10-06 — one rule, `staging.plain_name`: under staging a name with a directory component gets no location from the producer and is refused by the consumer (no silent fall through to the inputs root). Supporting such names is open]** LFNs containing `/` break the registry and the paths. The producer writes `data_ready`
+- **64. [FIXED 2026-10-06 — names with directory components are SUPPORTED under staging: one rule, `staging.safe_relpath` (normalised, contained — `..` and absolute paths refused), keys and places them on producer, server, client, store and site re-publish; a failed fetch leaves no empty directories]** LFNs containing `/` break the registry and the paths. The producer writes `data_ready`
   and `data_loc` under the raw `d.file` (`resource_agent.py:3458, 3499, 3508, 3547`); the consumer
   looks up by `basename` (`runner.py:534-536, 559, 567`), misses, and falls to `roots.inputs` — a
   stale read if the basename exists there, else a refusal. The producer also checks and serves
@@ -746,7 +746,7 @@ returns `{}` and says the caller must tell the cases apart; no test checks that 
   carrying no digest (`staging.py:517-525`); a store started `--no-verify` serves and accepts
   unverified data; `Put` has no size field and does not require the `last` chunk (`:307-355`), so a
   stream that ends cleanly without it is linked in as the stored file.
-- **72. [FIXED 2026-10-06 for docker — the image is inspected and pulled BEFORE the job's clock (`pull_s`), a failed pull is a transient refusal; `auto` stays in the declared runtime family unless `allow_runtime_substitution: true`. Apptainer's `docker://` conversion on first exec is still inside the job's time]** Images are fetched inside the timed job and the runtime is substituted silently. Docker
+- **72. [FIXED 2026-10-06 for docker — the image is inspected and pulled BEFORE the job's clock (`pull_s`), a failed pull is a transient refusal; `auto` stays in the declared runtime family unless `allow_runtime_substitution: true`. Apptainer's `docker://` reference is pulled to a per-host .sif cache before the clock too, and the command rewritten to it]** Images are fetched inside the timed job and the runtime is substituted silently. Docker
   pulls a missing image during `docker run`, apptainer converts `docker://` on first exec — both
   inside `duration_s`; a pull failure (125/255) is a job failure, not a refusal. Under `auto` a
   docker-kind container on a docker-less host silently runs under apptainer; the comment says the

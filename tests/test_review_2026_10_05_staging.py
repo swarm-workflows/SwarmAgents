@@ -20,7 +20,7 @@ sys.path.insert(0, REPO)
 sys.path.insert(0, os.path.join(REPO, "tests"))
 
 from swarm.execution import runner, staging  # noqa: E402
-from test_staging import _Job, _agent, _store, _write  # noqa: E402
+from test_staging import _Job, _agent, _serve, _store, _write  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -42,20 +42,53 @@ class _Node:
 
 # --------------------------------------------------------------------------- §64
 class TestOneNameRule:
-    def test_plain_name(self):
-        assert staging.plain_name("out.csv") == "out.csv"
-        for bad in ("runA/out.csv", "", ".", "..", None):
-            assert staging.plain_name(bad) is None
+    """§64 first refused names with a directory component; they are SUPPORTED now, keyed and
+    placed by one rule (`safe_relpath`) on every side, with `..` and absolute paths refused."""
 
-    def test_a_consumer_refuses_a_directory_component(self, tmp_path):
+    def test_safe_relpath(self):
+        assert staging.safe_relpath("out.csv") == "out.csv"
+        assert staging.safe_relpath("runA/./out.csv") == "runA/out.csv"
+        assert staging.safe_relpath("runA//b/out.csv") == "runA/b/out.csv"
+        for bad in ("", ".", "..", "/etc/passwd", "a/../../b", "../x", None):
+            assert staging.safe_relpath(bad) is None
+        assert staging.plain_name is staging.safe_relpath
+
+    def test_a_nested_name_moves_end_to_end(self, tmp_path):
+        """Producer publishes runA/out.csv at <work>/runA/out.csv; a consumer fetches it to the
+        same relative path in its own work dir."""
+        src = _write(str(tmp_path / "prod" / "runA" / "out.csv"), b"nested")
+        server, loc = _serve(tmp_path, {"runA/out.csv": src})
+        try:
+            staging.configure(enabled=True)
+            runner.configure(mode="real")
+            work = str(tmp_path / "cons")
+            os.makedirs(work)
+            staged, refusal = runner.stage_inputs(
+                [_Node("runA/out.csv")], work, locator=lambda n: {"runA/out.csv": [loc]},
+                run_id="run-1")
+            assert refusal == "" and staged == ["runA/out.csv"]
+            assert open(os.path.join(work, "runA", "out.csv"), "rb").read() == b"nested"
+        finally:
+            server.stop(0)
+
+    def test_a_producer_publishes_a_nested_output_at_its_real_path(self, tmp_path):
+        work = str(tmp_path / "work")
+        path = _write(os.path.join(work, "runA", "out.csv"), b"x")
+        staging.configure(enabled=True)
+        runner.configure(mode="real", work_dir=work)
+        a = _agent(tmp_path)
+        locs = a._publish_locations(_Job(), ["runA/out.csv"])
+        assert locs["runA/out.csv"][0]["sha256"] == staging.file_sha256(path)
+        assert a.staged_files.path_for("runA/out.csv") == path
+
+    def test_an_escaping_name_is_still_refused(self, tmp_path):
         work = str(tmp_path / "w")
         os.makedirs(work)
         staging.configure(enabled=True)
-        runner.configure(mode="real", roots={"inputs": str(tmp_path / "in")})
-        _write(str(tmp_path / "in" / "out.csv"), b"stale")
-        _s, refusal = runner.stage_inputs([_Node("runA/out.csv")], work,
+        runner.configure(mode="real")
+        _s, refusal = runner.stage_inputs([_Node("../outside.csv")], work,
                                           locator=lambda n: {}, run_id="r1")
-        assert "directory component" in refusal
+        assert "not a contained relative name" in refusal
 
     def test_staging_off_is_unchanged(self, tmp_path):
         work = str(tmp_path / "w")
@@ -64,13 +97,15 @@ class TestOneNameRule:
         _s, refusal = runner.stage_inputs([_Node("runA/out.csv")], work)
         assert refusal == ""
 
-    def test_a_producer_gives_a_directory_component_no_location(self, tmp_path):
-        work = str(tmp_path / "work")
-        _write(os.path.join(work, "out.csv"), b"x")
-        staging.configure(enabled=True)
-        runner.configure(mode="real", work_dir=work)
-        a = _agent(tmp_path)
-        assert "runA/out.csv" not in a._publish_locations(_Job(), ["runA/out.csv"])
+    def test_the_store_keeps_nested_names(self, tmp_path):
+        server, port, store_dir = _store(tmp_path)
+        try:
+            staging.configure(enabled=True, store_host="127.0.0.1", store_port=port)
+            f = _write(str(tmp_path / "w" / "o.csv"), b"stored")
+            assert staging.put("runA/o.csv", f, run_id="run-1").ok
+            assert open(os.path.join(store_dir, "run-1", "runA", "o.csv"), "rb").read() == b"stored"
+        finally:
+            server.stop(0)
 
 
 # --------------------------------------------------------------------------- §65

@@ -74,10 +74,14 @@ def main() -> int:
         run_dir = os.path.join(args.store_dir, run)
         if not os.path.isdir(run_dir) or run.startswith("."):
             continue
-        for n in os.listdir(run_dir):
-            full = os.path.join(run_dir, n)
-            if os.path.isfile(full) and not n.startswith("."):
-                existing[f"{run}/{n}"] = full
+        # Recursive: names may carry directory components (§64).
+        for root, _dirs, files in os.walk(run_dir):
+            for n in files:
+                if n.startswith("."):
+                    continue
+                full = os.path.join(root, n)
+                rel = os.path.relpath(full, run_dir).replace(os.sep, "/")
+                existing[f"{run}/{rel}"] = full
     published.publish_all(existing)
 
     server = staging.TransferServer(published, args.host, args.port, run_id=args.run_id,

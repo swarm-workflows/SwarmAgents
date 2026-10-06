@@ -590,7 +590,9 @@ def stage_inputs(data_in, work_dir: str,
             produced = None
 
     if locator is not None:
-        wanted = [os.path.basename(str(getattr(n, "file", "") or ""))
+        from swarm.execution import staging as _stk
+        wanted = [(_stk.safe_relpath(getattr(n, "file", "")) or "")
+                  if staging_on else os.path.basename(str(getattr(n, "file", "") or ""))
                   for n in (data_in or []) if getattr(n, "file", None)]
         wanted = [w for w in wanted if w and w not in (".", "..")]
         if wanted:
@@ -621,15 +623,20 @@ def stage_inputs(data_in, work_dir: str,
         name = getattr(node, "file", None)
         if not name:
             continue
-        if staging_on and "/" in str(name):
+        if staging_on:
+            # Under staging the key is the contained relative path — the same rule the producer
+            # used to publish it (§64). Directory components are kept; `..` and absolute paths
+            # are refused because they would escape the working directory.
             from swarm.execution import staging as _st
-            if _st.plain_name(name) is None:
-                return staged, (f"input {name!r} has a directory component, which staging does "
-                                f"not support: the producer and this consumer would key it "
-                                f"differently")
-        # basename is the traversal guard: a declared name may not escape the working
-        # directory, whatever the workflow says.
-        name = os.path.basename(str(name))
+            rel = _st.safe_relpath(name)
+            if rel is None:
+                return staged, (f"input {name!r} is not a contained relative name and cannot "
+                                f"be staged")
+            name = rel
+        else:
+            # basename is the traversal guard: a declared name may not escape the working
+            # directory, whatever the workflow says.
+            name = os.path.basename(str(name))
         if not name or name in (".", ".."):
             continue
         dest = os.path.join(work_dir, name)
@@ -707,6 +714,7 @@ def stage_inputs(data_in, work_dir: str,
         if not os.path.isfile(src):
             return staged, (f"input {name!r} is not in the working directory and was not "
                             f"found in the inputs root ({(pol.roots or {})['inputs']})")
+        os.makedirs(os.path.dirname(dest) or work_dir, exist_ok=True)    # nested names (§64)
         tmp = f"{dest}.staging.{os.getpid()}.{threading.get_ident()}"
         try:
             shutil.copy2(src, tmp)
@@ -820,6 +828,9 @@ def run(spec: ExecutionSpec, job_id: str,
     # inside the job's timed duration, and a pull failure (125) was recorded as the JOB failing
     # (§72). Apptainer's conversion of a `docker://` reference on first exec is still inside it.
     pull_s, pull_refusal = _ensure_docker_image(cmd, pol)
+    if not pull_refusal:
+        cmd, apt_pull_s, pull_refusal = _ensure_apptainer_image(cmd, pol, work_dir)
+        pull_s += apt_pull_s
     if pull_refusal:
         return ExecutionResult(exit_status=1, refused=True, transient=True,
                                reason=pull_refusal, pull_s=pull_s)
@@ -897,6 +908,60 @@ def _name_container(cmd: List[str], job_id: str, run_id: str) -> Tuple[List[str]
     return [cmd[0], "run", "--name", name, "--init"] + cmd[2:], name
 
 
+def _apptainer_image_index(cmd: List[str]) -> Optional[int]:
+    """Index of the image in an `apptainer exec` argv built by `build_command`: the first
+    argument after the flags (`--containall`, `--bind X`, `--pwd X`)."""
+    if len(cmd) < 3 or os.path.basename(cmd[0]) not in ("apptainer", "singularity") \
+            or cmd[1] != "exec":
+        return None
+    i = 2
+    while i < len(cmd):
+        if cmd[i] in ("--bind", "--pwd"):
+            i += 2
+        elif cmd[i].startswith("--"):
+            i += 1
+        else:
+            return i
+    return None
+
+
+def _ensure_apptainer_image(cmd: List[str], pol: "ExecutionPolicy",
+                            work_dir: str) -> Tuple[List[str], float, str]:
+    """Convert a registry reference to a local .sif BEFORE the job's clock starts.
+
+    Apptainer converts `docker://…` on first exec, inside the job's measured duration (code
+    review 2026-10-05 §72). The image is pulled into a per-host cache once and the command
+    rewritten to run the .sif. Pulled to a temporary name and moved into place, so two jobs
+    pulling the same image cannot hand each other a half-written file. A failed pull is a
+    transient refusal. Returns (cmd, seconds spent, refusal or "").
+    """
+    idx = _apptainer_image_index(cmd)
+    if idx is None or "://" not in cmd[idx]:
+        return cmd, 0.0, ""
+    ref = cmd[idx]
+    cache = os.path.join((pol.roots or {}).get("images") or work_dir, ".swarm-image-cache")
+    safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in ref)[:150]
+    target = os.path.join(cache, f"{safe}-{hashlib.sha1(ref.encode()).hexdigest()[:8]}.sif")
+    started = time.monotonic()
+    if not os.path.isfile(target):
+        try:
+            os.makedirs(cache, exist_ok=True)
+            tmp = f"{target}.pull.{os.getpid()}.{threading.get_ident()}"
+            logger.info("[EXEC] pulling %s to %s before the job starts", ref, target)
+            pulled = subprocess.run([cmd[0], "pull", tmp, ref], stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.PIPE, timeout=pol.pull_timeout_s,
+                                    text=True)
+            if pulled.returncode != 0 or not os.path.isfile(tmp):
+                return cmd, time.monotonic() - started, (
+                    f"could not pull image {ref}: {(pulled.stderr or '').strip()[:300]}")
+            os.replace(tmp, target)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return cmd, time.monotonic() - started, f"could not pull image {ref}: {exc}"
+    new = list(cmd)
+    new[idx] = target
+    return new, time.monotonic() - started, ""
+
+
 def _ensure_docker_image(cmd: List[str], pol: "ExecutionPolicy") -> Tuple[float, str]:
     """Make sure a `docker run`'s image is local. Returns (seconds spent, refusal or "")."""
     if len(cmd) < 2 or os.path.basename(cmd[0]) != "docker" or cmd[1] != "run":
@@ -946,8 +1011,11 @@ def _clear_declared_outputs(data_out, work_dir: str, job_id: str) -> None:
         name = getattr(node, "file", None)
         if not name:
             continue
-        local = os.path.basename(str(name))
-        if not local or local in (".", ".."):
+        # The path the job writes it at: the LFN relative to its working directory, directory
+        # components included (§64), contained — `..` or an absolute path is skipped.
+        from swarm.execution import staging as _st
+        local = _st.safe_relpath(name)
+        if not local:
             continue
         path = os.path.join(work_dir, local)
         if os.path.isfile(path):

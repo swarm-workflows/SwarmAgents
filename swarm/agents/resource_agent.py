@@ -3836,14 +3836,17 @@ class ResourceAgent(Agent):
             # same-named file happened to be there (§73).
             return {}
         for name in produced:
-            if _staging.plain_name(name) is None:
-                # Consumers refuse such names under staging (`plain_name`, §64); publishing a
-                # location under a key nobody will look up would only hide that.
+            rel = _staging.safe_relpath(name)
+            if rel is None:
+                # Absolute or escaping (`..`): not stageable, and joined onto the work dir it
+                # would name a file outside it.
                 self.logger.error(
-                    "[STAGE] job %s output %r has a directory component, which staging does "
-                    "not support; it gets no location", job.job_id, name)
+                    "[STAGE] job %s output %r is not a contained relative name; it gets no "
+                    "location", job.job_id, name)
                 continue
-            path = os.path.join(work_dir, os.path.basename(str(name)))
+            # The path the job wrote it at — the LFN relative to its working directory,
+            # directories included (§64).
+            path = os.path.join(work_dir, rel)
             if not os.path.isfile(path):
                 # The job exited 0 and declared this output but did not write it. That is a
                 # workflow (or converter) fault, and here is where it is visible; the location

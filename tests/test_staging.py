@@ -126,10 +126,14 @@ def test_the_server_serves_only_what_it_published(tmp_path):
         # because the local path is built from it. The server refusing is not enough — the temp
         # file is opened first, so a traversing name would write outside dest_dir on the way to
         # being told no.
-        for name in ("../p/secret.txt", "/etc/passwd", "..", "sub/dir.txt"):
+        for name in ("../p/secret.txt", "/etc/passwd", "..", "sub/../../x"):
             out = staging.fetch(name, loc, dest_dir, run_id="run-1")
             assert not out.ok, f"{name} should be refused"
-            assert "not a plain file name" in out.reason, out.reason
+            assert "not a contained relative name" in out.reason, out.reason
+        # A CONTAINED name with a directory is a legitimate LFN since §64; this server did not
+        # publish it, so the server refuses it by name.
+        out = staging.fetch("sub/dir.txt", loc, dest_dir, run_id="run-1")
+        assert not out.ok and "not produced by this agent" in out.reason
 
         assert not os.path.exists(os.path.join(dest_dir, "secret.txt"))
         assert os.listdir(dest_dir) == [], "no debris from any refused fetch"

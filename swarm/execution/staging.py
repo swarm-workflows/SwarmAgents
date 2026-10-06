@@ -108,19 +108,27 @@ def policy() -> StagingPolicy:
     return _POLICY
 
 
-def plain_name(name) -> Optional[str]:
-    """The staging key for a logical file name, or None when it cannot be staged.
+def safe_relpath(name) -> Optional[str]:
+    """The staging key — and the relative path under a working directory or store — for a
+    logical file name, or None when it cannot be staged.
 
-    ONE rule for producer and consumer. The producer registered the raw LFN while the consumer
-    looked up its basename, so a name with a directory component (`runA/out.csv`) was published
-    under one key and sought under another: a miss, then a fall through to the inputs root —
-    a stale read when a same-named file sat there (code review 2026-10-05 §64). Directory
-    components are not supported under staging; both sides refuse them by this test.
+    ONE rule for producer, server, client, store and runner. Names may carry directory
+    components (`runA/out.csv`, as Pegasus LFNs do); they are normalised (`.` and empty parts
+    dropped) and CONTAINED: an absolute path or any `..` component is refused, because the name
+    is workflow-supplied and is joined onto a directory (code review 2026-10-05 §64 — the
+    producer used to key the raw name while the consumer looked up its basename).
     """
-    name = str(name or "")
-    if not name or "/" in name or name in (".", ".."):
+    name = str(name or "").replace("\\", "/")
+    if not name or name.startswith("/"):
         return None
-    return name
+    parts = [p for p in name.split("/") if p not in ("", ".")]
+    if not parts or any(p == ".." for p in parts):
+        return None
+    return "/".join(parts)
+
+
+#: Kept as the name earlier callers used; it is the same rule.
+plain_name = safe_relpath
 
 
 def file_sha256(path: str, chunk: int = 1 << 20) -> str:
@@ -390,11 +398,11 @@ class _Servicer(consensus_pb2_grpc.DataTransferServiceServicer):
                     # Containment where the path is built, exactly as in `fetch`: the name is
                     # workflow-supplied, and joined onto the store a traversing name writes
                     # outside it.
-                    local = os.path.basename(name)
-                    if not local or local in (".", "..") or local != name:
+                    local = safe_relpath(name)
+                    if local is None:
                         self.put_refused += 1
                         return consensus_pb2.PutAck(
-                            ok=False, error=f"{name!r} is not a plain file name")
+                            ok=False, error=f"{name!r} is not a contained relative name")
                     run = str(chunk.run_id or "")
                     if run and self.run_id and run != self.run_id:
                         # Same restriction as the download side, checked the same way.
@@ -413,10 +421,11 @@ class _Servicer(consensus_pb2_grpc.DataTransferServiceServicer):
                             ok=False, error="upload carries no run_id; a store is keyed by "
                                             "(run, name) and cannot file it")
                     run_dir = os.path.join(self.store_dir, _safe_run_dir(run))
-                    os.makedirs(run_dir, exist_ok=True)
+                    dest_parent = os.path.dirname(os.path.join(run_dir, local))
+                    os.makedirs(dest_parent, exist_ok=True)
                     tmp = os.path.join(
-                        run_dir,
-                        f".{local}.put.{os.getpid()}.{threading.get_ident()}")
+                        dest_parent,
+                        f".{os.path.basename(local)}.put.{os.getpid()}.{threading.get_ident()}")
                     fh = open(tmp, "wb")
                 if chunk.content:
                     fh.write(chunk.content)
@@ -583,17 +592,27 @@ def fetch(name: str, location: dict, dest_dir: str, run_id: str, requester: str 
     # server's refusal is ever read, so the server being careful is not enough. A staged file
     # is always a plain name in the working directory — `stage_inputs` already basenames for
     # the same reason, and this makes the rule hold for every caller.
-    local = os.path.basename(str(name))
-    if not local or local in (".", "..") or local != str(name):
+    local = safe_relpath(name)
+    if local is None:
         return FetchResult(
-            False, f"{name!r} is not a plain file name; refusing to stage it")
+            False, f"{name!r} is not a contained relative name; refusing to stage it")
 
     host, port = location.get("host"), location.get("port")
     if not host or not port:
         return FetchResult(False, f"location for {name!r} has no host/port: {location!r}")
 
     target = f"{host}:{int(port)}"
-    tmp = os.path.join(dest_dir, f".{local}.fetch.{os.getpid()}.{threading.get_ident()}")
+    dest_parent = os.path.dirname(os.path.join(dest_dir, local))
+    # Remember which directories this fetch creates, so a refused or failed fetch leaves no
+    # empty directories behind (a nested name's parents exist before the server is asked).
+    created = []
+    probe = dest_parent
+    while os.path.normpath(probe) != os.path.normpath(dest_dir) and not os.path.isdir(probe):
+        created.append(probe)
+        probe = os.path.dirname(probe)
+    os.makedirs(dest_parent, exist_ok=True)
+    tmp = os.path.join(dest_parent,
+                       f".{os.path.basename(local)}.fetch.{os.getpid()}.{threading.get_ident()}")
     digest = hashlib.sha256() if pol.verify else None
     received = 0
     size = 0
@@ -666,6 +685,12 @@ def fetch(name: str, location: dict, dest_dir: str, run_id: str, requester: str 
             os.unlink(tmp)
         except OSError:
             pass
+        if not os.path.exists(os.path.join(dest_dir, local)):
+            for d in created:                       # deepest first; never dest_dir itself
+                try:
+                    os.rmdir(d)
+                except OSError:
+                    break
 
 
 @dataclass
@@ -692,9 +717,10 @@ def put(name: str, path: str, run_id: str, sender: str = "",
     pol = pol or _POLICY
     if not pol.store_host:
         return PutResult(False, "no staging site configured (staging.store_host is empty)")
-    local = os.path.basename(str(name))
-    if not local or local in (".", "..") or local != str(name):
-        return PutResult(False, f"{name!r} is not a plain file name; refusing to stage it out")
+    local = safe_relpath(name)
+    if local is None:
+        return PutResult(False, f"{name!r} is not a contained relative name; refusing to stage "
+                                f"it out")
     if not os.path.isfile(path):
         return PutResult(False, f"{name!r} is not on disk at {path}")
 
@@ -767,7 +793,7 @@ def fetch_any(name: str, locations, dest_dir: str, run_id: str, requester: str =
             # the producer published. A store holding another attempt's body, or a peer serving
             # a stale copy, both pass the first check (§65).
             want = loc.get("sha256")
-            dest = os.path.join(dest_dir, os.path.basename(str(name)))
+            dest = os.path.join(dest_dir, safe_relpath(name) or os.path.basename(str(name)))
             if want and os.path.isfile(dest) and file_sha256(dest) != want:
                 try:
                     os.unlink(dest)

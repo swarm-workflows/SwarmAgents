@@ -159,3 +159,40 @@ class TestSmaller:
         src = open(os.path.join(REPO, "swarm/agents/resource_agent.py")).read()
         i = src.index("            locations = self._publish_locations(job, produced)")
         assert src[i - 400:i].rstrip().endswith("try:")
+
+
+# --------------------------------------------------------------------------- §72 (apptainer)
+class TestApptainerPullsBeforeTheClock:
+    CMD = ["apptainer", "exec", "--containall", "--bind", "/w:/w", "--pwd", "/w",
+           "--bind", "/code:/srv/x:ro", "docker://repo/img:1", "/srv/x", "--flag"]
+
+    def test_the_image_argument_is_found_past_the_flags(self):
+        assert runner._apptainer_image_index(self.CMD) == self.CMD.index("docker://repo/img:1")
+
+    def test_a_registry_image_is_pulled_once_and_the_command_rewritten(self, tmp_path,
+                                                                     monkeypatch):
+        calls = []
+
+        def fake_run(cmd, **k):
+            calls.append(cmd)
+            open(cmd[2], "wb").write(b"sif")                # `apptainer pull <tmp> <ref>`
+            return MagicMock(returncode=0, stderr="")
+        monkeypatch.setattr(runner.subprocess, "run", fake_run)
+        runner.configure(mode="real", roots={"images": str(tmp_path)})
+        cmd, _s, refusal = runner._ensure_apptainer_image(self.CMD, runner.policy(), "/w")
+        assert refusal == "" and cmd[9].endswith(".sif") and os.path.isfile(cmd[9])
+        assert cmd[10:] == ["/srv/x", "--flag"]
+        cmd2, _s, _r = runner._ensure_apptainer_image(self.CMD, runner.policy(), "/w")
+        assert cmd2[9] == cmd[9] and len(calls) == 1         # cached: no second pull
+
+    def test_a_failed_pull_is_a_refusal(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(runner.subprocess, "run",
+                            lambda cmd, **k: MagicMock(returncode=255, stderr="denied"))
+        runner.configure(mode="real", roots={"images": str(tmp_path)})
+        _c, _s, refusal = runner._ensure_apptainer_image(self.CMD, runner.policy(), "/w")
+        assert "could not pull image docker://repo/img:1" in refusal
+
+    def test_a_local_sif_is_left_alone(self):
+        cmd = list(self.CMD)
+        cmd[9] = "/imgs/x.sif"
+        assert runner._ensure_apptainer_image(cmd, runner.policy(), "/w") == (cmd, 0.0, "")
