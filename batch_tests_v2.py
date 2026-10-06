@@ -201,7 +201,20 @@ def main():
     # Pegasus job integration (passthrough to run_test.py)
     ap.add_argument("--pegasus-profiles", default=None,
                     help="Path to Pegasus profiles file (text/export) or Redis host")
-    ap.add_argument("--pegasus-input-type", choices=["text", "redis", "export"], default="text",
+    # Forwarded to run_test.py verbatim when given (code review 2026-10-05 §56: a batch could not
+    # run a converted workflow, a quantum cell or a Grafana-instrumented campaign at all).
+    ap.add_argument("--pegasus-jobs-dir", default=None)
+    ap.add_argument("--pegasus-data-nodes", choices=["per-site", "per-file"], default=None)
+    ap.add_argument("--pegasus-dtn-names", default=None)
+    ap.add_argument("--pegasus-bundle-source-root", default=None)
+    ap.add_argument("--pegasus-dag-gating", action="store_true")
+    ap.add_argument("--textfile-dir", default=None)
+    ap.add_argument("--quantum-agents-pct", type=float, default=None)
+    ap.add_argument("--quantum-fraction", type=float, default=None)
+    ap.add_argument("--hybrid-fraction", type=float, default=None)
+    ap.add_argument("--split-hybrid", action="store_true")
+    ap.add_argument("--job-target-agents", type=int, default=None)
+    ap.add_argument("--pegasus-input-type", choices=["text", "redis", "export", "json"], default="text",
                     help="Format of the Pegasus profiles source (default: text)")
 
     # Logging/output structure per run
@@ -336,6 +349,7 @@ def main():
         if args.pegasus_profiles:
             cmd += ["--pegasus-profiles", args.pegasus_profiles]
             cmd += ["--pegasus-input-type", args.pegasus_input_type]
+        cmd += forwarded_run_flags(args)
 
         log(f"[{run_name}] Starting test…")
         (logs_dir / "batch_runner.log").write_text(
@@ -366,6 +380,26 @@ def main():
         log(f"{len(failed_runs)} run(s) failed: " +
             ", ".join(f"{n} (exit {rc})" for n, rc in failed_runs))
         return 1
+
+#: batch flag -> run_test.py flag, forwarded when set. Valued flags go as "--flag value";
+#: store_true flags as "--flag".
+_FORWARD_VALUED = ("pegasus_jobs_dir", "pegasus_data_nodes", "pegasus_dtn_names",
+                   "pegasus_bundle_source_root", "textfile_dir", "quantum_agents_pct",
+                   "quantum_fraction", "hybrid_fraction", "job_target_agents")
+_FORWARD_SWITCHES = ("pegasus_dag_gating", "split_hybrid")
+
+
+def forwarded_run_flags(args) -> list:
+    out = []
+    for name in _FORWARD_VALUED:
+        value = getattr(args, name, None)
+        if value is not None:
+            out += ["--" + name.replace("_", "-"), str(value)]
+    for name in _FORWARD_SWITCHES:
+        if getattr(args, name, False):
+            out.append("--" + name.replace("_", "-"))
+    return out
+
 
 if __name__ == "__main__":
     sys.exit(main() or 0)

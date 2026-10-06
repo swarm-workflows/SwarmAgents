@@ -21,7 +21,7 @@
 #
 # Usage:  sudo ./fix_slice_clocks.sh [--check] [host ...]
 #           --check   report synchronisation state and change nothing
-#           host ...  default: every agent-N in agent_hosts.txt, else agent-1..agent-92
+#           host ...  default: every agent-N in /etc/hosts (the whole slice), else agent-1..agent-92
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -30,13 +30,20 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHECK_ONLY=0
 [ "${1:-}" = "--check" ] && { CHECK_ONLY=1; shift; }
 
+# The default is the whole SLICE, from /etc/hosts — not agent_hosts.txt, which run_test.py
+# rewrites with the last run's subset (or `localhost` in local mode), so a repair or a check
+# covered 30 nodes, or only this one, and reported every node synchronised (code review
+# 2026-10-05 §59). Monitoring aliases (agent-N-mon) are excluded.
 if [ "$#" -gt 0 ]; then
     HOSTS=("$@")
-elif [ -f "$HERE/agent_hosts.txt" ]; then
-    mapfile -t HOSTS < "$HERE/agent_hosts.txt"
 else
-    mapfile -t HOSTS < <(seq 1 92 | sed 's/^/agent-/')
+    mapfile -t HOSTS < <(awk '{for (i = 2; i <= NF; i++) if ($i ~ /^agent-[0-9]+$/) print $i}' \
+                             /etc/hosts 2>/dev/null | sort -t- -k2,2n -u)
+    if [ "${#HOSTS[@]}" -eq 0 ]; then
+        mapfile -t HOSTS < <(seq 1 92 | sed 's/^/agent-/')
+    fi
 fi
+echo "Hosts: ${#HOSTS[@]} (${HOSTS[0]} .. ${HOSTS[${#HOSTS[@]}-1]})"
 
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new)
 PARALLEL="${PARALLEL:-20}"

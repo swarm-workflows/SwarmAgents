@@ -89,6 +89,22 @@ if [[ ${#HOSTS[@]} -eq 0 ]]; then
     [[ ${#HOSTS[@]} -eq 0 ]] && mapfile -t HOSTS < <(seq 1 92 | sed 's/^/agent-/')
 fi
 
+# A real write from EVERY host that the server reads back; prints the hosts that fail. `findmnt`
+# is not a check (CLAUDE.md: a root-owned sticky export passes it and refuses writes), and the
+# setup path used to probe only the first host (code review 2026-10-05 §59).
+probe_writes() {
+    local tag="nfs-probe-$$"
+    printf '%s\n' "${HOSTS[@]}" | xargs -P 40 -I{} bash -c \
+        "$SSH {} 'echo ok > $MOUNT_DIR/.${tag}-{}' >/dev/null 2>&1 || true"
+    for h in "${HOSTS[@]}"; do
+        if [[ -f "$EXPORT_DIR/.${tag}-$h" ]]; then
+            rm -f "$EXPORT_DIR/.${tag}-$h"
+        else
+            echo "$h"
+        fi
+    done
+}
+
 # ---------------------------------------------------------------------------- check mode
 if [[ $CHECK_ONLY -eq 1 ]]; then
     echo "=== database node ==="
@@ -109,11 +125,17 @@ if [[ $CHECK_ONLY -eq 1 ]]; then
     # of defect as a mount that exists but cannot be written to: it stays invisible until a
     # job lands on one of the hosts that was never set up.
     unmounted=$(echo "$results" | grep -c '^NOT-MOUNTED' || true)
-    if ! systemctl is-active --quiet nfs-server 2>/dev/null || [[ "$unmounted" -gt 0 ]]; then
-        echo "NOT READY: $unmounted/${#HOSTS[@]} host(s) unmounted" >&2
+    unwritable=$(probe_writes)
+    nw=$(printf '%s' "$unwritable" | grep -c . || true)
+    if [[ -n "$unwritable" ]]; then
+        echo "  write probe FAILED on: $(echo $unwritable)" >&2
+    fi
+    if ! systemctl is-active --quiet nfs-server 2>/dev/null || [[ "$unmounted" -gt 0 ]] \
+            || [[ "$nw" -gt 0 ]]; then
+        echo "NOT READY: $unmounted/${#HOSTS[@]} host(s) unmounted, $nw unwritable" >&2
         exit 1
     fi
-    echo "READY: ${#HOSTS[@]}/${#HOSTS[@]} host(s) mounted"
+    echo "READY: ${#HOSTS[@]}/${#HOSTS[@]} host(s) mounted and writable"
     exit 0
 fi
 
@@ -205,15 +227,12 @@ fi
 # A mount that exists but cannot be written to is the failure this whole step is meant to
 # rule out, and it is invisible to `findmnt`. Prove it round-trips before anything depends
 # on it: one agent writes, the server reads it back.
-echo "[3/4] verifying a write from an agent is visible on the server"
-PROBE="$EXPORT_DIR/.nfs-probe-$$"
-FIRST="${HOSTS[0]}"
-if $SSH "$FIRST" "echo ok > $MOUNT_DIR/.nfs-probe-$$" 2>/dev/null && [[ -f "$PROBE" ]]; then
-    echo "      ok ($FIRST wrote, database read)"
-    rm -f "$PROBE"
+echo "[3/4] verifying a write from EVERY agent is visible on the server"
+unwritable=$(probe_writes)
+if [[ -z "$unwritable" ]]; then
+    echo "      ok (${#HOSTS[@]} agents wrote, database read every file)"
 else
-    echo "      FAILED: $FIRST could not write a file the server can see" >&2
-    rm -f "$PROBE"
+    echo "      FAILED: these hosts could not write a file the server can see: $(echo $unwritable)" >&2
     exit 1
 fi
 
@@ -235,16 +254,26 @@ else
     BASE="$(basename "$STAGE_IMAGE")"
     SIZE=$(du -h "$STAGE_IMAGE" | cut -f1)
     echo "      staging $BASE ($SIZE) to $IMG_DIR on ${#HOSTS[@]} agents (local disk)"
+    # A host already holding the SAME bytes is skipped, so a rerun is cheap — by checksum, not
+    # size: a same-sized different image (a rebuilt tag) was skipped as current. Every failure
+    # is collected and fails the step: it used to WARN and exit 0 over a partial fleet (§59).
+    want=$(sha256sum "$STAGE_IMAGE" | cut -d' ' -f1)
+    failed=()
     for h in "${HOSTS[@]}"; do
-        $SSH "$h" "mkdir -p $IMG_DIR" 2>/dev/null || continue
-        # Skip a host that already has it at the right size, so a rerun is cheap.
-        want=$(stat -c%s "$STAGE_IMAGE")
-        have=$($SSH "$h" "stat -c%s $IMG_DIR/$BASE 2>/dev/null || echo 0" 2>/dev/null || echo 0)
+        if ! $SSH "$h" "mkdir -p $IMG_DIR" 2>/dev/null; then failed+=("$h"); continue; fi
+        have=$($SSH "$h" "sha256sum $IMG_DIR/$BASE 2>/dev/null | cut -d' ' -f1" 2>/dev/null || true)
         [[ "$have" == "$want" ]] && continue
-        scp -q -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$STAGE_IMAGE" "$h:$IMG_DIR/" \
-            || echo "      WARN: $h image copy failed" >&2
+        if ! scp -q -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$STAGE_IMAGE" "$h:$IMG_DIR/"; then
+            failed+=("$h"); continue
+        fi
+        have=$($SSH "$h" "sha256sum $IMG_DIR/$BASE 2>/dev/null | cut -d' ' -f1" 2>/dev/null || true)
+        [[ "$have" == "$want" ]] || failed+=("$h")
     done
-    echo "      done"
+    if [[ ${#failed[@]} -gt 0 ]]; then
+        echo "      FAILED on ${#failed[@]} host(s): ${failed[*]}" >&2
+        exit 1
+    fi
+    echo "      done (${#HOSTS[@]} hosts verified by sha256)"
     echo "      set runtime.execution.roots.images: $IMG_DIR"
 fi
 

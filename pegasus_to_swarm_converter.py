@@ -63,7 +63,9 @@ def parse_redis(host: str, port: int = 6379, pattern: str = "pegasus:profile:*")
     """Scan Redis for keys matching pattern and yield (key, profile) tuples."""
     import redis
     r = redis.StrictRedis(host=host, port=port, decode_responses=True)
-    for key in r.scan_iter(match=pattern):
+    # Sorted: scan_iter order is arbitrary, so `job_{i}` numbering changed from one conversion
+    # of the same profiles to the next (code review 2026-10-05 §58).
+    for key in sorted(r.scan_iter(match=pattern)):
         raw = r.get(key)
         if raw:
             yield key, json.loads(raw)
@@ -165,9 +167,28 @@ def _map_capacities(profile: dict, default_cores: float, min_ram_gb: float,
     }
 
 
+def refuse_duplicate_job_ids(mapped) -> None:
+    """Refuse a conversion that would publish two jobs under one id.
+
+    The id is `<run_name>_<job_name>`, and run_name is the dax label plus the submit directory's
+    basename — so two submit trees that both end in `run0001` for one workflow yield identical
+    ids. Redis keeps one job per id while the files and `total_jobs_written` say N: a workload
+    silently smaller than the one it reports (code review 2026-10-05 §58).
+    """
+    seen: Dict[str, int] = {}
+    for _i, job, _p, _w in mapped:
+        seen[job["id"]] = seen.get(job["id"], 0) + 1
+    dupes = sorted(j for j, n in seen.items() if n > 1)
+    if dupes:
+        raise ValueError(
+            f"{len(dupes)} job id(s) occur more than once, e.g. {dupes[:3]}. Two submit "
+            f"directories with the same basename for the same workflow produce identical ids; "
+            f"rename one (or convert them separately) so each run has a distinct run_name.")
+
+
 def make_dtn_resolver(dtn_map: Optional[Dict[str, str]] = None,
                       dtn_names: Optional[List[str]] = None,
-                      dtn_scope: str = "file"):
+                      dtn_scope: str = "job"):
     """Build a (site, lfn, group_key) -> DTN-name resolver.
 
     dtn_map renames Pegasus site names (e.g. {"local": "dtn1"}); sites not in
@@ -243,7 +264,7 @@ def _map_data_nodes(files_list: Optional[list],
 
     # The size of the lfn this node kept, carried like the per-file branch does. Dropping it
     # was silent data loss: `size_bytes` is the only per-file volume signal a job record has,
-    # and per-site is the DEFAULT mode, so a workload converted without --dag-gating had none
+    # and per-site WAS the default mode (per-file since 2026-10-06), so a workload converted without --dag-gating had none
     # at all (measured: 1549 of 1549 trace nodes bare, against 5194 of 5194 populated in a
     # per-file conversion of the same shape). The node already names one file; withholding
     # that file's size while keeping its name was arbitrary.
@@ -270,7 +291,7 @@ def map_profile(profile: dict, job_number: int,
                 default_cores: float = 1.0,
                 min_ram_gb: float = 0.1,
                 min_disk_gb: float = 1.0,
-                data_nodes_mode: str = "per-site",
+                data_nodes_mode: str = "per-file",
                 dtn_resolver=None) -> Tuple[dict, List[str]]:
     """Convert a single Pegasus profile to a SwarmAgents job dict."""
     warnings: List[str] = []
@@ -837,10 +858,10 @@ def convert_pegasus_profiles(
     default_cores: float = 1.0,
     min_ram_gb: float = 0.1,
     min_disk_gb: float = 1.0,
-    data_nodes_mode: str = "per-site",
+    data_nodes_mode: str = "per-file",
     dtn_map: Optional[Dict[str, str]] = None,
     dtn_names: Optional[List[str]] = None,
-    dtn_scope: str = "file",
+    dtn_scope: str = "job",
     dag_gating: bool = False,
     bundle: bool = True,
     bundle_source_root: Optional[str] = None,
@@ -921,6 +942,7 @@ def convert_pegasus_profiles(
             dtn_resolver=dtn_resolver,
         )
         mapped.append((i, job, profile, warnings))
+    refuse_duplicate_job_ids(mapped)
 
     dag_edges, dag_roots = (apply_dag_gating([j for _, j, _, _ in mapped])
                             if dag_gating else (0, []))
@@ -1588,6 +1610,7 @@ def convert(args: argparse.Namespace):
             dtn_resolver=dtn_resolver,
         )
         mapped.append((i, job, profile, warnings))
+    refuse_duplicate_job_ids(mapped)
 
     dag_edges, dag_roots = (apply_dag_gating([j for _, j, _, _ in mapped])
                             if args.dag_gating else (0, []))
@@ -1802,10 +1825,11 @@ def parse_args() -> argparse.Namespace:
         help="Default core count when request_cpus_db is 0. Default: 1.0."
     )
     parser.add_argument(
-        "--data-nodes", choices=["per-site", "per-file"], default="per-site",
+        "--data-nodes", choices=["per-site", "per-file"], default="per-file",
         help="data_in/data_out granularity: 'per-site' dedups to one DataNode "
              "per site (historical behavior); 'per-file' keeps every "
-             "input/output file with its size. Default: per-site."
+             "input/output file with its size. Default: per-file (since 2026-10-06; per-site "
+             "loses DAG edges and inputs, and run_test.py always used per-file)."
     )
     parser.add_argument(
         "--dtn-map", type=str, default=None,
@@ -1843,7 +1867,7 @@ def parse_args() -> argparse.Namespace:
              "is independent and the whole DAG is proposed at once."
     )
     parser.add_argument(
-        "--dtn-scope", choices=["file", "job"], default="file",
+        "--dtn-scope", choices=["file", "job"], default="job",
         help="With --dtn-names, hash over the file name ('file', spreads a job's files "
              "across DTNs) or over the job ('job', puts all of a job's files on one DTN). "
              "Use 'job' for jobs that will be scheduled — feasibility requires an agent to "

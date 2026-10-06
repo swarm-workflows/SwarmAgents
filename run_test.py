@@ -2072,7 +2072,8 @@ def parse_args() -> argparse.Namespace:
 
     # Plot generation
     ap.add_argument("--generate-plots", action="store_true",
-                    help="Generate full plots after test (default: CSV-only with --skip-plots)")
+                    help="NO EFFECT: the plotting step always runs in full. Accepted so existing "
+                         "scripts keep working (code review 2026-10-05 §56).")
 
     # Test shutdown control
     ap.add_argument("--shutdown-after-seconds", type=int, default=0,
@@ -2141,7 +2142,9 @@ def parse_args() -> argparse.Namespace:
                          "ladder (e.g. 270) so agent i is the same machine at every size; "
                          "without it, flavours scale with fleet size and the ladder compares "
                          "different fleets.")
-    ap.add_argument("--log-dir", default="logs")
+    ap.add_argument("--log-dir", default="logs",
+                    help="NO EFFECT: agent logs are written to --run-dir as agent-<id>.log. "
+                         "Accepted so existing scripts keep working (code review §56).")
 
     return ap.parse_args()
 
@@ -2195,6 +2198,10 @@ def main() -> None:
     if args.pegasus_jobs_dir:
         validate_pegasus_jobs_dir(args)
 
+    for flag, given in (("--generate-plots", args.generate_plots),
+                        ("--log-dir", args.log_dir != "logs")):
+        if given:
+            log(f"NOTE: {flag} has no effect (agent logs are in --run-dir; plots always run).")
     run_id = f"{Path(args.run_dir).name}-{datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}"
     os.environ["SWARM_RUN_ID"] = run_id
     log(f"run_id={run_id}")
