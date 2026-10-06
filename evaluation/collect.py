@@ -892,18 +892,31 @@ def regret_metrics(run_dir: Path) -> dict[str, Any]:
         print(f"  warn: regret scoring failed for {run_dir.name}: {exc}", file=sys.stderr)
         return {}
 
+    scored = summary["decisions_scored"]
+    unscored = summary.get("decisions_unscored", 0)
     out = {
         "regret_total": summary["regret_total"],
         "regret_mean": summary["regret_mean"],
+        "regret_mean_all_scored": summary.get("regret_mean_all_scored"),
         "routing_accuracy": summary["routing_accuracy"],
-        "regret_decisions_scored": summary["decisions_scored"],
+        "regret_decisions_scored": scored,
+        # What the oracle REFUSED to score, on the same row as what it scored. A decision is
+        # unscored when any candidate cannot be priced — in E2b, every decision with a killed
+        # member's group as a candidate — so `regret_total` covers only the easy decisions,
+        # and without these columns nothing on the row said so (code review 2026-10-05 §40).
+        "regret_decisions_unscored": unscored,
+        "regret_scored_share": (round(scored / (scored + unscored), 6)
+                                if (scored + unscored) else None),
+        "regret_decisions_with_a_choice": summary.get("decisions_with_a_choice"),
+        "regret_decisions_without_a_choice": summary.get("decisions_without_a_choice"),
         "regret_aggregate": summary["regret_aggregate"],
     }
     # The staleness figure (F6) is regret against context age, so the correlation between
     # them belongs on the same row as both — otherwise every plot of it starts by rejoining
-    # two files.
+    # two files. Over decisions with a choice only: the no-choice rows are zero regret at every
+    # age and would pull the correlation toward 0.
     paired = [(r["ctx_age_mean"], r["regret"]) for r in rows
-              if r.get("ctx_age_mean") is not None]
+              if r.get("ctx_age_mean") is not None and not r.get("no_choice")]
     if len(paired) > 2:
         ages = pd.Series([p[0] for p in paired], dtype=float)
         regrets = pd.Series([p[1] for p in paired], dtype=float)

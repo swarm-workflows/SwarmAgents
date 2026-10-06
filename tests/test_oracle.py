@@ -491,3 +491,32 @@ def test_validation_ignores_jobs_that_never_finished(tmp_path):
     report = validate(run, tmp_path)
     assert report["per_job_type"][0]["n_jobs"] == 1
     assert report["per_job_type"][0]["observed_failure_rate"] == pytest.approx(1.0)
+
+
+# --------------------------------------------------------------------------------------------
+# Code review 2026-10-05 §40: the summary the collector puts on the row.
+# --------------------------------------------------------------------------------------------
+
+def test_regret_mean_is_over_decisions_with_a_choice():
+    """One wrong choice plus three fan-outs covering every candidate. Over all scored decisions
+    the mean was a quarter of the real per-choice regret, and fell further as fan-out widened."""
+    run = _run([_decision([0])] + [_decision([0, 1], policy="bandit_all", job_id=f"a{i}")
+                                    for i in range(3)])
+    rows, summary = score_run(run)
+    assert summary["regret_mean"] == pytest.approx(rows[0]["regret"])
+    assert summary["regret_mean_all_scored"] == pytest.approx(rows[0]["regret"] / 4)
+
+
+def test_the_collector_row_says_what_was_not_scored(tmp_path, monkeypatch):
+    """E2b: a killed member's group cannot be priced, so every decision naming it is unscored and
+    regret_total covers only the easy ones. The row must carry that, not just the total."""
+    import evaluation.oracle as oracle
+    from evaluation.collect import regret_metrics
+    run = _run([_decision([0]), _decision([0], candidates=(0, 5), job_id="j2"),
+                _decision([1], candidates=(1, 5), job_id="j3")])
+    monkeypatch.setattr(oracle, "load_run", lambda run_dir: run)
+    out = regret_metrics(tmp_path)
+    assert out["regret_decisions_scored"] == 1
+    assert out["regret_decisions_unscored"] == 2
+    assert out["regret_scored_share"] == pytest.approx(1 / 3)
+    assert out["regret_decisions_with_a_choice"] == 1

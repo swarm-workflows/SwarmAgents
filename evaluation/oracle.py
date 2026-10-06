@@ -326,7 +326,13 @@ def score_run(run: dict, aggregate: str = "mean") -> tuple[list[dict], dict]:
         # "the policy got them all right".
         "decisions_without_a_choice": len(rows) - len(decided),
         "regret_total": round(cumulative, 6),
-        "regret_mean": round(cumulative / len(rows), 6),
+        # Over decisions that HAD a choice, like routing_accuracy: a decision whose candidates
+        # were all equally good has zero regret by construction, and averaging those in diluted
+        # the mean as fan-out widened (code review 2026-10-05 §40). The all-scored mean is kept
+        # under its own name.
+        "regret_mean": (round(sum(r["regret"] for r in decided) / len(decided), 6)
+                        if decided else None),
+        "regret_mean_all_scored": round(cumulative / len(rows), 6),
         # Over decisions that HAD a choice: including the inert ones would report a routing
         # accuracy that rises as a coordinator's fan-out widens, which measures configuration
         # rather than the policy.
