@@ -463,3 +463,55 @@ class TestUnannouncedClaims:
         a.engine = MagicMock()
         a._adopt_unannounced_claims()
         a.repository.get_assignments.assert_not_called()
+
+
+class TestNoClaimForADeadAgent:
+    """Stop-time review of §8: after a stale hint re-opened the vote, peers with the same stale
+    map still answered "decided for 9" — and those answers were tallied as votes for 9, so the
+    vote converged on the dead agent and the ordinary finalize claimed the freed key for it."""
+
+    def _engine(self, live=lambda a: a != 9):
+        eng, host, transport, cas = _make_engine(agent_id=1, peers=(2, 3, 4), k=3, beta=2)
+        host.is_agent_live = live
+        eng.propose([ProposalInfo(p_id="p", object_id="job-d", cost=10.0, agent_id="1")])
+        return eng, host, transport, cas
+
+    def _round(self, eng, transport, answers, decided):
+        eng._tick(now=0.0)
+        q = _latest_query_item(transport, "job-d")
+        for peer, choice in answers:
+            eng.on_snow_response(SnowResponse(source=peer, query_id=q["query_id"], job_id="job-d",
+                                              preferred_agent=choice, cost=0.0,
+                                              already_decided=decided))
+        eng._tick(now=0.0)
+
+    def test_stale_hints_after_a_reopen_are_not_votes(self):
+        eng, host, transport, cas = self._engine()
+        eng._finalize_work_inner(eng._states["job-d"], 9, "peer-decided")    # stale → reopen
+        for _ in range(4):
+            self._round(eng, transport, [(2, 9), (3, 9), (4, 9)], decided=True)
+        assert cas.get("job-d") is None
+
+    def test_a_vote_that_converges_on_a_dead_agent_does_not_claim_for_it(self):
+        eng, host, transport, cas = self._engine()
+        eng._finalize_work_inner(eng._states["job-d"], 9, "beta@round=2")
+        assert cas.get("job-d") is None
+        assert eng.dead_candidate_refusals == 1
+        assert not eng._states["job-d"].finalized
+
+    def test_a_live_winner_is_still_claimed(self):
+        eng, host, transport, cas = self._engine()
+        eng._finalize_work_inner(eng._states["job-d"], 3, "beta@round=2")
+        assert cas.get("job-d") == 3
+
+    def test_the_adapter_uses_heartbeat_liveness(self):
+        from swarm.agents.resource_agent import _HostAdapter
+        from swarm.utils.thread_safe_dict import ThreadSafeDict
+        agent = MagicMock()
+        agent.neighbor_map = ThreadSafeDict()
+        agent.neighbor_map.set(3, object())
+        agent.neighbor_map.set(9, object())
+        agent.failed_agents = ThreadSafeDict()
+        agent.failed_agents.set(9, 1.0)
+        host = _HostAdapter(agent)
+        assert host.is_agent_live(3) and not host.is_agent_live(9) and not host.is_agent_live(5)

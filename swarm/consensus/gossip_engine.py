@@ -199,6 +199,8 @@ class GossipConsensusEngine:
         self.won_count = 0
         # "Already decided" hints that proved stale and re-opened a vote (§8).
         self.stale_decided_hints = 0
+        # Finalizes refused because the vote converged on an agent not live here.
+        self.dead_candidate_refusals = 0
         self.abandoned_count = 0
         self.finalize_errors = 0
         # CAS won, object unreadable: no assignment produced. Never folded into `finalized`.
@@ -505,8 +507,11 @@ class GossipConsensusEngine:
             self._maybe_abort_or_continue(state, now)
             return
 
+        # A decided-hint is a claim to verify, never a vote: counted as one, several peers with
+        # the same stale map converged the vote on an agent that had since died, and the
+        # ordinary finalize then claimed the freed key for it (stop-time review of §8).
         counts = Counter(int(r.preferred_agent) for r in responses
-                         if r.preferred_agent is not None)
+                         if r.preferred_agent is not None and not r.already_decided)
         if not counts:
             with self._lock:
                 state.confidence = 0
@@ -519,7 +524,7 @@ class GossipConsensusEngine:
         # nor against. A peer that did not answer at all stays in it — silence is not an
         # abstention, and dropping it would let one fast responder decide a round.
         abstained = sum(1 for r in responses
-                        if r.preferred_agent is None and not r.already_decided)
+                        if r.preferred_agent is None or r.already_decided)
         sampled = state.queried or len(responses)
         alpha_threshold = self._alpha_threshold(max(sum(counts.values()), sampled - abstained))
 
@@ -631,6 +636,17 @@ class GossipConsensusEngine:
                 self._reopen(state)
                 return
             candidate = int(existing)
+        elif int(candidate) != self.agent_id and not self._candidate_live(int(candidate)):
+            # Never claim a job FOR an agent this agent believes dead: the claim is permanent
+            # until someone releases it, and the dead agent will not run the job. Re-open and
+            # let the vote find a live winner.
+            with self._stats_lock:
+                self.dead_candidate_refusals += 1
+            self.host.log_info(
+                f"[SNOW_DEAD_CANDIDATE] Object:{state.proposal.object_id} vote converged on "
+                f"{candidate}, which is not live here; re-opening the vote")
+            self._reopen(state)
+            return
         winner = self.host.try_claim_assignment(state.proposal.object_id, candidate)
 
         # Per-decision latency instrumentation: separates Snow round time from any
@@ -689,6 +705,10 @@ class GossipConsensusEngine:
             if elapsed >= 0:
                 self.time_to_finalize.add(elapsed)
 
+    def _candidate_live(self, agent_id: int) -> bool:
+        check = getattr(self.host, "is_agent_live", None)
+        return True if check is None else bool(check(agent_id))
+
     def _reopen(self, state: _SnowState) -> None:
         """Put a finalized-but-unclaimed instance back in play, ignoring decided-hints."""
         with self._lock:
@@ -721,6 +741,7 @@ class GossipConsensusEngine:
             "won": self.won_count,
             "abandoned": self.abandoned_count,
             "stale_decided_hints": self.stale_decided_hints,
+            "dead_candidate_refusals": self.dead_candidate_refusals,
             # Decisions that left the pending set without reaching either outcome: the CAS or
             # a host callback raised.
             "finalize_errors": self.finalize_errors,

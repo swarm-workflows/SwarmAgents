@@ -222,6 +222,12 @@ class _HostAdapter(ConsensusHost):
             level=self.agent.topology.level, group=self.agent.topology.group,
         )
 
+    def is_agent_live(self, agent_id: int) -> bool:
+        # Heartbeat's view — the authority for liveness (SWIM is advisory). In neighbor_map and
+        # not judged failed. Local, so safe on any thread.
+        return (int(agent_id) in self.agent.neighbor_map
+                and int(agent_id) not in self.agent.failed_agents)
+
     def get_assignment_local(self, object_id: str):
         # Peer-side already-decided short-circuit from LOCAL knowledge only (the
         # authoritative exactly-once check remains try_claim_assignment's Redis CAS).
