@@ -2157,10 +2157,13 @@ def parse_args() -> argparse.Namespace:
                     help="Path to Pegasus profiles file (text/export) or Redis host. "
                          "When set, jobs are converted from Pegasus profiles instead of generated synthetically.")
     ap.add_argument(
-        "--pegasus-dag-gating", action="store_true",
+        "--pegasus-dag-gating", action=argparse.BooleanOptionalAction, default=True,
         help="Reconstruct the workflow's dependency graph as per-job data predicates, so a "
-             "job is not selectable until its parents have produced what it reads. Required "
-             "for any real workflow; forces --pegasus-data-nodes per-file.")
+             "job is not selectable until its parents have produced what it reads. ON by "
+             "default since 2026-10-06 (it was off although this help called it required for "
+             "any real workflow, so a converted workflow ran every job at once): "
+             "--no-pegasus-dag-gating for independent replay. Forces --pegasus-data-nodes "
+             "per-file.")
     ap.add_argument(
         "--pegasus-bundle-source-root",
         help="Where the workflow tree lives on this fleet, so the converter can copy the "

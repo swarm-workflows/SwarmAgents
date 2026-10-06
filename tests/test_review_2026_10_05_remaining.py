@@ -105,3 +105,65 @@ def test_the_collector_runs_the_profile_validation():
     src = open(os.path.join(REPO, "evaluation/collect.py")).read()
     assert "verdict = validate(run, run_dir)" in src
     assert 'out["regret_profile_validated"]' in src
+
+
+# --------------------------------------------------------------------------- §46 leftovers
+def test_validate_takes_one_outcome_per_job_any_success_wins(tmp_path, monkeypatch):
+    import evaluation.oracle as oracle
+    jobs = tmp_path / "all_jobs.csv"
+    jobs.write_text("job_id,completed_at,exit_status\n"
+                    "j1,10,0\n"          # the leaf copy that succeeded
+                    "j1,11,1\n")         # a later fan-out copy that failed
+    monkeypatch.setattr(oracle, "score_decision",
+                        lambda d, run, agg: {"chosen_failure_rate": 0.1})
+    run = {"decisions": [{"job_id": "j1", "job_type": "cpu"}]}
+    out = oracle.validate(run, tmp_path)
+    assert out["validated"] is True
+    assert out["per_job_type"][0]["observed_failure_rate"] == 0.0
+
+
+def test_the_redis_job_loader_reads_every_group(monkeypatch):
+    import plotting.data as data
+
+    class _R:
+        store = {f"job:0:{g}:j{g}": json.dumps({"id": f"j{g}"}) for g in range(27)}
+        store["job:1:0:c1"] = json.dumps({"id": "c1"})
+
+        def __init__(self, **k):
+            pass
+
+        def scan_iter(self, match=None, count=None):
+            return list(self.store)
+
+        def mget(self, keys):
+            return [self.store[k] for k in keys]
+    monkeypatch.setattr(data.redis, "StrictRedis", _R)
+    df = data.load_jobs_from_redis("h")
+    assert len(df) == 28                                  # 27 leaf groups + a coordinator
+
+
+def test_from_csv_reads_all_jobs(tmp_path):
+    from plotting.data import load_jobs_from_csv
+    from test_collect import HEADER
+    (tmp_path / "all_jobs.csv").write_text(HEADER + "a,1,1,2,2,3,0,1,0,1\n")
+    assert list(load_jobs_from_csv(str(tmp_path))["job_id"]) == ["a"]
+
+
+def test_mab_plots_default_to_the_output_dirs_run_id():
+    src = open(os.path.join(REPO, "plotting/mab.py")).read()
+    assert 'run_id = (json.load(fh) or {}).get("run_id")' in src
+
+
+# --------------------------------------------------------------------------- §56
+def test_dag_gating_is_on_by_default_with_an_opt_out():
+    src = open(os.path.join(REPO, "run_test.py")).read()
+    assert '"--pegasus-dag-gating", action=argparse.BooleanOptionalAction, default=True,' in src
+    from batch_tests_v2 import forwarded_run_flags
+    import argparse
+    base = dict(pegasus_jobs_dir=None, pegasus_data_nodes=None, pegasus_dtn_names=None,
+                pegasus_bundle_source_root=None, textfile_dir=None, quantum_agents_pct=None,
+                quantum_fraction=None, hybrid_fraction=None, job_target_agents=None,
+                split_hybrid=False)
+    assert forwarded_run_flags(argparse.Namespace(**base, pegasus_dag_gating=None)) == []
+    assert forwarded_run_flags(argparse.Namespace(**base, pegasus_dag_gating=False)) == \
+        ["--no-pegasus-dag-gating"]

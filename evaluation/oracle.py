@@ -384,7 +384,13 @@ def validate(run: dict, run_dir: Path, aggregate: str = "mean") -> dict:
                 completed = record.get("completed_at")
                 if not completed or float(completed) <= 0:
                     continue  # never finished; its exit status means nothing
-                outcome[str(record.get("job_id"))] = 0 if float(status) == 0 else 1
+                # ONE outcome per job across its rows. all_jobs.csv holds a row per tier, and with
+                # fan-out one per group copy; last-row-wins took whichever came last. The job
+                # succeeded if ANY completed copy did — which is what the prediction it is
+                # compared with (the best selected group's rate) describes (§46).
+                failed = 0 if float(status) == 0 else 1
+                jid = str(record.get("job_id"))
+                outcome[jid] = min(outcome.get(jid, 1), failed)
     except (OSError, ValueError) as exc:
         return {"validated": False, "reason": f"could not read all_jobs.csv: {exc}"}
 

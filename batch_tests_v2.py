@@ -207,7 +207,7 @@ def main():
     ap.add_argument("--pegasus-data-nodes", choices=["per-site", "per-file"], default=None)
     ap.add_argument("--pegasus-dtn-names", default=None)
     ap.add_argument("--pegasus-bundle-source-root", default=None)
-    ap.add_argument("--pegasus-dag-gating", action="store_true")
+    ap.add_argument("--pegasus-dag-gating", action=argparse.BooleanOptionalAction, default=None)
     ap.add_argument("--textfile-dir", default=None)
     ap.add_argument("--quantum-agents-pct", type=float, default=None)
     ap.add_argument("--quantum-fraction", type=float, default=None)
@@ -386,7 +386,9 @@ def main():
 _FORWARD_VALUED = ("pegasus_jobs_dir", "pegasus_data_nodes", "pegasus_dtn_names",
                    "pegasus_bundle_source_root", "textfile_dir", "quantum_agents_pct",
                    "quantum_fraction", "hybrid_fraction", "job_target_agents")
-_FORWARD_SWITCHES = ("pegasus_dag_gating", "split_hybrid")
+_FORWARD_SWITCHES = ("split_hybrid",)
+#: Tri-state: forwarded as --flag / --no-flag only when given, so run_test.py's default applies.
+_FORWARD_BOOLEANS = ("pegasus_dag_gating",)
 
 
 def forwarded_run_flags(args) -> list:
@@ -398,6 +400,10 @@ def forwarded_run_flags(args) -> list:
     for name in _FORWARD_SWITCHES:
         if getattr(args, name, False):
             out.append("--" + name.replace("_", "-"))
+    for name in _FORWARD_BOOLEANS:
+        value = getattr(args, name, None)
+        if value is not None:
+            out.append(("--" if value else "--no-") + name.replace("_", "-"))
     return out
 
 

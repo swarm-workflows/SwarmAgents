@@ -152,7 +152,12 @@ def load_jobs_csv(csv_path: str, dedup: bool = True) -> pd.DataFrame:
 
 
 def load_jobs_from_csv(output_dir: str) -> pd.DataFrame:
-    """Load job data from CSV file."""
+    """Load job data from a run directory: `all_jobs.csv`, which is what run_test.py writes
+    (deduplicated to one row per job), else a legacy `jobs.csv`. It read only `jobs.csv`, which
+    a current run does not produce (code review 2026-10-05 §46)."""
+    all_jobs = os.path.join(output_dir, "all_jobs.csv")
+    if os.path.exists(all_jobs):
+        return load_jobs_csv(all_jobs)
     jobs_path = os.path.join(output_dir, "jobs.csv")
     if os.path.exists(jobs_path):
         return pd.read_csv(jobs_path)
@@ -173,17 +178,17 @@ def load_jobs_from_redis(db_host: str, db_port: int = 6379) -> pd.DataFrame:
     jobs = []
 
     try:
-        # Try multiple levels for hierarchical topology
-        for level in range(3):
-            for group in range(10):
-                raw = repo.get_all_objects(
-                    key_prefix=Repository.KEY_JOB,
-                    level=level,
-                    group=group
-                )
-                for data in raw:
-                    if isinstance(data, dict):
-                        jobs.append(data)
+        # EVERY job key, whatever its level and group. This walked groups 0-9 only, and Hier-270
+        # has 27 level-0 groups, so most of its jobs were silently dropped (§46).
+        keys = list(redis_client.scan_iter(match=f"{Repository.KEY_JOB}:*", count=1000))
+        for i in range(0, len(keys), 500):
+            for raw in redis_client.mget(keys[i:i + 500]):
+                try:
+                    data = json.loads(raw) if raw else None
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(data, dict):
+                    jobs.append(data)
     except Exception as e:
         print(f"Warning: Error loading jobs from Redis: {e}")
 

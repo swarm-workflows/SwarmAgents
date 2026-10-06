@@ -5,7 +5,7 @@ Second critical read of the code base, against the same question as the 2026-09-
 anything in the run saying so?** Everything found there is excluded here. Ranked by that
 question; within a rank, by how many cells it touches. Every finding names the file and line,
 the failing scenario, the metric it moves and the direction, and whether a test in `tests/` would
-catch it (none of the HIGH items has one). **Status (2026-10-06): every HIGH item and every MEDIUM item has been addressed; each heading carries its own FIXED / PARTLY FIXED note.** Regression tests are in `tests/test_review_2026_10_05_*.py` (13 files); where a file's tests could run against the pre-fix code, the commit message says how many failed there. **Still partly open:** §46 (validate()'s last-row-wins join; plotting Redis readers), §56 (`--pegasus-dag-gating` defaults off), and the §G config-drift table's remaining rows.
+catch it (none of the HIGH items has one). **Status (2026-10-06): every HIGH item and every MEDIUM item has been addressed; each heading carries its own FIXED / PARTLY FIXED note.** Regression tests are in `tests/test_review_2026_10_05_*.py` (13 files); where a file's tests could run against the pre-fix code, the commit message says how many failed there. **Still partly open:** and the §G config-drift table's remaining rows.
 
 **Method.** Six independent read-only passes, one per subsystem (consensus + membership; agent
 core + repository + selection; execution + staging; metrics + collection + plotting; run tooling
@@ -522,7 +522,7 @@ true index over the fleet is 0.33. The plan defines fairness "over per-agent loa
   (`instrumentation.py:374` → `collect.py:763-764`), so `aggregate()` averages skew over the
   skewed runs alone — the exact corollary bug the memory note records; `test_collect.py:903` covers
   the unmeasured case only.
-- **46. [PARTLY FIXED 2026-10-06 — a decision within `PHASE_BOUNDARY_MARGIN_S` (2 s) of a phase boundary is unscoreable, since its phase cannot be resolved across hosts; the collector runs the profile validation and reports `regret_profile_validated` / `_mae` / `regret_types_beyond_noise`. validate()'s last-row-wins join and the plotting Redis readers remain]** Oracle and plotting details. Phase elapsed is the coordinator's wall-clock `ts` minus
+- **46. [PARTLY FIXED 2026-10-06 — a decision within `PHASE_BOUNDARY_MARGIN_S` (2 s) of a phase boundary is unscoreable, since its phase cannot be resolved across hosts; the collector runs the profile validation and reports `regret_profile_validated` / `_mae` / `regret_types_beyond_noise`. validate() takes one outcome per job (any successful copy wins, matching the best-group prediction); the plotting Redis loader scans every job key; `mab.py` defaults its run id from run_meta.json and `--from-csv` reads all_jobs.csv]** Oracle and plotting details. Phase elapsed is the coordinator's wall-clock `ts` minus
   the member's wall-clock `failure_sim_start` (`oracle.py:191`) — cross-host, wrong by the offset
   near phase boundaries. `validate()` builds outcomes last-row-wins across tier and fan-out copies
   (`:358-368`) while the predicted rate is the min over selected groups (`:283`); mismatch under
