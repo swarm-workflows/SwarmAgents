@@ -28,6 +28,7 @@ from swarm.consensus.gossip_engine import SNOW_DEFAULTS, GossipConsensusEngine  
 from swarm.membership.swim import SWIM_DEFAULTS, SwimMembership  # noqa: E402
 from swarm.models.capacities import Capacities  # noqa: E402
 from swarm.models.job import Job  # noqa: E402
+from swarm.consensus.messages.agent_state_entry import AgentStateEntry  # noqa: E402
 
 
 @pytest.fixture(scope="module")
@@ -149,7 +150,6 @@ class TestStashExpires:
 # --------------------------------------------------------------------------- gossip
 def test_an_evicted_gossip_entry_is_not_resurrected_by_a_relayed_copy():
     from swarm.gossip.disseminator import GossipStateDisseminator
-    from swarm.consensus.messages.agent_state_entry import AgentStateEntry
     clock = [0.0]
     host = MagicMock(agent_id=1)
     d = GossipStateDisseminator(host=host, state_ttl_s=10.0, time_fn=lambda: clock[0])
@@ -161,6 +161,39 @@ def test_an_evicted_gossip_entry_is_not_resurrected_by_a_relayed_copy():
     assert d.get(7) is None
     d._merge_entry(AgentStateEntry(agent_id=7, load=10.0, version=5))     # the subject, alive
     assert d.get(7).version == 5
+
+
+def test_a_restarted_agent_is_readmitted_at_once():
+    """Codex review: a restart reset the counter to 0, so every new entry was <= the tombstone
+    (and <= any live copy) and the agent stayed out until it counted past its old version."""
+    from swarm.gossip.disseminator import GossipStateDisseminator
+    clock = [0.0]
+    peer = GossipStateDisseminator(host=MagicMock(agent_id=1), state_ttl_s=10.0,
+                                   time_fn=lambda: clock[0])
+    first = GossipStateDisseminator(host=MagicMock(agent_id=7))
+    peer._merge_entry(first.publish_local(load=50.0))
+    for _ in range(3):                       # agents publish once per tick, not per ms
+        old = first.publish_local(load=50.0)
+    peer._merge_entry(old)
+    clock[0] = 20.0
+    peer._evict_expired()
+    time.sleep(0.01)
+    restarted = GossipStateDisseminator(host=MagicMock(agent_id=7))   # fresh process
+    peer._merge_entry(restarted.publish_local(load=5.0))
+    assert peer.get(7) is not None and peer.get(7).load == 5.0
+
+
+def test_a_tombstone_expires_after_one_ttl():
+    from swarm.gossip.disseminator import GossipStateDisseminator
+    clock = [0.0]
+    d = GossipStateDisseminator(host=MagicMock(agent_id=1), state_ttl_s=10.0,
+                                time_fn=lambda: clock[0])
+    d._merge_entry(AgentStateEntry(agent_id=7, load=50.0, version=4))
+    clock[0] = 20.0
+    d._evict_expired()
+    clock[0] = 31.0
+    d._merge_entry(AgentStateEntry(agent_id=7, load=1.0, version=1))
+    assert d.get(7) is not None
 
 
 # --------------------------------------------------------------------------- completed sweep

@@ -86,9 +86,13 @@ class GossipStateDisseminator:
 
         self._lock = threading.RLock()
         self._cache: Dict[int, _CachedEntry] = {}
-        # agent_id -> version evicted as stale; refuses a relayed copy that is no newer.
-        self._evicted_version: Dict[int, int] = {}
-        self._self_version: int = 0
+        # agent_id -> (version evicted as stale, when); refuses a relayed copy that is no newer.
+        self._evicted_version: Dict[int, tuple] = {}
+        # Versions start from a wall-clock epoch (ms), not 0, so a RESTARTED agent's first entry
+        # is newer than everything it published before: peers order by version alone, and a
+        # counter restarting at 0 was refused as stale by every peer still holding (or
+        # tombstoning) the old incarnation's higher version until it counted past it.
+        self._self_version: int = int(time.time() * 1000)
 
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -118,7 +122,9 @@ class GossipStateDisseminator:
         """Register or refresh this agent's own entry. Bumps the version so
         peers' merge logic accepts the update."""
         with self._lock:
-            self._self_version += 1
+            # Never behind the wall-clock millisecond, so a later incarnation always outranks
+            # an earlier one however fast either published (see `_self_version`'s init).
+            self._self_version = max(self._self_version + 1, int(time.time() * 1000))
             entry = AgentStateEntry(
                 agent_id=int(self.host.agent_id),
                 cpu_util=cpu_util,
@@ -165,8 +171,14 @@ class GossipStateDisseminator:
             # it restarted the TTL of a dead agent's last state (§G). Only a newer version, which
             # the subject alone can mint, readmits it.
             tomb = self._evicted_version.get(int(entry.agent_id))
-            if existing is None and tomb is not None and entry.version <= tomb:
-                return
+            if existing is None and tomb is not None:
+                version, evicted_at = tomb
+                # Bounded to one TTL: long enough to outlast the relays of the evicted copy,
+                # short enough never to be the thing keeping an agent out.
+                if self._time() - evicted_at > self.state_ttl_s:
+                    self._evicted_version.pop(int(entry.agent_id), None)
+                elif entry.version <= version:
+                    return
             if existing is None or entry.version > existing.entry.version:
                 self._evicted_version.pop(int(entry.agent_id), None)
                 # Don't accept stale snapshots about ourselves (we own that record).
@@ -202,7 +214,7 @@ class GossipStateDisseminator:
                 and (now - c.received_at) > self.state_ttl_s
             ]
             for aid in stale:
-                self._evicted_version[aid] = int(self._cache[aid].entry.version)
+                self._evicted_version[aid] = (int(self._cache[aid].entry.version), now)
                 del self._cache[aid]
         if stale:
             self.host.log_debug(f"[gossip] evicted stale entries: {stale}")

@@ -778,7 +778,10 @@ returns `{}` and says the caller must tell the cases apart; no test checks that 
 > `reassign:` keys carry the run id; the agent-key TTL is floored at twice the own-tier eviction
 > threshold; stashed out-of-order messages expire after 300 s when the stash is full
 > (`pending_consensus_expired`, separate from `dropped`); an evicted gossip entry is tombstoned
-> at its version so only a newer one readmits it; the tick cleans up only newly settled ids
+> at its version for one state TTL so only a newer one readmits it, and an agent's versions start
+> from (and never fall behind) the wall-clock millisecond, so a restarted agent outranks its old
+> incarnation at once instead of counting up from 0 past it (the stop-time review caught the
+> tombstone without this blocking a restart; the counter-from-0 refusal of a *live* entry predated it); the tick cleans up only newly settled ids
 > (the SMEMBERS stays — `_purge_vanished_jobs` needs the full present set); the won-but-unscheduled
 > backlog counts in `proposed_load` (not in `load`, which is also the utilisation metric); the
 > selection cache signature carries `delegation_failed_agents`. **Also found:**
