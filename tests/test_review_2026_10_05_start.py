@@ -20,7 +20,7 @@ FAKE = """#!/bin/bash
 # `-c` is the starter reading agent_type out of a config.
 if [ "$1" = "-c" ]; then echo resource; exit 0; fi
 if [ "$FAKE_MODE" = crash ]; then exit 1; fi
-sleep 3
+exec sleep 3
 """
 
 
@@ -86,3 +86,61 @@ def test_cleanup_fails_loudly_when_redis_is_unreachable():
                           "--redis-host", "127.0.0.1", "--redis-port", "1", "--cleanup-redis"],
                          capture_output=True, text=True, cwd=REPO, timeout=60)
     assert res.returncode != 0
+
+
+# --------------------------------------------------------------------------- stop-time review
+PARTIAL = """#!/bin/bash
+if [ "$1" = "-c" ]; then echo resource; exit 0; fi
+# main.py <index>: agent 2 crashes; the others stay up and record their pid.
+if [ "$2" = "2" ]; then exit 1; fi
+echo $$ > "$PIDDIR/agent-$2.pid"
+exec sleep 30          # exec: the recorded pid IS the long-lived process, as a real agent's is
+"""
+
+
+def test_a_failed_start_stops_the_agents_that_survived(tmp_path):
+    shutil.copy(os.path.join(REPO, "swarm-multi-start.sh"), tmp_path / "start.sh")
+    (tmp_path / "configs").mkdir()
+    for i in (1, 2, 3):
+        (tmp_path / "configs" / f"config_swarm_multi_{i}.yml").write_text("agent_type: resource\n")
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    fake = bindir / "python3.11"
+    fake.write_text(PARTIAL)
+    fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+    piddir = tmp_path / "pids"
+    piddir.mkdir()
+    env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}", "STARTUP_CHECK_S": "1",
+           "PIDDIR": str(piddir)}
+    res = subprocess.run(["bash", "start.sh", "resource", "3", "mesh", "10", "localhost", "10",
+                          "--use-config-dir", "--add"],
+                         cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30)
+    assert res.returncode != 0
+    survivors = [int((piddir / f).read_text()) for f in os.listdir(piddir)]
+    assert survivors, "the healthy agents should have started"
+    for pid in survivors:
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+
+
+def test_a_failed_launch_stops_every_agent_the_run_started(monkeypatch):
+    import argparse
+    import run_test
+    stopped = []
+    monkeypatch.setattr(run_test, "start_agents_remote",
+                        lambda args, hosts: (_ for _ in ()).throw(SystemExit("h2 failed")))
+    monkeypatch.setattr(run_test, "stop_agents", lambda args, hosts: stopped.append(hosts))
+    with pytest.raises(SystemExit):
+        run_test.launch_or_teardown(argparse.Namespace(mode="remote"), ["h1", "h2"])
+    assert stopped == [["h1", "h2"]]
+
+
+def test_a_failed_dynamic_addition_fails_the_run():
+    import run_test
+    run_test._DRAIN.clear()
+    run_test._PRODUCER_RC.clear()
+    run_test._DRAIN["dynamic_start_failed"] = "h3 failed"
+    try:
+        assert "dynamic agent addition failed" in run_test.run_failed_to_measure()
+    finally:
+        run_test._DRAIN.clear()

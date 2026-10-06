@@ -196,6 +196,12 @@ for pid in "${launched_pids[@]+"${launched_pids[@]}"}"; do
 done
 if (( ${#dead[@]} > 0 )); then
     echo "ERROR: ${#dead[@]} of ${#launched_pids[@]} agent process(es) exited during startup: ${dead[*]}" >&2
+    # Stop the ones that survived: this start has failed, and a partial set left running would
+    # register in Redis and join whatever run comes next (stop-time review of §60). TERM first
+    # so they flush and deregister, KILL whatever is left.
+    for pid in "${launched_pids[@]}"; do kill -TERM "$pid" 2>/dev/null || true; done
+    sleep 2
+    for pid in "${launched_pids[@]}"; do kill -KILL "$pid" 2>/dev/null || true; done
     exit 1
 fi
 echo "Launched $num_agents '$agent_type' agents (${#launched_pids[@]} verified running)."

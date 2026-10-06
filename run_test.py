@@ -537,6 +537,27 @@ def check_delegation_policy_is_honoured(args) -> None:
             f"OPENAI_API_KEY), or use --delegation-policy bandit.")
 
 
+def launch_or_teardown(args, host_list) -> None:
+    """Start the initial agents; if that fails, stop every agent this run started first."""
+    try:
+        if args.mode == "local":
+            start_agents_local(args)
+        else:
+            start_agents_remote(args, host_list)
+    except BaseException as exc:
+        # A failed launch must not leave the agents that DID start running: the hosts that
+        # succeeded, and any survivors on a host where another agent died. They would sit in
+        # Redis and join the next run (stop-time review of §60). Stop everything this run
+        # started, then fail.
+        log(f"ERROR: agent launch failed ({exc}); stopping every agent this run started")
+        _TEARDOWN.set()
+        try:
+            stop_agents(args, host_list if args.mode == "remote" else None)
+        except Exception as stop_exc:
+            log(f"WARNING: teardown after the failed launch also failed: {stop_exc}")
+        raise
+
+
 def leftover_agents(r) -> list[tuple[str, str]]:
     """(key, host) for every agent record in Redis."""
     found = []
@@ -1602,6 +1623,8 @@ def run_failed_to_measure() -> str | None:
         return f"job_distributor.py exited {_PRODUCER_RC.get('rc')}"
     if _DRAIN.get("status") == "redis_unreadable":
         return "Redis was unreadable during the drain wait"
+    if _DRAIN.get("dynamic_start_failed"):
+        return f"the dynamic agent addition failed ({_DRAIN['dynamic_start_failed']})"
     return None
 
 def wait_with_early_exit(args) -> None:
@@ -2331,12 +2354,9 @@ def main() -> None:
     check_delegation_policy_is_honoured(args)
 
     # Start initial agents
-    if args.mode == "local":
-        start_agents_local(args)
-    else:
-        if not host_list:
-            raise SystemExit("Remote mode requires --agent-hosts or --agent-hosts-file")
-        start_agents_remote(args, host_list)
+    if args.mode == "remote" and not host_list:
+        raise SystemExit("Remote mode requires --agent-hosts or --agent-hosts-file")
+    launch_or_teardown(args, host_list)
 
     # Start job production in background thread to avoid blocking dynamic trigger detection
     job_thread = threading.Thread(target=lambda: produce_jobs(args), daemon=True, name="JobDistributor")
@@ -2353,7 +2373,14 @@ def main() -> None:
                 # trigger that fires late would start agents nobody will ever stop.
                 log("Dynamic trigger fired after teardown began; not adding agents")
                 return
-            add_dynamic_agents(args, host_list)
+            try:
+                add_dynamic_agents(args, host_list)
+            except BaseException as exc:
+                # The run carries on with the agents it has, but it is no longer the run it
+                # declares: it exits non-zero, and the normal teardown stops whatever the failed
+                # addition did start (§60).
+                log(f"ERROR: dynamic agent addition failed: {exc}")
+                _DRAIN["dynamic_start_failed"] = str(exc)
 
         dynamic_thread = threading.Thread(target=dynamic_addition, daemon=True, name="DynamicAgentAdder")
         dynamic_thread.start()
