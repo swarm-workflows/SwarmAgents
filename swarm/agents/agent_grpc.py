@@ -234,7 +234,8 @@ class Agent(Observer):
         staging.set_context(locator=self.repository.data_locations,
                             run_id=os.environ.get("SWARM_RUN_ID", ""),
                             agent_id=str(self.agent_id),
-                            published=self.staged_files)
+                            published=self.staged_files,
+                            produced=self.repository.produced_names)
         port = staging.data_port(self.grpc_port, pol)
         self.transfer_server = staging.TransferServer(
             self.staged_files, self.grpc_host, port,

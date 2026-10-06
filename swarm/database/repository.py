@@ -75,7 +75,8 @@ class Repository:
     def save(self, obj: dict, key_prefix: str = KEY_JOB, key: Optional[str] = None,
              level: int = 0, group: int = 0, max_retries: int = 10,
              produced_data: Optional[List[str]] = None,
-             produced_locations: Optional[Dict[str, dict]] = None):
+             produced_locations: Optional[Dict[str, dict]] = None,
+             require_existing: bool = False) -> bool:
         """
         Save a generic object into Redis under the given key.
 
@@ -118,6 +119,13 @@ class Repository:
             try:
                 pipeline.watch(key)
                 old_data = pipeline.get(key)
+                if require_existing and not old_data:
+                    # The record was deleted — a coordinator WITHDREW this copy. Re-creating it
+                    # here would run a job its coordinator has already handed elsewhere. The
+                    # WATCH makes the check and the write one decision: a delete landing
+                    # between them aborts the EXEC and the retry sees the key gone.
+                    pipeline.unwatch()
+                    return False
                 pipeline.multi()
                 pipeline.set(key, json.dumps(obj))
                 if key_prefix == self.KEY_AGENT:
@@ -145,7 +153,7 @@ class Repository:
                             pipeline.srem(old_state_key, key)
                 pipeline.execute()
                 self.saves += 1
-                return  # success
+                return True  # success
             except redis.WatchError:
                 self.watch_retries += 1
                 if attempt == max_retries:
@@ -446,6 +454,49 @@ class Repository:
         if not names:
             return True
         return all(self.redis.smismember(self._data_ready_key(), names))
+
+    def delete_if_state(self, obj_id: str, state, key_prefix: str = KEY_JOB,
+                        level: int = 0, group: int = 0, max_retries: int = 10) -> bool:
+        """Delete a record only while it is still in `state`. True if it was deleted or is
+        already gone; False if it has moved on.
+
+        A coordinator withdrawing a delegated copy must not delete one a child has just picked
+        up: read PENDING, child saves READY, coordinator deletes — and the job runs in a group
+        the coordinator believes it withdrew from (code review 2026-10-05 §15, found by the
+        stop-time review). WATCH makes read-and-delete one decision."""
+        key = f"{key_prefix}:{level}:{group}:{obj_id}"
+        want = state.value if hasattr(state, "value") else state
+        pipeline = self.redis.pipeline()
+        for attempt in range(1, max_retries + 1):
+            try:
+                pipeline.watch(key)
+                raw = pipeline.get(key)
+                if not raw:
+                    pipeline.unwatch()
+                    return True
+                current = json.loads(raw).get(self.KEY_STATE)
+                if current != want:
+                    pipeline.unwatch()
+                    return False
+                pipeline.multi()
+                pipeline.delete(key)
+                pipeline.srem(f"{self.KEY_STATE}:{level}:{group}:{current}", key)
+                pipeline.execute()
+                return True
+            except redis.WatchError:
+                if attempt == max_retries:
+                    raise RuntimeError(f"delete_if_state lost the race {max_retries} times "
+                                       f"for key={key}")
+                time.sleep(min(0.01 * (2 ** attempt), 0.5) + random.uniform(0, 0.01))
+        return False
+
+    def produced_names(self, names: List[str]) -> set:
+        """The subset of *names* this run has produced (in the readiness set). One round trip."""
+        names = [str(n) for n in names if n]
+        if not names:
+            return set()
+        flags = self.redis.smismember(self._data_ready_key(), names)
+        return {n for n, f in zip(names, flags) if f}
 
     def available_data(self) -> set:
         """Every name produced so far — for diagnostics, not for the scheduling path."""

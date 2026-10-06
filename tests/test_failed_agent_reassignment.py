@@ -78,6 +78,12 @@ class _FakeRedis:
             def watch(self, *a):
                 pass
 
+            def unwatch(self):
+                pass
+
+            def delete(self, k):
+                self.ops.append(("delete", k, None))
+
             def get(self, key):
                 return outer.kv.get(key)
 
@@ -108,6 +114,8 @@ class _FakeRedis:
                     elif op[0] == "srem":
                         outer.srem(op[1], *op[2])
                         out.append(True)
+                    elif op[0] == "delete":
+                        out.append(outer.delete(op[1]))
                     else:
                         out.append(outer.smembers(op[1]))
                 self.ops = []

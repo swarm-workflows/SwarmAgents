@@ -142,7 +142,11 @@ class TestRunMetrics(unittest.TestCase):
             self.assertFalse(metrics["metrics_complete"])
             self.assertEqual(metrics["agents_missing_metrics"], 3)
 
-    def test_reselection_multiplier_counts_repeat_records(self):
+    def test_two_records_of_one_job_are_tier_copies_not_reselection(self):
+        """This test used to assert `reselection_multiplier == 2.0` from two records of one
+        job. The export cannot produce that from a reselection — it overwrites the job's Redis
+        key — only from a job reaching two tiers, so the column measured hierarchy depth and
+        no livelock criterion built on it could fire (code review 2026-10-05 §34)."""
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = write_run(Path(tmp), "hier-30/run01",
                                 "1,100,110,114,115,0,0,5,0,9.0\n"
@@ -150,7 +154,8 @@ class TestRunMetrics(unittest.TestCase):
             metrics = run_metrics(run_dir, expected_jobs=1)
             self.assertEqual(metrics["job_records"], 2)
             self.assertEqual(metrics["jobs_seen"], 1)
-            self.assertEqual(metrics["reselection_multiplier"], 2.0)
+            self.assertEqual(metrics["tier_copies_per_job"], 2.0)
+            self.assertNotIn("reselection_multiplier", metrics)
 
 
 class TestDiscoveryAndAggregation(unittest.TestCase):

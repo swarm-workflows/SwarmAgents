@@ -162,12 +162,15 @@ class TestThroughTheRealSnowEngine:
         from test_snow import _make_engine
         return _make_engine(agent_id=2, peers=(1, 3, 4), my_cost=my_cost)[0]
 
-    def test_a_peer_with_no_verdict_yields_to_the_initiator(self):
-        """The LLM plane's miss path: abstaining must hand the round to the initiator."""
+    def test_a_peer_with_no_verdict_abstains(self):
+        """The LLM plane's miss path. This test used to assert the response named the
+        initiator — which the initiator tallies as a VOTE for itself, so every miss was an
+        endorsement (code review 2026-10-05 §3). An abstention names nobody."""
         eng = self._engine(my_cost=None)
         ans = eng._answer_query("q1", "j1", q_preferred=1, q_cost=25.0)
-        assert ans["preferred_agent"] == 1
-        assert ans["cost"] == pytest.approx(25.0)
+        assert ans["preferred_agent"] is None
+        assert ans["cost"] is None
+        assert ans["already_decided"] is False
 
     def test_raw_analytic_cost_beat_a_good_llm_bid(self):
         """The bug, driven through the real engine: peer 2's analytic 0.5 takes the job from

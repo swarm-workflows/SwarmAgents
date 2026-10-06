@@ -310,6 +310,7 @@ def save_jobs(jobs: list[Any], path: str, level: int | None = None):
             reasoning_time,
             scheduling_latency,
             selection_total,
+            1 if getattr(job, "refusal_reason", None) else 0,
             ])
         else:
             detailed_latency.append([
@@ -324,6 +325,7 @@ def save_jobs(jobs: list[Any], path: str, level: int | None = None):
                 reasoning_time,
                 scheduling_latency,
                 selection_total,
+                1 if getattr(job, "refusal_reason", None) else 0,
             ])
 
     file_name = f"{path}/all_jobs.csv" if level is None else f"{path}/level{level}_jobs.csv"
@@ -333,7 +335,7 @@ def save_jobs(jobs: list[Any], path: str, level: int | None = None):
         writer.writerow([
             'job_id', 'submitted_at', 'selection_started_at', 'assigned_at',
             'started_at', 'completed_at', 'exit_status', 'leader_id', 'reasoning_time', 'scheduling_latency',
-            'selection_total',
+            'selection_total', 'refused',
         ])
         writer.writerows(detailed_latency)
 
@@ -342,6 +344,6 @@ def save_jobs(jobs: list[Any], path: str, level: int | None = None):
         writer.writerow([
             'job_id', 'submitted_at', 'selection_started_at', 'assigned_at',
             'started_at', 'completed_at', 'exit_status', 'leader_id', 'reasoning_time', 'scheduling_latency',
-            'selection_total',
+            'selection_total', 'refused',
         ])
         writer.writerows(pending_jobs)

@@ -449,6 +449,48 @@ def selection_by_tier(agents: dict[str, dict], levels: dict[str, int]) -> dict[s
     return out
 
 
+#: Message types that are consensus traffic, as `GrpcTransport` labels them (str of the
+#: MessageType). Everything else — HeartBeat, JobStatus, Swim*, GossipState — is background.
+CONSENSUS_MESSAGE_TYPES = frozenset({
+    "Proposal", "Prepare", "Commit",
+    "SnowQuery", "SnowResponse", "SnowQueryBatch", "SnowResponseBatch",
+})
+
+
+def job_ids(df: pd.DataFrame | None) -> set[str]:
+    if df is None or df.empty or "job_id" not in df.columns:
+        return set()
+    return set(df["job_id"].astype(str))
+
+
+def execution_evidence(agents: dict[str, dict]) -> dict[str, Any]:
+    """Double-execution columns from the agents' `executed_jobs` lists.
+
+    `jobs_executed_twice` counts DISTINCT jobs started more than once anywhere in the fleet —
+    on two agents, or twice on one. It is the only direct evidence of a double execution: the
+    job records in Redis keep one copy per tier, so a second run of a job overwrites the first
+    and looks like one. `executions_extra` is the surplus starts (total − distinct).
+
+    Absent when no agent reported the key (a payload from before 2026-10-06), 0 when measured
+    and clean — a validity column must not read clean because it was never measured. It is a
+    LOWER bound when `metrics_complete` is false: an agent that never wrote metrics took its
+    executions with it.
+    """
+    reported = [p.get("executed_jobs") for p in agents.values()
+                if isinstance(p, dict) and isinstance(p.get("executed_jobs"), list)]
+    if not reported:
+        return {}
+    counts: dict[str, int] = {}
+    for ids in reported:
+        for job_id in ids:
+            counts[str(job_id)] = counts.get(str(job_id), 0) + 1
+    return {
+        "jobs_executed": len(counts),
+        "jobs_executed_twice": sum(1 for c in counts.values() if c > 1),
+        "executions_extra": sum(counts.values()) - len(counts),
+    }
+
+
 def instrumentation_metrics(agents: dict[str, dict], meta: dict | None = None,
                             levels: dict[str, int] | None = None) -> dict[str, Any]:
     """P0-4 columns: message cost, finalization, delegation context age, LLM token cost.
@@ -466,6 +508,14 @@ def instrumentation_metrics(agents: dict[str, dict], meta: dict | None = None,
         return out
 
     sent = sent_bytes = recv = recv_bytes = dropped = 0
+    cons_sent = cons_bytes = 0
+    have_by_type = False
+    won = 0
+    have_won = False
+    restarted_ids: set[str] = set()
+    restarts_total = 0
+    have_restarts = False
+    finalize_p95: list[float] = []
     finalized = abandoned = lost = 0
     # `abandoned` and `finalize_lost` are Snow-only: PBFT does not abandon (a stuck object goes
     # to the reselection timeout) and has no CAS to lose one on. Reported only if some agent
@@ -528,11 +578,29 @@ def instrumentation_metrics(agents: dict[str, dict], meta: dict | None = None,
             recv += int(messages.get("recv_msgs", 0) or 0)
             recv_bytes += int(messages.get("recv_bytes", 0) or 0)
             dropped += int(messages.get("dropped_msgs", 0) or 0)
+            by_type = messages.get("sent_by_type")
+            if isinstance(by_type, dict):
+                have_by_type = True
+                for mtype, cell in by_type.items():
+                    if str(mtype) in CONSENSUS_MESSAGE_TYPES and isinstance(cell, dict):
+                        cons_sent += int(cell.get("msgs", 0) or 0)
+                        cons_bytes += int(cell.get("bytes", 0) or 0)
+        restarts = payload.get("restarts")
+        if isinstance(restarts, dict):
+            have_restarts = True
+            for job_id, count in restarts.items():
+                restarted_ids.add(str(job_id))
+                restarts_total += int(count or 0)
         consensus = instr.get("consensus")
         if isinstance(consensus, dict):
             have_consensus = True
             protocols.add(str(consensus.get("protocol", "")))
             finalized += int(consensus.get("finalized", 0) or 0)
+            if consensus.get("won") is not None:
+                have_won = True
+                won += int(consensus.get("won") or 0)
+            if consensus.get("finalize_s_p95") is not None:
+                finalize_p95.append(float(consensus["finalize_s_p95"]))
             if consensus.get("abandoned") is not None:
                 have_abandoned = True
                 abandoned += int(consensus.get("abandoned") or 0)
@@ -590,22 +658,47 @@ def instrumentation_metrics(agents: dict[str, dict], meta: dict | None = None,
                 llm_out += int(site.get("output_tokens", 0) or 0)
 
     out["agents_reporting"] = len(agents)
+    out.update(execution_evidence(agents))
+    if have_restarts:
+        # Reselection churn from the agents' own counters. `jobs_restarted` is DISTINCT jobs
+        # any agent reset after `reselection_timeout_s`; `restarts_total` counts every agent's
+        # every reset, so under PBFT it scales with fleet size. This replaces
+        # `reselection_multiplier`, which divided Redis key count by job count — a reselection
+        # overwrites its key, so that read 1.0 on every flat run and ≥2 on every hierarchical
+        # one (one copy per tier), whatever happened (code review 2026-10-05 §34).
+        out["jobs_restarted"] = len(restarted_ids)
+        out["restarts_total"] = restarts_total
     if have_messages:
         out["msgs_sent"] = sent
         out["msgs_recv"] = recv
         out["msg_bytes_sent"] = sent_bytes
         out["msg_bytes_recv"] = recv_bytes
         out["msgs_dropped"] = dropped
+    if have_by_type:
+        # Consensus traffic alone. `msgs_sent` also counts SWIM probes, gossip and job-status
+        # messages, which scale with run duration × fleet size rather than with jobs — so the
+        # longest cells (the livelocking ones) carried the most background traffic (§37).
+        out["msgs_consensus_sent"] = cons_sent
+        out["msg_bytes_consensus_sent"] = cons_bytes
     if have_consensus:
         out["consensus_protocol"] = "/".join(sorted(p for p in protocols if p)) or float("nan")
         out["consensus_finalized"] = finalized
+        # Decisions WON — the protocol-comparable count. `finalized` is per Snow instance and
+        # every proposer runs one, so under Snow it is ≈ proposers × jobs (§38).
+        out["consensus_won"] = won if have_won else None
         out["consensus_abandoned"] = abandoned if have_abandoned else None
         # A decision whose CAS won but whose object could not be read: no leader elected, no
         # participant commit, no assignment. Non-zero means work was lost, so it belongs on the
         # row beside `finalized` rather than in a log.
         out["consensus_finalize_lost"] = lost if have_lost else None
-        out.update(_dist("finalize_s", pd.Series(finalize_s, dtype=float)))
-        out.update(_dist("rounds", pd.Series(rounds, dtype=float)))
+        # These are distributions OVER AGENTS of each agent's median — not fleet latency
+        # tails, which per-agent summaries cannot reconstruct. They were named
+        # `finalize_s_p95`/`_p99`, which reads as a tail (§38). The worst agent's own p95 is
+        # the nearest honest tail column.
+        out.update(_dist("finalize_s_agent_median", pd.Series(finalize_s, dtype=float)))
+        out.update(_dist("rounds_agent_median", pd.Series(rounds, dtype=float)))
+        if finalize_p95:
+            out["finalize_s_p95_worst_agent"] = round(max(finalize_p95), 6)
     if have_llm:
         out["llm_calls"] = llm_calls
         out["llm_failures"] = llm_failures
@@ -839,6 +932,12 @@ def run_metrics(run_dir: Path, expected_jobs: int | None) -> dict[str, Any]:
               file=sys.stderr)
 
     jobs = dedup_jobs(raw)
+    # Jobs OFFERED to the run: every job any tier exported, assigned or still pending. The
+    # fan-out ratios used to divide by assigned jobs only — PENDING and leaderless jobs go to
+    # the pending files — so 27 coordinators proposing 5400 jobs of which 200 finalized read
+    # 729 instead of 27, worst in exactly the collapse cell (§36).
+    pending_all = read_jobs_csv(run_dir / "pending_jobs.csv")
+    n_offered = len(job_ids(raw) | job_ids(pending_all))
     submitted = _numeric(jobs, "submitted_at")
     completed_at = _numeric(jobs, "completed_at")
     started_at = _numeric(jobs, "started_at")
@@ -877,12 +976,21 @@ def run_metrics(run_dir: Path, expected_jobs: int | None) -> dict[str, Any]:
         "agents_missing_metrics": missing_agents,
         "job_records": int(len(raw)),
         "jobs_seen": n_unique,
+        "jobs_offered": n_offered,
         "jobs_completed": n_completed,
         "jobs_succeeded": n_succeeded,
-        # Reselection/re-proposal churn: >1.0 means jobs were scheduled more than once.
-        "reselection_multiplier": round(len(raw) / n_unique, 4) if n_unique else float("nan"),
+        # Records per job in the export: one per tier a job reached. NOT reselection churn — a
+        # reselection overwrites its Redis key, so it leaves no extra record (§34); churn is
+        # `jobs_restarted`, from the agents' own counters.
+        "tier_copies_per_job": round(len(raw) / n_unique, 4) if n_unique else float("nan"),
         "exit_failures": int((exit_status.notna() & (exit_status != 0) & is_complete).sum()),
     }
+    # Of those failures, the ones real execution REFUSED to start (staging, runtime, spec): a
+    # configuration problem, not the workflow failing. Absent for exports that predate the
+    # column, so an unmeasured run does not read as refusal-free (§61).
+    if "refused" in jobs.columns:
+        refused = _numeric(jobs, "refused").fillna(0) > 0
+        metrics["exec_refusals"] = int((refused & is_complete).sum())
 
     # Completion% is only meaningful against the number of jobs *submitted*. Falling back
     # to the number of jobs the run happened to see hides exactly the failure we care
@@ -933,7 +1041,15 @@ def run_metrics(run_dir: Path, expected_jobs: int | None) -> dict[str, Any]:
 
     # Makespan and throughput over the completed set.
     if n_completed and complete_rows.any():
-        first_submit = float(submitted[complete_rows].min())
+        # From the FIRST SUBMISSION of any job offered, not of any completed job: if early
+        # jobs livelock and later ones finish, the old start moved later, makespan shrank and
+        # throughput rose — and `comparison.py` already used every job, so SWARM and the
+        # baselines were measured differently (§41).
+        submits = [submitted[submitted > 0]]
+        if pending_all is not None and not pending_all.empty:
+            pend = _numeric(pending_all, "submitted_at")
+            submits.append(pend[pend > 0])
+        first_submit = float(min(x.min() for x in submits if not x.empty))
         last_complete = float(completed_at[complete_rows].max())
         makespan = last_complete - first_submit
         metrics["makespan_s"] = round(makespan, 4)
@@ -941,14 +1057,34 @@ def run_metrics(run_dir: Path, expected_jobs: int | None) -> dict[str, Any]:
             round(n_completed / makespan, 4) if makespan > 0 else float("nan")
         )
     else:
+        # Nothing finished: makespan is undefined, but throughput is a measured ZERO. As NaN it
+        # dropped out of the cell mean and a cell where 2 of 5 repeats collapsed reported the
+        # 3 survivors' throughput (§35).
         metrics["makespan_s"] = float("nan")
-        metrics["throughput_jobs_per_s"] = float("nan")
+        metrics["throughput_jobs_per_s"] = 0.0
 
-    # Load balance across executing agents (Jain's over completed jobs per leader).
+    # Load balance across the EXECUTING FLEET (Jain's over completed jobs per agent), idle
+    # agents included as zeros. Over leaders only, 30 agents with 10 sharing all the work
+    # evenly read 1.0; the fleet value is 0.33 (§39). The fleet is every level-0 agent the run
+    # knows of plus every agent that led a completed job; `fairness_basis` says which source
+    # supplied the level-0 set, because `all_agents.csv` is read from Redis at teardown and
+    # misses agents whose keys expired.
     if "leader_id" in jobs.columns and n_completed:
-        per_leader = jobs.loc[is_complete, "leader_id"].value_counts()
+        per_leader = jobs.loc[is_complete, "leader_id"].dropna().astype(int).astype(str).value_counts()
+        levels = read_agent_levels(run_dir)
+        if levels:
+            fleet = {a for a, lvl in levels.items() if lvl == 0}
+            metrics["fairness_basis"] = "level0"
+        else:
+            fleet = {str(a) for a in read_agent_metrics(run_dir)}
+            metrics["fairness_basis"] = "reporting"
+        fleet |= set(per_leader.index)
+        counts = [float(per_leader.get(a, 0)) for a in sorted(fleet)]
         metrics["active_leaders"] = int(len(per_leader))
-        metrics["fairness_jain"] = round(float(jains_fairness(per_leader.to_numpy(dtype=float))), 4)
+        metrics["executing_agents"] = len(fleet)
+        metrics["fairness_jain"] = round(float(jains_fairness(np.asarray(counts, dtype=float))), 4)
+        metrics["fairness_jain_active"] = round(
+            float(jains_fairness(per_leader.to_numpy(dtype=float))), 4)
     else:
         metrics["active_leaders"] = 0
         metrics["fairness_jain"] = float("nan")
@@ -960,6 +1096,8 @@ def run_metrics(run_dir: Path, expected_jobs: int | None) -> dict[str, Any]:
             continue
         level_jobs = dedup_jobs(level_df)
         metrics[f"l{level}_jobs"] = int(len(level_jobs))
+        metrics[f"l{level}_jobs_offered"] = len(
+            job_ids(level_df) | job_ids(read_jobs_csv(run_dir / f"pending_level{level}_jobs.csv")))
         metrics.update(selection_metrics(level_jobs, f"l{level}_selection"))
 
     # Jobs still queued at teardown.
@@ -980,8 +1118,10 @@ def run_metrics(run_dir: Path, expected_jobs: int | None) -> dict[str, Any]:
     # this scope knows the latter. Computed over jobs the run actually SAW, not the declared
     # count: a job never distributed was never available to bid on, and including it would
     # make a stalled run look like a well-partitioned one.
-    if metrics.get("llm_bid_jobs") is not None and n_unique:
-        metrics["bidders_per_job"] = round(metrics["llm_bid_jobs"] / n_unique, 6)
+    if metrics.get("llm_bid_jobs") is not None and n_offered:
+        metrics["bidders_per_job"] = round(metrics["llm_bid_jobs"] / n_offered, 6)
+    if metrics.get("msgs_consensus_sent") is not None and n_offered:
+        metrics["consensus_msgs_per_job"] = round(metrics["msgs_consensus_sent"] / n_offered, 6)
     # Proposal fan-out per tier. The numerators are fleet sums from the agent payloads; the
     # denominator is the jobs that reached that tier, which only this scope knows.
     #
@@ -1000,9 +1140,9 @@ def run_metrics(run_dir: Path, expected_jobs: int | None) -> dict[str, Any]:
         pairs = metrics.get(f"sel_proposer_pairs_l{level}")
         if pairs is None:
             continue
-        denom = metrics.get(f"l{level}_jobs")
+        denom = metrics.get(f"l{level}_jobs_offered")
         if not denom and level == 0:
-            denom = n_unique
+            denom = n_offered
         if not denom:
             continue
         metrics[f"proposers_per_job_l{level}"] = round(pairs / denom, 6)
@@ -1039,6 +1179,10 @@ def aggregate(wide: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
             std = float(values.std(ddof=1)) if n > 1 else 0.0
             row[f"{metric}_mean"] = mean
             row[f"{metric}_std"] = std
+            # Per metric, because a metric can be missing from some repeats: a collapsed run
+            # has no makespan, no coordinator-tier latency. `n_runs` alone presented a mean over
+            # the survivors as a mean over the cell (§35).
+            row[f"{metric}_n"] = n
             # 95% CI half-width; 1.96 is fine given >=5 repeats per the stats protocol.
             row[f"{metric}_ci95"] = 1.96 * std / math.sqrt(n) if n > 1 else float("nan")
         rows.append(row)

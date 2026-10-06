@@ -106,14 +106,25 @@ class AgentInfo(JSONField):
 
     @dtns.setter
     def dtns(self, value: dict):
+        # Every value stored is a DataNode, whatever shape arrived. The list branch used to store
+        # the raw dicts, which is the shape an agent's YAML config has: its OWN AgentInfo then
+        # held dicts while every peer's (round-tripped through Redis's dict branch) held
+        # DataNodes, `compute_job_cost` raised on `dtn.name`, and `native_cost_for_job` turned
+        # that into "no opinion" — so under Snow every peer yielded on every job that needed a
+        # DTN (code review 2026-10-05 §2).
+        if value is None:
+            return
         if isinstance(value, list):
-            for dtn_info in value:
-                self.dtns[dtn_info.get('name')] = dtn_info
+            items = ((None, dtn_info) for dtn_info in value)
         elif isinstance(value, dict):
-            for key, dtn_info in value.items():
-                self.dtns[key] = DataNode.from_dict(dtn_info)
+            items = value.items()
         else:
             raise ValueError("Unsupported value type for dtns")
+        for key, dtn_info in items:
+            node = dtn_info if isinstance(dtn_info, DataNode) else DataNode.from_dict(dtn_info)
+            if node is None:
+                continue
+            self.dtns[key if key is not None else node.name] = node
 
     @property
     def quantum_backend(self) -> QuantumBackend:

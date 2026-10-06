@@ -75,7 +75,8 @@ class MABManager:
     def __init__(self, agent_id: int, child_groups: List[int],
                  config: dict, repository, logger: Optional[logging.Logger] = None,
                  group_snapshot_provider: Optional[Callable[[], Dict[int, GroupSnapshot]]] = None,
-                 delegation_timeout_s: float = 60.0):
+                 delegation_timeout_s: float = 60.0,
+                 outcome_horizon_s: Optional[float] = None):
         self.agent_id = agent_id
         self.child_groups = list(child_groups)
         self.config = config
@@ -88,7 +89,16 @@ class MABManager:
 
         self._snapshot_provider = group_snapshot_provider
         self.delegation_timeout_s = max(delegation_timeout_s, 1e-6)
-        self._pending_ttl_s = config.get("pending_ttl_s", 2 * delegation_timeout_s)
+        # How long a decision's context waits for its outcome. It must outlast the latest an
+        # outcome can arrive — `outcome_horizon_s`, the delegation timeout plus the execution
+        # grace, after which the monitor itself gives up. It was 2 × the timeout, sized for the
+        # reward being paid at SCHEDULING time; since P0-9 it is paid at completion, so any job
+        # running past ~2 × timeout lost its context first: the model update was skipped while
+        # the arm's counters still moved, and the per-type failure window — the C1 feature —
+        # trained on short jobs only (code review 2026-10-05 §22).
+        horizon = float(outcome_horizon_s) if outcome_horizon_s else 0.0
+        self._pending_ttl_s = config.get(
+            "pending_ttl_s", max(2 * delegation_timeout_s, horizon + delegation_timeout_s))
 
         reward_cfg = config.get("reward", {})
         self._reward_shaped = reward_cfg.get("shaped", False)

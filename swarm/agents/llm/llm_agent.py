@@ -390,6 +390,7 @@ class LlmAgent(ResourceAgent):
     #: Values for `delegation.policy`.
     DELEGATE_BANDIT = "bandit"
     DELEGATE_LLM = "llm"
+    SUPPORTS_LLM_DELEGATION = True
 
     def _init_delegation(self) -> None:
         """Read who decides where a job goes. Config only — no provider connection here.
@@ -910,7 +911,8 @@ class LlmAgent(ResourceAgent):
         self._cost_cache_ttl_s = float(llm_cfg.get("cost_cache_ttl_s", 300.0))
         self._cost_cache_max = int(llm_cfg.get("cost_cache_max", 8192))
         # What to answer a query with when this agent has no LLM verdict for the job.
-        #   "yield"    — say nothing (cost None); the engine yields to the initiator. Default:
+        #   "yield"    — say nothing (cost None); the engine abstains (before 2026-10-06 that
+        #                was silently a vote for the initiator). The key keeps its name. Default:
         #                answering with a different decision plane than the one we propose with
         #                is exactly the bug above.
         #   "analytic" — answer with the analytic cost, canonicalised as analytic. Kept as an
@@ -937,7 +939,8 @@ class LlmAgent(ResourceAgent):
         other peer's queries behind one 4-7s inference. A cached verdict is the only way the
         LLM's opinion can reach a vote at all.
 
-        A miss returns None ("no opinion"), so the engine yields to the initiator rather than
+        A miss returns None ("no opinion"), which the engine sends as an abstention — it counts
+        toward no candidate, and α is taken over the peers that did vote — rather than
         answering with the analytic model — answering with a *different* decision plane than the
         one this agent proposes with is the bug this method exists to fix. Set
         `llm.snow_cost_fallback: analytic` to measure the alternative.

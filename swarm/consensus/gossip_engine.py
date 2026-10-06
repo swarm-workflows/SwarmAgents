@@ -36,6 +36,7 @@ See ``docs/GOSSIP_CONSENSUS_DESIGN.md`` for the protocol description.
 
 from __future__ import annotations
 
+import math
 import random
 import threading
 import time
@@ -187,6 +188,12 @@ class GossipConsensusEngine:
         self.queries_to_finalize = RunningStats()
         self.time_to_finalize = RunningStats()
         self.finalized_count = 0
+        # Of `finalized_count`, the decisions this agent WON (the CAS named it). Every proposing
+        # agent runs its own Snow instance and the losers' instances converge too, so
+        # `finalized` is ≈ proposers-per-job × jobs, while PBFT's — counted at the winning
+        # proposer only — is ≈ jobs. `won` is the protocol-comparable count, and the only
+        # population the rounds/queries/time distributions describe (code review 2026-10-05 §38).
+        self.won_count = 0
         self.abandoned_count = 0
         self.finalize_errors = 0
         # CAS won, object unreadable: no assignment produced. Never folded into `finalized`.
@@ -295,16 +302,22 @@ class GossipConsensusEngine:
         # and the selection tie-break use, so all three agree on a winner without
         # any of them systematically favouring low agent ids (finding 10).
         if my_cost is None:
-            # Can't evaluate locally — yield.
-            preferred = int(q_preferred) if q_preferred is not None else self.agent_id
-            cost_out = float(q_cost or 0.0)
+            # No opinion: ABSTAIN. This used to answer with the initiator's candidate, which
+            # the initiator tallied as a vote for it — so every peer that did not hold the job
+            # (or could not price it) endorsed whoever asked first. An abstention names no
+            # candidate; the initiator counts it toward neither side and takes α over the peers
+            # that did vote (code review 2026-10-05 §3).
+            return {"query_id": query_id, "job_id": job_id,
+                    "preferred_agent": None, "cost": None, "already_decided": False}
         else:
             init_cost = float(q_cost) if q_cost is not None else float("inf")
             init_agent = int(q_preferred) if q_preferred is not None else -1
-            mine_dominates = (my_cost < init_cost) or (
+            # An infeasible peer (cost +inf) never prefers itself, not even on an exact tie
+            # with an initiator that sent no cost.
+            mine_dominates = math.isfinite(my_cost) and ((my_cost < init_cost) or (
                 my_cost == init_cost
                 and tiebreak_rank(job_id, self.agent_id) < tiebreak_rank(job_id, init_agent)
-            )
+            ))
             if mine_dominates:
                 preferred = self.agent_id
                 cost_out = my_cost
@@ -489,8 +502,14 @@ class GossipConsensusEngine:
             return
         top_choice, top_count = counts.most_common(1)[0]
         # Supermajority relative to the peers actually queried this round, so small
-        # groups (fewer than k peers) can still clear the threshold and commit.
-        alpha_threshold = self._alpha_threshold(state.queried or len(responses))
+        # groups (fewer than k peers) can still clear the threshold and commit. Abstentions
+        # (a peer with no opinion on this job) leave the denominator: they are neither for
+        # nor against. A peer that did not answer at all stays in it — silence is not an
+        # abstention, and dropping it would let one fast responder decide a round.
+        abstained = sum(1 for r in responses
+                        if r.preferred_agent is None and not r.already_decided)
+        sampled = state.queried or len(responses)
+        alpha_threshold = self._alpha_threshold(max(sum(counts.values()), sampled - abstained))
 
         with self._lock:
             if top_count >= alpha_threshold:
@@ -628,12 +647,16 @@ class GossipConsensusEngine:
         # finalize_errors` is supposed to be the whole population, which is the only reason
         # the error counter is worth having. The distribution summaries move with the count
         # for the same reason: they must describe the population they are counted with.
+        won = int(winner) == self.agent_id
         with self._stats_lock:
             self.finalized_count += 1
-        self.rounds_to_finalize.add(state.round_no)
-        self.queries_to_finalize.add(state.queried)
-        if elapsed >= 0:
-            self.time_to_finalize.add(elapsed)
+            if won:
+                self.won_count += 1
+        if won:
+            self.rounds_to_finalize.add(state.round_no)
+            self.queries_to_finalize.add(state.queried)
+            if elapsed >= 0:
+                self.time_to_finalize.add(elapsed)
 
     def _bump_conflict(self, object_id: str) -> None:
         """Count one round that failed the alpha threshold, bounded. Mirrors the PBFT engine's
@@ -652,6 +675,7 @@ class GossipConsensusEngine:
         stats: Dict[str, object] = {
             "protocol": "snow",
             "finalized": self.finalized_count,
+            "won": self.won_count,
             "abandoned": self.abandoned_count,
             # Decisions that left the pending set without reaching either outcome: the CAS or
             # a host callback raised.

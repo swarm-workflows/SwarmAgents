@@ -87,7 +87,23 @@ def run_once(cmd: list[str] | str) -> str:
     p = subprocess.run(cmd, shell=isinstance(cmd, str), capture_output=True, text=True, check=False)
     return (p.stdout or "") + (p.stderr or "")
 
-def parse_bucket_set_count(text: str, bucket: int) -> int:
+#: What `dump_db.py` prints when it cannot reach Redis — it still exits 0, so the text is the
+#: only signal. A Python traceback means the same: no count was read.
+_DUMP_FAILURE_MARKERS = ("Error connecting to Redis", "Traceback (most recent call last)")
+
+#: Persisted state indices (`ObjectState` values) that mean a job is assigned but not finished.
+INFLIGHT_BUCKETS = (5, 6)    # READY, RUNNING
+
+
+def parse_bucket_set_count(text: str, bucket: int) -> int | None:
+    """Jobs in `state:*:*:<bucket>` summed over every (level, group), or None when the dump
+    could not read Redis. It used to return 0 in that case — which the drain read as "pool
+    empty": a run whose controller could not reach Redis (a misspelt --db-host, a firewall)
+    was declared finished after the stability window. The `max_misses` branch written for
+    exactly that case was dead, because nothing ever returned None (code review 2026-10-05 §48).
+    """
+    if not text.strip() or any(m in text for m in _DUMP_FAILURE_MARKERS):
+        return None
     total_count = 0
     for raw_line in text.splitlines():
         line = raw_line.strip()
@@ -430,6 +446,134 @@ def cleanup_between_runs(args) -> None:
         for cmd in cmds:
             run_blocking(cmd, check=False)
 
+_WILDCARD_HOSTS = {"", "0.0.0.0", "::", "[::]", "*"}
+
+
+def _resolve(host: str) -> str:
+    import socket
+    try:
+        return socket.gethostbyname(host)
+    except OSError:
+        return host
+
+
+def placement_host(agent_id: int, args, host_list: list[str]) -> str:
+    """The host `start_agents_remote` puts agent `agent_id` on — and the one generate_configs.py
+    wrote into its config: block `(id - 1) // agents_per_host` of the hosts file."""
+    return host_list[(agent_id - 1) // int(args.agents_per_host)]
+
+
+def check_launch_matches_configs(args, host_list: list[str]) -> None:
+    """Refuse to launch a fleet whose configs do not describe where it will run.
+
+    `grpc.host` is what an agent ADVERTISES and what every peer dials, and it was fixed when the
+    configs were generated. Nothing compared it with where the launcher actually places each
+    agent, so under --use-config-dir a regenerated hosts file (one node down shifts the
+    interleave) or a different --agents-per-host sent every peer to the wrong address, and a
+    config generated without --agent-hosts-file advertised the wildcard 0.0.0.0 — the defect
+    that once ran consensus single-node with nothing failing (code review 2026-10-05 §51).
+
+    Local mode: the launcher reads ./configs whatever --config-dir says (§52), so a different
+    --config-dir means the run would launch a fleet other than the one it generated.
+    """
+    from swarm.utils.yaml_strict import safe_load
+    if args.mode == "local":
+        if Path(args.config_dir).resolve() != Path("configs").resolve():
+            raise SystemExit(
+                f"--config-dir {args.config_dir} in local mode: swarm-multi-start.sh launches "
+                f"from ./configs regardless, so this run would start a different fleet from "
+                f"the one it generated. Use --config-dir configs for local runs.")
+        return
+    problems = []
+    for idx, path in enumerate(_launched_config_paths(args), start=1):
+        try:
+            with open(path) as f:
+                host = str(((safe_load(f) or {}).get("grpc") or {}).get("host") or "")
+        except OSError as e:
+            problems.append(f"agent {idx}: cannot read {path}: {e}")
+            continue
+        if host.strip() in _WILDCARD_HOSTS:
+            problems.append(f"agent {idx}: advertises wildcard {host!r} ({path}) — generate "
+                            f"configs with --agent-hosts-file")
+            continue
+        try:
+            expected = placement_host(idx, args, host_list)
+        except IndexError:
+            problems.append(f"agent {idx}: no host for it in the hosts file")
+            continue
+        if host != expected and _resolve(host) != _resolve(expected):
+            problems.append(f"agent {idx}: config advertises {host}, launcher places it on "
+                            f"{expected}")
+    if problems:
+        shown = "\n  ".join(problems[:10])
+        more = f"\n  … and {len(problems) - 10} more" if len(problems) > 10 else ""
+        raise SystemExit(f"Launch does not match the configs ({len(problems)} agent(s)):\n  "
+                         f"{shown}{more}\nRegenerate the configs with this hosts file and "
+                         f"--agents-per-host, or launch with the ones they were generated for.")
+
+
+def check_delegation_policy_is_honoured(args) -> None:
+    """`delegation.policy: llm` needs LLM coordinators. On resource coordinators it ran the
+    bandit with no warning while run_meta.json recorded the LLM arm (code review 2026-10-05
+    §23). The agents now refuse it at startup; this refuses before anything is launched, and
+    also refuses a tier whose type cannot be determined or is mixed."""
+    if args.topology != "hierarchical" or _effective_delegation_policy(args) != "llm":
+        return
+    coordinators = _effective_coordinator_type(args)
+    if coordinators != "llm":
+        raise SystemExit(
+            f"delegation policy is llm but the coordinator tier is "
+            f"{coordinators or 'mixed or unknown'}: only LLM coordinators can delegate by LLM, "
+            f"and anything else would run the bandit under the LLM label. Pass "
+            f"--hierarchical-level1-agent-type llm (and place coordinators on hosts with "
+            f"OPENAI_API_KEY), or use --delegation-policy bandit.")
+
+
+def leftover_agents(r) -> list[tuple[str, str]]:
+    """(key, host) for every agent record in Redis."""
+    found = []
+    for key in r.scan_iter(match="agent:*", count=1000):
+        host = "?"
+        try:
+            host = (json.loads(r.get(key) or "{}") or {}).get("host") or "?"
+        except (ValueError, TypeError):
+            pass
+        found.append((str(key), str(host)))
+    return sorted(found)
+
+
+def refuse_if_agents_still_registering(args, settle_s: float = 5.0) -> None:
+    """After the flush and before launch, no agent may be writing to Redis.
+
+    The reap before the flush covers only this run's hosts file. An agent left from an earlier
+    run on a host that file no longer names — a ladder stepping from 90 hosts to 30, a crashed
+    run, a stop that could not confirm — survives the flush, re-registers within a tick, and is
+    then counted in quorum, sampled by Snow and handed jobs by the run that follows. Its metrics
+    carry the old run id, so it surfaced only as a 'foreign payloads' note and the run passed
+    (code review 2026-10-05 §50). One agent tick is well under `settle_s`; anything that
+    re-registers in that window is still alive, and the run refuses rather than measure it.
+    """
+    import redis as _redis
+    try:
+        r = _redis.StrictRedis(host=args.db_host, port=6379, decode_responses=True)
+        r.ping()
+        # Delete every agent record first, so what is found after the wait was WRITTEN after
+        # it — a live process — and not a dead agent's record still inside its TTL.
+        for key, _host in leftover_agents(r):
+            r.delete(key)
+        time.sleep(settle_s)
+        stale = leftover_agents(r)
+    except Exception as e:
+        raise SystemExit(f"Cannot reach Redis at {args.db_host} to verify the flush: {e}")
+    if stale:
+        hosts = sorted({h for _k, h in stale})
+        raise SystemExit(
+            f"{len(stale)} agent(s) re-registered in Redis after the flush — they are still "
+            f"running from an earlier run, on host(s) {hosts}. They would join this run. "
+            f"Stop them first, e.g. `./stop_agents_v2.sh` with a hosts file naming {hosts}. "
+            f"First keys: {[k for k, _h in stale[:5]]}")
+
+
 # ------------------------------
 # Agent start (local or remote)
 # ------------------------------
@@ -463,13 +607,17 @@ def start_agents_local(args, agent_count: int = None, start_offset: int = 0) -> 
     if args.debug:
         start_cmd += ["--debug"]
     if start_offset > 0:
-        start_cmd += ["--start-offset", str(start_offset)]
+        # A dynamic addition must not kill the agents already running (§49).
+        start_cmd += ["--start-offset", str(start_offset), "--add"]
 
     phase = "initial" if start_offset == 0 else "dynamic"
     log_file = f"local_agents_{phase}_start.log"
     log(f"Starting {agent_count} {phase} agents locally …")
-    # Run in background via nohup so we can proceed with the rest of the test
-    run_blocking(["nohup"] + start_cmd + [">", log_file, "2>&1", "&"], check=False)
+    # The starter backgrounds the agents itself and returns. Its output goes to the log through
+    # `run_blocking(log_file=...)`: this used to append ">", the file name, "2>&1" and "&" to an
+    # argv list run without a shell, where they were passed to the script as literal arguments
+    # (and ignored), so the start log documented in CLAUDE.md was never written.
+    run_blocking(["nohup"] + start_cmd, log_file=log_file, check=False)
 
 def shard_ranges(total: int, per_host: int) -> list[tuple[int,int]]:
     """
@@ -498,17 +646,28 @@ def start_agents_remote(args, agent_hosts_list: list[str], agent_count: int = No
     cfg_dir = Path(args.config_dir).absolute()
     cfg_prefix = "config_swarm_multi_"
 
-    # Calculate ranges for the agents we're starting
-    base_idx = start_offset + 1
-    ranges = [(base_idx + i * args.agents_per_host,
-               min(base_idx + (i + 1) * args.agents_per_host - 1, base_idx + agent_count - 1))
-              for i in range(math.ceil(agent_count / args.agents_per_host))]
+    # Agent `id` runs on host `(id - 1) // agents_per_host` — the SAME arithmetic
+    # generate_configs.py used to write that agent's advertised grpc.host, for initial and
+    # dynamic agents alike. Dynamic agents used to restart from the top of the host list, so
+    # each one advertised the host its config named while running on another: peers dialled an
+    # address with nothing behind it, and the agent landed on an occupied host (code review
+    # 2026-10-05 §51 — found by the launch check, which compares the two).
+    ids = range(start_offset + 1, start_offset + agent_count + 1)
+    ranges = []
+    for agent_id in ids:
+        host_idx = (agent_id - 1) // args.agents_per_host
+        if ranges and ranges[-1][2] == host_idx:
+            ranges[-1][1] = agent_id
+        else:
+            ranges.append([agent_id, agent_id, host_idx])
 
-    if len(agent_hosts_list) < len(ranges):
-        raise ValueError(f"Need at least {len(ranges)} hosts for {agent_count} agents with agents_per_host={args.agents_per_host}")
+    needed = ranges[-1][2] + 1 if ranges else 0
+    if len(agent_hosts_list) < needed:
+        raise ValueError(f"Need at least {needed} hosts for agents up to "
+                         f"{start_offset + agent_count} with agents_per_host={args.agents_per_host}")
 
-    for i, (start_idx, end_idx) in enumerate(ranges):
-        host = agent_hosts_list[i]
+    for start_idx, end_idx, host_idx in ranges:
+        host = agent_hosts_list[host_idx]
         count = end_idx - start_idx + 1
         log(f"[{host}] agents {start_idx}..{end_idx} (count={count})")
 
@@ -536,6 +695,11 @@ def start_agents_remote(args, agent_hosts_list: list[str], agent_count: int = No
             forwarded += ["--debug"]
         # Add start-offset for this host's agent range (0-based offset from 1-based start_idx)
         forwarded += ["--start-offset", str(start_idx - 1)]
+        # Every host but the first gets a non-zero offset even on the INITIAL launch, so the
+        # phase — not the per-host offset — decides whether running agents may be killed.
+        # A dynamic addition that wraps onto an occupied host must leave its agents alone (§49).
+        if start_offset > 0:
+            forwarded += ["--add"]
 
         # The run id has to cross the ssh boundary explicitly: a remote agent is not a child
         # of this process, so it inherits nothing, and an unstamped payload is indistinguishable
@@ -1164,6 +1328,15 @@ def validate_pegasus_jobs_dir(args) -> None:
             f"expected job count and the completion checks follow --jobs; set it to {count}.")
 
 
+#: Exit status of the job distributor thread, once it finishes. A non-zero value ends the wait
+#: and the run (exit 4): a run whose producer failed measured nothing, whatever drained.
+_PRODUCER_RC: dict = {}
+
+
+def producer_failed() -> bool:
+    return _PRODUCER_RC.get("rc", 0) not in (0, None)
+
+
 def produce_jobs(args) -> None:
     """
     Produce jobs according to params. You can swap this with your job generator if needed.
@@ -1183,10 +1356,15 @@ def produce_jobs(args) -> None:
             jobs_cmd.extend(["--level", "1"])
     if getattr(args, "split_hybrid", False):
         jobs_cmd.append("--split-hybrid")
-    if args.debug:
-        jobs_cmd.append("--debug")
+    # No --debug: job_distributor.py has no such flag (it has no logging at all). Forwarding it
+    # made argparse exit 2 inside this daemon thread with check=False, so every --debug run
+    # published zero jobs, drained an empty pool and exited 0 (code review 2026-10-05 §47).
     log("Producing jobs …")
-    run_blocking(jobs_cmd, check=False)
+    proc = run_blocking(jobs_cmd, check=False)
+    _PRODUCER_RC["rc"] = proc.returncode
+    if proc.returncode != 0:
+        log(f"ERROR: job_distributor.py exited {proc.returncode} — this run did not get its "
+            f"jobs. Stopping the wait; the run will exit non-zero.")
 
 
 def check_all_jobs_infeasible(args, bucket: int) -> bool:
@@ -1269,22 +1447,32 @@ def wait_runtime(args) -> None:
         if deadline is not None and time.time() >= deadline:
             log(f"Runtime cap of {runtime_cap}s reached before the pool drained → stopping. "
                 f"This run did NOT finish on the drain condition; treat its results as a stall.")
+            _DRAIN["status"] = "cap"
+            break
+        if producer_failed():
+            _DRAIN["status"] = "producer_failed"
             break
         out = run_once(["python3.11", "dump_db.py", "--host", args.db_host, "--type", "redis", "--key", "state"])
         size = parse_bucket_set_count(out, args.watch_bucket)
         if size is None:
             consecutive_misses += 1
-            log(f"WARN: state:*:*:{args.watch_bucket} not found (miss {consecutive_misses}/{args.max_misses})")
+            log(f"WARN: could not read the job state from Redis at {args.db_host} "
+                f"(miss {consecutive_misses}/{args.max_misses})")
             if consecutive_misses > args.max_misses:
-                log("Bucket missing too often → treating as done.")
+                # NOT "done": nothing is known about the pool. Stop, and fail the run.
+                log("ERROR: Redis unreadable too many times in a row → stopping. This run is "
+                    "NOT drained; it will exit non-zero.")
+                _DRAIN["status"] = "redis_unreadable"
                 break
         else:
+            consecutive_misses = 0
             cond = size < args.threshold
             log(f"Bucket state:*:*:{args.watch_bucket} size={size} (thr={args.threshold}) → {'LOW' if cond else 'OK'}")
 
             # Check if all remaining jobs are infeasible
             if size > 0 and check_all_jobs_infeasible(args, args.watch_bucket):
                 log("All remaining jobs are infeasible → triggering shutdown.")
+                _DRAIN["status"] = "infeasible"
                 break
 
             if cond:
@@ -1292,12 +1480,69 @@ def wait_runtime(args) -> None:
                     low_since = time.time()
                 elif time.time() - low_since >= args.stable_seconds:
                     log("Condition stable → proceed.")
+                    _DRAIN["status"] = "drained"
                     break
             else:
                 low_since = None
         time.sleep(args.check_interval)
+    if _DRAIN.get("status") == "drained":
+        _wait_for_inflight(args)
     log(f"Sleeping for grace_seconds: {args.grace_seconds}s …")
     time.sleep(args.grace_seconds)
+    _record_drain(args)
+
+
+#: How the wait ended, written to <run-dir>/drain.json: drained | cap | infeasible |
+#: redis_unreadable | producer_failed, plus the jobs still in flight when agents were stopped.
+_DRAIN: dict = {}
+
+
+def _inflight_count(args) -> int | None:
+    out = run_once(["python3.11", "dump_db.py", "--host", args.db_host, "--type", "redis",
+                    "--key", "state"])
+    counts = [parse_bucket_set_count(out, b) for b in INFLIGHT_BUCKETS]
+    return None if any(c is None for c in counts) else sum(counts)
+
+
+def _wait_for_inflight(args) -> None:
+    """The drain watches PENDING only, so it fired while the last wave was still RUNNING and
+    the stop cut it off — completion % short, nothing saying so. Wait for READY/RUNNING to empty
+    too, bounded by --inflight-drain-max-s; the count left at the bound is recorded."""
+    limit = float(getattr(args, "inflight_drain_max_s", 0) or 0)
+    deadline = time.time() + limit
+    while True:
+        n = _inflight_count(args)
+        _DRAIN["inflight_at_stop"] = n
+        if n == 0:
+            return
+        if time.time() >= deadline:
+            log(f"WARNING: {n if n is not None else 'unknown'} job(s) still READY/RUNNING after "
+                f"{limit:.0f}s; stopping anyway. This run's completion is TRUNCATED "
+                f"(recorded in drain.json).")
+            return
+        log(f"Pending drained; waiting for {n if n is not None else '?'} in-flight job(s) …")
+        time.sleep(args.check_interval)
+
+
+def _record_drain(args) -> None:
+    _DRAIN.setdefault("status", "unknown")
+    if producer_failed():
+        _DRAIN["status"] = "producer_failed"
+        _DRAIN["producer_rc"] = _PRODUCER_RC.get("rc")
+    try:
+        Path(args.run_dir).mkdir(parents=True, exist_ok=True)
+        (Path(args.run_dir) / "drain.json").write_text(json.dumps(_DRAIN, indent=2))
+    except OSError as e:
+        log(f"WARN: could not write drain.json: {e}")
+
+
+def run_failed_to_measure() -> str | None:
+    """Why this run measured nothing trustworthy, or None. Checked at exit."""
+    if producer_failed():
+        return f"job_distributor.py exited {_PRODUCER_RC.get('rc')}"
+    if _DRAIN.get("status") == "redis_unreadable":
+        return "Redis was unreadable during the drain wait"
+    return None
 
 def wait_with_early_exit(args) -> None:
     """
@@ -1323,6 +1568,9 @@ def wait_with_early_exit(args) -> None:
         return
 
     while time.time() < deadline:
+        if producer_failed():
+            _DRAIN["status"] = "producer_failed"
+            break
         remaining = int(deadline - time.time())
         sleep_for = min(poll_interval, remaining)
         if sleep_for <= 0:
@@ -1362,6 +1610,7 @@ def wait_with_early_exit(args) -> None:
                 if stable_count >= 2:
                     log(f"All {total_jobs} jobs reached terminal state — exiting early "
                         f"(saved {remaining}s)")
+                    _DRAIN["status"] = "all_terminal"
                     return
             else:
                 stable_count = 0
@@ -1716,6 +1965,10 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--stable-seconds", type=int, default=90)
     ap.add_argument("--check-interval", type=float, default=5.0)
     ap.add_argument("--max-misses", type=int, default=10)
+    ap.add_argument("--inflight-drain-max-s", type=float, default=600.0,
+                    help="After PENDING drains, wait up to this long for READY/RUNNING jobs to "
+                         "finish before stopping agents (0 = do not wait). What remained is "
+                         "recorded in <run-dir>/drain.json as inflight_at_stop.")
 
     # Dynamic agent addition
     ap.add_argument("--dynamic-agents", type=int, default=0,
@@ -1948,6 +2201,7 @@ def main() -> None:
 
     # Generate configs for ALL agents (initial + dynamic) up front
     cleanup_between_runs(args)
+    refuse_if_agents_still_registering(args)
     if not args.use_config_dir:
         if args.mode == "remote" and not host_list:
             raise SystemExit("Remote mode requires --agent-hosts or --agent-hosts-file")
@@ -1987,6 +2241,9 @@ def main() -> None:
     if args.pegasus_profiles or args.pegasus_jobs_dir:
         check_fleet_fits_jobs(args)
 
+    check_launch_matches_configs(args, host_list)
+    check_delegation_policy_is_honoured(args)
+
     # Start initial agents
     if args.mode == "local":
         start_agents_local(args)
@@ -2020,6 +2277,8 @@ def main() -> None:
     if args.shutdown_after_seconds > 0:
         log(f"Using time-based shutdown: will stop after {args.shutdown_after_seconds} seconds")
         wait_with_early_exit(args)
+        _DRAIN.setdefault("status", "timer")
+        _record_drain(args)
     else:
         wait_runtime(args)
     _TEARDOWN.set()
@@ -2036,6 +2295,10 @@ def main() -> None:
     # Update args.agents to total for reporting
     args.agents = total_agents
     parse_and_report(args, run_id)
+    failed = run_failed_to_measure()
+    if failed:
+        log(f"Done, but {failed} — exiting 4 so a batch driver does not average this in.")
+        sys.exit(4)
     if not measurable:
         log("Done, but this run's metrics are incomplete — exiting non-zero so a batch driver "
             "does not average it in as a good cell.")

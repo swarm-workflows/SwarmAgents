@@ -104,7 +104,7 @@ class ConsensusEngine:
         the first attempt's: the quantity the figure needs is how long the attempt that won
         took, and carrying a timed-out attempt into it would report the reselection timeout
         as consensus latency. The re-proposals are counted separately so the churn is not
-        lost — that is what `reselection_multiplier` in the collector is cross-checked against.
+        lost — that is what `jobs_restarted` in the collector is cross-checked against.
         """
         if object_id in self._proposed_at:
             self.reproposals += 1
@@ -141,6 +141,8 @@ class ConsensusEngine:
         stats: dict = {
             "protocol": "pbft",
             "finalized": self.finalized_count,
+            # PBFT counts at the winning proposer only, so every finalize it counts is a win.
+            "won": self.finalized_count,
             "reproposals": self.reproposals,
             "conflict_rounds": sum(self.conflicts.values()),
             "conflict_objects": len(self.conflicts),
@@ -213,13 +215,12 @@ class ConsensusEngine:
         now = time.time()
         for proposal in proposals:
             # Proposer implicitly prepares its own proposal
-            if self.agent_id not in proposal.prepares:
-                proposal.prepares.append(self.agent_id)
+            self._add_vote(proposal.prepares)
             self.outgoing.add_proposal(proposal)
             self._mark_proposed(proposal.object_id, now)
         self.transport.broadcast(payload=msg)
-        #for proposal in proposals:
-        #    self.outgoing.add_proposal(proposal)
+        # A live set of one has quorum 1, and the proposer's own PREPARE already meets it.
+        self._commit_where_prepared(proposals)
 
     def on_proposal(self, msg: Proposal) -> None:
         proposals = []
@@ -259,6 +260,9 @@ class ConsensusEngine:
                 self._remove_worse_proposals_from_container(proposal, self.outgoing)
                 self._remove_worse_proposals_from_container(proposal, self.incoming)
 
+                # Our own PREPARE counts toward the quorum we compute over a live set that
+                # includes us (code review 2026-10-05 §5).
+                self._add_vote(proposal.prepares)
                 proposals.append(proposal)
                 self.incoming.add_proposal(proposal)
                 object.state = ObjectState.PREPARE
@@ -270,6 +274,8 @@ class ConsensusEngine:
                               proposals=proposals)
             self.host.log_debug("Sending prepares")
             self.transport.broadcast(prepare)
+            # Our vote may be the one that completes the prepare quorum.
+            self._commit_where_prepared(proposals)
 
         if self.router.should_forward():
             self.transport.broadcast(payload=msg)
@@ -354,22 +360,10 @@ class ConsensusEngine:
             if (object.object_id, proposal.p_id) in self._commits_sent:
                 continue
 
-            quorum_count = self.host.calculate_quorum()
             object.state = ObjectState.PREPARE
+            proposals.append(proposal)
 
-            if len(proposal.prepares) >= quorum_count:
-                self.host.log_debug(f"Object: {p.object_id} Agent: {self.agent_id} received quorum "
-                                  f"prepares: {p.prepares}, starting commit!")
-
-                # Increment the number of commits to count the commit being sent
-                proposals.append(proposal)
-                object.state = ObjectState.COMMIT
-
-        if len(proposals):
-            commit = Commit(source=self.agent_id, agents=[AgentInfo(agent_id=self.agent_id)], proposals=proposals)
-            for sent in proposals:
-                self._commits_sent.add((sent.object_id, sent.p_id))
-            self.transport.broadcast(payload=commit)
+        self._commit_where_prepared(proposals)
 
         if self.router.should_forward():
             self.transport.broadcast(payload=msg)
@@ -406,6 +400,84 @@ class ConsensusEngine:
         fresh COMMIT — the very duplication this file exists to prevent."""
         for key in [k for k in self._finalized if k[0] == object_id]:
             self._finalized.pop(key, None)
+
+    # ---------- vote counting ----------
+    #
+    # A vote is counted when it is CAST, by whoever casts it: a peer's arrives in a message and
+    # is appended by the receiver; our own is appended here when we send it. Before 2026-10-06
+    # only arriving votes were appended, and `broadcast` never delivers to self, while
+    # `calculate_quorum` is a majority of `neighbor_map`, which includes self — so an agent
+    # needed q votes from its n-1 peers instead of q-1. A 2-agent group never finalized, and a
+    # 3-agent group with one peer down stalled for good (code review 2026-10-05 §5).
+    def _add_vote(self, votes: list, voter=None) -> None:
+        voter = self.agent_id if voter is None else voter
+        if voter not in votes:
+            votes.append(voter)
+
+    def _commit_where_prepared(self, proposals) -> None:
+        """Broadcast ONE COMMIT for every proposal whose prepare quorum is met and that we have
+        not committed to yet, count our own COMMIT, and finalize any whose commit quorum that
+        vote completes. The single place a COMMIT is sent, so the one-COMMIT-per-proposal rule
+        (`_commits_sent`, 2026-09-15) cannot be bypassed by a new caller."""
+        ready = []
+        quorum = self.host.calculate_quorum()
+        for proposal in proposals:
+            if (proposal.object_id, proposal.p_id) in self._commits_sent:
+                continue
+            if len(proposal.prepares) < quorum:
+                continue
+            object = self.host.get_object(proposal.object_id)
+            if object is None:
+                continue
+            self.host.log_debug(f"Object: {proposal.object_id} Agent: {self.agent_id} received "
+                                f"quorum prepares: {proposal.prepares}, starting commit!")
+            object.state = ObjectState.COMMIT
+            ready.append((object, proposal))
+        if not ready:
+            return
+        for _obj, proposal in ready:
+            self._commits_sent.add((proposal.object_id, proposal.p_id))
+            self._add_vote(proposal.commits)
+        commit = Commit(source=self.agent_id, agents=[AgentInfo(agent_id=self.agent_id)],
+                        proposals=[p for _o, p in ready])
+        self.transport.broadcast(payload=commit)
+        for object, proposal in ready:
+            self._finalize_if_quorum(object, proposal)
+
+    def _finalize_if_quorum(self, object, proposal) -> bool:
+        if self._already_finalized(proposal.object_id, proposal.p_id):
+            return False
+        quorum = self.host.calculate_quorum()
+        self.host.log_debug(f"Is quorum? /{quorum}")
+        if len(proposal.commits) < quorum:
+            return False
+        self.host.log_debug("Is quorum!!")
+        # Remembered BEFORE the containers are cleared, so the stragglers that follow
+        # are recognised as such rather than re-adopted.
+        self._note_finalized(proposal.object_id, proposal.p_id, time.time())
+        self._record_finalize(proposal)
+        # Leader vs participant. The leader is whoever PROPOSED — agent ids are unique, so a
+        # proposal naming us is ours whichever container it now sits in. This used to also
+        # require `outgoing.contains(...)`, and two paths remove our own proposal from
+        # `outgoing` while its election is still live (`_restart_selection`,
+        # `_clear_consensus_for_failed_agent`); late votes then finalized it on the
+        # participant branch with leader = self, so `select_job` never ran while every peer
+        # recorded us as the assignee (code review 2026-10-05 §6).
+        if proposal.agent_id == self.agent_id:
+            object.leader_id = proposal.agent_id
+            self.host.log_info(f"[CON_LEADER] Object:{proposal.object_id} Leader:{self.agent_id} p:{proposal.p_id}")
+            self.host.on_leader_elected(object, proposal.p_id)
+        else:
+            self.host.log_info(f"[CON_PART] Object:{proposal.object_id} Leader:{proposal.agent_id} p:{proposal.p_id}")
+            # The leader is the PROPOSER, not whoever's COMMIT happened to reach quorum
+            # last. `msg.agents[0]` was passed here, so every participant recorded the
+            # sender of the final COMMIT as the job's assignee in `job_assignments` —
+            # a different peer per participant, and the wrong one for all of them.
+            self.host.on_participant_commit(object, proposal.agent_id, proposal.p_id)
+        self.outgoing.remove_object(object_id=proposal.object_id)
+        self.incoming.remove_object(object_id=proposal.object_id)
+        self._forget_object(proposal.object_id)
+        return True
 
     def on_commit(self, msg: Commit) -> None:
         for p in msg.proposals:
@@ -459,33 +531,8 @@ class ConsensusEngine:
                     self.incoming.add_proposal(proposal=proposal)
                     self.host.log_debug(f"Accepted new proposal {p.p_id} via COMMIT (cost={p.cost})")
 
-            if msg.agents[0].agent_id not in proposal.commits:
-                proposal.commits.append(msg.agents[0].agent_id)
-
-            quorum = self.host.calculate_quorum()
-            self.host.log_debug(f"Is quorum? /{quorum}")
-            if len(proposal.commits) >= quorum:
-                self.host.log_debug("Is quorum!!")
-                # Remembered BEFORE the containers are cleared, so the stragglers that follow
-                # are recognised as such rather than re-adopted.
-                self._note_finalized(proposal.object_id, proposal.p_id, time.time())
-                self._record_finalize(proposal)
-                # leader vs participant path
-                if proposal.agent_id == self.agent_id and self.outgoing.contains(object_id=proposal.object_id, p_id=proposal.p_id):
-                    # I am leader, do selection
-                    object.leader_id = proposal.agent_id
-                    self.host.log_info(f"[CON_LEADER] Object:{proposal.object_id} Leader:{self.agent_id} p:{proposal.p_id}")
-                    self.host.on_leader_elected(object, proposal.p_id)
-                else:
-                    self.host.log_info(f"[CON_PART] Object:{proposal.object_id} Leader:{proposal.agent_id} p:{proposal.p_id}")
-                    # The leader is the PROPOSER, not whoever's COMMIT happened to reach quorum
-                    # last. `msg.agents[0]` was passed here, so every participant recorded the
-                    # sender of the final COMMIT as the job's assignee in `job_assignments` —
-                    # a different peer per participant, and the wrong one for all of them.
-                    self.host.on_participant_commit(object, proposal.agent_id, proposal.p_id)
-                self.outgoing.remove_object(object_id=proposal.object_id)
-                self.incoming.remove_object(object_id=proposal.object_id)
-                self._forget_object(proposal.object_id)
+            self._add_vote(proposal.commits, msg.agents[0].agent_id)
+            self._finalize_if_quorum(object, proposal)
 
         if self.router.should_forward():
             self.transport.broadcast(payload=msg)

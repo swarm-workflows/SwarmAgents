@@ -107,13 +107,18 @@ class ChannelPool:
             return entry
 
     def _set_up(self, target: str, up: bool, reason: str):
+        changed = False
         with self._lock:
             entry = self._entries.get(target)
             if entry and entry.up != up:
                 entry.up = up
+                changed = True
                 LOG.info("Peer %s marked %s (%s)", target, "UP" if up else "DOWN", reason)
-                # Emit event outside the lock to avoid deadlocks in callbacks
-        self._on_status(target, up, reason)
+        # Transitions only, and outside the lock to avoid deadlocks in callbacks. This used to
+        # fire on every health probe (every 2 s per peer), so a DOWN peer's failure handling
+        # re-ran every 2 s and every healthy peer's UP handling ran every 2 s too.
+        if changed:
+            self._on_status(target, up, reason)
 
     def _health_loop(self):
         while not self._stop:

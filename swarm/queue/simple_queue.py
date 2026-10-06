@@ -70,16 +70,23 @@ class SimpleQueue(ObjectQueue):
         :param object: Object to move to end of queue
         """
         with self.lock:
-            if object.object_id in self.objects:
-                # Remove from current position
-                del self.objects[object.object_id]
-            # Re-add at end (dict insertion order)
+            # Only an object still queued moves. This re-added unconditionally, so a selection
+            # loop rotating a job another thread had just removed (READY scan, a withdrawn
+            # delegation) put it straight back, and it was proposed again (code review
+            # 2026-10-05 §15).
+            if object.object_id not in self.objects:
+                return
+            del self.objects[object.object_id]
             self.objects[object.object_id] = object
 
     def remove(self, object_id: str):
         with self.lock:
             if object_id in self.objects:
                 self.objects.pop(object_id)
+
+    def ids(self) -> list[str]:
+        with self.lock:
+            return list(self.objects.keys())
 
     def get(self, object_id: str) -> Job:
         with self.lock:

@@ -529,6 +529,19 @@ def stage_inputs(data_in, work_dir: str,
     lookup_unavailable = ""
     if staging_on and locator is None:
         lookup_unavailable = "no location lookup is configured"
+    # Names this run produced, from the READINESS set. The guard below used to treat "produced
+    # by this run" as "has a location" — the wrong container: a name in the readiness set with
+    # no location (re-published by `_retry_unpublished_data`, which writes none, or produced by
+    # an agent with staging off) fell through to the inputs root and read last week's file of
+    # the same name (code review 2026-10-05 §63).
+    produced_here: set = set()
+    produced = None
+    if staging_on:
+        try:
+            from swarm.execution import staging as _staging
+            produced = _staging.context().produced
+        except Exception:                    # noqa: BLE001
+            produced = None
 
     if locator is not None:
         wanted = [os.path.basename(str(getattr(n, "file", "") or ""))
@@ -543,6 +556,12 @@ def stage_inputs(data_in, work_dir: str,
                 else:
                     logger.warning("[STAGE] location lookup failed (%s); staging is off, so "
                                    "resolving inputs locally as usual", exc)
+            if produced is not None:
+                try:
+                    produced_here = set(produced(wanted) or ())
+                except Exception as exc:   # noqa: BLE001
+                    lookup_unavailable = lookup_unavailable or (
+                        f"the produced-names lookup failed ({exc})")
 
     for node in data_in or []:
         # `DataNode.name` is the SITE (`local`, `dtn3`); `file` is the logical file name.
@@ -592,6 +611,13 @@ def stage_inputs(data_in, work_dir: str,
                             f"enabled but {lookup_unavailable}, so a name produced by another "
                             f"agent cannot be told apart from a same-named file in the inputs "
                             f"root; refusing rather than risking a stale input")
+
+        if name in produced_here:
+            # Produced by THIS run, and nobody recorded where. A same-named file in the inputs
+            # root is a collision, not this run's output.
+            return staged, (f"input {name!r} was produced by this run but has no recorded "
+                            f"location, so it cannot be fetched; refusing rather than read a "
+                            f"same-named file from the inputs root")
 
         src = resolve_under_root(name, "inputs", pol)
         if not src:
@@ -699,6 +725,7 @@ def run(spec: ExecutionSpec, job_id: str,
             out_path = err_path = None
             stdout = stderr = subprocess.DEVNULL
 
+    cmd, container = _name_container(cmd, job_id, run_id)
     started = time.monotonic()
     proc = None
     try:
@@ -708,11 +735,12 @@ def run(spec: ExecutionSpec, job_id: str,
         proc = subprocess.Popen(cmd, cwd=work_dir, stdout=stdout, stderr=stderr,
                                 stdin=subprocess.DEVNULL, start_new_session=True,
                                 env=job_environment())
+        _register(proc, container)
         rc = proc.wait(timeout=timeout_s if timeout_s is not None else pol.timeout_s)
         return ExecutionResult(exit_status=int(rc), duration_s=time.monotonic() - started,
                                stdout_path=out_path, stderr_path=err_path, command=cmd)
     except subprocess.TimeoutExpired:
-        _kill_group(proc)
+        _kill_group(proc, container)
         limit = timeout_s if timeout_s is not None else pol.timeout_s
         return ExecutionResult(exit_status=124,  # conventional timeout status
                                duration_s=time.monotonic() - started,
@@ -726,6 +754,7 @@ def run(spec: ExecutionSpec, job_id: str,
                                reason=f"could not start {cmd[0]!r}: {exc}",
                                stdout_path=out_path, stderr_path=err_path, command=cmd)
     finally:
+        _unregister(proc)
         for handle in (stdout, stderr):
             if handle not in (subprocess.DEVNULL, None):
                 try:
@@ -734,7 +763,53 @@ def run(spec: ExecutionSpec, job_id: str,
                     pass
 
 
-def _kill_group(proc) -> None:
+# Jobs this process has started and not yet reaped: pid -> (Popen, container name or None).
+# `terminate_all` uses it at agent shutdown, because `start_new_session` deliberately detaches
+# every job from the agent's process group — so when the agent exits after its drain timeout,
+# nothing else would stop them, and run N's jobs went on competing with run N+1's.
+_LIVE: Dict[int, tuple] = {}
+_LIVE_LOCK = threading.Lock()
+
+
+def _register(proc, container: Optional[str]) -> None:
+    with _LIVE_LOCK:
+        _LIVE[proc.pid] = (proc, container)
+
+
+def _unregister(proc) -> None:
+    if proc is None:
+        return
+    with _LIVE_LOCK:
+        _LIVE.pop(proc.pid, None)
+
+
+def _name_container(cmd: List[str], job_id: str, run_id: str) -> Tuple[List[str], Optional[str]]:
+    """Give a `docker run` a unique name and an init process, so it can be killed.
+
+    A docker container belongs to dockerd, not to the `docker run` client this module starts:
+    SIGKILLing the client's process group on a timeout left the container running — burning
+    CPU and writing into the run's working directory after the job was recorded 124 — and
+    `--rm` removes it only when it exits on its own (code review 2026-10-05 §62). A name makes
+    `docker kill` possible; `--init` makes the container's own PID 1 forward signals.
+    Apptainer and bare commands run inside the process group and need neither.
+    """
+    if len(cmd) < 2 or os.path.basename(cmd[0]) != "docker" or cmd[1] != "run":
+        return cmd, None
+    safe = lambda s: "".join(c if c.isalnum() or c in "-_." else "_" for c in str(s))[:40]
+    name = f"swarm-{safe(run_id or 'run')}-{safe(job_id)}-{os.getpid()}-{int(time.time()*1000)}"
+    return [cmd[0], "run", "--name", name, "--init"] + cmd[2:], name
+
+
+def terminate_all() -> int:
+    """Kill every job this process started that is still running. Returns how many."""
+    with _LIVE_LOCK:
+        live = list(_LIVE.values())
+    for proc, container in live:
+        _kill_group(proc, container)
+    return len(live)
+
+
+def _kill_group(proc, container: Optional[str] = None) -> None:
     """SIGKILL the process group and reap it, tolerating a process that already exited.
 
     The reap is not optional. Killing without waiting leaves a zombie for every timeout, and
@@ -743,6 +818,12 @@ def _kill_group(proc) -> None:
     still has not exited we would rather leak one entry than block the executor thread for
     the rest of the run.
     """
+    if container:
+        try:
+            subprocess.run(["docker", "kill", container], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=15, check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            logger.warning("[EXEC] could not kill container %s: %s", container, exc)
     if proc is None:
         return
     try:

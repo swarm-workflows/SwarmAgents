@@ -161,17 +161,24 @@ class StagingContext:
     run_id: str = ""
     agent_id: str = ""
     published: PublishedFiles = field(default_factory=lambda: PublishedFiles())
+    # `Repository.produced_names`: which of some names THIS run has produced (the readiness
+    # set). Distinct from `locator` on purpose — a name can be produced and have no location
+    # (re-published without one, or by a producer with staging off), and `stage_inputs` must
+    # refuse that name rather than read a same-named file from the inputs root.
+    produced: Optional[object] = None
 
 
 _CONTEXT = StagingContext()
 
 
 def set_context(locator=None, run_id: str = "", agent_id: str = "",
-                published: Optional["PublishedFiles"] = None) -> StagingContext:
+                published: Optional["PublishedFiles"] = None,
+                produced=None) -> StagingContext:
     global _CONTEXT
     _CONTEXT = StagingContext(locator=locator, run_id=str(run_id or ""),
                               agent_id=str(agent_id or ""),
-                              published=published or PublishedFiles())
+                              published=published or PublishedFiles(),
+                              produced=produced)
     return _CONTEXT
 
 

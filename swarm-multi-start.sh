@@ -14,6 +14,7 @@ Usage: $0 <agent_type> <num_agents> <topology> <job_cnt> [database] [jobs_per_pr
   --use-config-dir   (Optional) Use configs in ./configs directory instead of regenerating
   --debug            (Optional) Enable debug metrics/logging
   --start-offset N   (Optional) Starting agent ID offset (default: 0, for dynamic agents)
+  --add              (Optional) Add agents to a live run: do not kill running agents first
 
   # NEW (propagated to generate_configs.py for mesh/ring):
   --groups N         Number of independent groups
@@ -27,6 +28,7 @@ debug=false
 groups=""
 group_size=""
 start_offset="0"
+add=false
 
 # Collect flags & positionals
 pos=()
@@ -34,6 +36,7 @@ while (( "$#" )); do
   case "$1" in
     --use-config-dir) use_config_dir=true; shift ;;
     --debug)          debug=true; shift ;;
+    --add)            add=true; shift ;;
     --start-offset)
         [[ $# -lt 2 ]] && { echo "Error: --start-offset requires a value"; usage; }
         start_offset="$2"; shift 2 ;;
@@ -85,9 +88,15 @@ echo "  Start offset: $start_offset"
 [[ -n "$groups" ]] && echo "  Groups: $groups"
 [[ -n "$group_size" ]] && echo "  Group size: $group_size"
 
-# Clean previous run
-pkill -f "python3\.11 .*main\.py" || true
-rm -f shutdown
+# Clean previous run — but NEVER when adding agents to a live run (--add). This killed every
+# main.py on the host unconditionally, so a dynamic addition SIGTERMed the agents already
+# running there: in local mode, the whole initial fleet, every time. Their metrics carried this
+# run's id, so the completeness gate passed for a fleet that no longer existed (code review
+# 2026-10-05 §49). `rm -f shutdown` is guarded too: mid-run it deletes the teardown flag.
+if [[ "$add" != true ]]; then
+    pkill -f "python3\.11 .*main\.py" || true
+    rm -f shutdown
+fi
 
 # Raise file descriptor limit — 1024 is too low for multiple gRPC agents
 ulimit -n 65536 2>/dev/null || ulimit -n 8192 2>/dev/null || true

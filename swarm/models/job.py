@@ -105,6 +105,16 @@ class Job(Object):
         self._delegation_failed = False
         self._delegation_failed_count: int = 0
         self._delegation_failed_agents: List[int] = []
+        # Child groups a coordinator delegated this job to, recorded on the COORDINATOR-tier
+        # record. Empty means not delegated. It is what lets a peer coordinator tell, after the
+        # delegating coordinator dies, whether the job belongs to that coordinator's children
+        # (leave it) or never left the tier (re-elect it) — code review 2026-10-05 §13.
+        self._delegated_groups: List[int] = []
+        # Why real execution REFUSED this job (inputs could not be staged, no runtime, an
+        # unrunnable spec), or None. A refusal is persisted with exit_status 1 like a failure,
+        # and was indistinguishable from one: the reason was logged and dropped, so a run whose
+        # jobs could not start read as a workflow whose jobs failed (code review 2026-10-05 §61).
+        self._refusal_reason: Optional[str] = None
 
         # Meta
         self.logger = logger if logger else logging.getLogger(self.__class__.__name__)
@@ -135,6 +145,18 @@ class Job(Object):
 
     def add_delegation_failed_agents(self, value: int):
         self._delegation_failed_agents.append(value)
+
+    @property
+    def refusal_reason(self) -> Optional[str]:
+        return self._refusal_reason
+
+    @property
+    def delegated_groups(self) -> List[int]:
+        return self._delegated_groups
+
+    @delegated_groups.setter
+    def delegated_groups(self, value):
+        self._delegated_groups = [int(g) for g in (value or [])]
 
     # ---------- Convenience/derived ----------
     @property
@@ -573,6 +595,7 @@ class Job(Object):
         # `data_in` is the job's own declaration of what it reads; the runner stages from
         # it rather than from a second list on the execution spec.
         result = runner.run(self._execution, self.job_id, data_in=self.data_in)
+        self._refusal_reason = (result.reason or "refused") if result.refused else None
         if result.refused:
             self.logger.error(
                 "[EXEC] Job %s REFUSED (not run): %s. This is a configuration problem and "
@@ -851,6 +874,8 @@ class Job(Object):
             snap_job_type = self._job_type
             snap_reasoning_time = self._reasoning_time
             snap_deleg_agents = list(self._delegation_failed_agents)
+            snap_deleg_groups = list(self._delegated_groups)
+            snap_refusal = self._refusal_reason
             snap_deleg_failed = self._delegation_failed
             snap_deleg_count = self._delegation_failed_count
             snap_level = self.level
@@ -888,6 +913,8 @@ class Job(Object):
             "job_type": snap_job_type,
             "reasoning_time": snap_reasoning_time,
             "delegation_failed_agents": snap_deleg_agents,
+            "delegated_groups": snap_deleg_groups,
+            "refusal_reason": snap_refusal,
             "delegation_failed": snap_deleg_failed,
             "delegation_failed_count": snap_deleg_count,
             "level": snap_level,
@@ -983,6 +1010,8 @@ class Job(Object):
         parsed_last_transition = job_data.get("last_transition_at")
         parsed_reasoning_time = job_data.get("reasoning_time")
         parsed_deleg_agents = job_data.get("delegation_failed_agents")
+        parsed_deleg_groups = job_data.get("delegated_groups")
+        parsed_refusal = job_data.get("refusal_reason")
         parsed_deleg_failed = job_data.get("delegation_failed")
         parsed_deleg_count = job_data.get("delegation_failed_count")
         parsed_quantum = (
@@ -1021,6 +1050,8 @@ class Job(Object):
             self._last_transition_at = parsed_last_transition
             self._reasoning_time = float(parsed_reasoning_time) if parsed_reasoning_time is not None else None
             self._delegation_failed_agents = parsed_deleg_agents if parsed_deleg_agents is not None else []
+            self._delegated_groups = [int(g) for g in (parsed_deleg_groups or [])]
+            self._refusal_reason = str(parsed_refusal) if parsed_refusal else None
             self._delegation_failed = parsed_deleg_failed if parsed_deleg_failed is not None else False
             self._delegation_failed_count = parsed_deleg_count if parsed_deleg_count is not None else 0
             self._quantum = parsed_quantum

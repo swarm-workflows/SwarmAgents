@@ -50,6 +50,11 @@ class Metrics:
         self.llm_delegations = {}
         self.infeasible_retired = []  # job_ids retired after max infeasible retries
         self.agent_recoveries = []   # dicts with agent_id, recovered_at
+        # Every job id this agent STARTED executing, one entry per start. Joined across the
+        # fleet by evaluation/collect.py into `jobs_executed_twice`: the only direct evidence
+        # of a double execution, which several recovery and delegation paths could produce
+        # with nothing in the run saying so (code review 2026-10-05 §H).
+        self.executed_jobs = []
 
     def save_load_metric(self, load: float):
         """

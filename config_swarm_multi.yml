@@ -199,8 +199,13 @@ runtime:
   # selection_barrier_s: 60
   max_failed_agents: 0                 # Maximum tolerable failures (0 = unlimited)
   job_reassignment_enabled: true       # Enable automatic job reassignment
-  aggressive_failure_detection: true # Use proactive failure detection from gRPC
-  enable_agent_recovery: true        # Allow recovered agents to rejoin the pool
+  # OFF (2026-10-06, code review 2026-10-05 §4). On, ONE health probe past its 0.7 s deadline
+  # fails a live peer and reassigns its READY/RUNNING jobs while it is still running them, so
+  # they execute twice. On a 17-site WAN slice a 700 ms stall is routine. Heartbeat (Redis
+  # staleness, failure_threshold_seconds) is the failure detector; this was a second one with
+  # a hair trigger. Matches the code default.
+  aggressive_failure_detection: false
+  enable_agent_recovery: true        # Readmit a failed agent once it writes a fresh heartbeat
   max_infeasible_retries: 10         # Retire infeasible jobs after N attempts (0 = infinite)
   max_delegation_attempts: 3         # Mark job infeasible after N failed delegation timeouts
   #neighbor_refresh_full_s: 5        # Full Redis neighbor-refresh cadence. Default: per-tick
