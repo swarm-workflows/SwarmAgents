@@ -392,6 +392,10 @@ class SwimMembership:
                     del self._indirect_probes[pid]
                     self._indirect_acked.pop(pid, None)
                     self._relay_initiators.pop(pid, None)
+                    # Released with its siblings: the orphan sweep walks `_indirect_acked`, which
+                    # this branch has just cleared, so it never reaches this entry (stop-time
+                    # review of §11 — every timed-out relay leaked one).
+                    self._relay_targets.pop(pid, None)
         for probe in timed_out:
             self._mark_suspect(probe.target, reason="indirect-timeout")
 

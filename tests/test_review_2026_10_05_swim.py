@@ -80,3 +80,20 @@ def test_a_relayed_ack_names_its_target():
     clock.advance(0.06)
     two._handle_expirations(clock())
     assert forwarded == [3]
+
+
+def test_a_timed_out_relay_leaves_no_state_behind():
+    """The relayed target never answers; every relay map must be empty after expiry."""
+    clock, bus = _Clock(), _Bus()
+    _make_swim(1, bus, [1, 2, 3], clock)
+    two, _ = _make_swim(2, bus, [1, 2, 3], clock)
+    bus.drop_filter = lambda src, dst, p: dst == 3          # 3 is unreachable
+    two.on_ping_req(SwimPingReq(source=1, probe_id="r9", target_agent=3, updates=[]))
+    for _ in range(5):
+        clock.advance(0.06)
+        two._handle_expirations(clock())
+    with two._lock:
+        assert "r9" not in two._indirect_probes
+        assert "r9" not in two._indirect_acked
+        assert "r9" not in two._relay_initiators
+        assert "r9" not in two._relay_targets
