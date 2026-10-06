@@ -480,6 +480,10 @@ def execution_evidence(agents: dict[str, dict]) -> dict[str, Any]:
                 if isinstance(p, dict) and isinstance(p.get("executed_jobs"), list)]
     if not reported:
         return {}
+    # A job returned to the pool after a transient refusal is started again on purpose; the
+    # retries are counted beside the double-execution column so the two can be told apart.
+    retries = sum(int(p.get("refusal_retries") or 0) for p in agents.values()
+                  if isinstance(p, dict))
     counts: dict[str, int] = {}
     for ids in reported:
         for job_id in ids:
@@ -488,6 +492,7 @@ def execution_evidence(agents: dict[str, dict]) -> dict[str, Any]:
         "jobs_executed": len(counts),
         "jobs_executed_twice": sum(1 for c in counts.values() if c > 1),
         "executions_extra": sum(counts.values()) - len(counts),
+        "exec_refusal_retries": retries,
     }
 
 

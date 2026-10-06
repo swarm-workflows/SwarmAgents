@@ -55,6 +55,8 @@ class Metrics:
         # of a double execution, which several recovery and delegation paths could produce
         # with nothing in the run saying so (code review 2026-10-05 §H).
         self.executed_jobs = []
+        # Jobs this agent returned to the pool after a TRANSIENT execution refusal (§61).
+        self.refusal_retries = 0
 
     def save_load_metric(self, load: float):
         """

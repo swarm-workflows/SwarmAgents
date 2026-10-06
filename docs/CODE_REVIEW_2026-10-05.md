@@ -5,7 +5,7 @@ Second critical read of the code base, against the same question as the 2026-09-
 anything in the run saying so?** Everything found there is excluded here. Ranked by that
 question; within a rank, by how many cells it touches. Every finding names the file and line,
 the failing scenario, the metric it moves and the direction, and whether a test in `tests/` would
-catch it (none of the HIGH items has one). **Status: §1–§6, §13–§17, §20, §22–§23, §34–§39, §41, §47–§52, §62–§63 and the §H double-execution metric FIXED 2026-10-06** (§60, §61 partly) — all six recommended-order steps complete; second batch: §9, §19, §24, §25, §30, §33, §44 (partly), §53 (`tests/test_review_2026_10_05_snow.py`, 31 tests, 23 fail on the pre-fix tree; `tests/test_review_2026_10_05_pbft.py`, 13 tests, 8 fail on the pre-fix tree; `tests/test_review_2026_10_05_hierarchy.py`, 23 tests on the new write/monitor/purge paths; `tests/test_review_2026_10_05_collect.py`, 15 tests, all 15 fail on the pre-fix tree; `tests/test_review_2026_10_05_runner.py`, 21 tests on the new launch/drain paths; `tests/test_review_2026_10_05_delegation.py`, 12; `tests/test_review_2026_10_05_execution.py`, 15); everything else OPEN.
+catch it (none of the HIGH items has one). **Status: §1–§6, §13–§17, §20, §22–§23, §34–§39, §41, §47–§52, §62–§63 and the §H double-execution metric FIXED 2026-10-06** (§60 partly) — all six recommended-order steps complete; second batch: §9, §19, §24, §25, §30, §33, §44 (partly), §53 (`tests/test_review_2026_10_05_snow.py`, 31 tests, 23 fail on the pre-fix tree; `tests/test_review_2026_10_05_pbft.py`, 13 tests, 8 fail on the pre-fix tree; `tests/test_review_2026_10_05_hierarchy.py`, 23 tests on the new write/monitor/purge paths; `tests/test_review_2026_10_05_collect.py`, 15 tests, all 15 fail on the pre-fix tree; `tests/test_review_2026_10_05_runner.py`, 21 tests on the new launch/drain paths; `tests/test_review_2026_10_05_delegation.py`, 12; `tests/test_review_2026_10_05_execution.py`, 15); everything else OPEN.
 
 **Method.** Six independent read-only passes, one per subsystem (consensus + membership; agent
 core + repository + selection; execution + staging; metrics + collection + plotting; run tooling
@@ -657,9 +657,9 @@ different door: consensus silently runs single-node or to the wrong peers.
 
 ## F. Real execution and staging
 
-### 61. A refusal is permanent and indistinguishable from a workflow failure — **HIGH, every real-workflow run — FIXED 2026-10-06**
+### 61. A refusal is permanent and indistinguishable from a workflow failure — **HIGH, every real-workflow run — FIXED 2026-10-06 (retry added the same day)**
 
-*Status:* half fixed. A refusal's reason is now recorded on the job (`Job.refusal_reason`, through Redis), exported as a `refused` column, and counted by `collect.py` as `exec_refusals` beside `exit_failures` (absent for older exports). **Still open: retry.** A transient staging refusal still fails the job and gates its subtree; distinguishing transient from configuration refusals needs a design decision.
+*Status:* half fixed. A refusal's reason is now recorded on the job (`Job.refusal_reason`, through Redis), exported as a `refused` column, and counted by `collect.py` as `exec_refusals` beside `exit_failures` (absent for older exports). **Retry (added 2026-10-06, split agreed with the user):** the runner tags a refusal `transient` (`TransientRefusal`) when an input's producer or staging site could not be reached, a fetch passed its deadline, or a registry lookup failed; everything else — unrunnable spec, no work dir or runtime, missing executable or root input, a produced name with no location — is a configuration refusal and fails at once. A transient refusal returns the job to PENDING with its claim released (`_retry_refused`), up to `runtime.execution.refusal_retries` (3; the count rides on the job record so the cap holds across agents). A refused start is not counted in `executed_jobs`, and `exec_refusal_retries` is reported beside `jobs_executed_twice`.
 
 `swarm/models/job.py:575-589`, `:620-623`; `resource_agent.py:3458-3460`.
 

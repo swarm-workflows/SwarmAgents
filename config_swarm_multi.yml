@@ -89,6 +89,11 @@ runtime:
   # one that stops.
   execution:
     mode: simulate                # simulate | real
+    # How many times a job refused for a TRANSIENT reason (an input's producer or staging site
+    # unreachable, a fetch past its deadline, a registry lookup failure) is returned to the
+    # pool before the refusal is recorded as its outcome. Configuration refusals (unrunnable
+    # spec, no runtime, missing executable or root input) are never retried.
+    refusal_retries: 3
     # Shared scratch directory; the run id is appended, and every job of a run executes with
     # this as its cwd. It must be SHARED, not per-job: data_in/data_out carry bare logical
     # file names, so job B finds job A's output only if both ran in the same directory.

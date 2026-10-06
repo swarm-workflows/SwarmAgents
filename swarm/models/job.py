@@ -115,6 +115,11 @@ class Job(Object):
         # and was indistinguishable from one: the reason was logged and dropped, so a run whose
         # jobs could not start read as a workflow whose jobs failed (code review 2026-10-05 §61).
         self._refusal_reason: Optional[str] = None
+        # Whether the last refusal may not recur (in-process only), and how many times this
+        # job has been returned to the pool after one (persisted: the cap must hold across
+        # agents, or a job could bounce between them for ever).
+        self._refusal_transient: bool = False
+        self._refusal_retries: int = 0
 
         # Meta
         self.logger = logger if logger else logging.getLogger(self.__class__.__name__)
@@ -149,6 +154,18 @@ class Job(Object):
     @property
     def refusal_reason(self) -> Optional[str]:
         return self._refusal_reason
+
+    @property
+    def refusal_transient(self) -> bool:
+        return self._refusal_transient
+
+    @property
+    def refusal_retries(self) -> int:
+        return self._refusal_retries
+
+    @refusal_retries.setter
+    def refusal_retries(self, value: int):
+        self._refusal_retries = int(value or 0)
 
     @property
     def delegated_groups(self) -> List[int]:
@@ -596,6 +613,7 @@ class Job(Object):
         # it rather than from a second list on the execution spec.
         result = runner.run(self._execution, self.job_id, data_in=self.data_in)
         self._refusal_reason = (result.reason or "refused") if result.refused else None
+        self._refusal_transient = bool(result.refused and result.transient)
         if result.refused:
             self.logger.error(
                 "[EXEC] Job %s REFUSED (not run): %s. This is a configuration problem and "
@@ -876,6 +894,7 @@ class Job(Object):
             snap_deleg_agents = list(self._delegation_failed_agents)
             snap_deleg_groups = list(self._delegated_groups)
             snap_refusal = self._refusal_reason
+            snap_refusal_retries = self._refusal_retries
             snap_deleg_failed = self._delegation_failed
             snap_deleg_count = self._delegation_failed_count
             snap_level = self.level
@@ -915,6 +934,7 @@ class Job(Object):
             "delegation_failed_agents": snap_deleg_agents,
             "delegated_groups": snap_deleg_groups,
             "refusal_reason": snap_refusal,
+            "refusal_retries": snap_refusal_retries,
             "delegation_failed": snap_deleg_failed,
             "delegation_failed_count": snap_deleg_count,
             "level": snap_level,
@@ -1012,6 +1032,7 @@ class Job(Object):
         parsed_deleg_agents = job_data.get("delegation_failed_agents")
         parsed_deleg_groups = job_data.get("delegated_groups")
         parsed_refusal = job_data.get("refusal_reason")
+        parsed_refusal_retries = job_data.get("refusal_retries")
         parsed_deleg_failed = job_data.get("delegation_failed")
         parsed_deleg_count = job_data.get("delegation_failed_count")
         parsed_quantum = (
@@ -1052,6 +1073,7 @@ class Job(Object):
             self._delegation_failed_agents = parsed_deleg_agents if parsed_deleg_agents is not None else []
             self._delegated_groups = [int(g) for g in (parsed_deleg_groups or [])]
             self._refusal_reason = str(parsed_refusal) if parsed_refusal else None
+            self._refusal_retries = int(parsed_refusal_retries or 0)
             self._delegation_failed = parsed_deleg_failed if parsed_deleg_failed is not None else False
             self._delegation_failed_count = parsed_deleg_count if parsed_deleg_count is not None else 0
             self._quantum = parsed_quantum

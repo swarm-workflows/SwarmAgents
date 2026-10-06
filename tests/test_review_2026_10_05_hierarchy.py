@@ -365,12 +365,14 @@ class TestExecutionEvidence:
             "2": {"executed_jobs": ["b", "c"]},     # b on two agents
             "3": {"executed_jobs": ["d", "d"]},     # d twice on one agent
         })
-        assert out == {"jobs_executed": 4, "jobs_executed_twice": 2, "executions_extra": 2}
+        assert out == {"jobs_executed": 4, "jobs_executed_twice": 2, "executions_extra": 2,
+                       "exec_refusal_retries": 0}
 
     def test_clean_is_zero_not_absent(self):
         from evaluation.collect import execution_evidence
         assert execution_evidence({"1": {"executed_jobs": ["a"]}, "2": {"executed_jobs": []}}) \
-            == {"jobs_executed": 1, "jobs_executed_twice": 0, "executions_extra": 0}
+            == {"jobs_executed": 1, "jobs_executed_twice": 0, "executions_extra": 0,
+                "exec_refusal_retries": 0}
 
     def test_unmeasured_is_absent_not_zero(self):
         from evaluation.collect import execution_evidence

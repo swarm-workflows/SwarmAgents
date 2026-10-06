@@ -1456,6 +1456,61 @@ class ResourceAgent(Agent):
             f"(timeout: {self.delegation_timeout_s:.1f}s)"
         )
 
+    @property
+    def refusal_retries_max(self) -> int:
+        """`runtime.execution.refusal_retries`: how many times a job refused for a transient
+        reason is returned to the pool before the refusal is recorded as its outcome."""
+        cfg = (self.runtime_config.get("execution") or {}) if self.runtime_config else {}
+        return max(0, int(cfg.get("refusal_retries", 3)))
+
+    def _retry_refused(self, job: Job) -> bool:
+        """Return a job whose execution was refused for a TRANSIENT reason to the pool.
+
+        A transient refusal — an input whose producer or staging site could not be reached, a
+        fetch past its deadline, a registry lookup that failed — used to be persisted as the
+        job's outcome (exit 1, COMPLETE), so one network hiccup failed the job and gated its
+        whole subtree for the rest of the run. Now the job goes back to PENDING with its claim
+        released, so it is re-elected, possibly onto an agent that can reach the producer. The
+        attempt count rides on the job record so the cap holds across agents; past it the
+        refusal is recorded as before. True when the job was returned to the pool.
+        """
+        job_id = job.job_id
+        if job.refusal_retries >= self.refusal_retries_max:
+            self.logger.warning(
+                f"[REFUSAL] {job_id} refused again ({job.refusal_reason}); "
+                f"{job.refusal_retries} retries used, recording the refusal")
+            return False
+        job.refusal_retries += 1
+        job.state = ObjectState.PENDING
+        job.leader_id = None
+        job.exit_status = None
+        try:
+            self.repository.save(obj=job.to_dict(), key_prefix=Repository.KEY_JOB,
+                                 level=self.topology.level, group=self.topology.group)
+            self.repository.release_assignment(job_id, level=self.topology.level,
+                                               group=self.topology.group)
+        except Exception as e:
+            # Could not put it back: record the refusal instead (the completion write has its
+            # own retry queue), rather than leave a job nobody holds.
+            self.logger.error(f"[REFUSAL] could not return {job_id} to the pool ({e}); "
+                              f"recording the refusal")
+            job.refusal_retries -= 1
+            job.state = ObjectState.COMPLETE
+            job.exit_status = 1
+            return False
+        self.queues.ready_queue.remove(job_id)
+        with self.completed_lock:
+            self.completed_jobs_set.discard(job_id)
+        self._forget_decided(job_id)
+        self.job_assignments.remove(job_id)
+        self.metrics.refusal_retries += 1
+        self.logger.warning(
+            f"[REFUSAL] {job_id} refused for a transient reason ({job.refusal_reason}); "
+            f"returned to the pool (retry {job.refusal_retries}/{self.refusal_retries_max})")
+        if not self.queues.ready_queue.gets():
+            self.start_idle()
+        return True
+
     def _withdraw_child_copies(self, job_id: str, groups) -> list:
         """Delete this job's still-PENDING child-tier records in `groups`; return the groups
         whose copy could NOT be withdrawn because a child picked it up first (or the delete
@@ -2962,6 +3017,7 @@ class ResourceAgent(Agent):
             "final_quorum": self.calculate_quorum(),
             "infeasible_retired": getattr(self.metrics, 'infeasible_retired', []),
             "executed_jobs": list(getattr(self.metrics, 'executed_jobs', [])),
+            "refusal_retries": int(getattr(self.metrics, 'refusal_retries', 0)),
             # When THIS agent's failure-simulation clock started. Failure phases are resolved
             # against it per agent, and a 30-host remote launch spreads starts over a minute,
             # so the oracle (P1-1) cannot resolve which phase a decision fell in from the run
@@ -3604,6 +3660,19 @@ class ResourceAgent(Agent):
             self.logger.error(traceback.format_exc())
             job.exit_status = 1
             job.state = ObjectState.COMPLETE
+
+        # A refused job never started a process: it is not an execution, and counting it
+        # would make every retried refusal read as a double execution in `jobs_executed_twice`.
+        if job.refusal_reason:
+            try:
+                self.metrics.executed_jobs.remove(job_id)
+            except ValueError:
+                pass
+
+        # A refusal that may not recur goes back to the pool instead of being recorded as
+        # the job's outcome (code review 2026-10-05 §61).
+        if job.refusal_reason and job.refusal_transient and self._retry_refused(job):
+            return
 
         # Self-expanding pool: successful one-shot quantum jobs with post_process push a
         # classical post-processing job (data-triggered). Outside the execution try and

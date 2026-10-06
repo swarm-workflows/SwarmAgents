@@ -90,6 +90,11 @@ def job_environment(base: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     return env
 
 
+class TransientRefusal(str):
+    """A refusal reason worth retrying. Still a `str`, so a caller that only reads the text
+    — every one that predates retry — is unaffected; `run()` checks the type."""
+
+
 @dataclass
 class ExecutionResult:
     """Outcome of one real execution.
@@ -103,6 +108,11 @@ class ExecutionResult:
     duration_s: float = 0.0
     refused: bool = False
     reason: str = ""
+    # A refusal that may not happen again: an input could not be fetched (producer or staging
+    # site unreachable, fetch deadline) or the registry could not be read. The agent returns
+    # such a job to the pool, up to `runtime.execution.refusal_retries`. Every other refusal is
+    # a configuration fault that would repeat on any agent, and fails at once.
+    transient: bool = False
     stdout_path: Optional[str] = None
     stderr_path: Optional[str] = None
     command: List[str] = field(default_factory=list)
@@ -527,6 +537,7 @@ def stage_inputs(data_in, work_dir: str,
     # a stale file, because neither reads the inputs root. The ambiguity this guards against is
     # narrower than the whole function, so the guard has to be too.
     lookup_unavailable = ""
+    lookup_transient = False      # a failed lookup may succeed later; an absent one never will
     if staging_on and locator is None:
         lookup_unavailable = "no location lookup is configured"
     # Names this run produced, from the READINESS set. The guard below used to treat "produced
@@ -553,6 +564,7 @@ def stage_inputs(data_in, work_dir: str,
             except Exception as exc:       # noqa: BLE001
                 if staging_on:
                     lookup_unavailable = f"the location lookup failed ({exc})"
+                    lookup_transient = True
                 else:
                     logger.warning("[STAGE] location lookup failed (%s); staging is off, so "
                                    "resolving inputs locally as usual", exc)
@@ -562,6 +574,7 @@ def stage_inputs(data_in, work_dir: str,
                 except Exception as exc:   # noqa: BLE001
                     lookup_unavailable = lookup_unavailable or (
                         f"the produced-names lookup failed ({exc})")
+                    lookup_transient = True
 
     for node in data_in or []:
         # `DataNode.name` is the SITE (`local`, `dtn3`); `file` is the logical file name.
@@ -597,8 +610,9 @@ def stage_inputs(data_in, work_dir: str,
             # same-named file elsewhere: that is precisely how a child would silently read the
             # wrong input. The reason names the producer, because the usual cause is that it died.
             producers = ", ".join(str(l.get("agent_id", l.get("host", "?"))) for l in locs)
-            return staged, (f"input {name!r} was produced by agent {producers} but could not "
-                            f"be staged: {result.reason}")
+            return staged, TransientRefusal(
+                f"input {name!r} was produced by agent {producers} but could not be staged: "
+                f"{result.reason}")
 
         if lookup_unavailable:
             # This name is not in the working directory, so the next step would resolve it from
@@ -607,10 +621,11 @@ def stage_inputs(data_in, work_dir: str,
             # registry the two are indistinguishable, so this is the one place the ambiguity is
             # real. Note the refusal is reached only for a name that would otherwise have been
             # read from the root: a job whose inputs are all already local never gets here.
-            return staged, (f"input {name!r} is not in the working directory and staging is "
-                            f"enabled but {lookup_unavailable}, so a name produced by another "
-                            f"agent cannot be told apart from a same-named file in the inputs "
-                            f"root; refusing rather than risking a stale input")
+            reason = (f"input {name!r} is not in the working directory and staging is "
+                      f"enabled but {lookup_unavailable}, so a name produced by another "
+                      f"agent cannot be told apart from a same-named file in the inputs "
+                      f"root; refusing rather than risking a stale input")
+            return staged, (TransientRefusal(reason) if lookup_transient else reason)
 
         if name in produced_here:
             # Produced by THIS run, and nobody recorded where. A same-named file in the inputs
@@ -692,7 +707,8 @@ def run(spec: ExecutionSpec, job_id: str,
                                             locator=locator, run_id=run_id,
                                             requester=requester)
     if staging_refusal:
-        return ExecutionResult(exit_status=1, refused=True, reason=staging_refusal)
+        return ExecutionResult(exit_status=1, refused=True, reason=str(staging_refusal),
+                               transient=isinstance(staging_refusal, TransientRefusal))
 
     cmd, refusal = build_command(spec, work_dir, pol)
     if not cmd:
