@@ -130,14 +130,24 @@ def load_metrics_from_file(path: str) -> dict[int, dict]:
         return {}
 
 
-def load_jobs_csv(csv_path: str) -> pd.DataFrame:
-    """Load an all_jobs.csv file and return a DataFrame with numeric columns."""
+def load_jobs_csv(csv_path: str, dedup: bool = True) -> pd.DataFrame:
+    """Load an all_jobs.csv file: numeric columns, ONE row per job.
+
+    On a hierarchical run the export holds one record per tier, and the coordinator's copy
+    has coordinator-tier stamps only — so read raw, its shorter `scheduling_latency` entered
+    the SWARM latency CDF beside the leaf's, `jobs_total` doubled, and coordinators counted as
+    leaders: SWARM biased fast against the baselines (code review 2026-10-05 §42). Dedup uses
+    the collector's own rule, so the figure and the table pick the same record.
+    """
     df = pd.read_csv(csv_path)
     for col in ["submitted_at", "selection_started_at", "assigned_at",
                  "started_at", "completed_at", "scheduling_latency", "reasoning_time",
                  "selection_total"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
+    if dedup:
+        from evaluation.collect import dedup_jobs
+        df = dedup_jobs(df).reset_index(drop=True)
     return df
 
 

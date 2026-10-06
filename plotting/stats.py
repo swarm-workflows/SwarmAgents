@@ -19,27 +19,32 @@ def jains_fairness(values: np.ndarray) -> float:
 
 
 def safe_mean(series: pd.Series) -> float:
-    """Calculate mean, returning 0 if all values are NaN."""
+    """Calculate mean without warnings; NaN if there are no values.
+
+    It returned 0.0 for an all-NaN series, so a run that assigned nothing reported a 0 s
+    selection time — a livelocked cell read as the fastest one (code review 2026-10-05 §43).
+    """
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        result = series.mean()
-        return result if not pd.isna(result) else 0.0
+        return float(series.mean())
 
 
 def safe_median(series: pd.Series) -> float:
-    """Calculate median, returning 0 if all values are NaN."""
+    """Calculate median without warnings; NaN if there are no values.
+
+    It returned 0.0 for an all-NaN series, so a run that assigned nothing reported a 0 s
+    selection time — a livelocked cell read as the fastest one (code review 2026-10-05 §43).
+    """
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        result = series.median()
-        return result if not pd.isna(result) else 0.0
+        return float(series.median())
 
 
 def safe_quantile(series: pd.Series, q: float) -> float:
-    """Calculate quantile, returning 0 if all values are NaN."""
+    """Calculate a quantile without warnings; NaN if there are no values (see safe_mean)."""
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        result = series.quantile(q)
-        return result if not pd.isna(result) else 0.0
+        return float(series.quantile(q))
 
 
 def safe_sum(series: pd.Series) -> float:

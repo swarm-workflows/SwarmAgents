@@ -5,7 +5,7 @@ Second critical read of the code base, against the same question as the 2026-09-
 anything in the run saying so?** Everything found there is excluded here. Ranked by that
 question; within a rank, by how many cells it touches. Every finding names the file and line,
 the failing scenario, the metric it moves and the direction, and whether a test in `tests/` would
-catch it (none of the HIGH items has one). **Status: §1–§6, §13–§17, §20, §22–§23, §34–§39, §41, §47–§52, §62–§63 and the §H double-execution metric FIXED 2026-10-06** (§60 partly) — all six recommended-order steps complete; second batch: §9, §19, §24, §25, §30, §33, §44 (partly), §53; §61 retry; §7, §8 (`tests/test_review_2026_10_05_snow.py`, 31 tests, 23 fail on the pre-fix tree; `tests/test_review_2026_10_05_pbft.py`, 13 tests, 8 fail on the pre-fix tree; `tests/test_review_2026_10_05_hierarchy.py`, 23 tests on the new write/monitor/purge paths; `tests/test_review_2026_10_05_collect.py`, 15 tests, all 15 fail on the pre-fix tree; `tests/test_review_2026_10_05_runner.py`, 21 tests on the new launch/drain paths; `tests/test_review_2026_10_05_delegation.py`, 12; `tests/test_review_2026_10_05_execution.py`, 15); everything else OPEN.
+catch it (none of the HIGH items has one). **Status: §1–§6, §13–§17, §20, §22–§23, §34–§39, §41, §47–§52, §62–§63 and the §H double-execution metric FIXED 2026-10-06** (§60 partly) — all six recommended-order steps complete; second batch: §9, §19, §24, §25, §30, §33, §44 (partly), §53; §61 retry; §7, §8; §42, §43 (`tests/test_review_2026_10_05_snow.py`, 31 tests, 23 fail on the pre-fix tree; `tests/test_review_2026_10_05_pbft.py`, 13 tests, 8 fail on the pre-fix tree; `tests/test_review_2026_10_05_hierarchy.py`, 23 tests on the new write/monitor/purge paths; `tests/test_review_2026_10_05_collect.py`, 15 tests, all 15 fail on the pre-fix tree; `tests/test_review_2026_10_05_runner.py`, 21 tests on the new launch/drain paths; `tests/test_review_2026_10_05_delegation.py`, 12; `tests/test_review_2026_10_05_execution.py`, 15); everything else OPEN.
 
 **Method.** Six independent read-only passes, one per subsystem (consensus + membership; agent
 core + repository + selection; execution + staging; metrics + collection + plotting; run tooling
@@ -483,7 +483,7 @@ that clock too.
 
 ### 39. Jain's fairness ignores idle agents — **MEDIUM-HIGH, flattering — FIXED 2026-10-06**
 
-*Status:* over the executing fleet — level-0 agents from `all_agents.csv` plus every agent that led a completed job, idle ones as zeros; `fairness_basis` says which source supplied the set and `fairness_jain_active` keeps the old number. `comparison.py` (E7) not yet changed.
+*Status:* over the executing fleet — level-0 agents from `all_agents.csv` plus every agent that led a completed job, idle ones as zeros; `fairness_basis` says which source supplied the set and `fairness_jain_active` keeps the old number. `comparison.py` (E7) fixed the same way (§42).
 
 `collect.py:948-951` and `comparison.py:53` take `value_counts()` of `leader_id` over completed
 jobs; agents that ran nothing are absent. 30 agents with 10 sharing all the work evenly → 1.0; the
@@ -502,11 +502,11 @@ true index over the fleet is 0.33. The plan defines fairness "over per-agent loa
   `submitted[complete_rows].min()`): if early jobs livelock and later ones finish, makespan
   shrinks and throughput rises. `comparison.py:46` uses the minimum over all jobs, so SWARM and the
   E7 baselines are measured differently.
-- **42. `comparison.py` reads hierarchical `all_jobs.csv` without dedup.** Coordinator-tier
+- **42. [FIXED 2026-10-06 — `load_jobs_csv` dedups with the collector's `dedup_jobs`; fairness counts idle level-0 agents when the run has `all_agents.csv` (baselines fall back to leaders)]** `comparison.py` reads hierarchical `all_jobs.csv` without dedup. Coordinator-tier
   copies, whose `scheduling_latency` covers the coordinator tier only, enter SWARM's latency CDF
   and boxplot; `jobs_total` is doubled; `leader_counts` includes coordinators. SWARM latency
   biased low against the baselines.
-- **43. `multi_run.py` reports failures as fast and successful.** `safe_mean`/`safe_median`/
+- **43. [FIXED 2026-10-06 — `safe_mean/median/quantile` return NaN on no data; completion is `completed_at > 0`, success also requires exit 0; runs load deduplicated. The guessed coordinator ids remain]** `multi_run.py` reports failures as fast and successful. `safe_mean`/`safe_median`/
   `safe_quantile` (`plotting/stats.py:21-50`) return 0.0 when every value is NaN, so a livelocked
   run reports 0 s selection time; `completed_jobs`/`success_rate` (`multi_run.py:222-224`) test
   `exit_status == 0` but `save_jobs` writes None as 0 (`data.py:308, 322`), so READY and RUNNING

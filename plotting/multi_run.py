@@ -89,7 +89,8 @@ class MultiRunAnalyzer:
             return None
 
         try:
-            df_jobs = pd.read_csv(jobs_file)
+            from plotting.data import load_jobs_csv
+            df_jobs = load_jobs_csv(str(jobs_file))   # one row per job, as the collector reads it
 
             # Calculate metrics
             run_data = {
@@ -218,10 +219,15 @@ class MultiRunAnalyzer:
                     'mean_total_time': safe_mean(df_jobs['total_time']),
                     'median_total_time': safe_median(df_jobs['total_time']),
 
-                    # Job completion
-                    'completed_jobs': (df_jobs['exit_status'] == 0).sum(),
-                    'failed_jobs': (df_jobs['exit_status'] != 0).sum(),
-                    'success_rate': (df_jobs['exit_status'] == 0).mean(),
+                    # Job completion. FINISHED is `completed_at > 0`: the export writes a
+                    # missing exit status as 0, so `exit_status == 0` counted READY and RUNNING
+                    # jobs as successes (code review 2026-10-05 §43).
+                    'completed_jobs': int((df_jobs['completed_at'] > 0).sum()),
+                    'failed_jobs': int(((df_jobs['completed_at'] > 0)
+                                        & (df_jobs['exit_status'] != 0)).sum()),
+                    'success_rate': float(((df_jobs['completed_at'] > 0)
+                                           & (df_jobs['exit_status'] == 0)).mean())
+                                    if len(df_jobs) else float('nan'),
 
                     # Load balancing
                     'unique_leaders': df_jobs['leader_id'].nunique(),
