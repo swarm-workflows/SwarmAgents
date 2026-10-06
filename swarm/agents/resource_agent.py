@@ -3764,7 +3764,15 @@ class ResourceAgent(Agent):
         # child on its parent's failure would run it against inputs never written.
         produced = ([d.file for d in (job.data_out or []) if getattr(d, "file", None)]
                     if job.exit_status == 0 else None)
-        locations = self._publish_locations(job, produced)
+        # Never allowed to skip the completion write (§73): an exception here used to leave the
+        # job RUNNING with no retry queue covering it. A failure publishes no locations, and
+        # consumers then refuse the names loudly rather than the job silently never finishing.
+        try:
+            locations = self._publish_locations(job, produced)
+        except Exception as e:
+            self.logger.error(f"[STAGE] publishing outputs of {job_id} failed ({e}); "
+                              f"recording the completion without locations")
+            locations, self._last_withheld = {}, []
         withheld = set(getattr(self, "_last_withheld", []) or [])
         if produced and withheld:
             produced = [n for n in produced if str(n) not in withheld]
@@ -3807,6 +3815,11 @@ class ResourceAgent(Agent):
         work_dir = _runner.policy().work_dir
         locations: dict = {}
         self._last_withheld = []
+        if not work_dir:
+            # Simulate mode, or real mode with no work dir: there are no produced files, and an
+            # empty work_dir resolved outputs against the agent's OWN cwd — serving whatever
+            # same-named file happened to be there (§73).
+            return {}
         for name in produced:
             if _staging.plain_name(name) is None:
                 # Consumers refuse such names under staging (`plain_name`, §64); publishing a

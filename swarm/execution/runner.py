@@ -29,7 +29,9 @@ fleet. `path_rewrites` maps prefixes onto wherever the code was actually staged.
 explicit prefix map rather than a basename search because two workflows can have a
 `process.py` and picking the wrong one would run silently and produce plausible output.
 """
+import hashlib
 import logging
+import re
 import os
 import shlex
 import shutil
@@ -66,7 +68,14 @@ _SIF_RUNTIMES = ("apptainer", "singularity")
 #: else, whose stdout is captured to a shared filesystem -- is not something a scheduler
 #: should do quietly. Matched case-insensitively as substrings, so a new `..._TOKEN` is
 #: covered without anyone remembering to add it.
-_SECRET_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL")
+_SECRET_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL",
+                   # Added 2026-10-06 (code review §73): `*_PASS`, `*_AUTH*`, and the ssh agent
+                   # socket, through which a job could use the agent's ssh identity.
+                   "PASS", "AUTH", "SSH_AUTH_SOCK")
+
+#: A URL with credentials in it (`redis://user:pw@host`, `http_proxy=http://u:p@proxy`): the
+#: variable NAME says nothing, the value is the secret.
+_URL_CREDENTIALS = re.compile(r"://[^/@\s:]+:[^/@\s]+@")
 
 #: Agent-internal variables that are not secrets but mean nothing to a job and would be
 #: actively misleading inside one.
@@ -85,7 +94,8 @@ def job_environment(base: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     env = dict(os.environ if base is None else base)
     for name in list(env):
         upper = name.upper()
-        if name in _AGENT_ONLY_VARS or any(m in upper for m in _SECRET_MARKERS):
+        if (name in _AGENT_ONLY_VARS or any(m in upper for m in _SECRET_MARKERS)
+                or _URL_CREDENTIALS.search(str(env.get(name, "")))):
             env.pop(name, None)
     return env
 
@@ -108,6 +118,8 @@ class ExecutionResult:
     duration_s: float = 0.0
     refused: bool = False
     reason: str = ""
+    # Seconds spent pulling the container image before the job started; outside `duration_s`.
+    pull_s: float = 0.0
     # A refusal that may not happen again: an input could not be fetched (producer or staging
     # site unreachable, fetch deadline) or the registry could not be read. The agent returns
     # such a job to the pool, up to `runtime.execution.refusal_retries`. Every other refusal is
@@ -138,6 +150,12 @@ class ExecutionPolicy:
     # scrubbing moot, and the job saw the whole host environment where docker gave it none
     # (code review 2026-10-05 §69). Escape hatch for a workflow that needs the host home.
     apptainer_containall: bool = True
+    # Under `container_runtime: auto`, whether a container may run under the OTHER runtime family
+    # when its declared one is not installed (a docker image under apptainer). Off: that silently
+    # changed the runtime being compared against Pegasus (code review 2026-10-05 §72).
+    allow_runtime_substitution: bool = False
+    # How long a docker image pull may take before the job is refused (transient).
+    pull_timeout_s: float = 1800.0
     # Where to find the three kinds of thing a job needs, for jobs that name them RELATIVELY.
     # They map onto fields that already exist rather than introducing new ones:
     #   code   <- ExecutionSpec.pfn          (the executable)
@@ -339,11 +357,17 @@ def _available_runtime(kind: str, pol: ExecutionPolicy) -> Optional[str]:
         return None
     if requested != "auto":
         return requested if shutil.which(requested) else None
-    # `auto`: honour what the catalog declared, then accept the other family only if the
-    # image reference is plausibly for it (an override will have rewritten a .sif already).
+    # `auto`: the family the catalog declared. The other family only when explicitly allowed —
+    # the comment here used to promise "only if the image reference is plausibly for it" while
+    # the code accepted any installed runtime, so a docker container on a docker-less host ran
+    # under apptainer with nothing saying so (§72).
     order = _SIF_RUNTIMES if (kind or "").lower() in _SIF_KINDS else ("docker",)
-    for candidate in tuple(order) + KNOWN_RUNTIMES:
+    candidates = tuple(order) + (KNOWN_RUNTIMES if pol.allow_runtime_substitution else ())
+    for candidate in candidates:
         if shutil.which(candidate):
+            if candidate not in order:
+                logger.warning("[EXEC] %s container running under %s (substitution allowed by "
+                               "runtime.execution.allow_runtime_substitution)", kind, candidate)
             return candidate
     return None
 
@@ -739,7 +763,12 @@ def run(spec: ExecutionSpec, job_id: str,
     out_path = err_path = None
     stdout = stderr = subprocess.DEVNULL
     if pol.capture_output:
+        # One file per ATTEMPT, and the id's hash in the name: opening `<id>.out` with "wb"
+        # truncated a re-run's predecessor, and sanitising `a/b` and `a_b` to one name made two
+        # jobs share a log (§73).
         safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in str(job_id))
+        safe = (f"{safe}-{hashlib.sha1(str(job_id).encode()).hexdigest()[:8]}"
+                f"-{time.time_ns()}")
         log_dir = os.path.join(work_dir, ".swarm-logs")
         try:
             os.makedirs(log_dir, exist_ok=True)
@@ -762,6 +791,13 @@ def run(spec: ExecutionSpec, job_id: str,
             stdout = stderr = subprocess.DEVNULL
 
     cmd, container = _name_container(cmd, job_id, run_id)
+    # Pull before the clock starts. A missing docker image used to be pulled by `docker run`
+    # inside the job's timed duration, and a pull failure (125) was recorded as the JOB failing
+    # (§72). Apptainer's conversion of a `docker://` reference on first exec is still inside it.
+    pull_s, pull_refusal = _ensure_docker_image(cmd, pol)
+    if pull_refusal:
+        return ExecutionResult(exit_status=1, refused=True, transient=True,
+                               reason=pull_refusal, pull_s=pull_s)
     started = time.monotonic()
     proc = None
     try:
@@ -834,6 +870,33 @@ def _name_container(cmd: List[str], job_id: str, run_id: str) -> Tuple[List[str]
     safe = lambda s: "".join(c if c.isalnum() or c in "-_." else "_" for c in str(s))[:40]
     name = f"swarm-{safe(run_id or 'run')}-{safe(job_id)}-{os.getpid()}-{int(time.time()*1000)}"
     return [cmd[0], "run", "--name", name, "--init"] + cmd[2:], name
+
+
+def _ensure_docker_image(cmd: List[str], pol: "ExecutionPolicy") -> Tuple[float, str]:
+    """Make sure a `docker run`'s image is local. Returns (seconds spent, refusal or "")."""
+    if len(cmd) < 2 or os.path.basename(cmd[0]) != "docker" or cmd[1] != "run":
+        return 0.0, ""
+    try:
+        image = cmd[cmd.index("--entrypoint") + 2]
+    except (ValueError, IndexError):
+        return 0.0, ""
+    started = time.monotonic()
+    try:
+        have = subprocess.run(["docker", "image", "inspect", image], stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=60).returncode == 0
+        if have:
+            return time.monotonic() - started, ""
+        logger.info("[EXEC] pulling %s before the job starts", image)
+        pulled = subprocess.run(["docker", "pull", image], stdout=subprocess.DEVNULL,
+                                stderr=subprocess.PIPE, timeout=pol.pull_timeout_s, text=True)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return time.monotonic() - started, f"could not pull image {image}: {exc}"
+    elapsed = time.monotonic() - started
+    if pulled.returncode != 0:
+        return elapsed, (f"could not pull image {image}: "
+                         f"{(pulled.stderr or '').strip()[:300]}")
+    logger.info("[EXEC] pulled %s in %.1fs (not counted in the job's duration)", image, elapsed)
+    return elapsed, ""
 
 
 def terminate_all() -> int:

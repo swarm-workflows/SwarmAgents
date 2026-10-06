@@ -5,7 +5,7 @@ Second critical read of the code base, against the same question as the 2026-09-
 anything in the run saying so?** Everything found there is excluded here. Ranked by that
 question; within a rank, by how many cells it touches. Every finding names the file and line,
 the failing scenario, the metric it moves and the direction, and whether a test in `tests/` would
-catch it (none of the HIGH items has one). **Status: §1–§6, §13–§17, §20, §22–§23, §34–§39, §41, §47–§52, §62–§63 and the §H double-execution metric FIXED 2026-10-06** (§60 partly) — all six recommended-order steps complete; second batch: §9, §19, §24, §25, §30, §33, §44 (partly), §53; §61 retry; §7, §8; §42, §43; §40; §57; §64–§67; §69–§70 (`tests/test_review_2026_10_05_snow.py`, 31 tests, 23 fail on the pre-fix tree; `tests/test_review_2026_10_05_pbft.py`, 13 tests, 8 fail on the pre-fix tree; `tests/test_review_2026_10_05_hierarchy.py`, 23 tests on the new write/monitor/purge paths; `tests/test_review_2026_10_05_collect.py`, 15 tests, all 15 fail on the pre-fix tree; `tests/test_review_2026_10_05_runner.py`, 21 tests on the new launch/drain paths; `tests/test_review_2026_10_05_delegation.py`, 12; `tests/test_review_2026_10_05_execution.py`, 15); everything else OPEN.
+catch it (none of the HIGH items has one). **Status: §1–§6, §13–§17, §20, §22–§23, §34–§39, §41, §47–§52, §62–§63 and the §H double-execution metric FIXED 2026-10-06** (§60 partly) — all six recommended-order steps complete; second batch: §9, §19, §24, §25, §30, §33, §44 (partly), §53; §61 retry; §7, §8; §42, §43; §40; §57; §64–§67; §69–§73 (`tests/test_review_2026_10_05_snow.py`, 31 tests, 23 fail on the pre-fix tree; `tests/test_review_2026_10_05_pbft.py`, 13 tests, 8 fail on the pre-fix tree; `tests/test_review_2026_10_05_hierarchy.py`, 23 tests on the new write/monitor/purge paths; `tests/test_review_2026_10_05_collect.py`, 15 tests, all 15 fail on the pre-fix tree; `tests/test_review_2026_10_05_runner.py`, 21 tests on the new launch/drain paths; `tests/test_review_2026_10_05_delegation.py`, 12; `tests/test_review_2026_10_05_execution.py`, 15); everything else OPEN.
 
 **Method.** Six independent read-only passes, one per subsystem (consensus + membership; agent
 core + repository + selection; execution + staging; metrics + collection + plotting; run tooling
@@ -742,17 +742,17 @@ returns `{}` and says the caller must tell the cases apart; no test checks that 
   `staging_site.py:32`). `Put` accepts any `(run, name)` from any host; combined with first-wins, a
   pre-seeded or rogue upload becomes the durable copy and the real producer's push is discarded.
   The site binds `0.0.0.0` and serves every run to anyone with a guessable run id. No quota.
-- **71. Verification is optional at the far end.** A receiver with `verify=True` accepts a stream
+- **71. [FIXED 2026-10-06 — a verifying receiver refuses a stream with no digest; a fetch or upload that ends without its final chunk is refused, never linked in]** Verification is optional at the far end. A receiver with `verify=True` accepts a stream
   carrying no digest (`staging.py:517-525`); a store started `--no-verify` serves and accepts
   unverified data; `Put` has no size field and does not require the `last` chunk (`:307-355`), so a
   stream that ends cleanly without it is linked in as the stored file.
-- **72. Images are fetched inside the timed job and the runtime is substituted silently.** Docker
+- **72. [FIXED 2026-10-06 for docker — the image is inspected and pulled BEFORE the job's clock (`pull_s`), a failed pull is a transient refusal; `auto` stays in the declared runtime family unless `allow_runtime_substitution: true`. Apptainer's `docker://` conversion on first exec is still inside the job's time]** Images are fetched inside the timed job and the runtime is substituted silently. Docker
   pulls a missing image during `docker run`, apptainer converts `docker://` on first exec — both
   inside `duration_s`; a pull failure (125/255) is a job failure, not a refusal. Under `auto` a
   docker-kind container on a docker-less host silently runs under apptainer; the comment says the
   other runtime is accepted "only if the image reference is plausibly for it" and the code accepts
   any runtime in `KNOWN_RUNTIMES` (`runner.py:328-331, 421, 453`).
-- **73. Smaller.** `_publish_locations` (`resource_agent.py:3460`) sits outside any `try`, so an
+- **73. [FIXED 2026-10-06 — publish errors no longer skip the completion write; an empty work_dir publishes nothing; the env denylist adds PASS, AUTH, SSH_AUTH_SOCK and URL-embedded credentials; job logs are per attempt and hash-suffixed; a wildcard grpc.host with staging on is refused at startup. `_publish_produced`'s idle retry tick remains]** Smaller. `_publish_locations` (`resource_agent.py:3460`) sits outside any `try`, so an
   exception there skips `_persist_completion` entirely and the job stays RUNNING with no retry
   queue; with staging on and `work_dir` empty (simulate mode) outputs resolve against the agent's
   cwd and a same-named file there is served. The env denylist (`runner.py:69-90`) misses

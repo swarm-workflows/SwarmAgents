@@ -171,6 +171,8 @@ class Agent(Observer):
             image_overrides=dict(cfg.get("image_overrides", {}) or {}),
             capture_output=bool(cfg.get("capture_output", True)),
             apptainer_containall=bool(cfg.get("apptainer_containall", True)),
+            allow_runtime_substitution=bool(cfg.get("allow_runtime_substitution", False)),
+            pull_timeout_s=float(cfg.get("pull_timeout_s", 1800.0)),
             roots=roots,
         )
         if mode == "real":
@@ -217,10 +219,13 @@ class Agent(Observer):
             # The location record advertises this address to peers, and it is the same field
             # consensus already dials, so a wildcard here is broken for both. Worth saying out
             # loud at startup: as a location it fails at the far end, one fetch at a time.
-            self.logger.error(
-                "[STAGE] grpc.host is %r — a wildcard cannot be dialled by a peer, so every "
-                "location this agent publishes will be unusable. Set it to the address peers "
-                "reach this agent on.", self.grpc_host)
+            # Refused, not logged (§73): every location this agent published would be undialable,
+            # and the failure would surface one fetch at a time on other agents.
+            raise ValueError(
+                f"runtime.execution.staging is enabled but grpc.host is {self.grpc_host!r}: a "
+                f"wildcard cannot be dialled by a peer, so every location this agent publishes "
+                f"would be unusable. Set grpc.host to the address peers reach this agent on "
+                f"(generate_configs.py --agent-hosts-file).")
 
         if not os.environ.get("SWARM_RUN_ID", ""):
             # Required whenever staging is on, not only when a store is configured. Two

@@ -380,6 +380,7 @@ class _Servicer(consensus_pb2_grpc.DataTransferServiceServicer):
         name = local = None
         digest = hashlib.sha256() if self.pol.verify else None
         received = 0
+        saw_last = False
         tmp = None
         fh = None
         try:
@@ -423,6 +424,13 @@ class _Servicer(consensus_pb2_grpc.DataTransferServiceServicer):
                     if digest is not None:
                         digest.update(chunk.content)
                 if chunk.last:
+                    saw_last = True
+                    if digest is not None and not chunk.sha256:
+                        # A store that verifies must not accept an unverifiable upload (§71).
+                        self.put_refused += 1
+                        return consensus_pb2.PutAck(
+                            ok=False, error=f"{name!r} carries no digest and this store "
+                                            f"verifies uploads")
                     if digest is not None and chunk.sha256:
                         got = digest.hexdigest()
                         if got != chunk.sha256:
@@ -435,6 +443,12 @@ class _Servicer(consensus_pb2_grpc.DataTransferServiceServicer):
             if fh is None:
                 self.put_refused += 1
                 return consensus_pb2.PutAck(ok=False, error="empty upload")
+            if not saw_last:
+                # A stream that ended cleanly but without its final chunk was linked in as the
+                # stored file: a truncated upload becoming the durable copy (§71).
+                self.put_refused += 1
+                return consensus_pb2.PutAck(ok=False, error=f"{name!r} upload ended without "
+                                                            f"its final chunk")
             fh.close()
             fh = None
             dest = os.path.join(run_dir, local)
@@ -591,6 +605,7 @@ def fetch(name: str, location: dict, dest_dir: str, run_id: str, requester: str 
             stub = consensus_pb2_grpc.DataTransferServiceStub(channel)
             request = consensus_pb2.FetchRequest(
                 name=str(name), run_id=str(run_id or ""), requester=str(requester or ""))
+            saw_last = False
             with open(tmp, "wb") as out:
                 for chunk in stub.Fetch(request, timeout=pol.timeout_s,
                                         metadata=_auth_metadata()):
@@ -604,6 +619,14 @@ def fetch(name: str, location: dict, dest_dir: str, run_id: str, requester: str 
                         if digest is not None:
                             digest.update(chunk.content)
                     if chunk.last:
+                        saw_last = True
+                        if digest is not None and not chunk.sha256:
+                            # Verification on HERE and no digest from there: a sender with
+                            # verify off. Accepting it silently made `verify` a property of
+                            # whoever served the file rather than of this run (§71).
+                            return FetchResult(
+                                False, f"{name!r} from {target} carries no digest and this "
+                                       f"agent verifies transfers", size, received)
                         if digest is not None and chunk.sha256:
                             got = digest.hexdigest()
                             if got != chunk.sha256:
@@ -613,6 +636,10 @@ def fetch(name: str, location: dict, dest_dir: str, run_id: str, requester: str 
                                     f"{chunk.sha256[:12]}… receiver {got[:12]}…",
                                     size, received)
                         break
+        if not saw_last:
+            # The stream ended without its final chunk: cut off, however many bytes arrived.
+            return FetchResult(False, f"{name!r} from {target} ended without its final chunk",
+                               size, received)
         if size and received != size:
             # Belt and braces for the unverified path: a stream that ends early without an
             # error chunk is otherwise indistinguishable from a complete one.
