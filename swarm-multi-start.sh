@@ -29,6 +29,7 @@ groups=""
 group_size=""
 start_offset="0"
 add=false
+launched_pids=()
 
 # Collect flags & positionals
 pos=()
@@ -171,6 +172,7 @@ if [[ "$use_config_dir" == true ]]; then
         agent_type_from_config=$(python3.11 -c "import yaml; c=yaml.safe_load(open('$config_file')); print(c.get('agent_type', 'resource'))" 2>/dev/null || echo "resource")
 
         python3.11 main.py "$agent_index" --agent-type "$agent_type_from_config" "${debug_flag[@]+"${debug_flag[@]}"}" &
+        launched_pids+=("$!")
     done
 else
     # When not using config dir, use the global agent_type parameter
@@ -179,7 +181,21 @@ else
     for i in $(seq 0 $((num_agents - 1))); do
         agent_index=$((base_index + i + 1))
         python3.11 main.py "$agent_index" "${agent_flag[@]}" "${debug_flag[@]+"${debug_flag[@]}"}" &
+        launched_pids+=("$!")
     done
 fi
 
-echo "Launched $num_agents '$agent_type' agents."
+# Verify the agents are still running a moment later. A crash at startup (import error, bad
+# config, missing key) used to be invisible to the launcher: this script exited 0 having merely
+# FORKED them, and the run found out at the metrics gate after its full runtime (code review
+# 2026-10-05 §60). Exits non-zero naming the dead pids, so ssh_check / run_blocking fail at once.
+sleep "${STARTUP_CHECK_S:-3}"
+dead=()
+for pid in "${launched_pids[@]+"${launched_pids[@]}"}"; do
+    kill -0 "$pid" 2>/dev/null || dead+=("$pid")
+done
+if (( ${#dead[@]} > 0 )); then
+    echo "ERROR: ${#dead[@]} of ${#launched_pids[@]} agent process(es) exited during startup: ${dead[*]}" >&2
+    exit 1
+fi
+echo "Launched $num_agents '$agent_type' agents (${#launched_pids[@]} verified running)."

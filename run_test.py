@@ -429,7 +429,8 @@ def cleanup_between_runs(args) -> None:
     if args.db_host:
         cmd += ["--redis-host", args.db_host, "--cleanup-redis"]
     log("Cleanup between runs …")
-    run_blocking(cmd, check=False)
+    # Checked: cleanup.py exits non-zero when it cannot reach Redis to flush it (§60).
+    run_blocking(cmd, check=bool(args.db_host))
     if not args.use_config_dir:
         # Deleting agent_profiles.json / agent_dtns.json is deliberate and load-bearing:
         # generate_configs.py REUSES an existing agent_dtns.json through a different code path
@@ -624,7 +625,8 @@ def start_agents_local(args, agent_count: int = None, start_offset: int = 0) -> 
     # `run_blocking(log_file=...)`: this used to append ">", the file name, "2>&1" and "&" to an
     # argv list run without a shell, where they were passed to the script as literal arguments
     # (and ignored), so the start log documented in CLAUDE.md was never written.
-    run_blocking(["nohup"] + start_cmd, log_file=log_file, check=False)
+    # Checked: the starter exits non-zero when an agent dies during startup (§60).
+    run_blocking(["nohup"] + start_cmd, log_file=log_file, check=True)
 
 def shard_ranges(total: int, per_host: int) -> list[tuple[int,int]]:
     """
@@ -673,7 +675,7 @@ def start_agents_remote(args, agent_hosts_list: list[str], agent_count: int = No
         raise ValueError(f"Need at least {needed} hosts for agents up to "
                          f"{start_offset + agent_count} with agents_per_host={args.agents_per_host}")
 
-    for start_idx, end_idx, host_idx in ranges:
+    def launch_one(start_idx, end_idx, host_idx):
         host = agent_hosts_list[host_idx]
         count = end_idx - start_idx + 1
         log(f"[{host}] agents {start_idx}..{end_idx} (count={count})")
@@ -716,7 +718,7 @@ def start_agents_remote(args, agent_hosts_list: list[str], agent_count: int = No
         # line is logged by run_blocking and visible in `ps` on both hosts (stop-time review of
         # §70). The read runs in the FOREGROUND, before the backgrounded chain — a background job
         # in a non-interactive shell has /dev/null for stdin — and the variable it sets is
-        # inherited by that chain's subshell. Without a local token the remote ~/.profile is the
+        # inherited by the commands after it. Without a local token the remote ~/.profile is the
         # only source.
         token = os.environ.get("SWARM_STAGING_TOKEN", "")
         token_read = "IFS= read -r _SWARM_TOK; " if token else ""
@@ -731,9 +733,32 @@ def start_agents_remote(args, agent_hosts_list: list[str], agent_count: int = No
             f"{shlex.quote(args.agent_type)} {count} {shlex.quote(args.topology)} {args.jobs} "
             f"{shlex.quote(args.db_host)} {args.jobs_per_proposal} "
             f"--use-config-dir " + " ".join(shlex.quote(x) for x in forwarded) +
-            f" > agent_{start_idx}_start.log 2>&1 &"
+            # FOREGROUND, stdin from /dev/null. Ending the command with `&` backgrounded the whole
+            # `&&` chain, so ssh returned 0 before the profile, the `cd` or the starter had run,
+            # and a host that failed to start anything was found at the metrics gate after the
+            # full runtime (code review 2026-10-05 §60). The starter backgrounds the agents
+            # itself, checks they survived startup, and exits non-zero if not; /dev/null stdin
+            # keeps ssh from waiting on descriptors the agents would otherwise inherit.
+            f" > agent_{start_idx}_start.log 2>&1 < /dev/null"
         )
         ssh_check(host, start_cmd, stdin_text=(token + "\n") if token else None)
+
+
+    # Hosts in parallel: each start now waits for the starter's survival check (~3 s), which
+    # serially would be minutes across a 90-host slice. Every failure is collected and the
+    # launch refused as a whole, naming the hosts.
+    from concurrent.futures import ThreadPoolExecutor
+    failures = []
+    with ThreadPoolExecutor(max_workers=min(32, max(1, len(ranges)))) as pool:
+        futures = {pool.submit(launch_one, a, b, h): agent_hosts_list[h] for a, b, h in ranges}
+        for fut, host in futures.items():
+            try:
+                fut.result()
+            except Exception as exc:
+                failures.append(f"{host}: {exc}")
+    if failures:
+        raise SystemExit(f"Agent start failed on {len(failures)} host(s) — see each host's "
+                         f"agent_<id>_start.log:\n  " + "\n  ".join(failures))
 
     phase = "initial" if start_offset == 0 else "dynamic"
     log(f"Launched {agent_count} {phase} '{args.agent_type}' agents across {len(ranges)} remote host(s).")

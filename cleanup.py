@@ -88,6 +88,9 @@ if __name__ == '__main__':
                 task_repo.delete_all(key_prefix="*")
             except redis.exceptions.ConnectionError as e:
                 print(f"Error connecting to Redis for cleanup: {e}")
+                # Non-zero: a flush that did not happen must not look like one that did — the
+                # next run would inherit the previous run's keys (code review 2026-10-05 §60).
+                raise SystemExit(1)
             print(f"--- End Redis Cleanup ---")
 
 
