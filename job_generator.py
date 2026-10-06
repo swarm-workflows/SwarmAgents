@@ -71,8 +71,27 @@ class JobGenerator:
         # report are about the FLEET, not about which agents jobs were modelled on.
         self.leaf_profiles = {aid: p for aid, p in self.all_profiles.items()
                               if int(p.get("level", 0) or 0) == 0}
-        if target_agents and self.all_profiles and not self.agent_profiles:
-            raise ValueError(f"--job-target-agents {target_agents} leaves no executing agent")
+        if target_agents and self.all_profiles:
+            # The identical-workload guarantee needs the SAME target ids on every rung: every id
+            # in 1..K must exist and be a leaf here. Filtering coordinators out of 1..K instead
+            # (as this first did) gave Hier-30 the targets 1..27 and Hier-270 the targets 1..30
+            # — different workloads under one K (stop-time review of §55). Coordinators are
+            # numbered last, so leaves are ids 1..L and the largest valid K is L.
+            wanted = {str(i) for i in range(1, int(target_agents) + 1)}
+            bad = sorted((int(i) for i in wanted if i not in self.agent_profiles), key=int)
+            if bad:
+                leaves = sorted(int(a) for a, p in self.all_profiles.items()
+                                if int(p.get("level", 0) or 0) == 0)
+                prefix = 0
+                for a in leaves:
+                    if a != prefix + 1:
+                        break
+                    prefix = a
+                raise ValueError(
+                    f"--job-target-agents {target_agents}: ids {bad[:5]}{'…' if len(bad) > 5 else ''} "
+                    f"are not executing agents in this fleet, so the targets would differ from a "
+                    f"rung where they are. Use K <= {prefix} (this fleet's leaf prefix), and the "
+                    f"same K on every rung — the smallest rung's leaf count.")
         self.failure_rate = failure_rate
         self.failure_agents = failure_agents or {}
         self.quantum_fraction = quantum_fraction
@@ -445,9 +464,10 @@ if __name__ == "__main__":
                         help="seed for this generator's own RNG (jobs are reproducible from it "
                              "alone, independent of anything drawn before)")
     parser.add_argument("--job-target-agents", type=int, default=None,
-                        help="model jobs only on executing agents 1..K; with "
-                             "--master-fleet-size configs, K = the smallest rung gives every "
-                             "rung of a ladder the identical workload")
+                        help="model jobs only on agents 1..K, every one of which must be an "
+                             "executing (leaf) agent; with --master-fleet-size configs, K = the "
+                             "smallest rung's LEAF count gives every rung of a ladder the "
+                             "identical workload")
     parser.add_argument("--hybrid-fraction", type=float, default=0.0,
                         help="Fraction (0.0-1.0) of jobs with a hybrid classical<->quantum loop "
                              "(requires agent profiles with quantum_backend)")

@@ -1293,11 +1293,12 @@ if __name__ == "__main__":
                         help="Fraction (0.0-1.0) of generated jobs with a hybrid classical<->quantum loop")
 
     parser.add_argument("--job-target-agents", type=int, default=None,
-                        help="model synthetic jobs only on executing agents 1..K. With "
-                             "--master-fleet-size, agents 1..K are the same machines on every "
-                             "rung of size >= K, so K = the smallest rung gives the whole ladder "
-                             "the identical workload (with --seed). Default: every executing "
-                             "agent of this fleet.")
+                        help="model synthetic jobs only on agents 1..K, all of which must be "
+                             "leaves here (refused otherwise). With --master-fleet-size, agents "
+                             "1..K are the same machines on every rung, and coordinators are "
+                             "numbered last, so K = the smallest rung's LEAF count (27 for "
+                             "Hier-30) gives the whole ladder the identical workload (with "
+                             "--seed). Default: every executing agent of this fleet.")
     parser.add_argument("--master-fleet-size", type=int, default=None,
                         help="Draw per-agent flavours and quantum backends for a fleet of this "
                              "size, then write only the first <num_agents> of them. Set it to the "

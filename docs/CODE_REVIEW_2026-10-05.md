@@ -607,7 +607,7 @@ different door: consensus silently runs single-node or to the wrong peers.
   `--jobs`** (`run_test.py:410-431`: `rm -rf jobs` is inside `if not args.use_config_dir`;
   `generate_configs.py:1384` reuses an existing `jobs/` silently). A previous run's 600 jobs are
   published into a run declaring 200; an empty `jobs/` leads straight into §47.
-- **[FIXED 2026-10-06 — the job generator has its own RNG derived from `--seed`; coordinators are never job targets; `--job-target-agents K` (generate_configs, run_test, job_generator) models jobs on agents 1..K only, so with `--master-fleet-size` and K = the smallest rung every rung gets the identical workload] 55. The synthetic workload differs from rung to rung even with `--seed` and
+- **[FIXED 2026-10-06 — the job generator has its own RNG derived from `--seed`; coordinators are never job targets; `--job-target-agents K` (generate_configs, run_test, job_generator) models jobs on agents 1..K only, so with `--master-fleet-size` and K = the smallest rung's LEAF count every rung gets the identical workload; a K that reaches a coordinator on the rung being generated is refused, since its targets would differ from a rung where that id is a leaf (stop-time review)] 55. The synthetic workload differs from rung to rung even with `--seed` and
   `--master-fleet-size`** (`generate_configs.py:1384-1388` runs `JobGenerator` on the global RNG
   after the per-agent draws; `job_generator.py:181-186` samples targets from the current fleet).
   `--master-fleet-size` fixes the flavours, not the jobs. Hierarchical coordinators, which never

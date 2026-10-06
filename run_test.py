@@ -2132,8 +2132,9 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--seed", type=int, default=None,
                     help="Seed agent-profile generation so fleets are reproducible across runs")
     ap.add_argument("--job-target-agents", type=int, default=None,
-                    help="forwarded to generate_configs.py: model jobs only on agents 1..K "
-                         "(K = the smallest rung for an identical workload across a ladder)")
+                    help="forwarded to generate_configs.py: model jobs only on agents 1..K, all "
+                         "leaves (K = the smallest rung's leaf count for an identical workload "
+                         "across a ladder)")
     ap.add_argument("--master-fleet-size", type=int, default=None,
                     help="Generate per-agent flavours/backends for a fleet of this size and use "
                          "the first --agents of them. Set it to the largest rung of the scale "

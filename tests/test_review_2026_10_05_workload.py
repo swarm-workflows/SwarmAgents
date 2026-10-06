@@ -73,7 +73,7 @@ def test_a_target_cap_that_leaves_no_executor_is_refused():
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
         json.dump(_profiles(5, coordinators={1, 2}), f)
     try:
-        with pytest.raises(ValueError, match="no executing agent"):
+        with pytest.raises(ValueError, match="not executing agents"):
             JobGenerator(job_count=0, agent_profile_path=f.name, target_agents=2)
     finally:
         os.unlink(f.name)
@@ -153,3 +153,21 @@ class TestJobsDirUnderUseConfigDir:
         run_test.check_jobs_dir_matches(self._args(tmp_path))
         run_test.check_jobs_dir_matches(self._args(tmp_path, use_config_dir=False, jobs=99))
         run_test.check_jobs_dir_matches(self._args(tmp_path, pegasus_jobs_dir="x", jobs=99))
+
+
+# --------------------------------------------------------------------------- stop-time review of §55
+def _hier(n, coordinators):
+    """Coordinators are the TOP ids, as generate_configs numbers them (Hier-30: 28-30)."""
+    return _profiles(n, coordinators=set(range(n - coordinators + 1, n + 1)))
+
+
+def test_hierarchical_rungs_with_a_leaf_cap_get_the_same_workload():
+    hier30 = _jobs(_hier(30, 3), seed=7, target_agents=27)
+    hier270 = _jobs(_hier(270, 14), seed=7, target_agents=27)
+    assert hier30 == hier270
+
+
+def test_a_cap_reaching_a_coordinator_is_refused_with_the_valid_k():
+    """K=30 on Hier-30 would give targets 1..27 there but 1..30 on Hier-270."""
+    with pytest.raises(ValueError, match=r"Use K <= 27"):
+        _jobs(_hier(30, 3), seed=7, target_agents=30)
