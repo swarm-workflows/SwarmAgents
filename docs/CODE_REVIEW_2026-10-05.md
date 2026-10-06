@@ -5,7 +5,7 @@ Second critical read of the code base, against the same question as the 2026-09-
 anything in the run saying so?** Everything found there is excluded here. Ranked by that
 question; within a rank, by how many cells it touches. Every finding names the file and line,
 the failing scenario, the metric it moves and the direction, and whether a test in `tests/` would
-catch it (none of the HIGH items has one). **Status: §1–§6, §13–§17, §20, §22–§23, §34–§39, §41, §47–§52, §62–§63 and the §H double-execution metric FIXED 2026-10-06** (§60 partly) — all six recommended-order steps complete; second batch: §9, §19, §24, §25, §30, §33, §44 (partly), §53; §61 retry; §7, §8; §42, §43; §40; §57; §64–§67; §69–§73; §26–§29, §31, §32 (`tests/test_review_2026_10_05_snow.py`, 31 tests, 23 fail on the pre-fix tree; `tests/test_review_2026_10_05_pbft.py`, 13 tests, 8 fail on the pre-fix tree; `tests/test_review_2026_10_05_hierarchy.py`, 23 tests on the new write/monitor/purge paths; `tests/test_review_2026_10_05_collect.py`, 15 tests, all 15 fail on the pre-fix tree; `tests/test_review_2026_10_05_runner.py`, 21 tests on the new launch/drain paths; `tests/test_review_2026_10_05_delegation.py`, 12; `tests/test_review_2026_10_05_execution.py`, 15); everything else OPEN.
+catch it (none of the HIGH items has one). **Status: §1–§6, §13–§17, §20, §22–§23, §34–§39, §41, §47–§52, §62–§63 and the §H double-execution metric FIXED 2026-10-06** (§60 partly) — all six recommended-order steps complete; second batch: §9, §19, §24, §25, §30, §33, §44 (partly), §53; §61 retry; §7, §8; §42, §43; §40; §57; §64–§67; §69–§73; §26–§29, §31, §32; §54, §55, §56 (partly), §58 (partly) (`tests/test_review_2026_10_05_snow.py`, 31 tests, 23 fail on the pre-fix tree; `tests/test_review_2026_10_05_pbft.py`, 13 tests, 8 fail on the pre-fix tree; `tests/test_review_2026_10_05_hierarchy.py`, 23 tests on the new write/monitor/purge paths; `tests/test_review_2026_10_05_collect.py`, 15 tests, all 15 fail on the pre-fix tree; `tests/test_review_2026_10_05_runner.py`, 21 tests on the new launch/drain paths; `tests/test_review_2026_10_05_delegation.py`, 12; `tests/test_review_2026_10_05_execution.py`, 15); everything else OPEN.
 
 **Method.** Six independent read-only passes, one per subsystem (consensus + membership; agent
 core + repository + selection; execution + staging; metrics + collection + plotting; run tooling
@@ -603,17 +603,17 @@ different door: consensus silently runs single-node or to the wrong peers.
   exit 0; its remote ssh has no BatchMode or host-key options and a 10 s timeout, so a host that
   times out drops its agents from the kill list. Declare 3,7; only 3 dies; the run passes as a
   2-failure cell. `TestDeclaredSilentAgents` covers "none took" and "wrong agents", not "a subset".
-- **54. Under `--use-config-dir`, `jobs/` is neither cleaned, regenerated nor checked against
+- **[FIXED 2026-10-06 — a synthetic `jobs/` whose record count differs from `--jobs` is refused under `--use-config-dir`] 54. Under `--use-config-dir`, `jobs/` is neither cleaned, regenerated nor checked against
   `--jobs`** (`run_test.py:410-431`: `rm -rf jobs` is inside `if not args.use_config_dir`;
   `generate_configs.py:1384` reuses an existing `jobs/` silently). A previous run's 600 jobs are
   published into a run declaring 200; an empty `jobs/` leads straight into §47.
-- **55. The synthetic workload differs from rung to rung even with `--seed` and
+- **[FIXED 2026-10-06 — the job generator has its own RNG derived from `--seed`; coordinators are never job targets; `--job-target-agents K` (generate_configs, run_test, job_generator) models jobs on agents 1..K only, so with `--master-fleet-size` and K = the smallest rung every rung gets the identical workload] 55. The synthetic workload differs from rung to rung even with `--seed` and
   `--master-fleet-size`** (`generate_configs.py:1384-1388` runs `JobGenerator` on the global RNG
   after the per-agent draws; `job_generator.py:181-186` samples targets from the current fleet).
   `--master-fleet-size` fixes the flavours, not the jobs. Hierarchical coordinators, which never
   execute, are valid job targets, so a job sized to a coordinator's unique top flavour is
   infeasible for every leaf.
-- **56. Dead and disagreeing flags.** `--job-interval` (default 0.5) is never forwarded (the
+- **[PARTLY FIXED 2026-10-06 — `--job-interval` is forwarded (default now 1.0, the cadence runs actually had); `batch_tests_v2.py` exits 1 when any run fails. `--generate-plots`/`--log-dir`, the converter/run_test default disagreements and batch flag forwarding remain] 56. Dead and disagreeing flags.** `--job-interval` (default 0.5) is never forwarded (the
   distributor uses its own 1.0; `batch_tests_v2` forwards the dead flag); `--generate-plots` and
   `--log-dir` are dead; `--pegasus-data-nodes` defaults to per-file in `run_test.py:1820` but
   per-site in the converter CLI; `dtn_scope` is `job` in `run_test.py:261` but `file` in the
@@ -633,7 +633,7 @@ different door: consensus silently runs single-node or to the wrong peers.
   `lfn_sizes.get(lfn, 0)`) and an unknown exit code becomes `0` (`:600`), so the converter's
   absent-is-not-zero rule receives an explicit zero and keeps it. `test_a_transformation_with_no_
   container_has_none` and `test_a_malformed_catalog_does_not_abort_the_run` **pin** the fail-open.
-- **58. Job order and identity are not deterministic.** `job_distributor.py:78-89` publishes in
+- **[PARTLY FIXED 2026-10-06 — the distributor publishes in job-number order; the converter's unsorted Redis scan and job-id collisions remain] 58. Job order and identity are not deterministic.** `job_distributor.py:78-89` publishes in
   `st_ctime` order (after `rsync`, copy order — lexicographic `job_1`, `job_10`, …); the converter
   iterates Redis `scan_iter` unsorted (`:62-69`), so `job_{i}` numbering changes per conversion;
   `run_name` is `dax_label + basename(run_dir)` (`extractor:403`), so two submit trees ending in

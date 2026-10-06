@@ -71,22 +71,23 @@ class JobDistributor(threading.Thread):
 
     def _job_file_generator(self) -> Iterator[str]:
         """
-        Lazily yields full paths to JSON job files in order of their creation time.
-        Uses os.scandir() and a generator to reduce memory use.
+        Yields full paths to JSON job files in JOB-NUMBER order (`job_2` before `job_10`).
+
+        It used to sort by creation time, which is the order files were COPIED in — after an
+        rsync, lexicographic (`job_1`, `job_10`, `job_100`, ...) — so the arrival order of a
+        workload depended on how its directory was transferred (code review 2026-10-05 §58).
         """
+        def key(entry_name: str):
+            stem = entry_name[len("job_"):-len(".json")]
+            return (0, int(stem), "") if stem.isdigit() else (1, 0, stem)
 
-        def file_iter():
-            with os.scandir(self.jobs_dir) as it:
-                for entry in it:
-                    # Only actual job files (job_*.json) — never sidecars like
-                    # conversion_summary.json / pegasus_baseline.json, which are
-                    # metadata, not jobs.
-                    if entry.name.startswith("job_") and entry.name.endswith(".json") and entry.is_file():
-                        yield (entry.stat().st_ctime, entry.path)
-
-        # Lazily sort and yield just file paths
-        for _, path in sorted(file_iter()):
-            yield path
+        with os.scandir(self.jobs_dir) as it:
+            # Only actual job files (job_*.json) — never sidecars like conversion_summary.json /
+            # pegasus_baseline.json, which are metadata, not jobs.
+            names = [e.name for e in it
+                     if e.name.startswith("job_") and e.name.endswith(".json") and e.is_file()]
+        for name in sorted(names, key=key):
+            yield os.path.join(self.jobs_dir, name)
 
     def _load_jobs_from_file(self, file_path: str) -> List[Job]:
         """

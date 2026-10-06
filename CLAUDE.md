@@ -78,6 +78,10 @@ python generate_configs.py <num_agents> <jobs_per_proposal> <base_config> <outpu
 # the same seed gives agent i a different machine at each size). Generate from a clean state —
 # an existing agent_dtns.json is reused through a different RNG path and warns when it is.
 python generate_configs.py 30 10 ./config_swarm_multi.yml configs mesh localhost 600 --dtns --seed 42 --master-fleet-size 270
+# Since 2026-10-06 the job generator has its own --seed-derived RNG and never targets a coordinator.
+# For an IDENTICAL workload across a ladder add --job-target-agents K with K = the smallest rung:
+# agents 1..K are the same machines on every rung (master prefix), so every rung gets the same jobs.
+python generate_configs.py 90 10 ./config_swarm_multi.yml configs mesh localhost 600 --dtns --seed 42 --master-fleet-size 270 --job-target-agents 30
 # make_agent_hosts.py builds the hosts file for a remote run. Placement is the ORDER of this
 # file (agents are assigned to hosts in contiguous blocks), and agent ids map to sites in
 # contiguous blocks, so numeric order clusters each hierarchical group at one site: measured on

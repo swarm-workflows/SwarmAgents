@@ -1155,6 +1155,8 @@ class SwarmConfigGenerator:
             # Profile for jobs
             dtns = config.get("dtns", [])
             agent_profiles[str(agent_id)] = {
+                # Level, so the job generator models jobs only on agents that execute them.
+                "level": int(topo.get("level", 0) or 0),
                 "core": caps['core'],
                 "ram": caps['ram'],
                 "disk": caps['disk'],
@@ -1290,6 +1292,12 @@ if __name__ == "__main__":
     parser.add_argument("--hybrid-fraction", type=float, default=0.0,
                         help="Fraction (0.0-1.0) of generated jobs with a hybrid classical<->quantum loop")
 
+    parser.add_argument("--job-target-agents", type=int, default=None,
+                        help="model synthetic jobs only on executing agents 1..K. With "
+                             "--master-fleet-size, agents 1..K are the same machines on every "
+                             "rung of size >= K, so K = the smallest rung gives the whole ladder "
+                             "the identical workload (with --seed). Default: every executing "
+                             "agent of this fleet.")
     parser.add_argument("--master-fleet-size", type=int, default=None,
                         help="Draw per-agent flavours and quantum backends for a fleet of this "
                              "size, then write only the first <num_agents> of them. Set it to the "
@@ -1384,5 +1392,8 @@ if __name__ == "__main__":
     if not args.skip_jobs and not os.path.exists("jobs"):
         jg = JobGenerator(job_count=args.job_cnt, agent_profile_path='agent_profiles.json',
                           quantum_fraction=args.quantum_fraction,
-                          hybrid_fraction=args.hybrid_fraction)
+                          hybrid_fraction=args.hybrid_fraction,
+                          # Its own stream, derived from --seed alone (§55).
+                          seed=(None if args.seed is None else args.seed + 1_000_003),
+                          target_agents=args.job_target_agents)
         jg.generate_job_files(output_dir="jobs", enable_dtns=args.dtns, fit_all=args.fit_all)

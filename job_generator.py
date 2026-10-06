@@ -38,7 +38,8 @@ class JobGenerator:
 
     def __init__(self, job_count: int = 0, agent_profile_path: str = None,
                  failure_rate: float = 0.0, failure_agents: Dict[str, float] = None,
-                 quantum_fraction: float = 0.0, hybrid_fraction: float = 0.0) -> None:
+                 quantum_fraction: float = 0.0, hybrid_fraction: float = 0.0,
+                 seed: Optional[int] = None, target_agents: Optional[int] = None) -> None:
         """
         Initialize the JobGenerator.
 
@@ -51,7 +52,27 @@ class JobGenerator:
                                 classical<->quantum loop
         """
         self.job_count = job_count
-        self.agent_profiles = self._load_agent_profiles(agent_profile_path)
+        # Its own RNG. It used to draw from the module-level `random` AFTER generate_configs had
+        # consumed it for every agent's flavour and DTNs, so the same --seed produced a different
+        # job stream at every fleet size (code review 2026-10-05 §55). A private stream seeded
+        # from the seed alone is independent of how many draws config generation made.
+        self.rng = random.Random(seed)
+        self.all_profiles = self._load_agent_profiles(agent_profile_path)
+        # Job TARGETS: agents that execute (level 0 — a coordinator delegates and never runs a
+        # job, so sizing a job to its flavour could make the job infeasible for every leaf), and
+        # optionally only ids 1..target_agents. With --master-fleet-size, agents 1..K are the
+        # same machines on every rung of size >= K, so K = the smallest rung gives every rung of
+        # a ladder the identical workload, feasible on all of them.
+        self.agent_profiles = {
+            aid: p for aid, p in self.all_profiles.items()
+            if int(p.get("level", 0) or 0) == 0
+            and (not target_agents or int(aid) <= int(target_agents))}
+        # Every agent that executes, whatever the targets: fit-all sizing and the feasibility
+        # report are about the FLEET, not about which agents jobs were modelled on.
+        self.leaf_profiles = {aid: p for aid, p in self.all_profiles.items()
+                              if int(p.get("level", 0) or 0) == 0}
+        if target_agents and self.all_profiles and not self.agent_profiles:
+            raise ValueError(f"--job-target-agents {target_agents} leaves no executing agent")
         self.failure_rate = failure_rate
         self.failure_agents = failure_agents or {}
         self.quantum_fraction = quantum_fraction
@@ -75,17 +96,20 @@ class JobGenerator:
                 return json.load(f)
         return {}
 
-    @staticmethod
-    def biased_uniform(min_val, max_val, bias_factor=3):
+    def _fleet_profiles(self) -> Dict[str, Dict[str, Any]]:
+        """Every executing agent of the fleet; the targets when no fleet file was loaded."""
+        return self.leaf_profiles or self.agent_profiles
+
+    def biased_uniform(self, min_val, max_val, bias_factor=3):
         """Generate values skewed toward the lower range."""
-        return round(min_val + (max_val - min_val) * (random.random() ** bias_factor), 2)
+        return round(min_val + (max_val - min_val) * (self.rng.random() ** bias_factor), 2)
 
     def _compute_min_profile(self) -> Dict[str, Any]:
         """
         Compute the minimum capacities across all agent profiles.
         Jobs sized to this profile are feasible for every agent.
         """
-        profiles = list(self.agent_profiles.values())
+        profiles = list(self._fleet_profiles().values())
         min_profile = {
             "core": min(p.get("core", 0) for p in profiles),
             "ram": min(p.get("ram", 0) for p in profiles),
@@ -122,27 +146,27 @@ class JobGenerator:
         (error, confidence) pair from which the runtime derives the shot count.
         """
         spec = {
-            "qubits": random.randint(2, max(2, backend.get("qubits", 2))),
-            "circuit_depth": random.randint(10, 200),
-            "output_type": random.choice(["expectation", "histogram"]),
+            "qubits": self.rng.randint(2, max(2, backend.get("qubits", 2))),
+            "circuit_depth": self.rng.randint(10, 200),
+            "output_type": self.rng.choice(["expectation", "histogram"]),
             "hybrid": hybrid,
-            "iterations": random.randint(5, 50) if hybrid else 1,
+            "iterations": self.rng.randint(5, 50) if hybrid else 1,
         }
         # Histogram output of one-shot jobs needs classical post-processing —
         # the executing agent pushes that job to the pool on completion
         if not hybrid and spec["output_type"] == "histogram":
             spec["post_process"] = True
-        if random.random() < 0.5:
-            spec["shots"] = random.choice([1024, 2048, 4096, 8192])
+        if self.rng.random() < 0.5:
+            spec["shots"] = self.rng.choice([1024, 2048, 4096, 8192])
         else:
-            spec["error"] = round(random.uniform(0.01, 0.05), 3)
-            spec["confidence"] = random.choice([0.90, 0.95, 0.99])
+            spec["error"] = round(self.rng.uniform(0.01, 0.05), 3)
+            spec["confidence"] = self.rng.choice([0.90, 0.95, 0.99])
         # Fidelity floor at or below what the target backend offers
         backend_fidelity = backend.get("gate_fidelity", 1.0)
-        if random.random() < 0.5:
-            spec["fidelity"] = round(random.uniform(0.9, backend_fidelity), 4)
+        if self.rng.random() < 0.5:
+            spec["fidelity"] = round(self.rng.uniform(0.9, backend_fidelity), 4)
         # Architecture preference half the time (pins the job to that arch)
-        if backend.get("arch") and random.random() < 0.5:
+        if backend.get("arch") and self.rng.random() < 0.5:
             spec["arch"] = backend["arch"]
         return spec
 
@@ -151,7 +175,7 @@ class JobGenerator:
         classical — quantum jobs can never fit agents without a backend."""
         if fit_all:
             return "classical"
-        r = random.random()
+        r = self.rng.random()
         if r < self.hybrid_fraction:
             return "hybrid"
         if r < self.hybrid_fraction + self.quantum_fraction:
@@ -178,17 +202,17 @@ class JobGenerator:
             fail_prob = self.failure_rate
         elif job_class in ("quantum", "hybrid"):
             # Quantum/hybrid jobs must target an agent that owns a backend
-            agent_id = random.choice(list(self.quantum_profiles.keys()))
+            agent_id = self.rng.choice(list(self.quantum_profiles.keys()))
             profile = self.quantum_profiles[agent_id]
             fail_prob = self.failure_agents.get(agent_id, self.failure_rate)
         else:
             # Choose a random agent profile
-            agent_id = random.choice(list(self.agent_profiles.keys()))
+            agent_id = self.rng.choice(list(self.agent_profiles.keys()))
             profile = self.agent_profiles[agent_id]
             fail_prob = self.failure_agents.get(agent_id, self.failure_rate)
 
         # should_fail is stored in job; actual exit_status is set during execution
-        should_fail = random.random() < fail_prob
+        should_fail = self.rng.random() < fail_prob
         exit_status = 1 if should_fail else 0
 
         # Ensure job requirements do not exceed profile capacities
@@ -211,16 +235,16 @@ class JobGenerator:
             candidate_dtns = profile["dtns"]
             # Limit to max 2 DTNs to ensure jobs can be satisfied by multiple agents
             max_dtns = min(2, len(candidate_dtns))
-            dtn_count = random.randint(1, max_dtns)
-            dtns = random.sample(candidate_dtns, dtn_count)
+            dtn_count = self.rng.randint(1, max_dtns)
+            dtns = self.rng.sample(candidate_dtns, dtn_count)
             data_in = [
                 {'name': dtn.get("name") if isinstance(dtn, dict) else dtn,
-                 'file': random.choice(input_files)}
+                 'file': self.rng.choice(input_files)}
                 for dtn in dtns
             ]
             data_out = [
                 {'name': dtn.get("name") if isinstance(dtn, dict) else dtn,
-                 'file': random.choice(output_files)}
+                 'file': self.rng.choice(output_files)}
                 for dtn in dtns
             ]
 
@@ -334,13 +358,13 @@ class JobGenerator:
                 feasible_agents = []
                 infeasible_agents = []
 
-                for agent_id, agent_profile in self.agent_profiles.items():
+                for agent_id, agent_profile in self._fleet_profiles().items():
                     if self.is_job_feasible(job, agent_profile):
                         feasible_agents.append(agent_id)
                     else:
                         infeasible_agents.append(agent_id)
 
-                total_agents = len(self.agent_profiles)
+                total_agents = len(self._fleet_profiles())
                 total_feasible = len(feasible_agents)
                 feasibility_pct = (total_feasible / total_agents * 100) if total_agents > 0 else 0
 
@@ -378,7 +402,7 @@ class JobGenerator:
 
         if fit_all:
             min_profile = self._compute_min_profile()
-            print(f"fit-all mode: jobs sized to min profile across {len(self.agent_profiles)} agents:")
+            print(f"fit-all mode: jobs sized to min profile across {len(self._fleet_profiles())} agents:")
             print(f"  core={min_profile['core']}, ram={min_profile['ram']}, "
                   f"disk={min_profile['disk']}, gpu={min_profile['gpu']}, "
                   f"common_dtns={[d['name'] for d in min_profile.get('dtns', [])]}")
@@ -417,6 +441,13 @@ if __name__ == "__main__":
     parser.add_argument("--quantum-fraction", type=float, default=0.0,
                         help="Fraction (0.0-1.0) of jobs with a one-shot quantum component "
                              "(requires agent profiles with quantum_backend)")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="seed for this generator's own RNG (jobs are reproducible from it "
+                             "alone, independent of anything drawn before)")
+    parser.add_argument("--job-target-agents", type=int, default=None,
+                        help="model jobs only on executing agents 1..K; with "
+                             "--master-fleet-size configs, K = the smallest rung gives every "
+                             "rung of a ladder the identical workload")
     parser.add_argument("--hybrid-fraction", type=float, default=0.0,
                         help="Fraction (0.0-1.0) of jobs with a hybrid classical<->quantum loop "
                              "(requires agent profiles with quantum_backend)")
@@ -442,6 +473,8 @@ if __name__ == "__main__":
         failure_agents=failure_agents,
         quantum_fraction=args.quantum_fraction,
         hybrid_fraction=args.hybrid_fraction,
+        seed=args.seed,
+        target_agents=args.job_target_agents,
     )
     generator.generate_job_files(output_dir=args.output_dir, enable_dtns=args.enable_dtns,
                                  fit_all=args.fit_all)

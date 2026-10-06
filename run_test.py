@@ -406,6 +406,8 @@ def generate_configs(args, agent_hosts_list: list[str]) -> Path:
         gen_args += ["--seed", str(args.seed)]
     if getattr(args, "master_fleet_size", None):
         gen_args += ["--master-fleet-size", str(args.master_fleet_size)]
+    if getattr(args, "job_target_agents", None):
+        gen_args += ["--job-target-agents", str(args.job_target_agents)]
     if getattr(args, "pegasus_profiles", None) or getattr(args, "pegasus_jobs_dir", None):
         # jobs/ comes from convert_pegasus_jobs() (run right after this) or, with
         # --pegasus-jobs-dir, from a bundle converted elsewhere. Either way a synthetic set
@@ -825,6 +827,23 @@ def _launched_config_paths(args) -> list:
         return [cfg_dir / f"{CFG_PREFIX}{i}.yml" for i in range(1, launched + 1)]
     # No fleet size (a caller that is not the runner): read whatever is there.
     return sorted(cfg_dir.glob(f"{CFG_PREFIX}*.yml"))
+
+
+def check_jobs_dir_matches(args) -> None:
+    """Under --use-config-dir the synthetic jobs/ is neither regenerated nor cleaned, so it is
+    whatever the last generation left: a previous run's 600 jobs published into a run that
+    declares 200, or an empty directory feeding the drain nothing (code review 2026-10-05 §54).
+    A Pegasus run is validated elsewhere (`validate_pegasus_jobs_dir`)."""
+    if not getattr(args, "use_config_dir", False):
+        return
+    if getattr(args, "pegasus_profiles", None) or getattr(args, "pegasus_jobs_dir", None):
+        return
+    found = count_job_records(Path(jobs_dir(args)))
+    if found != int(args.jobs):
+        raise SystemExit(
+            f"--use-config-dir: {jobs_dir(args)}/ holds {found} job record(s) but --jobs is "
+            f"{args.jobs}. It is not regenerated under --use-config-dir; regenerate it "
+            f"(generate_configs.py, or a run without --use-config-dir) or pass --jobs {found}.")
 
 
 def count_job_records(path: Path) -> int:
@@ -1360,6 +1379,7 @@ def produce_jobs(args) -> None:
         "python3.11", "job_distributor.py",
         "--jobs-dir", jobs_dir(args),
         "--jobs-per-interval", str(args.jobs_per_interval),
+        "--interval", str(getattr(args, "job_interval", 1.0)),
         "--redis-host", args.db_host,
     ]
     if args.topology == "hierarchical":
@@ -1975,7 +1995,11 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--remote-repo-dir", default="/root/SwarmAgents", help="Remote repo root")
 
     # Test control
-    ap.add_argument("--job-interval", type=float, default=0.5, help="Seconds between job bursts")
+    ap.add_argument("--job-interval", type=float, default=1.0,
+                    help="Seconds between job bursts, forwarded to job_distributor.py --interval. "
+                         "Default 1.0 = what every run has actually used: until 2026-10-06 this "
+                         "flag (then defaulting to 0.5) was never forwarded, and the "
+                         "distributor ran at its own 1.0 (code review 2026-10-05 §56).")
     ap.add_argument("--jobs-per-interval", type=int, default=20)
     # Default 0, not 90: this value is now ENFORCED as a hard cap on wait_runtime(), and it was
     # silently ignored before. Defaulting to the old 90 would have truncated every run that does
@@ -2107,6 +2131,9 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--run-dir", default="run_out")
     ap.add_argument("--seed", type=int, default=None,
                     help="Seed agent-profile generation so fleets are reproducible across runs")
+    ap.add_argument("--job-target-agents", type=int, default=None,
+                    help="forwarded to generate_configs.py: model jobs only on agents 1..K "
+                         "(K = the smallest rung for an identical workload across a ladder)")
     ap.add_argument("--master-fleet-size", type=int, default=None,
                     help="Generate per-agent flavours/backends for a fleet of this size and use "
                          "the first --agents of them. Set it to the largest rung of the scale "
@@ -2260,6 +2287,7 @@ def main() -> None:
     # The fleet now exists either way, so replace the two run_meta fields that are requests
     # rather than facts with what the configs say. collect.py reads both.
     _record_observed_fleet(args)
+    check_jobs_dir_matches(args)
 
     # After the fleet is generated (or, with --use-config-dir, as it stands) and after any
     # conversion, so both sides of the comparison are the ones this run will use.
