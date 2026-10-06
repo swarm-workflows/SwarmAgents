@@ -5,7 +5,7 @@ Second critical read of the code base, against the same question as the 2026-09-
 anything in the run saying so?** Everything found there is excluded here. Ranked by that
 question; within a rank, by how many cells it touches. Every finding names the file and line,
 the failing scenario, the metric it moves and the direction, and whether a test in `tests/` would
-catch it (none of the HIGH items has one). **Status: §1–§6, §13–§17, §20, §22–§23, §34–§39, §41, §47–§52, §62–§63 and the §H double-execution metric FIXED 2026-10-06** (§60 partly) — all six recommended-order steps complete; second batch: §9, §19, §24, §25, §30, §33, §44 (partly), §53 (`tests/test_review_2026_10_05_snow.py`, 31 tests, 23 fail on the pre-fix tree; `tests/test_review_2026_10_05_pbft.py`, 13 tests, 8 fail on the pre-fix tree; `tests/test_review_2026_10_05_hierarchy.py`, 23 tests on the new write/monitor/purge paths; `tests/test_review_2026_10_05_collect.py`, 15 tests, all 15 fail on the pre-fix tree; `tests/test_review_2026_10_05_runner.py`, 21 tests on the new launch/drain paths; `tests/test_review_2026_10_05_delegation.py`, 12; `tests/test_review_2026_10_05_execution.py`, 15); everything else OPEN.
+catch it (none of the HIGH items has one). **Status: §1–§6, §13–§17, §20, §22–§23, §34–§39, §41, §47–§52, §62–§63 and the §H double-execution metric FIXED 2026-10-06** (§60 partly) — all six recommended-order steps complete; second batch: §9, §19, §24, §25, §30, §33, §44 (partly), §53; §61 retry; §7, §8 (`tests/test_review_2026_10_05_snow.py`, 31 tests, 23 fail on the pre-fix tree; `tests/test_review_2026_10_05_pbft.py`, 13 tests, 8 fail on the pre-fix tree; `tests/test_review_2026_10_05_hierarchy.py`, 23 tests on the new write/monitor/purge paths; `tests/test_review_2026_10_05_collect.py`, 15 tests, all 15 fail on the pre-fix tree; `tests/test_review_2026_10_05_runner.py`, 21 tests on the new launch/drain paths; `tests/test_review_2026_10_05_delegation.py`, 12; `tests/test_review_2026_10_05_execution.py`, 15); everything else OPEN.
 
 **Method.** Six independent read-only passes, one per subsystem (consensus + membership; agent
 core + repository + selection; execution + staging; metrics + collection + plotting; run tooling
@@ -190,13 +190,13 @@ Same shape as the 2026-09-18 straggler defect, one container over.
 
 ### 7–12. Snow and SWIM, medium
 
-- **7. Small samples.** `round(0.7 · eff)` is 1 for eff ≤ 2 (`gossip_engine.py:195-201`), so one
+- **7. [FIXED 2026-10-06 — α never falls below 2 when two or more peers voted; and a periodic sweep (`_adopt_unannounced_claims`, Snow only, 256 jobs/tick round-robin) reads the claims of this agent's undecided pending jobs: a claim naming this agent is an election it won unannounced and it acts as leader, one naming another stops it proposing]** Small samples. `round(0.7 · eff)` is 1 for eff ≤ 2 (`gossip_engine.py:195-201`), so one
   self-vote wins a round; ties between the initiator's candidate and a self-voter are broken by
   `Counter.most_common`, i.e. response arrival order (`:490`); the preference moves to that peer
   (`:512-515`) and the job is claimed for it (`:525`, `:584`). Only the agent that wins the CAS
   gets `on_leader_elected`; a preferred peer that never proposed is never told and the job is
   stranded. Applies to tiers of ≤ 3, any group shrunk to that, and truncated SWIM peer sets (§11).
-- **8. `already_decided` fast path has no α check** (`:284-289`, `:354-356`). One response
+- **8. [FIXED 2026-10-06 — the finalize worker checks the Redis claim: an existing claim wins whatever the hint said; no claim means the hint was stale, and the instance re-opens and ignores further hints (`stale_decided_hints` counts them)]** `already_decided` fast path has no α check (`:284-289`, `:354-356`). One response
   finalizes from the responder's local `job_assignments`. Agent X dies; the first detector releases
   the claim and resets J; a peer that has not yet detected answers `already_decided = X`; the CAS
   on the freed key gives J to the dead X; `try_claim_reassignment`'s 300 s TTL is spent, so J is

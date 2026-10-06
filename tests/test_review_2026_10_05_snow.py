@@ -369,3 +369,97 @@ class TestReadmissionIsByHeartbeat:
         assert "_note_failed_last_seen(agent_id, agent_info)" in hb
         assert "_note_failed_last_seen(failed_agent_id, failed_agent_info)" in grpc
         assert "failed_agents.remove" not in grpc
+
+
+# --------------------------------------------------------------------------- §8
+class TestDecidedHintsAreVerified:
+    def _proposed(self, cas=None):
+        eng, host, transport, cas = _make_engine(agent_id=1, peers=(2, 3, 4), cas=cas)
+        eng.propose([ProposalInfo(p_id="p", object_id="job-h", cost=10.0, agent_id="1")])
+        return eng, host, cas
+
+    def test_a_stale_hint_does_not_hand_the_job_to_the_named_agent(self):
+        """Peer still maps the job to agent 9, which died; its claim was released."""
+        eng, host, cas = self._proposed()
+        eng._finalize_work_inner(eng._states["job-h"], 9, "peer-decided")
+        assert cas.get("job-h") is None                  # nobody claimed for the corpse
+        assert eng.stale_decided_hints == 1
+        st = eng._states["job-h"]
+        assert not st.finalized and st.ignore_decided_hints
+        assert eng.outgoing.contains(object_id="job-h", p_id="p")
+
+    def test_a_reopened_instance_ignores_further_hints(self):
+        eng, host, cas = self._proposed()
+        eng._finalize_work_inner(eng._states["job-h"], 9, "peer-decided")
+        st = eng._states["job-h"]
+        eng._tick(now=0.0)
+        q = _latest_query_item(eng.transport, "job-h")
+        eng.on_snow_response(SnowResponse(source=2, query_id=q["query_id"], job_id="job-h",
+                                          preferred_agent=9, cost=0.0, already_decided=True))
+        assert not st.finalized
+
+    def test_a_real_claim_is_used_whatever_the_hint_says(self):
+        eng, host, cas = self._proposed()
+        cas.claim("job-h", 3)
+        eng._finalize_work_inner(eng._states["job-h"], 9, "peer-decided")
+        assert host.participant_events == [("job-h", 3)]
+        assert eng.stale_decided_hints == 0
+
+
+# --------------------------------------------------------------------------- §7
+class TestSmallSamples:
+    def test_two_voters_need_both(self):
+        eng = _make_engine(k=10, alpha=0.7)[0]
+        assert eng._alpha_threshold(2) == 2
+        assert eng._alpha_threshold(1) == 1
+        assert eng._alpha_threshold(3) == 2
+        assert eng._alpha_threshold(10) == 7
+
+
+class TestUnannouncedClaims:
+    def _agent(self, claims, pending_ids, decided=()):
+        from swarm.consensus.gossip_engine import GossipConsensusEngine
+        from swarm.queue.simple_queue import SimpleQueue
+        a = ResourceAgent.__new__(ResourceAgent)
+        a.logger = MagicMock()
+        a.agent_id = 4
+        a.topology = MagicMock(level=0, group=0)
+        a._init_decision_state()
+        for d in decided:
+            a._note_decided(d)
+        a.queues = MagicMock()
+        a.queues.pending_queue = SimpleQueue()
+        for j in pending_ids:
+            job = Job()
+            job.job_id = j
+            a.queues.pending_queue.add(job)
+        a.repository = MagicMock()
+        a.repository.get_assignments.side_effect = lambda ids, **k: {
+            j: v for j, v in claims.items() if j in ids}
+        a.engine = GossipConsensusEngine.__new__(GossipConsensusEngine)
+        a.engine.host = MagicMock()
+        return a
+
+    def test_a_claim_naming_this_agent_makes_it_leader(self):
+        a = self._agent({"j1": 4}, ["j1"])
+        a._adopt_unannounced_claims()
+        obj, p_id = a.engine.host.on_leader_elected.call_args.args
+        assert obj.job_id == "j1" and obj.leader_id == 4
+
+    def test_a_claim_naming_another_agent_stops_proposing(self):
+        a = self._agent({"j1": 7}, ["j1"])
+        a._adopt_unannounced_claims()
+        a.engine.host.on_participant_commit.assert_called_once()
+        assert a.engine.host.on_participant_commit.call_args.args[1] == 7
+
+    def test_unclaimed_and_decided_jobs_are_left_alone(self):
+        a = self._agent({"j2": 4}, ["j1", "j2"], decided=["j2"])
+        a._adopt_unannounced_claims()
+        a.engine.host.on_leader_elected.assert_not_called()
+        a.engine.host.on_participant_commit.assert_not_called()
+
+    def test_pbft_never_sweeps(self):
+        a = self._agent({"j1": 4}, ["j1"])
+        a.engine = MagicMock()
+        a._adopt_unannounced_claims()
+        a.repository.get_assignments.assert_not_called()

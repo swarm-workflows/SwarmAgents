@@ -1070,6 +1070,51 @@ class ResourceAgent(Agent):
             except Exception as e:
                 self.logger.warning(f"Replaying pending commit for {job_id} failed: {e}")
 
+    #: Undecided local jobs whose Snow claim is checked per periodic tick (round-robin).
+    _CLAIM_SWEEP_BATCH = 256
+
+    def _adopt_unannounced_claims(self) -> None:
+        """Act on Snow claims nobody announced to this agent.
+
+        A Snow instance claims a job for whichever candidate its vote converged on, and only
+        the agent that wins the CAS *for itself* is told. When the vote converged on a peer
+        that never ran its own instance for the job — it answered queries as the cheaper
+        candidate but its own selection did not propose — the claim named that peer and
+        nothing ever told it: the job sat claimed and unrun until the reselection timeout,
+        whose reset could not help because the claim still named the same agent (code review
+        2026-10-05 §7). The claim is the decision, so read it: a claim naming this agent is
+        an election this agent won; one naming another is a decided job to stop proposing.
+        Snow only — PBFT writes no claims. Bounded per tick and round-robin over the queue.
+        """
+        if not isinstance(self.engine, GossipConsensusEngine):
+            return
+        with self.completed_lock:
+            decided = set(self._decided_jobs)
+        undecided = [j for j in self.queues.pending_queue.ids() if j not in decided]
+        if not undecided:
+            return
+        start = getattr(self, "_claim_sweep_at", 0) % len(undecided)
+        batch = (undecided[start:] + undecided[:start])[:self._CLAIM_SWEEP_BATCH]
+        self._claim_sweep_at = start + len(batch)
+        try:
+            claims = self.repository.get_assignments(
+                batch, level=self.topology.level, group=self.topology.group)
+        except Exception as e:
+            self.logger.debug(f"Claim sweep skipped: {e}")
+            return
+        host = self.engine.host
+        for job_id, assignee in claims.items():
+            job = self.queues.pending_queue.get(job_id)
+            if job is None:
+                continue
+            if int(assignee) == int(self.agent_id):
+                self.logger.info(f"[SNOW_ADOPT] {job_id} is claimed for this agent but was "
+                                 f"never announced here; acting as leader")
+                job.leader_id = self.agent_id
+                host.on_leader_elected(job, "adopted-claim")
+            else:
+                host.on_participant_commit(job, int(assignee), "adopted-claim")
+
     def _purge_vanished_jobs(self, present: set) -> None:
         """Drop local pending jobs whose Redis record is gone.
 
@@ -2130,6 +2175,7 @@ class ResourceAgent(Agent):
         self._update_pending_jobs(jobs=state_map.get(ObjectState.PENDING.value, []))
         self._update_ready_jobs(jobs=state_map.get(ObjectState.READY.value, []))
         self._purge_vanished_jobs(present={j for ids in state_map.values() for j in ids})
+        self._adopt_unannounced_claims()
         # A job a peer has scheduled is persisted RUNNING until it finishes (P0-9); for
         # consensus purposes it is as settled as a COMPLETE one, so both feed the dedupe set.
         self._update_completed_jobs(

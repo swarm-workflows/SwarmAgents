@@ -97,6 +97,9 @@ class _SnowState:
     d: Counter = field(default_factory=Counter)  # Snowball cumulative per-choice support
     last_choice: Optional[int] = None            # top choice of the previous successful round
     cost_of: Dict[int, float] = field(default_factory=dict)  # best-known cost per candidate
+    # Set once a peer's "already decided" hint for this job proved stale (no claim in Redis):
+    # from then on such a response is an ordinary vote, never a shortcut (§8).
+    ignore_decided_hints: bool = False
 
 
 class GossipConsensusEngine:
@@ -194,6 +197,8 @@ class GossipConsensusEngine:
         # proposer only — is ≈ jobs. `won` is the protocol-comparable count, and the only
         # population the rounds/queries/time distributions describe (code review 2026-10-05 §38).
         self.won_count = 0
+        # "Already decided" hints that proved stale and re-opened a vote (§8).
+        self.stale_decided_hints = 0
         self.abandoned_count = 0
         self.finalize_errors = 0
         # CAS won, object unreadable: no assignment produced. Never folded into `finalized`.
@@ -205,7 +210,12 @@ class GossipConsensusEngine:
         groups — where fewer than k peers exist — still reach a supermajority and
         commit, instead of never clearing a k-based threshold."""
         eff = min(int(self.k), int(sample_size)) if sample_size else int(self.k)
-        return max(1, int(round(self.alpha * eff)))
+        threshold = int(round(self.alpha * eff))
+        # Never let ONE vote decide a round when two or more peers voted: round(0.7 × 2) is 1,
+        # so with two peers sampled either one alone carried the round, and a tie between the
+        # initiator's candidate and a self-voter fell to response arrival order (code review
+        # 2026-10-05 §7). A single sampled peer is the only case one vote can decide.
+        return max(1, threshold, 2 if eff >= 2 else 1)
 
     # ---- Lifecycle ------------------------------------------------------- #
 
@@ -364,8 +374,10 @@ class GossipConsensusEngine:
                 source=None, query_id=query_id, job_id=job_id,
                 preferred_agent=preferred_agent, cost=cost,
                 already_decided=bool(already_decided)))
-            # If a peer reports the job is already decided, fast-finalize.
-            if already_decided and preferred_agent is not None:
+            # If a peer reports the job is already decided, fast-finalize — VERIFIED against
+            # the authoritative claim in `_finalize_work_inner`, never on the peer's word.
+            if (already_decided and preferred_agent is not None
+                    and not state.ignore_decided_hints):
                 self._finalize(state, int(preferred_agent), reason="peer-decided")
 
     def on_snow_response(self, msg: SnowResponse) -> None:
@@ -600,6 +612,25 @@ class GossipConsensusEngine:
                 f"[snow] finalize of {state.proposal.object_id} failed: {exc}")
 
     def _finalize_work_inner(self, state: _SnowState, candidate: int, reason: str) -> None:
+        if reason == "peer-decided":
+            # One peer's LOCAL map said the job was decided. That map can be stale: after an
+            # agent dies, the first detector releases its claim and resets the job, while a peer
+            # that has not detected the failure yet still maps the job to the dead agent. CAS-ing
+            # on its word then gave the freed claim to the corpse — the reassignment claim's TTL
+            # already spent, so the job was stranded (code review 2026-10-05 §8). The claim in
+            # Redis is the authority: use it if it exists; if it does not, the hint was stale —
+            # re-open this instance and decide by vote. (This runs on a pool worker, so the
+            # Redis read does not touch the inbound thread.)
+            existing = self.host.get_assignment(state.proposal.object_id)
+            if existing is None:
+                with self._stats_lock:
+                    self.stale_decided_hints += 1
+                self.host.log_info(
+                    f"[SNOW_STALE_HINT] Object:{state.proposal.object_id} a peer reported it "
+                    f"decided for {candidate} but no claim exists; re-opening the vote")
+                self._reopen(state)
+                return
+            candidate = int(existing)
         winner = self.host.try_claim_assignment(state.proposal.object_id, candidate)
 
         # Per-decision latency instrumentation: separates Snow round time from any
@@ -658,6 +689,18 @@ class GossipConsensusEngine:
             if elapsed >= 0:
                 self.time_to_finalize.add(elapsed)
 
+    def _reopen(self, state: _SnowState) -> None:
+        """Put a finalized-but-unclaimed instance back in play, ignoring decided-hints."""
+        with self._lock:
+            state.finalized = False
+            state.ignore_decided_hints = True
+            state.pending_query_id = None
+            state.pending_responses = []
+            state.confidence = 0
+            state.round_deadline = self._time()
+            self.outgoing.add_proposal(state.proposal)
+            self._states[state.proposal.object_id] = state
+
     def _bump_conflict(self, object_id: str) -> None:
         """Count one round that failed the alpha threshold, bounded. Mirrors the PBFT engine's
         `_bump_conflict` so the two protocols' conflict columns mean the same thing."""
@@ -677,6 +720,7 @@ class GossipConsensusEngine:
             "finalized": self.finalized_count,
             "won": self.won_count,
             "abandoned": self.abandoned_count,
+            "stale_decided_hints": self.stale_decided_hints,
             # Decisions that left the pending set without reaching either outcome: the CAS or
             # a host callback raised.
             "finalize_errors": self.finalize_errors,

@@ -509,6 +509,15 @@ class Repository:
         v = self.redis.get(key)
         return int(v) if v is not None else None
 
+    def get_assignments(self, job_ids: List[str], level: int = 0,
+                        group: int = 0) -> Dict[str, int]:
+        """`{job_id: assignee}` for the jobs that have a committed claim. One MGET."""
+        job_ids = [str(j) for j in job_ids if j]
+        if not job_ids:
+            return {}
+        keys = [f"{self.KEY_ASSIGNEE}:{level}:{group}:{j}" for j in job_ids]
+        return {j: int(v) for j, v in zip(job_ids, self.redis.mget(keys)) if v is not None}
+
     def release_assignment(self, job_id: str, level: int = 0, group: int = 0) -> bool:
         """Drop the exactly-once claim on ``job_id`` so it can be assigned again.
 
