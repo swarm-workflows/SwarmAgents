@@ -364,3 +364,22 @@ def test_a_refused_start_is_not_counted_as_an_execution():
     j.execute = refuse
     a.execute_job(j)
     assert a.metrics.executed_jobs == []
+
+
+def test_retry_releases_the_claim_before_the_record_reads_pending():
+    """Saving PENDING first let a peer re-elect the job while the claim still named this agent;
+    its CAS returned this agent, every peer took the participant path, and nobody ran it."""
+    from swarm.database.repository import Repository
+    sys.path.insert(0, os.path.join(REPO, "tests"))
+    from test_failed_agent_reassignment import _FakeRedis
+    repo = Repository(_FakeRedis(), run_id="t")
+    a = _retry_agent(repo)
+    j = _refused_job(repo)
+    order = []
+    real_save, real_release = repo.save, repo.release_assignment
+    repo.save = lambda **k: (order.append(("save", k["obj"]["state"])), real_save(**k))[1]
+    repo.release_assignment = lambda *a_, **k: (order.append(("release",)),
+                                                real_release(*a_, **k))[1]
+    assert a._retry_refused(j) is True
+    pending = j.state.__class__.PENDING.value
+    assert order.index(("release",)) < order.index(("save", pending))

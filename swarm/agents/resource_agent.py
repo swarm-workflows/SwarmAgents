@@ -1485,10 +1485,14 @@ class ResourceAgent(Agent):
         job.leader_id = None
         job.exit_status = None
         try:
-            self.repository.save(obj=job.to_dict(), key_prefix=Repository.KEY_JOB,
-                                 level=self.topology.level, group=self.topology.group)
+            # Release the claim BEFORE the record says PENDING. The other order left a window
+            # in which a peer saw PENDING, re-elected the job, and its CAS still returned this
+            # agent — so every peer took the participant path and nobody ran it. Releasing
+            # first is safe: nobody elects a job whose record still reads COMPLETE.
             self.repository.release_assignment(job_id, level=self.topology.level,
                                                group=self.topology.group)
+            self.repository.save(obj=job.to_dict(), key_prefix=Repository.KEY_JOB,
+                                 level=self.topology.level, group=self.topology.group)
         except Exception as e:
             # Could not put it back: record the refusal instead (the completion write has its
             # own retry queue), rather than leave a job nobody holds.
