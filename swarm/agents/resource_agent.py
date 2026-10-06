@@ -186,7 +186,14 @@ class _HostAdapter(ConsensusHost):
     # --- Snow-engine extensions (no-ops for PBFT, used by GossipConsensusEngine).
     def live_peer_ids(self):
         if self.agent.swim is not None:
-            live = [a for a in self.agent.swim.live_agents() if a != self.agent.agent_id]
+            # SWIM-live AND deliverable. `Agent.send` silently drops a destination that is not in
+            # `neighbor_map`, while the engine still counted it as queried — so a peer heartbeat
+            # had evicted but SWIM still saw alive held every round it was sampled into to the
+            # full round timeout, and `queries_` overstated what was sent (code review
+            # 2026-10-05 §12). The sample is now drawn from peers a query can reach.
+            reachable = self.agent.neighbor_map
+            live = [a for a in self.agent.swim.live_agents()
+                    if a != self.agent.agent_id and a in reachable]
             if live:
                 return live
             # An EMPTY SWIM live set is almost always a false reading — under consensus

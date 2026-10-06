@@ -5,7 +5,7 @@ Second critical read of the code base, against the same question as the 2026-09-
 anything in the run saying so?** Everything found there is excluded here. Ranked by that
 question; within a rank, by how many cells it touches. Every finding names the file and line,
 the failing scenario, the metric it moves and the direction, and whether a test in `tests/` would
-catch it (none of the HIGH items has one). **Status: §1–§6, §13–§17, §20, §22–§23, §34–§39, §41, §47–§52, §62–§63 and the §H double-execution metric FIXED 2026-10-06** (§60 partly) — all six recommended-order steps complete; second batch: §9, §19, §24, §25, §30, §33, §44 (partly), §53; §61 retry; §7, §8; §42, §43; §40; §57; §64–§67; §69–§73; §26–§29, §31, §32; §54–§56, §58, §59; §11 (`tests/test_review_2026_10_05_snow.py`, 31 tests, 23 fail on the pre-fix tree; `tests/test_review_2026_10_05_pbft.py`, 13 tests, 8 fail on the pre-fix tree; `tests/test_review_2026_10_05_hierarchy.py`, 23 tests on the new write/monitor/purge paths; `tests/test_review_2026_10_05_collect.py`, 15 tests, all 15 fail on the pre-fix tree; `tests/test_review_2026_10_05_runner.py`, 21 tests on the new launch/drain paths; `tests/test_review_2026_10_05_delegation.py`, 12; `tests/test_review_2026_10_05_execution.py`, 15); everything else OPEN.
+catch it (none of the HIGH items has one). **Status (2026-10-06): every HIGH item and every MEDIUM item has been addressed; each heading carries its own FIXED / PARTLY FIXED note.** Regression tests are in `tests/test_review_2026_10_05_*.py` (13 files); where a file's tests could run against the pre-fix code, the commit message says how many failed there. **Still partly open:** §44 (a run with no metrics.json reads `metrics_complete`), §46 (validate()'s last-row-wins join; plotting Redis readers), §56 (`--pegasus-dag-gating` defaults off), §60 (a remote agent start is still backgrounded, so `ssh_check` cannot fail; `cleanup.py` exits 0 on a Redis error), §64 (names with a directory component are refused, not supported), §65 (`_retry_unpersisted_completions` re-saves a stale payload), §67 (an input already in the work dir wins over the registry), §72 (apptainer's `docker://` conversion is inside the job's time), §33/§38 (delegation and consensus durations on `time.time()`), and the §G config-drift table's remaining rows.
 
 **Method.** Six independent read-only passes, one per subsystem (consensus + membership; agent
 core + repository + selection; execution + staging; metrics + collection + plotting; run tooling
@@ -207,7 +207,7 @@ Same shape as the 2026-09-18 straggler defect, one container over.
   (`propose`, `:2624`). A replayed COMMIT and an inbound COMMIT for one job can both pass the
   quorum check → double `_record_finalize`, double `select_job`. `_stash_pending`'s
   setdefault-then-append (`:139-147`) racing `pop` (`:1035`) loses a message silently.
-- **10. PBFT does a Redis GET before its cheap straggler checks** (`engine.py:227-242`,
+- **10. [FIXED 2026-10-06 — `is_agreement_achieved` and `_already_finalized` run first on the object id; `get_object` only when the message will be used]** PBFT does a Redis GET before its cheap straggler checks (`engine.py:227-242`,
   `:280-291`, `:412-424` call `host.get_object` before `is_agreement_achieved` /
   `_already_finalized`; `get_object` at `resource_agent.py:105-130` is a synchronous GET on the
   single inbound thread once the job has left the local queue). `n − q` WAN round trips per phase
@@ -222,7 +222,7 @@ Same shape as the 2026-09-18 straggler defect, one container over.
   piggyback window. `live_peer_ids` (`resource_agent.py:183-193`) uses any non-empty SWIM set, so
   Snow samples a truncated pool (feeding §7) and gossip skips the missing agents.
   `test_swim_advisory.py:166-188` hands the verdict to the victim directly; wire delivery is untested.
-- **12. Snow's sample set and its deliverable set differ.** Snow samples SWIM-live peers;
+- **12. [FIXED 2026-10-06 — Snow samples SWIM-live peers that are also in `neighbor_map`, i.e. reachable by `send`]** Snow's sample set and its deliverable set differ. Snow samples SWIM-live peers;
   `agent.send` silently returns when the destination is not in `neighbor_map`
   (`agent_grpc.py:524-526`); `_safe_send` still reports the send dispatched and `state.queried`
   counts it (`gossip_engine.py:455-459`). A round that sampled a heartbeat-evicted peer runs to the
@@ -516,13 +516,13 @@ true index over the fleet is 0.33. The plan defines fairness "over per-agent loa
   failure under `run_blocking(check=False)` and every pre-gate run); `run_test.py:1610` writes the
   shortfall file even when every silent agent was declared, so every correctly measured E2b/E6
   kill run reads False; `unexpectedly_silent` is never read.
-- **45. Infeasible-retired FAILED jobs are invisible** (`resource_agent.py:4073` → `data.py:300`
+- **45. [FIXED 2026-10-06 — `jobs_retired_infeasible` (from the agents' `infeasible_retired`, minus jobs already exported), `jobs_failed_total`, and both `*_of_seen` denominators include retired jobs. `ctx_skew_max_s` None-when-clean remains]** Infeasible-retired FAILED jobs are invisible (`resource_agent.py:4073` → `data.py:300`
   routes them to `pending_jobs.csv`), so `exit_failures`, `jobs_seen` and both `*_of_seen`
   percentages exclude them. `ctx_skew_max_s` is None on a measured-clean run
   (`instrumentation.py:374` → `collect.py:763-764`), so `aggregate()` averages skew over the
   skewed runs alone — the exact corollary bug the memory note records; `test_collect.py:903` covers
   the unmeasured case only.
-- **46. Oracle and plotting details.** Phase elapsed is the coordinator's wall-clock `ts` minus
+- **46. [PARTLY FIXED 2026-10-06 — a decision within `PHASE_BOUNDARY_MARGIN_S` (2 s) of a phase boundary is unscoreable, since its phase cannot be resolved across hosts; the collector runs the profile validation and reports `regret_profile_validated` / `_mae` / `regret_types_beyond_noise`. validate()'s last-row-wins join and the plotting Redis readers remain]** Oracle and plotting details. Phase elapsed is the coordinator's wall-clock `ts` minus
   the member's wall-clock `failure_sim_start` (`oracle.py:191`) — cross-host, wrong by the offset
   near phase boundaries. `validate()` builds outcomes last-row-wins across tier and fan-out copies
   (`:358-368`) while the predicted rate is the min over selected groups (`:283`); mismatch under

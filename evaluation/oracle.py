@@ -137,6 +137,11 @@ def _group_members(agents: list) -> dict[int, list[str]]:
 
 # ------------------------------------------------------------------------ the ground truth
 
+#: Seconds either side of a failure-phase boundary within which a member's phase cannot be
+#: resolved across hosts: the measured inter-host offset (<= 1.1 s on the slice) plus slack.
+PHASE_BOUNDARY_MARGIN_S = 2.0
+
+
 def group_failure_rate(group: int, job_type: Optional[str], at: float,
                        truth: dict, members: dict[int, list[str]],
                        agent_starts: dict[str, float],
@@ -189,6 +194,14 @@ def group_failure_rate(group: int, job_type: Optional[str], at: float,
             if start is None:
                 return None
             elapsed = float(at) - float(start)
+            # `at` is the COORDINATOR's wall clock and `start` the MEMBER's, so `elapsed` is
+            # wrong by the offset between two hosts — measured up to 1.1 s on the slice. Away
+            # from a phase boundary that cannot change the phase; within the margin it can, and
+            # the phase is then not knowable, so the decision is unscoreable rather than placed
+            # by a guess (code review 2026-10-05 §46).
+            if any(abs(elapsed - float(ph.get("after_s", 0))) < PHASE_BOUNDARY_MARGIN_S
+                   for ph in phases):
+                return None
         per_agent, per_job_type, _ = ResourceAgent._select_failure_phase(
             elapsed, phases, base_per_agent, base_per_type)
         rates.append(ResourceAgent._resolve_failure_rate(

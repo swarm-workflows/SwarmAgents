@@ -232,21 +232,27 @@ class ConsensusEngine:
     def on_proposal(self, msg: Proposal) -> None:
         proposals = []
         for proposal in msg.proposals:
-            object = self.host.get_object(proposal.object_id)
-            if not object or self.host.is_agreement_achieved(object.object_id):
-                if not object:
-                    self.host.log_debug(f"Enqueued proposal {proposal.p_id} for {proposal.object_id} (missing)")
-                    self._set_pending_safe("proposal", msg, proposal.object_id)
-                else:
-                    self.host.log_debug(f"Skip proposal {proposal.p_id} for {proposal.object_id} (complete)")
-                    self.outgoing.remove_object(object_id=proposal.object_id)
-                    self.incoming.remove_object(object_id=proposal.object_id)
+            # Cheap, local checks FIRST. `get_object` is a synchronous Redis GET once the job
+            # has left the local queue, and every straggler (n - q per phase per job) used to
+            # pay it on the single inbound thread before being skipped — a WAN round trip
+            # charged to PBFT alone, in exactly the wide tiers where it was already losing
+            # (code review 2026-10-05 §10).
+            if self.host.is_agreement_achieved(proposal.object_id):
+                self.host.log_debug(f"Skip proposal {proposal.p_id} for {proposal.object_id} (complete)")
+                self.outgoing.remove_object(object_id=proposal.object_id)
+                self.incoming.remove_object(object_id=proposal.object_id)
                 continue
 
             if self._already_finalized(proposal.object_id, proposal.p_id):
                 # A straggler (or a ring/star forward) of a proposal this agent has already
                 # finalized. Adopting it would re-run the decision from its wire vote lists.
                 self.host.log_debug(f"Skip proposal {proposal.p_id} for {proposal.object_id} (finalized)")
+                continue
+
+            object = self.host.get_object(proposal.object_id)
+            if not object:
+                self.host.log_debug(f"Enqueued proposal {proposal.p_id} for {proposal.object_id} (missing)")
+                self._set_pending_safe("proposal", msg, proposal.object_id)
                 continue
 
             # Basic dominance check using your existing helpers
@@ -290,15 +296,15 @@ class ConsensusEngine:
     def on_prepare(self, msg: Prepare) -> None:
         proposals = []
         for p in msg.proposals:
-            object = self.host.get_object(p.object_id)
-            if not object or self.host.is_agreement_achieved(object.object_id):
-                if not object:
-                    self._set_pending_safe("prepare", msg, p.object_id)
-                    self.host.log_debug(f"Enqueued prepare {p.p_id}/{p.object_id} (missing)")
-                else:
-                    self.outgoing.remove_object(object_id=p.object_id)
-                    self.incoming.remove_object(object_id=p.object_id)
-                    self.host.log_debug(f"Skip prepare {p.p_id}/{p.object_id} (complete)")
+            # Cheap, local checks FIRST. `get_object` is a synchronous Redis GET once the job
+            # has left the local queue, and every straggler (n - q per phase per job) used to
+            # pay it on the single inbound thread before being skipped — a WAN round trip
+            # charged to PBFT alone, in exactly the wide tiers where it was already losing
+            # (code review 2026-10-05 §10).
+            if self.host.is_agreement_achieved(p.object_id):
+                self.outgoing.remove_object(object_id=p.object_id)
+                self.incoming.remove_object(object_id=p.object_id)
+                self.host.log_debug(f"Skip prepare {p.p_id}/{p.object_id} (complete)")
                 continue
 
             if self._already_finalized(p.object_id, p.p_id):
@@ -308,6 +314,12 @@ class ConsensusEngine:
                 # the 2026-09-15 COMMIT-inflation defect, reintroduced by the cleanup that
                 # fixed it. Pinned by tests/test_pbft_stragglers.py.
                 self.host.log_debug(f"Skip prepare {p.p_id}/{p.object_id} (finalized)")
+                continue
+
+            object = self.host.get_object(p.object_id)
+            if not object:
+                self._set_pending_safe("prepare", msg, p.object_id)
+                self.host.log_debug(f"Enqueued prepare {p.p_id}/{p.object_id} (missing)")
                 continue
 
             # I have sent this proposal
@@ -489,16 +501,16 @@ class ConsensusEngine:
 
     def on_commit(self, msg: Commit) -> None:
         for p in msg.proposals:
-            object = self.host.get_object(p.object_id)
-            if not object or self.host.is_agreement_achieved(object.object_id):
-                if not object:
-                    self._set_pending_safe("commit", msg, p.object_id)
-                    self.host.log_debug(f"Enqueued commit {p.p_id}/{p.object_id} (missing)")
-                else:
-                    self.outgoing.remove_object(object_id=p.object_id)
-                    self.incoming.remove_object(object_id=p.object_id)
-                    self._forget_object(p.object_id)
-                    self.host.log_debug(f"Skipped commit {p.p_id}/{p.object_id} (missing)")
+            # Cheap, local checks FIRST. `get_object` is a synchronous Redis GET once the job
+            # has left the local queue, and every straggler (n - q per phase per job) used to
+            # pay it on the single inbound thread before being skipped — a WAN round trip
+            # charged to PBFT alone, in exactly the wide tiers where it was already losing
+            # (code review 2026-10-05 §10).
+            if self.host.is_agreement_achieved(p.object_id):
+                self.outgoing.remove_object(object_id=p.object_id)
+                self.incoming.remove_object(object_id=p.object_id)
+                self._forget_object(p.object_id)
+                self.host.log_debug(f"Skipped commit {p.p_id}/{p.object_id} (complete)")
                 continue
 
             if self._already_finalized(p.object_id, p.p_id):
@@ -507,6 +519,12 @@ class ConsensusEngine:
                 # second time: `finalized_count` and `votes_` doubled, and the proposer took
                 # the participant branch with the straggler recorded as leader.
                 self.host.log_debug(f"Skip commit {p.p_id}/{p.object_id} (finalized)")
+                continue
+
+            object = self.host.get_object(p.object_id)
+            if not object:
+                self._set_pending_safe("commit", msg, p.object_id)
+                self.host.log_debug(f"Enqueued commit {p.p_id}/{p.object_id} (missing)")
                 continue
 
             # I have sent this proposal

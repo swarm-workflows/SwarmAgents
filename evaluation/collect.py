@@ -892,7 +892,8 @@ def regret_metrics(run_dir: Path) -> dict[str, Any]:
     except ImportError:
         return {}
     try:
-        rows, summary = score_run(load_run(run_dir))
+        run = load_run(run_dir)
+        rows, summary = score_run(run)
     except OracleError:
         return {}
     except Exception as exc:  # a broken run must not take the whole collection down
@@ -918,6 +919,18 @@ def regret_metrics(run_dir: Path) -> dict[str, Any]:
         "regret_decisions_without_a_choice": summary.get("decisions_without_a_choice"),
         "regret_aggregate": summary["regret_aggregate"],
     }
+    # Whether the failure profile the regret is scored against actually describes this run.
+    # `--validate` existed on the oracle CLI and the collector never ran it, so a regret column
+    # could rest on a profile the run contradicted with nothing on the row saying so (§46).
+    try:
+        from evaluation.oracle import validate
+        verdict = validate(run, run_dir)
+        out["regret_profile_validated"] = bool(verdict.get("validated"))
+        if verdict.get("validated"):
+            out["regret_profile_mae"] = verdict.get("mean_abs_error")
+            out["regret_types_beyond_noise"] = len(verdict.get("types_beyond_sampling_noise") or [])
+    except Exception as exc:  # validation is a validity column, not a reason to drop regret
+        print(f"  warn: regret validation failed for {run_dir.name}: {exc}", file=sys.stderr)
     # The staleness figure (F6) is regret against context age, so the correlation between
     # them belongs on the same row as both — otherwise every plot of it starts by rejoining
     # two files. Over decisions with a choice only: the no-choice rows are zero regret at every
@@ -963,6 +976,14 @@ def run_metrics(run_dir: Path, expected_jobs: int | None) -> dict[str, Any]:
     # 729 instead of 27, worst in exactly the collapse cell (§36).
     pending_all = read_jobs_csv(run_dir / "pending_jobs.csv")
     n_offered = len(job_ids(raw) | job_ids(pending_all))
+    # Jobs RETIRED as infeasible (persisted FAILED after max_infeasible_retries). They go to the
+    # pending files — no leader, not READY/RUNNING/COMPLETE — so they were in no failure count
+    # and no `*_of_seen` denominator, which then read high (code review 2026-10-05 §45). The
+    # agents export the ids they retired; absent when no payload carries the field.
+    retired_lists = [p.get("infeasible_retired") for p in read_agent_metrics(run_dir).values()
+                     if isinstance(p, dict) and isinstance(p.get("infeasible_retired"), list)]
+    retired_ids = {str(j) for ids in retired_lists for j in ids} - job_ids(raw)
+    n_retired = len(retired_ids)
     submitted = _numeric(jobs, "submitted_at")
     completed_at = _numeric(jobs, "completed_at")
     started_at = _numeric(jobs, "started_at")
@@ -1037,12 +1058,16 @@ def run_metrics(run_dir: Path, expected_jobs: int | None) -> dict[str, Any]:
         metrics["completion_pct"] = float("nan")
         metrics["success_pct"] = float("nan")
     # Always available: completion among the jobs this run actually touched.
+    seen = n_unique + n_retired
     metrics["completion_pct_of_seen"] = (
-        round(100.0 * n_completed / n_unique, 4) if n_unique else float("nan")
+        round(100.0 * n_completed / seen, 4) if seen else float("nan")
     )
     metrics["success_pct_of_seen"] = (
-        round(100.0 * n_succeeded / n_unique, 4) if n_unique else float("nan")
+        round(100.0 * n_succeeded / seen, 4) if seen else float("nan")
     )
+    if retired_lists:
+        metrics["jobs_retired_infeasible"] = n_retired
+        metrics["jobs_failed_total"] = metrics["exit_failures"] + n_retired
 
     # Latency decomposition. Each stage is only defined for jobs that reached it.
     # NOTE: 'selection' and 'sched_latency' are DIFFERENT quantities and both have been
