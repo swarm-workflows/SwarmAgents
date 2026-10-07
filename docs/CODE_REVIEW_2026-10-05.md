@@ -5,7 +5,7 @@ Second critical read of the code base, against the same question as the 2026-09-
 anything in the run saying so?** Everything found there is excluded here. Ranked by that
 question; within a rank, by how many cells it touches. Every finding names the file and line,
 the failing scenario, the metric it moves and the direction, and whether a test in `tests/` would
-catch it (none of the HIGH items has one). **Status (2026-10-06): every HIGH item and every MEDIUM item has been addressed; each heading carries its own FIXED / PARTLY FIXED note.** Regression tests are in `tests/test_review_2026_10_05_*.py` (19 files); where a file's tests could run against the pre-fix code, the commit message says how many failed there. **Nothing is left open:** the §G drift rows and the smaller robustness items closed last (2026-10-06, `tests/test_review_2026_10_05_drift.py`); the converter-default rows (`--pegasus-data-nodes`, `dtn_scope`) and `llm.timeout_seconds`/`mab.pending_ttl_s` closed with their own sections.
+catch it (none of the HIGH items has one). **Status (2026-10-06): every HIGH item and every MEDIUM item has been addressed; each heading carries its own FIXED / PARTLY FIXED note.** Regression tests are in `tests/test_review_2026_10_05_*.py` (19 files); where a file's tests could run against the pre-fix code, the commit message says how many failed there. **§18, §21 and §68 were found still open on 2026-10-06 after this header had already claimed "nothing is left open", and closed the same day** (`tests/test_review_2026_10_05_open_items.py`, 20 tests, 16 fail on the pre-fix source). Partial remainders are noted inline at §13, §36, §46 and §70. Everything else closed: the §G drift rows and the smaller robustness items closed last (2026-10-06, `tests/test_review_2026_10_05_drift.py`); the converter-default rows (`--pegasus-data-nodes`, `dtn_scope`) and `llm.timeout_seconds`/`mab.pending_ttl_s` closed with their own sections.
 
 **Method.** Six independent read-only passes, one per subsystem (consensus + membership; agent
 core + repository + selection; execution + staging; metrics + collection + plotting; run tooling
@@ -305,7 +305,7 @@ single-group.
   propagates up** (`:1316` sets `state` only), so in a 3-level fleet the top bandit is credited a
   success for every delegated job, failed or not. `test_reward_timing.py:246` checks that no
   outcome is reported, not this write.
-- **18. Failed-agent reassignment runs once and never retries** (`repository.py:476-490`,
+- **18. [FIXED 2026-10-06 (second pass) — `_resweep_failed_agent_jobs` runs on the periodic tick every 30 s while any peer is in the failed set: it re-reads the READY/RUNNING indexes once and retries `_reassign_jobs_from_failed_agent` for every job still held by a failed leader, so a reassigner that died or whose write raised is retried once its 300 s claim expires; and it releases a claim naming a failed agent on a PENDING record (the Snow variant) by compare-and-delete (`release_assignment_if_held_by`, WATCH-based), so two sweepers reading one stale claim cannot delete the live claim the first release let a peer win. Converges to a no-op; readmission empties the failed set. The reset itself is a compare-and-swap on the record (stop-time review): the PENDING write is refused under WATCH unless the record still shows the state and leader that were read, so a sweep working from a snapshot cannot overwrite a job a live agent re-won or a peer completed in between, and the claim is released only while it still names the dead agent]** Failed-agent reassignment runs once and never retries** (`repository.py:476-490`,
   `resource_agent.py:3883-3885`, `:4234-4272`). The reassignment claim has a 300 s TTL so a dead
   reassigner does not strand the job — but nobody retries after it expires. If the winner's
   release/save raises (caught at `:4271`) or the winner dies, the job stays READY/RUNNING forever.
@@ -323,7 +323,7 @@ single-group.
   (`:2527`). Within one tick a `self`-matrix coordinator proposes it again; under Snow peers
   answer `already_decided` with winner = self, it finalizes, `select_job` runs again and the child
   record is overwritten. Under PBFT it inflates `proposers_per_job_l1` and `reproposals`.
-- **21. `_update_pending_jobs` accepts reset evidence without checking the record's state**
+- **21. [FIXED 2026-10-06 (second pass) — `_update_pending_jobs` skips a fetched record whose state is no longer PENDING (no discard, no forget, no re-queue), and `_reset_evidence` requires a PENDING record before reading its stamp (`_record_is_pending`)]** `_update_pending_jobs` accepts reset evidence without checking the record's state**
   (`:998-1032`, `_reset_evidence` ~`:3040-3060`): the PENDING id list is a snapshot and the batch
   fetch is later, so a record that moved to READY/RUNNING in between with
   `last_transition_at > decided_at + 1` reads as a reset — decision forgotten (including the
@@ -728,7 +728,7 @@ returns `{}` and says the caller must tell the cases apart; no test checks that 
   rewriting an output gets the old file published; a false-failed agent's copy of a reassigned
   producer still writes into the shared dir; a container orphaned by §62 writes after its timeout.
   `test_a_file_already_in_the_work_dir_is_never_fetched` pins the first half.
-- **68. Two keys define the execution budget.** `delegation_exec_grace_s` defaults to
+- **68. [FIXED 2026-10-06 (second pass) — `delegation_exec_grace_s` reads the installed `ExecutionPolicy`: under `mode: real` the budget is `max(wall_time_max_s, execution.timeout_s)`, since a mixed run carries both kinds of job; an explicit key still wins]** Two keys define the execution budget.** `delegation_exec_grace_s` defaults to
   `Job._WALL_TIME_MAX_S` (120 s; `resource_agent.py:602-617`); a real job is bounded by
   `runtime.execution.timeout_s` (3600 s) and never by `wall_time_max_s`. A coordinator drops any
   real job longer than `delegation_timeout_s + 120 s` with no bandit outcome — the bandit never

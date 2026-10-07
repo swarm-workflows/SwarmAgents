@@ -553,6 +553,43 @@ class Repository:
         """
         return bool(self.redis.delete(self._claim_key(level, group, job_id)))
 
+    def release_assignment_if_held_by(self, job_id: str, agent_id: int, level: int = 0,
+                                      group: int = 0, max_retries: int = 10) -> bool:
+        """Drop the exactly-once claim on ``job_id`` only while it still names ``agent_id``.
+
+        The plain `release_assignment` is right when the caller has just reset the job itself
+        (code review 2026-09-15). The stranded-claim sweep (code review 2026-10-05 §18) is
+        different: several live agents read the same stale claim naming a dead leader, and a
+        plain delete from the second reader lands AFTER the first reader's release let a live
+        agent win a fresh claim — deleting the live assignment and reopening the double
+        execution the claim exists to prevent. WATCH makes read-compare-delete one decision.
+        Returns True only when this call removed the claim.
+        """
+        key = self._claim_key(level, group, job_id)
+        pipeline = self.redis.pipeline()
+        for attempt in range(1, max_retries + 1):
+            try:
+                pipeline.watch(key)
+                raw = pipeline.get(key)
+                if raw is None or int(raw) != int(agent_id):
+                    pipeline.unwatch()
+                    return False
+                pipeline.multi()
+                pipeline.delete(key)
+                pipeline.execute()
+                return True
+            except redis.WatchError:
+                if attempt == max_retries:
+                    raise RuntimeError(
+                        f"release_assignment_if_held_by lost the race {max_retries} times "
+                        f"on {key}")
+            finally:
+                try:
+                    pipeline.reset()
+                except Exception:
+                    pass
+        return False
+
     def _claim_key(self, level, group, job_id) -> str:
         """The exactly-once claim key, run-scoped like `data_ready` (§G). Unscoped, a run that
         skipped the between-run flush inherited the previous run's claims: a Snow finalize of a

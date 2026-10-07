@@ -677,12 +677,27 @@ class ResourceAgent(Agent):
         wall time, up to `runtime.wall_time_max_s` — so the default is that cap when one is set.
         Reading it from `Job` rather than from the config again keeps one key, one default.
         With no cap (`wall_time_max_s: 0`) fall back to 30 min; the Pegasus tail is ~2000 s.
+
+        Under `runtime.execution.mode: real` a job carrying an `execution` block is bounded by
+        the runner's `timeout_s` (3600 s shipped), never by the simulated cap — and a mixed run
+        carries both kinds, so the budget is the LARGER of the two. Read from the installed
+        `ExecutionPolicy`, the same object the runner enforces, not from the config again. Until
+        2026-10-06 this read the simulated cap alone, so a coordinator dropped every real job
+        longer than `delegation_timeout_s + 120 s` with no bandit outcome (code review §68).
         """
         configured = self.runtime_config.get("delegation_exec_grace_s")
         if configured is not None:
             return float(configured)
         cap = float(getattr(Job, "_WALL_TIME_MAX_S", 0.0) or 0.0)
-        return cap if cap > 0 else 1800.0
+        budget = cap if cap > 0 else 1800.0
+        try:
+            from swarm.execution import runner as _runner
+            pol = _runner.policy()
+            if pol is not None and pol.enabled():
+                budget = max(budget, float(pol.timeout_s or 0.0))
+        except Exception as e:  # the policy is process state; never let it break a tick
+            self.logger.debug(f"Execution policy unreadable for the grace budget: {e}")
+        return budget
 
     @property
     def capacities(self) -> Capacities:
@@ -1097,13 +1112,20 @@ class ResourceAgent(Agent):
                 except Exception as e:
                     self.logger.debug(f"Claim check for decided jobs skipped: {e}")
         for job_id in jobs:
+            job = fetched.get(job_id)
+            # The PENDING id list is a snapshot and the batch fetch came later. A record that
+            # moved to READY/RUNNING in between is not up for election: treating it as one
+            # dropped it from the dedupe set, forgot the decision and put a READY record back
+            # in `pending_queue` — the straggler window reopened for a tick (code review
+            # 2026-10-05 §21). Only a record that still says PENDING is evidence of anything.
+            if job is not None and not self._record_is_pending(job):
+                continue
             # Redis says this job is up for election again — a reassignment after an agent
             # failure, or any other return to the pool. Drop it from the consensus dedupe set
             # or `is_agreement_achieved` stays true here and every commit for it is skipped,
             # so the job would be reset by one agent and ignored by all of them.
             with self.completed_lock:
                 self.completed_jobs_set.discard(job_id)
-            job = fetched.get(job_id)
             if job_id in decided:
                 # A decision this agent witnessed, and Redis still says PENDING. That is a
                 # reset only if the record says so; otherwise it is a leader that has not
@@ -2245,6 +2267,7 @@ class ResourceAgent(Agent):
         if failed_agents:
             self._remove_failed_agents(failed_agents)
             self._check_failure_threshold()
+        self._resweep_failed_agent_jobs(current_time)
 
         agent_info = self._generate_agent_info()
         self.last_agent_info = agent_info  # snapshot reused by inbound hot paths
@@ -3426,11 +3449,28 @@ class ResourceAgent(Agent):
             decided_at = self._decided_jobs.get(job_id)
         if decided_at is None or not record:
             return False
+        # A record that has moved past PENDING is a decision in progress, not a reset — its
+        # transition stamp is later than ours precisely because the leader persisted READY
+        # (code review 2026-10-05 §21).
+        if not self._record_is_pending(record):
+            return False
         try:
             transitioned_at = float(record.get("last_transition_at") or 0.0)
         except (TypeError, ValueError):
             return False
         return transitioned_at > decided_at + self._RESET_EVIDENCE_SLACK_S
+
+    @staticmethod
+    def _record_is_pending(record: dict) -> bool:
+        """Does this Redis job record say PENDING? Absent state is parsed as PENDING by
+        `Job.from_dict`, so it is treated the same here; an unparseable one is not."""
+        raw = record.get("state")
+        if raw is None or raw == "":
+            return True
+        try:
+            return ObjectState(raw) == ObjectState.PENDING
+        except (ValueError, TypeError):
+            return False
 
     def _get_child_groups_for_job(self, job: Job) -> list[int]:
         """
@@ -4685,7 +4725,89 @@ class ResourceAgent(Agent):
             self.logger.warning(f"Cannot invalidate cache for agent {agent_id}: not found in neighbor_map")
             return False
 
-    def _reassign_jobs_from_failed_agent(self, failed_agent_id: int) -> None:
+    # How often the stranded-job sweep re-reads the in-flight indexes while any peer is in
+    # the failed set. The reassignment claim (`try_claim_reassignment`) lives 300 s, so a
+    # retry can only win after that anyway; 30 s keeps the sweep off the WAN hot path.
+    _REASSIGN_RESWEEP_S = 30.0
+
+    def _resweep_failed_agent_jobs(self, current_time: float) -> None:
+        """Retry reassignment for every peer still FAILED, until nothing of theirs is left.
+
+        `_reassign_jobs_from_failed_agent` ran exactly once, when the detector first removed
+        the peer. The per-(job, failure) claim has a 300 s TTL so a reassigner that dies does
+        not strand the job — but nobody ever came back after it expired, so a reassigner that
+        died, or whose release/save raised, left the job READY/RUNNING under a corpse for the
+        rest of the run (code review 2026-10-05 §18). This sweep re-reads the in-flight
+        records on a slow cadence while the failed set is non-empty; a job already returned to
+        the pool is PENDING and no longer a candidate, so the sweep converges to a no-op on its
+        own. Readmission (`_readmit_if_heartbeat_resumed`) empties the failed set, so a peer
+        that came back is never swept.
+
+        The Snow variant is swept too: a leader that died between winning the CAS and
+        persisting READY left a PENDING record whose claim named it, which reassignment (READY
+        and RUNNING only) never saw and which no finalize could overwrite. A claim naming a
+        FAILED peer on a PENDING record is released, compare-and-delete, so two sweepers
+        reading one stale claim cannot delete the live claim the first release let a peer win.
+        """
+        if self.shutdown or not self.job_reassignment_enabled:
+            return
+        failed = [int(a) for a in self.failed_agents.keys()]
+        if not failed:
+            return
+        last = getattr(self, "_last_reassign_resweep", 0.0)
+        if current_time - last < self._REASSIGN_RESWEEP_S:
+            return
+        self._last_reassign_resweep = current_time
+
+        level, group = self.topology.level, self.topology.group
+        try:
+            state_map = self.repository.get_all_ids_multi(
+                key_prefix=Repository.KEY_JOB, level=level, group=group,
+                states=[ObjectState.PENDING.value, ObjectState.READY.value,
+                        ObjectState.RUNNING.value])
+            in_flight = (state_map.get(ObjectState.READY.value, [])
+                         + state_map.get(ObjectState.RUNNING.value, []))
+            records = self.repository.get_many(
+                in_flight, key_prefix=Repository.KEY_JOB,
+                level=level, group=group) if in_flight else {}
+            pending = state_map.get(ObjectState.PENDING.value, [])
+            claims = self.repository.get_assignments(pending, level=level, group=group) \
+                if pending else {}
+        except Exception as e:
+            self.logger.warning(f"Stranded-job sweep skipped, Redis unreadable: {e}")
+            return
+
+        failed_set = set(failed)
+        for failed_agent_id in failed:
+            held = [jid for jid, rec in records.items()
+                    if rec and rec.get("leader_id") is not None
+                    and int(rec["leader_id"]) == failed_agent_id]
+            if held:
+                self.logger.info(
+                    f"[REASSIGN] Sweep: {len(held)} job(s) still held by failed agent "
+                    f"{failed_agent_id}; retrying reassignment")
+                self._reassign_jobs_from_failed_agent(failed_agent_id, records=records)
+
+        for job_id, assignee in claims.items():
+            if assignee not in failed_set:
+                continue
+            try:
+                if self.repository.release_assignment_if_held_by(
+                        job_id, assignee, level=level, group=group):
+                    self.metrics.reassignments.setdefault(job_id, {
+                        'failed_agent': assignee,
+                        'reassigned_at': time.time(),
+                        'reason': 'stale_claim',
+                        'old_state': ObjectState.PENDING.value,
+                    })
+                    self.logger.info(
+                        f"[REASSIGN] Released the assignment claim on PENDING job {job_id}: it "
+                        f"named failed agent {assignee}, which never persisted READY")
+            except Exception as e:
+                self.logger.error(f"Could not release the stale claim on {job_id}: {e}")
+
+    def _reassign_jobs_from_failed_agent(self, failed_agent_id: int,
+                                         records: Optional[dict] = None) -> None:
         """Return the failed agent's in-flight jobs to the pool so someone else runs them.
 
         Sourced from **Redis, not the local queues**. A job that won consensus is no longer in
@@ -4705,24 +4827,27 @@ class ResourceAgent(Agent):
         assignment and run the job twice.
 
         :param failed_agent_id: ID of the failed agent
+        :param records: the READY/RUNNING records already read by the sweep, so one sweep
+            over several failed peers reads the indexes once; fetched here when absent
         """
         level, group = self.topology.level, self.topology.group
 
         # In-flight jobs are READY (selected, not yet started) or RUNNING (executing). Both
         # are lost when their assignee dies; COMPLETE ones are done and must not be touched.
-        try:
-            state_map = self.repository.get_all_ids_multi(
-                key_prefix=Repository.KEY_JOB, level=level, group=group,
-                states=[ObjectState.READY.value, ObjectState.RUNNING.value])
-            in_flight = (state_map.get(ObjectState.READY.value, [])
-                         + state_map.get(ObjectState.RUNNING.value, []))
-            records = self.repository.get_many(
-                in_flight, key_prefix=Repository.KEY_JOB,
-                level=level, group=group) if in_flight else {}
-        except Exception as e:
-            self.logger.warning(
-                f"Could not read in-flight jobs while reassigning from {failed_agent_id}: {e}")
-            return
+        if records is None:
+            try:
+                state_map = self.repository.get_all_ids_multi(
+                    key_prefix=Repository.KEY_JOB, level=level, group=group,
+                    states=[ObjectState.READY.value, ObjectState.RUNNING.value])
+                in_flight = (state_map.get(ObjectState.READY.value, [])
+                             + state_map.get(ObjectState.RUNNING.value, []))
+                records = self.repository.get_many(
+                    in_flight, key_prefix=Repository.KEY_JOB,
+                    level=level, group=group) if in_flight else {}
+            except Exception as e:
+                self.logger.warning(
+                    f"Could not read in-flight jobs while reassigning from {failed_agent_id}: {e}")
+                return
 
         # The job record's leader_id is the authority on who holds it — the local
         # `job_assignments` map only ever sees the elections this agent witnessed.
@@ -4768,12 +4893,35 @@ class ResourceAgent(Agent):
                 # Release the exactly-once claim FIRST. Until it is gone a re-finalization
                 # returns the dead agent, so the job would be "reassigned" straight back to
                 # the corpse — the reason reassignment could not work under Snow at all.
-                self.repository.release_assignment(job_id, level=level, group=group)
+                # Only while it still names the dead agent: a live agent that re-won the job
+                # since this record was read holds a claim of its own, which must stay.
+                self.repository.release_assignment_if_held_by(
+                    job_id, failed_agent_id, level=level, group=group)
 
                 job_obj.state = ObjectState.PENDING
                 job_obj.leader_id = None
-                self.repository.save(obj=job_obj.to_dict(), key_prefix=Repository.KEY_JOB,
-                                     level=level, group=group)
+                # The record was read before this write — by the retry sweep, up to a whole
+                # pass earlier — and an unconditional save would put PENDING over whatever
+                # landed in between: a peer's reset already re-won by a live agent, or a
+                # COMPLETE from a peer heartbeat had misjudged. The write is refused under
+                # the same WATCH unless the record still shows the state and leader read.
+                expect_state = old_state.value if hasattr(old_state, "value") else old_state
+
+                def _unchanged(cur, _s=expect_state, _l=int(failed_agent_id)):
+                    if not cur or cur.get("state") != _s or cur.get("leader_id") is None:
+                        return False
+                    try:
+                        return int(cur["leader_id"]) == _l
+                    except (TypeError, ValueError):
+                        return False
+
+                if not self.repository.save(obj=job_obj.to_dict(), key_prefix=Repository.KEY_JOB,
+                                            level=level, group=group,
+                                            precondition=_unchanged):
+                    self.logger.info(
+                        f"[REASSIGN] Job {job_id} moved on since it was read as {old_state} on "
+                        f"failed agent {failed_agent_id}; leaving it alone")
+                    continue
 
                 # Local consensus state for a job that is up for election again.
                 self.engine.outgoing.remove_object(object_id=job_id)
