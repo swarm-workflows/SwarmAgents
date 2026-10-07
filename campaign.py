@@ -39,6 +39,11 @@ Campaign file (YAML or JSON)::
         args: {agents: 30, jobs: 600, topology: hierarchical, groups-per-coordinator: 1,
                hierarchical-level1-agent-type: resource, runtime: 3600}
         extra: ["--some-flag"]      # appended verbatim
+        # Optional: a command run beside each attempt ({run_dir} is substituted), in its own
+        # session, SIGTERMed when the attempt ends. E6 uses it for partition.py. A companion
+        # that exits non-zero makes the attempt `companion_failed` (retried): the cell did not
+        # measure what it says it measured.
+        companion: "python3.11 partition.py run --hosts-file agent_hosts.txt ... --out {run_dir}/partition.json"
 
 **Before each repeat, a health gate.** Every host the cell needs (the first
 `ceil(agents / agents_per_host)` of its hosts file) must answer ssh — probed with
@@ -59,6 +64,7 @@ the repeat is recorded `gate_failed` and skipped, rather than burning a night on
 | `unmeasurable` | exit 4: Redis unreadable or the job producer failed | retried |
 | `timeout` | killed after `timeout_s` | retried; the next run reaps its agents |
 | `failed` | any other status | retried |
+| `companion_failed` | the run was fine but its companion (e.g. the partition) exited non-zero | retried |
 
 A failed attempt's run directory is kept, renamed `<run>.attempt<k>`, for the post-mortem.
 Exit status: 0 when every repeat ended `ok*`, 1 when any did not, 2 when stopped on a refusal.
@@ -82,7 +88,7 @@ from typing import Callable, Dict, List, Optional
 ROOT = Path(__file__).resolve().parent
 
 DONE = {"ok", "ok_on_cap", "ok_infeasible", "ok_unverified"}
-RETRY = {"metrics_shortfall", "unmeasurable", "timeout", "failed"}
+RETRY = {"metrics_shortfall", "unmeasurable", "timeout", "failed", "companion_failed"}
 
 
 def log(msg: str, logfile: Optional[Path] = None) -> None:
@@ -270,6 +276,31 @@ def session_alive(pgid: int) -> bool:
         return True
 
 
+def start_companion(command: str, run_dir: Path) -> subprocess.Popen:
+    run_dir.parent.mkdir(parents=True, exist_ok=True)
+    argv = shlex.split(command.replace("{run_dir}", str(run_dir)))
+    return subprocess.Popen(argv, cwd=str(ROOT), start_new_session=True,
+                            stdout=open(f"{run_dir}.companion.log", "w"),
+                            stderr=subprocess.STDOUT)
+
+
+def stop_companion(proc: Optional[subprocess.Popen], grace_s: float = 180.0) -> Optional[int]:
+    """SIGTERM the companion (partition.py heals on it) and wait; its exit status."""
+    if proc is None:
+        return None
+    if proc.poll() is None:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            proc.wait(timeout=grace_s)
+        except subprocess.TimeoutExpired:
+            kill_session(proc.pid, grace_s=5.0, proc=proc)
+            proc.wait()
+    return proc.returncode
+
+
 def run_attempt(argv: List[str], run_dir: Path, timeout_s: float,
                 on_start: Optional[Callable[[int], None]] = None) -> tuple:
     """Run one attempt; returns (exit status or None, timed out?).
@@ -395,12 +426,14 @@ class Campaign:
                  python: str = sys.executable, only: Optional[List[str]] = None,
                  continue_on_refusal: bool = False,
                  stopper: Callable[[dict], None] = stop_cell_agents,
+                 companion_starter: Callable = start_companion,
                  ours: Callable[[int, str, Optional[str]], bool] = session_is_ours):
         self.spec, self.out, self.gate = spec, out, gate
         self.dry_run, self.runner, self.sleep, self.python = dry_run, runner, sleep, python
         self.only = set(only) if only else None
         self.continue_on_refusal = continue_on_refusal
         self.stopper, self.ours = stopper, ours
+        self.companion_starter = companion_starter
         self.state_path = out / "campaign_state.json"
         self.logfile = out / "campaign.log"
         self.state = self._load_state()
@@ -551,10 +584,13 @@ class Campaign:
                                     "leader_start": process_start(pgid)}
                 self._save_state()
 
+            companion = (self.companion_starter(cfg["companion"], run_dir)
+                         if cfg.get("companion") else None)
             try:
                 rc, timed_out = self.runner(argv, run_dir, float(cfg["timeout_s"]),
                                             on_start=_started)
             except BaseException:
+                stop_companion(companion)
                 # The session is already dead (run_attempt's finally); its remote agents are
                 # not. Stop them before giving up the attempt, then record it.
                 self._stop_agents(cfg, key)
@@ -566,9 +602,16 @@ class Campaign:
             if timed_out:
                 self._stop_agents(cfg, key)
             entry.pop("running", None)
+            companion_rc = stop_companion(companion)
             outcome = classify(rc, run_dir, timed_out)
-            entry["attempts"].append({"outcome": outcome, "exit": rc, "at": started,
-                                      "duration_s": round(time.time() - started, 1)})
+            # Exactly 0, nothing else: an unknown status is not a companion that did its job.
+            if companion is not None and companion_rc != 0 and outcome in DONE:
+                outcome = "companion_failed"
+            attempt_rec = {"outcome": outcome, "exit": rc, "at": started,
+                           "duration_s": round(time.time() - started, 1)}
+            if companion is not None:
+                attempt_rec["companion_exit"] = companion_rc
+            entry["attempts"].append(attempt_rec)
             self._log(f"{key}: {outcome} (exit {rc}, {time.time() - started:.0f}s)")
             if outcome not in RETRY:
                 break

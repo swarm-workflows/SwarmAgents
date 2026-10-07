@@ -1,0 +1,45 @@
+# E6 rehearsal (plan §6 T-3): Hier-30, PBFT and Snow, with a site partition held for 180 s
+# starting 60 s after job distribution begins. agent<->agent traffic is cut between two site
+# groups; Redis on `database` stays reachable from both. partition.json in each run dir records
+# the sides, the timestamps and the probe verdicts.
+#
+#   python3.11 campaign.py campaigns/e6-rehearsal.yml --python python3.11
+out: runs/e6-rehearsal-2026-10-07
+
+defaults:
+  runner: run_test.py
+  repeats: 1
+  retries: 0
+  timeout_s: 5400
+  args:
+    mode: remote
+    agent-type: resource
+    db-host: database
+    agent-hosts-file: agent_hosts.txt
+    agents-per-host: 1
+    master-fleet-size: 270
+    seed: 42
+    rtt-samples: 20
+    all-dtns: true
+    agents: 30
+    topology: hierarchical
+    groups-per-coordinator: 1
+    hierarchical-level1-agent-type: resource
+    pegasus-jobs-dir: /root/workloads/jobs_600
+    runtime: 2400
+  companion: >-
+    python3.11 partition.py run --hosts-file agent_hosts.txt --sites-file agent_sites.txt
+    --agents 30 --start-after-log {run_dir}.log --delay 60 --duration 180
+    --out {run_dir}.partition.json
+
+gate:
+  redis: {host: database, port: 6379}
+  clock_check: ./fix_slice_clocks.sh --check
+  retries: 3
+  wait_s: 300
+
+cells:
+  - name: e6r-hier30-pbft
+    args: {base-config: campaigns/config_pbft.yml}
+  - name: e6r-hier30-snow
+    args: {base-config: config_swarm_multi.yml}

@@ -438,3 +438,61 @@ def test_a_differently_named_base_config_still_yields_launchable_config_names(tm
                           cwd=REPO, capture_output=True, text=True, timeout=120)
     assert proc.returncode == 0, proc.stderr[-400:]
     assert sorted(p.name for p in out.glob("*.yml"))[:1] == ["config_swarm_multi_1.yml"]
+
+
+def test_a_companion_runs_beside_the_attempt_and_its_failure_is_retried(tmp_path):
+    started, stopped = [], []
+
+    class FakeProc:
+        def __init__(self, rc):
+            self.rc = rc
+            self.returncode = None
+            self.pid = 0
+
+        def poll(self):
+            return self.returncode
+
+    rcs = [3, 0]
+
+    def starter(command, run_dir):
+        started.append(command.replace("{run_dir}", str(run_dir)))
+        proc = FakeProc(rcs.pop(0))
+        proc.returncode = proc.rc       # already exited by the time the attempt ends
+        return proc
+
+    spec = _spec(tmp_path, cells=[{"name": "e6", "companion": "partition --out {run_dir}/p.json"}])
+    runner = FakeRunner([(0, "drained", False), (0, "drained", False)])
+    c = Campaign(spec, tmp_path / "out", _gate(spec), runner=runner, sleep=lambda s: None,
+                 stopper=lambda cfg: None, ours=lambda *a: True, companion_starter=starter)
+    assert c.run() == 0
+    assert started[0].endswith("/e6/run01/p.json")
+    state = json.loads((tmp_path / "out" / "campaign_state.json").read_text())
+    attempts = state["e6/run01"]["attempts"]
+    assert [a["outcome"] for a in attempts] == ["companion_failed", "ok"]
+    assert attempts[0]["companion_exit"] == 3
+
+
+def test_a_companion_with_no_exit_status_is_not_success(tmp_path):
+    class Proc:
+        pid, returncode = 0, None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return None
+
+    spec = _spec(tmp_path, cells=[{"name": "e6", "companion": "x"}], retries=0)
+    runner = FakeRunner([(0, "drained", False)])
+    import campaign as _c
+    orig = _c.stop_companion
+    _c.stop_companion = lambda proc, grace_s=180.0: None
+    try:
+        c = Campaign(spec, tmp_path / "out", _gate(spec), runner=runner, sleep=lambda s: None,
+                     stopper=lambda cfg: None, ours=lambda *a: True,
+                     companion_starter=lambda cmd, rd: Proc())
+        assert c.run() == 1
+    finally:
+        _c.stop_companion = orig
+    state = json.loads((tmp_path / "out" / "campaign_state.json").read_text())
+    assert state["e6/run01"]["outcome"] == "companion_failed"
