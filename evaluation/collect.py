@@ -8,6 +8,8 @@ metric set from ``docs/FGCS_EVAL_PLAN.md`` section 7, and writes:
 * ``runs_wide.csv``   -- one row per run, one column per metric
 * ``runs_tidy.csv``   -- one row per (run, metric); convenient for seaborn/ggplot
 * ``config_agg.csv``  -- per-configuration mean/std/n/ci95 across repeats
+* ``job_rtt.csv``     -- one row per job with its executor/coordinator RTT and bin (T-2, F3),
+  when any run captured an RTT matrix
 * ``decisions.csv``   -- one row per delegation decision (P0-4), when any run recorded them:
   the per-decision context age F6 needs, and the rows the oracle (P1-1) labels offline
 
@@ -48,6 +50,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from plotting.stats import jains_fairness  # noqa: E402
 from evaluation import context_error  # noqa: E402
+from evaluation import rtt  # noqa: E402
 
 # A run directory is anything holding this file.
 RUN_MARKER = "all_jobs.csv"
@@ -1222,6 +1225,8 @@ def run_metrics(run_dir: Path, expected_jobs: int | None) -> dict[str, Any]:
     annotated = context_error.annotate(decision_rows(agents_payload), run_dir, agents_payload)
     metrics.update(context_error.run_metrics(
         annotated, agents_payload, metrics_complete=metrics.get("metrics_complete") is True))
+    # T-2: per-job RTT between executor and delegating coordinator, binned (E3a / F3).
+    metrics.update(rtt.run_metrics(run_dir, rtt.job_rows(run_dir, jobs)))
     # P1-1 regret, when the run archived the failure profile it was scored against.
     metrics.update(regret_metrics(run_dir, annotated))
 
@@ -1296,6 +1301,7 @@ def main() -> int:
     labels = parse_labels(args.label)
     records: list[dict[str, Any]] = []
     decisions: list[dict[str, Any]] = []
+    job_rtt: list[dict[str, Any]] = []
 
     for root in args.root:
         root = root.expanduser().resolve()
@@ -1338,6 +1344,13 @@ def main() -> int:
             # Per-decision rows for F6 and for the oracle's offline labelling (P1-1). Carried
             # here rather than derived later because the factors that identify the run live
             # in this loop and the rows are useless without them.
+            # Per-job RTT rows for F3 (T-2), tagged with the run's factors like decisions.
+            raw_jobs = read_jobs_csv(run_dir / RUN_MARKER)
+            if raw_jobs is not None and not raw_jobs.empty:
+                for row in rtt.job_rows(run_dir, dedup_jobs(raw_jobs)):
+                    row.update({"root": str(root), "run_dir": os.path.relpath(run_dir, root)})
+                    row.update(factors)
+                    job_rtt.append(row)
             payload = read_agent_metrics(run_dir)
             for row in context_error.annotate(decision_rows(payload), run_dir, payload):
                 if isinstance(row.get("ctx_view"), dict):
@@ -1365,6 +1378,8 @@ def main() -> int:
     tidy = wide.melt(id_vars=id_cols, var_name="metric", value_name="value")
     tidy.to_csv(args.out / "runs_tidy.csv", index=False)
 
+    if job_rtt:
+        pd.DataFrame(job_rtt).to_csv(args.out / "job_rtt.csv", index=False)
     if decisions:
         decision_frame = pd.DataFrame(decisions)
         lead = [c for c in ("root", "run_dir", "agent_id", "ts", "job_id")
@@ -1386,6 +1401,8 @@ def main() -> int:
     print(f"\n{len(wide)} runs -> {args.out}")
     if decisions:
         print(f"  delegation decisions: {len(decisions)} -> decisions.csv")
+    if job_rtt:
+        print(f"  RTT-attributed job rows: {len(job_rtt)} -> job_rtt.csv")
     print(f"  grouped by: {', '.join(group_cols) if group_cols else '(nothing varies)'}")
     print(f"  configurations: {len(agg)}")
     return 0

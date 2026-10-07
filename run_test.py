@@ -47,6 +47,7 @@ Notes:
 """
 from __future__ import annotations
 import argparse, os, re, subprocess, sys, threading, time, math, shlex, csv, json, uuid
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -518,6 +519,37 @@ def check_launch_matches_configs(args, host_list: list[str]) -> None:
         raise SystemExit(f"Launch does not match the configs ({len(problems)} agent(s)):\n  "
                          f"{shown}{more}\nRegenerate the configs with this hosts file and "
                          f"--agents-per-host, or launch with the ones they were generated for.")
+
+
+def capture_rtt_matrix(args, host_list: list[str]) -> None:
+    """Measure the RTT matrix the fleet's consensus traffic will cross, before it is launched.
+
+    From each agent's placement host to every agent's ADVERTISED `grpc.host` — the address its
+    peers dial, read from the configs this run launches (T-2). Never fails the run: a capture
+    that cannot be taken is recorded as such in rtt_matrix.json, and the collector then emits no
+    RTT columns rather than binning by a guess.
+    """
+    out = Path(args.run_dir) / "rtt_matrix.json"
+    if args.mode != "remote" or int(getattr(args, "rtt_samples", 0) or 0) <= 0:
+        return
+    from swarm.utils.yaml_strict import safe_load
+    import rtt_matrix
+    try:
+        advertised, placement = {}, {}
+        for idx, path in enumerate(_launched_config_paths(args), start=1):
+            with open(path) as f:
+                advertised[idx] = str(((safe_load(f) or {}).get("grpc") or {}).get("host") or "")
+            placement[idx] = placement_host(idx, args, host_list)
+        log(f"Measuring the RTT matrix over {len(set(advertised.values()))} host(s) "
+            f"({args.rtt_samples} samples) …")
+        result = rtt_matrix.measure(advertised, placement, samples=int(args.rtt_samples),
+                                    interval_s=float(args.rtt_interval))
+        log(f"RTT matrix {result['status']}: {result['pairs'] - result['pairs_missing']}/"
+            f"{result['pairs']} pairs in {result['duration_s']} s")
+    except Exception as exc:
+        result = {"status": "failed", "error": str(exc)}
+        log(f"WARN: RTT matrix not captured: {exc}")
+    out.write_text(json.dumps(result, indent=2))
 
 
 def check_delegation_policy_is_honoured(args) -> None:
@@ -2031,6 +2063,11 @@ def parse_args() -> argparse.Namespace:
 
     # Starter and config
     ap.add_argument("--starter", default="./swarm-multi-start.sh", help="Path to swarm-multi-start.sh")
+    ap.add_argument("--base-config", default=BASE_CONFIG,
+                    help="Base config the per-agent configs are generated from (default "
+                         f"{BASE_CONFIG}). Lets a campaign give each cell its own engine or "
+                         "profile without editing the shared file between cells; the path and "
+                         "its sha256 are recorded in run_meta.json.")
     ap.add_argument("--config-dir", default="configs", help="Where to write generated configs")
     ap.add_argument("--use-config-dir", action="store_true", help="Tell starters to use pre-generated configs")
 
@@ -2062,6 +2099,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--stable-seconds", type=int, default=90)
     ap.add_argument("--check-interval", type=float, default=5.0)
     ap.add_argument("--max-misses", type=int, default=10)
+    ap.add_argument("--rtt-samples", type=int, default=20,
+                    help="Remote mode: ICMP samples per host pair for the RTT matrix captured at "
+                         "run start into <run-dir>/rtt_matrix.json (T-2; E3a bins jobs by it). "
+                         "0 skips it, and the run then has no RTT columns.")
+    ap.add_argument("--rtt-interval", type=float, default=0.2,
+                    help="Seconds between ICMP samples for the RTT matrix.")
     ap.add_argument("--inflight-drain-max-s", type=float, default=600.0,
                     help="After PENDING drains, wait up to this long for READY/RUNNING jobs to "
                          "finish before stopping agents (0 = do not wait). What remained is "
@@ -2214,6 +2257,12 @@ def read_hosts(args: argparse.Namespace) -> list[str]:
 def main() -> None:
     args = parse_args()
     Path(args.run_dir).mkdir(parents=True, exist_ok=True)
+    # Every reader of the base config looks the module name up at call time, so rebinding it
+    # here reaches generation, the execution-mode check and the delegation/ground-truth reads.
+    global BASE_CONFIG
+    if not Path(args.base_config).is_file():
+        raise SystemExit(f"--base-config {args.base_config}: no such file")
+    BASE_CONFIG = args.base_config
 
     # Identity for this run. Agents stamp it on the metrics they write to Redis and the
     # plotting step only reads payloads carrying it, so a payload written by an agent that
@@ -2303,6 +2352,8 @@ def main() -> None:
             # What made a delegated job fail, and what the bandit was rewarded with. The
             # oracle (P1-1) scores routing choices against exactly this.
             "ground_truth": _ground_truth(args),
+            "base_config": str(Path(BASE_CONFIG).resolve()),
+            "base_config_sha256": hashlib.sha256(Path(BASE_CONFIG).read_bytes()).hexdigest(),
             "argv": sys.argv,
         }, f, indent=2)
 
@@ -2355,6 +2406,9 @@ def main() -> None:
 
     check_launch_matches_configs(args, host_list)
     check_delegation_policy_is_honoured(args)
+    # After the configs are known good and before any agent runs, so the probes neither load
+    # the run nor are loaded by it.
+    capture_rtt_matrix(args, host_list)
 
     # Start initial agents
     if args.mode == "remote" and not host_list:
@@ -2537,5 +2591,18 @@ def find_all_agents(args, pattern: str = 'main.py') -> List[dict]:
 
     return all_agents
 
+#: Exit status of a launch the runner REFUSED (a configuration problem that will repeat on
+#: every retry) — distinct from 1, an unexpected failure. A campaign driver stops on it.
+EXIT_REFUSED = 2
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit as exc:
+        # Every refusal in this file is `raise SystemExit("<why>")`; Python prints the message
+        # and exits 1, the same status as a crash. Give it its own code, so a driver can tell
+        # "this cell's configuration is wrong" from "this attempt fell over".
+        if isinstance(exc.code, str):
+            print(exc.code, file=sys.stderr)
+            sys.exit(EXIT_REFUSED)
+        raise

@@ -33,6 +33,7 @@ import argparse
 import json
 import os
 import shlex
+import signal
 import subprocess
 import sys
 import time
@@ -223,7 +224,18 @@ def parse_args(argv=None) -> argparse.Namespace:
     return args
 
 
+def _exit_on_signal(signum, _frame):
+    # SIGTERM/SIGHUP end the process WITHOUT running `finally` by default, which here is what
+    # stops the nodes on the agent hosts. As SystemExit, teardown runs.
+    raise SystemExit(128 + signum)
+
+
 def main(argv=None) -> int:
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            signal.signal(sig, _exit_on_signal)
+        except ValueError:      # not the main thread (tests)
+            pass
     args = parse_args(argv)
     run_dir = Path(args.run_dir).resolve()
     run_dir.mkdir(parents=True, exist_ok=True)

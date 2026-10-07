@@ -1,0 +1,51 @@
+# Example campaign for campaign.py — the E0 Hier-30 reference and one Snow cell.
+#
+#   python campaign.py campaigns/example.yml --dry-run     # check the commands
+#   python campaign.py campaigns/example.yml               # run, or resume after a stop
+#
+# One base config per engine: copy config_swarm_multi.yml (ships consensus.protocol: snow) to
+# campaigns/config_pbft.yml and set `consensus.protocol: pbft` there. Keep both files unchanged
+# for the whole campaign — run_meta.json records each run's base_config path and sha256, so a
+# file edited mid-campaign shows up as two hashes in one cell.
+out: runs/campaign-example
+
+defaults:
+  runner: run_test.py
+  repeats: 5
+  retries: 1
+  timeout_s: 7200              # a hung attempt is killed after this, and retried
+  args:
+    mode: remote
+    agent-type: resource
+    db-host: database
+    agent-hosts-file: agent_hosts.txt
+    agents-per-host: 1
+    master-fleet-size: 270
+    seed: 42
+    runtime: 3600              # the run's own cap; a cell that hits it ends ok_on_cap
+    rtt-samples: 20            # the per-run RTT matrix (T-2)
+
+gate:
+  redis: {host: database, port: 6379}
+  clock_check: ./fix_slice_clocks.sh --check
+  retries: 3
+  wait_s: 300
+
+cells:
+  - name: e0-hier30-pbft
+    args:
+      agents: 30
+      jobs: 600
+      topology: hierarchical
+      groups-per-coordinator: 1
+      hierarchical-level1-agent-type: resource
+      base-config: campaigns/config_pbft.yml
+
+  - name: e1-hier30-snow
+    args:
+      agents: 30
+      jobs: 600
+      topology: hierarchical
+      groups-per-coordinator: 1
+      hierarchical-level1-agent-type: resource
+      base-config: config_swarm_multi.yml
