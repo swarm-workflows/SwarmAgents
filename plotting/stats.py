@@ -60,3 +60,17 @@ def calculate_entropy(series: pd.Series) -> float:
     value_counts = series.value_counts()
     probabilities = value_counts / len(series)
     return -np.sum(probabilities * np.log2(probabilities + 1e-10))
+
+
+def boxplot(ax, data, labels, **kwargs):
+    """`ax.boxplot` with tick labels on any matplotlib.
+
+    The keyword was renamed `labels` -> `tick_labels` in 3.9 and the old name removed in 3.11,
+    which is what the database node runs: every single-run plotting step raised TypeError
+    there (2026-10-07). One shim instead of a version pin, so the laptop (3.10) and the slice
+    (3.11) both draw the same figure.
+    """
+    import inspect
+    if "tick_labels" in inspect.signature(ax.boxplot).parameters:
+        return ax.boxplot(data, tick_labels=labels, **kwargs)
+    return ax.boxplot(data, labels=labels, **kwargs)

@@ -493,7 +493,11 @@ def execution_evidence(agents: dict[str, dict]) -> dict[str, Any]:
     for ids in reported:
         for job_id in ids:
             counts[str(job_id)] = counts.get(str(job_id), 0) + 1
+    refused = [int(p.get("duplicate_leader_refusals") or 0) for p in agents.values()
+               if isinstance(p, dict) and "duplicate_leader_refusals" in p]
+    extra = {"duplicate_leader_refusals": sum(refused)} if refused else {}
     return {
+        **extra,
         "jobs_executed": len(counts),
         "jobs_executed_twice": sum(1 for c in counts.values() if c > 1),
         "executions_extra": sum(counts.values()) - len(counts),

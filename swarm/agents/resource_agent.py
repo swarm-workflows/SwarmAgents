@@ -201,7 +201,21 @@ class _HostAdapter(ConsensusHost):
         # job COMPLETE. In that window every straggler message for the job found it "not
         # achieved" and re-ran the decision (see ConsensusEngine._finalized). Recording it here
         # closes the window on the host side too, whichever engine is running.
-        self.agent._note_decided(obj.object_id)
+        #
+        # Check-and-set, not a plain write: two paths can elect this agent for one job — the
+        # engine's own finalize and the claim sweep (`_adopt_unannounced_claims`), which reads
+        # a claim naming this agent and acts on it. The sweep's "not yet decided" snapshot was
+        # taken before the finalize recorded the decision, so both scheduled the job and it ran
+        # twice on the same agent (first slice pilot under Snow: 15 of 600 jobs, 2026-10-07).
+        # Whichever arrives second is refused here. A reset forgets the decision first, so a
+        # job genuinely re-elected after one still passes.
+        if not self.agent._claim_decision(obj.object_id):
+            self.agent.logger.warning(
+                f"[LEADER_DUP] {obj.object_id} was already decided here ({proposal_id}); "
+                f"not selecting it a second time")
+            self.agent.duplicate_leader_refusals = (
+                getattr(self.agent, "duplicate_leader_refusals", 0) + 1)
+            return
         self.agent.select_job(obj)
     def on_participant_commit(self, obj: Object, leader_id: int, proposal_id: str):
         self.agent._note_decided(obj.object_id)
@@ -1422,10 +1436,13 @@ class ResourceAgent(Agent):
             else:
                 time_since_delegation = current_time - delegated_at
             timed_out = time_since_delegation > self.delegation_timeout_s
-
-            # When MAB is disabled and timeout hasn't elapsed, skip checking
-            if not mab_active and not timed_out:
-                continue
+            # Every tick reads every copy, bandit or not. Without a bandit this loop used to
+            # skip a job until `delegation_timeout_s` had passed, so an analytic coordinator
+            # learned that its child had finished up to 600 s late: its record sat READY, the
+            # runner's drain waited on it, and every analytic hierarchical cell ended ~10 min
+            # after its last job (first slice pilot, 2026-10-07). The skip saved nothing — the
+            # prefetch above has already paid the Redis round trip — and every bandit-only step
+            # below is guarded on `mab_active`.
 
             # Read EVERY copy before deciding. With fan-out > 1 this loop used to break on the
             # first PENDING copy past the timeout even when another group's copy was RUNNING,
@@ -3216,6 +3233,9 @@ class ResourceAgent(Agent):
             "final_quorum": self.calculate_quorum(),
             "infeasible_retired": getattr(self.metrics, 'infeasible_retired', []),
             "executed_jobs": list(getattr(self.metrics, 'executed_jobs', [])),
+            # Leader elections refused because the job was already decided here — each one a
+            # double execution prevented (see _HostAdapter.on_leader_elected).
+            "duplicate_leader_refusals": int(getattr(self, "duplicate_leader_refusals", 0)),
             "refusal_retries": int(getattr(self.metrics, 'refusal_retries', 0)),
             # When THIS agent's failure-simulation clock started. Failure phases are resolved
             # against it per agent, and a 30-host remote launch spreads starts over a minute,
@@ -3440,6 +3460,15 @@ class ResourceAgent(Agent):
         # written by other hosts, which is wall clock too.
         with self.completed_lock:
             self._decided_jobs[job_id] = time.time()
+
+    def _claim_decision(self, job_id: str) -> bool:
+        """Record *job_id* as decided here unless it already is; True only for the first
+        caller. The one gate every path that would SELECT a job as leader goes through."""
+        with self.completed_lock:
+            if job_id in self._decided_jobs or job_id in self.completed_jobs_set:
+                return False
+            self._decided_jobs[job_id] = time.time()
+            return True
 
     def _forget_decided(self, job_id: str) -> None:
         """The job is up for election again: drop the local decision memory here AND in the

@@ -416,3 +416,25 @@ def test_the_launch_records_the_leaders_start_time(tmp_path):
     assert _campaign(tmp_path, runner, spec=spec).run() == 0
     running = seen["c1/run01"]["running"]
     assert running["leader_start"] and running["run_dir"].endswith("run01")
+
+
+def test_a_differently_named_base_config_still_yields_launchable_config_names(tmp_path):
+    """--base-config campaigns/config_pbft.yml produced config_pbft_<id>.yml, which no launcher
+    globs; the first slice pilot was refused for it (2026-10-07)."""
+    import run_test
+    src = tmp_path / "config_pbft.yml"
+    src.write_text((Path(REPO) / "campaigns" / "config_pbft.yml").read_text())
+    staged = run_test.stage_base_config(str(src), str(tmp_path / "run"))
+    assert Path(staged).name == "config_swarm_multi.yml"
+    assert Path(staged).read_text() == src.read_text()
+    same = tmp_path / "config_swarm_multi.yml"
+    same.write_text("x: 1\n")
+    assert run_test.stage_base_config(str(same), str(tmp_path / "run2")) == str(same)
+    # And the generator then names agent files with the prefix the launchers expect.
+    import subprocess
+    out = tmp_path / "cfgs"
+    proc = subprocess.run([sys.executable, "generate_configs.py", "3", "10", staged, str(out),
+                           "mesh", "localhost", "6", "--skip-jobs"],
+                          cwd=REPO, capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr[-400:]
+    assert sorted(p.name for p in out.glob("*.yml"))[:1] == ["config_swarm_multi_1.yml"]

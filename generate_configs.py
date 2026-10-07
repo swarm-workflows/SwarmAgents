@@ -540,6 +540,7 @@ class SwarmConfigGenerator:
         agent_sites: Optional[List[str]] = None,
         save_agent_profiles_path: str = "agent_profiles.json",
         job_req=None,
+        all_dtns: bool = False,
     ):
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
@@ -1036,6 +1037,22 @@ class SwarmConfigGenerator:
                   f"disk={math.ceil(job_req.disk)} gpu={math.ceil(job_req.gpu)}"
                   + (f", plus DTN(s) {', '.join(sorted(job_req.dtns))}" if job_req.dtns else ""))
 
+        # --all-dtns: every agent holds every DTN name in the fleet's pool, capacities untouched.
+        # The design of 2026-09-18 without its capacity floor: feasibility tests DTN NAMES only,
+        # so a job naming any combination of pool DTNs is placeable on every agent with the
+        # capacity for it, while locality survives in `connectivity_score`. An agent keeps its
+        # own 1-4 drawn DTNs and their scores; the names it lacks are added around the POOL's
+        # base for each name (one DTN, one base, jitter per agent — the sizing rule), never a
+        # second, unrelated draw. replay-golden needs it: 1,253 of its 2,222 jobs name 2-8
+        # DTNs, and a 1-4 random draw from 10 left 82 of a 600-job rung unplaceable.
+        if all_dtns:
+            from swarm.utils.fleet_sizing import dtn_entries  # noqa: F811 (sizing imports it too)
+            pool_bases = self._known_dtn_bases(dtn_pool)
+            if not pool_bases:
+                raise SystemExit("--all-dtns needs --dtns: there is no DTN pool to hold.")
+            required_dtn_bases = {**pool_bases, **(required_dtn_bases or {})}
+            print(f"\nEvery agent holds all {len(pool_bases)} pool DTN(s); capacities unchanged.")
+
         # Quantum backends (subset of agents when --quantum-agents-pct > 0)
         quantum_backends = self.assign_quantum_backends()
 
@@ -1314,6 +1331,12 @@ if __name__ == "__main__":
              "jobs name, so none of them is infeasible everywhere. Use it when the point is to "
              "RUN those jobs; it flattens capacity and locality heterogeneity, so a run whose "
              "subject is the fleet should keep the standard flavour pool.")
+    parser.add_argument(
+        "--all-dtns", action="store_true",
+        help="With --dtns: every agent holds every DTN name in the pool (its own drawn DTNs keep "
+             "their scores; the rest are jittered around each name's pool-wide base), and "
+             "capacities stay on the standard flavour pool. Locality is then carried by "
+             "connectivity_score alone, and no job naming pool DTNs is unplaceable.")
     parser.add_argument("--skip-jobs", action="store_true",
                         help="Generate agent configs only; do not synthesize jobs/. Used when the "
                              "job pool comes from elsewhere (e.g. Pegasus profiles converted after "
@@ -1382,7 +1405,8 @@ if __name__ == "__main__":
 
     try:
         generator.generate_configs(flavor_percentages=flavor_percentages, agent_hosts=agent_hosts,
-                                   agent_sites=agent_sites, job_req=job_req)
+                                   agent_sites=agent_sites, job_req=job_req,
+                                   all_dtns=args.all_dtns)
     except TopologyError as e:
         # Non-zero, so a driver running with check=True stops here instead of launching agents
         # against an empty (or stale) config directory.

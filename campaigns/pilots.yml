@@ -1,0 +1,64 @@
+# Pilot cells to run before the campaign (plan §8, 12 Oct pilot; §3.6; §4.2 E0 gate 2).
+#
+#   python3.11 campaign.py campaigns/pilots.yml --python python3.11
+#
+# One repeat each. The two Hier-30 cells exercise everything new on the real fleet (RTT matrix,
+# context error, launch refusals, double-execution column) and give the fixed-engine Snow number
+# that replaces the withdrawn "9x slower" expectation. Mesh-180 PBFT is where the rewritten
+# livelock criterion must fire. Hier-270 PBFT x analytic is the F1 gate.
+#
+# Workload: replay-golden duplicated per rung with duplicate_jobs.py into /root/workloads/jobs_<N>.
+out: runs/pilots-2026-10-07
+
+defaults:
+  runner: run_test.py
+  repeats: 1
+  retries: 1
+  args:
+    mode: remote
+    agent-type: resource
+    db-host: database
+    agent-hosts-file: agent_hosts.txt
+    master-fleet-size: 270
+    seed: 42
+    rtt-samples: 20
+    all-dtns: true             # every agent holds all 10 DTN names; capacities unchanged
+
+gate:
+  redis: {host: database, port: 6379}
+  clock_check: ./fix_slice_clocks.sh --check
+  retries: 3
+  wait_s: 300
+
+cells:
+  - name: p1-hier30-pbft
+    timeout_s: 5400
+    args: {agents: 30, agents-per-host: 1, topology: hierarchical, groups-per-coordinator: 1,
+           hierarchical-level1-agent-type: resource, base-config: campaigns/config_pbft.yml,
+           pegasus-jobs-dir: /root/workloads/jobs_600, runtime: 2400}
+
+  - name: p2-hier30-snow
+    timeout_s: 5400
+    args: {agents: 30, agents-per-host: 1, topology: hierarchical, groups-per-coordinator: 1,
+           hierarchical-level1-agent-type: resource, base-config: config_swarm_multi.yml,
+           pegasus-jobs-dir: /root/workloads/jobs_600, runtime: 2400}
+
+  - name: p3-mesh180-pbft
+    timeout_s: 7200
+    args: {agents: 180, agents-per-host: 2, topology: mesh,
+           base-config: campaigns/config_pbft.yml,
+           pegasus-jobs-dir: /root/workloads/jobs_3600, runtime: 3600}
+
+  - name: p4-hier270-pbft
+    timeout_s: 9000
+    args: {agents: 270, agents-per-host: 3, topology: hierarchical, groups-per-coordinator: 1,
+           hierarchical-level1-agent-type: resource, base-config: campaigns/config_pbft.yml,
+           pegasus-jobs-dir: /root/workloads/jobs_5400, runtime: 5400}
+
+  # Re-run of p2 after the duplicate-leader fix (15 of 600 jobs ran twice under Snow at 16:03):
+  # jobs_executed_twice must read 0 and duplicate_leader_refusals should be non-zero.
+  - name: p5-hier30-snow-leaderfix
+    timeout_s: 5400
+    args: {agents: 30, agents-per-host: 1, topology: hierarchical, groups-per-coordinator: 1,
+           hierarchical-level1-agent-type: resource, base-config: config_swarm_multi.yml,
+           pegasus-jobs-dir: /root/workloads/jobs_600, runtime: 2400}

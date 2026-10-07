@@ -17,6 +17,7 @@ from scipy import stats
 import warnings
 
 from plotting.stats import safe_mean, safe_median, safe_quantile, safe_sum, calculate_entropy
+from plotting.stats import boxplot as _boxplot
 
 # Set style for better-looking plots
 sns.set_style("whitegrid")
@@ -384,7 +385,7 @@ class MultiRunAnalyzer:
                         labels.append(f'{topology.capitalize()}\n{agents} agents')
 
             if data_to_plot:
-                bp = ax.boxplot(data_to_plot, labels=labels, patch_artist=True)
+                bp = _boxplot(ax, data_to_plot, labels, patch_artist=True)
 
                 # Color by topology
                 topology_colors = {

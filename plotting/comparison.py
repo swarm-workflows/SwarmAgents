@@ -33,6 +33,7 @@ import matplotlib.pyplot as plt
 
 from plotting.data import load_jobs_csv
 from plotting.stats import jains_fairness
+from plotting.stats import boxplot as _boxplot
 
 
 # ── Helpers ────────────────────────────────────────────────────────
@@ -124,7 +125,7 @@ def plot_latency_boxplot(data: dict[str, pd.DataFrame], output_dir: str):
             labels.append(label)
             latencies.append(lat.values)
 
-    bp = ax.boxplot(latencies, labels=labels, showfliers=False, patch_artist=True,
+    bp = _boxplot(ax, latencies, labels, showfliers=False, patch_artist=True,
                     whis=[5, 95])
     colors = ["#4C72B0", "#DD8452", "#55A868", "#C44E52"]
     for i, patch in enumerate(bp["boxes"]):

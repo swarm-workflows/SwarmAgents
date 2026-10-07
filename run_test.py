@@ -377,8 +377,15 @@ def generate_configs(args, agent_hosts_list: list[str]) -> Path:
         "--agents-per-host", str(args.agents_per_host) if args.mode == "remote" else str(args.agents),
         "--agent-type", args.agent_type,
     ]
-    if args.topology != "hierarchical":
+    # DTNs on EVERY topology. Hierarchical fleets used to be generated without them — a
+    # leftover from the plotting consolidation, not a design choice: the generator assigns DTNs
+    # topology-blind and CLAUDE.md's own hierarchical examples pass --dtns. With a workload
+    # whose jobs name DTNs (replay-golden: 2195 of 2222), every such job was infeasible on
+    # every leaf of a hierarchical fleet. --no-dtns keeps the old DTN-less fleet on purpose.
+    if not getattr(args, "no_dtns", False):
         gen_args.append("--dtns")
+        if getattr(args, "all_dtns", False):
+            gen_args.append("--all-dtns")
     if args.groups:
         gen_args += ["--groups", str(args.groups)]
     if args.group_size:
@@ -2063,6 +2070,13 @@ def parse_args() -> argparse.Namespace:
 
     # Starter and config
     ap.add_argument("--starter", default="./swarm-multi-start.sh", help="Path to swarm-multi-start.sh")
+    ap.add_argument("--all-dtns", action="store_true",
+                    help="Every agent holds every DTN name in the pool, capacities unchanged "
+                         "(generate_configs.py --all-dtns). The campaign fleets use it: "
+                         "replay-golden jobs name up to 8 DTNs.")
+    ap.add_argument("--no-dtns", action="store_true",
+                    help="Generate the fleet WITHOUT DTNs (any topology). Default: agents get "
+                         "1-4 DTNs from the 10-name pool, as the replay workloads require.")
     ap.add_argument("--base-config", default=BASE_CONFIG,
                     help="Base config the per-agent configs are generated from (default "
                          f"{BASE_CONFIG}). Lets a campaign give each cell its own engine or "
@@ -2254,6 +2268,25 @@ def read_hosts(args: argparse.Namespace) -> list[str]:
                     hosts.append(line)
     return hosts
 
+def stage_base_config(path: str, run_dir: str) -> str:
+    """The base config, under the file name the per-agent configs are derived from.
+
+    generate_configs.py names each agent's file after the base config's own name, and every
+    launcher globs `config_swarm_multi_<id>.yml` (CFG_PREFIX, swarm-multi-start.sh). So a base
+    config called anything else produced `config_pbft_<id>.yml`, which nothing launched — the
+    launch check refused it, reading whatever stale `config_swarm_multi_*` files a previous run
+    had left. Any other name is copied into the run dir as `config_swarm_multi.yml`; the
+    original path and its hash are what run_meta.json records.
+    """
+    src = Path(path)
+    if src.name == "config_swarm_multi.yml":
+        return str(src)
+    staged = Path(run_dir) / "base_config" / "config_swarm_multi.yml"
+    staged.parent.mkdir(parents=True, exist_ok=True)
+    staged.write_bytes(src.read_bytes())
+    return str(staged)
+
+
 def main() -> None:
     args = parse_args()
     Path(args.run_dir).mkdir(parents=True, exist_ok=True)
@@ -2262,7 +2295,8 @@ def main() -> None:
     global BASE_CONFIG
     if not Path(args.base_config).is_file():
         raise SystemExit(f"--base-config {args.base_config}: no such file")
-    BASE_CONFIG = args.base_config
+    args.base_config_source = str(Path(args.base_config).resolve())
+    BASE_CONFIG = stage_base_config(args.base_config, args.run_dir)
 
     # Identity for this run. Agents stamp it on the metrics they write to Redis and the
     # plotting step only reads payloads carrying it, so a payload written by an agent that
@@ -2352,7 +2386,7 @@ def main() -> None:
             # What made a delegated job fail, and what the bandit was rewarded with. The
             # oracle (P1-1) scores routing choices against exactly this.
             "ground_truth": _ground_truth(args),
-            "base_config": str(Path(BASE_CONFIG).resolve()),
+            "base_config": getattr(args, "base_config_source", str(Path(BASE_CONFIG).resolve())),
             "base_config_sha256": hashlib.sha256(Path(BASE_CONFIG).read_bytes()).hexdigest(),
             "argv": sys.argv,
         }, f, indent=2)

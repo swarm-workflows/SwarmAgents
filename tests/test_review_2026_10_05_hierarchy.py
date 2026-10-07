@@ -493,3 +493,33 @@ class TestScheduleWritesFirst:
         leaf.executor.submit.assert_called_once()
         assert _record(repo, "j1", CHILD_LEVEL, 1)["state"] == ObjectState.RUNNING.value
         assert "j1" in leaf.queues.ready_queue
+
+
+# --------------------------------------------------------------------------- #
+# 2026-10-07 slice pilot — an analytic coordinator saw completion only at the timeout
+# --------------------------------------------------------------------------- #
+
+class TestAnalyticCoordinatorSeesCompletionPromptly:
+
+    def test_without_a_bandit_a_finished_child_marks_the_parent_complete_at_once(self):
+        repo = Repository(_FakeRedis(), run_id="t")
+        coord = _coordinator(repo)
+        coord.mab_enabled = False
+        coord.mab_manager = None
+        _delegated(repo, coord, groups=(1,))
+        _set_child_state(repo, "j1", 1, ObjectState.COMPLETE, exit_status=0)
+        coord._monitor_delegated_jobs()          # well inside delegation_timeout_s
+        rec = _record(repo, "j1", COORD_LEVEL, COORD_GROUP)
+        assert rec["state"] == ObjectState.COMPLETE.value
+        assert coord.delegated_jobs.get("j1") is None
+
+    def test_without_a_bandit_an_unpicked_copy_is_still_left_until_the_timeout(self):
+        repo = Repository(_FakeRedis(), run_id="t")
+        coord = _coordinator(repo)
+        coord.mab_enabled = False
+        coord.mab_manager = None
+        _delegated(repo, coord, groups=(1,))
+        coord._reassign_delegated_job = MagicMock()
+        coord._monitor_delegated_jobs()
+        coord._reassign_delegated_job.assert_not_called()
+        assert coord.delegated_jobs.get("j1") is not None

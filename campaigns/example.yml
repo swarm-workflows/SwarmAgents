@@ -24,6 +24,7 @@ defaults:
     seed: 42
     runtime: 3600              # the run's own cap; a cell that hits it ends ok_on_cap
     rtt-samples: 20            # the per-run RTT matrix (T-2)
+    all-dtns: true             # every agent holds all 10 DTN names; capacities unchanged
 
 gate:
   redis: {host: database, port: 6379}

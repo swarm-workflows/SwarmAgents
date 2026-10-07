@@ -24,6 +24,7 @@ from plotting.data import (
     save_agents,
     save_jobs,
 )
+from plotting.stats import boxplot as _boxplot
 
 def collect_restarted_job_ids(output_dir: str, repo: Repository | None = None) -> Set[int]:
     """
@@ -1584,7 +1585,7 @@ def plot_latency_comparison_by_agent_type(output_dir: str):
     data_to_plot = [llm_jobs['scheduling_latency'].dropna(), resource_jobs['scheduling_latency'].dropna()]
     labels = [f'LLM Agents\n(n={len(llm_jobs)})', f'Resource Agents\n(n={len(resource_jobs)})']
 
-    bp = axes[0, 0].boxplot(data_to_plot, labels=labels, patch_artist=True, showfliers=False)
+    bp = _boxplot(axes[0, 0], data_to_plot, labels, patch_artist=True, showfliers=False)
     bp['boxes'][0].set_facecolor('#FF6B6B')
     bp['boxes'][1].set_facecolor('#4ECDC4')
     axes[0, 0].set_ylabel('Scheduling Latency (s)', fontsize=11)
@@ -1897,7 +1898,7 @@ def plot_latency_comparison_by_hierarchy_level(output_dir: str):
         data_to_plot.append(df_level0['scheduling_latency'].dropna())
         labels.append(f'Level 0 (Bottom)\n(n={len(df_level0)})')
 
-    bp = axes[0, 0].boxplot(data_to_plot, labels=labels, patch_artist=True, showfliers=False)
+    bp = _boxplot(axes[0, 0], data_to_plot, labels, patch_artist=True, showfliers=False)
     colors = ['#9B59B6', '#4ECDC4', '#FF6B6B']  # Level 2: purple, Level 1: cyan, Level 0: red
     for patch, color in zip(bp['boxes'], colors[:len(bp['boxes'])]):
         patch.set_facecolor(color)
@@ -2089,7 +2090,7 @@ def plot_latency_comparison_by_hierarchy_level(output_dir: str):
         labels.append(f'Level 0 (Bottom)\n(n={len(df_level0)})')
 
     ax_box = axes[0]
-    bp = ax_box.boxplot(data_to_plot, labels=labels, patch_artist=True, showfliers=False)
+    bp = _boxplot(ax_box, data_to_plot, labels, patch_artist=True, showfliers=False)
     colors = ['#9B59B6', '#4ECDC4', '#FF6B6B']  # Level 2, Level 1, Level 0
     for patch, color in zip(bp['boxes'], colors[:len(bp['boxes'])]):
         patch.set_facecolor(color)

@@ -225,3 +225,26 @@ def test_a_refused_launch_exits_2_not_1(tmp_path):
         cwd=REPO, capture_output=True, text=True, timeout=60)
     assert proc.returncode == 2, proc.stderr[-500:]
     assert "--delegation-policy has no effect" in proc.stderr
+
+
+# --------------------------------------------------------------------------- fleet DTNs
+
+@pytest.mark.parametrize("topology", ["hierarchical", "mesh", "ring"])
+def test_every_topology_gets_dtns_unless_asked_not_to(tmp_path, monkeypatch, topology):
+    """Hierarchical fleets were generated with no DTNs, so every replay-golden job naming one
+    was infeasible on every leaf. The generator is topology-blind; run_test.py now is too."""
+    import run_test
+    captured = []
+    monkeypatch.setattr(run_test, "run_blocking", lambda cmd, check=True: captured.append(cmd))
+    monkeypatch.setattr(sys, "argv", ["run_test.py", "--mode", "local", "--agent-type",
+                                      "resource", "--agents", "30", "--jobs", "60",
+                                      "--topology", topology, "--db-host", "localhost",
+                                      "--run-dir", str(tmp_path / "r"),
+                                      "--config-dir", str(tmp_path / "cfg"),
+                                      "--agent-hosts-file", str(tmp_path / "hosts")])
+    args = run_test.parse_args()
+    run_test.generate_configs(args, ["localhost"])
+    assert "--dtns" in captured[-1]
+    args.no_dtns = True
+    run_test.generate_configs(args, ["localhost"])
+    assert "--dtns" not in captured[-1]
