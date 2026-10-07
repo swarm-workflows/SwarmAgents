@@ -2504,9 +2504,11 @@ def main():
     if not args.from_csv:
         # For hierarchical topologies, fetch jobs from all levels (0, 1, 2)
         if args.hierarchical:
-            level0_jobs = repo.get_all_objects(key_prefix=Repository.KEY_JOB, level=0)
-            level1_jobs = repo.get_all_objects(key_prefix=Repository.KEY_JOB, level=1)
-            level2_jobs = repo.get_all_objects(key_prefix=Repository.KEY_JOB, level=2)
+            # Tagged with the group each record's key names, so level<N>_jobs.csv can say which
+            # group a delegated copy belonged to — including a copy no child picked up (T-5).
+            level0_jobs = repo.get_all_objects_with_group(key_prefix=Repository.KEY_JOB, level=0)
+            level1_jobs = repo.get_all_objects_with_group(key_prefix=Repository.KEY_JOB, level=1)
+            level2_jobs = repo.get_all_objects_with_group(key_prefix=Repository.KEY_JOB, level=2)
 
             # Tag jobs with their hierarchy level for analysis
             for job in level0_jobs:

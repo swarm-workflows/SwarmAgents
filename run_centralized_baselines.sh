@@ -19,7 +19,10 @@
 #   --db-port       PORT  Redis port (default: 6379)
 #   --jobs-per-interval N Jobs submitted per interval (default: 10)
 #   --base-dir      DIR   Base output directory (default: runs/baselines)
-#   --schedulers    LIST  Comma-separated schedulers to run (default: greedy,round-robin,random)
+#   --schedulers    LIST  Comma-separated schedulers to run (default: greedy,round-robin,random).
+#                         'sparrow' adds the decentralized Sparrow-style baseline
+#                         (baselines/run_sparrow.py); it needs --reuse-jobs, so every arm
+#                         runs the same profiles and jobs as the SWARM cell
 #   --reuse-jobs          Reuse existing jobs/ and agent_profiles.json
 #   --no-dtns             Disable DTN generation
 #   --timeout       SECS  Max run time per test in seconds (default: 600)
@@ -217,6 +220,33 @@ for SCHEDULER in "${SCHED_LIST[@]}"; do
     COMPLETED=$((COMPLETED + 1))
 
     log "[$COMPLETED/$TOTAL_TESTS] $SCHEDULER run $RUN_NUM → $RUN_DIR ($MODE)"
+
+    if [[ "$SCHEDULER" == "sparrow" ]]; then
+      # Decentralized: its own orchestrator, which needs the SWARM arm's profiles and jobs.
+      if [[ -z "$REUSE_FLAGS" ]]; then
+        log "  ✗ sparrow needs --reuse-jobs (same profiles and jobs as the SWARM arm); skipped"
+        FAILED=$((FAILED + 1)); echo "$SCHEDULER run-$RUN_NUM (no --reuse-jobs)" >> "$FAIL_LOG"
+        continue
+      fi
+      SPARROW_FLAGS="--mode $MODE"
+      [[ "$MODE" == "remote" ]] && SPARROW_FLAGS="$SPARROW_FLAGS --agent-hosts-file $AGENT_HOSTS_FILE --agents-per-host $AGENTS_PER_HOST --remote-repo-dir $REMOTE_REPO_DIR"
+      set +e   # a failed cell is recorded and the batch goes on; errexit would end it here
+      "$PYTHON" baselines/run_sparrow.py \
+          --agents "$AGENTS" --jobs "$JOBS" --db-host "$DB_HOST" --db-port "$DB_PORT" \
+          --jobs-per-interval "$JOBS_PER_INTERVAL" --run-dir "$RUN_DIR" --timeout "$TIMEOUT" \
+          $REUSE_FLAGS $SPARROW_FLAGS 2>&1 | tee "$RUN_DIR.log"
+      # The orchestrator's own status, not tee's (and read once: any later command resets it).
+      SPARROW_RC="${PIPESTATUS[0]}"
+      set -e
+      if [[ "$SPARROW_RC" -eq 0 ]]; then
+        log "  ✓ $SCHEDULER run $RUN_NUM completed"
+      else
+        FAILED=$((FAILED + 1))
+        log "  ✗ $SCHEDULER run $RUN_NUM FAILED (exit $SPARROW_RC; see $RUN_DIR.log)"
+        echo "$SCHEDULER run-$RUN_NUM" >> "$FAIL_LOG"
+      fi
+      continue
+    fi
 
     if [[ "$MODE" == "remote" ]]; then
       REMOTE_FLAGS="--agent-hosts-file $AGENT_HOSTS_FILE --agents-per-host $AGENTS_PER_HOST --remote-repo-dir $REMOTE_REPO_DIR --worker-timeout $WORKER_TIMEOUT"

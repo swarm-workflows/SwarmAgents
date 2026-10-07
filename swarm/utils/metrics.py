@@ -41,6 +41,10 @@ class Metrics:
         self.reassignments = {}
         self.quorum_changes = []
         self.delegation_reassignments = {}
+        # (job_id, child_group, at) for every untaken child copy a coordinator withdrew:
+        # the copy is deleted, so this is the only record of when it stopped being in
+        # flight (context error, T-5).
+        self.delegation_withdrawals = []
         self.mab_rewards = {}      # group_id -> list of (timestamp, reward)
         self.mab_selections = {}   # group_id -> selection count
         # LLM group delegation (P0-1): group_id -> count of jobs the *model* routed there.

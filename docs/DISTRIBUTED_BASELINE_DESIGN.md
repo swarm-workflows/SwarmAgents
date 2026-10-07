@@ -188,3 +188,69 @@ When `remote=True`:
 2. **Small-scale remote test**: 3 agents on 3 hosts, 20 jobs, greedy scheduler
 3. **Full-scale test**: 30 agents on 30 hosts, 500 jobs, all three schedulers
 4. **Comparison**: Run SWARM+ with same 500 jobs on same 30 hosts, compare makespan/fairness/latency
+
+---
+
+## Sparrow-style decentralized baseline (2026-10-07)
+
+The three schedulers above are centralized: one process on `database` sees every job and the
+whole fleet. A reviewer's first objection to comparing SWARM against them is that they are
+strawmen for a *decentralized* scheduler. The Sparrow-style arm answers it with the canonical
+decentralized design: batch sampling with late binding (Ousterhout et al., SOSP 2013).
+
+**Files.** `baselines/sparrow.py` (scheduler and worker logic), `baselines/sparrow_node.py` (one
+process, `worker` or `scheduler`), `baselines/run_sparrow.py` (orchestrator),
+`sparrow-node-start.sh` (detached start over ssh). Tests: `tests/test_sparrow_baseline.py`.
+
+**How it works.**
+
+- **Several independent schedulers.** Job ownership is a stable hash of the job id
+  (`owner_of`, crc32 mod K), so no two schedulers probe for one job and none shares state with
+  another. They run as separate processes spread evenly over the agent hosts (agent ids
+  `1 + j·N/K`), so on a site-interleaved hosts file they sit at different sites.
+- **Probes, not placements.** For each of its PENDING jobs a scheduler samples
+  `--probe-ratio` (d, default 2) distinct workers among those that could *ever* run the job
+  (total capacity and DTNs) and are live (fresh heartbeat), and appends a reservation to each
+  one's queue. It never reads load.
+- **Late binding.** A worker serves its queue in order. When it has a free slot that fits the
+  head job it claims the job record by compare-and-swap, PENDING to READY naming itself; the
+  first claim wins and every later reservation for that job is dropped (Sparrow's no-op). A head
+  job that does not fit yet keeps its place (head-of-line, as Sparrow's slots).
+- **Re-probing.** A job still unclaimed after `--reprobe-s` (30 s) gets a fresh round.
+- **Same jobs, same execution.** The workers run SWARM's `Job.execute()` with the
+  `runtime.wall_time_*` clamp and `executor_workers` concurrency read from the same base config
+  the SWARM arm used; they persist RUNNING then COMPLETE with the real exit status, honour
+  `should_fail`, gate workflow DAG jobs on SWARM's readiness registry and publish outputs in the
+  completion write, only on success. The fleet is the level-0 agents of the SWARM cell's
+  `agent_profiles.json`, placed on the same hosts in the same order (`(id-1)//agents_per_host`).
+
+**What differs from Sparrow, and why it is still the right comparison.** Probes and claims go
+through the shared Redis on `database` instead of direct scheduler-to-worker RPC, so each costs
+a round trip to `database` — the same store and the same WAN SWARM's job pool uses, but a star
+rather than peer links. There is no failure handling beyond Sparrow's own (none at the
+scheduler): a worker that dies holding a claimed job leaves it READY/RUNNING. Jobs are
+single-task, so the probe ratio is probes per job.
+
+**Running it.** On the `database` node, as root, with the SWARM cell's profiles and jobs:
+
+```bash
+python baselines/run_sparrow.py --mode remote --agents 90 --jobs 1800 \
+    --db-host database --agent-hosts-file agent_hosts.txt --run-dir runs/sparrow/run01 \
+    --use-profiles agent_profiles.json --use-jobs-dir jobs/ --probe-ratio 2 --seed 42
+# or in the batch script, beside the centralized arms:
+./run_centralized_baselines.sh --mode remote --schedulers greedy,round-robin,random,sparrow \
+    --reuse-jobs --agents 90 --jobs 1800 --db-host database --agent-hosts-file agent_hosts.txt
+```
+
+**Validity.** It refuses to start (exit 2) when the hosts file is too short for the fleet or any
+worker or scheduler fails to register within `--startup-timeout`; exits 3 when a worker never
+reports its stats (`metrics_shortfall.json`); exits 4 when the store is unreadable for 60 s.
+`drain.json` says how the run ended (`all_terminal`, `timer`, `redis_unreadable`). The run
+directory carries `metrics.json` keyed by agent id with each worker's `executed_jobs`, so
+`collect.py` reports `jobs_executed_twice`; `all_agents.csv`, so fairness counts idle workers;
+and `collect_meta.json` (`policy: sparrow`, `arm: baseline`). Compare with
+`plot_comparison.py --dirs Sparrow=runs/sparrow ...` or through `evaluation/collect.py`.
+
+**Local smoke test (2026-10-07).** 6 workers, 2 schedulers, 40 generated jobs, wall time capped
+at 2 s, against a fakeredis TCP server: 40/40 complete in 11.4 s, 74 probes, 28 no-ops, no job
+executed twice. Local mode pays no WAN and is for smoke tests only.

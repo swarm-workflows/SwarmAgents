@@ -247,6 +247,9 @@ def save_jobs(jobs: list[Any], path: str, level: int | None = None):
     detailed_latency = []
     pending_jobs = []
     for job_data in jobs:
+        # The group the record's Redis key named, when the caller fetched it with
+        # `Repository.get_all_objects_with_group`; blank otherwise (T-5).
+        key_group = job_data.get("_key_group", "") if isinstance(job_data, dict) else ""
         if isinstance(job_data, dict):
             job = Job()
             job.from_dict(job_data)
@@ -325,6 +328,7 @@ def save_jobs(jobs: list[Any], path: str, level: int | None = None):
             reasoning_time,
             scheduling_latency,
             selection_total,
+            key_group,
             1 if getattr(job, "refusal_reason", None) else 0,
             ])
         else:
@@ -340,6 +344,7 @@ def save_jobs(jobs: list[Any], path: str, level: int | None = None):
                 reasoning_time,
                 scheduling_latency,
                 selection_total,
+                key_group,
                 1 if getattr(job, "refusal_reason", None) else 0,
             ])
 
@@ -350,7 +355,7 @@ def save_jobs(jobs: list[Any], path: str, level: int | None = None):
         writer.writerow([
             'job_id', 'submitted_at', 'selection_started_at', 'assigned_at',
             'started_at', 'completed_at', 'exit_status', 'leader_id', 'reasoning_time', 'scheduling_latency',
-            'selection_total', 'refused',
+            'selection_total', 'group', 'refused',
         ])
         writer.writerows(detailed_latency)
 
@@ -359,6 +364,6 @@ def save_jobs(jobs: list[Any], path: str, level: int | None = None):
         writer.writerow([
             'job_id', 'submitted_at', 'selection_started_at', 'assigned_at',
             'started_at', 'completed_at', 'exit_status', 'leader_id', 'reasoning_time', 'scheduling_latency',
-            'selection_total', 'refused',
+            'selection_total', 'group', 'refused',
         ])
         writer.writerows(pending_jobs)

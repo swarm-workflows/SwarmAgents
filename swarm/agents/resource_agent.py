@@ -49,6 +49,7 @@ from swarm.selection.penalties import apply_multiplicative_penalty
 from swarm.topology.topology import TopologyType
 from swarm.utils.instrumentation import (DecisionLog, DecisionRecord, SelectionCounters,
                                         context_age, flatten_for_prom, render_prom,
+                                        snapshot_view,
                                         write_textfile)
 from swarm.utils.metrics import Metrics
 from swarm.utils.resource_queues import ResourceAgentQueues
@@ -1688,6 +1689,11 @@ class ResourceAgent(Agent):
                         job_id, ObjectState.PENDING, key_prefix=Repository.KEY_JOB,
                         level=self.topology.level - 1, group=child_group):
                     kept.append(child_group)
+                else:
+                    # The deleted copy is in no export; this is when it stopped being in
+                    # flight in that group (context error, T-5).
+                    self.metrics.delegation_withdrawals.append(
+                        (str(job_id), int(child_group), time.time()))
             except Exception as e:
                 kept.append(child_group)
                 self.logger.error(
@@ -1788,6 +1794,17 @@ class ResourceAgent(Agent):
                         )
                     except Exception:
                         pass
+                # Recorded like a timeout reassignment. The child copies are deleted, so this
+                # record is the only evidence of when they stopped being in flight; without it
+                # the context-error column (T-5) cannot end those copies and refuses to score
+                # every later decision on their groups.
+                self.metrics.delegation_reassignments[job_id] = {
+                    'reassigned_at': time.time(),
+                    'time_at_child_level': time_since_delegation,
+                    'child_groups': child_groups,
+                    'delegation_failed_count': fail_count,
+                    'reason': 'infeasible_after_max_attempts',
+                }
                 return
 
             # Reset job state to PENDING for parent level — and forget that it was decided, or
@@ -3191,6 +3208,8 @@ class ResourceAgent(Agent):
             "agent_failures": copy.deepcopy(self.metrics.agent_failures),
             "reassignments": copy.deepcopy(self.metrics.reassignments),
             "delegation_reassignments": copy.deepcopy(self.metrics.delegation_reassignments),
+            "delegation_withdrawals": [list(w) for w in
+                                       getattr(self.metrics, "delegation_withdrawals", [])],
             "quorum_changes": copy.deepcopy(self.metrics.quorum_changes),
             "failed_agents": self.failed_agents.to_dict(),
             "failed_agents_count": len(self.failed_agents),
@@ -3581,8 +3600,13 @@ class ResourceAgent(Agent):
         """
         self._decision_ctx.policy = None
         snapshots = None
+        view = {}
         try:
             snapshots = self._decision_snapshots(capable_groups)
+            # What the policy is about to see, captured before it runs (T-5): the manager
+            # writes its history into these objects, and the in-flight count is what the
+            # context-error column is checked against.
+            view = snapshot_view(snapshots, capable_groups)
         except Exception as exc:
             # Instrumentation must never be the reason a job fails to be delegated.
             self.logger.debug(f"Decision snapshot build failed: {exc}")
@@ -3609,6 +3633,7 @@ class ResourceAgent(Agent):
                 decide_s=decided_at - started_at,
                 age=context_age(snapshots or {}, selected or [],
                                 now=time.time(), now_monotonic=decided_at),
+                view=view,
             ))
         except Exception as exc:
             self.logger.debug(f"Decision record failed: {exc}")

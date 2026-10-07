@@ -304,6 +304,37 @@ class Repository:
         return {state: [k.split(":", 3)[-1] for k in keys]
                 for state, keys in zip(states, results)}
 
+    #: Field `get_all_objects_with_group` adds to each record: the group its Redis key names.
+    #: Underscored because it is not part of the object and must never be saved back.
+    KEY_GROUP_TAG = "_key_group"
+
+    def get_all_objects_with_group(self, key_prefix: str = KEY_JOB, level: int = 0) -> List[dict]:
+        """Every object at ``level``, each tagged with the group its KEY names (T-5).
+
+        A job record does not carry its group: a delegated copy lives at
+        `job:<level>:<group>:<id>` and the group is in the key alone. `get_all_objects` returns
+        the values, so an export of a fan-out run could not say which group's copy a row was —
+        the leader's group recovers it for a copy that was picked up, and nothing recovers it
+        for one that was not. The context-error column counts copies per group, and an
+        unattributed copy is a decision it has to refuse to score.
+        """
+        keys = list(self.redis.scan_iter(f"{key_prefix}:{level}:*"))
+        if not keys:
+            return []
+        out: List[dict] = []
+        for key, raw in zip(keys, self.redis.mget(keys)):
+            if not raw:
+                continue
+            obj = json.loads(raw)
+            parts = str(key).split(":")
+            if len(parts) >= 4:
+                try:
+                    obj[self.KEY_GROUP_TAG] = int(parts[2])
+                except ValueError:
+                    pass
+            out.append(obj)
+        return out
+
     def get_all_objects(self, key_prefix: str = KEY_JOB, level: int = 0, group: int = None, state: int = None) -> List[dict]:
         """
         Retrieve all objects under given key prefix.

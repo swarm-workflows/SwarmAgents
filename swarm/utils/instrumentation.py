@@ -386,6 +386,39 @@ def context_age(snapshots: Dict[int, Any], selected: Sequence[int],
     return age
 
 
+#: The `GroupSnapshot` fields recorded per candidate on a decision row (T-5). `inflight` is the
+#: one the collector can check against ground truth (delegated copies not yet finished, from
+#: the per-level job export); the headrooms are recorded so a reader can see what the policy
+#: saw, but no job export reconstructs a group's true headroom.
+VIEW_FIELDS = ("inflight", "cpu_headroom", "ram_headroom", "gpu_headroom", "active_children")
+
+
+def snapshot_view(snapshots: Dict[int, Any], candidates: Iterable[Any]) -> Dict[str, Dict[str, Any]]:
+    """`{str(group): {field: value}}` for each candidate the policy had a snapshot of.
+
+    Taken BEFORE the policy runs: the bandit's manager writes failure and timeout history into
+    the snapshot objects it is handed, and the view that matters is the one the decision used.
+    A candidate with no snapshot is left out rather than given defaults — the collector reads
+    an absent candidate as unknown, never as an idle group. Keys are strings so the row
+    survives a JSON round trip unchanged.
+    """
+    view: Dict[str, Dict[str, Any]] = {}
+    for g in candidates or []:
+        snap = (snapshots or {}).get(g)
+        if snap is None:
+            snap = (snapshots or {}).get(int(g)) if str(g).lstrip("-").isdigit() else None
+        if snap is None:
+            continue
+        entry: Dict[str, Any] = {}
+        for name in VIEW_FIELDS:
+            value = getattr(snap, name, None)
+            if value is None:
+                continue
+            entry[name] = int(value) if name in ("inflight", "active_children") else round(float(value), 6)
+        view[str(int(g))] = entry
+    return view
+
+
 @dataclass
 class DecisionRecord:
     """One delegation decision, with everything the oracle (P1-1) needs to label it offline."""
@@ -398,6 +431,10 @@ class DecisionRecord:
     selected: List[int]
     decide_s: float
     age: ContextAge = field(default_factory=ContextAge)
+    # Per-candidate view the policy decided on (T-5), from `snapshot_view`. Empty means the
+    # snapshot build failed, and the key is then left off the row: absent reads as "not
+    # recorded", which is what it is, and never as a view of idle groups.
+    view: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     def as_dict(self) -> Dict[str, Any]:
         row = {
@@ -411,6 +448,8 @@ class DecisionRecord:
             "decide_s": round(self.decide_s, 6),
         }
         row.update({f"ctx_age_{k}": v for k, v in self.age.as_dict().items()})
+        if self.view:
+            row["ctx_view"] = {g: dict(v) for g, v in self.view.items()}
         return row
 
 

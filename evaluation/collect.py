@@ -47,6 +47,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from plotting.stats import jains_fairness  # noqa: E402
+from evaluation import context_error  # noqa: E402
 
 # A run directory is anything holding this file.
 RUN_MARKER = "all_jobs.csv"
@@ -97,6 +98,7 @@ TOKEN_FACTORS: dict[str, tuple[str, Any]] = {
     "greedy": ("policy", "greedy"),
     "random": ("policy", "random"),
     "roundrobin": ("policy", "round_robin"),
+    "sparrow": ("policy", "sparrow"),
     # LLM model family
     "qwen3": ("llm_model", "qwen3"),
     "qwen2.5": ("llm_model", "qwen2.5"),
@@ -879,7 +881,7 @@ def instrumentation_metrics(agents: dict[str, dict], meta: dict | None = None,
     return out
 
 
-def regret_metrics(run_dir: Path) -> dict[str, Any]:
+def regret_metrics(run_dir: Path, annotated: list[dict] | None = None) -> dict[str, Any]:
     """Delegation regret against the offline optimum (P1-1), when the run can be scored.
 
     Silently absent rather than NaN for a run with no injected failure profile: with every
@@ -942,6 +944,10 @@ def regret_metrics(run_dir: Path) -> dict[str, Any]:
         regrets = pd.Series([p[1] for p in paired], dtype=float)
         if ages.std(ddof=1) > 0 and regrets.std(ddof=1) > 0:
             out["regret_ctx_age_corr"] = round(float(ages.corr(regrets)), 6)
+    # T-5: the same against context ERROR, rank-correlated as the plan's F6 test states. Joined
+    # on (coordinator, job, ts), over decisions whose error could be scored.
+    if annotated:
+        out.update(context_error.regret_correlation(rows, annotated))
     return out
 
 
@@ -1210,8 +1216,14 @@ def run_metrics(run_dir: Path, expected_jobs: int | None) -> dict[str, Any]:
         metrics[f"proposers_per_job_l{level}"] = round(pairs / denom, 6)
         metrics[f"proposals_per_job_l{level}"] = round(
             metrics.get(f"sel_proposals_l{level}", 0) / denom, 6)
+    # T-5: context ERROR at decision time — the F6 x-axis, since context age is a refresh
+    # cadence and cannot vary with the protocol (see evaluation/context_error.py).
+    agents_payload = read_agent_metrics(run_dir)
+    annotated = context_error.annotate(decision_rows(agents_payload), run_dir, agents_payload)
+    metrics.update(context_error.run_metrics(
+        annotated, agents_payload, metrics_complete=metrics.get("metrics_complete") is True))
     # P1-1 regret, when the run archived the failure profile it was scored against.
-    metrics.update(regret_metrics(run_dir))
+    metrics.update(regret_metrics(run_dir, annotated))
 
     return metrics
 
@@ -1326,7 +1338,10 @@ def main() -> int:
             # Per-decision rows for F6 and for the oracle's offline labelling (P1-1). Carried
             # here rather than derived later because the factors that identify the run live
             # in this loop and the rows are useless without them.
-            for row in decision_rows(read_agent_metrics(run_dir)):
+            payload = read_agent_metrics(run_dir)
+            for row in context_error.annotate(decision_rows(payload), run_dir, payload):
+                if isinstance(row.get("ctx_view"), dict):
+                    row["ctx_view"] = json.dumps(row["ctx_view"], sort_keys=True)
                 row.update({"root": str(root),
                             "run_dir": os.path.relpath(run_dir, root)})
                 row.update(factors)
