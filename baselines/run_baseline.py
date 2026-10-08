@@ -1,6 +1,11 @@
 #!/usr/bin/env python3.11
 """
-run_baseline.py — CLI entry point for baseline schedulers (Greedy, Round-Robin, Random).
+run_baseline.py — a centralized baseline (Greedy, Round-Robin, Random) in ONE local process.
+
+Scheduling and execution share this host: each level-0 agent gets its own pool of
+`runtime.executor_workers` threads. It pays no WAN and is for smoke tests only — the E7 table
+comes from `baselines/run_baseline_remote.py` on the slice. Output and exit statuses are the
+remote runner's (see there).
 
 Usage:
   python baselines/run_baseline.py \
@@ -32,17 +37,11 @@ _SWARM_ROOT = _SCRIPT_DIR.parent
 if str(_SWARM_ROOT) not in sys.path:
     sys.path.insert(0, str(_SWARM_ROOT))
 
-from baselines.scheduler import (
-    GreedyScheduler,
-    RoundRobinScheduler,
-    RandomScheduler,
-)
+import uuid
 
-SCHEDULER_MAP = {
-    "greedy": GreedyScheduler,
-    "round-robin": RoundRobinScheduler,
-    "random": RandomScheduler,
-}
+from baselines.common import configure_execution, executor_workers, load_config
+from baselines.scheduler import SCHEDULER_MAP
+from baselines.run_baseline_remote import count_job_files, resolve_cost
 
 
 def log(msg: str) -> None:
@@ -110,7 +109,7 @@ def generate_configs_and_jobs(
     return str(agent_profiles.resolve()), str(jobs_dir.resolve())
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run a baseline scheduler (Greedy / Round-Robin / Random).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -134,7 +133,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--run-dir", type=str, required=True, help="Output directory for results")
     parser.add_argument("--topology", type=str, default="mesh", help="Topology for config gen (default: mesh)")
-    parser.add_argument("--executor-workers", type=int, default=10, help="Thread pool size (default: 10)")
+    parser.add_argument("--executor-workers", type=int, default=None,
+                        help="Concurrent jobs per agent (default: runtime.executor_workers)")
+    parser.add_argument("--config", default=str(_SWARM_ROOT / "config_swarm_multi.yml"),
+                        help="Base config: cost parameters, runtime.wall_time_*, executor_workers")
     parser.add_argument("--timeout", type=float, default=600.0, help="Max run time in seconds (default: 600)")
     parser.add_argument("--no-dtns", action="store_true", help="Disable DTN generation")
 
@@ -152,22 +154,22 @@ def parse_args() -> argparse.Namespace:
         help="Path to existing agent_profiles.json (skip generation)",
     )
 
-    # Cost function overrides
-    parser.add_argument("--cpu-weight", type=float, default=0.4)
-    parser.add_argument("--ram-weight", type=float, default=0.3)
-    parser.add_argument("--disk-weight", type=float, default=0.2)
-    parser.add_argument("--gpu-weight", type=float, default=0.1)
-    parser.add_argument("--long-job-threshold", type=float, default=20.0)
-    parser.add_argument("--connectivity-penalty-factor", type=float, default=1.0)
+    # Cost function overrides (default: the base config's job_selection block)
+    parser.add_argument("--cpu-weight", type=float, default=None)
+    parser.add_argument("--ram-weight", type=float, default=None)
+    parser.add_argument("--disk-weight", type=float, default=None)
+    parser.add_argument("--gpu-weight", type=float, default=None)
+    parser.add_argument("--long-job-threshold", type=float, default=None)
+    parser.add_argument("--connectivity-penalty-factor", type=float, default=None)
 
     parser.add_argument("--skip-cleanup", action="store_true", help="Skip Redis cleanup before run")
     parser.add_argument("--debug", action="store_true", help="Enable DEBUG logging")
 
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main():
-    args = parse_args()
+def main(argv=None):
+    args = parse_args(argv)
 
     # Logging
     level = logging.DEBUG if args.debug else logging.INFO
@@ -201,52 +203,49 @@ def main():
             enable_dtns=enable_dtns,
         )
 
-    # 3. Instantiate scheduler
-    scheduler_cls = SCHEDULER_MAP[args.scheduler]
-    cost_weights = {
-        "cpu": args.cpu_weight,
-        "ram": args.ram_weight,
-        "disk": args.disk_weight,
-        "gpu": args.gpu_weight,
-    }
+    # 3. The base config: cost parameters, the wall-time clamp, per-agent concurrency.
+    config = load_config(args.config)
+    runtime = config.get("runtime") or {}
+    configure_execution(runtime)
+    run_id = f"baseline-{args.scheduler}-{uuid.uuid4().hex[:12]}"
+    os.environ["SWARM_RUN_ID"] = run_id
+    total = min(args.jobs, count_job_files(jobs_dir))
 
-    scheduler = scheduler_cls(
-        db_host=args.db_host,
-        db_port=args.db_port,
-        agent_profiles_path=profiles_path,
-        jobs_dir=jobs_dir,
-        jobs_per_interval=args.jobs_per_interval,
-        run_dir=args.run_dir,
-        total_jobs=args.jobs,
-        interval=args.interval,
-        executor_workers=args.executor_workers,
-        cost_weights=cost_weights,
-        long_job_threshold=args.long_job_threshold,
-        connectivity_penalty_factor=args.connectivity_penalty_factor,
-        timeout=args.timeout,
-    )
+    scheduler = SCHEDULER_MAP[args.scheduler](
+        db_host=args.db_host, db_port=args.db_port, agent_profiles_path=profiles_path,
+        jobs_dir=jobs_dir, jobs_per_interval=args.jobs_per_interval, run_dir=args.run_dir,
+        total_jobs=total, interval=args.interval,
+        executor_workers=args.executor_workers or executor_workers(runtime),
+        timeout=args.timeout, run_id=run_id, agents=args.agents,
+        **resolve_cost(args, config))
 
-    # 4. Load agents and run
-    scheduler.load_agents()
+    # 4. Load the level-0 fleet and run
+    try:
+        scheduler.load_agents()
+    except SystemExit as exc:
+        log(f"REFUSED: {exc}")
+        return 2
 
-    log(f"Starting {args.scheduler} scheduler with {args.agents} agents, {args.jobs} jobs")
+    log(f"Starting {args.scheduler} scheduler with {len(scheduler.agents)} level-0 agents, "
+        f"{total} jobs")
     t0 = time.time()
     scheduler.run()
     elapsed = time.time() - t0
 
     # 5. Save results
-    scheduler.save_results()
+    exit_code = scheduler.save_results(extra_meta={"config": args.config, "argv": sys.argv})
 
     # 6. Summary
     print("\n" + "=" * 60)
     print(f"  Scheduler:      {args.scheduler}")
-    print(f"  Agents:         {args.agents}")
-    print(f"  Total Jobs:     {args.jobs}")
+    print(f"  Agents:         {len(scheduler.agents)} level-0 of {args.agents}")
+    print(f"  Total Jobs:     {total}")
     print(f"  Completed:      {scheduler.completed_count}")
-    print(f"  Makespan:       {elapsed:.1f}s")
-    print(f"  Results:        {args.run_dir}/all_jobs.csv")
+    print(f"  Ended:          {scheduler.drain.get('status')} after {elapsed:.1f}s")
+    print(f"  Results:        {args.run_dir}/all_jobs.csv (exit {exit_code})")
     print("=" * 60)
+    return exit_code
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

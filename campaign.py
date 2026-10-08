@@ -7,7 +7,7 @@
 """Run an evaluation campaign unattended: cells x repeats, gated, classified, resumable.
 
 Run on the `database` node as root. One campaign file lists the cells; this driver runs each
-repeat through `run_test.py` (or `baselines/run_sparrow.py`), one at a time, and records every
+repeat through `run_test.py` (or `baselines/run_sparrow.py` / `baselines/run_baseline_remote.py`), one at a time, and records every
 attempt in `<out>/campaign_state.json`, so a re-invocation resumes where the last one stopped.
 
     python campaign.py campaign.yml               # run (or resume)
@@ -18,7 +18,7 @@ Campaign file (YAML or JSON)::
 
     out: runs/campaign-1
     defaults:                       # merged under every cell
-      runner: run_test.py           # or baselines/run_sparrow.py
+      runner: run_test.py           # or baselines/run_sparrow.py, baselines/run_baseline_remote.py
       repeats: 5
       retries: 1                    # extra attempts after a failed one
       timeout_s: 7200               # wall-clock kill for one attempt
@@ -387,6 +387,11 @@ def session_is_ours(pgid: int, run_dir: str, started: Optional[str]) -> bool:
     return run_dir in cmd
 
 
+# Baseline runners and the per-host process each starts over ssh (what a killed attempt leaves).
+BASELINE_NODES = {"run_sparrow.py": "sparrow_node.py",
+                  "run_baseline_remote.py": "baseline_worker.py"}
+
+
 def stop_cell_agents(cfg: dict) -> None:
     """Stop what a killed attempt started beyond its own session.
 
@@ -398,11 +403,13 @@ def stop_cell_agents(cfg: dict) -> None:
     """
     a = cfg["args"]
     mode = a.get("mode", "remote")
-    if cfg["runner"].endswith("run_sparrow.py"):
-        pattern = shlex.quote("sparrow_node.py")
+    node = next((proc for runner, proc in BASELINE_NODES.items()
+                 if cfg["runner"].endswith(runner)), None)
+    if node:
+        pattern = shlex.quote(node)
         hosts = [h for h in hosts_needed(cfg) if not h.startswith("<missing-")]
         if mode != "remote" or not hosts:
-            subprocess.call(["pkill", "-TERM", "-f", "sparrow_node.py"],
+            subprocess.call(["pkill", "-TERM", "-f", node],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return
         with ThreadPoolExecutor(max_workers=40) as pool:

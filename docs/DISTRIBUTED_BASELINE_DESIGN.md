@@ -1,193 +1,90 @@
-# Distributed Baseline Schedulers with Remote Job Execution
+# External Baseline Schedulers on the Slice (E7)
 
-## Context
+E7 compares SWARM against three **centralized** schedulers (Greedy min-cost, Round-Robin,
+Random) and one **decentralized** Sparrow-style scheduler. A row in that table is only about the
+*scheduler* if everything that is not the scheduler is SWARM's own, so every baseline shares
+one definition (`baselines/common.py`) of:
 
-The centralized baseline schedulers (Greedy, Round-Robin, Random) currently run everything in a single process on the swarm host using `SimulatedAgent` objects and `time.sleep()`. SWARM+ distributes real agent processes across 30 VMs. For a fair comparison, the baselines should also execute jobs on remote VMs — only the **scheduling decision** should remain centralized.
+- **the fleet** — the SWARM cell's level-0 agents, ids 1..N from its `agent_profiles.json`
+  (`load_level0_fleet`). Coordinator slots never execute;
+- **placement** — agent i on host `(i - 1) // agents_per_host` of the cell's hosts file, as
+  `run_test.py` places agents (`host_of`);
+- **execution** — SWARM's `Job.execute()` with the base config's `runtime.wall_time_*` clamp
+  (`configure_execution`), `runtime.executor_workers` jobs at once per agent, and the agent's
+  completion write: outputs published only on success, inside the same transaction
+  (`run_job`);
+- **the workflow DAG gate** — SWARM's readiness registry (`data_ready`);
+- **cost parameters** (Greedy) — `job_selection` from the base config (`cost_params`);
+- **outputs** — `all_jobs.csv`, `metrics.json` keyed by agent id with each agent's
+  `executed_jobs` (so `collect.py` reports `jobs_executed_twice`), `all_agents.csv` (the
+  level-0 fleet, so fairness counts idle agents), `run_meta.json`, `collect_meta.json`
+  (`arm: baseline`, `policy: greedy|round_robin|random|sparrow`) and `drain.json`; exit 0
+  completed or ended on the clock, 2 refused to start, 3 a worker never reported, 4 the store
+  became unreadable — the same statuses `campaign.py` already classifies.
 
-## Architecture
+Since 2026-10-07 `run_test.py` archives each run's `agent_profiles.json` into its run dir, so a
+baseline takes a SWARM cell's exact fleet with `--use-profiles <swarm-run>/agent_profiles.json`.
 
-```
- Swarm Host                          Remote VMs (agent-1..agent-30)
-┌──────────────────────┐
-│ Centralized Scheduler│             ┌─────────────────────┐
-│  - Polls PENDING     │──Redis───→  │ baseline_worker.py  │ (agent-1)
-│  - Assigns jobs      │             │  - Polls READY jobs │
-│  - Sets leader_id +  │             │    where leader_id  │
-│    state=READY       │             │    == my_agent_id   │
-│  - Tracks capacity   │             │  - Executes (sleep) │
-│                      │  ←─Redis──  │  - Sets COMPLETE    │
-│  - Monitors COMPLETE │             └─────────────────────┘
-│    for progress      │             ┌─────────────────────┐
-└──────────────────────┘             │ baseline_worker.py  │ (agent-2)
-                                     │  ...                │
-                                     └─────────────────────┘
-                                      × 30 VMs
-```
-
-No new state enum needed — we reuse `ObjectState.READY` (same as SWARM+).
-No gRPC — pure Redis coordination (same as SWARM+).
-
-## Files Created
-
-### 1. `baselines/baseline_worker.py` (~120 LOC)
-Lightweight worker process that runs on each remote VM.
+## Centralized schedulers (`baselines/scheduler.py`)
 
 ```
-Usage: python3.11 baselines/baseline_worker.py --agent-id 5 --db-host <swarm-ip> [--db-port 6379] [--level 0] [--group 0] [--poll-interval 0.5]
+database                                   agent hosts (placed as run_test.py places agents)
+┌──────────────────────────────┐           ┌──────────────────────────────┐
+│ run_baseline_remote.py       │           │ baseline_worker.py (agent i) │
+│  JobDistributor → PENDING    │           │  BLPOP baseline:<run>:q:<i>  │
+│  scheduler: read PENDING,    │──Redis──→ │  run executor_workers jobs   │
+│   gate on DAG, assign_jobs,  │  (star)   │   at once: RUNNING → execute │
+│   persist READY + leader,    │           │   → COMPLETE (+ outputs)     │
+│   RPUSH id to agent's queue  │ ←──────── │  heartbeat, stats            │
+│  poll COMPLETE, free capacity│           └──────────────────────────────┘
+└──────────────────────────────┘
 ```
 
-**Logic:**
-- Connects to Redis
-- Polls for jobs where `state == READY` AND `leader_id == agent_id` (filter client-side from `get_all_objects(state=READY)`)
-- For each found job: call `job.execute()`, save to Redis as COMPLETE
-- Track local capacity via `SimulatedAgent` (loaded from `agent_profiles.json`)
-- Exit when signaled via a Redis key (`baseline:shutdown`) or SIGTERM
+One process on `database` decides every placement. Each pass it reads new PENDING jobs, holds
+back those whose DAG inputs do not exist yet, and lets the strategy place the rest; a strategy
+**reserves capacity on the agent it picks before considering the next job of the batch**, so no
+agent is over-committed within one batch. The assignment is persisted (READY, `leader_id`,
+conditional on the record still being PENDING) and the job id is pushed onto that agent's
+run-scoped dispatch queue. The worker runs it — up to `executor_workers` at once, the rest
+waiting in its pool exactly as in an agent's executor — and writes RUNNING then COMPLETE, both
+conditional on the record still naming that worker. The scheduler learns of a completion the
+way it would in a deployment: through the store, on its next poll, and only then frees the
+capacity.
 
-### 2. `baselines/run_baseline_remote.py` (~200 LOC)
-Orchestration script that replaces `run_baseline.py` for distributed mode.
+Every key is run-scoped (`baseline:<run_id>:…`: queues, heartbeats, stats, shutdown) and
+workers are stopped by a pattern carrying the run id, so a leftover worker from another run can
+neither take this run's work nor be killed by it. A worker never runs a job the scheduler did
+not assign to it (a dispatch whose record is not READY with its own `leader_id` is a no-op).
 
-```
-Usage: python3.11 baselines/run_baseline_remote.py \
-    --scheduler greedy --agents 30 --jobs 500 \
-    --db-host localhost --agent-hosts-file agent_hosts.txt \
-    --run-dir runs/baselines/greedy/run-1 \
-    --use-profiles agent_profiles.json --use-jobs-dir jobs/
-```
-
-**Steps:**
-1. Clean Redis
-2. SSH into each agent host, start `baseline_worker.py` in background (via `nohup`)
-3. Wait for all workers to register (heartbeat key in Redis)
-4. Start `JobDistributor` thread (push PENDING jobs to Redis)
-5. Run centralized scheduling loop:
-   - Poll PENDING jobs from Redis
-   - Apply scheduling strategy (greedy/RR/random) — reuse existing `assign_jobs()` methods
-   - For each assigned job: set `leader_id`, `state=READY`, save to Redis
-   - Do NOT execute locally — workers handle execution
-   - Monitor COMPLETE count for progress
-6. Wait for all jobs to complete (or timeout)
-7. Signal workers to stop (set `baseline:shutdown` key in Redis)
-8. Collect logs from remote hosts via SCP
-9. Save results (`all_jobs.csv`, `metrics.json`)
-
-### 3. `baseline-worker-start.sh` (~15 LOC)
-Simple wrapper called via SSH on each remote host:
-```bash
-#!/bin/bash
-cd /root/SwarmAgents
-nohup python3.11 baselines/baseline_worker.py \
-    --agent-id $1 --db-host $2 --db-port ${3:-6379} \
-    > baseline-worker-$1.log 2>&1 &
-echo $!  # Return PID for tracking
-```
-
-### 4. `baseline-worker-stop.sh` (~10 LOC)
-Stop workers on all hosts:
-```bash
-#!/bin/bash
-# Reads agent_hosts.txt, SSH into each, kill baseline_worker.py
-```
-
-### 5. `run_centralized_baselines.sh`
-Batch runner that executes all three centralized baseline schedulers (Greedy, Round-Robin, Random) with multiple iterations for statistical significance. Supports both local and remote modes.
-
-```
-Usage: sudo ./run_centralized_baselines.sh [OPTIONS]
-```
-
-**Options:**
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--mode MODE` | `local` | Execution mode: `local` or `remote` |
-| `--agents N` | `30` | Number of agents |
-| `--jobs N` | `500` | Total number of jobs |
-| `--runs N` | `10` | Iterations per scheduler |
-| `--db-host HOST` | `localhost` | Redis host |
-| `--db-port PORT` | `6379` | Redis port |
-| `--jobs-per-interval N` | `10` | Jobs submitted per interval |
-| `--base-dir DIR` | `runs/baselines` | Base output directory |
-| `--schedulers LIST` | `greedy,round-robin,random` | Comma-separated schedulers to run |
-| `--reuse-jobs` | — | Reuse existing `jobs/` and `agent_profiles.json` |
-| `--no-dtns` | — | Disable DTN generation |
-| `--timeout SECS` | `600` | Max run time per test in seconds |
-| `--debug` | — | Enable debug logging |
-| `--agents-per-host N` | `1` | Agents per remote host (remote mode) |
-| `--agent-hosts-file F` | — | Hosts file for remote mode; auto-generates `agent-1..agent-N` if omitted |
-| `--remote-repo-dir DIR` | `/root/SwarmAgents` | Repo path on remote hosts |
-| `--skip-preflight` | — | Skip SSH preflight checks (remote mode) |
-| `--worker-timeout SECS` | `30` | Seconds to wait for workers to register (remote mode) |
-
-**Examples:**
+**Files.** `baselines/scheduler.py` (strategies and the loop), `baselines/baseline_worker.py`
+(`DispatchWorker`), `baselines/run_baseline_remote.py` (orchestrator, run on `database` as
+root), `baseline-worker-start.sh` (detached start over ssh, prints the pid),
+`baselines/run_baseline.py` (one local process, per-agent thread pools — smoke tests only, it
+pays no WAN), `run_centralized_baselines.sh` (repeats, all arms including `sparrow`).
 
 ```bash
-# Local: all 3 schedulers, 10 runs each (default)
-sudo ./run_centralized_baselines.sh
-
-# Local: quick test, 1 run, reuse existing jobs
-sudo ./run_centralized_baselines.sh --runs 1 --reuse-jobs
-
-# Local: only greedy, 5 runs
-sudo ./run_centralized_baselines.sh --schedulers greedy --runs 5
-
-# Remote: explicit hosts file
-sudo ./run_centralized_baselines.sh --mode remote \
-    --agent-hosts-file agent_hosts.txt --db-host 10.0.0.1 \
-    --agents 30 --jobs 500 --runs 10
-
-# Remote: auto-generate hosts (30 agents, 1 per host → agent-1..agent-30)
-sudo ./run_centralized_baselines.sh --mode remote \
-    --db-host database --agents 30 --jobs 500 --runs 10
-
-# Remote: 30 agents across 10 hosts (3 per host)
-sudo ./run_centralized_baselines.sh --mode remote \
-    --db-host database --agents 30 --agents-per-host 3 --runs 10
+python3.11 baselines/run_baseline_remote.py --scheduler greedy --agents 90 --jobs 1800 \
+    --db-host database --agent-hosts-file agent_hosts.txt --agents-per-host 1 \
+    --run-dir runs/e7/greedy/run01 --config campaigns/config_pbft.yml \
+    --use-profiles <swarm-run>/agent_profiles.json --use-jobs-dir /root/workloads/jobs_1800
 ```
 
-**Output structure:**
-```
-runs/baselines/
-├── greedy/
-│   ├── run-1/all_jobs.csv
-│   ├── run-2/all_jobs.csv
-│   └── ...
-├── round-robin/
-│   └── ...
-├── random/
-│   └── ...
-└── failures.log
-```
+The base config must exist at the same path under `--remote-repo-dir` on the agent hosts
+(`--remote-config` otherwise). In a campaign the runner is `baselines/run_baseline_remote.py`;
+a killed attempt's workers are stopped by `campaign.py`'s `stop_cell_agents`.
 
-## Files Modified
+**Fixed 2026-10-07** (plan E7, "known defects"); before then the centralized rows were weaker
+than centralization alone makes them, and none of these runs is citable: the worker ran one job
+at a time while the scheduler admitted several per agent, so the excess sat READY and inflated
+wait and makespan; at Hier-N every profile, coordinator slots included, became an executor;
+Round-Robin and Random did not reserve inside a batch; the wall-time clamp and cost parameters
+were class defaults rather than the config's; the DAG was ignored; `metrics.json` was a summary
+dict the collector read as a phantom agent; and `run_centralized_baselines.sh` tested `tee`'s
+exit status, so every failed run was logged as completed.
 
-### 5. `baselines/scheduler.py` — Refactored for reuse
-Scheduling loop supports two modes via a `remote` flag:
-- **Local mode** (existing): assign + execute locally (current behavior, kept for quick testing)
-- **Remote mode** (new): assign only, write to Redis, let workers execute
-
-When `remote=True`:
-- The `_execute_on_agent()` method becomes a no-op (workers handle execution)
-- The `run()` loop only assigns jobs (sets `leader_id` + `state=READY` in Redis) and monitors `COMPLETE` count from Redis
-- `ThreadPoolExecutor` is not used
-
-### 6. `baselines/agent_sim.py` — Added host field
-`SimulatedAgent.from_profile()` reads from the config's `grpc.host` field (already present when configs are generated with `--agent-hosts-file`).
-
-## Key Design Decisions
-
-1. **No new ObjectState** — Use existing `READY` state (value 5). Workers poll for READY jobs with matching `leader_id`.
-2. **No gRPC between scheduler and workers** — Redis is the sole communication channel (same as SWARM+).
-3. **Worker identifies "my" jobs** by filtering `leader_id == agent_id` from Redis results. The scheduler writes `leader_id` when assigning.
-4. **Capacity tracking stays in the scheduler** — The scheduler tracks `SimulatedAgent` capacity (same as now). Workers do a secondary capacity check but trust the scheduler.
-5. **`agent_profiles.json` already has host info** when generated with `--agent-hosts-file`. We need to regenerate configs with the actual agent hostnames.
-6. **Backward compatible** — `run_baseline.py` (local mode) continues to work unchanged.
-
-## Verification
-
-1. **Unit test**: Run `baseline_worker.py` locally, manually insert a READY job in Redis with matching leader_id, verify it executes and marks COMPLETE
-2. **Small-scale remote test**: 3 agents on 3 hosts, 20 jobs, greedy scheduler
-3. **Full-scale test**: 30 agents on 30 hosts, 500 jobs, all three schedulers
-4. **Comparison**: Run SWARM+ with same 500 jobs on same 30 hosts, compare makespan/fairness/latency
+**Not reproduced, by design.** No failure handling: a worker that dies holding a job leaves it
+READY/RUNNING, as a centralized scheduler without a recovery layer would. Under the E7 failure
+injection that is the result being measured, not a defect.
 
 ---
 

@@ -24,6 +24,9 @@
 #                         (baselines/run_sparrow.py); it needs --reuse-jobs, so every arm
 #                         runs the same profiles and jobs as the SWARM cell
 #   --reuse-jobs          Reuse existing jobs/ and agent_profiles.json
+#   --base-config   FILE  Base config the SWARM arm ran with (default: config_swarm_multi.yml);
+#                         every arm takes its cost parameters, wall-time clamp and
+#                         executor_workers from it. Remote: the same path must exist on the hosts
 #   --no-dtns             Disable DTN generation
 #   --timeout       SECS  Max run time per test in seconds (default: 600)
 #   --debug               Enable debug logging
@@ -33,7 +36,7 @@
 #                         --agents and --agents-per-host
 #   --remote-repo-dir DIR Repo path on remote hosts (default: /root/SwarmAgents)
 #   --skip-preflight      Skip SSH preflight checks (remote mode)
-#   --worker-timeout SECS Seconds to wait for workers to register (default: 30)
+#   --worker-timeout SECS Seconds to wait for workers to register (default: 60)
 #
 # Examples:
 #   # Local: all 3 schedulers, 10 runs each, 30 agents, 500 jobs
@@ -84,7 +87,8 @@ AGENTS_PER_HOST=1
 AGENT_HOSTS_FILE=""
 REMOTE_REPO_DIR="/root/SwarmAgents"
 SKIP_PREFLIGHT=""
-WORKER_TIMEOUT=30
+WORKER_TIMEOUT=60
+BASE_CONFIG="config_swarm_multi.yml"
 
 # ─── Parse arguments ───────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -99,6 +103,7 @@ while [[ $# -gt 0 ]]; do
     --base-dir)         BASE_DIR="$2";          shift 2 ;;
     --schedulers)       SCHEDULERS="$2";        shift 2 ;;
     --reuse-jobs)       REUSE_JOBS=true;        shift ;;
+    --base-config)      BASE_CONFIG="$2";       shift 2 ;;
     --no-dtns)          NO_DTNS="--no-dtns";    shift ;;
     --timeout)          TIMEOUT="$2";           shift 2 ;;
     --debug)            DEBUG="--debug";        shift ;;
@@ -129,7 +134,7 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-log() { printf '[%(%Y-%m-%d %H:%M:%S)T] %s\n' -1 "$*"; }
+log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 
 # ─── Auto-generate agent_hosts.txt if not provided (remote mode) ──
 if [[ "$MODE" == "remote" && -z "$AGENT_HOSTS_FILE" ]]; then
@@ -188,6 +193,7 @@ log "  Jobs/interval:     $JOBS_PER_INTERVAL"
 log "  Timeout:           ${TIMEOUT}s"
 log "  Output base:       $BASE_DIR"
 log "  Reuse jobs:        $REUSE_JOBS"
+log "  Base config:       $BASE_CONFIG"
 if [[ "$MODE" == "remote" ]]; then
 log "  Hosts file:        $AGENT_HOSTS_FILE"
 log "  Agents/host:       $AGENTS_PER_HOST"
@@ -234,7 +240,7 @@ for SCHEDULER in "${SCHED_LIST[@]}"; do
       "$PYTHON" baselines/run_sparrow.py \
           --agents "$AGENTS" --jobs "$JOBS" --db-host "$DB_HOST" --db-port "$DB_PORT" \
           --jobs-per-interval "$JOBS_PER_INTERVAL" --run-dir "$RUN_DIR" --timeout "$TIMEOUT" \
-          $REUSE_FLAGS $SPARROW_FLAGS 2>&1 | tee "$RUN_DIR.log"
+          --config "$BASE_CONFIG" $REUSE_FLAGS $SPARROW_FLAGS 2>&1 | tee "$RUN_DIR.log"
       # The orchestrator's own status, not tee's (and read once: any later command resets it).
       SPARROW_RC="${PIPESTATUS[0]}"
       set -e
@@ -257,7 +263,8 @@ for SCHEDULER in "${SCHED_LIST[@]}"; do
       RUN_SCRIPT="baselines/run_baseline.py"
     fi
 
-    if "$PYTHON" "$RUN_SCRIPT" \
+    set +e   # a failed cell is recorded and the batch goes on; errexit would end it here
+    "$PYTHON" "$RUN_SCRIPT" \
         --scheduler "$SCHEDULER" \
         --agents "$AGENTS" \
         --jobs "$JOBS" \
@@ -266,15 +273,21 @@ for SCHEDULER in "${SCHED_LIST[@]}"; do
         --jobs-per-interval "$JOBS_PER_INTERVAL" \
         --run-dir "$RUN_DIR" \
         --timeout "$TIMEOUT" \
+        --config "$BASE_CONFIG" \
         $NO_DTNS \
         $REUSE_FLAGS \
         $REMOTE_FLAGS \
         $DEBUG \
-        2>&1 | tee "$RUN_DIR.log"; then
+        2>&1 | tee "$RUN_DIR.log"
+    # The scheduler's own status, not tee's — `if a | tee` tested tee, which always succeeds,
+    # so every failed baseline run was logged as completed. Read once: any command resets it.
+    RUN_RC="${PIPESTATUS[0]}"
+    set -e
+    if [[ "$RUN_RC" -eq 0 ]]; then
       log "  ✓ $SCHEDULER run $RUN_NUM completed"
     else
       FAILED=$((FAILED + 1))
-      log "  ✗ $SCHEDULER run $RUN_NUM FAILED (see $RUN_DIR.log)"
+      log "  ✗ $SCHEDULER run $RUN_NUM FAILED (exit $RUN_RC; see $RUN_DIR.log)"
       echo "$SCHEDULER run-$RUN_NUM" >> "$FAIL_LOG"
     fi
 

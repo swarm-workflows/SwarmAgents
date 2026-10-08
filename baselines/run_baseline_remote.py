@@ -1,33 +1,36 @@
 #!/usr/bin/env python3.11
 """
-run_baseline_remote.py — Orchestration for distributed baseline scheduling.
+run_baseline_remote.py — a centralized baseline (Greedy / Round-Robin / Random) on the slice.
 
-Starts lightweight baseline workers on remote VMs via SSH, runs a centralized
-scheduler (Greedy/Round-Robin/Random) on the swarm host, and coordinates via
-Redis.  Workers execute jobs; the scheduler only makes assignment decisions.
+The scheduler runs here, on `database`; one execution worker per **level-0** agent of the SWARM
+cell runs on the host `run_test.py` would place that agent on — agent i on host
+``(i - 1) // agents_per_host`` of the same hosts file — so every dispatch, every completion and
+every DAG readiness check crosses the same WAN to the same store that SWARM's does. Workers run
+`runtime.executor_workers` jobs at once with the base config's wall-time clamp, exactly as an
+agent does (`baselines/common.py`). Run it as root on the database node:
 
-Usage:
-    python3.11 baselines/run_baseline_remote.py \
-        --scheduler greedy --agents 30 --jobs 500 \
-        --db-host 10.0.0.1 --agent-hosts-file agent_hosts.txt \
-        --run-dir runs/baselines/greedy/run-1 \
-        --use-profiles agent_profiles.json --use-jobs-dir jobs/
+    python3.11 baselines/run_baseline_remote.py --scheduler greedy --agents 90 --jobs 1800 \
+        --db-host database --agent-hosts-file agent_hosts.txt --run-dir runs/e7/greedy/run01 \
+        --use-profiles agent_profiles.json --use-jobs-dir jobs/ --config config_swarm_multi.yml
 
-    # With config/job generation:
-    python3.11 baselines/run_baseline_remote.py \
-        --scheduler round-robin --agents 30 --jobs 500 \
-        --db-host 10.0.0.1 --agent-hosts-file agent_hosts.txt \
-        --run-dir runs/baselines/rr/run-1
+Pass the SWARM cell's own `--use-profiles`/`--use-jobs-dir` and base config. The run directory
+gets `all_jobs.csv`, `metrics.json` keyed by agent with `executed_jobs`, `all_agents.csv`,
+`run_meta.json`, `collect_meta.json` (`arm: baseline`, `policy: greedy|round_robin|random`) and
+`drain.json`. Exit status: 0 completed or ended on the clock (see `drain.json`), 2 refused to
+start, 3 some worker never reported its stats, 4 the store became unreadable.
 """
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import shlex
+import signal
 import subprocess
 import sys
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -39,17 +42,9 @@ if str(_SWARM_ROOT) not in sys.path:
 
 import redis
 
-from baselines.scheduler import (
-    GreedyScheduler,
-    RoundRobinScheduler,
-    RandomScheduler,
-)
-
-SCHEDULER_MAP = {
-    "greedy": GreedyScheduler,
-    "round-robin": RoundRobinScheduler,
-    "random": RandomScheduler,
-}
+from baselines.common import (configure_execution, cost_params, executor_workers, host_of,
+                              load_config, wait_for_final_reports)
+from baselines.scheduler import SCHEDULER_MAP
 
 
 def log(msg: str) -> None:
@@ -142,86 +137,58 @@ def preflight_check(hosts: list[str], remote_repo_dir: str) -> None:
     log("Preflight checks passed.")
 
 
-def start_workers(
-    agents: list,
-    db_host: str,
-    db_port: int,
-    remote_repo_dir: str,
-    level: int,
-    group: int,
-) -> dict[str, list[int]]:
-    """SSH into each agent's host and start baseline_worker.py.
-
-    Returns {host: [agent_id, ...]} mapping for cleanup.
-    """
-    host_agents: dict[str, list[int]] = {}
+def start_workers(agents: list, args, run_id: str) -> tuple[dict[int, str], list[int]]:
+    """Start one worker per agent on its host. Returns ({agent_id: host}, [failed ids])."""
+    placement, failed = {}, []
+    log(f"Starting {len(agents)} workers …")
     for agent in agents:
-        host = agent.host
-        host_agents.setdefault(host, []).append(agent.agent_id)
-
-    log(f"Starting workers on {len(host_agents)} host(s) …")
-    for host, agent_ids in host_agents.items():
-        for aid in agent_ids:
-            cmd = (
-                f"cd {shlex.quote(remote_repo_dir)} && "
-                f"bash baseline-worker-start.sh {aid} {db_host} {db_port}"
-            )
-            try:
-                pid = ssh_output(host, cmd)
-                log(f"  Worker {aid} on {host} (PID {pid})")
-            except subprocess.CalledProcessError as e:
-                log(f"  FAILED to start worker {aid} on {host}: {e}")
-
-    return host_agents
+        cmd = (f"cd {shlex.quote(args.remote_repo_dir)} && bash baseline-worker-start.sh "
+               f"{shlex.quote(args.remote_python)} {agent.agent_id} "
+               f"--db-host {shlex.quote(args.db_host)} --db-port {args.db_port} "
+               f"--run-id {shlex.quote(run_id)} --config {shlex.quote(args.remote_config)}")
+        try:
+            pid = ssh_output(agent.host, cmd)
+            placement[agent.agent_id] = agent.host
+            log(f"  worker {agent.agent_id} on {agent.host} (pid {pid})")
+        except subprocess.CalledProcessError as e:
+            log(f"  FAILED to start worker {agent.agent_id} on {agent.host}: {e}")
+            failed.append(agent.agent_id)
+    return placement, failed
 
 
-def wait_for_workers(
-    redis_client: redis.StrictRedis,
-    agent_ids: list[int],
-    timeout: float = 30.0,
-) -> None:
-    """Wait until all workers have registered their heartbeat in Redis."""
+def wait_for_workers(redis_client, keys, agent_ids: list[int], timeout: float) -> list[int]:
+    """Wait until every worker's heartbeat is in the store; returns the ones still missing."""
     log(f"Waiting for {len(agent_ids)} workers to register …")
     deadline = time.time() + timeout
+    missing = list(agent_ids)
     while time.time() < deadline:
-        alive = 0
-        for aid in agent_ids:
-            if redis_client.exists(f"baseline:worker:{aid}:heartbeat"):
-                alive += 1
-        if alive >= len(agent_ids):
-            log(f"All {alive} workers registered.")
-            return
+        alive = redis_client.mget([keys.heartbeat(a) for a in agent_ids]) if agent_ids else []
+        missing = [a for a, v in zip(agent_ids, alive) if not v]
+        if not missing:
+            log(f"All {len(agent_ids)} workers registered.")
+            break
         time.sleep(1.0)
-    log(f"WARNING: Only {alive}/{len(agent_ids)} workers registered within {timeout}s. Proceeding anyway.")
+    return missing
 
 
-def stop_workers(redis_client: redis.StrictRedis, host_agents: dict[str, list[int]], remote_repo_dir: str) -> None:
-    """Signal workers to stop and kill any remaining processes."""
-    log("Signaling workers to shut down …")
-    redis_client.set("baseline:shutdown", "1", ex=120)
-    time.sleep(3)  # Give workers time to see the signal
-
-    for host, agent_ids in host_agents.items():
-        cmd = "pkill -f 'baseline_worker.py' 2>/dev/null; true"
-        ssh(host, cmd)
-
-    # Clean up shutdown key
-    redis_client.delete("baseline:shutdown")
+def stop_workers(hosts: list[str], run_id: str) -> None:
+    """Stop this run's workers only: the pattern carries the run id."""
+    pattern = shlex.quote(f"baseline_worker.py.*--run-id {run_id}")
+    for host in sorted(set(hosts)):
+        ssh(host, f"pkill -TERM -f {pattern}; sleep 5; pkill -KILL -f {pattern}; true")
 
 
-def collect_remote_logs(host_agents: dict[str, list[int]], run_dir: str, remote_repo_dir: str) -> None:
-    """SCP worker logs from remote hosts (best-effort)."""
+def collect_remote_logs(placement: dict[int, str], run_dir: str, remote_repo_dir: str) -> None:
+    """Copy each worker's log back (best-effort)."""
     log("Collecting logs from remote hosts …")
-    for host in host_agents:
-        dest_dir = os.path.join(run_dir, host.replace("/", "_"))
-        os.makedirs(dest_dir, exist_ok=True)
-        scp_cmd = (
-            f"scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
-            f"-o BatchMode=yes -o ConnectTimeout=10 -q "
-            f"{host}:{shlex.quote(remote_repo_dir)}/baseline-worker-*.log "
-            f"{shlex.quote(dest_dir)}/ 2>/dev/null"
-        )
-        subprocess.call(scp_cmd, shell=True)
+    for aid, host in sorted(placement.items()):
+        dest_dir = Path(run_dir) / "node-logs" / host
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        subprocess.call(["scp", "-o", "StrictHostKeyChecking=no", "-o",
+                         "UserKnownHostsFile=/dev/null", "-o", "BatchMode=yes", "-o",
+                         "ConnectTimeout=10", "-q",
+                         f"{host}:{remote_repo_dir}/baseline-worker-{aid}.log", str(dest_dir)],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 # ── Config / job generation ──────────────────────────────────────────
@@ -270,26 +237,39 @@ def generate_configs_and_jobs(
 
 # ── CLI ──────────────────────────────────────────────────────────────
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Run distributed baseline scheduler with remote workers.",
+        description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
     p.add_argument("--scheduler", required=True, choices=list(SCHEDULER_MAP.keys()))
-    p.add_argument("--agents", type=int, required=True)
+    p.add_argument("--mode", choices=["remote"], default="remote",
+                   help="Accepted so a campaign's `mode: remote` default applies unchanged; "
+                        "a local smoke run is baselines/run_baseline.py")
+    p.add_argument("--agents", type=int, required=True,
+                   help="The SWARM cell's fleet size; its level-0 agents become workers")
     p.add_argument("--jobs", type=int, required=True)
     p.add_argument("--db-host", type=str, required=True, help="Redis host (must be reachable from all VMs)")
     p.add_argument("--db-port", type=int, default=6379)
-    p.add_argument("--agent-hosts-file", type=str, required=True, help="File with one remote hostname per line")
+    p.add_argument("--agent-hosts-file", type=str, required=True,
+                   help="The SWARM cell's hosts file; placement is its order, as in run_test.py")
     p.add_argument("--agents-per-host", type=int, default=1, help="Number of agents per remote host (default: 1)")
     p.add_argument("--run-dir", type=str, required=True)
     p.add_argument("--remote-repo-dir", default="/root/SwarmAgents", help="Repo path on remote hosts")
+    p.add_argument("--remote-python", default="python3.11")
+    p.add_argument("--config", default=str(_SWARM_ROOT / "config_swarm_multi.yml"),
+                   help="Base config the SWARM arm ran with: cost parameters, "
+                        "runtime.wall_time_* and runtime.executor_workers come from it")
+    p.add_argument("--remote-config", default=None,
+                   help="Path of that config on the agent hosts (default: the same file name "
+                        "under --remote-repo-dir)")
 
     # Job submission
     p.add_argument("--jobs-per-interval", type=int, default=20)
     p.add_argument("--interval", type=float, default=1.0)
-    p.add_argument("--timeout", type=float, default=600.0)
+    p.add_argument("--timeout", type=float, default=3600.0,
+                   help="Hard cap on the run; drain.json says when it ended on it")
 
     # Reuse existing configs/jobs
     p.add_argument("--use-profiles", type=str, default=None)
@@ -298,143 +278,182 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--topology", type=str, default="mesh")
     p.add_argument("--no-dtns", action="store_true")
 
-    # Cost function overrides
-    p.add_argument("--cpu-weight", type=float, default=0.4)
-    p.add_argument("--ram-weight", type=float, default=0.3)
-    p.add_argument("--disk-weight", type=float, default=0.2)
-    p.add_argument("--gpu-weight", type=float, default=0.1)
-    p.add_argument("--long-job-threshold", type=float, default=20.0)
-    p.add_argument("--connectivity-penalty-factor", type=float, default=1.0)
+    # Cost function overrides (default: the base config's job_selection block)
+    p.add_argument("--cpu-weight", type=float, default=None)
+    p.add_argument("--ram-weight", type=float, default=None)
+    p.add_argument("--disk-weight", type=float, default=None)
+    p.add_argument("--gpu-weight", type=float, default=None)
+    p.add_argument("--long-job-threshold", type=float, default=None)
+    p.add_argument("--connectivity-penalty-factor", type=float, default=None)
 
     p.add_argument("--skip-cleanup", action="store_true")
     p.add_argument("--skip-preflight", action="store_true")
-    p.add_argument("--worker-timeout", type=float, default=30.0, help="Seconds to wait for workers to register")
+    p.add_argument("--worker-timeout", "--startup-timeout", dest="worker_timeout", type=float,
+                   default=60.0, help="Seconds to wait for workers to register")
+    p.add_argument("--stats-wait-s", type=float, default=None,
+                   help="Drain deadline for workers' final reports after the run ends "
+                        "(default: the config's wall_time_max_s + 60, so a capped job finishes)")
     p.add_argument("--debug", action="store_true")
 
-    return p.parse_args()
+    args = p.parse_args(argv)
+    if args.remote_config is None:
+        args.remote_config = str(Path(args.remote_repo_dir) / Path(args.config).name)
+    if args.stats_wait_s is None:
+        from baselines.run_sparrow import drain_deadline
+        args.stats_wait_s = drain_deadline(args.config)
+    return args
 
 
-def main():
-    args = parse_args()
+def resolve_cost(args, config: dict) -> dict:
+    """The base config's cost parameters, with any CLI override applied on top."""
+    params = cost_params(config)
+    for dim in ("cpu", "ram", "disk", "gpu"):
+        v = getattr(args, f"{dim}_weight")
+        if v is not None:
+            params["cost_weights"][dim] = v
+    if args.long_job_threshold is not None:
+        params["long_job_threshold"] = args.long_job_threshold
+    if args.connectivity_penalty_factor is not None:
+        params["connectivity_penalty_factor"] = args.connectivity_penalty_factor
+    return params
 
-    level = logging.DEBUG if args.debug else logging.INFO
+
+def count_job_files(jobs_dir: str) -> int:
+    return sum(1 for _ in Path(jobs_dir).glob("job_*.json"))
+
+
+def _exit_on_signal(signum, _frame):
+    # SIGTERM/SIGHUP end the process WITHOUT running `finally` by default, and `finally` is
+    # what stops the workers on the agent hosts. As SystemExit, teardown runs.
+    raise SystemExit(128 + signum)
+
+
+def main(argv=None) -> int:
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            signal.signal(sig, _exit_on_signal)
+        except ValueError:      # not the main thread (tests)
+            pass
+    args = parse_args(argv)
+
     logging.basicConfig(
-        level=level,
+        level=logging.DEBUG if args.debug else logging.INFO,
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
         datefmt="%H:%M:%S",
     )
 
     os.chdir(_SWARM_ROOT)
+    run_dir = Path(args.run_dir).resolve()
+    run_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Read host list
+    # 1. Hosts, placed exactly as run_test.py places agents.
     host_list = load_host_list(args.agent_hosts_file)
+    need = -(-args.agents // args.agents_per_host)
+    if len(host_list) < need:
+        log(f"REFUSED: {args.agents} agents at {args.agents_per_host}/host need {need} hosts; "
+            f"{args.agent_hosts_file} lists {len(host_list)}")
+        return 2
     log(f"Loaded {len(host_list)} hosts from {args.agent_hosts_file}")
 
-    # 2. Preflight
     if not args.skip_preflight:
-        preflight_check(host_list, args.remote_repo_dir)
+        preflight_check(host_list[:need], args.remote_repo_dir)
 
-    # 3. Cleanup Redis
+    run_id = f"baseline-{args.scheduler}-{uuid.uuid4().hex[:12]}"
+    os.environ["SWARM_RUN_ID"] = run_id          # the distributor's readiness keys match ours
+
     if not args.skip_cleanup:
         cleanup_redis(args.db_host, args.db_port)
 
-    # 4. Generate or reuse configs/jobs
+    # 2. Profiles and jobs (the SWARM cell's, for any number that goes beside SWARM's).
     if args.use_profiles and args.use_jobs_dir:
         profiles_path = str(Path(args.use_profiles).resolve())
         jobs_dir = str(Path(args.use_jobs_dir).resolve())
         log(f"Reusing profiles={profiles_path}, jobs={jobs_dir}")
     else:
-        config_dir = args.use_config_dir or "configs"
         profiles_path, jobs_dir = generate_configs_and_jobs(
-            agents=args.agents,
-            jobs=args.jobs,
-            db_host=args.db_host,
-            config_dir=config_dir,
-            topology=args.topology,
-            enable_dtns=not args.no_dtns,
-            agent_hosts_file=args.agent_hosts_file,
-            agents_per_host=args.agents_per_host,
-        )
+            agents=args.agents, jobs=args.jobs, db_host=args.db_host,
+            config_dir=args.use_config_dir or "configs", topology=args.topology,
+            enable_dtns=not args.no_dtns, agent_hosts_file=args.agent_hosts_file,
+            agents_per_host=args.agents_per_host)
 
-    # 5. Instantiate scheduler in remote mode
-    scheduler_cls = SCHEDULER_MAP[args.scheduler]
-    cost_weights = {
-        "cpu": args.cpu_weight,
-        "ram": args.ram_weight,
-        "disk": args.disk_weight,
-        "gpu": args.gpu_weight,
-    }
+    # 3. The base config: cost parameters, the wall-time clamp, per-agent concurrency.
+    config = load_config(args.config)
+    runtime = config.get("runtime") or {}
+    configure_execution(runtime)          # recorded in run_meta; the workers apply it too
+    cost = resolve_cost(args, config)
+    total = min(args.jobs, count_job_files(jobs_dir))
+    if total < args.jobs:
+        log(f"WARNING: --jobs {args.jobs} but {jobs_dir} holds {total} job files")
 
-    scheduler = scheduler_cls(
-        db_host=args.db_host,
-        db_port=args.db_port,
-        agent_profiles_path=profiles_path,
-        jobs_dir=jobs_dir,
-        jobs_per_interval=args.jobs_per_interval,
-        run_dir=args.run_dir,
-        total_jobs=args.jobs,
-        interval=args.interval,
-        cost_weights=cost_weights,
-        long_job_threshold=args.long_job_threshold,
-        connectivity_penalty_factor=args.connectivity_penalty_factor,
-        timeout=args.timeout,
-        remote=True,
-    )
-    scheduler.load_agents()
-
-    # 5b. Patch agent hosts from hosts file if profiles lack host info
-    #     (handles agent_profiles.json generated before grpc.host was included)
-    agents_missing_host = [a for a in scheduler.agents if a.host == "localhost"]
-    if agents_missing_host and host_list:
-        log(f"Patching {len(agents_missing_host)} agents with hosts from {args.agent_hosts_file}")
-        for agent in scheduler.agents:
-            host_idx = (agent.agent_id - 1) // args.agents_per_host
-            if host_idx < len(host_list):
-                agent.host = host_list[host_idx]
-
-    # 6. Start workers on remote hosts
-    host_agents = start_workers(
-        agents=scheduler.agents,
-        db_host=args.db_host,
-        db_port=args.db_port,
-        remote_repo_dir=args.remote_repo_dir,
-        level=0,
-        group=0,
-    )
-
-    # 7. Wait for workers to register
-    redis_client = redis.StrictRedis(host=args.db_host, port=args.db_port, decode_responses=True)
+    scheduler = SCHEDULER_MAP[args.scheduler](
+        db_host=args.db_host, db_port=args.db_port, agent_profiles_path=profiles_path,
+        jobs_dir=jobs_dir, jobs_per_interval=args.jobs_per_interval, run_dir=str(run_dir),
+        total_jobs=total, interval=args.interval,
+        executor_workers=executor_workers(runtime), timeout=args.timeout, remote=True,
+        run_id=run_id, agents=args.agents, **cost)
+    try:
+        scheduler.load_agents()
+    except SystemExit as exc:          # a profile set for a smaller fleet: a refusal, not a crash
+        log(f"REFUSED: {exc}")
+        return 2
+    for agent in scheduler.agents:
+        agent.host = host_of(host_list, agent.agent_id, args.agents_per_host)
     agent_ids = [a.agent_id for a in scheduler.agents]
-    wait_for_workers(redis_client, agent_ids, timeout=args.worker_timeout)
+    worker_hosts = sorted({a.host for a in scheduler.agents})
 
-    # 8. Run the scheduler
-    log(f"Starting {args.scheduler} scheduler (remote mode) with {args.agents} agents, {args.jobs} jobs")
+    redis_client = redis.StrictRedis(host=args.db_host, port=args.db_port, decode_responses=True)
+    keys = scheduler.keys
+    placement: dict[int, str] = {}
+    exit_code = 0
     t0 = time.time()
     try:
+        # 4. Workers. A fleet with silent workers is a smaller fleet than the cell claims, and
+        # its numbers would sit beside SWARM's as if it were not, so it is refused.
+        placement, failed = start_workers(scheduler.agents, args, run_id)
+        missing = wait_for_workers(redis_client, keys, agent_ids, args.worker_timeout)
+        if failed or missing:
+            log(f"REFUSED: workers not running — failed to start {failed[:10]}, "
+                f"not registered {missing[:10]}{'…' if len(missing) > 10 else ''}")
+            (run_dir / "drain.json").write_text(json.dumps(
+                {"status": "startup_refused", "failed_workers": failed,
+                 "missing_workers": missing}, indent=2))
+            return 2
+
+        # 5. Schedule.
+        log(f"Starting {args.scheduler} (remote) over {len(agent_ids)} level-0 workers of "
+            f"{args.agents} agents, {total} jobs, {scheduler.executor_workers} concurrent each")
         scheduler.run()
     finally:
-        # 9. Stop workers
-        stop_workers(redis_client, host_agents, args.remote_repo_dir)
-
-        # 10. Collect logs
-        collect_remote_logs(host_agents, args.run_dir, args.remote_repo_dir)
+        try:
+            redis_client.set(keys.shutdown, "1", ex=3600)
+        except redis.RedisError:
+            pass
+        # Every worker's FINAL report — written once its pool has drained — not any stats key:
+        # periodic snapshots exist from the first 10 s, and stopping on those killed workers
+        # mid-job. Past the deadline the stop below kills what is left, and save_results
+        # records those workers as a shortfall (exit 3).
+        wait_for_final_reports(redis_client, {a: keys.stats("worker", a) for a in agent_ids},
+                               args.stats_wait_s)
+        stop_workers(worker_hosts, run_id)
+        collect_remote_logs(placement, str(run_dir), args.remote_repo_dir)
 
     elapsed = time.time() - t0
+    exit_code = scheduler.save_results(extra_meta={
+        "agents_per_host": args.agents_per_host, "config": args.config,
+        "cost": cost, "argv": sys.argv,
+        "placement": {str(a): h for a, h in sorted(placement.items())}})
 
-    # 11. Save results
-    scheduler.save_results()
-
-    # 12. Summary
     print("\n" + "=" * 60)
     print(f"  Scheduler:      {args.scheduler} (REMOTE)")
-    print(f"  Agents:         {args.agents}")
-    print(f"  Hosts:          {len(host_list)}")
-    print(f"  Total Jobs:     {args.jobs}")
+    print(f"  Workers:        {len(agent_ids)} level-0 of {args.agents} agents")
+    print(f"  Hosts:          {len(worker_hosts)}")
+    print(f"  Total Jobs:     {total}")
     print(f"  Completed:      {scheduler.completed_count}")
-    print(f"  Makespan:       {elapsed:.1f}s")
-    print(f"  Results:        {args.run_dir}/all_jobs.csv")
+    print(f"  Ended:          {scheduler.drain.get('status')} after {elapsed:.1f}s")
+    print(f"  Results:        {run_dir}/all_jobs.csv (exit {exit_code})")
     print("=" * 60)
+    return exit_code
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

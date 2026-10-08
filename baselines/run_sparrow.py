@@ -47,7 +47,8 @@ if str(_ROOT) not in sys.path:
 
 import redis  # noqa: E402
 
-from baselines.agent_sim import SimulatedAgent  # noqa: E402
+from baselines.common import (keyed_metrics, load_level0_fleet, read_reports,  # noqa: E402
+                              runtime_config, wait_for_final_reports)
 from baselines.sparrow import Keys, publish_fleet  # noqa: E402
 from swarm.database.repository import Repository  # noqa: E402
 from swarm.models.job import ObjectState  # noqa: E402
@@ -76,19 +77,8 @@ def load_hosts(path: str) -> list[str]:
         return [ln.strip() for ln in fh if ln.strip() and not ln.startswith("#")]
 
 
-def load_fleet_profiles(path: str, agents: int) -> list[SimulatedAgent]:
-    """Agents 1..N from agent_profiles.json — level-0 executors only, as SWARM's fleet."""
-    with open(path) as fh:
-        profiles = json.load(fh)
-    fleet = []
-    for i in range(1, agents + 1):
-        prof = profiles.get(str(i)) if isinstance(profiles, dict) else None
-        if prof is None:
-            raise SystemExit(f"agent {i} is not in {path}; the profile set is for a smaller fleet")
-        if int(prof.get("level") or 0) != 0:
-            continue
-        fleet.append(SimulatedAgent.from_profile(i, prof))
-    return fleet
+# Level-0 executors only, as SWARM's fleet (one definition: baselines/common.py).
+load_fleet_profiles = load_level0_fleet
 
 
 def scheduler_agents(n_agents: int, n_schedulers: int) -> list[int]:
@@ -212,7 +202,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--timeout", type=float, default=3600.0,
                    help="Hard cap on the run; drain.json says when it ended on it.")
     p.add_argument("--startup-timeout", type=float, default=60.0)
-    p.add_argument("--stats-wait-s", type=float, default=60.0)
+    p.add_argument("--stats-wait-s", type=float, default=None,
+                   help="Drain deadline for workers' final reports after the run ends "
+                        "(default: the config's wall_time_max_s + 60, so a capped job finishes)")
     p.add_argument("--skip-cleanup", action="store_true")
     args = p.parse_args(argv)
     if args.mode == "remote" and not args.agent_hosts_file:
@@ -221,7 +213,18 @@ def parse_args(argv=None) -> argparse.Namespace:
         args.remote_config = str(Path(args.remote_repo_dir) / Path(args.config).name)
     if args.schedulers <= 0:
         args.schedulers = max(1, args.agents // 10)
+    if args.stats_wait_s is None:
+        args.stats_wait_s = drain_deadline(args.config)
     return args
+
+
+def drain_deadline(config_path) -> float:
+    """How long to wait for workers' final reports: the longest a job can run, plus a margin."""
+    try:
+        cap = float(runtime_config(config_path).get("wall_time_max_s", 120.0))
+    except OSError:
+        cap = 120.0
+    return (cap if cap > 0 else 1800.0) + 60.0
 
 
 def _exit_on_signal(signum, _frame):
@@ -333,17 +336,10 @@ def main(argv=None) -> int:
             client.set(keys.shutdown, "1", ex=3600)
         except redis.RedisError:
             pass
-        # Give nodes time to finish running jobs and write their final stats, then make sure.
-        wait_until = time.time() + args.stats_wait_s
-        while time.time() < wait_until:
-            try:
-                have = sum(1 for v in client.mget([keys.stats("worker", w) for w in worker_ids])
-                           if v)
-            except redis.RedisError:
-                break
-            if have >= len(worker_ids):
-                break
-            time.sleep(1.0)
+        # Wait for every worker's FINAL report — written after it stopped and its running jobs
+        # finished — not for any stats key: periodic snapshots exist from the first 10 s.
+        wait_for_final_reports(client, {w: keys.stats("worker", w) for w in worker_ids},
+                               args.stats_wait_s)
         nodes.stop(hosts)
         nodes.collect_logs()
         drain["ended_at"] = time.time()
@@ -356,26 +352,24 @@ def main(argv=None) -> int:
 def write_results(args, client, repo, keys, run_dir: Path, run_id: str, fleet, nodes,
                   total: int, started: float, exit_code: int) -> int:
     from plotting.data import save_jobs
-    save_jobs(repo.get_all_objects(key_prefix=Repository.KEY_JOB, level=0, group=0),
-              str(run_dir))
+    ids = [a.agent_id for a in fleet]
+    reports = {}
+    try:
+        save_jobs(repo.get_all_objects(key_prefix=Repository.KEY_JOB, level=0, group=0),
+                  str(run_dir))
+        reports = read_reports(client, {w: keys.stats("worker", w) for w in ids})
+    except redis.RedisError as exc:
+        # The store went away after the run: what it held cannot be exported, and the run says
+        # so with exit 4 rather than raising past the artifacts below.
+        log(f"Store unreadable while collecting results: {exc}")
+        exit_code = exit_code or 4
 
-    metrics, missing = {}, []
-    for a in fleet:
-        raw = client.get(keys.stats("worker", a.agent_id))
-        if not raw:
-            missing.append(a.agent_id)
-            continue
-        stats = json.loads(raw)
-        metrics[str(a.agent_id)] = {
-            "id": a.agent_id, "run_id": run_id,
-            "executed_jobs": stats.pop("executed_jobs", []),
-            "sparrow": stats,
-        }
+    metrics, missing = keyed_metrics(ids, reports, run_id, "sparrow")
     (run_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
     if missing:
         (run_dir / "metrics_shortfall.json").write_text(json.dumps(
             {"missing_agents": missing, "expected": len(fleet)}, indent=2))
-        log(f"{len(missing)} worker(s) never reported stats: {missing[:10]}")
+        log(f"{len(missing)} worker(s) sent no final report: {missing[:10]}")
         exit_code = exit_code or 3
 
     (run_dir / "all_agents.csv").write_text(json.dumps([
@@ -383,10 +377,13 @@ def write_results(args, client, repo, keys, run_dir: Path, run_id: str, fleet, n
          "capacities": a.capacities.to_dict() or {}, "dtns": sorted(a.dtns or {})}
         for a in fleet], indent=2))
 
-    sched_stats = {}
-    for i in range(args.schedulers):
-        raw = client.get(keys.stats("scheduler", i))
-        sched_stats[str(i)] = json.loads(raw) if raw else None
+    sched_stats = {str(i): None for i in range(args.schedulers)}
+    try:
+        for i in range(args.schedulers):
+            raw = client.get(keys.stats("scheduler", i))
+            sched_stats[str(i)] = json.loads(raw) if raw else None
+    except redis.RedisError:
+        exit_code = exit_code or 4
     (run_dir / "run_meta.json").write_text(json.dumps({
         "run_id": run_id, "scheduler": "sparrow", "mode": args.mode,
         "agents": args.agents, "agents_per_host": args.agents_per_host, "jobs": total,

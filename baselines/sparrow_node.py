@@ -32,27 +32,9 @@ if str(_ROOT) not in sys.path:
 
 import redis  # noqa: E402
 
+from baselines.common import configure_execution, executor_workers, runtime_config  # noqa: E402
 from baselines.sparrow import Keys, SparrowScheduler, SparrowWorker, load_fleet  # noqa: E402
 from swarm.database.repository import Repository  # noqa: E402
-from swarm.models.job import Job  # noqa: E402
-
-
-def runtime_config(path: str | None) -> dict:
-    """`runtime:` from the base config, read with the strict loader SWARM agents use."""
-    if not path:
-        return {}
-    from swarm.utils.yaml_strict import safe_load
-    with open(path) as fh:
-        return (safe_load(fh) or {}).get("runtime") or {}
-
-
-def configure_execution(runtime: dict) -> None:
-    """The same clamp `Agent._configure_job_execution_simulation` applies, from the same keys
-    and the same defaults, so a baseline job sleeps exactly as long as a SWARM job would."""
-    Job.configure_execution_simulation(
-        scale=float(runtime.get("wall_time_scale", 1.0)),
-        min_s=float(runtime.get("wall_time_min_s", 0.0)),
-        max_s=float(runtime.get("wall_time_max_s", 120.0)))
 
 
 def main() -> int:
@@ -98,14 +80,14 @@ def main() -> int:
         if me is None:
             log.error("agent %s is not in the published fleet", args.agent_id)
             return 2
-        workers = args.max_concurrent or int(runtime.get("executor_workers", 10))
+        workers = args.max_concurrent or executor_workers(runtime)
         node = SparrowWorker(me, repo, client, keys, max_concurrent=workers)
         log.info("worker %s up: %s concurrent, fleet of %d", me.agent_id, workers, len(fleet))
         try:
             node.run_forever(stop, block_s=1.0)
         finally:
             node.shutdown(wait=True)
-            node.write_stats()
+            node.write_stats(final=True)
         log.info("worker %s done: %s", me.agent_id, node.stats)
         return 0
 

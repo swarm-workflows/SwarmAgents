@@ -40,11 +40,13 @@ class SimulatedAgent:
         with self.lock:
             self.current_alloc = self.current_alloc + job_capacities
 
-    def release(self, job_capacities: Capacities):
-        """Free capacity after job completion."""
+    def release(self, job_capacities: Capacities, completed: bool = True):
+        """Free capacity — after a job completes, or (``completed=False``) when a reservation
+        is withdrawn before the job ever ran."""
         with self.lock:
             self.current_alloc = self.current_alloc - job_capacities
-            self.jobs_completed += 1
+            if completed:
+                self.jobs_completed += 1
 
     @classmethod
     def from_profile(cls, agent_id: int, profile: dict) -> "SimulatedAgent":

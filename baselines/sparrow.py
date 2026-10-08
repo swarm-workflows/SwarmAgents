@@ -66,6 +66,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Dict, Iterable, List, Optional
 
 from baselines.agent_sim import SimulatedAgent
+from baselines.common import data_ready, run_job
 from swarm.database.repository import Repository
 from swarm.models.capacities import Capacities
 from swarm.models.job import Job, ObjectState
@@ -83,11 +84,12 @@ def owner_of(job_id: str, n_schedulers: int) -> int:
 
 
 class Keys:
-    """Every Sparrow key is run-scoped, so a leftover node from an earlier run cannot serve
-    or claim this run's work."""
+    """Every baseline key is run-scoped, so a leftover node from an earlier run cannot serve
+    or claim this run's work. *prefix* separates the Sparrow arm (`sparrow`) from the
+    centralized arms' dispatch queues (`baseline`)."""
 
-    def __init__(self, run_id: str):
-        self.base = f"sparrow:{run_id}"
+    def __init__(self, run_id: str, prefix: str = "sparrow"):
+        self.base = f"{prefix}:{run_id}"
 
     def queue(self, worker_id: int) -> str:
         return f"{self.base}:q:{int(worker_id)}"
@@ -147,18 +149,8 @@ def statically_feasible(job: Job, agent: SimulatedAgent) -> bool:
     return not required or required.issubset(set(agent.dtns or {}))
 
 
-def _data_ready(repo: Repository, job: Job) -> bool:
-    """SWARM's workflow DAG gate, file-dependency form. A failure to check is not readiness."""
-    pred = job.data_predicate
-    if not pred:
-        return True
-    if pred.get("kind") == "files" or "files" in pred:
-        try:
-            return repo.data_available(list(pred.get("files") or []))
-        except Exception:
-            return False
-    # The quantum measurement-stream predicate has no Sparrow analogue; never release it.
-    return False
+# One definition of the DAG gate for every baseline (baselines/common.py).
+_data_ready = data_ready
 
 
 class SparrowScheduler:
@@ -270,7 +262,8 @@ class SparrowWorker:
         self.pool = ThreadPoolExecutor(max_workers=self.max_concurrent)
         self.executed_jobs: List[str] = []
         self.stats = {"reservations": 0, "claims": 0, "noops": 0, "lost_races": 0,
-                      "head_of_line_waits": 0, "completed": 0, "persist_refused": 0}
+                      "head_of_line_waits": 0, "completed": 0, "persist_refused": 0,
+                      "claim_refused": 0}
 
     # -- queue service -------------------------------------------------------------------
 
@@ -338,28 +331,9 @@ class SparrowWorker:
 
     def _run(self, job: Job, caps) -> None:
         try:
-            self.executed_jobs.append(str(job.job_id))
-            job.state = ObjectState.RUNNING
-            job.mark_started()
-            self.repo.save(obj=job.to_dict(), key_prefix=Repository.KEY_JOB, level=LEVEL,
-                           group=GROUP, precondition=self._ours)
-            try:
-                job.execute()
-            except Exception as exc:          # an execution failure is the job's outcome
-                logger.error("job %s raised: %s", job.job_id, exc)
-                job.exit_status = 1
-            job.state = ObjectState.COMPLETE
-            # The same publication rule as ResourceAgent.execute_job: outputs exist only when
-            # the job succeeded, and the names ride the completion write so a DAG's children
-            # are released by the same transaction that records their parent done.
-            produced = ([d.file for d in (job.data_out or []) if getattr(d, "file", None)]
-                        if job.exit_status == 0 else None)
-            if not self.repo.save(obj=job.to_dict(), key_prefix=Repository.KEY_JOB,
-                                  level=LEVEL, group=GROUP, produced_data=produced or None,
-                                  precondition=self._ours):
-                self.stats["persist_refused"] += 1
-            else:
-                self.stats["completed"] += 1
+            outcome = run_job(self.repo, job, self.agent.agent_id, self.executed_jobs)
+            self.stats["claim_refused" if outcome is None else
+                       "completed" if outcome else "persist_refused"] += 1
         finally:
             self.agent.release(caps)
             with self._lock:
@@ -391,7 +365,11 @@ class SparrowWorker:
         """Stop taking work; with *wait*, let running jobs finish and persist first."""
         self.pool.shutdown(wait=wait, cancel_futures=not wait)
 
-    def write_stats(self) -> None:
+    def write_stats(self, final: bool = False) -> None:
+        """Periodic snapshots carry ``final: false``; the one written after the worker stopped
+        and its jobs finished carries ``final: true`` and is the only one a run may treat as
+        the worker's report (`baselines.common.final_reports`)."""
         payload = dict(self.stats)
         payload["executed_jobs"] = list(self.executed_jobs)
+        payload["final"] = bool(final)
         self.redis.set(self.keys.stats("worker", self.agent.agent_id), json.dumps(payload))
