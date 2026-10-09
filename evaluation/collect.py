@@ -496,6 +496,10 @@ def execution_evidence(agents: dict[str, dict]) -> dict[str, Any]:
     refused = [int(p.get("duplicate_leader_refusals") or 0) for p in agents.values()
                if isinstance(p, dict) and "duplicate_leader_refusals" in p]
     extra = {"duplicate_leader_refusals": sum(refused)} if refused else {}
+    lost = [int(p.get("lost_leader_races") or 0) for p in agents.values()
+            if isinstance(p, dict) and "lost_leader_races" in p]
+    if lost:
+        extra["lost_leader_races"] = sum(lost)
     return {
         **extra,
         "jobs_executed": len(counts),

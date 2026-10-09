@@ -3236,6 +3236,9 @@ class ResourceAgent(Agent):
             # Leader elections refused because the job was already decided here — each one a
             # double execution prevented (see _HostAdapter.on_leader_elected).
             "duplicate_leader_refusals": int(getattr(self, "duplicate_leader_refusals", 0)),
+            # Elections this agent won that the job record had already given to another agent
+            # (select_job's precondition) — each one a double execution prevented. PBFT only.
+            "lost_leader_races": int(getattr(self, "lost_leader_races", 0)),
             "refusal_retries": int(getattr(self.metrics, 'refusal_retries', 0)),
             # When THIS agent's failure-simulation clock started. Failure phases are resolved
             # against it per agent, and a 30-host remote launch spreads starts over a minute,
@@ -3832,6 +3835,24 @@ class ResourceAgent(Agent):
         self._update_completed_jobs(jobs=[job.job_id])
         self.executor.submit(self.execute_job, job)
 
+    #: States in which a job record names the agent that won its election at this tier.
+    _DECIDED_STATES = frozenset({ObjectState.READY, ObjectState.RUNNING,
+                                 ObjectState.COMPLETE, ObjectState.FAILED})
+
+    def _decided_by_other(self, record: Optional[dict]) -> bool:
+        """Does this persisted job *record* show the job decided under another agent?
+        Absent or unreadable fields mean no: refusing on a guess would strand the job."""
+        if not record:
+            return False
+        raw, leader = record.get("state"), record.get("leader_id")
+        if raw is None or leader is None or str(leader) == str(self.agent_id):
+            return False
+        try:
+            state = ObjectState(raw) if isinstance(raw, int) else ObjectState[str(raw)]
+        except (KeyError, ValueError):
+            return False
+        return state in self._DECIDED_STATES
+
     def select_job(self, job: Job):
         print(f"[SELECTED]: {job.job_id} on agent: {self.agent_id}")
         self.logger.info(f"[SELECTED]: {job.job_id} on agent: {self.agent_id} to Select Queue")
@@ -3843,9 +3864,40 @@ class ResourceAgent(Agent):
         # record means a coordinator WITHDREW this copy (a delegated job pulled back, or handed
         # to another group). An unconditional save re-created it and this group ran a job the
         # coordinator had already given elsewhere (code review 2026-10-05 §15).
+        #
+        # precondition: the record must not already show ANOTHER agent as the decided leader.
+        # PBFT can finalize one job twice in one tier — a voter that committed to one proposal
+        # switches to a cheaper one and commits again, and its first COMMIT stays counted, so
+        # a proposer whose inbox is ~20 s behind (inbound_q ~2000 at a Hier-90 coordinator)
+        # reaches quorum on its own proposal after a peer has already won. Each winner then
+        # delegated to its own group and the job ran twice: 8 of 12,000 jobs in the first
+        # E0 cells, 2026-10-09. The engine is unchanged; this makes the persisted record the
+        # tie-breaker under one WATCH, so whichever winner writes second steps aside. Snow's
+        # Redis claim already gives this, so it never trips there.
+        seen = {}
+
+        def not_decided_elsewhere(cur) -> bool:
+            seen["record"] = cur
+            return not self._decided_by_other(cur)
+
         if self.repository.save(obj=job.to_dict(), key_prefix=Repository.KEY_JOB,
                                 level=self.topology.level, group=self.topology.group,
-                                require_existing=True) is False:
+                                require_existing=True,
+                                precondition=not_decided_elsewhere) is False:
+            record = seen.get("record")
+            if self._decided_by_other(record):
+                winner = record.get("leader_id")
+                self.logger.warning(f"[LEADER_LOST] {job.job_id} is already {record.get('state')} "
+                                    f"under agent {winner}; not selecting it here")
+                self.lost_leader_races = getattr(self, "lost_leader_races", 0) + 1
+                # A participant now: the decision stands (stragglers stay skipped), the
+                # assignee is the agent the record names.
+                try:
+                    self.job_assignments.set(job.job_id, int(winner))
+                except (TypeError, ValueError):
+                    self.job_assignments.remove(job.job_id)
+                self.queues.pending_queue.remove(job.job_id)
+                return
             self.logger.info(f"[SELECTED] {job.job_id} was withdrawn before it could be "
                              f"selected here; dropping it")
             self.job_assignments.remove(job.job_id)
