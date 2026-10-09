@@ -1,0 +1,608 @@
+# Snow x bandit arm (E1'): mab.enabled: true, mab.algorithm: linucb, nothing else changed (protocol snow as shipped).
+# Generated 2026-10-08 from config_swarm_multi.yml; regenerate the same way if the base moves.
+redis:
+  host: database 
+  port: 6379
+queue:
+  type: simple
+  host: 127.0.0.1
+  port: 8098
+capacities:
+  cpu: 2
+  core: 8
+  gpu: 8
+  ram: 32
+  disk: 100
+  bw: 0
+  burst_size: 0
+  unit: 0
+  mtu: 0
+topology:
+  children: null
+  level: 0
+  group: 0
+  group_size: 0
+  group_count: 0
+  parent: null
+  peer_agents:
+    - 1
+    - 2
+  type: mesh
+grpc:
+  port: 20000 
+  host: "0.0.0.0"
+dtns:
+  - name: dtn1
+    ip: "192.168.1.10"
+    user: "dtn_user"
+    connectivity_score: 0.95
+  - name: dtn2
+    ip: "192.168.1.11"
+    user: "dtn_user2"
+    connectivity_score: 0.87
+runtime:
+  projected_queue_threshold: 300.00
+  ready_queue_threshold: 100.00
+  max_time_load_zero: 300
+  restart_job_selection: 30
+  # Staleness filter for peers read from Redis; NOT the failure detector (heartbeat and SWIM
+  # are authoritative for that). Since 2026-09-20 it also evicts an entry ALREADY in the map
+  # whose record has stopped moving — a child group used to survive its own death until the
+  # agent key's TTL (2x this value) expired. On the agent's own tier the eviction threshold is
+  # floored at failure_threshold_seconds, because _detect_failed_agents owns that map and is
+  # what reassigns a dead peer's jobs; keep this above that key. This key was defined twice in
+  # this block — 300 here and 45 eight lines down — so YAML kept 45 and every run of the
+  # campaign used a value the file and CLAUDE.md both denied, which is exactly the inverted
+  # order that floor now guards. Duplicate keys raise (swarm/utils/yaml_strict.py).
+  peer_expiry_seconds: 300
+  empty_timeout_seconds: 300
+  reselection_timeout_s: 300          # also the code default when the key is absent (was 60 until 2026-10-06)
+  results_dir: swarm-multi
+  shutdown_mode: manual
+  total_agents: 5                     # placeholder; generate_configs.py overwrites per fleet
+
+  # Job execution simulation. The simulated sleep is
+  #   clamp(wall_time * wall_time_scale, wall_time_min_s, wall_time_max_s).
+  # `execute()` used to sleep a flat 1s for every job, with the real sleep commented out, so
+  # every job took the same time no matter its duration and makespan / throughput /
+  # utilisation measured nothing. The Pegasus traces carry true wall times (p50 ~2s, p90 ~11s,
+  # p99 ~40s, max ~33min over the 25k-job base set), so scale 1.0 replays them faithfully and
+  # the 120s cap bounds the ~1% tail that would otherwise dominate a run's makespan — state
+  # the cap wherever makespan is reported.
+  # wall_time_scale: 0.0 restores the legacy flat 1s; a run using it must not report makespan.
+  wall_time_scale: 1.0
+  wall_time_min_s: 0.0
+  wall_time_max_s: 120.0
+
+  # Real execution. Default `simulate` = sleep for the (scaled) wall_time, which is what every
+  # measurement so far used. `real` = run the job's executable in its container, so exit
+  # statuses are the processes' own and durations are real work. The two produce results that
+  # cannot be compared; an unknown value raises rather than defaulting, and `real` is logged at
+  # WARNING, because a run meant to be simulated that quietly executed would be hard to spot
+  # from the metrics afterwards.
+  #
+  # Only jobs carrying an `execution` block (converted from a Pegasus workflow — see
+  # swarm/models/execution.py) ever execute; a synthetic job in a `real` run still simulates,
+  # so a workflow and a background load can share one run.
+  #
+  # A refusal (no container runtime, unresolvable executable, no work_dir) FAILS the job and
+  # logs at ERROR. It deliberately does not fall back to the sleep: a run silently mixing
+  # executed and simulated jobs, with nothing in the results telling them apart, is worse than
+  # one that stops.
+  execution:
+    mode: simulate                # simulate | real
+    # How many times a job refused for a TRANSIENT reason (an input's producer or staging site
+    # unreachable, a fetch past its deadline, a registry lookup failure) is returned to the
+    # pool before the refusal is recorded as its outcome. Configuration refusals (unrunnable
+    # spec, no runtime, missing executable or root input) are never retried.
+    refusal_retries: 3
+    # Shared scratch directory; the run id is appended, and every job of a run executes with
+    # this as its cwd. It must be SHARED, not per-job: data_in/data_out carry bare logical
+    # file names, so job B finds job A's output only if both ran in the same directory.
+    # On the slice this is the NFS export from setup_nfs_workflow.sh.
+    work_dir: /export/swarm-wf/work
+    timeout_s: 3600.0             # per job; on expiry the whole process group is killed
+    container_runtime: auto       # auto | docker | apptainer | singularity | none
+    capture_output: true          # stdout/stderr to <work_dir>/.swarm-logs/<job>.{out,err}
+    # A catalog's pfn is a path on the Pegasus SUBMIT host, which does not exist on this
+    # fleet. Map prefixes onto wherever the code was actually staged. An explicit prefix map,
+    # not a basename search: two workflows can both have a `process.py`, and running the wrong
+    # one would succeed and produce plausible output.
+    path_rewrites: []
+    #   - from: /home/ubuntu/soilmoisture-workflow
+    #     to:   /export/swarm-wf/soilmoisture
+    # Where the three kinds of thing a job needs live, for jobs that name them RELATIVELY.
+    # These map onto fields that already exist rather than adding new ones:
+    #   code   <- execution.pfn        (the executable)
+    #   inputs <- the job's data_in    (the files it reads; staged into work_dir before it runs)
+    #   images <- execution.container.image
+    # An ABSOLUTE path is used as written, so a Pegasus-derived job keeps resolving through
+    # path_rewrites exactly as before; roots are how a hand-authored job says "bin/analyze.py".
+    # A relative path with no root configured is a refusal naming the missing key, never a
+    # guess at a base directory.
+    roots: {}
+    #   code:   /export/swarm-wf/workflows/soilmoisture-workflow
+    #   inputs: /export/swarm-wf/inputs
+    #   images: /root/wf-images
+    # A converted-jobs directory from pegasus_to_swarm_converter.py is SELF-CONTAINED: it
+    # carries the executables in code/ and the root inputs in inputs/, so pointing at it
+    # sets all three roots at once. Copy the directory anywhere and the jobs run.
+    # Explicit `roots` entries above still win — images are normally not bundled (they are
+    # gigabytes), so `bundle` plus `roots.images` is the expected pairing, not an exception.
+    bundle: ""
+    #   bundle: /export/swarm-wf/converted_jobs
+    # Substitute an image by container NAME. The catalogs here declare singularity .sif images
+    # while the agent VMs have only Docker; which image stands in for which is a deployment
+    # decision with real consequences for what is measured, so it is stated here and never
+    # inferred from whatever the host happens to have installed.
+    image_overrides: {}
+    # ---- Data staging: move a workflow's files between agents -------------------------
+    # OFF by default, and off is the behaviour every measurement so far used: an input is
+    # resolved in the working directory or under `roots.inputs`, which on the slice is one
+    # NFS export mounted at the same path everywhere. That works, but it makes every agent
+    # equidistant from every file — exactly the variable the DTN penalties price — so no
+    # data-movement number can come from it.
+    #
+    # ON: a job's outputs stay on the agent that produced them, the location registry says
+    # which agent that is, and a consumer elsewhere fetches them over a SECOND gRPC port on
+    # the same host consensus uses (`grpc.port + port_offset`). Same host, so transfers
+    # traverse the same measured data-plane paths; separate port, so a multi-megabyte
+    # transfer never queues behind — or ahead of — the consensus messages whose latency the
+    # evaluation measures.
+    #
+    # With staging on the work_dir above must be LOCAL to each agent. A shared one makes
+    # every fetch a no-op and measures nothing.
+    #
+    # NOT YET BUILT, and it decides whether a cell is valid (docs/STAGING_DESIGN.md §6):
+    # a dead producer's outputs are gone, its job is COMPLETE so nothing re-runs it, and
+    # every descendant is released and then refuses to stage. **Do not enable this on a
+    # failure-injection cell** until that is resolved.
+    staging:
+      enabled: false
+      port_offset: 1000         # data port = grpc.port + this
+      chunk_bytes: 1048576      # 1 MiB
+      timeout_s: 300.0          # per fetch
+      verify: true              # digest the stream, check it at the receiver
+      # ---- Stage-out: the durability half -------------------------------------------
+      # Peer-to-peer fetch alone is fast and NOT durable. A dead producer's outputs are
+      # gone, its job is COMPLETE so nothing re-runs it, and every descendant is released
+      # and then refuses. Pushing each output to a staging site as it is produced removes
+      # that, without the cascading re-runs that re-running the producer would cause --
+      # its own inputs may be gone too. It is also what Pegasus itself does.
+      #
+      # The push happens BEFORE the name is published, so a name is never visible without
+      # a durable copy behind it. That puts an upload on the critical path of every DAG
+      # edge, which lands on makespan: `[STAGE_OUT]` logs the bytes and seconds per file
+      # so the cost is a measured number rather than an assumption.
+      #
+      # A consumer tries the producer FIRST and the store only if that fails, so the
+      # common case stays one hop. Empty store_host leaves stage-out off (peer-only).
+      # Start the site with:  python3 staging_site.py --store-dir <dir> --port 21000
+      store_host: ""            # e.g. "database"; empty = no stage-out, not durable
+      store_port: 21000
+      store_timeout_s: 120.0    # per push; a failure costs durability, not the job
+    #   soilmoisture_container: swarm/soilmoisture:1.0
+  # How long past delegation_timeout_s a coordinator keeps waiting for a job its children have
+  # already scheduled (persisted RUNNING) to finish before dropping it from delegation tracking
+  # without a bandit outcome. Default (key absent) = wall_time_max_s, or 1800 if that is 0.
+  # Since P0-9 a leaf persists RUNNING for the whole simulated wall time and COMPLETE only with
+  # the real exit_status, so the bandit's reward arrives when the job finishes, not when it is
+  # scheduled. Set this only to make the monitor give up sooner than the execution cap.
+  # delegation_exec_grace_s: 120.0
+
+  # Teardown's budget for jobs still executing when the agent is asked to stop. Metrics are
+  # saved BEFORE this drain, so the only thing a short value costs is the last few job
+  # completions in the final payload — which is why it does not scale with wall_time_max_s.
+  # It used to be an unbounded `executor.shutdown(wait=True)` ahead of the metrics save, so an
+  # agent holding a 120s job wrote its metrics long after the runner had read Redis and plotted:
+  # both smoke-g2-* runs reported a single agent out of thirty.
+  shutdown_drain_timeout_s: 20.0
+  jobs_per_proposal: 20
+  executor_workers: 10
+  failure_threshold_seconds: 60        # Time before declaring agent as failed
+  # How long selection waits at startup for the whole group to register before starting with
+  # whoever is there. Defaults to failure_threshold_seconds (one judgement for "this peer is not
+  # coming"). Unbounded before 2026-09-20: one agent that never registered idled its whole group.
+  # selection_barrier_s: 60
+  max_failed_agents: 0                 # Maximum tolerable failures (0 = unlimited)
+  job_reassignment_enabled: true       # Enable automatic job reassignment
+  # OFF (2026-10-06, code review 2026-10-05 §4). On, ONE health probe past its 0.7 s deadline
+  # fails a live peer and reassigns its READY/RUNNING jobs while it is still running them, so
+  # they execute twice. On a 17-site WAN slice a 700 ms stall is routine. Heartbeat (Redis
+  # staleness, failure_threshold_seconds) is the failure detector; this was a second one with
+  # a hair trigger. Matches the code default.
+  aggressive_failure_detection: false
+  enable_agent_recovery: true        # Readmit a failed agent once it writes a fresh heartbeat
+  max_infeasible_retries: 10         # Retire infeasible jobs after N attempts (0 = infinite)
+  max_delegation_attempts: 3         # Mark job infeasible after N failed delegation timeouts
+  #neighbor_refresh_full_s: 5        # Full Redis neighbor-refresh cadence. Default: per-tick
+                                     # without gossip; 5s with gossip enabled (peer `load` then
+                                     # arrives via the epidemic cache every tick instead)
+
+# Consensus protocol — Phase 3/4 of the gossip-consensus migration.
+#   pbft   : PBFT-like 3-phase engine everywhere (best <50 agents / small groups).
+#   snow   : Snow/Avalanche engine everywhere (k-peer sampling + Redis SET-NX finalization;
+#            livelock-free at flat scale; benefits from gossip + SWIM). Default in this file,
+#            tuned below for a 20-agent flat mesh.
+#   hybrid : Phase 4 — engine chosen per topology level (see `hybrid` below). PBFT within small
+#            level-0 worker groups (low latency) + Snow across the large coordinator tier
+#            (removes the O(g^2) wall). Consensus only flows among same-level peers, so each
+#            level runs a single engine type.
+consensus:
+  protocol: snow            # pbft | snow (default here) | hybrid
+  hybrid:
+    level0: pbft            # engine for level-0 worker groups (small, <=10 agents)
+    coordinator: snow       # engine for level >= 1 coordinator tiers (large pools)
+  # Snow parameters tuned for a 20-agent FLAT MESH (n=20, every agent a peer).
+  # For larger pools (>=100 agents) move back toward k=15-20 / beta=15-20; for a
+  # small hybrid coordinator tier (~10 agents) k=8 / beta=6 is a good starting point.
+  snow:
+    k: 10                    # Peers sampled per query round. Half the 20-agent pool: keeps
+                             # sampling genuinely sub-linear (k=20 would query every peer
+                             # each round, degenerating into a broadcast) while still giving
+                             # a solid majority sample. The engine caps k to live peers, so
+                             # this stays correct if agents fail or join.
+    alpha: 0.7               # Supermajority threshold within the sample -> 7 of 10 must agree.
+                             # Threshold is computed against the peers actually sampled, so
+                             # a shrunken pool can still commit.
+    beta: 6                  # Consecutive winning rounds required to commit. 20 is the
+                             # Avalanche large-scale default; at n=20 the candidate set is
+                             # tiny and converges in a few rounds, so beta=6 commits with the
+                             # same outcome at ~3x lower decision latency (validated at
+                             # Hier-60 level-1: beta=6 -> 0.96s selection). Safety margin is
+                             # still (1-alpha)^beta ~ 7e-4 per decision, and the Redis SET-NX
+                             # claim in repository.try_claim_assignment is the hard
+                             # exactly-once backstop.
+    max_rounds: 100          # Abandon Snow attempt after this many rounds
+    round_timeout_ms: 300    # Per-round response timeout (upper bound; a round ends as soon
+                             # as all k queried peers respond — see gossip_engine). 20 agents
+                             # on one LAN/site respond well inside 300ms, so the lower bound
+                             # only matters when a peer is already dead.
+    tick_interval_ms: 50     # Driver-thread polling interval
+    local_sample_frac: 1.0   # Fraction of each k-sample drawn from same-site peers (1.0 = uniform;
+                             # <1.0 enables topology-aware sampling when agents have a `site`).
+                             # Keep 1.0 for a single-site 20-agent mesh.
+    send_workers: 16         # Thread-pool size for non-blocking best-effort query sends.
+                             # Peak demand is max_inflight * k = 160 sends/tick; 16 workers
+                             # drain that comfortably at this scale.
+    send_timeout_ms: 300     # Per-send timeout for Snow queries/responses (no retries; a dropped
+                             # query just means that peer abstains this round)
+    max_inflight: 16         # Max decisions with an outstanding query round at once — bounds
+                             # send demand to what the pool can drain (prevents congestion
+                             # collapse under delegation bursts)
+
+# Failure detection — Phase 1 of the gossip-consensus migration (see
+# docs/GOSSIP_CONSENSUS_DESIGN.md). With `protocol: swim`, the SWIM membership
+# layer runs alongside the heartbeat mechanism; heartbeats remain authoritative
+# for job reassignment in this phase.
+failure_detection:
+  protocol: swim            # heartbeat | swim (enabled here to keep Snow's live-peer
+                            # sample fresh; heartbeat still drives job reassignment)
+  swim:
+    period_ms: 1000          # Protocol round period
+    probe_timeout_ms: 1000   # Direct ping timeout before falling back to ping-req.
+                             # WAN + inbound-queue lag under consensus bursts make a
+                             # LAN-tuned 300ms window false-fail healthy peers.
+    k_req: 3                 # Indirect probe fanout
+    suspect_timeout_s: 60    # Suspect -> failed transition. LLM agents block on local
+                             # inference for ~10s per bid (worst case ~19s observed), which
+                             # sat right at the previous 20s window and false-failed healthy
+                             # peers. Raise above worst-case bid latency; real failures then
+                             # take proportionally longer to detect.
+
+# Gossip state dissemination (Phase 2). When enabled, agents push their
+# versioned utilization/load state to `fanout` random peers every round.
+# Independent of SWIM.
+gossip:
+  enabled: true            # Peer load/utilization reaches Snow cost estimates via the
+                           # epidemic cache instead of a per-tick Redis neighbor refresh
+  fanout: 3                # 3 pushes/round covers a 20-agent pool in ~3 rounds
+  period_ms: 1000
+  state_ttl_s: 30
+
+# Run instrumentation (P0-4). Everything here is on by default and costs a few counters per
+# message and one dict per delegation; the only thing that is off is the Prometheus export,
+# because it needs a path that exists on the agent host.
+instrumentation:
+  # Per-decision delegation rows kept in memory and written to metrics.json. The bound is a
+  # ring: when it binds the OLDEST rows go, because a delegation run's interesting regime is
+  # the converged one. At ~1 row per delegated job this does not bind below ~20k jobs.
+  decision_log_max: 20000
+
+  # node_exporter textfile collector directory, e.g. /var/lib/node_exporter/textfile_collector.
+  # Unset (the default) disables the export entirely; metrics.json is unaffected either way.
+  # Each agent writes swarm_agent_<id>.prom there, atomically.
+  textfile_dir:
+  textfile_period_s: 15     # node_exporter scrapes at 15s; writing per 0.5s tick buys nothing
+
+logging:
+  ## The directory in which actor should create log files.
+  ## This directory will be automatically created if it does not exist.
+  log-directory: swarm-multi
+
+  ## The filename to be used for actor's log file.
+  log-file: agent
+
+  ## The default log level for actor.
+  log-level: INFO 
+
+  ## actor rotates log files. You may specify how many archived log files to keep here.
+  log-retain: 5
+
+  ## actor rotates log files after they exceed a certain size.
+  ## You may specify the file size that results in a log file being rotated here.
+  log-size: 5000000
+
+  logger: agent
+job_selection:
+  cost_weights:
+    cpu: 0.4       # Relative importance of CPU utilization in job cost (0–1, sum of all weights should ≈ 1.0)
+    ram: 0.3       # Relative importance of RAM utilization in job cost (0–1)
+    disk: 0.2      # Relative importance of Disk utilization in job cost (0–1)
+    gpu: 0.1       # Relative importance of GPU utilization in job cost (0–1)
+    qpu: 0.0       # Relative importance of QPU (qubit) utilization (0–1); set >0 when quantum backends are deployed
+                   # (weights are re-normalized per job type, so enabling qpu does not require re-tuning the others)
+
+  long_job_threshold: 20.0            # Execution time (in seconds) beyond which jobs incur extra penalty
+  connectivity_penalty_factor: 1.0    # Multiplier for DTN connectivity penalty (0=no effect, >1 increases penalty severity)
+  quantum_penalty_factor: 1.0         # Multiplier for quantum backend quality penalty (error rate + calibration downtime)
+  # selection_threshold_pct was REMOVED on 2026-09-20 (code review §7). It was documented here,
+  # in both CLAUDE.md files and in the README as the candidate-pool control, and it never did
+  # anything: the value was tested against the column best that had just been selected, so the
+  # comparison asked whether best > best. An agent whose config still sets it logs a [CONFIG]
+  # warning and ignores it. There is no replacement: a rule-based agent proposes exactly when it
+  # computes itself the cheapest assignee, and nothing widens or narrows that. designate_bidder
+  # below narrows bidders per job and is measured (bidders_per_job / designate_forced_share),
+  # but it is read only by LlmAgent — on a resource agent it is a no-op too.
+
+  # Which assignees a hierarchical coordinator (level > 0) scores a job against. Leaf agents
+  # (level 0) are unaffected by this key.
+  #
+  # self  = this agent only (shipped, and the behaviour behind every hierarchical number
+  #         measured so far). Every coordinator that holds the job proposes ITSELF for it, so
+  #         the coordinator tier runs one consensus decision per coordinator per job. That is
+  #         a second explanation for the Hier-250 PBFT collapse besides PBFT's own O(n^2), and
+  #         the two are only separable from proposers_per_job_l1 (see evaluation/collect.py).
+  # peers = the coordinator peers in neighbor_map, exactly as level 0 works, so one proposal
+  #         per job at the tier. The inputs for it already exist: a parent publishes its
+  #         SUBTREE's aggregate capacities/allocations/load in its AgentInfo, and
+  #         is_job_feasible prices a peer parent off max_child_capacity — an optimistic
+  #         estimate whose failure mode (delegation timeout, job returns to the tier) is
+  #         documented in is_job_feasible and becomes load-bearing under this setting.
+  #
+  # Treat `peers` as an experiment arm, not a fix: it changes placement at the coordinator
+  # tier, so no hierarchical figure may mix the two. An unknown value raises.
+  coordinator_cost_matrix: self
+
+
+  # Designated-bidder mode (LLM agents only). Default false = every agent bids on every job it
+  # can run, which is what the campaign measured: ~3.7 distinct agents pay a full LLM bid per
+  # job placed once, and throughput is flat in fleet size (test plan 4.0b).
+  #
+  # true = each agent first runs the CHEAP analytic cost model over all live peers to work out
+  # who should bid, and only the designated agent spends an LLM call. Analytic cost and
+  # feasibility are peer-computable, so no coordination is needed; peer LLM cost is not
+  # (finding 11), which is why this uses the analytic model and not the LLM one.
+  #
+  # Turn this on only for a throughput experiment, and re-measure capture and fairness (4d)
+  # alongside: it changes HOW MANY agents compete for each job, so those figures are no longer
+  # comparable with the rest of the campaign. It also further reduces the LLM's influence on
+  # placement, since a designated bidder faces no competing proposal.
+  designate_bidder: false
+  # Liveness deadline: a non-designated agent bids anyway once a job has gone unclaimed for this
+  # long, so a job whose designee never bids degrades to the default behaviour instead of
+  # stalling. This is a deadline rather than a retry count on purpose — the designated agent needs
+  # one LLM bid (4-7 s measured) plus consensus (~1 s) before it can claim anything, and a
+  # counter of a few loop iterations (~1.5 s) would fire first on every job, restoring full
+  # redundancy while adding delay. Keep it several times bid-plus-consensus.
+  designate_bidder_fallback_s: 30.0
+  #
+  # Whether it is working is measurable and must be checked, not assumed. Every agent reports
+  # the distinct jobs it paid an LLM bid for; `evaluation/collect.py` turns the fleet sum over
+  # the run's jobs into `bidders_per_job` — the ~3.7 this mode exists to cut to ~1 — and reports
+  # `designate_forced_share` beside it. That second number is the one to read first: if the
+  # liveness deadline above is firing on most jobs, every agent bids anyway, bidders_per_job
+  # returns to its undesignated value, and nothing else in the run looks any different.
+
+# Quantum runtime (Phase 2: data-triggered split hybrid scheduling).
+# Applies to all agents; inert unless split hybrid jobs / post-processing
+# jobs exist in the pool. See docs/QUANTUM_HYBRID_DESIGN.md.
+quantum:
+  comm_penalty_factor: 1.0    # Cross-site penalty for stream consumers (0 = ignore locality)
+  consumer_timeout_s: 60.0    # Consumer fails if the measurement stream stalls this long
+  predicate_cache_s: 1.0      # Snapshot-count cache TTL for data-predicate gating
+  measurement_ttl_s: 3600     # Redis TTL for measurement streams
+
+# Quantum backend owned by this agent (omit for classical-only agents).
+# Qubit count is mirrored into capacities.qubits for allocation arithmetic;
+# quality attributes are used for feasibility (arch/fidelity/gate set) and
+# cost penalties (error rate, calibration downtime). See docs/QUANTUM_HYBRID_DESIGN.md.
+#quantum_backend:
+#  name: aer-sim-64
+#  arch: superconducting        # superconducting | ion-trap | neutral-atom | photonic
+#  qubits: 64
+#  clops: 100000                # circuit layer operations per second
+#  gate_fidelity: 0.999
+#  error_rate: 0.001
+#  calibration_downtime_pct: 0.0
+#  simulator: true
+# Who decides which child group a coordinator hands a job to (P0-1). Feasibility, the DTN
+# check and the liveness gate run first; this picks among what survives.
+#   bandit  - the bandit if mab.enabled, else every capable group. The pre-existing behaviour
+#             and the measured baseline, so it is the default.
+#   llm     - the model ranks the capable groups from their live state (capacity headroom,
+#             inflight, recent failure/timeout rates) and the top `top_k` are used. Any
+#             failure - provider error, `llm.timeout_seconds` breach, an answer naming no
+#             group we offered - falls back to `bandit` for that job, AT THE SAME top_k: a
+#             fallback must not change the fan-out, or failing is rewarded with the subtree.
+#             A single candidate, or a top_k that already covers every candidate, spends no
+#             inference: the ranking could not change the outcome. Decisions are audited to
+#             `llm_score:delegate:*`. Watch `fallbacks` and `filled` in the [STATS] line -
+#             a run dominated by either is not measuring the model.
+# REQUIRES a coordinator that ACTIVELY LEADS more than one child group - and the shipped
+# hierarchical topology cannot currently produce one. Each Level-1 coordinator is assigned
+# exactly one group (--co-parents defaults to 1), and --co-parents does NOT fix it: every group
+# is led by its lowest-ID live co-parent, so leadership concentrates instead of spreading.
+# Measured on Hier-30 (5 coordinators, all alive), groups actively led:
+#     K=1 -> [1,1,1,1,1]   K=2 -> [0,1,1,1,2]   K=5 -> [0,0,0,0,5]
+# With one candidate there is no routing decision: neither this nor the bandit ever chooses and
+# every delegation is recorded as `trivial`. Coordinators log `[DELEGATION] ... can never
+# choose` in that state. Use `generate_configs.py --groups-per-coordinator G` (forwarded by
+# run_test.py and batch_tests_v2.py) to give each coordinator G groups exclusively: at Hier-90
+# with G=3 that is 3 coordinators leading 3 groups each, all with a real choice.
+# The fan-out must also stay BELOW the number of groups a coordinator leads: at or above that
+# count every candidate is delegated to whatever the ranking says, so the policy is inert for a
+# second reason. The same warning covers it. Which key sets the fan-out depends on the policy -
+# `delegation.top_k` under `llm`, `mab.top_k` under `bandit` (which ignores `delegation.top_k`
+# entirely, and logs that it is doing so).
+# Note the call runs on the coordinator's scheduling thread, so every later job it holds
+# queues behind it; `llm.timeout_seconds` is the bound until P0-3 adds a cache and a budget.
+delegation:
+  policy: "bandit"                 # "bandit" (default) or "llm"
+  top_k: 0                         # Groups per job; 0 = follow mab.top_k (one default, one place)
+
+mab:
+  enabled: true                    # Enable Multi-Armed Bandit for hierarchical delegation
+  algorithm: "linucb"              # epsilon_greedy | ucb1 | linucb | lin_ts
+  epsilon: 0.1                     # Initial exploration rate (epsilon_greedy only)
+  epsilon_decay: 0.995             # Epsilon decay per update (epsilon_greedy only)
+  epsilon_min: 0.01                # Minimum epsilon floor, clamped to <= epsilon (epsilon_greedy only)
+  exploration_weight: 1.41         # UCB1 exploration weight (ucb1 only)
+  top_k: 1                         # Child groups per job — for the bandit AND for the no-bandit (random) path
+  step_size: null                  # Optional recency-weighted Q for epsilon_greedy/ucb1 (null = lifetime average)
+  linucb:                          # Contextual bandit settings (algorithm: "linucb" or "lin_ts")
+    alpha: 1.0                     # Exploration width (UCB bonus multiplier; linucb only)
+    discount: 0.995                # Forgetting factor gamma; 1.0 = standard LinUCB
+    ts_variance: 0.25              # Posterior-sampling variance (lin_ts only)
+  context:                         # Feature extraction (linucb/lin_ts) — changing these changes the schema version and resets persisted model state
+    job_types: []                  # One-hot vocabulary, e.g. ["compute", "transfer"]
+    max_group_size: 10             # Normalization caps
+    max_inflight: 32
+    max_dtns: 4
+    long_job_threshold: 20.0
+    failure_window: 20             # Sliding-window length for per-group/per-type failure rates (timeouts excluded)
+    timeout_decay_s: 120.0         # e-folding time of the per-group timeout signal (fades without new trials)
+    max_caps:
+      core: 16
+      ram: 64                      # G, matching Capacities units
+      disk: 500                    # G
+      gpu: 4
+  reward:
+    shaped: false                  # Latency-shaped rewards instead of binary +/-1
+    exit_failure: -0.5             # Reward for non-zero exit status (shaped mode)
+    timeout: -1.0                  # Reward for delegation timeout (shaped mode)
+    non_winner: null               # Reward for co-selected groups that didn't complete the job (null = no update)
+  persist_to_redis: false          # Persist bandit state to Redis
+  persist_interval_s: 30.0         # Seconds between Redis persistence writes
+  failure_simulation:
+    enabled: false                 # Enable simulated job failures for testing
+    failure_probability: 0.5       # Base failure probability (0.0–1.0)
+    per_agent_failure_rates: {}    # Per-agent overrides, e.g. {3: 0.5}
+    per_job_type_failure_rates: {} # Per-job-type overrides, e.g. {"compute": 0.2}
+llm:
+  enabled: true
+  provider: openai            # "openai" (FABRIC gateway), "ollama" (per-host), or "none"
+  # MUST be a model the provider's key can actually reach. On the FABRIC gateway the key is
+  # scoped to a list, and asking for anything else returns 403 on EVERY bid — which does not
+  # stop the run: it completes normally, every bid silently becomes an analytic fallback, and
+  # nothing but `llm_bid_failure_rate` says so. Measured 2026-09-14: 924/924 bids 403'd for
+  # `gpt-4o-mini` while the key allowed ['gpt-oss-20b', 'nemotron-nano-30b', 'qwen3.5-122b',
+  # 'minimax-m2.7'], and the run still completed 197/197 jobs. Check the gateway's list before
+  # a campaign cell, and check `llm_bid_failure_rate` after it.
+  model: "gpt-4o-mini"       # any text model that returns JSON the provider key can access
+  base_url: ""                # ollama only, e.g. "http://127.0.0.1:11434/v1"; OLLAMA_BASE_URL env overrides
+  temperature: 0.1
+  timeout_seconds: 6
+  use_for_selection: true     # use LLM to break ties across candidates
+  # Ablation for paper figure D. false = a failed LLM bid falls back to the analytic cost, which
+  # is what every campaign result was measured with. true = a failed bid means NO bid (infinite
+  # cost), so the agent drops out of the running for that job.
+  #
+  # Inert without a fault: the gateway arm's fault-free fallback rate is 0.0%, so there is nothing
+  # to disable unless something is breaking the LLM. The informative experiment is this flag
+  # combined with S05 — it converts graceful degradation into hard failure and so measures what the
+  # safety net is actually worth. See test plan 4e/4f.2/4.0c for why that question is open: the
+  # LLM's output has been shown to have little influence on placement, and this tests the
+  # complement.
+  disable_fallback: false
+
+  # How the LLM's verdict reaches consensus (chaos finding 11). An inbound Snow query is
+  # answered on the single consumer thread and must never block, so it cannot call the model;
+  # the agent answers from the last verdict it computed for that job instead. Without this the
+  # only non-blocking answer was the ANALYTIC cost, so an LLM agent priced a job with the model
+  # when proposing and analytically when voting, and the LLM's opinion never entered the protocol.
+  cost_cache_ttl_s: 300.0     # a verdict older than this is dropped rather than voted with
+  cost_cache_max: 8192        # bounded; oldest verdict evicted first
+  # What to answer with when there is no verdict for the job:
+  #   yield    — abstain (the engine yields to the initiator). Default: answering with a
+  #              different decision plane than the one we propose with is the bug above.
+  #   analytic — answer with the analytic cost, canonicalised as analytic. Ablation arm, so the
+  #              cost of abstaining can be measured rather than assumed.
+  snow_cost_fallback: yield
+
+  # Elicitation (P0-6). The measured problem with the LLM plane is that its output barely
+  # varies: 59% of qwen2.5:3b bids were the identical 75.00, and gpt-oss-20b put 92% of bids on
+  # two values. A 0-100 rating is answered in round steps, so most agents tie and the bid cannot
+  # order them — one reason inverting the model's reasoning changed no placements. A larger
+  # model made it worse, so the lever is how the bid is asked for, not which model answers.
+  # Both arms below default to the measured baseline; E4 crosses them.
+  score_scale: 100            # range the model is asked for; the cost is normalised to 0-100
+                              # either way. 1000 gives it room to discriminate.
+  tie_break_with_analytic: false   # when two bids give the same rating, order them by the
+                              # analytic cost. The rating is quantised to the grid above and the
+                              # term capped at half a grid step, so it can only separate agents
+                              # that rated the same and can never move one past a neighbouring
+                              # rating. Scores are floats, so the cap alone would not be enough.
+                              # Sub-grid precision is discarded on this branch; for finer
+                              # resolution raise score_scale.
+  tie_break_ref_cost: 11.85   # analytic cost at which that term is half its range; the measured
+                              # median over 400 Pegasus jobs x the 5 shipped flavours
+
+  # Bid pacing (P0-7). Placement is decided by WHEN an agent bids, not what it bids: slowing 15
+  # of 30 agents by +3s on a ~10s bid changed placement not at all (and no trend out to +60s),
+  # while taking the LLM away from 8 of 30 gave those agents 280 of 300 jobs — 38.5x the healthy
+  # rate — because a failed bid skips inference and returns in ~0s. The pathology is not that
+  # broken agents are fast, it is that the fallback path is orders of magnitude cheaper than the
+  # path it stands in for, so failing is rewarded with the work.
+  #   none            - what the campaign measured (default).
+  #   fallback_parity - hold a fallback bid until it has taken as long as a real one.
+  #   uniform         - hold EVERY bid to the same target, so arrival time carries no
+  #                     information about the agent. The direct test of race-to-propose: if
+  #                     placement still ignores cost with the race removed, the LLM's output is
+  #                     inert for reasons unrelated to timing.
+  # The wait tops a bid up to the target rather than adding to it, so a slow bid waits not at all.
+  bid_pacing: none
+  bid_pacing_target_s: 0.0    # 0 = derive from this agent's own observed bid latencies, which
+                              # self-calibrates across arms (gateway vs local Ollama) and models
+  bid_pacing_quantile: 0.5    # which quantile to pace to when deriving it. Use ~0.9 for
+                              # `uniform`, or half the fleet finishes early and keeps racing
+  bid_pacing_min_samples: 8   # successful bids needed before the derived target takes over;
+                              # a quantile over one or two samples is noise
+  bid_pacing_bootstrap_s: 0.0 # target used until then — and FOREVER on an agent whose LLM never
+                              # succeeds, which is precisely the population this feature exists
+                              # to slow down. Deriving only from successful bids would leave the
+                              # always-503 agents of S05 unpaced. 0 = use llm.timeout_seconds,
+                              # which (now that the timeout is enforced) is an upper bound on how
+                              # long a successful bid can take, so pacing to it guarantees a
+                              # fallback never arrives before a real bid could have
+  bid_pacing_max_s: 30.0      # ceiling on any single wait, so a slow outlier cannot stall the loop
+  prompts:
+    cost: |-
+      You are a distributed scheduler in a mesh topology with peer agents.
+      Score this job for THIS agent (higher = better fit, 0-{scale}).
+
+      Key factors to consider:
+      1. Resource headroom: Prefer agents with spare capacity
+      2. Current load: Avoid overloaded agents (check peer context)
+      3. DTN connectivity: Match job's data_in/data_out to agent's DTNs
+      4. Load balancing: Favor underutilized agents in the mesh
+      5. Execution time: Consider wall_time vs agent's current queue depth
+
+      When PEER CONTEXT is provided, use it to make load-aware decisions.
+      Compare this agent's load against peer loads to promote balanced distribution.
+
+      Use the FULL range and avoid round numbers: two agents that differ at all should get
+      different scores. A rating you would round to the nearest 5 is not discriminating.
+
+      Return JSON: {{"score": <0-{scale}>, "explanation": "<concise reason>"}}
+      Explanation should be max 1 sentence focusing on the key decision factor.
