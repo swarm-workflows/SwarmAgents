@@ -189,6 +189,15 @@ class GossipConsensusEngine:
         # appear, so it stays small; bounded anyway (oldest first) like `conflicts`.
         self._generation: "OrderedDict[str, int]" = OrderedDict()
         self._generation_max = 65536
+        # object_id -> RLock serializing a finalize (generation check, CAS, host callbacks) with
+        # a reset of the same job (forget_decision). Checking the generation and then acting
+        # leaves a window a reset can land in; holding one lock across both closes it. Lock
+        # order is always this one, then `_lock`. Re-entrant because a host callback may itself
+        # reset the job it was handed (select_job's withdrawn path). One per job a run sees —
+        # thousands, not a growth problem — and never evicted while a run is live, since
+        # evicting a held lock would hand the same job a second one.
+        self._object_locks: Dict[str, threading.RLock] = {}
+        self._object_locks_guard = threading.Lock()
 
         # ProposalContainer parity with PBFT engine — agent code reads/clears these.
         self.outgoing = ProposalContainer()
@@ -313,6 +322,13 @@ class GossipConsensusEngine:
     def on_prepare(self, msg) -> None: pass
     def on_commit(self, msg) -> None: pass
 
+    def _object_lock(self, object_id: str) -> threading.RLock:
+        with self._object_locks_guard:
+            lock = self._object_locks.get(object_id)
+            if lock is None:
+                lock = self._object_locks[object_id] = threading.RLock()
+            return lock
+
     def forget_decision(self, object_id: str) -> None:
         """The agent calls this when a job is up for election again (reselection timeout,
         reset evidence, a coordinator taking a job back, a withdrawn copy). Snow's decision
@@ -327,7 +343,9 @@ class GossipConsensusEngine:
         instances outnumbered decisions (3,976-4,316 vs 3,600 per Hier-90 Snow run). Not
         counted as abandoned: nothing was given up, the election it belonged to is over.
         """
-        with self._lock:
+        # Waits for a finalize of this job that is already past its generation check, so the
+        # reset is ordered strictly before or strictly after it — never inside it.
+        with self._object_lock(object_id), self._lock:
             # A new generation, so an instance of the old one that is NOT in `_states` any more
             # — finalized, its CAS and callbacks queued on the pool — is refused there too
             # (`_is_current`) rather than claiming or re-opening the election that just ended.
@@ -678,7 +696,10 @@ class GossipConsensusEngine:
 
     def _finalize_work(self, state: _SnowState, candidate: int, reason: str) -> None:
         try:
-            self._finalize_work_inner(state, candidate, reason)
+            # The whole decision — generation check, CAS, callbacks — under the job's lock, so a
+            # reset (forget_decision) cannot land between the check and what it guards.
+            with self._object_lock(state.proposal.object_id):
+                self._finalize_work_inner(state, candidate, reason)
         except Exception as exc:
             # Runs on pool workers whose Future nobody reads — never let an error vanish.
             # Counted as well as logged: `_finalize` has already marked the state finalized
@@ -768,10 +789,9 @@ class GossipConsensusEngine:
                 f"; reason={reason}")
             return
 
-        # Checked again after the CAS, which is a network round trip: a reset landing inside it
-        # must not be followed by a leader/participant callback for the old election. The claim
-        # the CAS may have written is not undone here — it names a live agent, and the new
-        # election's own CAS reads it back as its decision, so the job is still decided once.
+        # Re-checked before the callbacks. Under the job's lock a reset from another thread
+        # cannot land here; this catches a reset made on THIS thread by the CAS's host side
+        # (the lock is re-entrant), which must not be followed by a callback for the old election.
         if self._drop_obsolete(state, "callback"):
             return
 

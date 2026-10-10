@@ -158,3 +158,53 @@ def test_a_current_election_still_finalizes_normally():
     eng._finalize_work_inner(st, candidate=1, reason="beta")
     assert cas.get("job-1") == 1
     assert host.leader_events == ["job-1"]
+
+
+def test_a_reset_from_another_thread_waits_for_a_finalize_already_past_its_check():
+    """Check-then-act is not enough (stop-time review): a reset landing between the generation
+    check and the CAS let an obsolete election claim the job — in the take-back case for the
+    coordinator that had just barred itself, stranding it again. The finalize and the reset
+    now hold the same per-job lock, so the reset is ordered strictly after the decision."""
+    import threading
+    eng, host, _t, cas = _make_engine()
+    eng.propose([_prop(pid="old")])
+    st = eng._states["job-1"]
+    st.finalized = True
+    in_cas, release_cas, reset_done = threading.Event(), threading.Event(), threading.Event()
+    real_claim = host.try_claim_assignment
+
+    def slow_claim(oid, aid):
+        in_cas.set()
+        release_cas.wait(5)
+        return real_claim(oid, aid)
+
+    host.try_claim_assignment = slow_claim
+    worker = threading.Thread(target=eng._finalize_work, args=(st, 1, "beta"))
+    worker.start()
+    assert in_cas.wait(5)
+
+    def reset():
+        eng.forget_decision("job-1")
+        reset_done.set()
+
+    resetter = threading.Thread(target=reset)
+    resetter.start()
+    assert not reset_done.wait(0.2), "the reset must not land inside the finalize"
+    release_cas.set()
+    worker.join(5)
+    resetter.join(5)
+    assert reset_done.is_set()
+    # The decision completed before the reset: claimed and elected once, then the job was reset.
+    assert cas.get("job-1") == 1 and host.leader_events == ["job-1"]
+    assert eng._generation["job-1"] == 1
+
+
+def test_a_reset_that_wins_the_lock_first_leaves_the_finalize_nothing_to_do():
+    eng, host, _t, cas = _make_engine()
+    eng.propose([_prop(pid="old")])
+    st = eng._states["job-1"]
+    st.finalized = True
+    eng._states.pop("job-1")
+    eng.forget_decision("job-1")
+    eng._finalize_work(st, 1, "beta")
+    assert cas.get("job-1") is None and host.leader_events == []
