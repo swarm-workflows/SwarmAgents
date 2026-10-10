@@ -322,6 +322,14 @@ class GossipConsensusEngine:
     def on_prepare(self, msg) -> None: pass
     def on_commit(self, msg) -> None: pass
 
+    def election_lock(self, object_id: str) -> threading.RLock:
+        """The per-job lock a finalize holds from its generation check through its host
+        callbacks. The agent holds it across a whole reset — its own decision memory and local
+        winner as well as `forget_decision` — so a decision lands entirely before or entirely
+        after the reset; with only the engine half under it, a finalize's callbacks could
+        re-write the decision and winner the agent had just cleared (stop-time review)."""
+        return self._object_lock(object_id)
+
     def _object_lock(self, object_id: str) -> threading.RLock:
         with self._object_locks_guard:
             lock = self._object_locks.get(object_id)

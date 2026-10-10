@@ -19,6 +19,7 @@
 # SOFTWARE.
 #
 # Author: Komal Thareja(kthare10@renci.org)
+import contextlib
 import copy
 import math
 import os
@@ -1337,15 +1338,19 @@ class ResourceAgent(Agent):
             if diff > self.reselection_timeout_s:
                 self.logger.info(f"RESTART: Job: {job} reset to Pending")
                 print(f"RESTART: Job: {job} reset to Pending {self.reselection_timeout_s} seconds")
-                job.state = ObjectState.PENDING
-                self.engine.outgoing.remove_object(object_id=job.job_id)
-                self.engine.incoming.remove_object(object_id=job.job_id)
-                with self.completed_lock:
-                    self.completed_jobs_set.discard(job.job_id)
-                self._forget_decided(job.job_id)
-                job_id = job.job_id
-                self.metrics.restarts[job_id] = self.metrics.restarts.get(job_id, 0) + 1
-                self._persist_restart(job)
+                # One reset, under the election lock: a decision for the old election lands
+                # wholly before it (and the persisted write below sees its READY and stands
+                # down) or wholly after it (and is dropped as obsolete).
+                with self._election_lock(job.job_id):
+                    job.state = ObjectState.PENDING
+                    self.engine.outgoing.remove_object(object_id=job.job_id)
+                    self.engine.incoming.remove_object(object_id=job.job_id)
+                    with self.completed_lock:
+                        self.completed_jobs_set.discard(job.job_id)
+                    self._forget_decided(job.job_id)
+                    job_id = job.job_id
+                    self.metrics.restarts[job_id] = self.metrics.restarts.get(job_id, 0) + 1
+                    self._persist_restart(job)
 
                 # TODO restart selection for jobs which were assigned to neighbor which just went down
 
@@ -1701,32 +1706,34 @@ class ResourceAgent(Agent):
                 f"[REFUSAL] {job_id} refused again ({job.refusal_reason}); "
                 f"{job.refusal_retries} retries used, recording the refusal")
             return False
-        job.refusal_retries += 1
-        job.state = ObjectState.PENDING
-        job.leader_id = None
-        job.exit_status = None
-        try:
-            # Release the claim BEFORE the record says PENDING. The other order left a window
-            # in which a peer saw PENDING, re-elected the job, and its CAS still returned this
-            # agent — so every peer took the participant path and nobody ran it. Releasing
-            # first is safe: nobody elects a job whose record still reads COMPLETE.
-            self.repository.release_assignment(job_id, level=self.topology.level,
-                                               group=self.topology.group)
-            self.repository.save(obj=job.to_dict(), key_prefix=Repository.KEY_JOB,
-                                 level=self.topology.level, group=self.topology.group)
-        except Exception as e:
-            # Could not put it back: record the refusal instead (the completion write has its
-            # own retry queue), rather than leave a job nobody holds.
-            self.logger.error(f"[REFUSAL] could not return {job_id} to the pool ({e}); "
-                              f"recording the refusal")
-            job.refusal_retries -= 1
-            job.state = ObjectState.COMPLETE
-            job.exit_status = 1
-            return False
-        self.queues.ready_queue.remove(job_id)
-        with self.completed_lock:
-            self.completed_jobs_set.discard(job_id)
-        self._forget_decided(job_id)
+        # Release, re-record and forget as one reset under the job's election lock.
+        with self._election_lock(job_id):
+            job.refusal_retries += 1
+            job.state = ObjectState.PENDING
+            job.leader_id = None
+            job.exit_status = None
+            try:
+                # Release the claim BEFORE the record says PENDING. The other order left a window
+                # in which a peer saw PENDING, re-elected the job, and its CAS still returned this
+                # agent — so every peer took the participant path and nobody ran it. Releasing
+                # first is safe: nobody elects a job whose record still reads COMPLETE.
+                self.repository.release_assignment(job_id, level=self.topology.level,
+                                                   group=self.topology.group)
+                self.repository.save(obj=job.to_dict(), key_prefix=Repository.KEY_JOB,
+                                     level=self.topology.level, group=self.topology.group)
+            except Exception as e:
+                # Could not put it back: record the refusal instead (the completion write has its
+                # own retry queue), rather than leave a job nobody holds.
+                self.logger.error(f"[REFUSAL] could not return {job_id} to the pool ({e}); "
+                                  f"recording the refusal")
+                job.refusal_retries -= 1
+                job.state = ObjectState.COMPLETE
+                job.exit_status = 1
+                return False
+            self.queues.ready_queue.remove(job_id)
+            with self.completed_lock:
+                self.completed_jobs_set.discard(job_id)
+            self._forget_decided(job_id)
         self.metrics.refusal_retries += 1
         self.logger.warning(
             f"[REFUSAL] {job_id} refused for a transient reason ({job.refusal_reason}); "
@@ -1867,67 +1874,73 @@ class ResourceAgent(Agent):
                 }
                 return
 
-            # Reset job state to PENDING for parent level — and forget that it was decided, or
-            # the fresh election's messages are skipped as stragglers of the old one.
-            job_obj.state = ObjectState.PENDING
-            job_obj.delegated_groups = []
-            self._forget_decided(job_id)
-            # And release the exactly-once claim, which still names THIS coordinator. Under
-            # Snow every re-finalization otherwise returned this agent from the CAS — which has
-            # just barred itself via `delegation_failed_agents` and will never propose — so
-            # every peer took the participant path, nobody ran `select_job`, and under
-            # `coordinator_cost_matrix: self` the job was retired FAILED after
-            # `max_infeasible_retries`: a feasible job lost per delegation timeout (§14).
-            try:
-                self.repository.release_assignment(job_id, level=self.topology.level,
-                                                   group=self.topology.group)
-            except Exception as e:
-                self.logger.error(f"Could not release the assignment claim on {job_id}: {e}")
-
-            # Add back to parent's pending queue if not already there
-            if job_id not in self.queues.pending_queue:
-                self.queues.pending_queue.add(job_obj)
-                self.logger.info(
-                    f"Re-added delegated job {job_id} to parent queue "
-                    f"(was stuck at child level for {time_since_delegation:.1f}s)"
-                )
-            else:
-                # Update the existing job in the queue
-                existing_job = self.queues.pending_queue.get(job_id)
-                if existing_job:
-                    existing_job.delegation_failed = job_obj.delegation_failed
-                    existing_job.delegation_failed_count = job_obj.delegation_failed_count
-                    existing_job.add_delegation_failed_agents(self.agent_id)
-
-            # Remove from child level(s) in Redis to avoid duplicate processing
-            for child_group in child_groups:
+            # The whole take-back under the job's election lock: forget, release the claim, put
+            # the record back. A Snow decision for the old election either lands before it (and
+            # is undone by it) or after it (and is dropped as obsolete) — never between the
+            # release and the forget, where it would re-claim the job for this coordinator,
+            # which has just barred itself from it.
+            with self._election_lock(job_id):
+                # Reset job state to PENDING for parent level — and forget that it was decided, or
+                # the fresh election's messages are skipped as stragglers of the old one.
+                job_obj.state = ObjectState.PENDING
+                job_obj.delegated_groups = []
+                self._forget_decided(job_id)
+                # And release the exactly-once claim, which still names THIS coordinator. Under
+                # Snow every re-finalization otherwise returned this agent from the CAS — which has
+                # just barred itself via `delegation_failed_agents` and will never propose — so
+                # every peer took the participant path, nobody ran `select_job`, and under
+                # `coordinator_cost_matrix: self` the job was retired FAILED after
+                # `max_infeasible_retries`: a feasible job lost per delegation timeout (§14).
                 try:
-                    # Delete from child level
-                    self.repository.delete(
-                        obj_id=job_id,
-                        key_prefix=Repository.KEY_JOB,
-                        level=self.topology.level - 1,
-                        group=child_group
+                    self.repository.release_assignment(job_id, level=self.topology.level,
+                                                       group=self.topology.group)
+                except Exception as e:
+                    self.logger.error(f"Could not release the assignment claim on {job_id}: {e}")
+
+                # Add back to parent's pending queue if not already there
+                if job_id not in self.queues.pending_queue:
+                    self.queues.pending_queue.add(job_obj)
+                    self.logger.info(
+                        f"Re-added delegated job {job_id} to parent queue "
+                        f"(was stuck at child level for {time_since_delegation:.1f}s)"
                     )
-                    self.logger.debug(
-                        f"Removed job {job_id} from child level {self.topology.level - 1}, group {child_group}"
-                    )
+                else:
+                    # Update the existing job in the queue
+                    existing_job = self.queues.pending_queue.get(job_id)
+                    if existing_job:
+                        existing_job.delegation_failed = job_obj.delegation_failed
+                        existing_job.delegation_failed_count = job_obj.delegation_failed_count
+                        existing_job.add_delegation_failed_agents(self.agent_id)
+
+                # Remove from child level(s) in Redis to avoid duplicate processing
+                for child_group in child_groups:
+                    try:
+                        # Delete from child level
+                        self.repository.delete(
+                            obj_id=job_id,
+                            key_prefix=Repository.KEY_JOB,
+                            level=self.topology.level - 1,
+                            group=child_group
+                        )
+                        self.logger.debug(
+                            f"Removed job {job_id} from child level {self.topology.level - 1}, group {child_group}"
+                        )
+                    except Exception as e:
+                        self.logger.error(
+                            f"Error removing job {job_id} from child group {child_group}: {e}"
+                        )
+                # Add to redis for parent's level to be picked for consensus again
+                try:
+                    self.repository.save(obj=job_obj.to_dict(), key_prefix=Repository.KEY_JOB,
+                                         level=self.topology.level, group=self.topology.group)
                 except Exception as e:
                     self.logger.error(
-                        f"Error removing job {job_id} from child group {child_group}: {e}"
+                        f"Error adding job {job_id} to parent's group {self.topology.group} level: {self.topology.level}: {e}"
                     )
-            # Add to redis for parent's level to be picked for consensus again
-            try:
-                self.repository.save(obj=job_obj.to_dict(), key_prefix=Repository.KEY_JOB,
-                                     level=self.topology.level, group=self.topology.group)
-            except Exception as e:
-                self.logger.error(
-                    f"Error adding job {job_id} to parent's group {self.topology.group} level: {self.topology.level}: {e}"
-                )
-                traceback.format_exc()
+                    traceback.format_exc()
 
-            # Remove from delegated tracking
-            self.delegated_jobs.remove(job_id)
+                # Remove from delegated tracking
+                self.delegated_jobs.remove(job_id)
 
             self.metrics.delegation_reassignments[job_id] = {
                 'reassigned_at': time.time(),
@@ -3519,9 +3532,22 @@ class ResourceAgent(Agent):
             self._decided_jobs[job_id] = time.time()
             return True
 
+    def _election_lock(self, job_id: str):
+        """The engine's per-job election lock (Snow), or a no-op (PBFT, which finalizes on the
+        inbound thread under its own lock and queues no decision work). Held across a whole
+        reset so a Snow decision for the old election cannot land in the middle of one."""
+        lock_for = getattr(getattr(self, "engine", None), "election_lock", None)
+        lock = lock_for(job_id) if callable(lock_for) else None
+        return lock if lock is not None else contextlib.nullcontext()
+
     def _forget_decided(self, job_id: str) -> None:
         """The job is up for election again: drop the local decision memory here AND in the
-        engine, or its next election's messages are skipped as stragglers of the last one."""
+        engine, or its next election's messages are skipped as stragglers of the last one.
+        All of it under the job's election lock — see `_election_lock`."""
+        with self._election_lock(job_id):
+            self._forget_decided_locked(job_id)
+
+    def _forget_decided_locked(self, job_id: str) -> None:
         with self.completed_lock:
             self._decided_jobs.pop(job_id, None)
         # And the local winner. Snow peers answer "already decided for X" from this map
@@ -5052,45 +5078,47 @@ class ResourceAgent(Agent):
                     continue
                 job_obj.delegated_groups = []
 
-                # Release the exactly-once claim FIRST. Until it is gone a re-finalization
-                # returns the dead agent, so the job would be "reassigned" straight back to
-                # the corpse — the reason reassignment could not work under Snow at all.
-                # Only while it still names the dead agent: a live agent that re-won the job
-                # since this record was read holds a claim of its own, which must stay.
-                self.repository.release_assignment_if_held_by(
-                    job_id, failed_agent_id, level=level, group=group)
+                # Release, reset and forget as one reset under the job's election lock.
+                with self._election_lock(job_id):
+                    # Release the exactly-once claim FIRST. Until it is gone a re-finalization
+                    # returns the dead agent, so the job would be "reassigned" straight back to
+                    # the corpse — the reason reassignment could not work under Snow at all.
+                    # Only while it still names the dead agent: a live agent that re-won the job
+                    # since this record was read holds a claim of its own, which must stay.
+                    self.repository.release_assignment_if_held_by(
+                        job_id, failed_agent_id, level=level, group=group)
 
-                job_obj.state = ObjectState.PENDING
-                job_obj.leader_id = None
-                # The record was read before this write — by the retry sweep, up to a whole
-                # pass earlier — and an unconditional save would put PENDING over whatever
-                # landed in between: a peer's reset already re-won by a live agent, or a
-                # COMPLETE from a peer heartbeat had misjudged. The write is refused under
-                # the same WATCH unless the record still shows the state and leader read.
-                expect_state = old_state.value if hasattr(old_state, "value") else old_state
+                    job_obj.state = ObjectState.PENDING
+                    job_obj.leader_id = None
+                    # The record was read before this write — by the retry sweep, up to a whole
+                    # pass earlier — and an unconditional save would put PENDING over whatever
+                    # landed in between: a peer's reset already re-won by a live agent, or a
+                    # COMPLETE from a peer heartbeat had misjudged. The write is refused under
+                    # the same WATCH unless the record still shows the state and leader read.
+                    expect_state = old_state.value if hasattr(old_state, "value") else old_state
 
-                def _unchanged(cur, _s=expect_state, _l=int(failed_agent_id)):
-                    if not cur or cur.get("state") != _s or cur.get("leader_id") is None:
-                        return False
-                    try:
-                        return int(cur["leader_id"]) == _l
-                    except (TypeError, ValueError):
-                        return False
+                    def _unchanged(cur, _s=expect_state, _l=int(failed_agent_id)):
+                        if not cur or cur.get("state") != _s or cur.get("leader_id") is None:
+                            return False
+                        try:
+                            return int(cur["leader_id"]) == _l
+                        except (TypeError, ValueError):
+                            return False
 
-                if not self.repository.save(obj=job_obj.to_dict(), key_prefix=Repository.KEY_JOB,
-                                            level=level, group=group,
-                                            precondition=_unchanged):
-                    self.logger.info(
-                        f"[REASSIGN] Job {job_id} moved on since it was read as {old_state} on "
-                        f"failed agent {failed_agent_id}; leaving it alone")
-                    continue
+                    if not self.repository.save(obj=job_obj.to_dict(), key_prefix=Repository.KEY_JOB,
+                                                level=level, group=group,
+                                                precondition=_unchanged):
+                        self.logger.info(
+                            f"[REASSIGN] Job {job_id} moved on since it was read as {old_state} on "
+                            f"failed agent {failed_agent_id}; leaving it alone")
+                        continue
 
-                # Local consensus state for a job that is up for election again.
-                self.engine.outgoing.remove_object(object_id=job_id)
-                self.engine.incoming.remove_object(object_id=job_id)
-                with self.completed_lock:
-                    self.completed_jobs_set.discard(job_id)
-                self._forget_decided(job_id)
+                    # Local consensus state for a job that is up for election again.
+                    self.engine.outgoing.remove_object(object_id=job_id)
+                    self.engine.incoming.remove_object(object_id=job_id)
+                    with self.completed_lock:
+                        self.completed_jobs_set.discard(job_id)
+                    self._forget_decided(job_id)
 
                 self.metrics.reassignments[job_id] = {
                     'failed_agent': failed_agent_id,

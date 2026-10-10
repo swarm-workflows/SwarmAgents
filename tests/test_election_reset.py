@@ -208,3 +208,49 @@ def test_a_reset_that_wins_the_lock_first_leaves_the_finalize_nothing_to_do():
     eng.forget_decision("job-1")
     eng._finalize_work(st, 1, "beta")
     assert cas.get("job-1") is None and host.leader_events == []
+
+
+def test_the_agent_side_reset_is_inside_the_election_lock_too():
+    """Only the engine half of the reset used to be under the lock: `_forget_decided` cleared
+    the agent's decision memory and local winner first, and a finalize already holding the lock
+    could then run its callbacks and write them straight back — the stale 'decided for X' hint
+    the reset existed to remove (stop-time review). The whole reset now waits for it."""
+    import threading
+    a = _agent()
+    eng, _h, _t, _c = _make_engine(agent_id=88)
+    a.engine = eng
+    in_callback, finish_callback, reset_done = (threading.Event(), threading.Event(),
+                                                threading.Event())
+
+    def finalize_callbacks():
+        with eng.election_lock("1350"):
+            in_callback.set()
+            finish_callback.wait(5)
+            a._note_decided("1350")              # what on_participant_commit records
+            a.job_assignments.set("1350", 88)
+
+    worker = threading.Thread(target=finalize_callbacks)
+    worker.start()
+    assert in_callback.wait(5)
+
+    def reset():
+        a._forget_decided("1350")
+        reset_done.set()
+
+    resetter = threading.Thread(target=reset)
+    resetter.start()
+    assert not reset_done.wait(0.2), "the agent-side reset must wait for the decision"
+    finish_callback.set()
+    worker.join(5)
+    resetter.join(5)
+    # Ordered after the decision, the reset wins: nothing stale is left to answer peers with.
+    assert a.job_assignments.get("1350") is None
+    assert "1350" not in a._decided_jobs
+
+
+def test_pbft_agents_reset_without_an_election_lock():
+    a = _agent()
+    a.engine = MagicMock(spec=["forget_decision", "outgoing", "incoming"])
+    a.job_assignments.set("7", 3)
+    a._forget_decided("7")
+    assert a.job_assignments.get("7") is None

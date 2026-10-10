@@ -573,6 +573,7 @@ class TestStaleDecisionIsNotCommittedLocally:
         a.queues.pending_queue = SimpleQueue()
         a.engine = GossipConsensusEngine.__new__(GossipConsensusEngine)
         a.engine.forget_decision = lambda oid: None
+        a.engine.election_lock = lambda oid: __import__('contextlib').nullcontext()
         a.pending_proposals, a.pending_prepares, a.pending_commits = {}, {}, {}
         import threading
         a._pending_lock = threading.Lock()
@@ -608,6 +609,7 @@ class TestStaleDecisionIsNotCommittedLocally:
         a.queues.pending_queue = SimpleQueue()
         a.engine = GossipConsensusEngine.__new__(GossipConsensusEngine)
         a.engine.forget_decision = lambda oid: None
+        a.engine.election_lock = lambda oid: __import__('contextlib').nullcontext()
         a.pending_proposals, a.pending_prepares, a.pending_commits = {}, {}, {}
         a._pending_lock = threading.Lock()
         a._note_decided("j1")
