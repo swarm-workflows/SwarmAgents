@@ -179,6 +179,7 @@ class GossipConsensusEngine:
         self._send_pool: Optional[ThreadPoolExecutor] = None
         self._send_sem: Optional[threading.BoundedSemaphore] = None
         self.sends_dropped = 0
+        self.cancelled_count = 0   # instances dropped because their election was reset
 
         # ProposalContainer parity with PBFT engine — agent code reads/clears these.
         self.outgoing = ProposalContainer()
@@ -303,10 +304,27 @@ class GossipConsensusEngine:
     def on_commit(self, msg) -> None: pass
 
     def forget_decision(self, object_id: str) -> None:
-        """API parity with `ConsensusEngine`: the agent calls this when a job is up for
-        election again. Snow's decision memory is the Redis claim, which the agent releases
-        itself (`release_assignment`), so there is nothing engine-side to drop."""
-        return None
+        """The agent calls this when a job is up for election again (reselection timeout,
+        reset evidence, a coordinator taking a job back, a withdrawn copy). Snow's decision
+        memory is the Redis claim, which the agent releases itself (`release_assignment`);
+        what is engine-side is the instance still voting on the OLD election, and it is
+        cancelled here.
+
+        Left running, it kept a `max_inflight` slot and kept sending until `max_rounds`
+        (measured: 1,008 s on a leaf whose copy had been withdrawn 7 minutes earlier), while
+        `propose` skipped the fresh election as "already in flight" — so a restart could not
+        restart anything until the stale instance abandoned. In the first E1′ cells abandoned
+        instances outnumbered decisions (3,976-4,316 vs 3,600 per Hier-90 Snow run). Not
+        counted as abandoned: nothing was given up, the election it belonged to is over.
+        """
+        with self._lock:
+            state = self._states.pop(object_id, None)
+            if state is not None and not state.finalized:
+                state.finalized = True
+                with self._stats_lock:
+                    self.cancelled_count += 1
+            self.outgoing.remove_object(object_id=object_id)
+            self.incoming.remove_object(object_id=object_id)
 
     # ---- Snow-message handlers (called from inbound thread) ------------- #
 
@@ -790,6 +808,9 @@ class GossipConsensusEngine:
             # a job. finalized + abandoned + errors + lost is the whole population.
             "finalize_lost": self.finalize_lost,
             "sends_dropped": self.sends_dropped,
+            # Instances dropped because the agent reset their election (forget_decision) —
+            # neither a decision nor an abandonment; the reset's new instance is counted anew.
+            "cancelled": self.cancelled_count,
             "conflict_rounds": sum(self.conflicts.values()),
             "conflict_objects": len(self.conflicts),
         }

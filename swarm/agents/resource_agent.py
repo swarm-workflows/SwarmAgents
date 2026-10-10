@@ -1345,8 +1345,52 @@ class ResourceAgent(Agent):
                 self._forget_decided(job.job_id)
                 job_id = job.job_id
                 self.metrics.restarts[job_id] = self.metrics.restarts.get(job_id, 0) + 1
+                self._persist_restart(job)
 
                 # TODO restart selection for jobs which were assigned to neighbor which just went down
+
+    def _persist_restart(self, job: Job) -> None:
+        """Make a reselection-timeout reset visible to the peers that witnessed a decision.
+
+        The reset above is local. A peer that finalized the job as a PBFT participant holds
+        it as decided and skips every later message for it; it forgets that only on *reset
+        evidence* — a PENDING record stamped after its decision (`_reset_evidence`) — and
+        nothing wrote one. So when the decided leader never selected the job (a proposer that
+        dropped its own winning proposal for a cheaper late one, which then got no votes
+        because the rest of the tier had decided), the job could never reach quorum again and
+        sat PENDING until the run retired it as infeasible: 2 of 600 and 1 of 1800 jobs in the
+        first E0 cells, 2026-10-09. Writing the reset closes that.
+
+        Conditional on the record still being PENDING: a record another agent has already
+        taken (READY/RUNNING/...) means the decision did land, so this agent stands down as a
+        participant instead of re-electing it; a missing record is a withdrawn copy.
+        """
+        seen = {}
+
+        def still_pending(cur) -> bool:
+            seen["record"] = cur
+            return bool(cur) and self._record_is_pending(cur)
+
+        try:
+            if self.repository.save(obj=job.to_dict(), key_prefix=Repository.KEY_JOB,
+                                    level=self.topology.level, group=self.topology.group,
+                                    precondition=still_pending):
+                self.restarts_persisted = getattr(self, "restarts_persisted", 0) + 1
+                return
+        except Exception as e:
+            self.logger.warning(f"RESTART: could not persist the reset of {job.job_id}: {e}")
+            return
+        record = seen.get("record")
+        if self._decided_by_other(record):
+            winner = record.get("leader_id")
+            self.logger.info(f"RESTART: {job.job_id} is already {record.get('state')} under "
+                             f"agent {winner}; standing down")
+            self._note_decided(job.job_id)
+            try:
+                self.job_assignments.set(job.job_id, int(winner))
+            except (TypeError, ValueError):
+                pass
+            self.queues.pending_queue.remove(job.job_id)
 
     def _is_leader_for_group(self, group_id) -> bool:
         """
@@ -1683,7 +1727,6 @@ class ResourceAgent(Agent):
         with self.completed_lock:
             self.completed_jobs_set.discard(job_id)
         self._forget_decided(job_id)
-        self.job_assignments.remove(job_id)
         self.metrics.refusal_retries += 1
         self.logger.warning(
             f"[REFUSAL] {job_id} refused for a transient reason ({job.refusal_reason}); "
@@ -3239,6 +3282,9 @@ class ResourceAgent(Agent):
             # Elections this agent won that the job record had already given to another agent
             # (select_job's precondition) — each one a double execution prevented. PBFT only.
             "lost_leader_races": int(getattr(self, "lost_leader_races", 0)),
+            # Reselection-timeout resets written to the job record so peers re-vote
+            # (_persist_restart). Non-zero means an election stalled for the full timeout.
+            "restarts_persisted": int(getattr(self, "restarts_persisted", 0)),
             "refusal_retries": int(getattr(self.metrics, 'refusal_retries', 0)),
             # When THIS agent's failure-simulation clock started. Failure phases are resolved
             # against it per agent, and a 30-host remote launch spreads starts over a minute,
@@ -3478,6 +3524,16 @@ class ResourceAgent(Agent):
         engine, or its next election's messages are skipped as stragglers of the last one."""
         with self.completed_lock:
             self._decided_jobs.pop(job_id, None)
+        # And the local winner. Snow peers answer "already decided for X" from this map
+        # (`get_assignment_local`) without a Redis read, so an entry that outlives the decision
+        # turns every answer into a stale hint — a hint is not a vote, every round came back
+        # empty, and the vote was abandoned at max_rounds every reselection period until the
+        # cap. Found in the first E1′ bandit cells (2026-10-10): a coordinator took back a job
+        # its child group never placed, released the claim and forgot the decision, but it and
+        # both peers kept answering "decided for 88"; 6-8 jobs per run stranded, 4 runs capped.
+        jobs_map = getattr(self, "job_assignments", None)
+        if jobs_map is not None:
+            jobs_map.remove(job_id)
         forget = getattr(self.engine, "forget_decision", None)
         if callable(forget):
             forget(job_id)

@@ -500,6 +500,10 @@ def execution_evidence(agents: dict[str, dict]) -> dict[str, Any]:
             if isinstance(p, dict) and "lost_leader_races" in p]
     if lost:
         extra["lost_leader_races"] = sum(lost)
+    persisted = [int(p.get("restarts_persisted") or 0) for p in agents.values()
+                 if isinstance(p, dict) and "restarts_persisted" in p]
+    if persisted:
+        extra["restarts_persisted"] = sum(persisted)
     return {
         **extra,
         "jobs_executed": len(counts),
@@ -536,12 +540,12 @@ def instrumentation_metrics(agents: dict[str, dict], meta: dict | None = None,
     llm_usage_unknown = 0
     have_usage_unknown = False
     finalize_p95: list[float] = []
-    finalized = abandoned = lost = 0
+    finalized = abandoned = lost = cancelled = 0
     # `abandoned` and `finalize_lost` are Snow-only: PBFT does not abandon (a stuck object goes
     # to the reselection timeout) and has no CAS to lose one on. Reported only if some agent
     # actually reported them, so a pure-PBFT cell reads absent rather than a confident 0 next
     # to Snow's measured count (code review §11).
-    have_abandoned = have_lost = False
+    have_abandoned = have_lost = have_cancelled = False
     protocols: set[str] = set()
     llm_calls = llm_failures = llm_in = llm_out = 0
     bid_jobs = bid_calls = designated = forced = claimed_jobs = 0
@@ -624,6 +628,9 @@ def instrumentation_metrics(agents: dict[str, dict], meta: dict | None = None,
             if consensus.get("abandoned") is not None:
                 have_abandoned = True
                 abandoned += int(consensus.get("abandoned") or 0)
+            if consensus.get("cancelled") is not None:
+                have_cancelled = True
+                cancelled += int(consensus.get("cancelled") or 0)
             if consensus.get("finalize_lost") is not None:
                 have_lost = True
                 lost += int(consensus.get("finalize_lost") or 0)
@@ -710,6 +717,9 @@ def instrumentation_metrics(agents: dict[str, dict], meta: dict | None = None,
         # every proposer runs one, so under Snow it is ≈ proposers × jobs (§38).
         out["consensus_won"] = won if have_won else None
         out["consensus_abandoned"] = abandoned if have_abandoned else None
+        # Snow instances dropped because their election was reset (forget_decision). Absent
+        # for PBFT and for payloads from before 2026-10-10.
+        out["consensus_cancelled"] = cancelled if have_cancelled else None
         # A decision whose CAS won but whose object could not be read: no leader elected, no
         # participant commit, no assignment. Non-zero means work was lost, so it belongs on the
         # row beside `finalized` rather than in a log.
