@@ -41,7 +41,7 @@ import random
 import threading
 import time
 import uuid
-from collections import Counter
+from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Protocol
@@ -100,6 +100,11 @@ class _SnowState:
     # Set once a peer's "already decided" hint for this job proved stale (no claim in Redis):
     # from then on such a response is an ordinary vote, never a shortcut (§8).
     ignore_decided_hints: bool = False
+    # The election this instance belongs to (`GossipConsensusEngine._generation`). An
+    # instance from an earlier generation — its job was reset after it started — may neither
+    # finalize nor be re-opened: it would claim, or re-insert, a decision for an election that
+    # is over.
+    gen: int = 0
 
 
 #: The ONE default for every `consensus.snow.*` key (code review 2026-10-05 §G). The agent's
@@ -180,6 +185,10 @@ class GossipConsensusEngine:
         self._send_sem: Optional[threading.BoundedSemaphore] = None
         self.sends_dropped = 0
         self.cancelled_count = 0   # instances dropped because their election was reset
+        # object_id -> election generation, bumped by forget_decision. Only reset objects
+        # appear, so it stays small; bounded anyway (oldest first) like `conflicts`.
+        self._generation: "OrderedDict[str, int]" = OrderedDict()
+        self._generation_max = 65536
 
         # ProposalContainer parity with PBFT engine — agent code reads/clears these.
         self.outgoing = ProposalContainer()
@@ -292,6 +301,7 @@ class GossipConsensusEngine:
                     preferred_cost=float(p.cost or 0.0),
                     round_deadline=now,  # send first query on next tick
                     started_at=now,
+                    gen=self._generation.get(p.object_id, 0),
                 )
                 st.cost_of[self.agent_id] = float(p.cost or 0.0)
                 self._states[p.object_id] = st
@@ -318,6 +328,13 @@ class GossipConsensusEngine:
         counted as abandoned: nothing was given up, the election it belonged to is over.
         """
         with self._lock:
+            # A new generation, so an instance of the old one that is NOT in `_states` any more
+            # — finalized, its CAS and callbacks queued on the pool — is refused there too
+            # (`_is_current`) rather than claiming or re-opening the election that just ended.
+            self._generation[object_id] = self._generation.get(object_id, 0) + 1
+            self._generation.move_to_end(object_id)
+            while len(self._generation) > self._generation_max:
+                self._generation.popitem(last=False)
             state = self._states.pop(object_id, None)
             if state is not None and not state.finalized:
                 state.finalized = True
@@ -325,6 +342,23 @@ class GossipConsensusEngine:
                     self.cancelled_count += 1
             self.outgoing.remove_object(object_id=object_id)
             self.incoming.remove_object(object_id=object_id)
+
+    def _is_current(self, state: _SnowState) -> bool:
+        """Is this instance from the job's current election? Caller holds `_lock`, or accepts
+        that the answer can turn False right after (see `_finalize_work_inner`)."""
+        return state.gen == self._generation.get(state.proposal.object_id, 0)
+
+    def _drop_obsolete(self, state: _SnowState, where: str) -> bool:
+        """True (and counted, and logged) when *state* belongs to an election already reset."""
+        with self._lock:
+            current = self._is_current(state)
+        if current:
+            return False
+        with self._stats_lock:
+            self.cancelled_count += 1
+        self.host.log_debug(f"[snow] {where} of {state.proposal.object_id} dropped: its "
+                            f"election was reset after it started")
+        return True
 
     # ---- Snow-message handlers (called from inbound thread) ------------- #
 
@@ -657,6 +691,9 @@ class GossipConsensusEngine:
                 f"[snow] finalize of {state.proposal.object_id} failed: {exc}")
 
     def _finalize_work_inner(self, state: _SnowState, candidate: int, reason: str) -> None:
+        # Queued on the pool before the job was reset: the election it would decide is over.
+        if self._drop_obsolete(state, "finalize"):
+            return
         if reason == "peer-decided":
             # One peer's LOCAL map said the job was decided. That map can be stale: after an
             # agent dies, the first detector releases its claim and resets the job, while a peer
@@ -731,6 +768,13 @@ class GossipConsensusEngine:
                 f"; reason={reason}")
             return
 
+        # Checked again after the CAS, which is a network round trip: a reset landing inside it
+        # must not be followed by a leader/participant callback for the old election. The claim
+        # the CAS may have written is not undone here — it names a live agent, and the new
+        # election's own CAS reads it back as its decision, so the job is still decided once.
+        if self._drop_obsolete(state, "callback"):
+            return
+
         if int(winner) == self.agent_id:
             self.host.log_info(
                 f"[SNOW_LEADER] Object:{state.proposal.object_id} "
@@ -767,8 +811,15 @@ class GossipConsensusEngine:
         return True if check is None else bool(check(agent_id))
 
     def _reopen(self, state: _SnowState) -> None:
-        """Put a finalized-but-unclaimed instance back in play, ignoring decided-hints."""
+        """Put a finalized-but-unclaimed instance back in play, ignoring decided-hints.
+
+        Never for an obsolete instance, and never over a newer one: after a reset the job may
+        already have a fresh instance in `_states`, and re-inserting this one replaced it with
+        an election that is over (stop-time review, 2026-10-10)."""
         with self._lock:
+            oid = state.proposal.object_id
+            if not self._is_current(state) or self._states.get(oid, state) is not state:
+                return
             state.finalized = False
             state.ignore_decided_hints = True
             state.pending_query_id = None

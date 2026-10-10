@@ -226,6 +226,7 @@ def test_finalize_counter_is_taken_under_the_lock():
     eng.host.get_object.return_value = None
     state = MagicMock()
     state.proposal.object_id = "j1"
+    state.gen = 0   # the current election (no reset)
     state.started_at = 0.0
     state.round_no = 1
     state.queried = 1
@@ -246,6 +247,7 @@ def test_the_success_path_takes_the_lock_once_too():
     eng.host.get_object.return_value = MagicMock()
     state = MagicMock()
     state.proposal.object_id = "j1"
+    state.gen = 0   # the current election (no reset)
     state.started_at = 0.0
     state.round_no = 1
     state.queried = 1
@@ -266,6 +268,7 @@ def test_finalize_counter_totals_correctly_across_threads():
         for _ in range(250):
             state = MagicMock()
             state.proposal.object_id = "j1"
+            state.gen = 0   # the current election (no reset)
             state.started_at = 0.0
             state.round_no = 1
             state.queried = 1
@@ -286,6 +289,7 @@ def test_a_finalize_that_raises_is_counted_not_just_logged():
     eng.host.try_claim_assignment.side_effect = RuntimeError("redis down")
     state = MagicMock()
     state.proposal.object_id = "j1"
+    state.gen = 0   # the current election (no reset)
     state.started_at = 0.0
 
     eng._stats_lock = _CountingLock()
@@ -314,6 +318,7 @@ def test_a_failed_host_callback_is_an_error_not_also_a_finalize():
     eng.host.on_leader_elected.side_effect = RuntimeError("callback blew up")
     state = MagicMock()
     state.proposal.object_id = "j1"
+    state.gen = 0   # the current election (no reset)
     state.started_at = 0.0
     state.round_no = 1
     state.queried = 1
@@ -339,6 +344,7 @@ def test_a_finalize_with_no_object_is_neither_a_success_nor_an_error():
     eng.host.get_object.return_value = None
     state = MagicMock()
     state.proposal.object_id = "j1"
+    state.gen = 0   # the current election (no reset)
     state.started_at = 0.0
     state.round_no = 1
     state.queried = 1
@@ -362,6 +368,7 @@ def test_a_lost_finalize_stays_out_of_the_latency_distributions():
     eng.host.get_object.return_value = None
     state = MagicMock()
     state.proposal.object_id = "j1"
+    state.gen = 0   # the current election (no reset)
     state.started_at = 0.0
     state.round_no = 9
     state.queried = 9

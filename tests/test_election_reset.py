@@ -85,3 +85,76 @@ def test_a_snow_peer_stops_answering_already_decided_once_the_decision_is_forgot
     a._forget_decided("1350")
     ans = eng._answer_query("q2", "1350", 89, 1.0)
     assert ans["already_decided"] is False and ans["preferred_agent"] == 89
+
+
+# --- A reset must not be undone by work the old election already queued (stop-time review). ---
+
+def _finalized_old_instance(eng):
+    """An instance of the first election, finalized and dropped from `_states` as `_tick`
+    does, with its CAS + callbacks still to run on the pool."""
+    eng.propose([_prop(pid="old")])
+    old = eng._states["job-1"]
+    old.finalized = True
+    eng._states.pop("job-1")
+    return old
+
+
+def test_a_queued_finalize_of_a_reset_election_claims_nothing_and_elects_nobody():
+    eng, host, _t, cas = _make_engine()
+    old = _finalized_old_instance(eng)
+    eng.forget_decision("job-1")
+    eng._finalize_work_inner(old, candidate=1, reason="beta")
+    assert cas.get("job-1") is None
+    assert host.leader_events == [] and host.participant_events == []
+    assert eng.consensus_stats()["cancelled"] == 1
+    assert eng.consensus_stats()["finalized"] == 0
+
+
+def test_a_stale_hint_on_a_reset_election_does_not_resurrect_it_over_the_new_one():
+    eng, host, _t, cas = _make_engine()
+    old = _finalized_old_instance(eng)
+    eng.forget_decision("job-1")
+    eng.propose([_prop(pid="new")])
+    new = eng._states["job-1"]
+    # The old instance's queued finalize, on a peer's stale "decided" hint with no claim.
+    eng._finalize_work_inner(old, candidate=2, reason="peer-decided")
+    assert eng._states["job-1"] is new
+    assert eng._states["job-1"].proposal.p_id == "new"
+
+
+def test_reopen_never_replaces_a_newer_instance_even_within_one_generation():
+    eng, _host, _t, _cas = _make_engine()
+    old = _finalized_old_instance(eng)
+    eng.propose([_prop(pid="new")])          # same generation, newer instance in _states
+    new = eng._states["job-1"]
+    eng._reopen(old)
+    assert eng._states["job-1"] is new
+
+
+def test_a_reset_landing_during_the_cas_suppresses_the_callbacks():
+    eng, host, _t, cas = _make_engine()
+    eng.propose([_prop(pid="old")])
+    st = eng._states["job-1"]
+    st.finalized = True
+    real_claim = host.try_claim_assignment
+
+    def claim_then_reset(oid, aid):
+        winner = real_claim(oid, aid)
+        eng.forget_decision(oid)              # the agent resets the job mid-CAS
+        return winner
+
+    host.try_claim_assignment = claim_then_reset
+    eng._finalize_work_inner(st, candidate=1, reason="beta")
+    assert host.leader_events == [] and host.participant_events == []
+    assert eng.consensus_stats()["finalized"] == 0
+
+
+def test_a_current_election_still_finalizes_normally():
+    eng, host, _t, cas = _make_engine()
+    eng.forget_decision("job-1")              # an earlier election was reset
+    eng.propose([_prop(pid="new")])
+    st = eng._states["job-1"]
+    st.finalized = True
+    eng._finalize_work_inner(st, candidate=1, reason="beta")
+    assert cas.get("job-1") == 1
+    assert host.leader_events == ["job-1"]
