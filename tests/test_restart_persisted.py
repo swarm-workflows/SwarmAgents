@@ -118,3 +118,104 @@ def test_collector_sums_persisted_restarts():
     out = execution_evidence({"1": {"executed_jobs": ["a"], "restarts_persisted": 2},
                               "2": {"executed_jobs": ["b"], "restarts_persisted": 1}})
     assert out["restarts_persisted"] == 3
+
+
+# --- The restart must never stall the periodic (heartbeat) thread (2026-10-10). ---
+# First run on 59d425b6: a coordinator restarting 180 jobs, each written synchronously and each
+# waiting on a finalize's election lock, went 81 s without a heartbeat; a peer declared it
+# FAILED, reassigned its 133 in-flight jobs, and 47 ran twice.
+
+def test_snow_agents_do_not_write_restarts_their_peers_read_claims_instead():
+    from swarm.consensus.gossip_engine import GossipConsensusEngine
+    repo = _repo_with(_job())
+    a = _agent(29, repo)
+    a.engine = GossipConsensusEngine.__new__(GossipConsensusEngine)
+    a.engine.outgoing, a.engine.incoming = MagicMock(), MagicMock()
+    a.engine.forget_decision = lambda oid: None
+    a.engine.election_lock = lambda oid: __import__("contextlib").nullcontext()
+    before = _record(repo)["last_transition_at"]
+    _stuck_in_commit(a)
+    a._restart_selection()
+    assert _record(repo)["last_transition_at"] == before
+    assert getattr(a, "restarts_persisted", 0) == 0
+    assert a.metrics.restarts == {"28": 1}            # the local reset still happened
+
+
+def test_a_job_whose_election_lock_is_held_is_skipped_not_waited_for():
+    import threading
+    repo = _repo_with(_job())
+    a = _agent(29, repo)
+    held = threading.RLock()
+    a.engine.election_lock = lambda oid: held
+    job = _stuck_in_commit(a)
+    taken, release = threading.Event(), threading.Event()
+
+    def finalize():
+        with held:
+            taken.set()
+            release.wait(5)
+
+    t = threading.Thread(target=finalize)
+    t.start()
+    assert taken.wait(5)
+    started = time.monotonic()
+    a._restart_selection()                            # must return at once
+    assert time.monotonic() - started < 0.5
+    assert job.state == ObjectState.COMMIT and a.metrics.restarts == {}
+    release.set()
+    t.join(5)
+    a._restart_selection()                            # next pass: lock free, reset happens
+    assert a.metrics.restarts == {"28": 1}
+
+
+def test_the_write_happens_on_the_restart_writer_not_the_caller():
+    import threading
+    repo = _repo_with(_job())
+    a = _agent(29, repo)
+    a._restart_writes_async = True
+    a.shutdown = False
+    callers = []
+    real = a._persist_restart_now
+
+    def spy(job_id, record):
+        callers.append(threading.current_thread().name)
+        real(job_id, record)
+
+    a._persist_restart_now = spy
+    _stuck_in_commit(a)
+    a._restart_selection()
+    deadline = time.time() + 5
+    while not callers and time.time() < deadline:
+        time.sleep(0.01)
+    assert callers == ["restart-writer"]
+    deadline = time.time() + 5
+    while getattr(a, "restarts_persisted", 0) == 0 and time.time() < deadline:
+        time.sleep(0.01)
+    assert a.restarts_persisted == 1
+
+
+def test_purge_defers_a_job_whose_election_lock_is_held():
+    import threading
+    a = _agent(29, _repo_with(None))
+    held = threading.RLock()
+    a.engine.election_lock = lambda oid: held
+    a.queues.pending_queue.add(_job())
+    a._purge_vanished_jobs(set())                    # first absence: noted only
+    taken, release = threading.Event(), threading.Event()
+
+    def finalize():
+        with held:
+            taken.set()
+            release.wait(5)
+
+    t = threading.Thread(target=finalize)
+    t.start()
+    assert taken.wait(5)
+    started = time.monotonic()
+    a._purge_vanished_jobs(set())                    # second absence, lock busy: deferred
+    assert time.monotonic() - started < 0.5
+    assert "28" in a.queues.pending_queue.ids()
+    release.set()
+    t.join(5)
+    a._purge_vanished_jobs(set())                    # next pass: purged
+    assert "28" not in a.queues.pending_queue.ids()

@@ -552,6 +552,9 @@ class ResourceAgent(Agent):
         # the peer's own clock, so no inter-host offset enters the comparison.
         self._failed_last_seen: dict[int, float] = {}
         self.job_assignments = ThreadSafeDict[str, int]()  # job_id -> assigned_agent_id
+        # Reselection resets are written by a background writer, never on the periodic thread
+        # that also writes this agent's heartbeat (see _persist_restart).
+        self._restart_writes_async = True
 
         # Consensus messages that arrived before their job (see _HostAdapter.set_pending_*).
         # Replayed by _replay_pending_consensus once the job lands in the pending queue.
@@ -1149,7 +1152,8 @@ class ResourceAgent(Agent):
                 # the stale PENDING record or the decision forgotten.
                 if not (job_id in unclaimed or self._reset_evidence(job_id, job)):
                     continue
-                self._forget_decided(job_id)
+                if not self._forget_decided(job_id, wait=False):
+                    continue                     # being decided right now; next scan
             if job:
                 job_obj = Job()
                 job_obj.from_dict(job)
@@ -1246,14 +1250,18 @@ class ResourceAgent(Agent):
         """
         absent = {j for j in self.queues.pending_queue.ids() if j not in present}
         previously = getattr(self, "_absent_once", set())
+        deferred = set()
         for job_id in absent & previously:
+            # The periodic thread: never wait on a finalize's election lock (heartbeat).
+            if not self._forget_decided(job_id, wait=False):
+                deferred.add(job_id)             # being decided right now; next scan
+                continue
             self.queues.pending_queue.remove(job_id)
             self.engine.incoming.remove_object(object_id=job_id)
             self.engine.outgoing.remove_object(object_id=job_id)
-            self._forget_decided(job_id)
             self.logger.info(f"[PURGE] Job {job_id} has no record at this tier any more "
                              f"(withdrawn); dropped from the local pending queue")
-        self._absent_once = absent - previously
+        self._absent_once = (absent - previously) | deferred
 
     def _update_ready_jobs(self, jobs: list[str]):
         for j in jobs:
@@ -1339,9 +1347,17 @@ class ResourceAgent(Agent):
                 self.logger.info(f"RESTART: Job: {job} reset to Pending")
                 print(f"RESTART: Job: {job} reset to Pending {self.reselection_timeout_s} seconds")
                 # One reset, under the election lock: a decision for the old election lands
-                # wholly before it (and the persisted write below sees its READY and stands
-                # down) or wholly after it (and is dropped as obsolete).
-                with self._election_lock(job.job_id):
+                # wholly before it or wholly after it (and is dropped as obsolete). NEVER waited
+                # for: this is the periodic thread, which also writes the heartbeat, and a burst
+                # of 180 restarts each queued behind a finalize's WAN CAS kept a coordinator
+                # silent for 81 s — a peer declared it FAILED, reassigned its 133 in-flight jobs
+                # and 47 ran twice (first run on 59d425b6, 2026-10-10). A job whose lock is held
+                # is being decided right now, which is what a restart wants anyway; it is
+                # skipped and re-examined on the next pass.
+                lock = self._election_lock(job.job_id)
+                if not self._try_lock(lock):
+                    continue
+                try:
                     job.state = ObjectState.PENDING
                     self.engine.outgoing.remove_object(object_id=job.job_id)
                     self.engine.incoming.remove_object(object_id=job.job_id)
@@ -1350,11 +1366,54 @@ class ResourceAgent(Agent):
                     self._forget_decided(job.job_id)
                     job_id = job.job_id
                     self.metrics.restarts[job_id] = self.metrics.restarts.get(job_id, 0) + 1
-                    self._persist_restart(job)
+                finally:
+                    self._unlock(lock)
+                self._persist_restart(job)
 
                 # TODO restart selection for jobs which were assigned to neighbor which just went down
 
+    @staticmethod
+    def _try_lock(lock) -> bool:
+        acquire = getattr(lock, "acquire", None)
+        if acquire is None:                      # contextlib.nullcontext — PBFT, no lock
+            return True
+        return bool(acquire(blocking=False))
+
+    @staticmethod
+    def _unlock(lock) -> None:
+        release = getattr(lock, "release", None)
+        if release is not None:
+            release()
+
     def _persist_restart(self, job: Job) -> None:
+        """Hand a reselection reset to the restart writer (PBFT only) — see
+        `_persist_restart_now`. Never written on the calling (periodic, heartbeat) thread: the
+        write is a WATCH/MULTI round trip to Redis per job, and a burst of them there is what
+        let a peer judge a live coordinator dead (see `_restart_selection`). Snow needs none of
+        this — a Snow peer already reads a PENDING record with no claim as a reset."""
+        if isinstance(getattr(self, "engine", None), GossipConsensusEngine):
+            return
+        record = job.to_dict()                    # snapshot now; the job object keeps moving
+        if not getattr(self, "_restart_writes_async", False):
+            self._persist_restart_now(job.job_id, record)
+            return
+        q = getattr(self, "_restart_queue", None)
+        if q is None:
+            import queue as _queue
+            q = self._restart_queue = _queue.Queue()
+            threading.Thread(target=self._restart_writer_loop, name="restart-writer",
+                             daemon=True).start()
+        q.put((job.job_id, record))
+
+    def _restart_writer_loop(self) -> None:
+        while not getattr(self, "shutdown", False):
+            job_id, record = self._restart_queue.get()
+            try:
+                self._persist_restart_now(job_id, record)
+            except Exception as e:                # never let the writer die
+                self.logger.warning(f"RESTART: writer failed on {job_id}: {e}")
+
+    def _persist_restart_now(self, job_id: str, record_out: dict) -> None:
         """Make a reselection-timeout reset visible to the peers that witnessed a decision.
 
         The reset above is local. A peer that finalized the job as a PBFT participant holds
@@ -1377,25 +1436,25 @@ class ResourceAgent(Agent):
             return bool(cur) and self._record_is_pending(cur)
 
         try:
-            if self.repository.save(obj=job.to_dict(), key_prefix=Repository.KEY_JOB,
+            if self.repository.save(obj=record_out, key_prefix=Repository.KEY_JOB,
                                     level=self.topology.level, group=self.topology.group,
                                     precondition=still_pending):
                 self.restarts_persisted = getattr(self, "restarts_persisted", 0) + 1
                 return
         except Exception as e:
-            self.logger.warning(f"RESTART: could not persist the reset of {job.job_id}: {e}")
+            self.logger.warning(f"RESTART: could not persist the reset of {job_id}: {e}")
             return
         record = seen.get("record")
         if self._decided_by_other(record):
             winner = record.get("leader_id")
-            self.logger.info(f"RESTART: {job.job_id} is already {record.get('state')} under "
+            self.logger.info(f"RESTART: {job_id} is already {record.get('state')} under "
                              f"agent {winner}; standing down")
-            self._note_decided(job.job_id)
+            self._note_decided(job_id)
             try:
-                self.job_assignments.set(job.job_id, int(winner))
+                self.job_assignments.set(job_id, int(winner))
             except (TypeError, ValueError):
                 pass
-            self.queues.pending_queue.remove(job.job_id)
+            self.queues.pending_queue.remove(job_id)
 
     def _is_leader_for_group(self, group_id) -> bool:
         """
@@ -3540,12 +3599,26 @@ class ResourceAgent(Agent):
         lock = lock_for(job_id) if callable(lock_for) else None
         return lock if lock is not None else contextlib.nullcontext()
 
-    def _forget_decided(self, job_id: str) -> None:
+    def _forget_decided(self, job_id: str, wait: bool = True) -> bool:
         """The job is up for election again: drop the local decision memory here AND in the
         engine, or its next election's messages are skipped as stragglers of the last one.
-        All of it under the job's election lock — see `_election_lock`."""
-        with self._election_lock(job_id):
+        All of it under the job's election lock — see `_election_lock`.
+
+        `wait=False` is for the periodic thread, which also writes the heartbeat: it returns
+        False instead of queuing behind a finalize that holds the lock (the job is being
+        decided right now), and the caller re-examines the job on its next pass."""
+        lock = self._election_lock(job_id)
+        if wait:
+            with lock:
+                self._forget_decided_locked(job_id)
+            return True
+        if not self._try_lock(lock):
+            return False
+        try:
             self._forget_decided_locked(job_id)
+        finally:
+            self._unlock(lock)
+        return True
 
     def _forget_decided_locked(self, job_id: str) -> None:
         with self.completed_lock:
