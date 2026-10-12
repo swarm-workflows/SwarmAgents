@@ -49,6 +49,11 @@ defaults:
     all-dtns: true             # every agent holds all 10 DTN names; capacities unchanged
     topology: hierarchical
     hierarchical-level1-agent-type: resource
+    # 600 s by default. PBFT+LinUCB concentrates work (pilot e669e79c: 64% of jobs to one child
+    # group, a 4-core leaf holding 49 unstarted) and stopped TRUNCATED with 116 in flight; the
+    # longer wait lets every job finish so its queueing is measured, not cut off. Fits every
+    # cell's timeout_s (runtime cap + 1800 + setup/collection).
+    inflight-drain-max-s: 1800
 
 gate:
   redis: {host: database, port: 6379}
