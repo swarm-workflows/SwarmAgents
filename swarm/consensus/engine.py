@@ -95,6 +95,11 @@ class ConsensusEngine:
         # for the reselection timeout instead of being resolved by switching.
         self._committed_to: dict[str, str] = {}
         self.commit_lock_holds = 0
+        # object_id -> {p_id: (ProposalInfo, voters whose COMMIT for it we know)}: every COMMIT
+        # seen for the object in this election, kept apart from the proposal containers (which
+        # drop proposals as "worse"), so a split commit can be recognised — see `_resolve_split`.
+        self._commit_ledger: dict[str, dict[str, tuple]] = {}
+        self.commit_splits_resolved = 0
         # (object_id, p_id) pairs this agent has already FINALIZED, kept after the object
         # leaves the containers. Finalization used to erase every trace of a decision at once
         # (`_forget_object`), and that is exactly when the stragglers arrive: every tier wider
@@ -169,6 +174,9 @@ class ConsensusEngine:
             # Prepare quorums this agent declined to COMMIT because it had committed to another
             # proposal for the object (`_committed_to`). Counted per evaluation, not per job.
             "commit_lock_holds": self.commit_lock_holds,
+            # Commit splits with every live voter's COMMIT known and no quorum, left by moving
+            # every commit to the best committed proposal (`_resolve_split`).
+            "commit_splits_resolved": self.commit_splits_resolved,
         }
         stats.update(self.votes_to_finalize.summary("votes_"))
         stats.update(self.time_to_finalize.summary("finalize_s_"))
@@ -416,6 +424,7 @@ class ConsensusEngine:
         for k in stale:
             self._commits_sent.discard(k)
         self._committed_to.pop(object_id, None)
+        self._commit_ledger.pop(object_id, None)
 
     def _note_finalized(self, object_id: str, p_id: str, now: float) -> None:
         key = (object_id, p_id)
@@ -442,6 +451,7 @@ class ConsensusEngine:
             self._finalized.pop(key, None)
         # A reset ends the election this agent committed in; the new one carries new p_ids.
         self._committed_to.pop(object_id, None)
+        self._commit_ledger.pop(object_id, None)
 
     # ---------- vote counting ----------
     #
@@ -489,11 +499,78 @@ class ConsensusEngine:
         for _obj, proposal in ready:
             self._commits_sent.add((proposal.object_id, proposal.p_id))
             self._add_vote(proposal.commits)
+            self._ledger_note(proposal, proposal.commits)
         commit = Commit(source=self.agent_id, agents=[AgentInfo(agent_id=self.agent_id)],
                         proposals=[p for _o, p in ready])
         self.transport.broadcast(payload=commit)
         for object, proposal in ready:
-            self._finalize_if_quorum(object, proposal)
+            if not self._finalize_if_quorum(object, proposal):
+                self._resolve_split(proposal.object_id)
+
+    def _ledger_note(self, proposal: ProposalInfo, voters) -> None:
+        entry = self._commit_ledger.setdefault(proposal.object_id, {})
+        held = entry.get(proposal.p_id)
+        if held is None:
+            held = entry[proposal.p_id] = (proposal, set())
+        held[1].update(v for v in voters if v is not None)
+
+    def _resolve_split(self, object_id: str) -> None:
+        """Leave a commit split that can never finish, safely.
+
+        A COMMIT is binding (`_committed_to`), so votes locked onto different proposals with no
+        majority among them wait for the reselection timeout (300 s) — the first slice run of
+        the binding commit (355b4df8, Hier-30 PBFT) left 2 of 600 coordinator-tier jobs unrun
+        that way. Switching is what the binding forbids, because a proposal might have reached
+        quorum somewhere this agent has not heard of. That cannot be the case once this agent
+        KNOWS a COMMIT from every live voter and no proposal holds a quorum of them: each voter
+        commits once per election, so no quorum exists anywhere and nothing was finalized. Then
+        every agent that knows the same — the same set of committed proposals — moves its commit
+        to the same one, the best by the ordinary dominance rule, and it finalizes. An agent
+        missing any voter's commit does nothing; the reselection timeout stays the fallback."""
+        count = getattr(self.host, "live_voter_count", None)
+        n = count() if callable(count) else None
+        ledger = self._commit_ledger.get(object_id)
+        if not n or not ledger:
+            return
+        quorum = self.host.calculate_quorum()
+        voters = set()
+        for _prop, who in ledger.values():
+            if len(who) >= quorum:
+                return                        # a decision exists; the ordinary path finishes it
+            voters |= who
+        if len(voters) < n:
+            return
+        target = None
+        for prop, _who in ledger.values():
+            if target is None or dominates(object_id, prop.cost, prop.agent_id,
+                                           target.cost, target.agent_id):
+                target = prop
+        if self._committed_to.get(object_id) == target.p_id:
+            return
+        object = self.host.get_object(object_id)
+        if object is None:
+            return
+        if self.outgoing.contains(object_id=object_id, p_id=target.p_id):
+            local = self.outgoing.get_proposal(p_id=target.p_id)
+        elif self.incoming.contains(object_id=object_id, p_id=target.p_id):
+            local = self.incoming.get_proposal(p_id=target.p_id)
+        else:
+            local = target
+            self.incoming.add_proposal(proposal=local)
+        for v in ledger[target.p_id][1]:
+            self._add_vote(local.commits, v)
+        self.commit_splits_resolved += 1
+        self.host.log_info(f"[CON_SPLIT] Object:{object_id} commits split over "
+                           f"{len(ledger)} proposals with no quorum; moving commit to "
+                           f"{target.p_id} (agent {target.agent_id})")
+        self._committed_to[object_id] = target.p_id
+        self._commits_sent.add((object_id, target.p_id))
+        self._add_vote(local.commits)
+        self._ledger_note(local, local.commits)
+        object.state = ObjectState.COMMIT
+        self.transport.broadcast(payload=Commit(
+            source=self.agent_id, agents=[AgentInfo(agent_id=self.agent_id)], proposals=[local]))
+        self._finalize_if_quorum(object, local)
 
     def _finalize_if_quorum(self, object, proposal) -> bool:
         quorum = self.host.calculate_quorum()
@@ -545,6 +622,8 @@ class ConsensusEngine:
                 self.host.log_debug(f"Skipped commit {p.p_id}/{p.object_id} (complete)")
                 continue
 
+            self._ledger_note(p, list(p.commits) + [msg.agents[0].agent_id])
+
             if self._already_finalized(p.object_id, p.p_id):
                 # Straggler COMMIT after our finalization. It carries the sender's wire
                 # `commits` list, already at quorum, so adopting it finalized the decision a
@@ -579,6 +658,7 @@ class ConsensusEngine:
                         f"already have better proposal {better.p_id} (cost={better.cost})"
                     )
                     self._bump_conflict(object.object_id)
+                    self._resolve_split(p.object_id)
                     continue
                 else:
                     # Remove worse proposals before adding
@@ -590,7 +670,8 @@ class ConsensusEngine:
                     self.host.log_debug(f"Accepted new proposal {p.p_id} via COMMIT (cost={p.cost})")
 
             self._add_vote(proposal.commits, msg.agents[0].agent_id)
-            self._finalize_if_quorum(object, proposal)
+            if not self._finalize_if_quorum(object, proposal):
+                self._resolve_split(p.object_id)
 
         if self.router.should_forward():
             self.transport.broadcast(payload=msg)

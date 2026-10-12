@@ -544,12 +544,12 @@ def instrumentation_metrics(agents: dict[str, dict], meta: dict | None = None,
     llm_usage_unknown = 0
     have_usage_unknown = False
     finalize_p95: list[float] = []
-    finalized = abandoned = lost = cancelled = lock_holds = 0
+    finalized = abandoned = lost = cancelled = lock_holds = splits = 0
     # `abandoned` and `finalize_lost` are Snow-only: PBFT does not abandon (a stuck object goes
     # to the reselection timeout) and has no CAS to lose one on. Reported only if some agent
     # actually reported them, so a pure-PBFT cell reads absent rather than a confident 0 next
     # to Snow's measured count (code review §11).
-    have_abandoned = have_lost = have_cancelled = have_lock_holds = False
+    have_abandoned = have_lost = have_cancelled = have_lock_holds = have_splits = False
     protocols: set[str] = set()
     llm_calls = llm_failures = llm_in = llm_out = 0
     bid_jobs = bid_calls = designated = forced = claimed_jobs = 0
@@ -638,6 +638,9 @@ def instrumentation_metrics(agents: dict[str, dict], meta: dict | None = None,
             if consensus.get("commit_lock_holds") is not None:
                 have_lock_holds = True
                 lock_holds += int(consensus.get("commit_lock_holds") or 0)
+            if consensus.get("commit_splits_resolved") is not None:
+                have_splits = True
+                splits += int(consensus.get("commit_splits_resolved") or 0)
             if consensus.get("finalize_lost") is not None:
                 have_lost = True
                 lost += int(consensus.get("finalize_lost") or 0)
@@ -729,6 +732,9 @@ def instrumentation_metrics(agents: dict[str, dict], meta: dict | None = None,
         out["consensus_cancelled"] = cancelled if have_cancelled else None
         # PBFT only: prepare quorums a voter held back because its COMMIT was already given.
         out["consensus_commit_lock_holds"] = lock_holds if have_lock_holds else None
+        # PBFT only: agent-level moves out of a commit split nobody could finish (one per agent
+        # per split, so a resolved 3-way split at a 3-coordinator tier reads 2-3).
+        out["consensus_commit_splits_resolved"] = splits if have_splits else None
         # A decision whose CAS won but whose object could not be read: no leader elected, no
         # participant commit, no assignment. Non-zero means work was lost, so it belongs on the
         # row beside `finalized` rather than in a log.

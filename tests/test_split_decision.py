@@ -113,6 +113,47 @@ class TestStickyCommit:
         assert all("j1" not in eng._committed_to for eng in bus.engines.values())
 
 
+def _deadlock(n=3, silent=()):
+    """Every agent commits to its OWN proposal — prepares from itself and one peer each — so
+    the commits split 1/1/1 and no proposal can reach a quorum of 2."""
+    bus, hosts = _cluster(n)
+    for h in hosts.values():
+        h.live_voter_count = (lambda h=h: len(h.live))
+    bus.silent = set(silent)
+    costs = {1: 5.0, 2: 3.0, 3: 4.0}
+    for aid, eng in bus.engines.items():
+        nxt = aid % n + 1
+        p = ProposalInfo(p_id=f"p{aid}", object_id="j1", cost=costs[aid], agent_id=aid,
+                         prepares=[aid, nxt])
+        eng.outgoing.add_proposal(p)
+        eng._commit_where_prepared([p])
+    bus.run()
+    return bus, hosts
+
+
+class TestCommitSplit:
+    def test_a_full_split_moves_every_commit_to_the_best_proposal(self):
+        bus, hosts = _deadlock()
+        leaders = [aid for aid, h in hosts.items() if "j1" in h.leader_of]
+        assert leaders == [2], "the cheapest committed proposal is agent 2's"
+        assert all(h.assignee.get("j1", 2) == 2 for h in hosts.values())
+        assert sum(e.consensus_stats()["commit_splits_resolved"] for e in bus.engines.values()) >= 2
+
+    def test_a_missing_commit_is_not_a_split(self):
+        bus, hosts = _deadlock(silent=(3,))
+        assert not any("j1" in h.leader_of for h in hosts.values())
+        assert all(e.commit_splits_resolved == 0 for e in bus.engines.values())
+
+    def test_no_resolution_without_a_live_count(self):
+        bus, hosts = _cluster(3)
+        eng = bus.engines[1]
+        for aid in (1, 2, 3):
+            eng._ledger_note(ProposalInfo(p_id=f"p{aid}", object_id="j1", cost=1.0,
+                                          agent_id=aid), [aid])
+        eng._resolve_split("j1")
+        assert eng.commit_splits_resolved == 0
+
+
 class TestSnowRepricing:
     def test_own_proposal_is_repriced_each_round(self):
         eng, host, transport, _ = _make_engine(agent_id=1, peers=(2, 3), my_cost=0.55, k=2)
