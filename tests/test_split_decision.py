@@ -118,7 +118,7 @@ def _deadlock(n=3, silent=()):
     the commits split 1/1/1 and no proposal can reach a quorum of 2."""
     bus, hosts = _cluster(n)
     for h in hosts.values():
-        h.live_voter_count = (lambda h=h: len(h.live))
+        h.live_voter_ids = (lambda h=h: set(h.live))
     bus.silent = set(silent)
     costs = {1: 5.0, 2: 3.0, 3: 4.0}
     for aid, eng in bus.engines.items():
@@ -143,6 +143,25 @@ class TestCommitSplit:
         bus, hosts = _deadlock(silent=(3,))
         assert not any("j1" in h.leader_of for h in hosts.values())
         assert all(e.commit_splits_resolved == 0 for e in bus.engines.values())
+
+    def test_a_commit_from_outside_the_live_set_does_not_complete_it(self):
+        bus, hosts = _cluster(3)
+        eng = bus.engines[1]
+        hosts[1].live_voter_ids = lambda: {1, 2, 3}
+        for aid in (1, 2, 4):                       # 3 is live and unheard; 4 is not live
+            eng._ledger_note(ProposalInfo(p_id=f"p{aid}", object_id="j1", cost=1.0,
+                                          agent_id=aid), [aid])
+        eng._resolve_split("j1")
+        assert eng.commit_splits_resolved == 0
+
+    def test_one_id_in_two_types_counts_once(self):
+        bus, hosts = _cluster(3)
+        eng = bus.engines[1]
+        hosts[1].live_voter_ids = lambda: {1, 2, 3}
+        eng._ledger_note(ProposalInfo(p_id="p1", object_id="j1", cost=1.0, agent_id=1), [1, "2"])
+        eng._ledger_note(ProposalInfo(p_id="p2", object_id="j1", cost=2.0, agent_id=2), [2])
+        eng._resolve_split("j1")
+        assert eng.commit_splits_resolved == 0
 
     def test_no_resolution_without_a_live_count(self):
         bus, hosts = _cluster(3)

@@ -197,7 +197,7 @@ class _HostAdapter(ConsensusHost):
 
     def is_agreement_achieved(self, object_id: str): return self.agent.is_job_completed(object_id)
     def calculate_quorum(self): return self.agent.calculate_quorum()
-    def live_voter_count(self): return self.agent.live_agent_count
+    def live_voter_ids(self): return set(self.agent.neighbor_map.keys())
     def on_leader_elected(self, obj: Object, proposal_id: str):
         # Decided is a LOCAL fact from this instant. `select_job` only persists READY, and the
         # consensus dedupe set is fed by `schedule_job` (~0.5 s later at a leaf) or by the

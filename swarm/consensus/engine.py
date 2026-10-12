@@ -507,6 +507,16 @@ class ConsensusEngine:
             if not self._finalize_if_quorum(object, proposal):
                 self._resolve_split(proposal.object_id)
 
+    @staticmethod
+    def _as_ids(values) -> set:
+        out = set()
+        for v in values or ():
+            try:
+                out.add(int(v))
+            except (TypeError, ValueError):
+                continue
+        return out
+
     def _ledger_note(self, proposal: ProposalInfo, voters) -> None:
         entry = self._commit_ledger.setdefault(proposal.object_id, {})
         held = entry.get(proposal.p_id)
@@ -527,18 +537,21 @@ class ConsensusEngine:
         every agent that knows the same — the same set of committed proposals — moves its commit
         to the same one, the best by the ordinary dominance rule, and it finalizes. An agent
         missing any voter's commit does nothing; the reselection timeout stays the fallback."""
-        count = getattr(self.host, "live_voter_count", None)
-        n = count() if callable(count) else None
+        ids = getattr(self.host, "live_voter_ids", None)
+        live = self._as_ids(ids()) if callable(ids) else None
         ledger = self._commit_ledger.get(object_id)
-        if not n or not ledger:
+        if not live or not ledger:
             return
         quorum = self.host.calculate_quorum()
         voters = set()
         for _prop, who in ledger.values():
-            if len(who) >= quorum:
+            if len(self._as_ids(who)) >= quorum:
                 return                        # a decision exists; the ordinary path finishes it
-            voters |= who
-        if len(voters) < n:
+            voters |= self._as_ids(who)
+        # Every LIVE voter by id, not a count of distinct voters: a commit from an agent outside
+        # the live set, or one id seen as both "3" and 3, made the count reach n while a live
+        # voter's COMMIT was still unknown (stop-time review).
+        if not live <= voters:
             return
         target = None
         for prop, _who in ledger.values():
