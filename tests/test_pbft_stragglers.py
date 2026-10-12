@@ -234,6 +234,7 @@ def _agent():
     a.topology = MagicMock(level=1, group=0)
     a.job_assignments = MagicMock()
     a.pending_proposals, a.pending_prepares, a.pending_commits = {}, {}, {}
+    a.__dict__["runtime_config"] = {}
     a._init_decision_state()
     return a
 
@@ -276,14 +277,19 @@ def test_a_reset_record_is_forgotten_here_and_in_the_engine():
     a.engine.forget_decision.assert_called_with("j1")
 
 
-def test_a_delayed_ready_is_not_a_reset_however_long_it_takes():
+def test_a_delayed_ready_is_not_a_reset_within_the_grace():
     """The record the scan sees is the pre-election one — its transition stamp predates the
     decision — and it stays that way for as long as the leader's READY write is delayed. Redis
     is slow under exactly the load that delays the stragglers, so a timer here re-opened the
-    straggler window at the worst moment. Evidence, not elapsed time."""
+    straggler window at the worst moment. Evidence, not elapsed time — WITHIN
+    `decided_unpersisted_grace_s` (60 s). Past it, since 2026-10-12, a still-PENDING decided
+    job is re-elected (`_decided_but_unpersisted`): the straggler window (~20 s at the worst
+    inbox lag measured) is long closed by then, and a leader whose READY lands later still
+    cannot run the job twice. This test used to say "however long it takes"; a decision no
+    leader acts on (job 1063, 2026-10-10) then stranded its job for the run."""
     a = _agent()
     a._note_decided("j1")
-    a._decided_jobs["j1"] -= 3600                                   # decided an hour ago
+    a._decided_jobs["j1"] -= 30                                     # decided 30 s ago
     a.repository.get_many.return_value = {"j1": _pending_record("j1", time.time() - 7200)}
     a._update_pending_jobs(["j1"])
     assert a.is_job_completed("j1"), "an old PENDING record is not evidence of a reset"

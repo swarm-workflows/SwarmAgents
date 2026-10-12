@@ -104,6 +104,8 @@ def resolve_coordinator_cost_matrix(job_cfg: dict) -> str:
 
 #: `runtime.reselection_timeout_s` when the key is absent; equal to the shipped config.
 RESELECTION_TIMEOUT_DEFAULT_S = 300.0
+#: `runtime.decided_unpersisted_grace_s` when the key is absent; equal to the shipped config.
+DECIDED_UNPERSISTED_GRACE_DEFAULT_S = 60.0
 #: `runtime.failure_threshold_seconds` when the key is absent; equal to the shipped config.
 FAILURE_THRESHOLD_DEFAULT_S = 60
 
@@ -664,6 +666,13 @@ class ResourceAgent(Agent):
         return self.runtime_config.get("reselection_timeout_s", RESELECTION_TIMEOUT_DEFAULT_S)
 
     @property
+    def decided_unpersisted_grace_s(self) -> float:
+        """PBFT: how long a job this agent saw decided may stay PENDING in Redis before the
+        decision is treated as one nobody acted on (see `_decided_but_unpersisted`). 0 disables."""
+        return float(self.runtime_config.get("decided_unpersisted_grace_s",
+                                             DECIDED_UNPERSISTED_GRACE_DEFAULT_S))
+
+    @property
     def shutdown_drain_timeout_s(self) -> float:
         """Teardown's budget for jobs already running, in seconds.
 
@@ -1150,7 +1159,8 @@ class ResourceAgent(Agent):
                 # reset only if the record says so; otherwise it is a leader that has not
                 # persisted READY yet, and the local object (COMMIT) must not be replaced by
                 # the stale PENDING record or the decision forgotten.
-                if not (job_id in unclaimed or self._reset_evidence(job_id, job)):
+                if not (job_id in unclaimed or self._reset_evidence(job_id, job)
+                        or self._decided_but_unpersisted(job_id, job)):
                     continue
                 if not self._forget_decided(job_id, wait=False):
                     continue                     # being decided right now; next scan
@@ -3357,6 +3367,7 @@ class ResourceAgent(Agent):
             # Reselection-timeout resets written to the job record so peers re-vote
             # (_persist_restart). Non-zero means an election stalled for the full timeout.
             "restarts_persisted": int(getattr(self, "restarts_persisted", 0)),
+            "decided_unpersisted_resets": int(getattr(self, "decided_unpersisted_resets", 0)),
             "refusal_retries": int(getattr(self.metrics, 'refusal_retries', 0)),
             # When THIS agent's failure-simulation clock started. Failure phases are resolved
             # against it per agent, and a 30-host remote launch spreads starts over a minute,
@@ -3665,6 +3676,39 @@ class ResourceAgent(Agent):
         except (TypeError, ValueError):
             return False
         return transitioned_at > decided_at + self._RESET_EVIDENCE_SLACK_S
+
+    def _decided_but_unpersisted(self, job_id: str, record: Optional[dict]) -> bool:
+        """PBFT: was this job decided here long enough ago that its leader should have written
+        READY, and the record still says PENDING? Then nobody is acting on the decision and the
+        job is re-elected rather than left to the reselection timeout — which a decided job never
+        reaches anyway, since a decided job is out of the consensus states it scans.
+
+        Elapsed time, which `_reset_evidence` deliberately is not: there it would decide that a
+        reset HAPPENED; here it decides only that a decision is not being acted on, and the
+        grace (60 s) is far past the persist path's normal latency (milliseconds) and past the
+        ~20 s inbox lag measured on the busiest coordinator, so stragglers are long done. A
+        leader that does write READY after all cannot run the job twice: the new winner's
+        `select_job` persists under `not_decided_elsewhere` and steps aside. The case it exists
+        for is a decision with no live leader — job 1063 (Hier-90 PBFT run05, 2026-10-10)
+        finalized for 84 at agent 83 and for 83 everywhere else, so neither ran it. The sticky
+        COMMIT (`ConsensusEngine._committed_to`) removes that cause; this bounds any other.
+        Snow is excluded: its decision is a claim, and a PENDING record with no claim is
+        already read as a reset."""
+        if isinstance(getattr(self, "engine", None), GossipConsensusEngine):
+            return False
+        if not record or not self._record_is_pending(record):
+            return False
+        grace = self.decided_unpersisted_grace_s
+        if grace <= 0:
+            return False
+        with self.completed_lock:
+            decided_at = self._decided_jobs.get(job_id)
+        if decided_at is None or time.time() - decided_at <= grace:
+            return False
+        self.decided_unpersisted_resets = getattr(self, "decided_unpersisted_resets", 0) + 1
+        self.logger.info(f"[DECIDED_UNPERSISTED] Job {job_id} decided "
+                         f"{time.time() - decided_at:.0f}s ago and still PENDING; re-electing")
+        return True
 
     @staticmethod
     def _record_is_pending(record: dict) -> bool:

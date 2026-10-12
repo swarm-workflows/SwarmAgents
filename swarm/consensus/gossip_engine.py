@@ -560,7 +560,11 @@ class GossipConsensusEngine:
             self._finalize(state, self.agent_id, reason="single-node")
             return None
         query_id = uuid.uuid4().hex
+        own_now = self._own_cost_now(state)
         with self._lock:
+            if own_now is not None and state.preferred == self.agent_id:
+                state.preferred_cost = own_now
+                state.cost_of[self.agent_id] = own_now
             state.pending_query_id = query_id
             state.pending_responses = []
             state.round_deadline = now + self.round_timeout_s
@@ -575,6 +579,27 @@ class GossipConsensusEngine:
             "round": state.round_no,
         }
         return peers, item
+
+    def _own_cost_now(self, state: _SnowState) -> Optional[float]:
+        """This agent's cost for the job NOW, in the units a peer answers in, while the vote
+        still backs this agent; None when it backs someone else or the host cannot say.
+
+        The advertised cost used to be frozen at proposal time for the whole instance (up to
+        `max_rounds`, ~170 s under load), while every peer compares it with its own CURRENT
+        cost. Once this agent's load fell, its stale price sat above its real one, a peer
+        falling in that gap voted for itself on every round, and with two peers one defection
+        blocks α — so every coordinator of a group split on every round and abandoned.
+        Measured 2026-10-12 (aa2b9bb9 diagnostics, Hybrid+LinUCB Hier-90): all 42,863 failed
+        rounds of 429 abandons were full splits, advertised 0.63 against an own cost of 0.55
+        and a peer voting itself at 0.61. Re-priced here from `my_cost_for_job`, the very
+        number this agent answers peers with, so a proposal and an answer cannot disagree."""
+        if state.preferred != self.agent_id:
+            return None
+        try:
+            cost = self.host.my_cost_for_job(state.proposal.object_id)
+        except Exception:
+            return None
+        return None if cost is None else float(cost)
 
     def _flush_query_batches(self, pending_sends: List[tuple], now: float) -> None:
         buckets: Dict[int, List[dict]] = {}

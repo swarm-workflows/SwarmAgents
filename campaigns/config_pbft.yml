@@ -57,6 +57,7 @@ runtime:
   peer_expiry_seconds: 300
   empty_timeout_seconds: 300
   reselection_timeout_s: 300          # also the code default when the key is absent (was 60 until 2026-10-06)
+  decided_unpersisted_grace_s: 60     # PBFT: a job decided here but still PENDING this long is re-elected; 0 disables
   results_dir: swarm-multi
   shutdown_mode: manual
   total_agents: 5                     # placeholder; generate_configs.py overwrites per fleet

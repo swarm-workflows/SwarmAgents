@@ -122,9 +122,14 @@ def test_participant_also_commits_once():
     assert len(_commits(eng)) == 1
 
 
-def test_adopting_a_better_proposal_still_commits():
-    """Suppression is per proposal, not per object: a better proposal must still commit, or
-    the fix would trade redundant messages for lost decisions."""
+def test_a_better_proposal_commits_only_after_a_reset():
+    """Suppression is per proposal, not per object — but a COMMIT is binding (2026-10-12).
+
+    This test used to require a SECOND COMMIT for a better proposal after the first, which is
+    the defect: a voter counted toward two quorums and two proposals for one job finalized
+    (`tests/test_split_decision.py`). The better proposal is held while the election this
+    agent committed in is live, and commits once the host resets it, so a re-election still
+    reaches a decision rather than trading duplicates for lost ones."""
     obj = _Obj()
     eng = _engine(obj, quorum=2)
     mine = _info(p_id="p1", agent_id="1", cost=9.0)
@@ -136,7 +141,10 @@ def test_adopting_a_better_proposal_still_commits():
     better = _info(p_id="p2", agent_id="2", cost=0.1)
     for sender in (2, 3):
         eng.on_prepare(_prepare_from(sender, [better]))
+    assert len(_commits(eng)) == 1, "committed to p1: p2 is held"
 
+    eng.forget_decision("j1")
+    eng.on_prepare(_prepare_from(3, [better]))
     assert len(_commits(eng)) == 2
 
 

@@ -82,6 +82,19 @@ class ConsensusEngine:
         # rather than by object so that adopting a better proposal (which resets the object
         # to PREPARE) still commits, and so does a re-proposal after a reselection timeout.
         self._commits_sent: set[tuple[str, str]] = set()
+        # object_id -> the ONE p_id this agent has sent COMMIT for in the current election.
+        # A COMMIT is binding: until the election ends here (finalize) or the host resets it
+        # (`forget_decision`), this agent commits to no other proposal for the object, and its
+        # committed proposal is never dropped as "worse". Without it a voter that had committed
+        # still switched to a cheaper late proposal and committed again, its first COMMIT never
+        # withdrawn — one voter counted toward two quorums, so two proposals for one job both
+        # finalized: 8 jobs ran twice in the first E0 cells (2026-10-09), and job 1063 of Hier-90
+        # PBFT run05 (2026-10-10) finalized for 84 at agent 83 and for 83 everywhere else, so
+        # neither ran it. With every voter in at most one commit set, two commit quorums (each a
+        # majority) cannot form in a connected tier. Cost: a split with no majority left waits
+        # for the reselection timeout instead of being resolved by switching.
+        self._committed_to: dict[str, str] = {}
+        self.commit_lock_holds = 0
         # (object_id, p_id) pairs this agent has already FINALIZED, kept after the object
         # leaves the containers. Finalization used to erase every trace of a decision at once
         # (`_forget_object`), and that is exactly when the stragglers arrive: every tier wider
@@ -153,6 +166,9 @@ class ConsensusEngine:
             "reproposals": self.reproposals,
             "conflict_rounds": sum(self.conflicts.values()),
             "conflict_objects": len(self.conflicts),
+            # Prepare quorums this agent declined to COMMIT because it had committed to another
+            # proposal for the object (`_committed_to`). Counted per evaluation, not per job.
+            "commit_lock_holds": self.commit_lock_holds,
         }
         stats.update(self.votes_to_finalize.summary("votes_"))
         stats.update(self.time_to_finalize.summary("finalize_s_"))
@@ -195,10 +211,13 @@ class ConsensusEngine:
         so it is now a per-object rank that no agent wins systematically.
         """
         all_proposals = container.get_proposals_by_object_id(incoming_proposal.object_id)
+        locked = self._committed_to.get(incoming_proposal.object_id)
 
         for existing in all_proposals:
             if existing.p_id == incoming_proposal.p_id:
                 continue  # Don't compare proposal to itself
+            if existing.p_id == locked:
+                continue  # Committed to it: its commits must still be counted here
 
             # Determine if existing proposal is worse
             is_worse = dominates(incoming_proposal.object_id,
@@ -361,7 +380,7 @@ class ConsensusEngine:
 
                     # FIX: If we accepted a better proposal while in COMMIT phase, reset to PREPARE
                     # This ensures we properly vote for the better proposal
-                    if object.is_commit:
+                    if object.is_commit and object.object_id not in self._committed_to:
                         self.host.log_debug(
                             f"Resetting object {object.object_id} from COMMIT to PREPARE "
                             f"for better proposal {p.p_id} (cost={p.cost})"
@@ -379,7 +398,8 @@ class ConsensusEngine:
             if (object.object_id, proposal.p_id) in self._commits_sent:
                 continue
 
-            object.state = ObjectState.PREPARE
+            if self._committed_to.get(object.object_id) is None:
+                object.state = ObjectState.PREPARE
             proposals.append(proposal)
 
         self._commit_where_prepared(proposals)
@@ -395,6 +415,7 @@ class ConsensusEngine:
         stale = [k for k in self._commits_sent if k[0] == object_id]
         for k in stale:
             self._commits_sent.discard(k)
+        self._committed_to.pop(object_id, None)
 
     def _note_finalized(self, object_id: str, p_id: str, now: float) -> None:
         key = (object_id, p_id)
@@ -419,6 +440,8 @@ class ConsensusEngine:
         fresh COMMIT — the very duplication this file exists to prevent."""
         for key in [k for k in self._finalized if k[0] == object_id]:
             self._finalized.pop(key, None)
+        # A reset ends the election this agent committed in; the new one carries new p_ids.
+        self._committed_to.pop(object_id, None)
 
     # ---------- vote counting ----------
     #
@@ -445,6 +468,12 @@ class ConsensusEngine:
                 continue
             if len(proposal.prepares) < quorum:
                 continue
+            locked = self._committed_to.get(proposal.object_id)
+            if locked is not None and locked != proposal.p_id:
+                self.commit_lock_holds += 1
+                self.host.log_debug(f"Object: {proposal.object_id} prepare quorum for "
+                                    f"{proposal.p_id}, but committed to {locked}; holding")
+                continue
             object = self.host.get_object(proposal.object_id)
             if object is None:
                 continue
@@ -456,6 +485,7 @@ class ConsensusEngine:
             return
         for _obj, proposal in ready:
             self._commits_sent.add((proposal.object_id, proposal.p_id))
+            self._committed_to[proposal.object_id] = proposal.p_id
             self._add_vote(proposal.commits)
         commit = Commit(source=self.agent_id, agents=[AgentInfo(agent_id=self.agent_id)],
                         proposals=[p for _o, p in ready])
