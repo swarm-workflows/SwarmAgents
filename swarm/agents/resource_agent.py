@@ -122,12 +122,16 @@ class _HostAdapter(ConsensusHost):
         # Not in local queue - fetch from Redis on-demand
         # This allows agents to vote on proposals even if they haven't pulled the job locally yet
         try:
+            began = time.monotonic()
             job_data = self.agent.repository.get(
                 obj_id=object_id,
                 key_prefix=Repository.KEY_JOB,
                 level=self.agent.topology.level,
                 group=self.agent.topology.group
             )
+            # A WAN round trip, usually on the single inbound thread: timed so a slow consumer
+            # can be attributed (see `_note_handler_time`).
+            self.agent._note_handler_time("get_object_redis", time.monotonic() - began)
             if job_data:
                 self.agent.logger.debug(f"Fetched job {object_id} from Redis for consensus voting")
                 job = Job()
@@ -220,7 +224,9 @@ class _HostAdapter(ConsensusHost):
             self.agent.duplicate_leader_refusals = (
                 getattr(self.agent, "duplicate_leader_refusals", 0) + 1)
             return
+        began = time.monotonic()
         self.agent.select_job(obj)
+        self.agent._note_handler_time("select_job", time.monotonic() - began)
     def on_participant_commit(self, obj: Object, leader_id: int, proposal_id: str):
         self.agent._note_decided(obj.object_id)
         obj.state = ObjectState.COMMIT
@@ -1055,9 +1061,25 @@ class ResourceAgent(Agent):
     def __on_commit(self, incoming: Commit):
         self.engine.on_commit(incoming)
 
+    def _note_handler_time(self, key: str, seconds: float) -> None:
+        """Time spent on the inbound path, by message type (and by the slow calls inside it).
+        A leaf's inbound queue reached 3,477 messages in the Hybrid+LinUCB pilot (ee76e05b)
+        while it received ~10 messages/s, and only calls of a whole second or more were ever
+        logged, so where the consumer's time went was not measurable. Exported as
+        `inbound_timing` in metrics.json."""
+        table = self.__dict__.setdefault("_inbound_timing", {})
+        row = table.get(key)
+        if row is None:
+            row = table[key] = [0, 0.0, 0.0]
+        row[0] += 1
+        row[1] += seconds
+        if seconds > row[2]:
+            row[2] = seconds
+
     def _process(self, messages: list[dict]):
         for message in messages:
             message_type = MessageType(message.get('message_type'))
+            began_mono = time.monotonic()
             try:
                 begin = time.time()
                 incoming = MessageBuilder.from_dict(message)
@@ -1112,6 +1134,8 @@ class ResourceAgent(Agent):
             except Exception as e:
                 self.logger.error(f"Error while processing message {type(message)}, {e}")
                 self.logger.error(traceback.format_exc())
+            finally:
+                self._note_handler_time(message_type.name, time.monotonic() - began_mono)
 
     def _update_pending_jobs(self, jobs: list[str]):
         # One MGET for every job we don't have locally — the per-id get() loop paid a
@@ -3378,6 +3402,8 @@ class ResourceAgent(Agent):
             # (_persist_restart). Non-zero means an election stalled for the full timeout.
             "restarts_persisted": int(getattr(self, "restarts_persisted", 0)),
             "decided_unpersisted_resets": int(getattr(self, "decided_unpersisted_resets", 0)),
+            "inbound_timing": {k: {"n": v[0], "total_s": round(v[1], 3), "max_s": round(v[2], 3)}
+                               for k, v in dict(self.__dict__.get("_inbound_timing", {})).items()},
             "refusal_retries": int(getattr(self.metrics, 'refusal_retries', 0)),
             # When THIS agent's failure-simulation clock started. Failure phases are resolved
             # against it per agent, and a 30-host remote launch spreads starts over a minute,
