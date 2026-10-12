@@ -343,15 +343,21 @@ class TestMonitor:
         assert rec["state"] == ObjectState.COMPLETE.value
         assert rec["exit_status"] == 3
 
-    def test_the_grace_drop_does_not_write_complete(self):
+    def test_the_grace_does_not_write_complete_but_a_late_completion_does(self):
         repo = Repository(_FakeRedis(), run_id="t")
         coord = _coordinator(repo)
         _delegated(repo, coord, groups=(1,))
         _set_child_state(repo, "j1", 1, ObjectState.RUNNING)
         self._age(coord, "j1", coord.delegation_timeout_s + coord.delegation_exec_grace_s + 5)
         coord._monitor_delegated_jobs()
-        assert coord.delegated_jobs.get("j1") is None
+        assert coord.delegated_jobs.get("j1") is not None, "still watched past the grace"
         assert _record(repo, "j1", COORD_LEVEL, COORD_GROUP)["state"] == ObjectState.READY.value
+
+        _set_child_state(repo, "j1", 1, ObjectState.COMPLETE, exit_status=2)
+        coord._monitor_delegated_jobs()
+        rec = _record(repo, "j1", COORD_LEVEL, COORD_GROUP)
+        assert (rec["state"], rec["exit_status"]) == (ObjectState.COMPLETE.value, 2)
+        assert coord.delegated_jobs.get("j1") is None
 
 
 # --------------------------------------------------------------------------- #

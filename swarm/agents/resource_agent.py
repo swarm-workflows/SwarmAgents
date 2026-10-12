@@ -1605,17 +1605,25 @@ class ResourceAgent(Agent):
                 # Picked up by a child, not finished. Since P0-9 the child persists RUNNING for
                 # the job's whole execution, so this can legitimately outlast
                 # `delegation_timeout_s` (which bounds selection, not execution).
-                if time_since_delegation > self.delegation_timeout_s + self.delegation_exec_grace_s:
+                if (time_since_delegation > self.delegation_timeout_s + self.delegation_exec_grace_s
+                        and not delegation_info.get('bandit_closed')):
                     self.logger.warning(
                         f"Delegated job {job_id} still {copies[in_progress[0]]} at child group "
                         f"{in_progress[0]} {time_since_delegation:.0f}s after delegation "
                         f"(grace {self.delegation_exec_grace_s:.0f}s past the "
-                        f"{self.delegation_timeout_s:.0f}s timeout) — dropping it from "
-                        f"delegation tracking without a bandit outcome")
+                        f"{self.delegation_timeout_s:.0f}s timeout) — closing its bandit "
+                        f"outcome; still watching for its completion")
                     # NOT a completion: the parent record is left as it is (§17 — writing
                     # COMPLETE here recorded a job nobody finished, and if its group died the
-                    # job was lost under a COMPLETE label).
-                    jobs_processed.append((job_id, None))
+                    # job was lost under a COMPLETE label). Nor is it the end of tracking: this
+                    # used to drop the job, so its completion was never propagated, this tier's
+                    # record stayed READY for the rest of the run and the runner's in-flight
+                    # drain waited 600 s on it and stopped TRUNCATED — a leaf that queued a
+                    # delegated job for 11 min (pilot ee76e05b, 3 jobs; PBFT+LinUCB runs 1 and 4
+                    # of the 3482e92c campaign, 5 and 29). Only the bandit's window closes here:
+                    # a late completion still reaches this record, and the bandit hears nothing.
+                    delegation_info = dict(delegation_info, bandit_closed=True)
+                    self.delegated_jobs.set(job_id, delegation_info)
             elif unpicked and timed_out:
                 job_still_pending = True
                 self.logger.warning(
@@ -1635,7 +1643,8 @@ class ResourceAgent(Agent):
 
             # Feed MAB reward for completed jobs — credit the group where
             # completion was observed (works for any top_k)
-            if mab_active and job_complete and completed_group is not None:
+            if (mab_active and job_complete and completed_group is not None
+                    and not delegation_info.get('bandit_closed')):
                 success = (job_exit_status == 0)
                 latency_s = time_since_delegation if delegated_at else None
                 reward = self.mab_manager.report_outcome(

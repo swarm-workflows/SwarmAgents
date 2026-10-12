@@ -243,7 +243,10 @@ def test_the_p09_sequence_running_then_complete_reports_the_failure_not_a_succes
     assert success is False
 
 
-def test_stuck_in_progress_job_is_dropped_only_after_the_grace_and_without_an_outcome():
+def test_stuck_in_progress_job_closes_its_outcome_after_the_grace_but_stays_watched():
+    """Past the grace the bandit's window closes — no outcome then or later — but the job is
+    still watched, so its completion reaches this tier's record (it used to be dropped, the
+    record stayed READY and the run's in-flight drain stopped truncated)."""
     a = make_coordinator({"delegation_timeout_s": 10.0, "delegation_exec_grace_s": 20.0})
     _delegate(a, "j1", group=1, ago_s=31.0)          # past timeout + grace
     a.repository.child_view[("j1", 1)] = {"state": ObjectState.RUNNING.value, "exit_status": 0}
@@ -251,8 +254,14 @@ def test_stuck_in_progress_job_is_dropped_only_after_the_grace_and_without_an_ou
     a._monitor_delegated_jobs()
 
     a.mab_manager.report_outcome.assert_not_called()
+    assert "j1" in a.delegated_jobs
+    assert a.delegated_jobs.get("j1").get("bandit_closed") is True
+    assert any("closing its bandit outcome" in w for w in a.logger.warnings)
+
+    a.repository.child_view[("j1", 1)] = {"state": ObjectState.COMPLETE.value, "exit_status": 0}
+    a._monitor_delegated_jobs()
+    a.mab_manager.report_outcome.assert_not_called()
     assert "j1" not in a.delegated_jobs
-    assert any("dropping it from delegation tracking" in w for w in a.logger.warnings)
 
 
 def test_exec_grace_defaults_to_the_wall_time_cap_and_never_to_zero():
