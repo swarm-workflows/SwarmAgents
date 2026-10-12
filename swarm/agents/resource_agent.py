@@ -119,6 +119,19 @@ class _HostAdapter(ConsensusHost):
         if job:
             return job
 
+        # Never a Redis round trip on the single inbound consumer: a leaf paid one per message
+        # for every job it did not hold, and none at all was cached for a job past PENDING, so
+        # one leaf spent 310 s of its consumer in this GET (7,371 calls on another) while its
+        # inbound queue grew to 3,477 messages and the jobs it had won waited minutes to be
+        # acted on (inbound_timing, 43596385). From the consumer the job is reported missing;
+        # the engine stashes the message (`set_pending_*`), the stash queues the job for the
+        # background fetcher, and the fetcher replays the stash once the job is local
+        # (`_job_fetch_batch`). Every other caller — a Snow finalize on its pool — still reads
+        # Redis here, since it has nowhere to stash.
+        if threading.get_ident() == getattr(self.agent, "_inbound_thread_ident", None):
+            self.agent.inbound_fetch_deferred = getattr(self.agent, "inbound_fetch_deferred", 0) + 1
+            return None
+
         # Not in local queue - fetch from Redis on-demand
         # This allows agents to vote on proposals even if they haven't pulled the job locally yet
         try:
@@ -169,6 +182,9 @@ class _HostAdapter(ConsensusHost):
                 self.agent.pending_consensus_dropped += 1
                 return
             bucket.append(msg)
+        # After the stash, never before: the fetcher replays what is stashed, so a request made
+        # first could fetch and replay before this message was in it.
+        agent._request_job_fetch(object_id)
 
     #: How long a stashed message waits for its job (§G). Only a job id appearing in the PENDING
     #: scan drained the stash, so messages for a job that never becomes PENDING here (a child
@@ -338,7 +354,10 @@ class _SwimAdapter:
         self.agent_id = agent.agent_id
 
     def send(self, dest: int, payload: object) -> None:
-        self.agent.send(dest, payload)
+        # Fire-and-forget: acks are sent from the inbound consumer and probes from the periodic
+        # thread (which also writes the heartbeat); neither may wait on a peer. A lost probe or
+        # ack is what SWIM's indirect probing exists for.
+        self.agent.send_async(dest, payload)
 
     def known_peers(self):
         # neighbor_map is the canonical peer set; SWIM seeds from it.
@@ -1060,6 +1079,82 @@ class ResourceAgent(Agent):
 
     def __on_commit(self, incoming: Commit):
         self.engine.on_commit(incoming)
+
+    #: How long a job found past PENDING (or absent) is not fetched again for a stashed message.
+    _FETCH_NEGATIVE_TTL_S = 10.0
+
+    def _request_job_fetch(self, job_id: str) -> None:
+        """Queue *job_id* for the background fetcher (see `_HostAdapter.get_object`)."""
+        if not job_id:
+            return
+        neg = self.__dict__.setdefault("_fetch_negative", {})
+        if neg.get(job_id, 0.0) > time.monotonic():
+            return
+        guard = self.__dict__.setdefault("_fetch_guard", threading.Lock())
+        with guard:
+            inflight = self.__dict__.setdefault("_fetch_inflight", set())
+            if job_id in inflight:
+                return
+            inflight.add(job_id)
+            q = self.__dict__.get("_fetch_queue")
+            if q is None:
+                import queue as _queue
+                q = self._fetch_queue = _queue.Queue()
+                threading.Thread(target=self._job_fetch_loop, name="job-fetch",
+                                 daemon=True).start()
+        q.put(job_id)
+
+    def _job_fetch_loop(self) -> None:
+        import queue as _queue
+        while not getattr(self, "shutdown", False):
+            try:
+                first = self._fetch_queue.get(timeout=0.5)
+            except _queue.Empty:
+                continue
+            time.sleep(0.05)                      # let a burst coalesce into one MGET
+            ids = [first]
+            while len(ids) < 256:
+                try:
+                    ids.append(self._fetch_queue.get_nowait())
+                except _queue.Empty:
+                    break
+            try:
+                self._job_fetch_batch(ids)
+            except Exception as e:                # never let the fetcher die
+                try:
+                    self.logger.warning(f"job fetch of {len(ids)} ids failed: {e}")
+                    with self._fetch_guard:
+                        self._fetch_inflight.difference_update(ids)
+                except Exception:
+                    pass
+
+    def _job_fetch_batch(self, ids: list) -> None:
+        """One MGET for jobs that consensus messages named before this agent held them: a
+        PENDING record joins the pending queue and its stashed messages are replayed; anything
+        else is remembered for `_FETCH_NEGATIVE_TTL_S` so a stream of stragglers about a job
+        decided elsewhere costs one fetch, not one per message. Runs on the fetcher thread."""
+        began = time.monotonic()
+        fetched = self.repository.get_many(ids, key_prefix=Repository.KEY_JOB,
+                                           level=self.topology.level, group=self.topology.group)
+        self._note_handler_time("job_fetch_batch", time.monotonic() - began)
+        neg = self.__dict__.setdefault("_fetch_negative", {})
+        now = time.monotonic()
+        for job_id in ids:
+            record = fetched.get(job_id)
+            if record and self._record_is_pending(record):
+                if self.queues.pending_queue.get(job_id) is None:
+                    job = Job()
+                    job.from_dict(record)
+                    self.queues.pending_queue.add(job)
+                    self.queues.pending_event.set()
+                self._replay_pending_consensus(job_id)
+            else:
+                neg[job_id] = now + self._FETCH_NEGATIVE_TTL_S
+        if len(neg) > 8192:
+            for k in [k for k, t in neg.items() if t <= now]:
+                neg.pop(k, None)
+        with self._fetch_guard:
+            self._fetch_inflight.difference_update(ids)
 
     def _note_handler_time(self, key: str, seconds: float) -> None:
         """Time spent on the inbound path, by message type (and by the slow calls inside it).
@@ -3402,6 +3497,7 @@ class ResourceAgent(Agent):
             # (_persist_restart). Non-zero means an election stalled for the full timeout.
             "restarts_persisted": int(getattr(self, "restarts_persisted", 0)),
             "decided_unpersisted_resets": int(getattr(self, "decided_unpersisted_resets", 0)),
+            "inbound_fetch_deferred": int(getattr(self, "inbound_fetch_deferred", 0)),
             "inbound_timing": {k: {"n": v[0], "total_s": round(v[1], 3), "max_s": round(v[2], 3)}
                                for k, v in dict(self.__dict__.get("_inbound_timing", {})).items()},
             "refusal_retries": int(getattr(self.metrics, 'refusal_retries', 0)),

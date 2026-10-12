@@ -144,6 +144,34 @@ class GrpcTransport(Observer):
             if self._bcast_sem is not None:
                 self._bcast_sem.release()
 
+    def _ensure_pool(self) -> None:
+        # Lazy pool init (broadcast can be called before/without start()).
+        if self._bcast_pool is None:
+            self._bcast_pool = ThreadPoolExecutor(
+                max_workers=self.bcast_workers, thread_name_prefix="bcast")
+            self._bcast_sem = threading.BoundedSemaphore(self.bcast_workers * 8)
+
+    def send_async(self, host: str, port: int, src: int, dest: int, payload: object) -> bool:
+        """One fire-and-forget unicast on the fan-out pool, with the fan-out's reduced
+        retries. False (counted as dropped) when the pool is saturated."""
+        if not isinstance(payload, Message):
+            raise TypeError("Payload must be of Message type")
+        self._ensure_pool()
+        msg_type = str(payload.message_type)
+        if not self._bcast_sem.acquire(blocking=False):
+            self.bcast_sends_dropped += 1
+            self.counters.record_dropped(msg_type)
+            return False
+        try:
+            self._bcast_pool.submit(self._bcast_send, host, port, src, dest,
+                                    json.dumps(payload.to_dict()), msg_type)
+            return True
+        except RuntimeError:  # pool shutting down
+            self._bcast_sem.release()
+            self.bcast_sends_dropped += 1
+            self.counters.record_dropped(msg_type)
+            return False
+
     def broadcast(self, payload: object, peers: list[int], neighbor_map: object, sender: int) -> None:
         if not isinstance(payload, Message):
             raise TypeError("Payload must be of Message type")
@@ -151,11 +179,7 @@ class GrpcTransport(Observer):
         if not isinstance(neighbor_map, ThreadSafeDict):
             raise TypeError("Neighbor map must be ThreadSafeDict")
 
-        # Lazy pool init (broadcast can be called before/without start()).
-        if self._bcast_pool is None:
-            self._bcast_pool = ThreadPoolExecutor(
-                max_workers=self.bcast_workers, thread_name_prefix="bcast")
-            self._bcast_sem = threading.BoundedSemaphore(self.bcast_workers * 8)
+        self._ensure_pool()
 
         payload.path.append(sender)
         payload_json = json.dumps(payload.to_dict())

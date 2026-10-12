@@ -431,6 +431,9 @@ class Agent(Observer):
 
     def _do_inbound(self):
         self.logger.info("Inbound Message Handler - Start")
+        # Which thread is the single inbound consumer: paths that would block it (a Redis
+        # round trip in `get_object`) take a non-blocking route when called from it.
+        self._inbound_thread_ident = threading.get_ident()
         while not self.shutdown:
             try:
                 self.queues.message_event.wait(timeout=0.5)
@@ -540,6 +543,21 @@ class Agent(Observer):
         self.transport.send(host=peer_info.host, port=peer_info.port, payload=payload,
                       dest=peer_info.agent_id, src=self.agent_id,
                       timeout=timeout, retries=retries)
+
+    def send_async(self, dest: int, payload: object) -> None:
+        """Fire-and-forget unicast on the transport's send pool. For best-effort protocol
+        traffic (SWIM probes and acks) sent from threads that must not wait on a peer: an ack
+        sent synchronously from the inbound consumer cost a WAN round trip per ping — 250 s of
+        one leaf's consumer in a Hier-90 Hybrid run (inbound_timing, 43596385)."""
+        peer_info = self.neighbor_map.get(dest)
+        if peer_info is None:
+            return
+        sender = getattr(self.transport, "send_async", None)
+        if sender is None:
+            self.send(dest, payload)
+            return
+        sender(host=peer_info.host, port=peer_info.port, payload=payload,
+               dest=peer_info.agent_id, src=self.agent_id)
 
     def calculate_quorum(self) -> int:
         # Simple majority over the live set. `live_agent_count` is `len(neighbor_map)`, and
