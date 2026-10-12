@@ -8,6 +8,9 @@ lower and the choice reinforces itself. `mab.linucb.model: disjoint` keeps one m
 `mab.load_slack` keeps the choice among the near-least-loaded groups, and the LinUCB campaign
 configs turn on `reward.shaped`.
 """
+import collections
+import heapq
+import random
 from unittest.mock import MagicMock
 
 import pytest
@@ -127,3 +130,90 @@ class TestManager:
     def test_stats_report_the_guard(self):
         stats = _mgr(slack=9).get_stats()
         assert (stats["load_slack"], stats["load_guard_decisions"]) == (9.0, 0)
+
+
+def _burst(model, slack, shaped, seed, n=600, span=120.0, slots=36, groups=(6, 7, 8)):
+    """Route a seeded burst through the REAL `MABManager.select_groups` / `report_outcome` path
+    (policy, load guard, reward shaping) into three equal groups of `slots` execution slots.
+    Returns (busiest group's share, p95 delegation-to-completion latency). Deterministic per
+    seed; ~0.1 s."""
+    random.seed(seed)
+    rnd = random.Random(seed)
+    running = {g: 0 for g in groups}
+    inflight = {g: 0 for g in groups}
+    queue = {g: collections.deque() for g in groups}
+
+    def snaps():
+        return {g: GroupSnapshot(active_children=9,
+                                 cpu_headroom=max(0.0, 1 - running[g] / slots),
+                                 ram_headroom=max(0.0, 1 - running[g] / slots),
+                                 inflight=inflight[g]) for g in groups}
+
+    m = MABManager(agent_id=90, child_groups=list(groups), repository=MagicMock(),
+                   config={"algorithm": "linucb", "load_slack": slack,
+                           "linucb": {"model": model}, "reward": {"shaped": shaped}},
+                   group_snapshot_provider=snaps, delegation_timeout_s=600.0)
+    events, t = [], 0.0
+    for i in range(n):
+        t += rnd.expovariate(n / span)
+        heapq.heappush(events, (t, 0, i))
+    chosen, latencies = collections.Counter(), []
+    while events:
+        now, kind, data = heapq.heappop(events)
+        if kind == 0:
+            job = _job(data)
+            job.wall_time = rnd.uniform(5, 120)
+            g = m.select_groups(list(groups), job=job, top_k=1)[0]
+            chosen[g] += 1
+            inflight[g] += 1
+            item = (data, job.wall_time, now)
+            if running[g] < slots:
+                running[g] += 1
+                heapq.heappush(events, (now + job.wall_time, 1, (g,) + item))
+            else:
+                queue[g].append(item)
+        else:
+            g, job_id, _dur, t0 = data
+            running[g] -= 1
+            inflight[g] -= 1
+            latencies.append(now - t0)
+            m.report_outcome(g, str(job_id), True, latency_s=now - t0)
+            if queue[g]:
+                nxt, dur, tq = queue[g].popleft()
+                running[g] += 1
+                heapq.heappush(events, (now + dur, 1, (g, nxt, dur, tq)))
+    latencies.sort()
+    return max(chosen.values()) / n, latencies[int(len(latencies) * 0.95)]
+
+
+SEEDS = (1, 2, 3)
+
+
+class TestBurstRouting:
+    """Behaviour, not mechanism: under a saturating burst with every outcome a success (E1′
+    injects no failures), does routing herd? Measured at commit (8 seeds): shared/no guard/
+    binary 0.92-0.96 of jobs to one group, p95 805-871 s; the E1′ configuration 0.34, 255-280 s;
+    per-arm models without the guard 0.44-0.84 — which is why the guard is on as well."""
+
+    def test_the_shipped_bandit_herds(self):
+        for seed in SEEDS:
+            share, _ = _burst("shared", 0, False, seed)
+            assert share >= 0.8, f"seed {seed}: {share:.2f}"
+
+    def test_the_e1_configuration_spreads_the_burst(self):
+        for seed in SEEDS:
+            share, p95 = _burst("disjoint", 9, True, seed)
+            _, herded_p95 = _burst("shared", 0, False, seed)
+            assert share <= 0.40, f"seed {seed}: {share:.2f}"
+            assert p95 <= 0.5 * herded_p95, f"seed {seed}: p95 {p95:.0f} vs {herded_p95:.0f}"
+
+    def test_the_guard_alone_spreads_it_for_either_model(self):
+        for seed in SEEDS:
+            assert _burst("shared", 9, True, seed)[0] <= 0.40
+            assert _burst("disjoint", 9, False, seed)[0] <= 0.40
+
+    def test_per_arm_models_alone_herd_less_but_still_herd(self):
+        shared = sum(_burst("shared", 0, False, s)[0] for s in SEEDS) / len(SEEDS)
+        disjoint = sum(_burst("disjoint", 0, False, s)[0] for s in SEEDS) / len(SEEDS)
+        assert disjoint < shared
+        assert disjoint > 0.40, "if this ever balances on its own, revisit whether the guard is needed"
