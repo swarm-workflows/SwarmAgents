@@ -77,6 +77,17 @@ class TestStickyCommit:
         bus, _hosts = _race()
         assert sum(eng.consensus_stats()["commit_lock_holds"] for eng in bus.engines.values()) > 0
 
+    def test_one_batch_cannot_commit_two_proposals(self):
+        bus, _hosts = _cluster(3)
+        eng = bus.engines[2]
+        a = ProposalInfo(p_id="pA", object_id="j1", cost=5.0, agent_id=1, prepares=[1, 2, 3])
+        b = ProposalInfo(p_id="pB", object_id="j1", cost=1.0, agent_id=3, prepares=[1, 2, 3])
+        eng._commit_where_prepared([a, b])
+        sent = [json.loads(w) for _d, w in bus.queue]
+        committed = {p["p_id"] for m in sent for p in m["proposals"]}
+        assert committed == {"pA"}
+        assert eng._committed_to["j1"] == "pA"
+
     def test_committed_proposal_is_not_dropped_as_worse(self):
         bus, hosts = _cluster(3)
         eng = bus.engines[2]

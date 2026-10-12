@@ -477,6 +477,9 @@ class ConsensusEngine:
             object = self.host.get_object(proposal.object_id)
             if object is None:
                 continue
+            # Taken HERE, not after the loop: two proposals for one object can reach prepare
+            # quorum in the same batch, and a lock recorded only after it let both commit.
+            self._committed_to[proposal.object_id] = proposal.p_id
             self.host.log_debug(f"Object: {proposal.object_id} Agent: {self.agent_id} received "
                                 f"quorum prepares: {proposal.prepares}, starting commit!")
             object.state = ObjectState.COMMIT
@@ -485,7 +488,6 @@ class ConsensusEngine:
             return
         for _obj, proposal in ready:
             self._commits_sent.add((proposal.object_id, proposal.p_id))
-            self._committed_to[proposal.object_id] = proposal.p_id
             self._add_vote(proposal.commits)
         commit = Commit(source=self.agent_id, agents=[AgentInfo(agent_id=self.agent_id)],
                         proposals=[p for _o, p in ready])
