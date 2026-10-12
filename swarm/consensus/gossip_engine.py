@@ -105,6 +105,13 @@ class _SnowState:
     # finalize nor be re-opened: it would claim, or re-insert, a decision for an election that
     # is over.
     gen: int = 0
+    # Why rounds failed, for the abandon line: no response at all / every voter abstained or
+    # hinted / fewer answers than peers queried (silence counts against α) / a full split.
+    fail_empty: int = 0
+    fail_abstain: int = 0
+    fail_short: int = 0
+    fail_split: int = 0
+    last_votes: list = field(default_factory=list)   # [(peer_pref, cost)] of the last failed round
 
 
 #: The ONE default for every `consensus.snow.*` key (code review 2026-10-05 §G). The agent's
@@ -604,6 +611,7 @@ class GossipConsensusEngine:
             # No-one responded; reset confidence and retry.
             with self._lock:
                 state.confidence = 0
+                state.fail_empty += 1
             self._maybe_abort_or_continue(state, now)
             return
 
@@ -615,6 +623,7 @@ class GossipConsensusEngine:
         if not counts:
             with self._lock:
                 state.confidence = 0
+                state.fail_abstain += 1
             self._maybe_abort_or_continue(state, now)
             return
         top_choice, top_count = counts.most_common(1)[0]
@@ -653,6 +662,13 @@ class GossipConsensusEngine:
                 state.last_choice = top_choice
             else:
                 state.confidence = 0
+                if len(responses) < sampled:
+                    state.fail_short += 1
+                else:
+                    state.fail_split += 1
+                state.last_votes = [
+                    (r.preferred_agent, None if r.cost is None else round(float(r.cost), 3))
+                    for r in responses]
                 self._bump_conflict(state.proposal.object_id)
 
             ready_to_commit = state.confidence >= self.beta
@@ -667,9 +683,17 @@ class GossipConsensusEngine:
             elapsed = now - state.started_at if state.started_at else -1.0
             # Same grep surface as SNOW_TIMING — an overloaded tier abandoning every
             # decision must be visible, not inferred from the absence of finalizes.
+            try:
+                own_now = self.host.my_cost_for_job(state.proposal.object_id)
+            except Exception:
+                own_now = None
             self.host.log_warn(
                 f"[SNOW_ABANDON] Object:{state.proposal.object_id} rounds={state.round_no} "
-                f"elapsed={elapsed:.3f}s — max_rounds exhausted, leaving for reselection"
+                f"elapsed={elapsed:.3f}s — max_rounds exhausted, leaving for reselection "
+                f"preferred={state.preferred} advertised={state.preferred_cost:.3f} "
+                f"own_now={own_now if own_now is None else round(float(own_now), 3)} "
+                f"fails(empty/abstain/short/split)={state.fail_empty}/{state.fail_abstain}/"
+                f"{state.fail_short}/{state.fail_split} last_votes={state.last_votes}"
             )
             with self._stats_lock:
                 self.abandoned_count += 1
