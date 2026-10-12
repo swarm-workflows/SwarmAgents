@@ -32,8 +32,8 @@ import numpy as np
 
 import math
 
-from swarm.rl.bandit import (BanditPolicy, EpsilonGreedyPolicy, LinTSPolicy,
-                             LinUCBPolicy, UCB1Policy)
+from swarm.rl.bandit import (BanditPolicy, DisjointLinUCBPolicy, EpsilonGreedyPolicy,
+                             LinTSPolicy, LinUCBPolicy, UCB1Policy)
 from swarm.rl.context import ContextExtractor, GroupSnapshot
 
 
@@ -112,6 +112,14 @@ class MABManager:
         self._reward_timeout = reward_cfg.get("timeout", -1.0)
         self._reward_non_winner = reward_cfg.get("non_winner", None)
 
+        # `mab.load_slack` (see `_load_eligible`); 0, the one default, leaves every capable
+        # group eligible exactly as before.
+        self._load_slack = float(config.get("load_slack", 0) or 0)
+        if self._load_slack < 0:
+            raise ValueError(f"mab.load_slack must be >= 0, got {config.get('load_slack')!r}")
+        self.load_guard_decisions = 0
+        self.load_guard_narrowed = 0
+
         self.extractor: Optional[ContextExtractor] = None
         self.policy = self._create_policy(config)
 
@@ -150,6 +158,10 @@ class MABManager:
     #: configured `LinUCB` (the spelling CLAUDE.md used) ran epsilon-greedy under the LinUCB
     #: label (code review 2026-10-05 §30). Matched case-insensitively for that reason.
     ALGORITHMS = ("epsilon_greedy", "ucb1", "linucb", "lin_ts")
+    #: `mab.linucb.model`: one ridge model shared by every arm (the original design) or one per
+    #: arm. Unknown values raise, like `algorithm`; `shared` is the one default.
+    LINUCB_MODELS = ("shared", "disjoint")
+    LINUCB_MODEL_DEFAULT = "shared"
 
     def _create_policy(self, config: dict) -> BanditPolicy:
         algorithm = str(config.get("algorithm", "epsilon_greedy")).strip().lower()
@@ -168,7 +180,12 @@ class MABManager:
                     dim=self.extractor.dim,
                     schema_version=self.extractor.schema_version,
                 )
-            return LinUCBPolicy(
+            model = str(linucb_cfg.get("model", self.LINUCB_MODEL_DEFAULT)).strip().lower()
+            if model not in self.LINUCB_MODELS:
+                raise ValueError(f"mab.linucb.model {linucb_cfg.get('model')!r} is not one of "
+                                 f"{', '.join(self.LINUCB_MODELS)}")
+            cls = DisjointLinUCBPolicy if model == "disjoint" else LinUCBPolicy
+            return cls(
                 alpha=linucb_cfg.get("alpha", 1.0),
                 discount=linucb_cfg.get("discount", 0.995),
                 dim=self.extractor.dim,
@@ -330,16 +347,21 @@ class MABManager:
             self._sweep_pending(now)
 
             contexts = None
-            if self.contextual and job is not None:
+            snaps = None
+            if (self.contextual and job is not None) or (
+                    self._load_slack > 0 and top_k < len(capable_groups)):
                 snaps = (snapshots if snapshots is not None
                          else self._build_snapshots(capable_groups))
+            if self.contextual and job is not None:
                 contexts = self.extractor.build(job, capable_groups, snaps)
 
             if top_k >= len(capable_groups):
                 selected = list(capable_groups)
             else:
+                eligible = self._load_eligible(capable_groups, top_k, snaps)
                 selected = self.policy.select_top_k(
-                    capable_groups, top_k, context=contexts)
+                    eligible, top_k,
+                    context={g: contexts[g] for g in eligible} if contexts else None)
 
             if self.contextual and job_id is not None:
                 entries = self._pending.setdefault(job_id, {})
@@ -355,6 +377,32 @@ class MABManager:
                 f"(job={job_id})"
             )
             return selected
+
+    def _load_eligible(self, capable_groups: List[int], top_k: int,
+                       snaps: Optional[Dict[int, GroupSnapshot]]) -> List[int]:
+        """The candidates the policy may choose from under `mab.load_slack`: groups whose
+        in-flight count is within the slack of the least-loaded candidate (0 = off, all).
+
+        A load guard outside the learner, because the reward cannot carry load in time: a
+        queued job's latency reaches the model only when it finishes, after the burst that
+        queued it has been routed. Offline (real LinUCB, 1,300-job burst over 3 equal groups)
+        it brought p95 latency from ~1,700 s (shared, binary) or ~850 s (disjoint) to ~520 s,
+        the least-loaded figure; inside the slack the policy still chooses. Relative to the
+        least-loaded group, never an absolute capacity: a "has free slots" rule stops filtering
+        once every group is past its slots, which is exactly when the herding resumes.
+        Always at least `top_k` groups, filled by load."""
+        if self._load_slack <= 0 or not snaps:
+            return list(capable_groups)
+        load = {g: (snaps[g].inflight if g in snaps else 0) for g in capable_groups}
+        floor = min(load.values())
+        eligible = [g for g in capable_groups if load[g] <= floor + self._load_slack]
+        if len(eligible) < top_k:
+            rest = sorted((g for g in capable_groups if g not in eligible), key=lambda g: load[g])
+            eligible += rest[:top_k - len(eligible)]
+        if len(eligible) < len(capable_groups):
+            self.load_guard_narrowed += 1
+        self.load_guard_decisions += 1
+        return eligible
 
     def _shape_reward(self, success: bool, latency_s: Optional[float],
                       timed_out: bool) -> float:
@@ -467,6 +515,10 @@ class MABManager:
         with self._lock:
             stats = {
                 "algorithm": self.config.get("algorithm", "epsilon_greedy"),
+                # `mab.load_slack`: decisions the guard saw, and how many it narrowed.
+                "load_slack": self._load_slack,
+                "load_guard_decisions": self.load_guard_decisions,
+                "load_guard_narrowed": self.load_guard_narrowed,
                 "arms": {
                     arm_id: arm.to_dict()
                     for arm_id, arm in self.policy.arms.items()

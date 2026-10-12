@@ -404,6 +404,109 @@ class LinUCBPolicy(BanditPolicy):
             self._init_model(self.dim)
 
 
+class DisjointLinUCBPolicy(LinUCBPolicy):
+    """LinUCB with ONE ridge model PER ARM (disjoint LinUCB, Li et al. 2010).
+
+    The shared model scores every arm with one theta, so its fit follows whatever features the
+    arms it chose had in common. With no contrast in the reward (+1 for every success, and E1′
+    injects no failures) that is the chosen group's own load: measured 2026-10-12, coordinator
+    90 sent 1,151 of 1,292 jobs to one of its three groups at 762 in flight and 5 % CPU
+    headroom, the others idle. Per-arm models keep one group's history out of another's score;
+    offline, on the same burst, they cut the busiest group's share from ~90 % to ≤ ~47 %.
+    What is lost is cross-arm generalisation: a new arm starts from the prior, not from its
+    features. ``discount`` forgets per arm, on that arm's own updates.
+    """
+
+    MODEL = "disjoint"
+
+    def _init_model(self, dim: int):
+        self.dim = dim
+        self.A_inv = None                 # no shared model; kept None so `theta` reports none
+        self.b = None
+        self._arm_A_inv: Dict[int, np.ndarray] = {}
+        self._arm_b: Dict[int, np.ndarray] = {}
+
+    def _ensure_dim(self, x: np.ndarray):
+        if self.dim is None:
+            self._init_model(len(x))
+        elif len(x) != self.dim:
+            raise ValueError(
+                f"Context dimension {len(x)} does not match model dimension {self.dim}")
+        if not hasattr(self, "_arm_A_inv"):
+            self._arm_A_inv, self._arm_b = {}, {}
+
+    def _arm_model(self, arm_id: int):
+        if arm_id not in self._arm_A_inv:
+            self._arm_A_inv[arm_id] = np.eye(self.dim)
+            self._arm_b[arm_id] = np.zeros(self.dim)
+        return self._arm_A_inv[arm_id], self._arm_b[arm_id]
+
+    @property
+    def theta(self) -> Optional[np.ndarray]:
+        return None
+
+    def _scores(self, eligible_arms: List[int],
+                context: Dict[int, np.ndarray]) -> Dict[int, float]:
+        scores = {}
+        for arm_id in eligible_arms:
+            x = np.asarray(context[arm_id], dtype=float)
+            a_inv, b = self._arm_model(arm_id)
+            width = math.sqrt(max(0.0, float(x @ a_inv @ x)))
+            scores[arm_id] = float((a_inv @ b) @ x) + self.alpha * width
+        return scores
+
+    def update(self, arm_id: int, reward: float,
+               context: Optional[np.ndarray] = None):
+        BanditPolicy.update(self, arm_id, reward)
+        if context is None:
+            return
+        x = np.asarray(context, dtype=float)
+        self._ensure_dim(x)
+        a_inv, b = self._arm_model(arm_id)
+        m = a_inv / self.discount
+        mx = m @ x
+        a_inv = m - np.outer(mx, mx) / (1.0 + float(x @ mx))
+        self._arm_A_inv[arm_id] = (a_inv + a_inv.T) / 2.0
+        self._arm_b[arm_id] = self.discount * b + reward * x
+
+    def get_state(self) -> dict:
+        state = BanditPolicy.get_state(self)
+        state.update({
+            "model": self.MODEL, "alpha": self.alpha, "discount": self.discount,
+            "dim": self.dim, "schema_version": self.schema_version,
+            "arm_A_inv": {str(a): m.tolist() for a, m in getattr(self, "_arm_A_inv", {}).items()},
+            "arm_b": {str(a): v.tolist() for a, v in getattr(self, "_arm_b", {}).items()},
+        })
+        return state
+
+    def load_state(self, state: dict):
+        if state.get("model") != self.MODEL:
+            logger.warning("Disjoint LinUCB: discarding persisted state from a different "
+                           f"model ({state.get('model', 'shared')!r})")
+            return
+        if self.schema_version is not None and state.get("schema_version") != self.schema_version:
+            logger.warning("Disjoint LinUCB: discarding persisted state — schema version mismatch")
+            return
+        stored_dim = state.get("dim")
+        if self.dim is not None and stored_dim is not None and stored_dim != self.dim:
+            logger.warning("Disjoint LinUCB: discarding persisted state — dimension mismatch")
+            return
+        BanditPolicy.load_state(self, state)
+        self.alpha = state.get("alpha", self.alpha)
+        self.discount = state.get("discount", self.discount)
+        if stored_dim is not None:
+            self._init_model(stored_dim)
+            for a, m in (state.get("arm_A_inv") or {}).items():
+                self._arm_A_inv[int(a)] = np.array(m, dtype=float)
+            for a, v in (state.get("arm_b") or {}).items():
+                self._arm_b[int(a)] = np.array(v, dtype=float)
+
+    def reset(self):
+        BanditPolicy.reset(self)
+        if self.dim is not None:
+            self._init_model(self.dim)
+
+
 class LinTSPolicy(LinUCBPolicy):
     """Linear Thompson Sampling over the same shared model as LinUCB.
 

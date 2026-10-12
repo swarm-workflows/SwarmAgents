@@ -469,9 +469,11 @@ mab:
   epsilon_decay: 0.995             # Epsilon decay per update (epsilon_greedy only)
   epsilon_min: 0.01                # Minimum epsilon floor, clamped to <= epsilon (epsilon_greedy only)
   exploration_weight: 1.41         # UCB1 exploration weight (ucb1 only)
+  load_slack: 9                    # Choose only among groups within 9 in-flight of the least-loaded (0 = off). 2026-10-12: binary rewards herded 64-90% of jobs onto one group
   top_k: 1                         # Child groups per job — for the bandit AND for the no-bandit (random) path
   step_size: null                  # Optional recency-weighted Q for epsilon_greedy/ucb1 (null = lifetime average)
   linucb:                          # Contextual bandit settings (algorithm: "linucb" or "lin_ts")
+    model: disjoint                # One ridge model per group (shared | disjoint); the shared model herded, see load_slack
     alpha: 1.0                     # Exploration width (UCB bonus multiplier; linucb only)
     discount: 0.995                # Forgetting factor gamma; 1.0 = standard LinUCB
     ts_variance: 0.25              # Posterior-sampling variance (lin_ts only)
@@ -489,7 +491,7 @@ mab:
       disk: 500                    # G
       gpu: 4
   reward:
-    shaped: false                  # Latency-shaped rewards instead of binary +/-1
+    shaped: true                   # Latency-shaped rewards instead of binary +/-1 (on for E1′: no failures are injected, so binary rewards carry no contrast)
     exit_failure: -0.5             # Reward for non-zero exit status (shaped mode)
     timeout: -1.0                  # Reward for delegation timeout (shaped mode)
     non_winner: null               # Reward for co-selected groups that didn't complete the job (null = no update)
