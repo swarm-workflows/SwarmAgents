@@ -170,6 +170,27 @@ class _HostAdapter(ConsensusHost):
     _PENDING_MAX_OBJECTS = 2048
     _PENDING_MAX_PER_OBJECT = 32
 
+    @staticmethod
+    def _only_object(msg, object_id: str):
+        """A shallow copy of a Proposal/Prepare/Commit carrying only *object_id*'s entries.
+
+        A consensus message batches entries for up to ~10 jobs, and the engine stashes the WHOLE
+        message once per job it is missing. Replayed whole, it re-ran every other job in it;
+        once replay could no longer read Redis (e0550584), each job still missing re-stashed the
+        whole message again, so one message bred copies on every replay until the 32-per-job
+        cap dropped real votes: up to 17,970 dropped at one Hier-30 agent, 431-637 reselection
+        resets per Hier-30 run and 6,560 at Hier-90, jobs left unrun (f3fdb42a). Stashed per
+        job, a replay touches only the job it was stashed for, so it cannot re-stash anything."""
+        entries = getattr(msg, "_proposals", None)
+        if entries is None:
+            return msg
+        mine = [p for p in entries if getattr(p, "object_id", None) == object_id]
+        if len(mine) == len(entries):
+            return msg
+        clone = copy.copy(msg)
+        clone._proposals = mine
+        return clone
+
     def _stash_pending(self, store: dict, object_id: str, msg) -> None:
         # Under the agent's stash lock: setdefault-then-append on the inbound thread raced the
         # periodic thread's pop of the same bucket, and a vote appended to a bucket just popped
@@ -187,7 +208,7 @@ class _HostAdapter(ConsensusHost):
             if len(bucket) >= self._PENDING_MAX_PER_OBJECT:
                 self.agent.pending_consensus_dropped += 1
                 return
-            bucket.append(msg)
+            bucket.append(self._only_object(msg, object_id))
         # After the stash, never before: the fetcher replays what is stashed, so a request made
         # first could fetch and replay before this message was in it.
         agent._request_job_fetch(object_id)

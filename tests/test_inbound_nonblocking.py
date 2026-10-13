@@ -168,3 +168,49 @@ class TestFailureDetectorView:
         a, now = self._agent(1)
         assert sorted(a._detect_failed_agents(now)) == [2, 3]
         a.repository.get_all_objects.assert_not_called()
+
+
+class TestStashIsPerJob:
+    """A batched message stashed whole was replayed whole and, once replay could not read Redis,
+    re-stashed itself under every other missing job on every replay: up to 17,970 votes dropped
+    at one Hier-30 agent (f3fdb42a). A stash now keeps only the job's own entries."""
+
+    def _batch(self):
+        from swarm.consensus.messages.proposal import Proposal
+        from swarm.consensus.messages.proposal_info import ProposalInfo
+        from swarm.models.agent_info import AgentInfo
+        return Proposal(source=7, agents=[AgentInfo(agent_id=7)], proposals=[
+            ProposalInfo(p_id=f"p{j}", object_id=f"j{j}", cost=1.0, agent_id=7) for j in (1, 2, 3)])
+
+    def test_a_stash_keeps_only_its_own_job(self):
+        a = _agent()
+        a._request_job_fetch = MagicMock()
+        msg = self._batch()
+        _HostAdapter(a).set_pending_proposal(msg, "j2")
+        stashed = a.pending_proposals["j2"][0]
+        assert [p.object_id for p in stashed.proposals] == ["j2"]
+        assert [p.object_id for p in msg.proposals] == ["j1", "j2", "j3"], "original untouched"
+
+    def test_a_replay_hands_the_engine_only_that_job(self):
+        a = _agent()
+        a._request_job_fetch = MagicMock()
+        a.engine = MagicMock()
+        host = _HostAdapter(a)
+        msg = self._batch()
+        for job in ("j1", "j3"):                         # the engine stashes per missing job
+            host.set_pending_proposal(msg, job)
+        a._replay_pending_consensus("j1")
+        replayed = a.engine.on_proposal.call_args.args[0]
+        assert [p.object_id for p in replayed.proposals] == ["j1"]
+        assert [p.object_id for p in a.pending_proposals["j3"][0].proposals] == ["j3"]
+
+    def test_a_single_job_message_is_stored_as_is(self):
+        from swarm.consensus.messages.proposal import Proposal
+        from swarm.consensus.messages.proposal_info import ProposalInfo
+        from swarm.models.agent_info import AgentInfo
+        a = _agent()
+        a._request_job_fetch = MagicMock()
+        msg = Proposal(source=7, agents=[AgentInfo(agent_id=7)],
+                       proposals=[ProposalInfo(p_id="p1", object_id="j1", cost=1.0, agent_id=7)])
+        _HostAdapter(a).set_pending_proposal(msg, "j1")
+        assert a.pending_proposals["j1"][0] is msg
