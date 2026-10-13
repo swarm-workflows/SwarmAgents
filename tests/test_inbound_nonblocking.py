@@ -114,7 +114,7 @@ class TestFailureDetectorView:
     all 8 live group peers FAILED from the view it had before the stall; 47-77 jobs per run
     executed twice. The detector refreshes a stale view before judging, or skips the round."""
 
-    def _agent(self, refreshed_ago, refresh=None):
+    def _agent(self, refreshed_ago, records=None, fail=False):
         from swarm.models.agent_info import AgentInfo
         from swarm.utils.thread_safe_dict import ThreadSafeDict
         a = _agent()
@@ -125,31 +125,46 @@ class TestFailureDetectorView:
         a.failed_agents = ThreadSafeDict()
         a.neighbor_map = ThreadSafeDict()
         now = time.time()
-        peer = AgentInfo(agent_id=2)
-        peer.last_updated = now - 70          # stale only in the old view
-        a.neighbor_map.set(2, peer)
+        for aid in (2, 3):
+            peer = AgentInfo(agent_id=aid)
+            peer.last_updated = now - 70      # stale in the old view
+            a.neighbor_map.set(aid, peer)
         a._neighbors_refreshed_mono = time.monotonic() - refreshed_ago
         a._note_failed_last_seen = MagicMock()
         a.metrics = MagicMock()
         a.metrics.agent_failures = {}
-        a._refresh_neighbors = refresh or MagicMock()
+        a._refresh_neighbors = MagicMock()
+        if fail:
+            a.repository.get_all_objects.side_effect = RuntimeError("redis")
+        else:
+            a.repository.get_all_objects.return_value = records or []
         return a, now
 
-    def test_a_stale_view_is_refreshed_before_judging(self):
-        def refresh(current_time):
-            a.neighbor_map.get(2).last_updated = time.time()   # the peer was alive all along
-            a._neighbors_refreshed_mono = time.monotonic()
-        a, now = self._agent(70)
-        a._refresh_neighbors = refresh
-        assert a._detect_failed_agents(now) == []
+    def test_a_stale_view_reads_fresh_heartbeats_before_judging(self):
+        a, now = self._agent(70, records=[{"agent_id": 2, "last_updated": time.time()}])
+        failed = a._detect_failed_agents(now)
+        assert 2 not in failed, "alive all along"
+        assert failed == [3], "absent from Redis: still judged, and judged dead"
         assert a.fd_refreshed_stale_view == 1
 
-    def test_a_failed_refresh_skips_the_round(self):
-        a, now = self._agent(70, refresh=MagicMock(side_effect=RuntimeError("redis")))
+    def test_the_stale_path_never_evicts(self):
+        a, now = self._agent(70, records=[])
+        a._detect_failed_agents(now)
+        a._refresh_neighbors.assert_not_called()
+        assert sorted(k for k, _ in a.neighbor_map.items()) == [2, 3]
+
+    def test_fresh_stamps_are_not_written_into_the_map(self):
+        a, now = self._agent(70, records=[{"agent_id": 2, "last_updated": time.time()}])
+        before = a.neighbor_map.get(2).last_updated
+        a._detect_failed_agents(now)
+        assert a.neighbor_map.get(2).last_updated == before
+
+    def test_a_failed_read_skips_the_round(self):
+        a, now = self._agent(70, fail=True)
         assert a._detect_failed_agents(now) == []
         assert a.fd_skipped_stale_view == 1
 
     def test_a_fresh_view_is_judged_as_before(self):
         a, now = self._agent(1)
-        assert a._detect_failed_agents(now) == [2]
-        a._refresh_neighbors.assert_not_called()
+        assert sorted(a._detect_failed_agents(now)) == [2, 3]
+        a.repository.get_all_objects.assert_not_called()

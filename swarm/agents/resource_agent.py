@@ -4903,6 +4903,26 @@ class ResourceAgent(Agent):
             self.logger.debug(f"Failed to look up agent by endpoint {host}:{port}: {e}")
         return None
 
+    def _fresh_heartbeats(self) -> dict:
+        """Each peer's latest heartbeat stamp in Redis, for this detection round ONLY. Never the
+        full `_refresh_neighbors`: that also EVICTS a peer whose record is gone or past its
+        expiry, so after a long enough stall it would remove a genuinely dead peer before the
+        detector judged it — no failure recorded, its jobs stranded (the 2026-09-15 recovery
+        defect; stop-time review). Nor written into `neighbor_map`: the full refresh decides a
+        record is fresher by its stamp, and a stamp bumped here would read as unchanged there
+        and freeze the context-age column. A peer absent from Redis gets no stamp and is judged
+        on its old one."""
+        records = self.repository.get_all_objects(
+            key_prefix=Repository.KEY_AGENT, level=self.topology.level, group=self.topology.group)
+        latest = {}
+        for rec in records or []:
+            try:
+                aid = int(rec.get("agent_id"))
+                latest[aid] = float(rec.get("last_updated") or 0.0)
+            except (TypeError, ValueError, AttributeError):
+                continue
+        return latest
+
     def _fd_view_max_age_s(self) -> float:
         """How old this agent's neighbour view may be before the failure detector refreshes it
         first: twice the full-refresh period, never under 10 s."""
@@ -4931,12 +4951,13 @@ class ResourceAgent(Agent):
         # (Hier-90 PBFT, e669e79c) resumed after ~70 s, declared all 8 live group peers FAILED at
         # once, reassigned their in-flight jobs, and 47-77 jobs per run executed twice. So a stale
         # view is refreshed first, and if that fails the round is skipped.
+        fresh_stamps: dict = {}
         refreshed = self.__dict__.get("_neighbors_refreshed_mono")
         if refreshed is not None and time.monotonic() - refreshed > self._fd_view_max_age_s():
             try:
-                self._refresh_neighbors(current_time=current_time)
+                fresh_stamps = self._fresh_heartbeats()
             except Exception as exc:
-                self.logger.warning(f"[FD_STALE_VIEW] neighbour refresh failed ({exc}); "
+                self.logger.warning(f"[FD_STALE_VIEW] heartbeat read failed ({exc}); "
                                     f"skipping failure detection this round")
                 self.fd_skipped_stale_view = getattr(self, "fd_skipped_stale_view", 0) + 1
                 return []
@@ -4959,7 +4980,9 @@ class ResourceAgent(Agent):
                 continue
 
             # Check if agent hasn't updated in Redis beyond threshold
-            time_since_update = current_time - agent_info.last_updated
+            last_seen = max(float(agent_info.last_updated or 0.0),
+                            fresh_stamps.get(int(agent_id), 0.0))
+            time_since_update = current_time - last_seen
 
             if time_since_update > threshold:
                 # Check if already marked as failed
@@ -4983,7 +5006,7 @@ class ResourceAgent(Agent):
                     self.metrics.agent_failures[agent_id] = {
                         'detected_at': current_time,
                         'detected_by': "redis",
-                        'last_seen': agent_info.last_updated,
+                        'last_seen': last_seen,
                         'downtime': time_since_update,
                         'version_at_failure': agent_info.version
                     }
