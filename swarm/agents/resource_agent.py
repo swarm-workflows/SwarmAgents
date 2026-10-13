@@ -1507,6 +1507,7 @@ class ResourceAgent(Agent):
             diff = int(time.time() - job.last_transition_at)
             if diff > self.reselection_timeout_s:
                 self.logger.info(f"RESTART: Job: {job} reset to Pending")
+                self._log_restart_view(job.job_id)
                 print(f"RESTART: Job: {job} reset to Pending {self.reselection_timeout_s} seconds")
                 # One reset, under the election lock: a decision for the old election lands
                 # wholly before it or wholly after it (and is dropped as obsolete). NEVER waited
@@ -1533,6 +1534,34 @@ class ResourceAgent(Agent):
                 self._persist_restart(job)
 
                 # TODO restart selection for jobs which were assigned to neighbor which just went down
+
+    def _log_restart_view(self, job_id: str) -> None:
+        """One INFO line with this agent's view of a vote it is about to reset: every proposal it
+        holds (proposer, cost, who prepared, who committed), what it committed to, the quorum,
+        and whether messages for the job are still stashed or its fetch is suppressed. Diagnoses
+        why an election stalled for a whole reselection timeout without DEBUG logging, which
+        would slow every agent and change what is measured."""
+        try:
+            eng = self.engine
+            props = []
+            for container in (getattr(eng, "outgoing", None), getattr(eng, "incoming", None)):
+                if container is None:
+                    continue
+                for p in container.get_proposals_by_object_id(job_id) or []:
+                    props.append(f"{p.p_id[:8]}@{p.agent_id}:{p.cost}:P{sorted(map(str, p.prepares))}"
+                                 f":C{sorted(map(str, p.commits))}")
+            ledger = getattr(eng, "_commit_ledger", {}).get(job_id, {})
+            stashed = [len(store.get(job_id, [])) for store in
+                       (self.pending_proposals, self.pending_prepares, self.pending_commits)]
+            neg = self.__dict__.get("_fetch_negative", {}).get(job_id)
+            self.logger.info(
+                f"[RESTART_VIEW] Job {job_id} quorum={self.calculate_quorum()} "
+                f"live={self.live_agent_count} committed_to="
+                f"{getattr(eng, '_committed_to', {}).get(job_id)} props={props} "
+                f"ledger={ {k[:8]: sorted(map(str, v[1])) for k, v in ledger.items()} } "
+                f"stashed(P/Pr/C)={stashed} fetch_suppressed={neg is not None and neg > time.monotonic()}")
+        except Exception as exc:
+            self.logger.debug(f"[RESTART_VIEW] {job_id} failed: {exc}")
 
     @staticmethod
     def _try_lock(lock) -> bool:
