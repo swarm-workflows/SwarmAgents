@@ -85,6 +85,7 @@ class ParallelBroadcastTests(unittest.TestCase):
             setattr(t, k, v)
         t.sent = []
         t.bcast_workers = 1
+        t.bcast_queue = 8  # the backlog is its own setting since 2026-10-13 (runtime.fanout_queue)
         try:
             t._bcast_pool = None  # force re-init with 1 worker / backlog 8
             peers = list(range(2, 30))  # 28 sends >> 1 worker x 8 backlog
