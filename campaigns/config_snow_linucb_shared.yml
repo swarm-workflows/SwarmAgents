@@ -1,4 +1,4 @@
-# PBFT x bandit arm (E1'): consensus.protocol: pbft, mab.enabled: true, mab.algorithm: linucb, nothing else changed.
+# Snow x bandit arm (E1'): mab.enabled: true, mab.algorithm: linucb, nothing else changed (protocol snow as shipped).
 # Generated 2026-10-08 from config_swarm_multi.yml; regenerate the same way if the base moves.
 redis:
   host: database 
@@ -230,7 +230,7 @@ runtime:
 #            (removes the O(g^2) wall). Consensus only flows among same-level peers, so each
 #            level runs a single engine type.
 consensus:
-  protocol: pbft            # pbft | snow (default here) | hybrid
+  protocol: snow            # pbft | snow (default here) | hybrid
   hybrid:
     level0: pbft            # engine for level-0 worker groups (small, <=10 agents)
     coordinator: snow       # engine for level >= 1 coordinator tiers (large pools)
@@ -469,11 +469,11 @@ mab:
   epsilon_decay: 0.995             # Epsilon decay per update (epsilon_greedy only)
   epsilon_min: 0.01                # Minimum epsilon floor, clamped to <= epsilon (epsilon_greedy only)
   exploration_weight: 1.41         # UCB1 exploration weight (ucb1 only)
-  load_slack: 9                    # Choose only among groups within 9 in-flight of the least-loaded (0 = off). 2026-10-12: binary rewards herded 64-90% of jobs onto one group
+  load_slack: 9                    # Choose only among groups within 9 in-flight of the least-loaded (0 = off); on in both LinUCB variants
   top_k: 1                         # Child groups per job — for the bandit AND for the no-bandit (random) path
   step_size: null                  # Optional recency-weighted Q for epsilon_greedy/ucb1 (null = lifetime average)
   linucb:                          # Contextual bandit settings (algorithm: "linucb" or "lin_ts")
-    model: disjoint                # One ridge model per group (shared | disjoint); the shared model herded, see load_slack
+    model: shared                  # One ridge model for all groups: the E1′ shared LinUCB variant
     alpha: 1.0                     # Exploration width (UCB bonus multiplier; linucb only)
     discount: 0.995                # Forgetting factor gamma; 1.0 = standard LinUCB
     ts_variance: 0.25              # Posterior-sampling variance (lin_ts only)

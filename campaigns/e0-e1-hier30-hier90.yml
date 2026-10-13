@@ -6,11 +6,11 @@
 # Run it under tmux/nohup on the database node: a SIGKILLed driver leaves its agents up until the
 # next invocation reaps them. Resumes from <out>/campaign_state.json; --only <cell> picks cells.
 #
-# Cells (5 repeats each, 35 runs):
+# Cells (5 repeats each, 50 runs):
 #   E0   Hier-30  PBFT × analytic, G=1           — E0's alone (the eScience 5 × 5 topology)
 #   E0 = E1′ Hier-90 PBFT × analytic, G=1        — doubles as E1′'s PBFT × analytic column; never rerun
 #   E1′  Hier-90  {Snow, Hybrid} × analytic, G=1
-#   E1′  Hier-90  {PBFT, Snow, Hybrid} × LinUCB, G=3
+#   E1′  Hier-90  {PBFT, Snow, Hybrid} × LinUCB {shared, per-group}, G=3
 #
 # Fan-out (decided 2026-10-08): analytic cells pass G=1 (§3.4, and E0 must be the eScience
 # topology); bandit cells pass G=3, the E2 topology (3 coordinators × 3 groups), because at G=1 a
@@ -24,7 +24,9 @@
 # Base configs, one per arm, each config_swarm_multi.yml with only the arm's keys changed — keep
 # them unchanged for the whole campaign (run_meta.json records each run's base_config sha256):
 #   PBFT config_pbft.yml · Snow ../config_swarm_multi.yml · Hybrid config_hybrid.yml
-#   LinUCB (mab.enabled: true, algorithm linucb): config_{pbft,snow,hybrid}_linucb.yml
+#   LinUCB (mab.enabled: true, algorithm linucb): config_{pbft,snow,hybrid}_linucb_{shared,pergroup}.yml
+#     — the pair differs ONLY in mab.linucb.model (shared | disjoint); both keep load_slack 9 and
+#     shaped reward, so the pair isolates the model design (decided 2026-10-13)
 # All keep coordinator_cost_matrix: self (§3.5) — check proposers_per_job_l1 ≥ C/2 per cell.
 #
 # Workload: replay-golden duplicated per rung with duplicate_jobs.py into /root/workloads/jobs_<N>.
@@ -84,21 +86,39 @@ cells:
     args: {agents: 90, jobs: 1800, pegasus-jobs-dir: /root/workloads/jobs_1800, runtime: 3600,
            groups-per-coordinator: 1, base-config: campaigns/config_hybrid.yml}
 
-  # ---- E1′ Hier-90, bandit column (LinUCB, G=3) -----------------------------------------------
-  - name: e1-hier90-pbft-linucb
+  # ---- E1′ Hier-90, bandit column (LinUCB, G=3): two model designs per engine ---------------
+  - name: e1-hier90-pbft-linucb-shared
     timeout_s: 7200
     args: {agents: 90, jobs: 1800, pegasus-jobs-dir: /root/workloads/jobs_1800, runtime: 3600,
            groups-per-coordinator: 3, delegation-policy: bandit,
-           base-config: campaigns/config_pbft_linucb.yml}
+           base-config: campaigns/config_pbft_linucb_shared.yml}
 
-  - name: e1-hier90-snow-linucb
+  - name: e1-hier90-pbft-linucb-pergroup
     timeout_s: 7200
     args: {agents: 90, jobs: 1800, pegasus-jobs-dir: /root/workloads/jobs_1800, runtime: 3600,
            groups-per-coordinator: 3, delegation-policy: bandit,
-           base-config: campaigns/config_snow_linucb.yml}
+           base-config: campaigns/config_pbft_linucb_pergroup.yml}
 
-  - name: e1-hier90-hybrid-linucb
+  - name: e1-hier90-snow-linucb-shared
     timeout_s: 7200
     args: {agents: 90, jobs: 1800, pegasus-jobs-dir: /root/workloads/jobs_1800, runtime: 3600,
            groups-per-coordinator: 3, delegation-policy: bandit,
-           base-config: campaigns/config_hybrid_linucb.yml}
+           base-config: campaigns/config_snow_linucb_shared.yml}
+
+  - name: e1-hier90-snow-linucb-pergroup
+    timeout_s: 7200
+    args: {agents: 90, jobs: 1800, pegasus-jobs-dir: /root/workloads/jobs_1800, runtime: 3600,
+           groups-per-coordinator: 3, delegation-policy: bandit,
+           base-config: campaigns/config_snow_linucb_pergroup.yml}
+
+  - name: e1-hier90-hybrid-linucb-shared
+    timeout_s: 7200
+    args: {agents: 90, jobs: 1800, pegasus-jobs-dir: /root/workloads/jobs_1800, runtime: 3600,
+           groups-per-coordinator: 3, delegation-policy: bandit,
+           base-config: campaigns/config_hybrid_linucb_shared.yml}
+
+  - name: e1-hier90-hybrid-linucb-pergroup
+    timeout_s: 7200
+    args: {agents: 90, jobs: 1800, pegasus-jobs-dir: /root/workloads/jobs_1800, runtime: 3600,
+           groups-per-coordinator: 3, delegation-policy: bandit,
+           base-config: campaigns/config_hybrid_linucb_pergroup.yml}
