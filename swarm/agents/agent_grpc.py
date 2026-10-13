@@ -412,7 +412,17 @@ class Agent(Observer):
     def on_shutdown(self):
         pass
 
+    def mark_nonblocking_thread(self) -> None:
+        """Register the calling thread as one that must never wait on Redis inside a consensus
+        handler (`_HostAdapter.get_object` then reports a job it does not hold as missing and the
+        message is stashed for the background fetcher). The inbound consumer, the periodic thread
+        — which writes the heartbeat, refreshes the neighbour view and runs the failure detector
+        — and the job fetcher itself."""
+        idents = self.__dict__.setdefault("_nonblocking_thread_idents", set())
+        idents.add(threading.get_ident())
+
     def _do_periodic(self):
+        self.mark_nonblocking_thread()
         while not self.shutdown:
             try:
                 self.on_periodic()
@@ -434,6 +444,7 @@ class Agent(Observer):
         # Which thread is the single inbound consumer: paths that would block it (a Redis
         # round trip in `get_object`) take a non-blocking route when called from it.
         self._inbound_thread_ident = threading.get_ident()
+        self.mark_nonblocking_thread()
         while not self.shutdown:
             try:
                 self.queues.message_event.wait(timeout=0.5)

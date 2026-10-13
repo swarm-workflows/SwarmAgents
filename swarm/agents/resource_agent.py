@@ -128,7 +128,13 @@ class _HostAdapter(ConsensusHost):
         # background fetcher, and the fetcher replays the stash once the job is local
         # (`_job_fetch_batch`). Every other caller — a Snow finalize on its pool — still reads
         # Redis here, since it has nowhere to stash.
-        if threading.get_ident() == getattr(self.agent, "_inbound_thread_ident", None):
+        # Not the inbound consumer alone: stashed messages are REPLAYED on the periodic thread
+        # (and the fetcher), and a replayed batch names up to ten jobs, each a synchronous GET
+        # here. Moving the GET off the consumer moved it onto the thread that writes the
+        # heartbeat and runs the failure detector: Hier-90 PBFT on e669e79c, agent 43's periodic
+        # thread spent ~5 min there (154 s of GETs), judged 8 live peers FAILED from a 70 s old
+        # view, and 47-77 jobs per run executed twice.
+        if threading.get_ident() in self.agent.__dict__.get("_nonblocking_thread_idents", ()):
             self.agent.inbound_fetch_deferred = getattr(self.agent, "inbound_fetch_deferred", 0) + 1
             return None
 
@@ -1106,6 +1112,11 @@ class ResourceAgent(Agent):
 
     def _job_fetch_loop(self) -> None:
         import queue as _queue
+        # The fetcher replays stashes too; a replay naming a job it does not hold re-stashes
+        # that message and requests the job rather than reading Redis inline.
+        mark = getattr(self, "mark_nonblocking_thread", None)
+        if mark is not None:
+            mark()
         while not getattr(self, "shutdown", False):
             try:
                 first = self._fetch_queue.get(timeout=0.5)
@@ -2173,6 +2184,7 @@ class ResourceAgent(Agent):
             level=self.topology.level,
             groups=[self.topology.group]
         )
+        self._neighbors_refreshed_mono = time.monotonic()
 
     def _refresh_children(self, current_time: float):
         """
@@ -2479,13 +2491,18 @@ class ResourceAgent(Agent):
         detector = float(self.failure_threshold_seconds) * 1.1 + 1.0
         return int(max(60, expiry * 2, math.ceil(detector * 2)))
 
+    def _neighbor_refresh_full_s(self) -> float:
+        """`runtime.neighbor_refresh_full_s`, resolved in one place: 5 s with gossip, every
+        tick (0) without."""
+        default = 5.0 if getattr(self, "gossip", None) is not None else 0.0
+        return float(self.runtime_config.get("neighbor_refresh_full_s", default))
+
     def _should_full_neighbor_refresh(self, now: float) -> bool:
         """Full (Redis) neighbor refresh cadence. Per-tick without gossip (status quo);
         with gossip enabled the default drops to 5s — gossip keeps `load` fresh in
         between, and liveness is SWIM's job anyway (5s lag is far under the 45-300s
         peer-expiry threshold)."""
-        default = 5.0 if self.gossip is not None else 0.0
-        interval = float(self.runtime_config.get("neighbor_refresh_full_s", default))
+        interval = self._neighbor_refresh_full_s()
         last = getattr(self, "_last_full_neighbor_refresh", 0.0)
         if now - last >= interval:
             self._last_full_neighbor_refresh = now
@@ -3498,6 +3515,8 @@ class ResourceAgent(Agent):
             "restarts_persisted": int(getattr(self, "restarts_persisted", 0)),
             "decided_unpersisted_resets": int(getattr(self, "decided_unpersisted_resets", 0)),
             "inbound_fetch_deferred": int(getattr(self, "inbound_fetch_deferred", 0)),
+            "fd_refreshed_stale_view": int(getattr(self, "fd_refreshed_stale_view", 0)),
+            "fd_skipped_stale_view": int(getattr(self, "fd_skipped_stale_view", 0)),
             "inbound_timing": {k: {"n": v[0], "total_s": round(v[1], 3), "max_s": round(v[2], 3)}
                                for k, v in dict(self.__dict__.get("_inbound_timing", {})).items()},
             "refusal_retries": int(getattr(self.metrics, 'refusal_retries', 0)),
@@ -4884,6 +4903,11 @@ class ResourceAgent(Agent):
             self.logger.debug(f"Failed to look up agent by endpoint {host}:{port}: {e}")
         return None
 
+    def _fd_view_max_age_s(self) -> float:
+        """How old this agent's neighbour view may be before the failure detector refreshes it
+        first: twice the full-refresh period, never under 10 s."""
+        return max(10.0, 2.0 * self._neighbor_refresh_full_s())
+
     def _detect_failed_agents(self, current_time: float) -> list[int]:
         """
         Identify agents that have failed based on missing heartbeats.
@@ -4899,6 +4923,24 @@ class ResourceAgent(Agent):
             return []
 
         failed_this_round = []
+
+        # Never judge a peer from a view this agent did not keep fresh. The detector compares a
+        # peer's last heartbeat with now, but the peer's record is only as new as this agent's
+        # last neighbour refresh — and both run on this thread, the refresh AFTER the detector.
+        # After a stall of this thread every peer looks exactly as old as the stall: agent 43
+        # (Hier-90 PBFT, e669e79c) resumed after ~70 s, declared all 8 live group peers FAILED at
+        # once, reassigned their in-flight jobs, and 47-77 jobs per run executed twice. So a stale
+        # view is refreshed first, and if that fails the round is skipped.
+        refreshed = self.__dict__.get("_neighbors_refreshed_mono")
+        if refreshed is not None and time.monotonic() - refreshed > self._fd_view_max_age_s():
+            try:
+                self._refresh_neighbors(current_time=current_time)
+            except Exception as exc:
+                self.logger.warning(f"[FD_STALE_VIEW] neighbour refresh failed ({exc}); "
+                                    f"skipping failure detection this round")
+                self.fd_skipped_stale_view = getattr(self, "fd_skipped_stale_view", 0) + 1
+                return []
+            self.fd_refreshed_stale_view = getattr(self, "fd_refreshed_stale_view", 0) + 1
 
         # Add ±10% jitter to threshold to prevent synchronized failure detection
         jitter = random.uniform(0.9, 1.1) if len(self.neighbor_map) > 5 else 1.0

@@ -35,9 +35,11 @@ def _record(job_id, state=ObjectState.PENDING):
 
 
 class TestGetObject:
-    def test_the_inbound_thread_never_reads_redis(self):
+    def test_a_nonblocking_thread_never_reads_redis(self):
+        """The inbound consumer, the periodic thread (heartbeat, neighbour refresh, failure
+        detector — it replays stashes) and the fetcher all register themselves."""
         a = _agent()
-        a._inbound_thread_ident = threading.get_ident()
+        a.mark_nonblocking_thread()
         assert _HostAdapter(a).get_object("j1") is None
         a.repository.get.assert_not_called()
         assert a.inbound_fetch_deferred == 1
@@ -105,3 +107,49 @@ class TestAsyncSends:
                           payload=SwimAck(source=1, probe_id="p", target_agent=1, updates=[]))
         assert ok is False and t.bcast_sends_dropped == 1
         t._bcast_pool.submit.assert_not_called()
+
+
+class TestFailureDetectorView:
+    """Agent 43 (Hier-90 PBFT, e669e79c) resumed a ~70 s stall of its periodic thread and judged
+    all 8 live group peers FAILED from the view it had before the stall; 47-77 jobs per run
+    executed twice. The detector refreshes a stale view before judging, or skips the round."""
+
+    def _agent(self, refreshed_ago, refresh=None):
+        from swarm.models.agent_info import AgentInfo
+        from swarm.utils.thread_safe_dict import ThreadSafeDict
+        a = _agent()
+        a.agent_id = 1
+        a.shutdown = False
+        a.gossip = object()
+        a.__dict__["runtime_config"] = {"failure_threshold_seconds": 60}
+        a.failed_agents = ThreadSafeDict()
+        a.neighbor_map = ThreadSafeDict()
+        now = time.time()
+        peer = AgentInfo(agent_id=2)
+        peer.last_updated = now - 70          # stale only in the old view
+        a.neighbor_map.set(2, peer)
+        a._neighbors_refreshed_mono = time.monotonic() - refreshed_ago
+        a._note_failed_last_seen = MagicMock()
+        a.metrics = MagicMock()
+        a.metrics.agent_failures = {}
+        a._refresh_neighbors = refresh or MagicMock()
+        return a, now
+
+    def test_a_stale_view_is_refreshed_before_judging(self):
+        def refresh(current_time):
+            a.neighbor_map.get(2).last_updated = time.time()   # the peer was alive all along
+            a._neighbors_refreshed_mono = time.monotonic()
+        a, now = self._agent(70)
+        a._refresh_neighbors = refresh
+        assert a._detect_failed_agents(now) == []
+        assert a.fd_refreshed_stale_view == 1
+
+    def test_a_failed_refresh_skips_the_round(self):
+        a, now = self._agent(70, refresh=MagicMock(side_effect=RuntimeError("redis")))
+        assert a._detect_failed_agents(now) == []
+        assert a.fd_skipped_stale_view == 1
+
+    def test_a_fresh_view_is_judged_as_before(self):
+        a, now = self._agent(1)
+        assert a._detect_failed_agents(now) == [2]
+        a._refresh_neighbors.assert_not_called()
