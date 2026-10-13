@@ -37,6 +37,17 @@ from swarm.utils.instrumentation import MessageCounters
 from swarm.utils.thread_safe_dict import ThreadSafeDict
 
 
+#: `runtime.fanout_workers` / `runtime.fanout_queue` when absent; equal to the shipped config.
+#: The pool every broadcast and fire-and-forget send goes through. It was 16 workers with 128
+#: queued sends, and a full pool DROPS the send. Once the inbound consumer stopped blocking
+#: (e669e79c-156a5b05) an agent voted as fast as messages arrived and outran it: Hier-90 PBFT
+#: coordinators dropped 49,426 sends a run (15,643 of them COMMITs, 276 before), PBFT never
+#: retransmits, so ~200 elections per coordinator stalled until the 300 s reselection timeout
+#: and consensus messages per job rose 60% from the re-elections alone.
+FANOUT_WORKERS_DEFAULT = 64
+FANOUT_QUEUE_DEFAULT = 2048
+
+
 class GrpcTransport(Observer):
     def __init__(self, host: str, port: int, logger: logging.Logger = logging.getLogger(),
                  on_peer_status = None):
@@ -52,7 +63,8 @@ class GrpcTransport(Observer):
         # quorum plus the pending-message replay recover from individual losses.
         self._bcast_pool: Optional[ThreadPoolExecutor] = None
         self._bcast_sem: Optional[threading.BoundedSemaphore] = None
-        self.bcast_workers = 16
+        self.bcast_workers = FANOUT_WORKERS_DEFAULT
+        self.bcast_queue = FANOUT_QUEUE_DEFAULT
 
     def _init_instrumentation(self) -> None:
         """Counters this transport keeps for the whole run.
@@ -149,7 +161,8 @@ class GrpcTransport(Observer):
         if self._bcast_pool is None:
             self._bcast_pool = ThreadPoolExecutor(
                 max_workers=self.bcast_workers, thread_name_prefix="bcast")
-            self._bcast_sem = threading.BoundedSemaphore(self.bcast_workers * 8)
+            self._bcast_sem = threading.BoundedSemaphore(
+                max(self.bcast_workers, int(getattr(self, "bcast_queue", FANOUT_QUEUE_DEFAULT))))
 
     def send_async(self, host: str, port: int, src: int, dest: int, payload: object) -> bool:
         """One fire-and-forget unicast on the fan-out pool, with the fan-out's reduced

@@ -91,6 +91,7 @@ class Agent(Observer):
 
         self.transport = GrpcTransport(host=self.grpc_host, port=self.grpc_port,
                                        logger=self.logger, on_peer_status=self.on_peer_status)
+        self._configure_fanout()
 
         self.threads = {
             "periodic": threading.Thread(target=self._do_periodic, daemon=True),
@@ -554,6 +555,19 @@ class Agent(Observer):
         self.transport.send(host=peer_info.host, port=peer_info.port, payload=payload,
                       dest=peer_info.agent_id, src=self.agent_id,
                       timeout=timeout, retries=retries)
+
+    def _configure_fanout(self) -> None:
+        """Size the transport's send pool from `runtime.fanout_workers` / `runtime.fanout_queue`
+        (defaults in `grpc_transport`, one place). A send that finds the queue full is dropped
+        and counted, never retried, so the queue must hold a burst's worth of votes."""
+        from swarm.comm.grpc_transport import FANOUT_QUEUE_DEFAULT, FANOUT_WORKERS_DEFAULT
+        workers = int(self.runtime_config.get("fanout_workers", FANOUT_WORKERS_DEFAULT))
+        queue_len = int(self.runtime_config.get("fanout_queue", FANOUT_QUEUE_DEFAULT))
+        if workers < 1 or queue_len < workers:
+            raise ValueError(f"runtime.fanout_workers ({workers}) must be >= 1 and "
+                             f"runtime.fanout_queue ({queue_len}) >= it")
+        self.transport.bcast_workers = workers
+        self.transport.bcast_queue = queue_len
 
     def send_async(self, dest: int, payload: object) -> None:
         """Fire-and-forget unicast on the transport's send pool. For best-effort protocol
