@@ -1486,10 +1486,22 @@ def produce_jobs(args) -> None:
     jobs_cmd = [
         "python3.11", "job_distributor.py",
         "--jobs-dir", jobs_dir(args),
-        "--jobs-per-interval", str(args.jobs_per_interval),
-        "--interval", str(getattr(args, "job_interval", 1.0)),
         "--redis-host", args.db_host,
     ]
+    if getattr(args, "run_dir", None):
+        jobs_cmd += ["--arrivals-out", str(Path(args.run_dir) / "arrivals.json")]
+    if getattr(args, "arrival", "batch") == "poisson":
+        jobs_cmd += ["--arrival", "poisson"]
+        if args.arrival_rate is not None:
+            jobs_cmd += ["--rate", str(args.arrival_rate)]
+        else:
+            jobs_cmd += ["--rate-schedule", str(Path(args.arrival_schedule).resolve())]
+        seed = args.arrival_seed if args.arrival_seed is not None else args.seed
+        if seed is not None:
+            jobs_cmd += ["--arrival-seed", str(seed)]
+    else:
+        jobs_cmd += ["--jobs-per-interval", str(args.jobs_per_interval),
+                     "--interval", str(getattr(args, "job_interval", 1.0))]
     if args.topology == "hierarchical":
         # For 3-tier hierarchies (100 or 1000 agents), jobs enter at Level 2
         # For 2-tier hierarchies (30 or 110 agents), jobs enter at Level 1
@@ -2123,6 +2135,19 @@ def parse_args() -> argparse.Namespace:
                          "flag (then defaulting to 0.5) was never forwarded, and the "
                          "distributor ran at its own 1.0 (code review 2026-10-05 §56).")
     ap.add_argument("--jobs-per-interval", type=int, default=20)
+    ap.add_argument("--arrival", choices=("batch", "poisson"), default="batch",
+                    help="How jobs arrive. batch (default, and every run before 2026-10-14): "
+                         "--jobs-per-interval every --job-interval s, which at 20/s offers a "
+                         "Hier-90 fleet ~5x what it drains. poisson: one job at a time at Poisson "
+                         "arrival times, rate from --arrival-rate or --arrival-schedule")
+    ap.add_argument("--arrival-rate", type=float, default=None,
+                    help="poisson: constant arrival rate, jobs per second")
+    ap.add_argument("--arrival-schedule", default=None,
+                    help="poisson: JSON [[start_s, jobs_per_s], ...], a piecewise-constant rate "
+                         "(e.g. a compressed work day)")
+    ap.add_argument("--arrival-seed", type=int, default=None,
+                    help="poisson: seed for arrival times; defaults to --seed, so every repeat "
+                         "of a cell sees the same arrival times")
     # Default 0, not 90: this value is now ENFORCED as a hard cap on wait_runtime(), and it was
     # silently ignored before. Defaulting to the old 90 would have truncated every run that does
     # not pass the flag, so opting in is explicit.
@@ -2277,7 +2302,30 @@ def parse_args() -> argparse.Namespace:
                     help="NO EFFECT: agent logs are written to --run-dir as agent-<id>.log. "
                          "Accepted so existing scripts keep working (code review §56).")
 
-    return ap.parse_args()
+    args = ap.parse_args()
+    check_arrival_args(args)
+    return args
+
+
+def check_arrival_args(args) -> None:
+    """Refuse an arrival configuration that would silently run a different one."""
+    rate = getattr(args, "arrival_rate", None)
+    sched = getattr(args, "arrival_schedule", None)
+    if getattr(args, "arrival", "batch") == "batch":
+        if rate is not None or sched:
+            raise SystemExit("--arrival-rate/--arrival-schedule apply to --arrival poisson only")
+        return
+    if (rate is None) == (not sched):
+        raise SystemExit("--arrival poisson takes exactly one of --arrival-rate or "
+                         "--arrival-schedule")
+    if rate is not None and not (math.isfinite(rate) and rate > 0):
+        raise SystemExit(f"--arrival-rate must be a positive number, got {rate}")
+    if sched:
+        from job_distributor import load_rate_schedule
+        try:
+            load_rate_schedule(sched)
+        except (OSError, ValueError) as e:
+            raise SystemExit(f"--arrival-schedule {sched}: {e}")
 
 def read_hosts(args: argparse.Namespace) -> list[str]:
     hosts: list[str] = []
