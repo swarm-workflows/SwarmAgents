@@ -153,7 +153,9 @@ class ContextExtractor:
         cfg = config or {}
         self.job_types: List[str] = list(cfg.get("job_types", []))
         self.max_group_size = float(cfg.get("max_group_size", 10))
-        self.max_inflight = float(cfg.get("max_inflight", 32))
+        # 256, not 32: at Hier-90 a group held up to 242 delegated jobs and a cap of 32 read
+        # 1.0 for 47% of E1′ candidates (2026-10-14). Changing it changes `schema_version`.
+        self.max_inflight = float(cfg.get("max_inflight", 256))
         self.max_dtns = float(cfg.get("max_dtns", 4))
         self.long_job_threshold = float(cfg.get("long_job_threshold", 20.0))
         max_caps = cfg.get("max_caps", {})

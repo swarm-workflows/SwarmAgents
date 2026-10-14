@@ -217,3 +217,19 @@ class TestBurstRouting:
         disjoint = sum(_burst("disjoint", 0, False, s)[0] for s in SEEDS) / len(SEEDS)
         assert disjoint < shared
         assert disjoint > 0.40, "if this ever balances on its own, revisit whether the guard is needed"
+
+
+def test_the_inflight_feature_does_not_saturate_at_hier90():
+    """At Hier-90 with 3 groups per coordinator a group held 0-242 delegated jobs; a cap of 32
+    read 1.0 for 47% of E1′ candidates, so the model could not tell loaded groups apart."""
+    import os
+    import yaml
+    from swarm.rl.context import ContextExtractor, GroupSnapshot
+    assert ContextExtractor().max_inflight == 256
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    shipped = yaml.safe_load(open(os.path.join(repo, "config_swarm_multi.yml")))
+    assert shipped["mab"]["context"]["max_inflight"] == 256
+    ex = ContextExtractor()
+    busy = ex.group_features(GroupSnapshot(inflight=242))[4]
+    lighter = ex.group_features(GroupSnapshot(inflight=40))[4]
+    assert lighter < busy < 1.0

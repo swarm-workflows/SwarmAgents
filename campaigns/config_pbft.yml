@@ -482,7 +482,9 @@ mab:
   context:                         # Feature extraction (linucb/lin_ts) — changing these changes the schema version and resets persisted model state
     job_types: []                  # One-hot vocabulary, e.g. ["compute", "transfer"]
     max_group_size: 10             # Normalization caps
-    max_inflight: 32
+    max_inflight: 256              # Scales the in-flight feature. Was 32: in E1′ (Hier-90, 3 groups per
+                                   # coordinator) a group held 0-242 jobs and the feature read 1.0 for 47%
+                                   # of candidates, so the bandit could not tell loaded groups apart (2026-10-14)
     max_dtns: 4
     long_job_threshold: 20.0
     failure_window: 20             # Sliding-window length for per-group/per-type failure rates (timeouts excluded)
