@@ -1515,7 +1515,11 @@ def produce_jobs(args) -> None:
     # made argparse exit 2 inside this daemon thread with check=False, so every --debug run
     # published zero jobs, drained an empty pool and exited 0 (code review 2026-10-05 §47).
     log("Producing jobs …")
-    proc = run_blocking(jobs_cmd, check=False)
+    _PRODUCER_RC["running"] = True
+    try:
+        proc = run_blocking(jobs_cmd, check=False)
+    finally:
+        _PRODUCER_RC["running"] = False
     _PRODUCER_RC["rc"] = proc.returncode
     if proc.returncode != 0:
         log(f"ERROR: job_distributor.py exited {proc.returncode} — this run did not get its "
@@ -1621,8 +1625,14 @@ def wait_runtime(args) -> None:
                 break
         else:
             consecutive_misses = 0
-            cond = size < args.threshold
-            log(f"Bucket state:*:*:{args.watch_bucket} size={size} (thr={args.threshold}) → {'LOW' if cond else 'OK'}")
+            # Never drained while jobs are still arriving: under a steady arrival rate the pool
+            # sits at 0-7 the whole run, so "< threshold for stable_seconds" could fire between
+            # two arrivals (the 20/s burst kept it far above the threshold until the end).
+            producing = bool(_PRODUCER_RC.get("running"))
+            cond = size < args.threshold and not producing
+            _DRAIN["pending_at_stop"] = size
+            log(f"Bucket state:*:*:{args.watch_bucket} size={size} (thr={args.threshold}) → "
+                f"{'LOW' if cond else 'OK'}{' (still producing)' if producing else ''}")
 
             # Check if all remaining jobs are infeasible
             if size > 0 and check_all_jobs_infeasible(args, args.watch_bucket):
@@ -1631,9 +1641,16 @@ def wait_runtime(args) -> None:
                 break
 
             if cond:
+                # An empty pool is done after `stable_seconds`. A pool with a few jobs left gets
+                # long enough for the protocol's own fallbacks to act on them — the 60 s
+                # re-election of a decision nobody persisted and the 300 s reselection timeout:
+                # a pilot (2026-10-14) stopped with 3 jobs PENDING 3 min after their
+                # re-election, before the reselection could fire, and recorded "drained".
+                need = args.stable_seconds if size == 0 else max(
+                    args.stable_seconds, getattr(args, "stranded_wait_s", 0) or 0)
                 if low_since is None:
                     low_since = time.time()
-                elif time.time() - low_since >= args.stable_seconds:
+                elif time.time() - low_since >= need:
                     log("Condition stable → proceed.")
                     _DRAIN["status"] = "drained"
                     break
@@ -2159,6 +2176,11 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--watch-bucket", type=int, default=1)
     ap.add_argument("--threshold", type=int, default=5)
     ap.add_argument("--stable-seconds", type=int, default=90)
+    ap.add_argument("--stranded-wait-s", type=int, default=420,
+                    help="With 1..threshold-1 jobs still PENDING, how long the pool must stay "
+                         "that low before the run is called drained: long enough for the 60 s "
+                         "re-election and the 300 s reselection timeout to act. drain.json "
+                         "records pending_at_stop either way.")
     ap.add_argument("--check-interval", type=float, default=5.0)
     ap.add_argument("--max-misses", type=int, default=10)
     ap.add_argument("--rtt-samples", type=int, default=20,
