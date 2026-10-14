@@ -356,6 +356,10 @@ class _TransportAdapter(ConsensusTransport):
         self.agent.send(dest, payload)
     def broadcast(self, payload: object) -> None:
         self.agent.broadcast(payload)
+    def send_async(self, dest: int, payload: object) -> None:
+        # Fire-and-forget on the transport's send pool, for sends from threads that must not
+        # wait on a peer (a commit certificate resent from the periodic thread).
+        self.agent.send_async(dest, payload)
     def send_besteffort(self, dest: int, payload: object, timeout_s: float = 0.3) -> None:
         # Low-latency, no-retry send for best-effort Snow queries/responses so a slow or
         # unreachable peer can't stall the Snow driver.
@@ -3906,6 +3910,21 @@ class ResourceAgent(Agent):
             decided_at = self._decided_jobs.get(job_id)
         if decided_at is None or time.time() - decided_at <= grace:
             return False
+        # First tell the leader. Participants hold a commit certificate the leader may never
+        # have counted (a cheaper uncommitted proposal had replaced its own, and it dropped the
+        # commits as worse): on a steady-arrival Hier-90 pilot (2026-10-14) six coordinators
+        # finalized agent 90's proposal for three jobs, 90 never did, and the re-election that
+        # followed did not land before the run ended. Re-elect only if the job is still PENDING
+        # a second grace later, or at once when there is no certificate to send.
+        resent = self.__dict__.setdefault("_certificate_resent", set())
+        if time.time() - decided_at <= 2 * grace and job_id not in resent:
+            resend = getattr(self.engine, "resend_certificate", None)
+            if callable(resend) and resend(job_id):
+                resent.add(job_id)
+                return False
+        if job_id in resent and time.time() - decided_at <= 2 * grace:
+            return False
+        resent.discard(job_id)
         self.decided_unpersisted_resets = getattr(self, "decided_unpersisted_resets", 0) + 1
         self.logger.info(f"[DECIDED_UNPERSISTED] Job {job_id} decided "
                          f"{time.time() - decided_at:.0f}s ago and still PENDING; re-electing")

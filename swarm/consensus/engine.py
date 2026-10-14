@@ -115,6 +115,14 @@ class ConsensusEngine:
         # and a new election carries a new p_id anyway.
         self._finalized: "OrderedDict[tuple[str, str], float]" = OrderedDict()
         self._finalized_max = 8192
+        # object_id -> (decided proposal, its commit voters), kept at a PARTICIPANT's finalize so
+        # the certificate can be sent to the leader if the leader never acts on it
+        # (`resend_certificate`). Bounded like `_finalized`; dropped on `forget_decision`.
+        self._certificates: "OrderedDict[str, tuple]" = OrderedDict()
+        # Finalizes made on a commit certificate for a proposal this agent no longer held (it
+        # had been replaced by a cheaper uncommitted one), and certificates resent to a leader.
+        self.certificate_finalizes = 0
+        self.certificates_resent = 0
         self._proposed_at: dict[str, float] = {}
         self._proposed_at_max = 8192
         self.time_to_finalize = RunningStats()
@@ -177,6 +185,8 @@ class ConsensusEngine:
             # Commit splits with every live voter's COMMIT known and no quorum, left by moving
             # every commit to the best committed proposal (`_resolve_split`).
             "commit_splits_resolved": self.commit_splits_resolved,
+            "certificate_finalizes": self.certificate_finalizes,
+            "certificates_resent": self.certificates_resent,
         }
         stats.update(self.votes_to_finalize.summary("votes_"))
         stats.update(self.time_to_finalize.summary("finalize_s_"))
@@ -452,6 +462,37 @@ class ConsensusEngine:
         # A reset ends the election this agent committed in; the new one carries new p_ids.
         self._committed_to.pop(object_id, None)
         self._commit_ledger.pop(object_id, None)
+        self._certificates.pop(object_id, None)
+
+    def resend_certificate(self, object_id: str) -> bool:
+        """Send the commit certificate of a decision this agent took part in to its leader.
+
+        For a decision the leader never acted on: on a Hier-90 coordinator tier under steady
+        arrivals (2026-10-14), six peers finalized agent 90's proposal for each of three jobs
+        while 90 itself never did, so nobody ran them. A certificate is a quorum of commit
+        voters, so with the certificate rule in `on_commit` the leader finalizes on receipt,
+        whatever it holds now. Fire-and-forget: the host calls this from the periodic thread,
+        which also writes the heartbeat. False when there is nothing to send."""
+        cert = self._certificates.get(object_id)
+        if cert is None:
+            return False
+        prop, voters = cert
+        try:
+            leader = int(prop.agent_id)
+        except (TypeError, ValueError):
+            return False
+        if leader == self.agent_id:
+            return False
+        msg = Commit(source=self.agent_id, agents=[AgentInfo(agent_id=self.agent_id)],
+                     proposals=[ProposalInfo(p_id=prop.p_id, object_id=prop.object_id,
+                                             cost=prop.cost, agent_id=prop.agent_id,
+                                             commits=sorted(voters))])
+        send = getattr(self.transport, "send_async", None) or self.transport.send
+        send(leader, msg)
+        self.certificates_resent += 1
+        self.host.log_info(f"[CON_CERT_RESEND] Object:{object_id} to leader {leader} "
+                           f"p:{prop.p_id} voters={len(voters)}")
+        return True
 
     # ---------- vote counting ----------
     #
@@ -611,6 +652,13 @@ class ConsensusEngine:
             self.host.on_leader_elected(object, proposal.p_id)
         else:
             self.host.log_info(f"[CON_PART] Object:{proposal.object_id} Leader:{proposal.agent_id} p:{proposal.p_id}")
+            self._certificates[proposal.object_id] = (
+                ProposalInfo(p_id=proposal.p_id, object_id=proposal.object_id,
+                             cost=proposal.cost, agent_id=proposal.agent_id),
+                self._as_ids(proposal.commits))
+            self._certificates.move_to_end(proposal.object_id)
+            while len(self._certificates) > self._finalized_max:
+                self._certificates.popitem(last=False)
             # The leader is the PROPOSER, not whoever's COMMIT happened to reach quorum
             # last. `msg.agents[0]` was passed here, so every participant recorded the
             # sender of the final COMMIT as the job's assignee in `job_assignments` —
@@ -651,12 +699,28 @@ class ConsensusEngine:
                 self.host.log_debug(f"Enqueued commit {p.p_id}/{p.object_id} (missing)")
                 continue
 
+            # A quorum of distinct voters committed to this proposal: it is DECIDED. Each voter
+            # commits once per election (`_committed_to`), and two quorums share a voter, so no
+            # other proposal can hold one. Dominance must not overrule a decision — a proposer
+            # whose own uncommitted proposal had been replaced by a cheaper one dropped every
+            # COMMIT for it as "worse", and `_resolve_split` stood aside because a quorum
+            # existed, so peers recorded it as leader and it never knew (2026-10-14).
+            held = self._commit_ledger.get(p.object_id, {}).get(p.p_id)
+            voters = self._as_ids(held[1]) if held is not None else set()
+            certified = len(voters) >= self.host.calculate_quorum()
+
             # I have sent this proposal
             if self.outgoing.contains(object_id=p.object_id, p_id=p.p_id):
                 proposal = self.outgoing.get_proposal(p_id=p.p_id)
             # Received this proposal
             elif self.incoming.contains(object_id=p.object_id, p_id=p.p_id):
                 proposal = self.incoming.get_proposal(p_id=p.p_id)
+            elif certified:
+                proposal = p
+                self.incoming.add_proposal(proposal=proposal)
+                self.certificate_finalizes += 1
+                self.host.log_info(f"[CON_CERT] Object:{p.object_id} p:{p.p_id} decided by "
+                                   f"{len(voters)} commits; adopting over any cheaper proposal")
             # New proposal arriving via COMMIT (before PROPOSAL/PREPARE messages)
             else:
                 # FIX: Check dominance before blindly adding
@@ -683,6 +747,11 @@ class ConsensusEngine:
                     self.host.log_debug(f"Accepted new proposal {p.p_id} via COMMIT (cost={p.cost})")
 
             self._add_vote(proposal.commits, msg.agents[0].agent_id)
+            # Every voter the commits carry, not just their sender: a decision whose sender
+            # messages did not all arrive was otherwise never counted here.
+            for v in voters:
+                if v not in self._as_ids(proposal.commits):
+                    self._add_vote(proposal.commits, v)
             if not self._finalize_if_quorum(object, proposal):
                 self._resolve_split(p.object_id)
 

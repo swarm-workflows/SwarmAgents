@@ -208,6 +208,8 @@ def _stub_agent(decided_ago, grace=60.0, snow=False):
     a.completed_lock = threading.RLock()
     a._decided_jobs = {} if decided_ago is None else {"j1": time.time() - decided_ago}
     a.engine = MagicMock(spec=GossipConsensusEngine) if snow else MagicMock()
+    if not snow:
+        a.engine.resend_certificate.return_value = False   # no certificate: re-elect at once
     a.logger = MagicMock()
     return a
 
