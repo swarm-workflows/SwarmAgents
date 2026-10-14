@@ -61,6 +61,7 @@ the repeat is recorded `gate_failed` and skipped, rather than burning a night on
 | `ok_unverified` | exit 0, no `drain.json` | done, flagged |
 | `refused` | exit 2: the runner refused the launch (a configuration error) | **campaign stops**; it would repeat on every retry |
 | `metrics_shortfall` | exit 3 | retried |
+| `stranded` | exit 0, but jobs never left PENDING (`drain.json` `pending_at_stop`) | retried; the attempt is kept — jobs were lost |
 | `unmeasurable` | exit 4: Redis unreadable or the job producer failed | retried |
 | `timeout` | killed after `timeout_s` | retried; the next run reaps its agents |
 | `failed` | any other status | retried |
@@ -88,7 +89,7 @@ from typing import Callable, Dict, List, Optional
 ROOT = Path(__file__).resolve().parent
 
 DONE = {"ok", "ok_on_cap", "ok_infeasible", "ok_unverified"}
-RETRY = {"metrics_shortfall", "unmeasurable", "timeout", "failed", "companion_failed"}
+RETRY = {"metrics_shortfall", "unmeasurable", "timeout", "failed", "companion_failed", "stranded"}
 
 
 def log(msg: str, logfile: Optional[Path] = None) -> None:
@@ -241,6 +242,8 @@ def classify(rc: Optional[int], run_dir: Path, timed_out: bool) -> str:
         return "ok_on_cap"
     if status == "infeasible":
         return "ok_infeasible"
+    if status == "stranded":
+        return "stranded"
     if status in ("redis_unreadable", "producer_failed", "startup_refused"):
         return "unmeasurable"
     return "ok_unverified"

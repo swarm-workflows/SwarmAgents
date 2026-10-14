@@ -75,9 +75,9 @@ def test_an_empty_pool_is_done_after_stable_seconds(tmp_path, monkeypatch):
     assert 90 <= waited < 120
 
 
-def test_a_few_pending_jobs_get_the_protocols_fallbacks_first(tmp_path, monkeypatch):
+def test_a_few_pending_jobs_get_the_protocols_fallbacks_then_strand(tmp_path, monkeypatch):
     waited = _run(tmp_path, monkeypatch, [3] * 1000)
-    assert run_test._DRAIN["status"] == "drained"
+    assert run_test._DRAIN["status"] == "stranded"      # never "drained" with jobs lost
     assert run_test._DRAIN["pending_at_stop"] == 3
     assert waited >= 420
 
@@ -92,3 +92,17 @@ def test_never_drained_while_jobs_are_still_arriving(tmp_path, monkeypatch):
     waited = _run(tmp_path, monkeypatch, [0] * 1000, producing=True, runtime=600)
     assert run_test._DRAIN["status"] == "cap"
     assert waited >= 600
+
+
+def test_jobs_that_clear_inside_the_wait_are_drained(tmp_path, monkeypatch):
+    _run(tmp_path, monkeypatch, [3] * 40 + [0] * 1000)
+    assert run_test._DRAIN["status"] == "drained"
+
+
+def test_the_campaign_retries_a_stranded_run(tmp_path):
+    import json
+    import campaign
+    (tmp_path / "drain.json").write_text(json.dumps({"status": "stranded", "pending_at_stop": 3}))
+    outcome = campaign.classify(0, tmp_path, False)
+    assert outcome == "stranded"
+    assert outcome in campaign.RETRY and outcome not in campaign.DONE

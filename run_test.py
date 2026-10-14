@@ -1651,21 +1651,29 @@ def wait_runtime(args) -> None:
                 if low_since is None:
                     low_since = time.time()
                 elif time.time() - low_since >= need:
-                    log("Condition stable → proceed.")
-                    _DRAIN["status"] = "drained"
+                    if size == 0:
+                        log("Condition stable → proceed.")
+                        _DRAIN["status"] = "drained"
+                    else:
+                        # Not drained: these jobs were never run, and the fallbacks had their
+                        # chance. A run that loses jobs must not read as a clean one.
+                        log(f"WARNING: {size} job(s) still PENDING after {need}s → stopping. "
+                            f"This run STRANDED jobs (recorded in drain.json).")
+                        _DRAIN["status"] = "stranded"
                     break
             else:
                 low_since = None
         time.sleep(args.check_interval)
-    if _DRAIN.get("status") == "drained":
+    if _DRAIN.get("status") in ("drained", "stranded"):
         _wait_for_inflight(args)
     log(f"Sleeping for grace_seconds: {args.grace_seconds}s …")
     time.sleep(args.grace_seconds)
     _record_drain(args)
 
 
-#: How the wait ended, written to <run-dir>/drain.json: drained | cap | infeasible |
-#: redis_unreadable | producer_failed, plus the jobs still in flight when agents were stopped.
+#: How the wait ended, written to <run-dir>/drain.json: drained | stranded | cap | infeasible |
+#: redis_unreadable | producer_failed, plus the jobs still pending and in flight at the stop.
+#: `stranded` = 1..threshold-1 jobs never left PENDING even after --stranded-wait-s.
 _DRAIN: dict = {}
 
 
