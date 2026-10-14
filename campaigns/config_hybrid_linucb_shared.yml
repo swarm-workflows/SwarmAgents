@@ -265,9 +265,11 @@ consensus:
     local_sample_frac: 1.0   # Fraction of each k-sample drawn from same-site peers (1.0 = uniform;
                              # <1.0 enables topology-aware sampling when agents have a `site`).
                              # Keep 1.0 for a single-site 20-agent mesh.
-    send_workers: 16         # Thread-pool size for non-blocking best-effort query sends.
-                             # Peak demand is max_inflight * k = 160 sends/tick; 16 workers
-                             # drain that comfortably at this scale.
+    send_workers: 64         # Thread-pool size for non-blocking best-effort query sends.
+                             # Each send holds a worker for a round trip, so a pool drains
+                             # workers / RTT sends a second: 16 at ~90 ms (a far host on the
+                             # WAN slice) was ~180/s against ~320/s of queries and answers,
+                             # and that host dropped 6-13k sends a run (2026-10-14).
     send_timeout_ms: 300     # Per-send timeout for Snow queries/responses (no retries; a dropped
                              # query just means that peer abstains this round)
     max_inflight: 16         # Max decisions with an outstanding query round at once — bounds

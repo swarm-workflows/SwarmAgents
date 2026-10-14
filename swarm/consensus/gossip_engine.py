@@ -41,7 +41,7 @@ import random
 import threading
 import time
 import uuid
-from collections import Counter, OrderedDict
+from collections import Counter, OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Protocol
@@ -112,6 +112,16 @@ class _SnowState:
     fail_short: int = 0
     fail_split: int = 0
     last_votes: list = field(default_factory=list)   # [(peer_pref, cost)] of the last failed round
+    # Query ids of this instance's recent rounds. A reply that misses its round is otherwise
+    # discarded, and from a host whose round trip exceeds `round_timeout_ms` EVERY reply misses:
+    # 89 at ~90 ms RTT from every other coordinator abandoned 80 jobs a run that its peers had
+    # long decided, each holding an inflight slot for ~37 s (2026-10-14). A late "already
+    # decided" hint is still the answer to this instance's question, so it is honoured.
+    recent_query_ids: deque = field(default_factory=lambda: deque(maxlen=RECENT_QUERY_IDS))
+
+
+#: How many of an instance's past round ids a late reply may still match (see `_SnowState`).
+RECENT_QUERY_IDS = 16
 
 
 #: The ONE default for every `consensus.snow.*` key (code review 2026-10-05 §G). The agent's
@@ -126,7 +136,7 @@ SNOW_DEFAULTS = {
     "round_timeout_ms": 300,
     "tick_interval_ms": 50,
     "local_sample_frac": 1.0,
-    "send_workers": 16,
+    "send_workers": 64,
     "send_timeout_ms": 300,
     "max_inflight": 16,
 }
@@ -244,6 +254,8 @@ class GossipConsensusEngine:
         self.won_count = 0
         # "Already decided" hints that proved stale and re-opened a vote (§8).
         self.stale_decided_hints = 0
+        # Decided-hints that arrived after their round and still finalized the instance.
+        self.late_decided_hints = 0
         # Finalizes refused because the vote converged on an agent not live here.
         self.dead_candidate_refusals = 0
         self.abandoned_count = 0
@@ -475,15 +487,28 @@ class GossipConsensusEngine:
             if state is None or state.finalized:
                 return
             if state.pending_query_id != query_id:
-                return  # response for a prior round; discard
-            state.pending_responses.append(SnowResponse(
-                source=None, query_id=query_id, job_id=job_id,
-                preferred_agent=preferred_agent, cost=cost,
-                already_decided=bool(already_decided)))
-            # If a peer reports the job is already decided, fast-finalize — VERIFIED against
-            # the authoritative claim in `_finalize_work_inner`, never on the peer's word.
-            fast = (already_decided and preferred_agent is not None
-                    and not state.ignore_decided_hints)
+                # A reply for an earlier round of THIS instance. Its vote answered a question the
+                # instance has since moved past and is discarded, but a decided-hint is still
+                # true of the job: honour it, verified against the claim like a timely one.
+                late_hint = (query_id in state.recent_query_ids and already_decided
+                             and preferred_agent is not None and not state.ignore_decided_hints)
+                if not late_hint:
+                    return
+                with self._stats_lock:
+                    self.late_decided_hints += 1
+                fast = True
+            else:
+                fast = None
+            if fast is None:
+                state.pending_responses.append(SnowResponse(
+                    source=None, query_id=query_id, job_id=job_id,
+                    preferred_agent=preferred_agent, cost=cost,
+                    already_decided=bool(already_decided)))
+                # If a peer reports the job is already decided, fast-finalize — VERIFIED
+                # against the authoritative claim in `_finalize_work_inner`, never on the
+                # peer's word.
+                fast = (already_decided and preferred_agent is not None
+                        and not state.ignore_decided_hints)
         # Outside `_lock`: with no pool (after `stop()`) `_finalize` runs the Redis CAS and the
         # host callbacks inline, and those must never run holding the engine lock.
         if fast:
@@ -566,6 +591,7 @@ class GossipConsensusEngine:
                 state.preferred_cost = own_now
                 state.cost_of[self.agent_id] = own_now
             state.pending_query_id = query_id
+            state.recent_query_ids.append(query_id)
             state.pending_responses = []
             state.round_deadline = now + self.round_timeout_s
             state.last_round_at = now
@@ -926,6 +952,9 @@ class GossipConsensusEngine:
             "won": self.won_count,
             "abandoned": self.abandoned_count,
             "stale_decided_hints": self.stale_decided_hints,
+            # Decided-hints that arrived after their round ended and still finalized the
+            # instance (see `_SnowState.recent_query_ids`).
+            "late_decided_hints": self.late_decided_hints,
             "dead_candidate_refusals": self.dead_candidate_refusals,
             # Decisions that left the pending set without reaching either outcome: the CAS or
             # a host callback raised.
