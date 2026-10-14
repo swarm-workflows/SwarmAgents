@@ -123,6 +123,12 @@ class ConsensusEngine:
         # had been replaced by a cheaper uncommitted one), and certificates resent to a leader.
         self.certificate_finalizes = 0
         self.certificates_resent = 0
+        # (object_id, p_id) of every proposal of an election the host RESET (`forget_decision`):
+        # a delayed message for one may not take part in the next election. Without this the
+        # certificate rule let delayed COMMITs of the old election rebuild a quorum in the
+        # cleared ledger and finalize a superseded proposal (stop-time review, 2026-10-14).
+        self._superseded: "OrderedDict[tuple[str, str], None]" = OrderedDict()
+        self.superseded_skips = 0
         self._proposed_at: dict[str, float] = {}
         self._proposed_at_max = 8192
         self.time_to_finalize = RunningStats()
@@ -187,6 +193,7 @@ class ConsensusEngine:
             "commit_splits_resolved": self.commit_splits_resolved,
             "certificate_finalizes": self.certificate_finalizes,
             "certificates_resent": self.certificates_resent,
+            "superseded_skips": self.superseded_skips,
         }
         stats.update(self.votes_to_finalize.summary("votes_"))
         stats.update(self.time_to_finalize.summary("finalize_s_"))
@@ -280,6 +287,9 @@ class ConsensusEngine:
                 self.incoming.remove_object(object_id=proposal.object_id)
                 continue
 
+            if self._superseded_skip(proposal.object_id, proposal.p_id, "proposal"):
+                continue
+
             if self._already_finalized(proposal.object_id, proposal.p_id):
                 # A straggler (or a ring/star forward) of a proposal this agent has already
                 # finalized. Adopting it would re-run the decision from its wire vote lists.
@@ -342,6 +352,9 @@ class ConsensusEngine:
                 self.outgoing.remove_object(object_id=p.object_id)
                 self.incoming.remove_object(object_id=p.object_id)
                 self.host.log_debug(f"Skip prepare {p.p_id}/{p.object_id} (complete)")
+                continue
+
+            if self._superseded_skip(p.object_id, p.p_id, "prepare"):
                 continue
 
             if self._already_finalized(p.object_id, p.p_id):
@@ -457,12 +470,33 @@ class ConsensusEngine:
         record stays PENDING in Redis until the leader persists READY), so the dedupe was
         being erased mid-election every 0.5 s and the next PREPARE past quorum broadcast a
         fresh COMMIT — the very duplication this file exists to prevent."""
+        # Only what provably belongs to the election being reset: what this agent finalized,
+        # the certificate it holds, the proposal it committed to. Not the containers or the
+        # ledger — peers reset seconds apart, and a peer that reset first may already have
+        # proposed in the NEW election; superseding that would cancel the election we want.
+        old = {k[1] for k in self._finalized if k[0] == object_id}
+        if self._committed_to.get(object_id):
+            old.add(self._committed_to[object_id])
+        if object_id in self._certificates:
+            old.add(self._certificates[object_id][0].p_id)
+        for p_id in old:
+            self._superseded[(object_id, p_id)] = None
+            self._superseded.move_to_end((object_id, p_id))
+        while len(self._superseded) > self._finalized_max:
+            self._superseded.popitem(last=False)
         for key in [k for k in self._finalized if k[0] == object_id]:
             self._finalized.pop(key, None)
         # A reset ends the election this agent committed in; the new one carries new p_ids.
         self._committed_to.pop(object_id, None)
         self._commit_ledger.pop(object_id, None)
         self._certificates.pop(object_id, None)
+
+    def _superseded_skip(self, object_id: str, p_id: str, kind: str) -> bool:
+        if (object_id, p_id) not in self._superseded:
+            return False
+        self.superseded_skips += 1
+        self.host.log_debug(f"Skip {kind} {p_id}/{object_id} (election was reset)")
+        return True
 
     def resend_certificate(self, object_id: str) -> bool:
         """Send the commit certificate of a decision this agent took part in to its leader.
@@ -681,6 +715,9 @@ class ConsensusEngine:
                 self.incoming.remove_object(object_id=p.object_id)
                 self._forget_object(p.object_id)
                 self.host.log_debug(f"Skipped commit {p.p_id}/{p.object_id} (complete)")
+                continue
+
+            if self._superseded_skip(p.object_id, p.p_id, "commit"):
                 continue
 
             self._ledger_note(p, list(p.commits) + [msg.agents[0].agent_id])

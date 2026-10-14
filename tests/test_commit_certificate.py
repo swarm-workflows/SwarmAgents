@@ -135,3 +135,27 @@ class TestAgentTellsTheLeaderFirst:
     def test_without_a_certificate_it_reelects_at_once(self):
         a = _stub_agent(decided_ago=70, resend_ok=False)
         assert a._decided_but_unpersisted("j1", PENDING)
+
+
+class TestResetSupersedes:
+    def test_delayed_commits_of_a_reset_election_cannot_finalize_it(self):
+        bus, hosts, held = _decided_without_its_leader()
+        # Agent 2 resets the election; then the old election's COMMITs reach it again.
+        hosts[2].decided.discard("j1")
+        hosts[2].assignee.clear()
+        bus.engines[2].forget_decision("j1")
+        for voter in (3, 4, 5):
+            old = ProposalInfo(p_id="pP", object_id="j1", cost=5.0, agent_id=1,
+                               commits=[voter])
+            bus.engines[2].on_commit(Commit(source=voter, agents=[AgentInfo(agent_id=voter)],
+                                            proposals=[old]))
+        assert "j1" not in hosts[2].assignee
+        assert bus.engines[2].consensus_stats()["superseded_skips"] == 3
+
+    def test_a_new_election_that_arrived_first_is_not_cancelled(self):
+        bus, hosts, held = _decided_without_its_leader()
+        new = ProposalInfo(p_id="pR", object_id="j1", cost=2.0, agent_id=3)
+        bus.engines[2].incoming.add_proposal(new)      # proposed by a peer that reset first
+        bus.engines[2].forget_decision("j1")
+        assert ("j1", "pR") not in bus.engines[2]._superseded
+        assert ("j1", "pP") in bus.engines[2]._superseded
