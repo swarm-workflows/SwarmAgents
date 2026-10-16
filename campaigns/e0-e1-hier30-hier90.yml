@@ -41,7 +41,7 @@
 # Sizing: pilots took 11-18 min at Hier-30 and 30 min at Hier-270; the caps leave room for the
 # 120 s execution cap on top of a slow schedule. Check fleet reachability (90 of 92 needed) and
 # regenerate agent_hosts.txt with make_agent_hosts.py --count 90 (interleaved) before starting.
-out: runs/campaign-e0-e1-fc9eb220     # the 9177551a campaign (runs/campaign-e0-e1-hier30-90) is not citable for Snow/Hybrid/LinUCB
+out: runs/campaign-e0-e1-f45d9ff1     # utilization cost model (f45d9ff1). fc9eb220 (runs/campaign-e0-e1-fc9eb220) used capacity: its latency/wait/throughput figures describe the old model
 
 defaults:
   runner: run_test.py
