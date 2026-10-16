@@ -282,7 +282,9 @@ class LlmAgent(ResourceAgent):
                 f"[LLM_COST_FALLBACK] Job={job.job_id} Agent={agent.agent_id} "
                 f"FallingBackToAnalyticCost due to error: %s", e
             )
-            analytical_cost = self._cost_job_on_agent(job, agent)
+            # In LLM-plane units: this bid takes `_projected_load_factor` in the LLM matrix like
+            # any other, so it must not price load itself (`utilization` would count it twice).
+            analytical_cost = self._cost_job_on_agent_unloaded(job, agent)
             self.logger.info(
                 f"[ANALYTIC_COST] Job={job.job_id} Agent={agent.agent_id} Cost={analytical_cost:.2f}"
             )
@@ -968,6 +970,17 @@ class LlmAgent(ResourceAgent):
             with lock:
                 self._cost_cache.pop(job_id, None)
 
+    def _wire_load_factor(self, info, scale) -> float:
+        """An LLM agent proposes from its LLM matrix, which applies `_projected_load_factor` to
+        every entry — a real bid and an analytic fallback alike (the fallback is priced without
+        load for that reason, `_cost_job_on_agent_unloaded`). Its cached verdicts are answered
+        in the same unit. The one exception is the `snow_cost_fallback: analytic` ablation,
+        whose cache misses are answered by `ResourceAgent.native_cost_for_job`, in that model's
+        own unit."""
+        if self.llm_snow_cost_fallback == "analytic" and scale == CostScale.ANALYTIC:
+            return self._selection_load_factor(info)
+        return self._projected_load_factor(info)
+
     def native_cost_for_job(self, object_id: str):
         """Answer an inbound consensus query from the LLM verdict, never by calling the model.
 
@@ -1187,7 +1200,7 @@ class LlmAgent(ResourceAgent):
         matrix = self.analytic_selector.compute_cost_matrix(
             assignees=agents, candidates=pending_jobs)
         matrix = apply_multiplicative_penalty(
-            cost_matrix=matrix, assignees=agents, factor_fn=self._projected_load_factor)
+            cost_matrix=matrix, assignees=agents, factor_fn=self._selection_load_factor)
         designations = self.analytic_selector.pick_agent_per_candidate(
             assignees=agents,
             candidates=pending_jobs,

@@ -376,6 +376,15 @@ job_selection:
   # Treat `peers` as an experiment arm, not a fix: it changes placement at the coordinator
   # tier, so no hierarchical figure may mix the two. An unknown value raises.
   coordinator_cost_matrix: self
+  # How the analytic plane prices a job on an agent (resolve_cost_model, resource_agent.py).
+  #   utilization (default since 2026-10-16): (scheduled + backlog + demand) / capacity per resource
+  #     the job uses — an idle agent prices as before, a busy one prices its queue, so a free small
+  #     agent beats a saturated large one. The load factor is then 1.0 for analytic costs.
+  #   capacity: demand / TOTAL capacity x projected-load factor — every run before 2026-10-16. It
+  #     left 54-74 of 81-87 leaves idle in every fc9eb220 cell and, under Snow, the four smallest
+  #     coordinator groups (docs/results/e0-e1-fc9eb220/README.md §9). Kept to reproduce those runs.
+  # An unknown value is refused.
+  cost_model: utilization
 
 
   # Designated-bidder mode (LLM agents only). Default false = every agent bids on every job it

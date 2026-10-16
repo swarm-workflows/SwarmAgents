@@ -102,6 +102,9 @@ def make_agent(disable_fallback: bool):
         return 0.42
 
     a._cost_job_on_agent = _analytic
+    # The LLM fallback prices without load (`_cost_job_on_agent_unloaded`) since the
+    # utilization cost model: stub the method it calls, not only the loaded one.
+    a._cost_job_on_agent_unloaded = a._cost_job_on_agent
     a._get_peer_context = lambda: {"peer_agents": {}}
 
     class _Log:

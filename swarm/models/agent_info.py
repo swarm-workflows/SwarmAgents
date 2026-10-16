@@ -41,6 +41,12 @@ class AgentInfo(JSONField):
         self.proposed_load = 0.0
         self._capacities = Capacities()
         self._capacity_allocations = Capacities()
+        # Work this agent has won but not yet scheduled (a leaf's selected queue; a coordinator's
+        # own undelegated jobs, its delegated-but-unpicked jobs and its children's backlogs).
+        # `capacity_allocations` counts only scheduled work, and the scheduler holds a job in the
+        # selected queue until capacity frees, so a busy agent's queue was invisible to every
+        # peer pricing it. Read by the `utilization` cost model (job_selection.cost_model).
+        self._capacity_backlog = Capacities()
         self._max_child_capacity = None  # For hierarchical agents: max capacity of any single child
         self.last_updated = 0.0
         self._version = 0  # Incremented when agent state changes (e.g., failure detection) to invalidate caches
@@ -164,6 +170,21 @@ class AgentInfo(JSONField):
             self._capacity_allocations = Capacities.from_dict(value)
         else:
             raise ValueError("Unsupported value type for capacity_allocations")
+
+    @property
+    def capacity_backlog(self) -> Capacities:
+        return self._capacity_backlog
+
+    @capacity_backlog.setter
+    def capacity_backlog(self, value: Capacities):
+        if value is None:
+            self._capacity_backlog = Capacities()
+        elif isinstance(value, Capacities):
+            self._capacity_backlog = value
+        elif isinstance(value, dict):
+            self._capacity_backlog = Capacities.from_dict(value)
+        else:
+            raise ValueError("Unsupported value type for capacity_backlog")
 
     @property
     def max_child_capacity(self) -> Capacities:

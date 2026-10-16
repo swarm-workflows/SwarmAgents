@@ -508,6 +508,13 @@ def execution_evidence(agents: dict[str, dict]) -> dict[str, Any]:
                    if isinstance(p, dict) and "decided_unpersisted_resets" in p]
     if unpersisted:
         extra["decided_unpersisted_resets"] = sum(unpersisted)
+    # Which cost model placed the jobs. Absent (not "capacity") for payloads written before the
+    # key existed — those all used `capacity`, but the column records what the run said, and a
+    # run whose agents disagree says "mixed" rather than averaging two placement regimes.
+    models = {str(p["cost_model"]) for p in agents.values()
+              if isinstance(p, dict) and p.get("cost_model")}
+    if models:
+        extra["cost_model"] = models.pop() if len(models) == 1 else "mixed"
     return {
         **extra,
         "jobs_executed": len(counts),

@@ -763,7 +763,12 @@ class GossipConsensusEngine:
             if state.finalized:
                 return
             state.finalized = True
-            self.outgoing.remove_object(object_id=state.proposal.object_id)
+            # `outgoing` keeps this proposal until `_finalize_work` has run the host callbacks
+            # (`_release_outgoing`): an agent prices its open proposals as committed work (the
+            # `utilization` cost model), and the job only reaches the agent's selected queue
+            # inside `on_leader_elected`, after the CAS and the object fetch — WAN round trips
+            # on the pool. Removing it here left a gap in which the agent priced other jobs as
+            # if it held nothing (stop-time review, 2026-10-16). PBFT already orders it so.
             self.incoming.remove_object(object_id=state.proposal.object_id)
 
         pool = self._send_pool
@@ -793,6 +798,17 @@ class GossipConsensusEngine:
                 self.finalize_errors += 1
             self.host.log_warn(
                 f"[snow] finalize of {state.proposal.object_id} failed: {exc}")
+        finally:
+            self._release_outgoing(state)
+
+    def _release_outgoing(self, state: _SnowState) -> None:
+        """Drop this instance's proposal from `outgoing` once its finalize has run, on every
+        exit path. By proposal id, so a newer election's proposal for the same job is never
+        touched; and not if the instance was re-opened (`_reopen`), which is voting again."""
+        with self._lock:
+            if state.finalized:
+                self.outgoing.remove_proposal(state.proposal.p_id,
+                                              object_id=state.proposal.object_id)
 
     def _finalize_work_inner(self, state: _SnowState, candidate: int, reason: str) -> None:
         # Queued on the pool before the job was reset: the election it would decide is over.

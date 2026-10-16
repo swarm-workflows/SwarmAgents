@@ -118,7 +118,8 @@ class GossipStateDisseminator:
 
     def publish_local(self, *, cpu_util: float = 0.0, ram_util: float = 0.0,
                       disk_util: float = 0.0, gpu_util: float = 0.0,
-                      load: float = 0.0) -> AgentStateEntry:
+                      load: float = 0.0, cpu_backlog: float = 0.0, ram_backlog: float = 0.0,
+                      disk_backlog: float = 0.0, gpu_backlog: float = 0.0) -> AgentStateEntry:
         """Register or refresh this agent's own entry. Bumps the version so
         peers' merge logic accepts the update."""
         with self._lock:
@@ -132,6 +133,10 @@ class GossipStateDisseminator:
                 disk_util=disk_util,
                 gpu_util=gpu_util,
                 load=load,
+                cpu_backlog=cpu_backlog,
+                ram_backlog=ram_backlog,
+                disk_backlog=disk_backlog,
+                gpu_backlog=gpu_backlog,
                 version=self._self_version,
             )
             self._cache[int(self.host.agent_id)] = _CachedEntry(

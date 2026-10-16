@@ -23,6 +23,13 @@ class AgentStateEntry(JSONField):
         self._disk_util = 0.0
         self._gpu_util = 0.0
         self._load = 0.0
+        # Backlog (won, not yet scheduled) as a percentage of capacity, per resource — what the
+        # `utilization` cost model needs beside the *_util fields to price a peer between full
+        # Redis refreshes. 0 from a publisher that does not send them.
+        self._cpu_backlog = 0.0
+        self._ram_backlog = 0.0
+        self._disk_backlog = 0.0
+        self._gpu_backlog = 0.0
         self._version = 0
         self._set_fields(**kwargs)
 
@@ -73,6 +80,38 @@ class AgentStateEntry(JSONField):
     @load.setter
     def load(self, v):
         self._load = float(v or 0.0)
+
+    @property
+    def cpu_backlog(self):
+        return self._cpu_backlog
+
+    @cpu_backlog.setter
+    def cpu_backlog(self, v):
+        self._cpu_backlog = float(v or 0.0)
+
+    @property
+    def ram_backlog(self):
+        return self._ram_backlog
+
+    @ram_backlog.setter
+    def ram_backlog(self, v):
+        self._ram_backlog = float(v or 0.0)
+
+    @property
+    def disk_backlog(self):
+        return self._disk_backlog
+
+    @disk_backlog.setter
+    def disk_backlog(self, v):
+        self._disk_backlog = float(v or 0.0)
+
+    @property
+    def gpu_backlog(self):
+        return self._gpu_backlog
+
+    @gpu_backlog.setter
+    def gpu_backlog(self, v):
+        self._gpu_backlog = float(v or 0.0)
 
     @property
     def version(self):

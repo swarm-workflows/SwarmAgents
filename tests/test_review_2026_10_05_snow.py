@@ -125,10 +125,12 @@ class TestOwnDtnsAreDataNodes:
 # --------------------------------------------------------------------------- #
 
 def _proposal_cost_as_selection_main_builds_it(agent: ResourceAgent, job: Job, info: AgentInfo):
-    """Mirror of `selection_main`: base matrix → × load factor → proposal_cost."""
+    """Mirror of `selection_main` (`_assign_batch`): base matrix → × the analytic load factor
+    → proposal_cost. The factor is `_selection_load_factor`, which is what selection applies —
+    `_projected_load_factor` under `capacity`, 1.0 under `utilization`."""
     base = np.array([[agent._cost_job_on_agent(job, info)]])
     penalised = apply_multiplicative_penalty(cost_matrix=base, assignees=[info],
-                                             factor_fn=agent._projected_load_factor)
+                                             factor_fn=agent._selection_load_factor)
     return agent.proposal_cost(job, float(penalised[0, 0]))
 
 
@@ -142,24 +144,46 @@ class TestWireCostMatchesProposalCost:
             pytest.approx(_proposal_cost_as_selection_main_builds_it(a, job, info))
 
     def test_wire_cost_carries_the_load_factor(self):
+        """The `capacity` cost model prices load only through the factor."""
         job = _job()
-        idle = _agent(_info(load=0.0), {"j1": job}).wire_cost_for_job("j1")
-        busy = _agent(_info(load=80.0, proposed=20.0), {"j1": job}).wire_cost_for_job("j1")
+        idle_agent = _agent(_info(load=0.0), {"j1": job})
+        busy_agent = _agent(_info(load=80.0, proposed=20.0), {"j1": job})
+        idle_agent.cost_model = busy_agent.cost_model = "capacity"
+        idle, busy = idle_agent.wire_cost_for_job("j1"), busy_agent.wire_cost_for_job("j1")
         assert busy == pytest.approx(round(idle * 2.0, 2), abs=0.02)   # 1 + (100/100)^1.5 = 2
 
-    def test_the_old_undercut_no_longer_happens(self):
+    def test_wire_cost_carries_committed_work_under_utilization(self):
+        """The `utilization` model (the default) prices load through the committed work in the
+        cost itself — scheduled and backlog alike — and the factor is 1.0, so the scalar
+        `load` an agent advertises no longer moves the number twice."""
+        job = _job()
+        idle = _agent(_info(), {"j1": job})
+        busy_info = _info()
+        busy_info.capacity_allocations = Capacities(core=4, ram=16, disk=50)
+        busy_info.capacity_backlog = Capacities(core=2, ram=8, disk=10)
+        busy = _agent(busy_info, {"j1": job})
+        assert idle.cost_model == busy.cost_model == "utilization"
+        assert busy.wire_cost_for_job("j1") > idle.wire_cost_for_job("j1")
+        assert busy._selection_load_factor(busy_info) == 1.0
+        scalar_only = _agent(_info(load=80.0, proposed=20.0), {"j1": job})
+        assert scalar_only.wire_cost_for_job("j1") == idle.wire_cost_for_job("j1")
+
+    @pytest.mark.parametrize("model", ["utilization", "capacity"])
+    def test_the_old_undercut_no_longer_happens(self, model):
         """Two identical agents at the same load. The initiator advertises its penalised
-        cost; the peer used to answer its base cost, which is strictly lower whenever load > 0,
-        so it voted for itself. Now the two numbers are equal and the tie-break decides,
-        the same way it decided which of them proposed."""
+        cost; the peer used to answer its base cost, which is strictly lower whenever load > 0
+        under `capacity`, so it voted for itself. Now the two numbers are equal under either
+        model and the tie-break decides, the same way it decided which of them proposed."""
         job = _job()
         info_init = _info(agent_id=1, load=50.0)
         info_peer = _info(agent_id=2, load=50.0)
-        advertised = _proposal_cost_as_selection_main_builds_it(
-            _agent(info_init, {"j1": job}), job, info_init)
+        init = _agent(info_init, {"j1": job})
         peer = _agent(info_peer, {"j1": job})
+        init.cost_model = peer.cost_model = model
+        advertised = _proposal_cost_as_selection_main_builds_it(init, job, info_init)
         assert peer.wire_cost_for_job("j1") == pytest.approx(advertised)
-        assert peer.native_cost_for_job("j1")[0] < advertised   # the number it used to send
+        if model == "capacity":
+            assert peer.native_cost_for_job("j1")[0] < advertised   # the number it used to send
 
     def test_an_infeasible_peer_answers_infinity(self):
         a = _agent(_info(), {"j1": _job()}, feasible=False)

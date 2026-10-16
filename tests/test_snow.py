@@ -504,3 +504,56 @@ class SnowNonBlockingSendTests(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class SnowOutgoingHeldThroughFinalizeTests(unittest.TestCase):
+    """A proposal stays in `outgoing` until its finalize has run the host callbacks.
+
+    An agent prices its open proposals as committed work (`job_selection.cost_model:
+    utilization`), and a won job only reaches its selected queue inside `on_leader_elected`,
+    after the CAS and the object fetch run on the pool. `_finalize` used to drop the proposal
+    first, so for those WAN round trips the agent priced other jobs as if it held nothing
+    (stop-time review, 2026-10-16)."""
+
+    def _finalize_with_probe(self, cas=None, candidate=1):
+        eng, host, _, _ = _make_engine(agent_id=1, peers=[2, 3, 4], cas=cas)
+        seen = []
+        host.on_leader_elected = lambda obj, p_id: seen.append(
+            eng.outgoing.contains(object_id=obj.object_id))
+        host.on_participant_commit = lambda obj, leader, p_id: seen.append(
+            eng.outgoing.contains(object_id=obj.object_id))
+        eng.propose([ProposalInfo(p_id="p", object_id="job-z", cost=1.0, agent_id="1")])
+        state = eng._states["job-z"]
+        eng._finalize(state, candidate, reason="test")
+        return eng, seen
+
+    def test_held_while_the_leader_callback_runs_then_released(self):
+        eng, seen = self._finalize_with_probe()
+        self.assertEqual(seen, [True])
+        self.assertFalse(eng.outgoing.contains(object_id="job-z"))
+
+    def test_released_when_another_agent_wins(self):
+        cas = _FakeCAS()
+        cas.claim("job-z", 7)
+        eng, seen = self._finalize_with_probe(cas=cas)
+        self.assertFalse(eng.outgoing.contains(object_id="job-z"))
+
+    def test_released_when_the_finalize_raises(self):
+        eng, host, _, _ = _make_engine(agent_id=1, peers=[2, 3, 4])
+        host.get_object = lambda oid: (_ for _ in ()).throw(RuntimeError("redis down"))
+        eng.propose([ProposalInfo(p_id="p", object_id="job-e", cost=1.0, agent_id="1")])
+        eng._finalize(eng._states["job-e"], 1, reason="test")
+        self.assertFalse(eng.outgoing.contains(object_id="job-e"))
+        self.assertEqual(eng.finalize_errors, 1)
+
+    def test_a_newer_proposal_for_the_same_job_is_not_removed(self):
+        eng, host, _, _ = _make_engine(agent_id=1, peers=[2, 3, 4])
+        eng.propose([ProposalInfo(p_id="old", object_id="job-n", cost=1.0, agent_id="1")])
+        old = eng._states["job-n"]
+        with eng._lock:
+            old.finalized = True
+            eng._states.pop("job-n")
+        eng.propose([ProposalInfo(p_id="new", object_id="job-n", cost=1.0, agent_id="1")])
+        eng._release_outgoing(old)
+        self.assertTrue(eng.outgoing.contains(object_id="job-n", p_id="new"))
+        self.assertFalse(eng.outgoing.contains(object_id="job-n", p_id="old"))

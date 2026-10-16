@@ -321,6 +321,9 @@ class TestTheEffectItIsFor:
         a.repository = types.SimpleNamespace(save=lambda *x, **k: None)
         a._get_peer_context = lambda: {"peer_agents": {}}
         a._cost_job_on_agent = lambda job, agent: 11.85
+        # The LLM fallback prices without load (`_cost_job_on_agent_unloaded`) since the
+        # utilization cost model: stub the method it calls, not only the loaded one.
+        a._cost_job_on_agent_unloaded = a._cost_job_on_agent
         a.bidder = types.SimpleNamespace(
             score=lambda **_k: (_ for _ in ()).throw(RuntimeError("503 Service Unavailable")))
         return a

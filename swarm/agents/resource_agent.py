@@ -102,6 +102,42 @@ def resolve_coordinator_cost_matrix(job_cfg: dict) -> str:
 
 
 
+#: How the analytic plane prices a job on an agent. See `job_selection.cost_model` in
+#: config_swarm_multi.yml and docs/results/e0-e1-fc9eb220/README.md §9 for why it changed.
+COST_MODELS = ("utilization", "capacity")
+#: The default when the key is absent. `utilization` since 2026-10-16; `capacity` is the
+#: model every run before then used, kept so those runs can be reproduced.
+COST_MODEL_DEFAULT = "utilization"
+
+
+def resolve_cost_model(job_cfg: dict) -> str:
+    """Resolve `job_selection.cost_model`, refusing an unknown value.
+
+    ``capacity`` (the model until 2026-10-16) prices a job by its demand over the agent's TOTAL
+    capacity and multiplies by `_projected_load_factor`. Measured on the fc9eb220 campaign, a
+    2-core leaf prices a job at 29x a 32-core leaf and the load factor never exceeded 1.32x at a
+    coordinator, so in every cell 54-74 of 81-87 leaves never ran a job and under Snow the four
+    smallest coordinator groups never won one.
+
+    ``utilization`` prices it by the agent's COMMITTED utilization once the job is added:
+    (scheduled + backlog + demand) / capacity per resource the job uses. An idle agent prices
+    exactly as under ``capacity``; a busy one prices its queue in, so a free small agent beats a
+    saturated large one. The load factor is then 1.0 for the analytic plane (it would count the
+    same load twice).
+
+    One function, one default, refused rather than defaulted: the two models place jobs on
+    different agents, so a typo would mislabel a whole cell.
+    """
+    model = str((job_cfg or {}).get("cost_model", COST_MODEL_DEFAULT)).lower()
+    if model not in COST_MODELS:
+        raise ValueError(
+            f"job_selection.cost_model {model!r} is not one of "
+            f"{' or '.join(repr(m) for m in COST_MODELS)}. Refused rather than defaulted: the "
+            "two models place jobs on different agents, and a run that silently took the other "
+            "one would be mislabelled.")
+    return model
+
+
 #: `runtime.reselection_timeout_s` when the key is absent; equal to the shipped config.
 RESELECTION_TIMEOUT_DEFAULT_S = 300.0
 #: `runtime.decided_unpersisted_grace_s` when the key is absent; equal to the shipped config.
@@ -588,6 +624,7 @@ class ResourceAgent(Agent):
         # typo that silently selected the other regime would mislabel a whole cell. Resolved
         # in one place (the module-level function) so the key cannot acquire a second default.
         self.coordinator_cost_matrix = resolve_coordinator_cost_matrix(job_cfg)
+        self.cost_model = resolve_cost_model(job_cfg)
         self._refuse_unsupported_delegation_policy()
 
         self.selector = SelectionEngine(
@@ -1764,6 +1801,12 @@ class ResourceAgent(Agent):
                            if g in copies and g not in terminal
                            and copies[g] != ObjectState.PENDING.value]
             unpicked = [g for g in child_groups if copies.get(g) == ObjectState.PENDING.value]
+            if (terminal or in_progress) and not delegation_info.get('picked'):
+                # A child holds it now and counts it in its own allocations or backlog, which
+                # this coordinator aggregates — stop counting it here (`compute_backlog`).
+                delegation_info = dict(delegation_info, picked=True)
+                if not terminal:
+                    self.delegated_jobs.set(job_id, delegation_info)
 
             job_complete = False
             job_exit_status = 0
@@ -1937,7 +1980,10 @@ class ResourceAgent(Agent):
         self.delegated_jobs.set(job_id, {
             'delegated_at': time.time(),
             'delegated_mono': time.monotonic(),
-            'groups': selected_groups
+            'groups': selected_groups,
+            # Counted in this coordinator's backlog until a child picks the job up
+            # (`compute_backlog`); `_monitor_delegated_jobs` sets 'picked'.
+            'capacities': job.capacities.to_dict() if job.capacities else {},
         })
 
         self.logger.debug(
@@ -2447,6 +2493,7 @@ class ResourceAgent(Agent):
                 capacity_allocations=self.capacity_allocations,
                 load=self._load,
                 proposed_load=proposed_load,
+                capacity_backlog=self.compute_backlog(),
                 last_updated=current_time,
                 dtns=self.config.get("dtns"),
                 quantum_backend=self.quantum_backend,
@@ -2458,6 +2505,7 @@ class ResourceAgent(Agent):
         else:
             total_capacities = Capacities()
             total_allocations = Capacities()
+            total_backlog = self.compute_backlog()   # own undelegated + unpicked delegations
             max_child_capacity = None  # Track max capacity across all children
 
             # Aggregate DTNs with proper connectivity score averaging
@@ -2475,6 +2523,7 @@ class ResourceAgent(Agent):
                     continue
                 total_capacities += child.capacities
                 total_allocations += child.capacity_allocations
+                total_backlog += child.capacity_backlog or Capacities()
 
                 # Compute element-wise maximum capacity across children
                 if max_child_capacity is None:
@@ -2520,6 +2569,7 @@ class ResourceAgent(Agent):
                 agent_id=self.agent_id,
                 capacities=total_capacities,
                 capacity_allocations=total_allocations,
+                capacity_backlog=total_backlog,
                 max_child_capacity=max_child_capacity,  # Set max capacity for hierarchical feasibility
                 load=self._load,
                 last_updated=current_time,
@@ -2563,12 +2613,37 @@ class ResourceAgent(Agent):
             return True
         return False
 
+    _GOSSIP_DIMS = (("cpu", "core"), ("ram", "ram"), ("disk", "disk"), ("gpu", "gpu"))
+
+    @classmethod
+    def _gossip_utilization(cls, info: AgentInfo) -> dict:
+        """Per-resource utilization and backlog of `info`, in percent of its capacity, for the
+        gossip entry. Read from the agent's full AgentInfo, NOT `self.capacity_allocations`:
+        for a coordinator that property is its own (empty) ready queue while its capacity is
+        its children's sum, so the legacy publish reads 0 % for every coordinator."""
+        cap = info.capacities or Capacities()
+        alloc = info.capacity_allocations or Capacities()
+        backlog = info.capacity_backlog or Capacities()
+        out = {}
+        for prefix, dim in cls._GOSSIP_DIMS:
+            total = float(getattr(cap, dim, 0) or 0)
+            out[f"{prefix}_util"] = float(getattr(alloc, dim, 0) or 0) / total * 100.0 if total else 0.0
+            out[f"{prefix}_backlog"] = float(getattr(backlog, dim, 0) or 0) / total * 100.0 if total else 0.0
+        return out
+
     def _apply_gossip_overlay(self) -> None:
         """Refresh the fast-changing `load` on neighbor_map entries from the gossip
         cache. Gossip propagates in ~1-2 epidemic rounds, so between full refreshes
-        selection costs use FRESHER load than the old per-tick Redis poll provided."""
+        selection costs use FRESHER load than the old per-tick Redis poll provided.
+
+        Under the `utilization` cost model the per-resource allocations and backlog are
+        refreshed the same way, rebuilt from the percentages against the capacity this agent
+        already holds for the peer — they are what that model prices, and the full refresh is
+        5 s apart. New objects, never mutated in place: a copy taken for batch assignment
+        shares them."""
         if self.gossip is None:
             return
+        utilization = self.cost_model == "utilization"
         try:
             for entry in self.gossip.snapshot():
                 if entry.agent_id == self.agent_id:
@@ -2576,6 +2651,14 @@ class ResourceAgent(Agent):
                 info = self.neighbor_map.get(entry.agent_id)
                 if info is not None:
                     info.load = float(entry.load)
+                    if utilization and info.capacities is not None:
+                        alloc, backlog = {}, {}
+                        for prefix, dim in self._GOSSIP_DIMS:
+                            total = float(getattr(info.capacities, dim, 0) or 0)
+                            alloc[dim] = float(getattr(entry, f"{prefix}_util", 0) or 0) * total / 100.0
+                            backlog[dim] = float(getattr(entry, f"{prefix}_backlog", 0) or 0) * total / 100.0
+                        info.capacity_allocations = Capacities(**alloc)
+                        info.capacity_backlog = Capacities(**backlog)
         except Exception as exc:
             self.logger.debug(f"[gossip] overlay failed: {exc}")
 
@@ -2599,14 +2682,18 @@ class ResourceAgent(Agent):
         # Refresh our own gossip entry every tick so peers' TTLs don't expire us.
         if self.gossip is not None:
             try:
-                cap = self._capacities
-                alloc = self.capacity_allocations
-                self.gossip.publish_local(
-                    cpu_util=(alloc.core / cap.core * 100.0) if cap.core else 0.0,
-                    ram_util=(alloc.ram / cap.ram * 100.0) if cap.ram else 0.0,
-                    disk_util=(alloc.disk / cap.disk * 100.0) if cap.disk else 0.0,
-                    load=float(self._load),
-                )
+                if self.cost_model == "utilization" and self.last_agent_info is not None:
+                    self.gossip.publish_local(**self._gossip_utilization(self.last_agent_info),
+                                              load=float(self._load))
+                else:
+                    cap = self._capacities
+                    alloc = self.capacity_allocations
+                    self.gossip.publish_local(
+                        cpu_util=(alloc.core / cap.core * 100.0) if cap.core else 0.0,
+                        ram_util=(alloc.ram / cap.ram * 100.0) if cap.ram else 0.0,
+                        disk_util=(alloc.disk / cap.disk * 100.0) if cap.disk else 0.0,
+                        load=float(self._load),
+                    )
             except Exception as exc:
                 self.logger.debug(f"[gossip] publish_local failed: {exc}")
 
@@ -2765,8 +2852,9 @@ class ResourceAgent(Agent):
     def is_job_feasible(self, job: Job, agent: AgentInfo) -> bool:
         """
         Check if a job is feasible for a given agent based on:
-          - Current load threshold
-          - Resource availability
+          - Resource availability against TOTAL capacity (a job must fit on the agent at all;
+            there is no load or free-capacity threshold here — how busy an agent is enters
+            through the cost, see `job_selection.cost_model`)
           - Connectivity to required DTNs for data_in and data_out
 
         For hierarchical agents (level > 0), feasibility is checked against
@@ -2905,6 +2993,30 @@ class ResourceAgent(Agent):
 
         return self.resource_usage_score(allocated=allocations, total=self.capacities)
 
+    def compute_backlog(self) -> Capacities:
+        """Work this agent has won but not yet scheduled, in capacity units, for
+        `AgentInfo.capacity_backlog` (read by the `utilization` cost model).
+
+        A leaf: its selected queue — the scheduler holds a won job there until capacity frees,
+        so this is the queue behind its scheduled work. A coordinator adds the jobs it has
+        delegated that no child has picked up yet: until a leaf wins a delegated job it is in no
+        leaf's allocations or backlog, and without it a coordinator that had just taken a burst
+        would still advertise itself idle. Once a child picks the job up it is counted in that
+        child's allocations or backlog, which `_generate_agent_info` aggregates. Open proposals
+        are deliberately NOT counted (unlike `compute_proposed_load`): a job under proposal is
+        the job being priced, so an initiator would count it twice and every peer would
+        undercut it — the code review 2026-10-05 §1 defect by another route.
+        """
+        backlog = Capacities()
+        for job in self.queues.selected_queue.gets():
+            backlog += job.capacities
+        if self.topology.children:
+            for _, info in self.delegated_jobs.items():
+                caps = info.get("capacities")
+                if caps and not info.get("picked"):
+                    backlog += Capacities.from_dict(caps)
+        return backlog
+
     def compute_proposed_load(self):
         """Load this agent has committed to but is not yet running: its open proposals AND the
         jobs it has won and not yet scheduled (`selected_queue`). The selected backlog counted
@@ -2984,12 +3096,28 @@ class ResourceAgent(Agent):
                 round(backend.gate_fidelity, 4), round(backend.error_rate, 4),
                 round(backend.calibration_downtime_pct, 3),
             )
+        # Under `utilization` the cost depends on what the agent holds, so the cache key must
+        # too: without it a cached idle price would be served for up to the cache TTL (60 s)
+        # while the agent filled up. Under `capacity` it is absent, as it always was — load
+        # enters there through the factor applied outside the cache.
+        held = self._committed(agent)
+        if held is not None and getattr(agent, "agent_id", None) == getattr(self, "agent_id", None):
+            # The price of a job on THIS agent depends on which of its open proposals is left out
+            # (`_open_proposal_capacities`), so the key carries the set, not only its total.
+            held_sig_ids = tuple(sorted(str(j) for j in self._open_proposal_ids()))
+        else:
+            held_sig_ids = None
+        held_sig = None if held is None else (held_sig_ids,) + (
+            round(float(held.core or 0), 3), round(float(held.ram or 0), 3),
+            round(float(held.disk or 0), 3), round(float(getattr(held, "gpu", 0) or 0), 3),
+            round(float(getattr(held, "qubits", 0) or 0), 3))
         return (
             agent.agent_id, agent.version,
             caps.core, caps.ram, caps.disk, caps.gpu, getattr(caps, "qubits", 0),
             #round(caps.core, 3), round(caps.ram, 3), round(caps.disk, 3), round(getattr(caps, "gpu", 0.0), 3),
             dtn_pairs,
             backend_sig,
+            held_sig,
         )
 
     def compute_job_cost(
@@ -2998,7 +3126,8 @@ class ResourceAgent(Agent):
             total: Capacities,
             dtns: dict[str, DataNode],
             backend: Optional[QuantumBackend] = None,
-            site: Optional[str] = None
+            site: Optional[str] = None,
+            committed: Optional[Capacities] = None,
     ) -> float:
         """
         Compute the cost of executing a job on an agent based on weighted resource usage,
@@ -3019,6 +3148,11 @@ class ResourceAgent(Agent):
         :type dtns: dict[str, DataNode]
         :param backend: Quantum backend of the agent (None for classical agents)
         :type backend: Optional[QuantumBackend]
+        :param committed: Work the agent already holds (scheduled + backlog), for the
+            ``utilization`` cost model. Each ratio then becomes (committed + demand) / total for
+            every resource the job uses, so the cost prices the agent's queue. None (the
+            ``capacity`` model, and any caller that does not know) gives demand / total — the
+            same number an idle agent gets under ``utilization``.
         :return: Calculated job cost (higher is more expensive).
         :rtype: float
         """
@@ -3096,12 +3230,22 @@ class ResourceAgent(Agent):
         total_qubits = getattr(total, "qubits", 0) or 1
         job_qubits = getattr(job.capacities, "qubits", 0)
 
-        # Resource usage ratios
-        core_ratio = job.capacities.core / total.core
-        ram_ratio = job.capacities.ram / total.ram
-        disk_ratio = job.capacities.disk / total.disk
-        gpu_ratio = job_gpu / total_gpu
-        qpu_ratio = job_qubits / total_qubits
+        # Resource usage ratios. With `committed` (the `utilization` model) each one is the
+        # agent's utilization of that resource once this job is added, counted only for the
+        # resources the job uses: a GPU-bound neighbour must not make a CPU-only job dearer.
+        # Without it, demand / total, exactly as before.
+        def _ratio(demand, held, cap):
+            demand = float(demand or 0)
+            if committed is None or demand <= 0:
+                return demand / cap
+            return (float(held or 0) + demand) / cap
+
+        held = committed or Capacities()
+        core_ratio = _ratio(job.capacities.core, held.core, total.core)
+        ram_ratio = _ratio(job.capacities.ram, held.ram, total.ram)
+        disk_ratio = _ratio(job.capacities.disk, held.disk, total.disk)
+        gpu_ratio = _ratio(job_gpu, getattr(held, "gpu", 0), total_gpu)
+        qpu_ratio = _ratio(job_qubits, getattr(held, "qubits", 0), total_qubits)
 
         # Weighted base score
         base_score = (
@@ -3193,13 +3337,100 @@ class ResourceAgent(Agent):
           mode. An experiment arm; it moves every hierarchical number.
         """
         agents_map = self.neighbor_map
+        own = self._own_selection_info(agents_map.get(self.agent_id))
         if int(self.topology.level) > 0 and self.coordinator_cost_matrix == "self":
             # Preserved verbatim from the hack, `None` entry included: an agent whose own
             # record has not yet landed in neighbor_map scores nothing this pass and retries,
             # which is what it did before the key existed.
-            return [agents_map.get(self.agent_id)]
-        return [info for info in (agents_map.get(aid) for aid in list(agents_map.keys()))
-                if info is not None]
+            return [own]
+        return [own if aid == self.agent_id else info
+                for aid, info in ((aid, agents_map.get(aid)) for aid in list(agents_map.keys()))
+                if (own if aid == self.agent_id else info) is not None]
+
+    def _assign_batch(self, agents: list, jobs: list) -> list:
+        """`(agent, cost)` per job: the minimum-cost assignee in this agent's view, None/inf for
+        a job no agent can run. The cost is in proposal units (load factor applied).
+
+        Under `capacity` one matrix for the whole batch, as before. Under `utilization` the jobs
+        are assigned in order and each assignment is added to its agent's backlog before the
+        next job is priced. Priced from one snapshot, a batch (up to `jobs_per_proposal`, 20 in
+        the campaign configs) would otherwise go whole to whichever agent looked emptiest — a
+        2-core leaf handed 20 jobs at once. The copies carry the extra backlog only for this
+        pass; the agents' real state is untouched.
+        """
+        tie_break = (lambda ag, s, cand: tiebreak_rank(
+            getattr(cand, "job_id", ""), getattr(ag, "agent_id", "")))
+        if self.cost_model != "utilization":
+            cost_matrix = self.selector.compute_cost_matrix(assignees=agents, candidates=jobs)
+            penalised = apply_multiplicative_penalty(
+                cost_matrix=cost_matrix, assignees=agents, factor_fn=self._selection_load_factor)
+            return self.selector.pick_agent_per_candidate(
+                assignees=agents, candidates=jobs, cost_matrix=penalised,
+                objective="min", tie_break_key=tie_break)
+
+        current = list(agents)
+        out = []
+        for job in jobs:
+            matrix = self.selector.compute_cost_matrix(assignees=current, candidates=[job])
+            matrix = apply_multiplicative_penalty(
+                cost_matrix=matrix, assignees=current, factor_fn=self._selection_load_factor)
+            [(chosen, cost)] = self.selector.pick_agent_per_candidate(
+                assignees=current, candidates=[job], cost_matrix=matrix,
+                objective="min", tie_break_key=tie_break)
+            out.append((chosen, cost))
+            if chosen is None or cost == float("inf") or job.capacities is None:
+                continue
+            idx = next(i for i, a in enumerate(current) if a is chosen)
+            bumped = AgentInfo.update(chosen)
+            backlog = Capacities()
+            backlog += chosen.capacity_backlog or Capacities()
+            backlog += job.capacities
+            bumped.capacity_backlog = backlog
+            current[idx] = bumped
+        return self._reprice_own_proposals(agents, jobs, out)
+
+    def _reprice_own_proposals(self, agents: list, jobs: list, out: list) -> list:
+        """Put the jobs this agent is about to propose at the price it will answer for them.
+
+        Once proposed, each is an open proposal, so the wire price of job j counts the rest of
+        the batch (`_open_proposal_capacities`) — not only the jobs assigned before it, which is
+        all the sequential pass saw. Proposing at the sequential price would advertise the first
+        job of a batch below, and the last above, what this agent then answers a peer with.
+        """
+        own = next((a for a in agents if getattr(a, "agent_id", None) == self.agent_id), None)
+        mine = [k for k, (chosen, cost) in enumerate(out)
+                if chosen is not None and chosen.agent_id == self.agent_id
+                and cost != float("inf")]
+        if own is None or not mine:
+            return out
+        batch = Capacities()
+        if self._counts_open_proposals():
+            for k in mine:
+                if jobs[k].capacities is not None:
+                    batch += jobs[k].capacities
+        for k in mine:
+            job = jobs[k]
+            held = self._committed(own, job)
+            held += batch
+            if self._counts_open_proposals() and job.capacities is not None:
+                held -= job.capacities
+            cost = self.compute_job_cost(job=job, total=own.capacities, dtns=own.dtns,
+                                         backend=own.quantum_backend, site=own.site,
+                                         committed=held)
+            out[k] = (out[k][0], cost * self._selection_load_factor(own))
+        return out
+
+    def _own_selection_info(self, mapped: Optional[AgentInfo]) -> Optional[AgentInfo]:
+        """This agent's own column in its cost matrix. Under `utilization` it is the per-tick
+        snapshot (`last_agent_info`), because its own `neighbor_map` entry is refreshed from
+        Redis only every `neighbor_refresh_full_s` (5 s with gossip, which skips self) — an
+        agent pricing its own queue from a 5 s old copy would keep taking work it no longer
+        has room for. It also matches what `wire_cost_for_job` answers peers with. Under
+        `capacity` the mapped entry, as before. A not-yet-registered agent stays None either
+        way, so the barrier semantics above are unchanged."""
+        if mapped is None or self.cost_model != "utilization":
+            return mapped
+        return getattr(self, "last_agent_info", None) or mapped
 
     def _note_proposals(self, proposals, assignees: int | None = None) -> None:
         """Record a proposal batch for the proposals-per-job-by-tier measurement.
@@ -3302,25 +3533,8 @@ class ResourceAgent(Agent):
                 # Step 1: Compute cost matrix ONCE for all agents and jobs
                 agents = self._selection_assignees()
 
-                # Build once
-                cost_matrix = self.selector.compute_cost_matrix(
-                    assignees=agents,
-                    candidates=pending_jobs,
-                )
-
-                cost_matrix_with_penalities = apply_multiplicative_penalty(cost_matrix=cost_matrix,
-                                                                           assignees=agents,
-                                                                           factor_fn=self._projected_load_factor)
-
-                # Step 2: Use existing helper to get the best agent per job
-                assignments = self.selector.pick_agent_per_candidate(
-                    assignees=agents,
-                    candidates=pending_jobs,
-                    cost_matrix=cost_matrix_with_penalities,
-                    objective="min",
-                    tie_break_key=lambda ag, s, cand: tiebreak_rank(
-                        getattr(cand, "job_id", ""), getattr(ag, "agent_id", ""))
-                )
+                # Step 2: the best agent per job (see `_assign_batch`)
+                assignments = self._assign_batch(agents, pending_jobs)
 
                 # Step 3: If this agent is assigned, start proposal
                 for job, (selected_agent, cost) in zip(pending_jobs, assignments):
@@ -3568,6 +3782,9 @@ class ResourceAgent(Agent):
             # (_persist_restart). Non-zero means an election stalled for the full timeout.
             "restarts_persisted": int(getattr(self, "restarts_persisted", 0)),
             "decided_unpersisted_resets": int(getattr(self, "decided_unpersisted_resets", 0)),
+            # `job_selection.cost_model` this agent priced with. Absent from payloads written
+            # before 2026-10-16, which all priced with `capacity`.
+            "cost_model": self.cost_model,
             "inbound_fetch_deferred": int(getattr(self, "inbound_fetch_deferred", 0)),
             "fd_refreshed_stale_view": int(getattr(self, "fd_refreshed_stale_view", 0)),
             "fd_skipped_stale_view": int(getattr(self, "fd_skipped_stale_view", 0)),
@@ -4849,12 +5066,93 @@ class ResourceAgent(Agent):
 
     def _cost_job_on_agent(self, job: Job, agent: AgentInfo) -> float:
         return self.compute_job_cost(job=job, total=agent.capacities, dtns=agent.dtns,
+                                     backend=agent.quantum_backend, site=agent.site,
+                                     committed=self._committed(agent, job))
+
+    def _cost_job_on_agent_unloaded(self, job: Job, agent: AgentInfo) -> float:
+        """The analytic cost with no committed work priced in, whatever the cost model: for a
+        caller whose cost then takes `_projected_load_factor` (the LLM plane's analytic
+        fallback), which would otherwise count load twice under `utilization`."""
+        return self.compute_job_cost(job=job, total=agent.capacities, dtns=agent.dtns,
                                      backend=agent.quantum_backend, site=agent.site)
+
+    def _committed(self, agent: AgentInfo, job: Optional[Job] = None) -> Optional[Capacities]:
+        """What `agent` already holds, as the `utilization` cost model reads it: scheduled work
+        plus backlog, and — when `agent` is THIS agent — its open proposals other than `job`
+        (`_open_proposal_capacities`). None under `capacity`, which ignores all three (and
+        prices load through `_projected_load_factor` instead)."""
+        if self.cost_model != "utilization":
+            return None
+        held = Capacities()
+        held += agent.capacity_allocations or Capacities()
+        held += agent.capacity_backlog or Capacities()
+        if getattr(agent, "agent_id", None) == getattr(self, "agent_id", None):
+            held += self._open_proposal_capacities(
+                exclude=getattr(job, "job_id", None) if job is not None else None)
+        return held
+
+    def _counts_open_proposals(self) -> bool:
+        """Whether this agent's open proposals are commitments it should price in. At level 0 (and
+        a coordinator scoring its peers) an agent proposes a job only when it is the cheapest
+        assignee, so an open proposal is work it expects to win. Under
+        `coordinator_cost_matrix: self` EVERY coordinator proposes EVERY job and one wins each:
+        counting them would charge each coordinator the whole tier's pending load, which a large
+        group absorbs better than a small one — the herding this model exists to remove."""
+        return int(getattr(getattr(self, "topology", None), "level", 0) or 0) == 0 or \
+            getattr(self, "coordinator_cost_matrix", "self") == "peers"
+
+    def _open_proposal_ids(self) -> list:
+        """Jobs this agent has proposed and not yet won or lost, as `compute_proposed_load` reads
+        them (a won job has moved to the selected or ready queue and is counted there)."""
+        engine = getattr(self, "engine", None)
+        queues = getattr(self, "queues", None)
+        if engine is None or queues is None or not self._counts_open_proposals():
+            return []
+        try:
+            return [j for j in engine.outgoing.objects()
+                    if j not in queues.ready_queue and j not in queues.selected_queue]
+        except Exception:
+            return []
+
+    def _open_proposal_capacities(self, exclude: Optional[str] = None) -> Capacities:
+        """Demand of this agent's open proposals, `exclude` (the job being priced) left out.
+
+        This is what makes a batch's reservations survive consensus. `_assign_batch` spreads a
+        batch by reserving each assignment before pricing the next; once proposed, those
+        reservations are this agent's open proposals, and every price it puts on the wire —
+        its proposal, a Snow re-price, an answer to a peer's query about ANOTHER job — counts
+        them. Without this a large agent that had just proposed 17 jobs still answered a query
+        about the 18th at its idle price, voted for itself and pulled the batch back (stop-time
+        review). The job being priced is left out: counting it as well as its demand made the
+        initiator dearer than any peer, the code review 2026-10-05 §1 undercut by another route.
+        """
+        caps = Capacities()
+        queues = getattr(self, "queues", None)
+        for job_id in self._open_proposal_ids():
+            if job_id == exclude:
+                continue
+            job = queues.pending_queue.get(job_id) if queues is not None else None
+            if job is not None and job.capacities is not None:
+                caps += job.capacities
+        return caps
+
+    def _selection_load_factor(self, agent: AgentInfo) -> float:
+        """The load factor for an ANALYTIC cost: 1.0 under `utilization`, whose cost already
+        prices the agent's committed work (applying `_projected_load_factor` too would count it
+        twice), and `_projected_load_factor` under `capacity`. An LLM-plane cost always takes
+        `_projected_load_factor`: the model's verdict says nothing about load."""
+        if self.cost_model == "utilization":
+            return 1.0
+        return self._projected_load_factor(agent)
 
     # ---------- Cost that crosses the wire ----------------------------------------------
     # Both planes emit 0..100 and are compared raw; `COST_SCALE` only tags which plane a cost
     # came from, for instrumentation. See swarm/agents/cost_scale.py for the measurement.
     COST_SCALE: str = CostScale.ANALYTIC
+
+    #: Resolved per agent from `job_selection.cost_model` in `__init__`; the class attribute is
+    #: the same default, so a test double built with `__new__` exercises the shipped model.
+    cost_model: str = COST_MODEL_DEFAULT
 
     #: Whether this agent type implements `delegation.policy: llm`. Only `LlmAgent` does.
     SUPPORTS_LLM_DELEGATION: bool = False
@@ -4908,8 +5206,8 @@ class ResourceAgent(Agent):
 
         A Snow peer compares this number against the initiator's advertised cost, so it must be
         built exactly as `selection_main` builds a proposal: feasibility first (infeasible → inf),
-        the base cost from this agent's decision plane (`native_cost_for_job`), times
-        `_projected_load_factor`, rounded by `proposal_cost`. It used to return the base cost
+        the base cost from this agent's decision plane (`native_cost_for_job`), times the load
+        factor `selection_main` applies to that plane, rounded by `proposal_cost`. It used to return the base cost
         alone — no load factor, no feasibility — so any initiator under load advertised a number
         every peer could undercut, every peer voted for itself, no candidate reached α, and the
         job abandoned to the reselection timeout; Snow placement ignored load and capacity while
@@ -4933,8 +5231,19 @@ class ResourceAgent(Agent):
         got = self.native_cost_for_job(object_id)
         if got is None:
             return None
-        native, _scale = got
-        return self.proposal_cost(job, float(native) * self._projected_load_factor(info))
+        native, scale = got
+        # The factor `selection_main` applies to a cost from this plane, so an answer and a
+        # proposal stay in one unit: 1.0 for an analytic cost under `utilization` (it already
+        # prices load), the projected-load factor otherwise.
+        return self.proposal_cost(job, float(native) * self._wire_load_factor(info, scale))
+
+    def _wire_load_factor(self, info: AgentInfo, scale) -> float:
+        """The load factor this agent's `selection_main` applies to a cost of `scale`, so a wire
+        answer matches the proposal it would make. Overridden by `LlmAgent`, whose selection
+        matrix applies `_projected_load_factor` to every entry whatever its plane."""
+        if scale == CostScale.ANALYTIC:
+            return self._selection_load_factor(info)
+        return self._projected_load_factor(info)
 
     def proposal_cost(self, job: Job, native_cost: float) -> float:
         """Cost to advertise for a proposal this agent is making.
