@@ -233,6 +233,13 @@ runtime:
 #            level runs a single engine type.
 consensus:
   protocol: snow            # pbft | snow (default here) | hybrid
+  pbft:
+    # A PBFT coordinator under job_selection.coordinator_cost_matrix: self that receives a
+    # proposal for a job it has not proposed compares that proposal's cost with its own and
+    # proposes itself if cheaper, instead of preparing whatever it heard first (default true
+    # since 2026-10-19). false = every earlier PBFT run, where the coordinator nearest the
+    # database won 55-73 % of jobs (docs/results/e0-e1-f45d9ff1/README.md §7).
+    counter_propose: true
   hybrid:
     level0: pbft            # engine for level-0 worker groups (small, <=10 agents)
     coordinator: snow       # engine for level >= 1 coordinator tiers (large pools)
@@ -272,6 +279,10 @@ consensus:
                              # and that host dropped 6-13k sends a run (2026-10-14).
     send_timeout_ms: 300     # Per-send timeout for Snow queries/responses (no retries; a dropped
                              # query just means that peer abstains this round)
+    tie_tolerance: 0.05      # A peer backs itself only when cheaper than the initiator by more than
+                             # 5 % of the initiator's cost (0 = strict). Balanced costs flipped the
+                             # cheapest agent round to round and slowed a 3-coordinator tier from
+                             # 15-17 s to 26-30 s per decision at a burst (2026-10-19).
     max_inflight: 16         # Max decisions with an outstanding query round at once — bounds
                              # send demand to what the pool can drain (prevents congestion
                              # collapse under delegation bursts)

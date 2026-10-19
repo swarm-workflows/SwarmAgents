@@ -139,6 +139,7 @@ SNOW_DEFAULTS = {
     "send_workers": 64,
     "send_timeout_ms": 300,
     "max_inflight": 16,
+    "tie_tolerance": 0.05,
 }
 
 
@@ -173,6 +174,7 @@ class GossipConsensusEngine:
         send_workers: int = SNOW_DEFAULTS["send_workers"],
         send_timeout_s: float = SNOW_DEFAULTS["send_timeout_ms"] / 1000.0,
         max_inflight: int = SNOW_DEFAULTS["max_inflight"],
+        tie_tolerance: float = SNOW_DEFAULTS["tie_tolerance"],
         # Monotonic by default (§38): every use is a duration or a deadline inside this process,
         # and a stepped wall clock moved round deadlines and finalize latencies.
         time_fn: Callable[[], float] = time.monotonic,
@@ -198,6 +200,13 @@ class GossipConsensusEngine:
         # Max Snow decisions with an outstanding query round at once — bounds total send
         # demand to what the pool can drain (Snow's analog of PBFT max_pending_elections).
         self.max_inflight = max(1, int(max_inflight))
+        # A peer backs itself only when it is cheaper than the initiator by more than this
+        # fraction of the initiator's cost; otherwise it backs the initiator (`_answer_query`).
+        # 0 restores the strict rule. Clamped so a typo cannot make every peer always yield.
+        self.tie_tolerance = min(0.5, max(0.0, float(tie_tolerance)))
+        # Votes where this peer was cheaper, but within `tie_tolerance`, and backed the
+        # initiator instead of itself.
+        self.tolerance_yields = 0
         self._send_pool: Optional[ThreadPoolExecutor] = None
         self._send_sem: Optional[threading.BoundedSemaphore] = None
         self.sends_dropped = 0
@@ -442,10 +451,24 @@ class GossipConsensusEngine:
             init_agent = int(q_preferred) if q_preferred is not None else -1
             # An infeasible peer (cost +inf) never prefers itself, not even on an exact tie
             # with an initiator that sent no cost.
-            mine_dominates = math.isfinite(my_cost) and ((my_cost < init_cost) or (
+            strict = math.isfinite(my_cost) and ((my_cost < init_cost) or (
                 my_cost == init_cost
                 and tiebreak_rank(job_id, self.agent_id) < tiebreak_rank(job_id, init_agent)
             ))
+            # Tie tolerance: a peer cheaper than the initiator by no more than `tie_tolerance`
+            # of the initiator's cost backs the initiator. With costs that price load, which
+            # agent is cheapest flips as each takes work; under the strict rule every flip reset
+            # the β count, and in a three-coordinator tier (both peers must agree) decisions
+            # took 26-30 s at a burst against 15-17 s before the costs were balanced
+            # (docs/results/e0-e1-f45d9ff1/README.md §4.3). The Redis claim still makes the
+            # decision exactly-once; the price of the tolerance is a placement at most
+            # `tie_tolerance` dearer than the best the peer knows of.
+            mine_dominates = strict and (
+                self.tie_tolerance <= 0 or not math.isfinite(init_cost)
+                or my_cost < init_cost * (1.0 - self.tie_tolerance))
+            if strict and not mine_dominates:
+                with self._stats_lock:
+                    self.tolerance_yields += 1
             if mine_dominates:
                 preferred = self.agent_id
                 cost_out = my_cost
@@ -967,6 +990,7 @@ class GossipConsensusEngine:
             "finalized": self.finalized_count,
             "won": self.won_count,
             "abandoned": self.abandoned_count,
+            "tolerance_yields": self.tolerance_yields,
             "stale_decided_hints": self.stale_decided_hints,
             # Decided-hints that arrived after their round ended and still finalized the
             # instance (see `_SnowState.recent_query_ids`).

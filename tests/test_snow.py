@@ -557,3 +557,58 @@ class SnowOutgoingHeldThroughFinalizeTests(unittest.TestCase):
         eng._release_outgoing(old)
         self.assertTrue(eng.outgoing.contains(object_id="job-n", p_id="new"))
         self.assertFalse(eng.outgoing.contains(object_id="job-n", p_id="old"))
+
+
+class SnowTieToleranceTests(unittest.TestCase):
+    """A peer backs itself only when cheaper than the initiator by more than `tie_tolerance`
+    (default 5 %) of the initiator's cost (2026-10-19). With load-aware costs the cheapest agent
+    flips round to round; under the strict rule each flip reset β, and a three-coordinator tier
+    took 26-30 s per decision at a burst."""
+
+    def _answer(self, my_cost, init_cost, tol=None, init_agent=2):
+        eng, host, _, _ = _make_engine(agent_id=1, peers=[2, 3], my_cost=my_cost)
+        if tol is not None:
+            eng.tie_tolerance = tol
+        return eng, eng._answer_query("q", "job-t", init_agent, init_cost)
+
+    def test_the_default_is_five_percent(self):
+        eng, _h, _t, _c = _make_engine()
+        self.assertAlmostEqual(eng.tie_tolerance, 0.05)
+
+    def test_a_peer_within_the_tolerance_backs_the_initiator(self):
+        eng, ans = self._answer(0.97, 1.00)
+        self.assertEqual(ans["preferred_agent"], 2)
+        self.assertEqual(eng.tolerance_yields, 1)
+
+    def test_a_clearly_cheaper_peer_backs_itself(self):
+        eng, ans = self._answer(0.90, 1.00)
+        self.assertEqual(ans["preferred_agent"], 1)
+        self.assertEqual(eng.tolerance_yields, 0)
+
+    def test_zero_restores_the_strict_rule(self):
+        _eng, ans = self._answer(0.97, 1.00, tol=0.0)
+        self.assertEqual(ans["preferred_agent"], 1)
+
+    def test_a_dearer_peer_backs_the_initiator_as_before(self):
+        eng, ans = self._answer(1.20, 1.00)
+        self.assertEqual(ans["preferred_agent"], 2)
+        self.assertEqual(eng.tolerance_yields, 0)
+
+    def test_an_initiator_with_no_cost_still_loses_to_any_price(self):
+        _eng, ans = self._answer(5.0, None)
+        self.assertEqual(ans["preferred_agent"], 1)
+
+    def test_an_infeasible_peer_never_backs_itself(self):
+        _eng, ans = self._answer(float("inf"), 1.0)
+        self.assertEqual(ans["preferred_agent"], 2)
+
+    def test_the_tolerance_is_clamped(self):
+        eng, _h, _t, _c = _make_engine()
+        from swarm.consensus.gossip_engine import GossipConsensusEngine
+        e2 = GossipConsensusEngine(agent_id=1, host=eng.host, transport=eng.transport,
+                                   router=eng.router, tie_tolerance=3.0)
+        self.assertEqual(e2.tie_tolerance, 0.5)
+
+    def test_yields_are_reported(self):
+        eng, _ans = self._answer(0.99, 1.00)
+        self.assertEqual(eng.consensus_stats()["tolerance_yields"], 1)

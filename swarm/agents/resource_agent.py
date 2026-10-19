@@ -110,6 +110,21 @@ COST_MODELS = ("utilization", "capacity")
 COST_MODEL_DEFAULT = "utilization"
 
 
+def resolve_pbft_counter_propose(consensus_cfg: dict) -> bool:
+    """Resolve `consensus.pbft.counter_propose` (default true), refusing a non-boolean.
+
+    True: a PBFT coordinator under `coordinator_cost_matrix: self` that receives a proposal for a
+    job it has not proposed compares that proposal's cost with its own and proposes itself if it
+    is cheaper (`ConsensusEngine._counter_proposal`). False: it PREPAREs the first proposal it
+    hears, which is every PBFT run before 2026-10-19 and made the tier a Redis-scan race won by
+    the coordinator nearest the database (docs/results/e0-e1-f45d9ff1/README.md §7).
+    """
+    value = ((consensus_cfg or {}).get("pbft") or {}).get("counter_propose", True)
+    if not isinstance(value, bool):
+        raise ValueError(f"consensus.pbft.counter_propose must be true or false, not {value!r}")
+    return value
+
+
 def resolve_cost_model(job_cfg: dict) -> str:
     """Resolve `job_selection.cost_model`, refusing an unknown value.
 
@@ -281,6 +296,16 @@ class _HostAdapter(ConsensusHost):
     def is_agreement_achieved(self, object_id: str): return self.agent.is_job_completed(object_id)
     def calculate_quorum(self): return self.agent.calculate_quorum()
     def live_voter_ids(self): return set(self.agent.neighbor_map.keys())
+
+    def counter_proposal_cost(self, object_id: str):
+        """This agent's proposal-unit price for a job it has not proposed, when it is a candidate
+        for every job (PBFT engine only; see `ResourceAgent.counter_proposal_cost`). Local-only:
+        called from the inbound consumer thread."""
+        return self.agent.counter_proposal_cost(object_id)
+
+    def on_counter_proposals(self, proposals) -> None:
+        """Count counter-proposals in the per-tier proposal measurement, like selection's."""
+        self.agent._note_proposals(proposals, assignees=1)
     def on_leader_elected(self, obj: Object, proposal_id: str):
         # Decided is a LOCAL fact from this instant. `select_job` only persists READY, and the
         # consensus dedupe set is fed by `schedule_job` (~0.5 s later at a leaf) or by the
@@ -523,6 +548,7 @@ class ResourceAgent(Agent):
                     send_workers=int(snow_get("send_workers")),
                     send_timeout_s=float(snow_get("send_timeout_ms")) / 1000.0,
                     max_inflight=int(snow_get("max_inflight")),
+                    tie_tolerance=float(snow_get("tie_tolerance")),
                 )
             return ConsensusEngine(agent_id, host, transport, router=router)
 
@@ -625,6 +651,7 @@ class ResourceAgent(Agent):
         # in one place (the module-level function) so the key cannot acquire a second default.
         self.coordinator_cost_matrix = resolve_coordinator_cost_matrix(job_cfg)
         self.cost_model = resolve_cost_model(job_cfg)
+        self.pbft_counter_propose = resolve_pbft_counter_propose(self.config.get("consensus", {}))
         self._refuse_unsupported_delegation_policy()
 
         self.selector = SelectionEngine(
@@ -5244,6 +5271,27 @@ class ResourceAgent(Agent):
         if scale == CostScale.ANALYTIC:
             return self._selection_load_factor(info)
         return self._projected_load_factor(info)
+
+    def counter_proposal_cost(self, object_id: str):
+        """The price at which this agent would counter a peer's PBFT proposal, or None not to.
+
+        Only a hierarchical coordinator under `coordinator_cost_matrix: self` answers — there every
+        coordinator is a candidate for every job but proposes only itself, so a peer's proposal
+        says nothing about whether this coordinator is cheaper. At level 0, and under `peers`, an
+        agent proposes only when it computed itself as the cheapest assignee, so a peer's proposal
+        already reflects that comparison. Off with `consensus.pbft.counter_propose: false`.
+        The number is `wire_cost_for_job`'s — the unit `selection_main` proposes in — and None
+        for a job this agent does not hold, so the engine falls back to preparing.
+        """
+        if not getattr(self, "pbft_counter_propose", True):
+            return None
+        if int(getattr(self.topology, "level", 0) or 0) == 0:
+            return None
+        if getattr(self, "coordinator_cost_matrix", "self") != "self":
+            return None
+        if isinstance(getattr(self, "engine", None), GossipConsensusEngine):
+            return None
+        return self.wire_cost_for_job(object_id)
 
     def proposal_cost(self, job: Job, native_cost: float) -> float:
         """Cost to advertise for a proposal this agent is making.

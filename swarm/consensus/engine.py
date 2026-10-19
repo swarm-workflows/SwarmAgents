@@ -23,6 +23,7 @@
 #
 # Author: Komal Thareja(kthare10@renci.org)
 import threading
+from typing import Optional
 import time
 from collections import OrderedDict
 
@@ -35,6 +36,7 @@ from ..models.agent_info import AgentInfo
 from ..models.object import ObjectState
 from ..utils.instrumentation import RunningStats
 from ..utils.tiebreak import dominates
+from ..utils.utils import generate_id
 
 
 class ConsensusEngine:
@@ -94,6 +96,8 @@ class ConsensusEngine:
         # majority) cannot form in a connected tier. Cost: a split with no majority left waits
         # for the reselection timeout instead of being resolved by switching.
         self._committed_to: dict[str, str] = {}
+        # Counter-proposals issued instead of preparing a dearer proposal (`_counter_proposal`).
+        self.counter_proposals = 0
         self.commit_lock_holds = 0
         # object_id -> {p_id: (ProposalInfo, voters whose COMMIT for it we know)}: every COMMIT
         # seen for the object in this election, kept apart from the proposal containers (which
@@ -194,6 +198,7 @@ class ConsensusEngine:
             "certificate_finalizes": self.certificate_finalizes,
             "certificates_resent": self.certificates_resent,
             "superseded_skips": self.superseded_skips,
+            "counter_proposals": self.counter_proposals,
         }
         stats.update(self.votes_to_finalize.summary("votes_"))
         stats.update(self.time_to_finalize.summary("finalize_s_"))
@@ -257,6 +262,63 @@ class ConsensusEngine:
                 )
                 container.remove_proposal(p_id=existing.p_id, object_id=incoming_proposal.object_id)
 
+    def _counter_proposal(self, object, incoming: ProposalInfo) -> Optional[ProposalInfo]:
+        """A proposal of this agent's own for `object`, if it should answer `incoming` with one.
+
+        Without this, an agent that had not yet proposed a job PREPAREd the first proposal it
+        heard for it, whatever that cost, and never proposed the job itself (its selection loop
+        takes PENDING jobs only). Where every agent is a candidate — a hierarchical coordinator
+        under `coordinator_cost_matrix: self` — that made the tier a race: the first coordinator
+        to scan Redis after a batch landed won 95-99 % of it, and the cheapest coordinator often
+        won least (docs/results/e0-e1-f45d9ff1/README.md §7). Now such an agent first asks the host
+        for its own price (`counter_proposal_cost`, optional: a host that does not implement it, or
+        answers None, keeps the old behaviour) and, if that dominates the incoming proposal by the
+        rule every PBFT comparison uses (`dominates`), proposes itself instead of preparing. Peers
+        already prefer the better of two proposals until they commit
+        (`_remove_worse_proposals_from_container`), so the cheaper one can still win the vote.
+
+        Never once this agent has committed for the object (a COMMIT is binding), nor when it
+        holds a proposal of its own for it (the ordinary comparison then applies).
+        """
+        fn = getattr(self.host, "counter_proposal_cost", None)
+        if fn is None:
+            return None
+        oid = incoming.object_id
+        if oid in self._committed_to or self.outgoing.contains(object_id=oid):
+            return None
+        try:
+            own = fn(oid)
+        except Exception as exc:
+            self.host.log_debug(f"counter_proposal_cost({oid}) failed: {exc}")
+            return None
+        if own is None or own != own or own == float("inf"):
+            return None
+        if not dominates(oid, float(own), self.agent_id, incoming.cost, incoming.agent_id):
+            return None
+        return ProposalInfo(p_id=generate_id(), object_id=oid, agent_id=self.agent_id,
+                            cost=float(own))
+
+    def _issue_counter_proposals(self, counters: list) -> None:
+        """Propose the counter-proposals gathered from one message, as one PROPOSAL."""
+        if not counters:
+            return
+        for p in counters:
+            obj = self.host.get_object(p.object_id)
+            if obj is not None:
+                obj.state = ObjectState.PRE_PREPARE
+        self.counter_proposals += len(counters)
+        hook = getattr(self.host, "on_counter_proposals", None)
+        if hook is not None:
+            try:
+                hook(counters)
+            except Exception as exc:
+                self.host.log_debug(f"on_counter_proposals failed: {exc}")
+        self.host.log_info(
+            f"[CON_COUNTER] proposing {len(counters)} job(s) at a lower cost than the proposal "
+            f"received: {', '.join(p.object_id for p in counters[:10])}"
+            f"{' ...' if len(counters) > 10 else ''}")
+        self.propose(counters)
+
     # ---------- API exposed to the agent/framework ----------
     def propose(self, proposals: list[ProposalInfo]) -> None:
         # send PROPOSAL to peers
@@ -275,6 +337,7 @@ class ConsensusEngine:
 
     def on_proposal(self, msg: Proposal) -> None:
         proposals = []
+        counters = []
         for proposal in msg.proposals:
             # Cheap, local checks FIRST. `get_object` is a synchronous Redis GET once the job
             # has left the local queue, and every straggler (n - q per phase per job) used to
@@ -315,6 +378,10 @@ class ConsensusEngine:
                 self.host.log_debug(f"Already accepted better proposal for Object {object.object_id} from peer {peer_better.agent_id} Cost: {peer_better.cost}")
                 self._bump_conflict(object.object_id)
             else:
+                counter = self._counter_proposal(object, proposal)
+                if counter is not None:
+                    counters.append(counter)
+                    continue
                 # Incoming proposal is better - remove ALL worse existing proposals
                 # FIX: Use helper method to remove ALL worse proposals, not just one arbitrary one
                 self._remove_worse_proposals_from_container(proposal, self.outgoing)
@@ -328,6 +395,7 @@ class ConsensusEngine:
                 object.state = ObjectState.PREPARE
 
         # respond with PREPARE
+        self._issue_counter_proposals(counters)
         if len(proposals):
             prepare = Prepare(source=self.agent_id,
                               agents=[AgentInfo(agent_id=self.agent_id)],
@@ -342,6 +410,7 @@ class ConsensusEngine:
 
     def on_prepare(self, msg: Prepare) -> None:
         proposals = []
+        counters = []
         for p in msg.proposals:
             # Cheap, local checks FIRST. `get_object` is a synchronous Redis GET once the job
             # has left the local queue, and every straggler (n - q per phase per job) used to
@@ -401,6 +470,10 @@ class ConsensusEngine:
                     self._bump_conflict(object.object_id)
                     continue
                 else:
+                    counter = self._counter_proposal(object, p)
+                    if counter is not None:
+                        counters.append(counter)
+                        continue
                     # This is the best proposal we've seen so far
                     # Remove any worse proposals before adding
                     self._remove_worse_proposals_from_container(p, self.outgoing)
@@ -433,6 +506,7 @@ class ConsensusEngine:
                 object.state = ObjectState.PREPARE
             proposals.append(proposal)
 
+        self._issue_counter_proposals(counters)
         self._commit_where_prepared(proposals)
 
         if self.router.should_forward():
