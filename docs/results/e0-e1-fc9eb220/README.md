@@ -1,5 +1,8 @@
 # E0 / E1′ campaign at fc9eb220 — results and analysis
 
+> **Superseded for latency, wait, throughput and placement** by `../e0-e1-f45d9ff1/README.md`, the same
+> campaign re-run on the utilization cost model. §9 here is the root cause that re-run fixed.
+
 Collected 2026-10-15 from `runs/campaign-e0-e1-fc9eb220` on the database node. This is the first
 E0/E1′ campaign in which every run is citable. It supersedes the 9177551a campaign of 13–14 Oct,
 whose Snow and Hybrid numbers carried the far-host send-pool defect (see §7).
