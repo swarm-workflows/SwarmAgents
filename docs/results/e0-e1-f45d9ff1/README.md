@@ -276,18 +276,79 @@ the binding-commit lock. Nothing was stranded.
 * `coordinator_cost_matrix: self` throughout. The E5 `peers` arm is still unrun.
 * The Snow-over-PBFT result under the burst is about placement and holds only while there is queueing.
   At 3 jobs/s the engines tie.
-* PBFT's uneven coordinator spread (coordinator 30 at Hier-30, 90 at Hier-90) is measured but not
-  explained.
+* PBFT's uneven coordinator spread is a scan race decided by distance to the database (§7). It is not
+  cost-driven.
 
 ## 6. Open questions
 
-1. Why PBFT's proposal race favours or starves particular coordinators. Read the proposal arrival
-   order per coordinator for one job.
+1. ~~Why PBFT's proposal race favours or starves particular coordinators.~~ Answered in §7: the first
+   coordinator to scan Redis after a batch proposes it, and its peers adopt that proposal whatever it costs.
 2. Whether a tie tolerance in Snow's dominance check removes the three-member slowdown without
-   harming placement.
+   harming placement. **Built 2026-10-19** (`consensus.snow.tie_tolerance: 0.05`), together with
+   PBFT counter-proposals for §7 (`consensus.pbft.counter_propose: true`). Neither is piloted yet.
 3. Whether Snow's placement advantage survives at Hier-270 and Mesh-180, and under the E5 `peers` arm.
 
-## 7. Files
+## 7. Why PBFT's coordinator tier favours some coordinators (investigated 2026-10-19)
+
+**Short answer.** Under `coordinator_cost_matrix: self`, PBFT's coordinator tier gives each job to whichever
+coordinator proposes it first. Cost plays almost no part. The first proposer is the coordinator whose periodic
+Redis scan finds the new jobs first, which favours coordinators close to the database. The job distributor
+writes a batch of 20 jobs a second, and one coordinator then wins 95–99 % of each batch. This is a property of
+how the tier is set up, not a defect in the engine. Snow does not show it, because a Snow peer compares its own
+price with the initiator's on every query.
+
+**Mechanism, from the code (`engine.py` `on_proposal`).** A coordinator that has not yet proposed a job
+accepts the first proposal it receives for it. `has_better_proposal` finds nothing of its own to compare
+against, so it prepares the incoming proposal and marks the job in-vote. Its selection loop takes only jobs
+still pending (`pending_queue.gets(states=[PENDING])`), so it never proposes that job itself. Cost decides
+only between proposals a coordinator has already seen. A coordinator learns of a new job only in its periodic
+tick, after the delegation monitor, the child refresh, failure detection and its own record save, all Redis
+round trips (`_update_pending_jobs`). So whoever scans first after a batch lands proposes the whole batch
+(`jobs_per_proposal: 20`). Its proposal reaches the others in one RTT, before their own scan does.
+
+**Evidence, from every PBFT run of the campaign (`racecorr.py`, `batchwin.py`).**
+
+| Cell | Coordinators, nearest to the database first: share of jobs won |
+|---|---|
+| Hier-30 analytic burst | 29 @ 0.1 ms 60–73 % · 28 @ 13.5 ms 26–40 % · 30 @ 84.7 ms 0–4 % (5 of 5 runs, same order) |
+| Hier-90 LinUCB shared burst | 90 @ 0.1 ms 55–66 % · 88 @ 13.7 ms 26–39 % · 89 @ 73.9 ms 6–10 % (5 of 5) |
+| Hier-90 LinUCB shared 3 jobs/s | 90 @ 0.1 ms 57–60 % · 88 @ 14 ms 31–34 % · 89 @ 73.8 ms 8–10 % (5 of 5) |
+| Hier-90 analytic 3 jobs/s | 90 @ 0.1 ms ~20 % · 86 @ 2.4 ms ~19 % · 88 @ 13.7 ms 14 % … 82 @ 34 ms 7 % · 89 @ 74 ms 3 % (5 of 5) |
+| Hier-90 analytic burst | 86 @ 2.4 ms 15–22 % … 89 @ 74 ms 3–5 %; but 90 @ 0.1 ms only 0–14 % |
+
+* **Cost does not order the winners.** In the LinUCB block the coordinator that wins most, 90, leads the
+  smallest subtree (27 leaves, 180 cores against 210 and 236), so it is the most expensive when idle. The
+  cheapest, 89, wins least.
+* **Batches are won whole.** In each one-second distributor batch, one coordinator wins 95–99 % of its jobs.
+  79–86 of ~90 batches per run go to a single coordinator.
+* **The exception confirms the mechanism.** In the analytic burst runs coordinator 90 is nearest the database,
+  yet in run01 it proposed nothing at all (its selection counters are empty and its cost cache never ran).
+  It was a participant for all 1,800 jobs: every job reached it already in a peer's vote. Batch winners there
+  rotate among 82–89. With nine coordinators all scanning on ~0.5 s ticks against a 1 s batch, which one
+  scans first after a batch depends on tick phase, and 90 lost that phase for the whole run. In run02
+  and run05 it won the opening batches (14 %). Not explained: why its phase lost so consistently. Its tick is
+  not logged, and the next step would be per-tick timing.
+* **At steady arrivals the order is smooth.** Poisson arrivals at 3 jobs/s remove the batch alignment, and the
+  shares then fall steadily with distance to the database (20 % down to 3 %).
+
+**What it means.**
+* **PBFT's coordinator placement is a scan race, not a cost decision.** It is part of why PBFT places worse than
+  Snow under load (§4.2): at the burst its busiest LinUCB coordinator's groups queue (wait p95 72–74 s) while
+  Snow's do not. It is also the setting behind the Hier-30 E0 quirk (coordinator 30, 85 ms from the database,
+  wins 0–4 %).
+* **For E2 (Hier-90, G=3, 3 coordinators) it skews learning.** Under PBFT coordinator 90 makes ~60 % of the
+  delegation decisions and 89 ~8 %, so per-coordinator learning curves and E2a/E2b re-learning times would mix
+  the engine's placement with the bandit's quality. Aggregate regret per decision stays valid. Report it per
+  coordinator, or weight by decisions.
+* **Options, none applied.** (a) Report it as measured: it is real behaviour of PBFT under this coordinator
+  setup. (b) The E5 `peers` arm, where coordinators score each other and only the cheapest proposes, should
+  remove the race. That is now a specific prediction for E5. (c) Change PBFT so that a coordinator receiving a
+  proposal it has not matched compares the proposal's cost with its own, and proposes itself if cheaper, as a
+  Snow peer does. That changes PBFT semantics and every PBFT number, so it would be a decision, not a fix.
+  (d) Shrink `jobs_per_proposal` at the coordinator tier, so a batch can split across coordinators.
+  That reduces the effect without changing the protocol.
+
+## 8. Files
 
 | File | Contents |
 |---|---|
