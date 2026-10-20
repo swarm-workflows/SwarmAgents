@@ -4311,9 +4311,13 @@ class ResourceAgent(Agent):
         # A policy call can span an NTP step -- an LLM decision takes seconds and the fleet
         # steps at 0.1 s of drift -- and a wall-clock duration across one is wrong by the
         # step, or negative.
+        manager = getattr(self, "mab_manager", None)
+        if manager is not None:
+            manager.pop_eligible()          # drop anything left by a decision not recorded here
         started_at = time.monotonic()
         selected = self._select_child_groups(job, capable_groups, snapshots=snapshots)
         decided_at = time.monotonic()
+        eligible = manager.pop_eligible() if manager is not None else None
 
         try:
             policy = getattr(self._decision_ctx, "policy", None) or "unknown"
@@ -4329,6 +4333,7 @@ class ResourceAgent(Agent):
                 age=context_age(snapshots or {}, selected or [],
                                 now=time.time(), now_monotonic=decided_at),
                 view=view,
+                eligible=eligible,
             ))
         except Exception as exc:
             self.logger.debug(f"Decision record failed: {exc}")

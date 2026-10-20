@@ -83,6 +83,10 @@ class MABManager:
         self.repository = repository
         self.logger = logger or logging.getLogger(f"mab.{agent_id}")
         self._lock = threading.Lock()
+        # The candidates the load guard left the policy for the last decision made on this
+        # thread (`pop_eligible`), so a decision record can say what the policy could choose
+        # from. Thread-local because the decision record is written on the deciding thread.
+        self._eligible_tls = threading.local()
         self._last_persist_time = 0.0
         self._persist_interval = config.get("persist_interval_s", 30.0)
         self._persist_to_redis = config.get("persist_to_redis", False)
@@ -357,8 +361,10 @@ class MABManager:
 
             if top_k >= len(capable_groups):
                 selected = list(capable_groups)
+                self._eligible_tls.eligible = list(capable_groups)
             else:
                 eligible = self._load_eligible(capable_groups, top_k, snaps)
+                self._eligible_tls.eligible = list(eligible)
                 selected = self.policy.select_top_k(
                     eligible, top_k,
                     context={g: contexts[g] for g in eligible} if contexts else None)
@@ -377,6 +383,13 @@ class MABManager:
                 f"(job={job_id})"
             )
             return selected
+
+    def pop_eligible(self) -> Optional[List[int]]:
+        """The candidates the policy was allowed to choose from in the last `select` on this
+        thread, then forgotten; None if no bandit decision was made since the last pop."""
+        eligible = getattr(self._eligible_tls, "eligible", None)
+        self._eligible_tls.eligible = None
+        return eligible
 
     def _load_eligible(self, capable_groups: List[int], top_k: int,
                        snaps: Optional[Dict[int, GroupSnapshot]]) -> List[int]:

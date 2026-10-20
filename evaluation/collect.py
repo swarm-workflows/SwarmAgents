@@ -964,6 +964,12 @@ def regret_metrics(run_dir: Path, annotated: list[dict] | None = None) -> dict[s
         "regret_decisions_without_a_choice": summary.get("decisions_without_a_choice"),
         "regret_aggregate": summary["regret_aggregate"],
     }
+    # The load-guard split, when the decisions recorded their eligible sets (absent otherwise).
+    for key in ("regret_split_decisions", "regret_guard_total", "regret_policy_total",
+                "regret_guard_mean", "regret_policy_mean", "decisions_narrowed",
+                "decisions_guard_excluded_best"):
+        if key in summary:
+            out[key] = summary[key]
     # Whether the failure profile the regret is scored against actually describes this run.
     # `--validate` existed on the oracle CLI and the collector never ran it, so a regret column
     # could rest on a profile the run contradicted with nothing on the row saying so (§46).

@@ -283,6 +283,21 @@ def score_decision(row: dict, run: dict, aggregate: str = "mean") -> Optional[di
                  or spread <= 1e-12)
     best_groups = sorted(g for g, v in rewards.items() if v >= best_reward - 1e-12)
     known = rates
+    # Load-guard split. With the eligible set recorded, total regret = guard + policy: the guard's
+    # part is what the best group the guard ALLOWED falls short of the best overall, the
+    # policy's part is what the chosen group falls short of the best allowed. Absent (not 0)
+    # when the decision carries no eligible set, which is every non-bandit rule and every run
+    # from before the field existed.
+    eligible = [int(g) for g in (row.get("eligible") or []) if int(g) in rewards]
+    split = {}
+    if eligible:
+        best_allowed = max(rewards[g] for g in eligible)
+        split = {
+            "eligible": " ".join(str(g) for g in eligible),
+            "narrowed": len(eligible) < len(rewards),
+            "regret_guard": round(max(0.0, best_reward - best_allowed), 6),
+            "regret_policy": round(max(0.0, best_allowed - chosen_reward), 6),
+        }
     return {
         "ts": row.get("ts"),
         "agent_id": row["agent_id"],
@@ -304,6 +319,7 @@ def score_decision(row: dict, run: dict, aggregate: str = "mean") -> Optional[di
         "ctx_age_mean": row.get("ctx_age_mean"),
         "ctx_age_chosen": row.get("ctx_age_chosen"),
         "decide_s": row.get("decide_s"),
+        **split,
     }
 
 
@@ -353,6 +369,18 @@ def score_run(run: dict, aggregate: str = "mean") -> tuple[list[dict], dict]:
                              if decided else None),
         "regret_aggregate": aggregate,
     }
+    split_rows = [r for r in decided if "regret_guard" in r]
+    if split_rows:
+        summary.update({
+            "regret_split_decisions": len(split_rows),
+            "regret_guard_total": round(sum(r["regret_guard"] for r in split_rows), 6),
+            "regret_policy_total": round(sum(r["regret_policy"] for r in split_rows), 6),
+            "regret_guard_mean": round(sum(r["regret_guard"] for r in split_rows) / len(split_rows), 6),
+            "regret_policy_mean": round(sum(r["regret_policy"] for r in split_rows) / len(split_rows), 6),
+            "decisions_narrowed": sum(1 for r in split_rows if r["narrowed"]),
+            # Decisions where the guard removed every best group from the choice.
+            "decisions_guard_excluded_best": sum(1 for r in split_rows if r["regret_guard"] > 0),
+        })
     return rows, summary
 
 

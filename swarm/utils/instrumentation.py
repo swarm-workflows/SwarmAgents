@@ -435,6 +435,10 @@ class DecisionRecord:
     # snapshot build failed, and the key is then left off the row: absent reads as "not
     # recorded", which is what it is, and never as a view of idle groups.
     view: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # The candidates the bandit's load guard (`mab.load_slack`) left the policy, when a bandit
+    # decided. None (and absent from the row) for any other rule, which the guard never
+    # touches. The oracle uses it to split regret into the policy's part and the guard's.
+    eligible: Optional[List[int]] = None
 
     def as_dict(self) -> Dict[str, Any]:
         row = {
@@ -450,6 +454,8 @@ class DecisionRecord:
         row.update({f"ctx_age_{k}": v for k, v in self.age.as_dict().items()})
         if self.view:
             row["ctx_view"] = {g: dict(v) for g, v in self.view.items()}
+        if self.eligible is not None:
+            row["eligible"] = [int(g) for g in self.eligible]
         return row
 
 
