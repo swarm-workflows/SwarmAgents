@@ -1,5 +1,9 @@
 # E0 / E1′ campaign at f45d9ff1: the utilization cost model
 
+> **Superseded** for every PBFT coordinator-tier number and every Snow number by `../e0-e1-c125ed8c/README.md`
+> (PBFT counter-proposals and the Snow tie tolerance). §7 here is the PBFT race that re-run removed; the
+> "Snow places better" reading of §4.2 was largely that race.
+
 Collected 2026-10-19 from `runs/campaign-e0-e1-f45d9ff1` on the database node. This campaign is the
 fc9eb220 campaign (`../e0-e1-fc9eb220/README.md`) re-run unchanged except for the cost model. It
 replaces every latency, wait, throughput and placement figure from fc9eb220, which were measured
