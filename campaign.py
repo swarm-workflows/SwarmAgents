@@ -62,6 +62,9 @@ the repeat is recorded `gate_failed` and skipped, rather than burning a night on
 | `refused` | exit 2: the runner refused the launch (a configuration error) | **campaign stops**; it would repeat on every retry |
 | `metrics_shortfall` | exit 3 | retried |
 | `stranded` | exit 0, but jobs never left PENDING (`drain.json` `pending_at_stop`) | retried; the attempt is kept — jobs were lost |
+| `truncated` | exit 0, drained, but jobs still READY/RUNNING at the in-flight bound (`inflight_at_stop`) | retried; the attempt is kept |
+| `duplicated` | exit 0, drained, but `metrics.json` shows a job started more than once | retried; the attempt is kept |
+| `false_verdicts` | exit 0, drained, but agents declared peers failed in a cell with no companion or `expect-silent-agents` | retried; the attempt is kept |
 | `unmeasurable` | exit 4: Redis unreadable or the job producer failed | retried |
 | `timeout` | killed after `timeout_s` | retried; the next run reaps its agents |
 | `failed` | any other status | retried |
@@ -89,7 +92,8 @@ from typing import Callable, Dict, List, Optional
 ROOT = Path(__file__).resolve().parent
 
 DONE = {"ok", "ok_on_cap", "ok_infeasible", "ok_unverified"}
-RETRY = {"metrics_shortfall", "unmeasurable", "timeout", "failed", "companion_failed", "stranded"}
+RETRY = {"metrics_shortfall", "unmeasurable", "timeout", "failed", "companion_failed", "stranded",
+         "truncated", "duplicated", "false_verdicts"}
 
 
 def log(msg: str, logfile: Optional[Path] = None) -> None:
@@ -221,7 +225,41 @@ class Gate:
 
 # --------------------------------------------------------------------------- classification
 
-def classify(rc: Optional[int], run_dir: Path, timed_out: bool) -> str:
+def integrity(run_dir: Path, injected: bool) -> Optional[str]:
+    """`duplicated` when any job started more than once across the fleet, `false_verdicts` when
+    agents declared peers failed in a cell that injects no outage; None when clean or when
+    metrics.json is unreadable (the runner's own exit 3 covers missing metrics).
+
+    A drained run can still be wrong: on 2026-10-22 the database's WAN path failed mid-run,
+    81 of 90 agents were declared failed through stale Redis heartbeats, 519 jobs ran twice,
+    and the drain still said "drained"."""
+    try:
+        agents = json.loads((run_dir / "metrics.json").read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(agents, dict):
+        return None
+    starts: Dict[str, int] = {}
+    verdicts = 0
+    for p in agents.values():
+        if not isinstance(p, dict):
+            continue
+        for job_id in p.get("executed_jobs") or []:
+            starts[str(job_id)] = starts.get(str(job_id), 0) + 1
+        verdicts += len(p.get("agent_failures") or {})
+    # No allowance for refusal retries: the agent removes a refused start from executed_jobs
+    # (resource_agent.execute_job), so any job listed twice really ran twice — and a count
+    # allowance would let one job's retries excuse another job's double run.
+    if any(n > 1 for n in starts.values()):
+        return "duplicated"
+    if verdicts and not injected:
+        return "false_verdicts"
+    return None
+
+
+def classify(rc: Optional[int], run_dir: Path, timed_out: bool, injected: bool = False) -> str:
+    """*injected*: the cell kills agents on purpose (a companion or --expect-silent-agents), so
+    failure verdicts are expected there."""
     if timed_out:
         return "timeout"
     if rc == 2:
@@ -237,7 +275,17 @@ def classify(rc: Optional[int], run_dir: Path, timed_out: bool) -> str:
     except (OSError, ValueError):
         return "ok_unverified"
     if status in ("drained", "all_terminal"):
-        return "ok"
+        # The drain watches PENDING only; jobs still READY/RUNNING when the in-flight wait
+        # hit its bound were cut off, and completion reads short with "drained" beside it.
+        try:
+            inflight = json.loads((run_dir / "drain.json").read_text()).get("inflight_at_stop", 0)
+        except (OSError, ValueError):
+            inflight = 0
+        if inflight is None:
+            return "ok_unverified"
+        if inflight:
+            return "truncated"
+        return integrity(run_dir, injected) or "ok"
     if status in ("cap", "timer"):
         return "ok_on_cap"
     if status == "infeasible":
@@ -613,7 +661,8 @@ class Campaign:
                 self._stop_agents(cfg, key)
             entry.pop("running", None)
             companion_rc = stop_companion(companion)
-            outcome = classify(rc, run_dir, timed_out)
+            injected = bool(cfg.get("companion")) or "expect-silent-agents" in cfg.get("args", {})
+            outcome = classify(rc, run_dir, timed_out, injected)
             # Exactly 0, nothing else: an unknown status is not a companion that did its job.
             if companion is not None and companion_rc != 0 and outcome in DONE:
                 outcome = "companion_failed"

@@ -496,3 +496,63 @@ def test_a_companion_with_no_exit_status_is_not_success(tmp_path):
         _c.stop_companion = orig
     state = json.loads((tmp_path / "out" / "campaign_state.json").read_text())
     assert state["e6/run01"]["outcome"] == "companion_failed"
+
+
+# --------------------------------------------------------------------------- run integrity
+# 2026-10-22: the database's WAN path failed mid-run; 81 of 90 agents were declared failed, 519
+# jobs ran twice, 73 were still RUNNING at the in-flight bound — and drain.json said "drained".
+
+def _drained(tmp, inflight=0, agents=None):
+    (tmp / "drain.json").write_text(json.dumps({"status": "drained", "inflight_at_stop": inflight}))
+    if agents is not None:
+        (tmp / "metrics.json").write_text(json.dumps(agents))
+
+
+def test_jobs_left_in_flight_truncate_a_drained_run(tmp_path):
+    _drained(tmp_path, inflight=73)
+    assert classify(0, tmp_path, False) == "truncated"
+    assert "truncated" in campaign.RETRY
+
+
+def test_an_unknown_in_flight_count_is_unverified_not_clean(tmp_path):
+    _drained(tmp_path, inflight=None)
+    assert classify(0, tmp_path, False) == "ok_unverified"
+
+
+def test_a_job_started_twice_is_a_duplicated_run(tmp_path):
+    _drained(tmp_path, agents={"1": {"executed_jobs": ["a", "b"]}, "2": {"executed_jobs": ["b"]}})
+    assert classify(0, tmp_path, False) == "duplicated"
+
+
+def test_refusal_retries_never_excuse_a_double_run(tmp_path):
+    # Refused starts are removed from executed_jobs at the source; job b's double run must not
+    # be offset by job a's retry count.
+    _drained(tmp_path, agents={"1": {"executed_jobs": ["a", "b"], "refusal_retries": 5},
+                               "2": {"executed_jobs": ["b"]}})
+    assert classify(0, tmp_path, False) == "duplicated"
+
+
+def test_failure_verdicts_without_an_injected_outage_are_false(tmp_path):
+    _drained(tmp_path, agents={"1": {"executed_jobs": ["a"], "agent_failures": {"7": 1.0}}})
+    assert classify(0, tmp_path, False) == "false_verdicts"
+    assert classify(0, tmp_path, False, injected=True) == "ok"
+
+
+def test_a_clean_run_with_metrics_is_ok(tmp_path):
+    _drained(tmp_path, agents={"1": {"executed_jobs": ["a"], "agent_failures": {}},
+                               "2": {"executed_jobs": ["b"]}})
+    assert classify(0, tmp_path, False) == "ok"
+
+
+def test_a_companion_cell_tolerates_verdicts_but_not_duplicates(tmp_path):
+    spec = _spec(tmp_path, cells=[{"name": "c1", "args": {"agents": 3, "jobs": 10},
+                                   "companion": "true"}])
+
+    def runner(argv, run_dir, timeout_s, on_start=None):
+        run_dir.mkdir(parents=True, exist_ok=True)
+        _drained(run_dir, agents={"1": {"executed_jobs": ["a"], "agent_failures": {"2": 1.0}}})
+        return 0, False
+
+    c = _campaign(tmp_path, runner, spec=spec, companion_starter=lambda cmd, d: None)
+    assert c.run() == 0
+    assert c.state["c1/run01"]["outcome"] == "ok"
