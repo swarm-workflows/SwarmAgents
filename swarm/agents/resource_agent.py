@@ -994,15 +994,28 @@ class ResourceAgent(Agent):
         )
 
     def _get_live_child_groups(self) -> set:
-        """Groups with at least one fresh child heartbeat in the children map
-        (stale entries are pruned by `_refresh_agent_map` at `peer_expiry_seconds`,
-        for existing entries too since 2026-09-20). Used to gate delegation:
-        a dead group must not be offered to the bandit at all — idle-default
-        features plus an empty failure history make it look attractive
-        (Scenario C dog-piling). Genuinely new groups do heartbeat, so
-        cold-start optimism is preserved."""
-        return {child.group if child.group is not None else 0
-                for child in self.children.values()}
+        """Groups with at least one child whose record moved within the failure detector's
+        window (`_detector_window_s`), on this agent's monotonic clock. Used to gate
+        delegation: a dead group must not be offered to the bandit at all — idle-default
+        features plus an empty failure history make it look attractive (Scenario C
+        dog-piling). Genuinely new groups do heartbeat, so cold-start optimism is preserved.
+
+        Until 2026-10-28 this was every group with an entry in the children map, and a child
+        entry is evicted only at `peer_expiry_seconds` (300 s shipped). E2 at c9c980b8 killed a
+        whole group for 180 s and its coordinators delegated to it until ~170 s into the outage
+        in every Snow run: the gate never closed. It reads the stamps instead of evicting
+        earlier, so nothing else that reads the children map changes. A child with no stamp
+        yet counts as live (the old behaviour) rather than being refused on a missing input.
+        """
+        window = self._detector_window_s()
+        now = time.monotonic()
+        seen_at = self._agent_seen_at
+        live = set()
+        for child in self.children.values():
+            seen = seen_at.get(child.agent_id)
+            if seen is None or now - seen <= window:
+                live.add(child.group if child.group is not None else 0)
+        return live
 
     @property
     def empty_timeout_seconds(self):
@@ -2477,7 +2490,13 @@ class ResourceAgent(Agent):
         base = float(self.peer_expiry_seconds)
         if level != self.topology.level:
             return base
-        return max(base, float(self.failure_threshold_seconds) * 1.1 + 1.0)
+        return max(base, self._detector_window_s())
+
+    def _detector_window_s(self) -> float:
+        """How long a peer may go without a fresher record before the failure detector has
+        judged it: `failure_threshold_seconds` with the detector's 1.1x jitter plus one tick.
+        One definition for the own-tier eviction floor and the child-group liveness gate."""
+        return float(self.failure_threshold_seconds) * 1.1 + 1.0
 
     def _note_agent_seen(self, agent_id: int) -> None:
         """Record, on this agent's own monotonic clock, that a fresher record arrived.

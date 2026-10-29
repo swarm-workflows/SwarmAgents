@@ -183,3 +183,70 @@ class TestSameTierFloor:
         a._refresh_neighbors(current_time=NOW)
 
         assert 7 not in a.neighbor_map
+
+
+# --------------------------------------------------------------------------- detector-window gate
+# E2 at c9c980b8 (2026-10-28): a whole group was SIGKILLed for 180 s. Eviction waits for
+# peer_expiry_seconds (300 s), so the dead group stayed in `children` and its coordinators
+# delegated to it until ~170 s into the outage in every Snow run. The gate now reads each
+# child's last-fresher-record stamp against the failure detector's window instead.
+
+def _clock(monkeypatch, t):
+    import swarm.agents.resource_agent as ra
+    monkeypatch.setattr(ra.time, "monotonic", lambda: t)
+
+
+def test_a_silent_group_is_gated_at_the_detector_window_not_at_peer_expiry(monkeypatch):
+    a = _coordinator()
+    for aid, g in ((1, 1), (2, 1), (3, 2)):
+        a.children.set(aid, _info(aid, group=g, last_updated=NOW - 1))
+    a._agent_seen_at.update({1: 1000.0, 2: 1000.0, 3: 1000.0})
+
+    _clock(monkeypatch, 1000.0 + 60.0)          # inside 60 x 1.1 + 1 = 67 s
+    assert a._get_live_child_groups() == {1, 2}
+
+    a._agent_seen_at[3] = 1100.0                 # group 2 keeps writing, group 1 went silent
+    _clock(monkeypatch, 1000.0 + 68.0)
+    assert a._get_live_child_groups() == {2}
+    assert set(a.children.keys()) == {1, 2, 3}, "the gate must not evict: nothing else changes"
+
+
+def test_one_fresh_member_keeps_its_group_live(monkeypatch):
+    a = _coordinator()
+    a.children.set(1, _info(1, group=1, last_updated=NOW - 1))
+    a.children.set(2, _info(2, group=1, last_updated=NOW - 1))
+    a._agent_seen_at.update({1: 0.0, 2: 950.0})
+    _clock(monkeypatch, 1000.0)
+    assert a._get_live_child_groups() == {1}
+
+
+def test_a_rejoined_member_reopens_the_gate_on_its_first_fresh_record(monkeypatch):
+    a = _coordinator()
+    old = _info(1, group=1, last_updated=NOW - 200)
+    a.children.set(1, old)
+    a._agent_seen_at[1] = 0.0
+    _clock(monkeypatch, 200.0)
+    assert a._get_live_child_groups() == set()
+
+    fresh = _info(1, group=1, last_updated=NOW - 1)   # restarted agent writes again
+    _redis_returns(a, {1: [fresh], 2: []})
+    a._refresh_children(current_time=NOW)
+    assert a._get_live_child_groups() == {1}
+
+
+def test_a_child_with_no_stamp_counts_as_live(monkeypatch):
+    a = _coordinator()
+    a.children.set(1, _info(1, group=1, last_updated=NOW - 1))
+    _clock(monkeypatch, 1e6)
+    assert a._get_live_child_groups() == {1}
+
+
+def test_the_window_follows_the_failure_threshold(monkeypatch):
+    a = _coordinator(runtime={"peer_expiry_seconds": 300, "failure_threshold_seconds": 20})
+    a.children.set(1, _info(1, group=1, last_updated=NOW - 1))
+    a._agent_seen_at[1] = 0.0
+    _clock(monkeypatch, 23.0)                    # 20 x 1.1 + 1 = 23
+    assert a._get_live_child_groups() == {1}
+    _clock(monkeypatch, 23.5)
+    assert a._get_live_child_groups() == set()
+    assert a._detector_window_s() == pytest.approx(23.0)
