@@ -16,6 +16,7 @@ had drifted (code review 2026-10-07, plan E7).
 from __future__ import annotations
 
 import json
+import math
 import logging
 from typing import List, Optional
 
@@ -252,8 +253,9 @@ def arrival_kwargs(args, run_dir) -> dict:
     if (rate is None) == (sched is None):
         raise SystemExit("--arrival poisson takes exactly one of --arrival-rate or "
                          "--arrival-schedule")
-    if rate is not None and not rate > 0:
-        raise SystemExit(f"--arrival-rate must be a positive number, got {rate}")
+    # Finite as well as positive: an infinite rate makes every gap 0, a burst named "poisson".
+    if rate is not None and not (math.isfinite(rate) and rate > 0):
+        raise SystemExit(f"--arrival-rate must be a positive finite number, got {rate}")
     if args.arrival_seed is None:
         raise SystemExit("--arrival poisson needs --arrival-seed (the SWARM cell's --seed), or "
                          "the baseline and the cell it is compared with see different arrivals")

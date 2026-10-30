@@ -64,6 +64,8 @@ def test_the_baseline_sees_the_swarm_cells_arrival_times(tmp_path):
     (["--arrival", "poisson", "--arrival-rate", "3", "--arrival-schedule", "s.json",
       "--arrival-seed", "1"], "exactly one"),
     (["--arrival", "poisson", "--arrival-rate", "0", "--arrival-seed", "1"], "positive"),
+    (["--arrival", "poisson", "--arrival-rate", "inf", "--arrival-seed", "1"], "finite"),
+    (["--arrival", "poisson", "--arrival-rate", "nan", "--arrival-seed", "1"], "finite"),
     (["--arrival-rate", "3.0"], "poisson only"),
     (["--arrival-seed", "42"], "poisson only"),
 ])
