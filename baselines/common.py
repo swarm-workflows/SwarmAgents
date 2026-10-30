@@ -264,3 +264,33 @@ def arrival_kwargs(args, run_dir) -> dict:
     except (OSError, ValueError) as e:
         raise SystemExit(f"--arrival-schedule {sched}: {e}")
     return {**out, "arrival": "poisson", "schedule": schedule, "arrival_seed": args.arrival_seed}
+
+
+_SSH_OPTS = ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+             "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+
+
+def stage_config(hosts, local_path: str, remote_repo_dir: str, run_id: str, run=None) -> str:
+    """Copy the base config the runner loaded to every worker host, under a run-scoped name, and
+    return that remote path: workers and runner then read one file. Until 2026-10-30 the remote
+    path was `<repo>/<basename>` and nothing copied it, so a config under `campaigns/` was missing
+    on every agent (the first E7 rehearsal: 81 workers died on start) and one present by chance
+    could differ from the runner's. Raises SystemExit naming every host the copy failed on."""
+    import subprocess
+    from concurrent.futures import ThreadPoolExecutor
+    run = run or (lambda argv: subprocess.run(argv, stdout=subprocess.DEVNULL,
+                                              stderr=subprocess.DEVNULL, timeout=60).returncode)
+    remote = f"{remote_repo_dir.rstrip('/')}/configs/baseline-{run_id}.yml"
+
+    def one(host):
+        if run(["ssh", *_SSH_OPTS, host, f"mkdir -p {remote_repo_dir.rstrip('/')}/configs"]) != 0:
+            return host
+        return host if run(["scp", "-q", *_SSH_OPTS, local_path, f"{host}:{remote}"]) != 0 else None
+
+    hosts = sorted(set(h for h in hosts if h))
+    with ThreadPoolExecutor(max_workers=32) as pool:
+        failed = [h for h in pool.map(one, hosts) if h]
+    if failed:
+        raise SystemExit(f"could not copy {local_path} to {len(failed)} host(s): "
+                         f"{', '.join(failed[:10])}{'…' if len(failed) > 10 else ''}")
+    return remote

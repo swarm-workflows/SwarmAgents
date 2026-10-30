@@ -48,8 +48,8 @@ if str(_ROOT) not in sys.path:
 import redis  # noqa: E402
 
 from baselines.common import (add_arrival_args, arrival_kwargs, keyed_metrics,  # noqa: E402
-                              load_level0_fleet, read_reports, runtime_config,
-                              wait_for_final_reports)
+                              load_level0_fleet, read_reports, runtime_config, safe_write_drain,
+                              stage_config, wait_for_final_reports)
 from baselines.sparrow import Keys, publish_fleet  # noqa: E402
 from swarm.database.repository import Repository  # noqa: E402
 from swarm.models.job import ObjectState  # noqa: E402
@@ -211,8 +211,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     args = p.parse_args(argv)
     if args.mode == "remote" and not args.agent_hosts_file:
         p.error("--mode remote needs --agent-hosts-file")
-    if args.remote_config is None:
-        args.remote_config = str(Path(args.remote_repo_dir) / Path(args.config).name)
+    # --remote-config unset = copy --config to every node host at launch (common.stage_config).
     if args.schedulers <= 0:
         args.schedulers = max(1, args.agents // 10)
     if args.stats_wait_s is None:
@@ -275,8 +274,17 @@ def main(argv=None) -> int:
     if total < args.jobs:
         log(f"WARNING: --jobs {args.jobs} but {args.use_jobs_dir} holds {total} job files")
 
-    nodes = Nodes(args, run_id, run_dir)
     sched_hosts = scheduler_agents(args.agents, args.schedulers)
+    if args.mode == "remote" and args.config and args.remote_config is None:
+        node_hosts = {host_of(w) for w in worker_ids} | {host_of(s) for s in sched_hosts}
+        try:
+            args.remote_config = stage_config(node_hosts, args.config, args.remote_repo_dir, run_id)
+        except SystemExit as exc:
+            log(f"REFUSED: {exc}")
+            safe_write_drain(run_dir, {"status": "startup_refused", "config_not_staged": str(exc)})
+            return 2
+        log(f"Base config staged to {len(node_hosts)} host(s) as {args.remote_config}")
+    nodes = Nodes(args, run_id, run_dir)
     exit_code = 0
     drain = {"status": None}
     try:

@@ -109,3 +109,29 @@ def test_the_centralized_scheduler_hands_them_to_the_distributor(tmp_path, monke
     t.start()
     t.join(10)
     assert {k: got[k] for k in arrival} == arrival
+
+
+# --------------------------------------------------------------------------- config staging
+# The first E7 rehearsal (2026-10-30): workers were told to read <repo>/config_pbft.yml, nothing
+# copied it there, and the file lives under campaigns/ — all 81 workers died on start.
+
+def test_the_config_is_copied_to_every_host_under_a_run_scoped_name():
+    from baselines.common import stage_config
+    calls = []
+    remote = stage_config(["agent-2", "agent-1", "agent-2", None], "campaigns/config_pbft.yml",
+                          "/root/SwarmAgents", "run-x", run=lambda argv: calls.append(argv) or 0)
+    assert remote == "/root/SwarmAgents/configs/baseline-run-x.yml"
+    scps = sorted(a[-1] for a in calls if a[0] == "scp")
+    assert scps == ["agent-1:" + remote, "agent-2:" + remote]          # each host once
+    assert all(a[-2] == "campaigns/config_pbft.yml" for a in calls if a[0] == "scp")
+
+
+def test_a_host_the_copy_fails_on_is_named_and_refused():
+    from baselines.common import stage_config
+    run = lambda argv: 1 if argv[0] == "scp" and argv[-1].startswith("agent-7:") else 0
+    with pytest.raises(SystemExit, match="agent-7"):
+        stage_config(["agent-1", "agent-7"], "c.yml", "/root/SwarmAgents", "r", run=run)
+
+
+def test_sparrow_leaves_the_remote_config_to_be_staged():
+    assert _sparrow().remote_config is None and _central().remote_config is None

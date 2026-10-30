@@ -44,7 +44,7 @@ import redis
 
 from baselines.common import (add_arrival_args, arrival_kwargs, configure_execution,
                               cost_params, executor_workers, host_of, load_config,
-                              wait_for_final_reports)
+                              stage_config, wait_for_final_reports)
 from baselines.scheduler import SCHEDULER_MAP
 
 
@@ -298,8 +298,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--debug", action="store_true")
 
     args = p.parse_args(argv)
-    if args.remote_config is None:
-        args.remote_config = str(Path(args.remote_repo_dir) / Path(args.config).name)
+    # --remote-config unset = copy --config to every worker host at launch (common.stage_config).
     if args.stats_wait_s is None:
         from baselines.run_sparrow import drain_deadline
         args.stats_wait_s = drain_deadline(args.config)
@@ -412,6 +411,16 @@ def main(argv=None) -> int:
     try:
         # 4. Workers. A fleet with silent workers is a smaller fleet than the cell claims, and
         # its numbers would sit beside SWARM's as if it were not, so it is refused.
+        if args.remote_config is None:
+            try:
+                args.remote_config = stage_config(worker_hosts, args.config,
+                                                  args.remote_repo_dir, run_id)
+            except SystemExit as exc:
+                log(f"REFUSED: {exc}")
+                (run_dir / "drain.json").write_text(json.dumps(
+                    {"status": "startup_refused", "config_not_staged": str(exc)}, indent=2))
+                return 2
+            log(f"Base config staged to {len(worker_hosts)} host(s) as {args.remote_config}")
         placement, failed = start_workers(scheduler.agents, args, run_id)
         missing = wait_for_workers(redis_client, keys, agent_ids, args.worker_timeout)
         if failed or missing:

@@ -157,7 +157,9 @@ def test_a_cli_override_wins_over_the_config(tmp_path):
                        "x", "--agent-hosts-file", "h", "--run-dir", "r", "--cpu-weight", "0.2",
                        "--config", str(cfg)])
     assert resolve_cost(args, load_config(str(cfg)))["cost_weights"]["cpu"] == 0.2
-    assert args.remote_config == "/root/SwarmAgents/c.yml"
+    # Not `<repo>/<basename>` any more: unset means the runner copies --config to every worker
+    # host at launch (common.stage_config), so a config under campaigns/ is not missing remotely.
+    assert args.remote_config is None
 
 
 # --------------------------------------------------------------------------- local runs
