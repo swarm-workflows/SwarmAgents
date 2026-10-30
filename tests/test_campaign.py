@@ -519,9 +519,9 @@ def test_an_unknown_in_flight_count_is_unverified_not_clean(tmp_path):
     assert classify(0, tmp_path, False) == "ok_unverified"
 
 
-def test_a_job_started_twice_is_a_duplicated_run(tmp_path):
+def test_a_job_started_twice_is_flagged_done_not_retried(tmp_path):
     _drained(tmp_path, agents={"1": {"executed_jobs": ["a", "b"]}, "2": {"executed_jobs": ["b"]}})
-    assert classify(0, tmp_path, False) == "duplicated"
+    assert classify(0, tmp_path, False) == "ok_duplicated"
 
 
 def test_refusal_retries_never_excuse_a_double_run(tmp_path):
@@ -529,7 +529,7 @@ def test_refusal_retries_never_excuse_a_double_run(tmp_path):
     # be offset by job a's retry count.
     _drained(tmp_path, agents={"1": {"executed_jobs": ["a", "b"], "refusal_retries": 5},
                                "2": {"executed_jobs": ["b"]}})
-    assert classify(0, tmp_path, False) == "duplicated"
+    assert classify(0, tmp_path, False) == "ok_duplicated"
 
 
 def test_failure_verdicts_without_an_injected_outage_are_false(tmp_path):
@@ -544,7 +544,32 @@ def test_a_clean_run_with_metrics_is_ok(tmp_path):
     assert classify(0, tmp_path, False) == "ok"
 
 
-def test_a_companion_cell_tolerates_verdicts_but_not_duplicates(tmp_path):
+def test_a_partition_cell_keeps_its_double_executions(tmp_path):
+    """E6 under PBFT measures jobs run twice; retrying would discard exactly that evidence."""
+    spec = _spec(tmp_path, cells=[{"name": "c1", "args": {"agents": 3, "jobs": 10},
+                                   "companion": "true"}])
+    calls = []
+
+    def runner(argv, run_dir, timeout_s, on_start=None):
+        calls.append(run_dir)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        _drained(run_dir, agents={"1": {"executed_jobs": ["a", "b"], "agent_failures": {"2": 1.0}},
+                                  "2": {"executed_jobs": ["b"]}})
+        return 0, False
+
+    c = _campaign(tmp_path, runner, spec=spec, companion_starter=lambda cmd, d: None)
+    assert c.run() == 0
+    assert c.state["c1/run01"]["outcome"] == "ok_duplicated" and len(calls) == 1
+
+
+def test_an_outage_with_duplicates_is_retried_as_false_verdicts(tmp_path):
+    """The 2026-10-22 WAN outage: verdicts in a clean cell mark infrastructure, whatever else."""
+    _drained(tmp_path, agents={"1": {"executed_jobs": ["a", "b"], "agent_failures": {"2": 1.0}},
+                               "2": {"executed_jobs": ["b"]}})
+    assert classify(0, tmp_path, False) == "false_verdicts"
+
+
+def test_a_companion_cell_tolerates_verdicts(tmp_path):
     spec = _spec(tmp_path, cells=[{"name": "c1", "args": {"agents": 3, "jobs": 10},
                                    "companion": "true"}])
 

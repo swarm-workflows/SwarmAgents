@@ -63,7 +63,7 @@ the repeat is recorded `gate_failed` and skipped, rather than burning a night on
 | `metrics_shortfall` | exit 3 | retried |
 | `stranded` | exit 0, but jobs never left PENDING (`drain.json` `pending_at_stop`) | retried; the attempt is kept — jobs were lost |
 | `truncated` | exit 0, drained, but jobs still READY/RUNNING at the in-flight bound (`inflight_at_stop`) | retried; the attempt is kept |
-| `duplicated` | exit 0, drained, but `metrics.json` shows a job started more than once | retried; the attempt is kept |
+| `ok_duplicated` | exit 0, drained, but `metrics.json` shows a job started more than once | done, flagged — never retried: in a fault cell it may be the measurement, and a retry would bias it toward 0 |
 | `false_verdicts` | exit 0, drained, but agents declared peers failed in a cell with no companion or `expect-silent-agents` | retried; the attempt is kept |
 | `unmeasurable` | exit 4: Redis unreadable or the job producer failed | retried |
 | `timeout` | killed after `timeout_s` | retried; the next run reaps its agents |
@@ -91,9 +91,9 @@ from typing import Callable, Dict, List, Optional
 
 ROOT = Path(__file__).resolve().parent
 
-DONE = {"ok", "ok_on_cap", "ok_infeasible", "ok_unverified"}
+DONE = {"ok", "ok_on_cap", "ok_infeasible", "ok_unverified", "ok_duplicated"}
 RETRY = {"metrics_shortfall", "unmeasurable", "timeout", "failed", "companion_failed", "stranded",
-         "truncated", "duplicated", "false_verdicts"}
+         "truncated", "false_verdicts"}
 
 
 def log(msg: str, logfile: Optional[Path] = None) -> None:
@@ -226,9 +226,15 @@ class Gate:
 # --------------------------------------------------------------------------- classification
 
 def integrity(run_dir: Path, injected: bool) -> Optional[str]:
-    """`duplicated` when any job started more than once across the fleet, `false_verdicts` when
-    agents declared peers failed in a cell that injects no outage; None when clean or when
-    metrics.json is unreadable (the runner's own exit 3 covers missing metrics).
+    """`false_verdicts` when agents declared peers failed in a cell that injects no outage (an
+    infrastructure fault: retried); else `ok_duplicated` when any job started more than once
+    across the fleet; None when clean or when metrics.json is unreadable (the runner's own
+    exit 3 covers missing metrics).
+
+    A double execution is DONE-but-flagged, never retried: in a fault cell it can be the
+    measurement itself (E6 under PBFT counts exactly this), and in a clean cell it is the only
+    evidence of a defect (8 jobs ran twice in E0 that way, 2026-10-09). A retry would drop the
+    run from the aggregate and bias the column toward 0, the flattering way.
 
     A drained run can still be wrong: on 2026-10-22 the database's WAN path failed mid-run,
     81 of 90 agents were declared failed through stale Redis heartbeats, 519 jobs ran twice,
@@ -250,10 +256,10 @@ def integrity(run_dir: Path, injected: bool) -> Optional[str]:
     # No allowance for refusal retries: the agent removes a refused start from executed_jobs
     # (resource_agent.execute_job), so any job listed twice really ran twice — and a count
     # allowance would let one job's retries excuse another job's double run.
-    if any(n > 1 for n in starts.values()):
-        return "duplicated"
     if verdicts and not injected:
         return "false_verdicts"
+    if any(n > 1 for n in starts.values()):
+        return "ok_duplicated"
     return None
 
 
