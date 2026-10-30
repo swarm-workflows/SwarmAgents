@@ -262,6 +262,19 @@ class ConsensusEngine:
                 )
                 container.remove_proposal(p_id=existing.p_id, object_id=incoming_proposal.object_id)
 
+    def _counters_active(self, oid: str) -> bool:
+        """Whether this agent would price `oid` for a counter-proposal at all, whatever the
+        comparison: the host implements `counter_proposal_cost` and answers a number for it.
+        False at every leaf and wherever counter-proposals are off."""
+        fn = getattr(self.host, "counter_proposal_cost", None)
+        if fn is None:
+            return False
+        try:
+            own = fn(oid)
+        except Exception:
+            return False
+        return own is not None and own == own and own != float("inf")
+
     def _counter_proposal(self, object, incoming: ProposalInfo) -> Optional[ProposalInfo]:
         """A proposal of this agent's own for `object`, if it should answer `incoming` with one.
 
@@ -338,6 +351,7 @@ class ConsensusEngine:
     def on_proposal(self, msg: Proposal) -> None:
         proposals = []
         counters = []
+        merged = []
         for proposal in msg.proposals:
             # Cheap, local checks FIRST. `get_object` is a synchronous Redis GET once the job
             # has left the local queue, and every straggler (n - q per phase per job) used to
@@ -387,11 +401,19 @@ class ConsensusEngine:
                 self._remove_worse_proposals_from_container(proposal, self.outgoing)
                 self._remove_worse_proposals_from_container(proposal, self.incoming)
 
+                # Already adopted from a PREPARE and voted for then (`on_prepare`): merge the
+                # wire copy's votes and check commit on the merged copy, but send no second
+                # PREPARE, since this agent's vote is already out.
+                held = (self.incoming.get_proposal(p_id=proposal.p_id)
+                        if self.incoming.contains(object_id=proposal.object_id, p_id=proposal.p_id)
+                        else None)
+                voted = held is not None and self.agent_id in held.prepares
                 # Our own PREPARE counts toward the quorum we compute over a live set that
                 # includes us (code review 2026-10-05 §5).
                 self._add_vote(proposal.prepares)
-                proposals.append(proposal)
                 self.incoming.add_proposal(proposal)
+                stored = self.incoming.get_proposal(p_id=proposal.p_id) or proposal
+                (merged if voted else proposals).append(stored)
                 object.state = ObjectState.PREPARE
 
         # respond with PREPARE
@@ -402,8 +424,9 @@ class ConsensusEngine:
                               proposals=proposals)
             self.host.log_debug("Sending prepares")
             self.transport.broadcast(prepare)
-            # Our vote may be the one that completes the prepare quorum.
-            self._commit_where_prepared(proposals)
+        # Our vote, or the merged copy's, may be the one that completes the prepare quorum.
+        if proposals or merged:
+            self._commit_where_prepared(proposals + merged)
 
         if self.router.should_forward():
             self.transport.broadcast(payload=msg)
@@ -411,6 +434,7 @@ class ConsensusEngine:
     def on_prepare(self, msg: Prepare) -> None:
         proposals = []
         counters = []
+        adopted = []
         for p in msg.proposals:
             # Cheap, local checks FIRST. `get_object` is a synchronous Redis GET once the job
             # has left the local queue, and every straggler (n - q per phase per job) used to
@@ -479,8 +503,23 @@ class ConsensusEngine:
                     self._remove_worse_proposals_from_container(p, self.outgoing)
                     self._remove_worse_proposals_from_container(p, self.incoming)
 
-                    proposal = p
-                    self.incoming.add_proposal(proposal=proposal)
+                    self.incoming.add_proposal(proposal=p)
+                    proposal = self.incoming.get_proposal(p_id=p.p_id) or p
+                    # Vote for it, as `on_proposal` does, where this agent never counter-proposes
+                    # (every leaf; a coordinator under `peers` or with counter_propose off). Until
+                    # 2026-10-30 an agent that learned a proposal from a PREPARE adopted it
+                    # SILENTLY and voted only if the PROPOSAL itself arrived later. PBFT never
+                    # retransmits, so a lost PROPOSAL left every second-hand agent mute: in E6 a
+                    # 5-agent group held 2 votes against a quorum of 3 until the 300 s
+                    # reselection, 9-11 jobs per run after a partition healed
+                    # (docs/results/e6-58f3ab22/README.md §3). Where counter-proposals are live
+                    # the silence is kept: voting at once lets a dearer first proposal reach its
+                    # prepare quorum before a cheaper counter does, and commits then lock onto
+                    # different proposals with no quorum anywhere (7 of 400 undecided at 9
+                    # coordinators with no loss, against 0; tests/test_pbft_adopt_via_prepare.py).
+                    if not self._counters_active(p.object_id):
+                        self._add_vote(proposal.prepares)
+                        adopted.append(proposal)
 
                     # FIX: If we accepted a better proposal while in COMMIT phase, reset to PREPARE
                     # This ensures we properly vote for the better proposal
@@ -507,6 +546,10 @@ class ConsensusEngine:
             proposals.append(proposal)
 
         self._issue_counter_proposals(counters)
+        if adopted:
+            self.transport.broadcast(Prepare(source=self.agent_id,
+                                             agents=[AgentInfo(agent_id=self.agent_id)],
+                                             proposals=adopted))
         self._commit_where_prepared(proposals)
 
         if self.router.should_forward():
