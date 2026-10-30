@@ -135,3 +135,18 @@ def test_a_host_the_copy_fails_on_is_named_and_refused():
 
 def test_sparrow_leaves_the_remote_config_to_be_staged():
     assert _sparrow().remote_config is None and _central().remote_config is None
+
+
+@pytest.mark.parametrize("exc", ["timeout", "oserror"])
+def test_a_hung_or_unrunnable_copy_is_a_refusal_not_a_crash(exc):
+    import subprocess
+    from baselines.common import stage_config
+
+    def run(argv):
+        if argv[-1].startswith("agent-3"):
+            if exc == "timeout":
+                raise subprocess.TimeoutExpired(argv, 60)
+            raise OSError("ssh: not found")
+        return 0
+    with pytest.raises(SystemExit, match="agent-3"):
+        stage_config(["agent-1", "agent-3"], "c.yml", "/root/SwarmAgents", "r", run=run)

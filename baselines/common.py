@@ -283,9 +283,17 @@ def stage_config(hosts, local_path: str, remote_repo_dir: str, run_id: str, run=
     remote = f"{remote_repo_dir.rstrip('/')}/configs/baseline-{run_id}.yml"
 
     def one(host):
-        if run(["ssh", *_SSH_OPTS, host, f"mkdir -p {remote_repo_dir.rstrip('/')}/configs"]) != 0:
+        # A hung or unrunnable ssh/scp is a failed host, like a non-zero exit: it must end in
+        # the refusal below, never escape the pool as a crash with no drain.json.
+        try:
+            if run(["ssh", *_SSH_OPTS, host,
+                    f"mkdir -p {remote_repo_dir.rstrip('/')}/configs"]) != 0:
+                return host
+            if run(["scp", "-q", *_SSH_OPTS, local_path, f"{host}:{remote}"]) != 0:
+                return host
+        except (subprocess.TimeoutExpired, OSError):
             return host
-        return host if run(["scp", "-q", *_SSH_OPTS, local_path, f"{host}:{remote}"]) != 0 else None
+        return None
 
     hosts = sorted(set(h for h in hosts if h))
     with ThreadPoolExecutor(max_workers=32) as pool:
