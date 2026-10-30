@@ -79,6 +79,7 @@ class BaselineScheduler(ABC):
         run_id: str | None = None,
         agents: int | None = None,
         redis_client=None,
+        arrival: dict | None = None,
     ):
         self.db_host = db_host
         self.db_port = db_port
@@ -88,6 +89,8 @@ class BaselineScheduler(ABC):
         self.run_dir = run_dir
         self.total_jobs = total_jobs
         self.interval = interval
+        # JobDistributor's arrival keywords (`common.arrival_kwargs`); None = batch, as before.
+        self.arrival = dict(arrival or {})
         self.executor_workers = max(1, int(executor_workers))
         self.level = level
         self.group = group
@@ -462,7 +465,7 @@ class BaselineScheduler(ABC):
             distributor = JobDistributor(
                 redis_host=self.db_host, redis_port=self.db_port, jobs_dir=self.jobs_dir,
                 jobs_per_interval=self.jobs_per_interval, interval=self.interval,
-                level=self.level, group=self.group)
+                level=self.level, group=self.group, **self.arrival)
             distributor.daemon = True
             distributor.start()
 

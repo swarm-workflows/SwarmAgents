@@ -47,8 +47,9 @@ if str(_ROOT) not in sys.path:
 
 import redis  # noqa: E402
 
-from baselines.common import (keyed_metrics, load_level0_fleet, read_reports,  # noqa: E402
-                              runtime_config, wait_for_final_reports)
+from baselines.common import (add_arrival_args, arrival_kwargs, keyed_metrics,  # noqa: E402
+                              load_level0_fleet, read_reports, runtime_config,
+                              wait_for_final_reports)
 from baselines.sparrow import Keys, publish_fleet  # noqa: E402
 from swarm.database.repository import Repository  # noqa: E402
 from swarm.models.job import ObjectState  # noqa: E402
@@ -199,6 +200,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--use-jobs-dir", required=True, help="jobs directory of the SWARM arm")
     p.add_argument("--jobs-per-interval", type=int, default=20)
     p.add_argument("--interval", type=float, default=1.0)
+    add_arrival_args(p)
     p.add_argument("--timeout", type=float, default=3600.0,
                    help="Hard cap on the run; drain.json says when it ended on it.")
     p.add_argument("--startup-timeout", type=float, default=60.0)
@@ -242,6 +244,7 @@ def main(argv=None) -> int:
     args = parse_args(argv)
     run_dir = Path(args.run_dir).resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
+    arrival = arrival_kwargs(args, run_dir)      # refused here, before any worker launches
     run_id = f"sparrow-{uuid.uuid4().hex[:12]}"
     os.environ["SWARM_RUN_ID"] = run_id          # the distributor's readiness keys match ours
     started = time.time()
@@ -302,7 +305,7 @@ def main(argv=None) -> int:
         distributor = JobDistributor(redis_host=args.db_host, redis_port=args.db_port,
                                      jobs_dir=args.use_jobs_dir,
                                      jobs_per_interval=args.jobs_per_interval,
-                                     interval=args.interval, level=0, group=0)
+                                     interval=args.interval, level=0, group=0, **arrival)
         distributor.daemon = True
         distributor.start()
         log(f"Distributing {total} jobs; probe ratio {args.probe_ratio}")

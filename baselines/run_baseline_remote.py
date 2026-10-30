@@ -42,8 +42,9 @@ if str(_SWARM_ROOT) not in sys.path:
 
 import redis
 
-from baselines.common import (configure_execution, cost_params, executor_workers, host_of,
-                              load_config, wait_for_final_reports)
+from baselines.common import (add_arrival_args, arrival_kwargs, configure_execution,
+                              cost_params, executor_workers, host_of, load_config,
+                              wait_for_final_reports)
 from baselines.scheduler import SCHEDULER_MAP
 
 
@@ -268,6 +269,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     # Job submission
     p.add_argument("--jobs-per-interval", type=int, default=20)
     p.add_argument("--interval", type=float, default=1.0)
+    add_arrival_args(p)
     p.add_argument("--timeout", type=float, default=3600.0,
                    help="Hard cap on the run; drain.json says when it ended on it")
 
@@ -377,6 +379,7 @@ def main(argv=None) -> int:
             agents_per_host=args.agents_per_host)
 
     # 3. The base config: cost parameters, the wall-time clamp, per-agent concurrency.
+    arrival = arrival_kwargs(args, run_dir)      # refused here, before any worker launches
     config = load_config(args.config)
     runtime = config.get("runtime") or {}
     configure_execution(runtime)          # recorded in run_meta; the workers apply it too
@@ -390,7 +393,7 @@ def main(argv=None) -> int:
         jobs_dir=jobs_dir, jobs_per_interval=args.jobs_per_interval, run_dir=str(run_dir),
         total_jobs=total, interval=args.interval,
         executor_workers=executor_workers(runtime), timeout=args.timeout, remote=True,
-        run_id=run_id, agents=args.agents, **cost)
+        run_id=run_id, agents=args.agents, arrival=arrival, **cost)
     try:
         scheduler.load_agents()
     except SystemExit as exc:          # a profile set for a smaller fleet: a refusal, not a crash

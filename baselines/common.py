@@ -218,3 +218,47 @@ def safe_write_drain(run_dir, drain: dict) -> None:
     """`drain.json` touches no store, so it is written whatever state Redis is in."""
     from pathlib import Path as _P
     _P(run_dir, "drain.json").write_text(json.dumps(drain, indent=2))
+
+
+def add_arrival_args(p) -> None:
+    """The arrival options `run_test.py` takes, so a baseline cell can be given the SWARM cell's
+    load. Poisson needs an explicit `--arrival-seed`: `run_test.py` falls back to its `--seed`,
+    and a baseline drawing different arrival times from the cell it sits beside would compare
+    two different workloads."""
+    p.add_argument("--arrival", choices=("batch", "poisson"), default="batch",
+                   help="batch: --jobs-per-interval every --interval s; poisson: seeded Poisson "
+                        "arrival times, rate from --arrival-rate or --arrival-schedule")
+    p.add_argument("--arrival-rate", type=float, default=None,
+                   help="poisson: constant arrival rate, jobs per second")
+    p.add_argument("--arrival-schedule", default=None,
+                   help="poisson: JSON [[start_s, jobs_per_s], ...] piecewise rate")
+    p.add_argument("--arrival-seed", type=int, default=None,
+                   help="poisson: seed for arrival times; pass the SWARM cell's --seed")
+
+
+def arrival_kwargs(args, run_dir) -> dict:
+    """`JobDistributor` keyword arguments for the chosen arrivals, plus `arrivals.json` in the
+    run dir, or SystemExit for a configuration that would silently run a different one (the
+    same refusals as `run_test.check_arrival_args`)."""
+    from pathlib import Path as _P
+    from job_distributor import load_rate_schedule
+    out = {"arrivals_out": str(_P(run_dir) / "arrivals.json")}
+    rate, sched = args.arrival_rate, args.arrival_schedule
+    if args.arrival == "batch":
+        if rate is not None or sched is not None or args.arrival_seed is not None:
+            raise SystemExit("--arrival-rate/--arrival-schedule/--arrival-seed apply to "
+                             "--arrival poisson only")
+        return {**out, "arrival": "batch"}
+    if (rate is None) == (sched is None):
+        raise SystemExit("--arrival poisson takes exactly one of --arrival-rate or "
+                         "--arrival-schedule")
+    if rate is not None and not rate > 0:
+        raise SystemExit(f"--arrival-rate must be a positive number, got {rate}")
+    if args.arrival_seed is None:
+        raise SystemExit("--arrival poisson needs --arrival-seed (the SWARM cell's --seed), or "
+                         "the baseline and the cell it is compared with see different arrivals")
+    try:
+        schedule = [(0.0, float(rate))] if rate is not None else load_rate_schedule(sched)
+    except (OSError, ValueError) as e:
+        raise SystemExit(f"--arrival-schedule {sched}: {e}")
+    return {**out, "arrival": "poisson", "schedule": schedule, "arrival_seed": args.arrival_seed}
