@@ -101,6 +101,10 @@ not a useful comparison here: it measures return to each arm's *own* pre-event a
 
 ### 3.4 E2b: re-adoption is fast, but detection does not gate the dead group
 
+**Superseded by `../e2b-58f3ab22/README.md`** (gate fixed in 58f3ab22, E2b re-run 29 Oct): the last
+delegation to the dead group now comes at most 68 s after the kill and LinUCB re-adopts in 3–8 s. The
+text below is kept as the record of the defect.
+
 | Arm | Engine | Delegations to group 3 while down (of coordinator 89's) | Re-adopted | First delegation after rejoin |
 |---|---|---|---|---|
 | LinUCB shared | PBFT / Snow | 10.6 of 61 / 20.2 of 144 | 5/5 / 5/5 | 38.8 s (median 16) / 20.4 s |
@@ -141,9 +145,8 @@ across engines. The schedule's shape is stylized, not from a trace: say so besid
 
 ## 5. Caveats and open items
 
-* **E2b needs a decision before it is cited as liveness evidence:** an outage longer than
-  `peer_expiry_seconds` plus margin, or a child-tier eviction tied to the failure detector (a code change,
-  so a re-run of E2b at the new revision). As it stands it is a re-adoption measurement only.
+* **E2b here did not exercise liveness gating** (§3.4). Resolved by gating on the failure detector's
+  window (58f3ab22) and re-running E2b: `../e2b-58f3ab22/README.md`. Cite E2b from there.
 * The guard's benefit (spreading load) is not measured in this campaign: `group_busiest_share` is not in
   this collection, so the herding side of the trade-off still rests on E1′.
 * The engine-independence of regret is a property of this profile (failures depend on job type, not load).
