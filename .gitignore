@@ -172,3 +172,29 @@ swarm-multi/**
 jobs/
 *.json
 shutdown
+
+# Local run artifacts and archives (evaluation data lives in
+# swarmplus-evaluation-data, not here)
+*.tgz
+*.tar.gz
+notebooks/run-h-*/
+configs-recovery/
+cpegasus
+
+# Claude Code per-session usage log (local bookkeeping)
+cc-usage-log.md
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Paper plans are local-only (decision 2026-09-21): followable on their own, not published.
+# History up to ab5ee074 still carries earlier revisions (the conference plan under its old
+# venue-specific name, CCGRID27_PAPER_PLAN.md); the Snow-only plan was merged into the
+# conference plan and deleted from the tree at 57ce28f6's successor.
+docs/CONFERENCE_PAPER_PLAN.md
+docs/CCGRID27_PAPER_PLAN.md
+docs/FGCS_EVAL_PLAN.md
+docs/.plan-backups/
+
+# Local reviews of the local-only plans
+docs/*.review-*.md

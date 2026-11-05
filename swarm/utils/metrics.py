@@ -41,10 +41,26 @@ class Metrics:
         self.reassignments = {}
         self.quorum_changes = []
         self.delegation_reassignments = {}
+        # (job_id, child_group, at) for every untaken child copy a coordinator withdrew:
+        # the copy is deleted, so this is the only record of when it stopped being in
+        # flight (context error, T-5).
+        self.delegation_withdrawals = []
         self.mab_rewards = {}      # group_id -> list of (timestamp, reward)
         self.mab_selections = {}   # group_id -> selection count
+        # LLM group delegation (P0-1): group_id -> count of jobs the *model* routed there.
+        # Separate from mab_selections so a run cannot report bandit selections it never made
+        # — under `delegation.policy: llm` the bandit still receives outcomes, so a shared
+        # counter would read as if it had been choosing.
+        self.llm_delegations = {}
         self.infeasible_retired = []  # job_ids retired after max infeasible retries
         self.agent_recoveries = []   # dicts with agent_id, recovered_at
+        # Every job id this agent STARTED executing, one entry per start. Joined across the
+        # fleet by evaluation/collect.py into `jobs_executed_twice`: the only direct evidence
+        # of a double execution, which several recovery and delegation paths could produce
+        # with nothing in the run saying so (code review 2026-10-05 §H).
+        self.executed_jobs = []
+        # Jobs this agent returned to the pool after a TRANSIENT execution refusal (§61).
+        self.refusal_retries = 0
 
     def save_load_metric(self, load: float):
         """

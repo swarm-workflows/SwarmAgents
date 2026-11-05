@@ -49,6 +49,7 @@ from swarm.models.role import Role, ObjectState
 
 import grpc
 
+from swarm.utils.tiebreak import tiebreak_rank
 from swarm.utils.utils import generate_id
 
 import threading
@@ -511,8 +512,8 @@ class ColmenaAgent(Agent):
             candidates=[self.role],
             cost_matrix=cost_matrix,
             objective="min",
-            threshold_pct=10.0,  # e.g., 10 means within +10% of best, TODO: Take from config file
-            tie_break_key=lambda ag, s: getattr(ag, "agent_id", "")
+            tie_break_key=lambda ag, s, cand: tiebreak_rank(
+                getattr(cand, "role_id", ""), getattr(ag, "agent_id", ""))
         )
 
         # Step 3: If this agent is assigned, start proposal
@@ -556,6 +557,10 @@ class ColmenaAgent(Agent):
         self.logger.info("Saving Results")
         agent_metrics = {
             "id": self.agent_id,
+            # Stamped for the same reason as in ResourceAgent.save_results: the collector
+            # filters by run_id, so an unstamped payload reads as another run's leftover.
+            "run_id": os.environ.get("SWARM_RUN_ID"),
+            "saved_at": time.time(),
             "restarts": self.metrics.restarts,
             "conflicts": self.engine.conflicts,
             "idle_time": self.metrics.idle_time,

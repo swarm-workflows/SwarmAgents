@@ -1,0 +1,1146 @@
+"""Moving a workflow's files between agents (`docs/STAGING_DESIGN.md`).
+
+Until this existed, "staging" was a local copy from a root the agent could already see — on the
+slice, one NFS export mounted at the same path everywhere. That works, and it is what validated
+real execution, but it makes every agent equidistant from every file, which is exactly the
+variable the scheduler's DTN penalties price. Nothing moved data between agents.
+
+The tests that matter here are the ones that fail *quietly* if the design is wrong:
+
+* a produced name must beat a same-named file in the inputs root (workflow names are a flat
+  namespace; 62 colliding names were measured in the shipped profile),
+* a truncated transfer must be refused, not left as a short file a job reads happily,
+* a fetch must never overwrite a file that appeared while it was in flight,
+* the server must serve only what it published, with no directory join to traverse,
+* and with staging off, every path must behave exactly as it did before.
+"""
+import hashlib
+import json
+import os
+import sys
+import threading
+
+import pytest
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO)
+
+from swarm.execution import runner, staging  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _clean_policy():
+    """Every test starts from the shipped defaults and leaves them that way."""
+    runner.configure()
+    staging.configure()
+    staging.set_context()
+    yield
+    runner.configure()
+    staging.configure()
+    staging.set_context()
+
+
+class _Node:
+    """The two fields `stage_inputs` reads off a DataNode."""
+
+    def __init__(self, file, name="local"):
+        self.file = file
+        self.name = name
+
+
+def _write(path, content=b"payload"):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as fh:
+        fh.write(content)
+    return path
+
+
+def _serve(tmp_path, mapping, run_id="run-1", port=0):
+    """Start a real transfer server on a free port; returns (server, location-dict-factory)."""
+    published = staging.PublishedFiles()
+    published.publish_all(mapping)
+    # Port 0 lets the OS pick, but the gRPC server needs the real one to build a location.
+    import socket
+    if port == 0:
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+    server = staging.TransferServer(published, "127.0.0.1", port, run_id)
+    server.start()
+    return server, {"agent_id": "7", "host": "127.0.0.1", "port": port}
+
+
+# --------------------------------------------------------------------------------------------
+# end to end over a real server
+# --------------------------------------------------------------------------------------------
+
+def test_a_file_moves_between_agents_and_verifies(tmp_path):
+    src = _write(str(tmp_path / "producer" / "result.json"), b'{"answer": 42}' * 1000)
+    dest_dir = str(tmp_path / "consumer")
+    os.makedirs(dest_dir)
+    server, loc = _serve(tmp_path, {"result.json": src})
+    try:
+        out = staging.fetch("result.json", loc, dest_dir, run_id="run-1", requester="9")
+        assert out.ok, out.reason
+        assert out.size == os.path.getsize(src)
+        assert out.bytes_received == out.size
+        with open(os.path.join(dest_dir, "result.json"), "rb") as fh:
+            assert fh.read() == open(src, "rb").read()
+    finally:
+        server.stop(0)
+
+
+def test_a_multi_chunk_file_arrives_whole(tmp_path):
+    """The chunk boundary is where a streaming bug lives: off-by-one at the last read, or a
+    digest taken over one chunk instead of the stream."""
+    staging.configure(enabled=True, chunk_bytes=1024)
+    payload = os.urandom(1024 * 7 + 13)      # not a chunk multiple, on purpose
+    src = _write(str(tmp_path / "p" / "big.bin"), payload)
+    dest_dir = str(tmp_path / "c")
+    os.makedirs(dest_dir)
+    server, loc = _serve(tmp_path, {"big.bin": src})
+    try:
+        out = staging.fetch("big.bin", loc, dest_dir, run_id="run-1")
+        assert out.ok, out.reason
+        got = open(os.path.join(dest_dir, "big.bin"), "rb").read()
+        assert got == payload
+        assert hashlib.sha256(got).hexdigest() == hashlib.sha256(payload).hexdigest()
+    finally:
+        server.stop(0)
+
+
+def test_the_server_serves_only_what_it_published(tmp_path):
+    """A name it did not publish has no path at all — there is no join to traverse."""
+    _write(str(tmp_path / "p" / "secret.txt"), b"not yours")
+    src = _write(str(tmp_path / "p" / "public.txt"), b"fine")
+    dest_dir = str(tmp_path / "c")
+    os.makedirs(dest_dir)
+    server, loc = _serve(tmp_path, {"public.txt": src})
+    try:
+        # A name it did not publish: refused by the server, by name.
+        out = staging.fetch("secret.txt", loc, dest_dir, run_id="run-1")
+        assert not out.ok and "not produced by this agent" in out.reason
+
+        # A name that is not a plain file name: refused by the CLIENT, before any connection,
+        # because the local path is built from it. The server refusing is not enough — the temp
+        # file is opened first, so a traversing name would write outside dest_dir on the way to
+        # being told no.
+        for name in ("../p/secret.txt", "/etc/passwd", "..", "sub/../../x"):
+            out = staging.fetch(name, loc, dest_dir, run_id="run-1")
+            assert not out.ok, f"{name} should be refused"
+            assert "not a contained relative name" in out.reason, out.reason
+        # A CONTAINED name with a directory is a legitimate LFN since §64; this server did not
+        # publish it, so the server refuses it by name.
+        out = staging.fetch("sub/dir.txt", loc, dest_dir, run_id="run-1")
+        assert not out.ok and "not produced by this agent" in out.reason
+
+        assert not os.path.exists(os.path.join(dest_dir, "secret.txt"))
+        assert os.listdir(dest_dir) == [], "no debris from any refused fetch"
+    finally:
+        server.stop(0)
+
+
+def test_a_fetch_for_another_run_is_refused(tmp_path):
+    """A stale location record from a previous run must not be answered with this run's file of
+    the same name — the same guard the run-scoped registry key gives."""
+    src = _write(str(tmp_path / "p" / "f.txt"), b"this run")
+    dest_dir = str(tmp_path / "c")
+    os.makedirs(dest_dir)
+    server, loc = _serve(tmp_path, {"f.txt": src}, run_id="run-2")
+    try:
+        out = staging.fetch("f.txt", loc, dest_dir, run_id="run-1")
+        assert not out.ok and "run" in out.reason
+    finally:
+        server.stop(0)
+
+
+def test_a_published_but_deleted_file_names_the_workflow_fault(tmp_path):
+    src = _write(str(tmp_path / "p" / "gone.txt"), b"x")
+    dest_dir = str(tmp_path / "c")
+    os.makedirs(dest_dir)
+    server, loc = _serve(tmp_path, {"gone.txt": src})
+    os.unlink(src)
+    try:
+        out = staging.fetch("gone.txt", loc, dest_dir, run_id="run-1")
+        assert not out.ok and "no longer on disk" in out.reason
+    finally:
+        server.stop(0)
+
+
+def test_an_unreachable_producer_is_reported_not_raised(tmp_path):
+    """The dead-producer case. It must come back as a refusal naming the target, because under
+    per-agent storage this is the one failure that has no local remedy
+    (`docs/STAGING_DESIGN.md` §6)."""
+    dest_dir = str(tmp_path / "c")
+    os.makedirs(dest_dir)
+    staging.configure(enabled=True, timeout_s=1.0)
+    out = staging.fetch("x.txt", {"agent_id": "3", "host": "127.0.0.1", "port": 1},
+                        dest_dir, run_id="run-1")
+    assert not out.ok
+    assert "could not reach" in out.reason and "127.0.0.1:1" in out.reason
+    assert os.listdir(dest_dir) == [], "a failed fetch must leave no debris"
+
+
+def test_a_location_without_host_or_port_is_refused(tmp_path):
+    dest_dir = str(tmp_path / "c")
+    os.makedirs(dest_dir)
+    out = staging.fetch("x", {"agent_id": "3"}, dest_dir, run_id="r")
+    assert not out.ok and "no host/port" in out.reason
+
+
+def test_a_fetch_never_overwrites_a_file_that_appeared_meanwhile(tmp_path):
+    """`os.link`, not `os.replace`: a parent job can finish and write this very file while the
+    transfer is in flight, and a replace would clobber a fresh result with the older copy."""
+    src = _write(str(tmp_path / "p" / "race.txt"), b"fetched")
+    dest_dir = str(tmp_path / "c")
+    os.makedirs(dest_dir)
+    _write(os.path.join(dest_dir, "race.txt"), b"local parent output")
+    server, loc = _serve(tmp_path, {"race.txt": src})
+    try:
+        out = staging.fetch("race.txt", loc, dest_dir, run_id="run-1")
+        assert out.ok                        # the transfer itself succeeded
+        assert open(os.path.join(dest_dir, "race.txt"), "rb").read() == b"local parent output"
+    finally:
+        server.stop(0)
+
+
+# --------------------------------------------------------------------------------------------
+# stage_inputs ordering — the part that goes quietly wrong
+# --------------------------------------------------------------------------------------------
+
+def test_a_produced_name_beats_a_same_named_file_in_the_inputs_root(tmp_path):
+    """Workflow file names are a flat namespace. A name in the location registry was produced
+    *by this run*; a file of the same name in the inputs root is a collision, not a copy. Taking
+    the root would feed a child last week's file and look entirely healthy."""
+    produced = _write(str(tmp_path / "p" / "shared.txt"), b"THIS RUN")
+    inputs_root = str(tmp_path / "inputs")
+    _write(os.path.join(inputs_root, "shared.txt"), b"stale from another workflow")
+    work = str(tmp_path / "work")
+    os.makedirs(work)
+
+    staging.configure(enabled=True)
+    runner.configure(mode="real", roots={"inputs": inputs_root})
+    server, loc = _serve(tmp_path, {"shared.txt": produced})
+    try:
+        staged, refusal = runner.stage_inputs(
+            [_Node("shared.txt")], work,
+            locator=lambda names: {"shared.txt": loc}, run_id="run-1")
+        assert refusal == "", refusal
+        assert staged == ["shared.txt"]
+        assert open(os.path.join(work, "shared.txt"), "rb").read() == b"THIS RUN"
+    finally:
+        server.stop(0)
+
+
+def test_the_inputs_root_still_serves_a_name_nobody_produced(tmp_path):
+    """Root inputs of the DAG are not produced by any job; that path is unchanged."""
+    inputs_root = str(tmp_path / "inputs")
+    _write(os.path.join(inputs_root, "seed.csv"), b"a,b\n1,2\n")
+    work = str(tmp_path / "work")
+    os.makedirs(work)
+    staging.configure(enabled=True)
+    runner.configure(mode="real", roots={"inputs": inputs_root})
+
+    staged, refusal = runner.stage_inputs(
+        [_Node("seed.csv")], work, locator=lambda names: {}, run_id="run-1")
+    assert refusal == "" and staged == ["seed.csv"]
+    assert open(os.path.join(work, "seed.csv"), "rb").read() == b"a,b\n1,2\n"
+
+
+def test_a_produced_file_that_cannot_be_fetched_refuses_rather_than_falling_back(tmp_path):
+    """Falling back to a same-named file elsewhere is exactly how a child silently reads the
+    wrong input, so an unfetchable produced file is a refusal — and it names the producer,
+    because the usual cause is that the producer died."""
+    inputs_root = str(tmp_path / "inputs")
+    _write(os.path.join(inputs_root, "shared.txt"), b"stale")
+    work = str(tmp_path / "work")
+    os.makedirs(work)
+    staging.configure(enabled=True, timeout_s=1.0)
+    runner.configure(mode="real", roots={"inputs": inputs_root})
+
+    staged, refusal = runner.stage_inputs(
+        [_Node("shared.txt")], work,
+        locator=lambda names: {"shared.txt": [{"agent_id": "5", "host": "127.0.0.1", "port": 1}]},
+        run_id="run-1")
+    assert staged == []
+    assert "produced by agent 5" in refusal and "could not be staged" in refusal
+    assert not os.path.exists(os.path.join(work, "shared.txt"))
+
+
+def test_a_file_already_in_the_work_dir_is_never_fetched(tmp_path):
+    """A parent that ran on this agent. The lookup may happen; the transfer must not."""
+    work = str(tmp_path / "work")
+    _write(os.path.join(work, "parent.out"), b"already here")
+    staging.configure(enabled=True)
+    runner.configure(mode="real")
+
+    calls = []
+
+    def _locator(names):
+        calls.append(names)
+        return {"parent.out": {"agent_id": "1", "host": "127.0.0.1", "port": 1}}
+
+    staged, refusal = runner.stage_inputs([_Node("parent.out")], work,
+                                          locator=_locator, run_id="run-1")
+    assert refusal == "" and staged == []
+    assert open(os.path.join(work, "parent.out"), "rb").read() == b"already here"
+
+
+def test_a_lookup_failure_refuses_rather_than_reading_a_same_named_local_file(tmp_path):
+    """The first version of this fell back to the inputs root "because Redis being briefly
+    unreachable is not a reason to fail a job whose input is on disk". That reasoning is wrong
+    with staging on, and wrong in the way this codebase keeps being bitten by: the *fallback*
+    path was more permissive than the path it stood in for. A name a parent produced lives on
+    another agent, the lookup is the only thing that knows which, and resolving it from a
+    same-named file in the inputs root is exactly the stale-collision read the source order
+    exists to prevent — reached through the error path instead of the happy one. A refusal is
+    loud and retryable; a stale input is silent and produces plausible numbers."""
+    inputs_root = str(tmp_path / "inputs")
+    _write(os.path.join(inputs_root, "seed.csv"), b"stale same-named file")
+    work = str(tmp_path / "work")
+    os.makedirs(work)
+    staging.configure(enabled=True)
+    runner.configure(mode="real", roots={"inputs": inputs_root})
+
+    def _boom(names):
+        raise RuntimeError("redis down")
+
+    staged, refusal = runner.stage_inputs([_Node("seed.csv")], work,
+                                          locator=_boom, run_id="run-1")
+    assert staged == []
+    assert "location lookup failed" in refusal and "inputs root" in refusal
+    assert not os.path.exists(os.path.join(work, "seed.csv"))
+
+
+def test_staging_on_with_no_lookup_configured_refuses(tmp_path):
+    """The silent version of the same hole: staging enabled, context never installed, so every
+    produced name resolved from the inputs root with no warning at all."""
+    inputs_root = str(tmp_path / "inputs")
+    _write(os.path.join(inputs_root, "seed.csv"), b"stale")
+    work = str(tmp_path / "work")
+    os.makedirs(work)
+    staging.configure(enabled=True)
+    staging.set_context()                    # no locator
+    runner.configure(mode="real", roots={"inputs": inputs_root})
+
+    staged, refusal = runner.stage_inputs([_Node("seed.csv")], work)
+    assert staged == []
+    assert "no location lookup is configured" in refusal
+
+
+# The first version of that refusal returned before any name was examined, which rejected jobs
+# that could not possibly read a stale file. The ambiguity is per name, so the guard is too.
+
+def test_a_job_with_no_inputs_is_not_refused_when_the_lookup_is_unavailable(tmp_path):
+    """Nothing to resolve, so nothing to get wrong. This was refused outright."""
+    work = str(tmp_path / "work")
+    os.makedirs(work)
+    staging.configure(enabled=True)
+    staging.set_context()                    # no locator
+    runner.configure(mode="real")
+
+    for empty in ([], None):
+        staged, refusal = runner.stage_inputs(empty, work)
+        assert refusal == "", refusal
+        assert staged == []
+
+
+def test_inputs_already_in_the_work_dir_are_not_refused_when_the_lookup_is_unavailable(tmp_path):
+    """A parent that ran on this very agent already wrote them. The inputs root is never
+    consulted, so there is no stale file to read — and this was refused outright."""
+    work = str(tmp_path / "work")
+    _write(os.path.join(work, "parent.out"), b"written by the parent here")
+    inputs_root = str(tmp_path / "inputs")
+    _write(os.path.join(inputs_root, "parent.out"), b"stale collision")
+    staging.configure(enabled=True)
+    staging.set_context()                    # no locator
+    runner.configure(mode="real", roots={"inputs": inputs_root})
+
+    staged, refusal = runner.stage_inputs([_Node("parent.out")], work)
+
+    assert refusal == "", refusal
+    assert open(os.path.join(work, "parent.out"), "rb").read() == b"written by the parent here"
+
+
+def test_only_the_name_that_would_read_the_root_is_refused(tmp_path):
+    """The mixed case, which is the point of moving the guard into the loop: one input is
+    already local and fine, the other would fall through to the root and is the ambiguous one."""
+    work = str(tmp_path / "work")
+    _write(os.path.join(work, "here.txt"), b"local")
+    inputs_root = str(tmp_path / "inputs")
+    _write(os.path.join(inputs_root, "elsewhere.txt"), b"possibly stale")
+    staging.configure(enabled=True)
+    staging.set_context()
+    runner.configure(mode="real", roots={"inputs": inputs_root})
+
+    staged, refusal = runner.stage_inputs(
+        [_Node("here.txt"), _Node("elsewhere.txt")], work)
+
+    # Quote the name so the check is exact: "elsewhere.txt" contains "here.txt" as a substring,
+    # which is how the first version of this assertion fooled itself.
+    assert "'elsewhere.txt'" in refusal
+    assert "'here.txt'" not in refusal, "the already-local input is not what was refused"
+    assert not os.path.exists(os.path.join(work, "elsewhere.txt"))
+    assert open(os.path.join(work, "here.txt"), "rb").read() == b"local"
+
+
+def test_with_staging_off_a_lookup_failure_is_still_harmless(tmp_path):
+    """Off, there are no produced-elsewhere names to confuse it with, so the local resolve is
+    the right answer and a failed lookup is genuinely nothing to fail a job over."""
+    inputs_root = str(tmp_path / "inputs")
+    _write(os.path.join(inputs_root, "seed.csv"), b"x")
+    work = str(tmp_path / "work")
+    os.makedirs(work)
+    staging.configure(enabled=False)
+    runner.configure(mode="real", roots={"inputs": inputs_root})
+
+    def _boom(names):
+        raise RuntimeError("redis down")
+
+    staged, refusal = runner.stage_inputs([_Node("seed.csv")], work,
+                                          locator=_boom, run_id="run-1")
+    assert refusal == "" and staged == ["seed.csv"]
+
+
+# --------------------------------------------------------------------------------------------
+# staging off: nothing changes
+# --------------------------------------------------------------------------------------------
+
+def test_with_staging_off_the_context_is_not_consulted(tmp_path):
+    """The shipped default. An existing run must behave exactly as it did."""
+    inputs_root = str(tmp_path / "inputs")
+    _write(os.path.join(inputs_root, "seed.csv"), b"x")
+    work = str(tmp_path / "work")
+    os.makedirs(work)
+    runner.configure(mode="real", roots={"inputs": inputs_root})
+
+    calls = []
+    staging.configure(enabled=False)
+    staging.set_context(locator=lambda n: calls.append(n) or {}, run_id="run-1", agent_id="2")
+
+    staged, refusal = runner.stage_inputs([_Node("seed.csv")], work)
+    assert refusal == "" and staged == ["seed.csv"]
+    assert calls == [], "staging off must not reach the locator"
+
+
+def test_the_context_supplies_the_locator_when_the_caller_cannot(tmp_path):
+    """`Job.execute()` is rebuilt from Redis and has no route back to the agent, so the
+    process-wide context is how it reaches the lookup at all."""
+    produced = _write(str(tmp_path / "p" / "x.txt"), b"from peer")
+    work = str(tmp_path / "work")
+    os.makedirs(work)
+    staging.configure(enabled=True)
+    runner.configure(mode="real")
+    server, loc = _serve(tmp_path, {"x.txt": produced})
+    try:
+        staging.set_context(locator=lambda names: {"x.txt": loc}, run_id="run-1", agent_id="9")
+        staged, refusal = runner.stage_inputs([_Node("x.txt")], work)
+        assert refusal == "" and staged == ["x.txt"]
+        assert open(os.path.join(work, "x.txt"), "rb").read() == b"from peer"
+    finally:
+        server.stop(0)
+
+
+# --------------------------------------------------------------------------------------------
+# config
+# --------------------------------------------------------------------------------------------
+
+def test_an_unknown_staging_key_is_refused_not_ignored():
+    """A misspelled key that silently did nothing would produce a run that looks staged and is
+    not — the failure `resolve_mode` exists to prevent for `mode` itself."""
+    with pytest.raises(ValueError) as exc:
+        staging.configure(enabled=True, chunk_size=4096)
+    assert "chunk_size" in str(exc.value)
+
+
+def test_the_data_port_is_derived_from_the_consensus_port():
+    staging.configure(enabled=True, port_offset=1000)
+    assert staging.data_port(20001) == 21001
+    staging.configure(enabled=True, port_offset=7)
+    assert staging.data_port(20001) == 20008
+
+
+def test_server_stats_count_what_was_served(tmp_path):
+    src = _write(str(tmp_path / "p" / "a.txt"), b"12345")
+    dest_dir = str(tmp_path / "c")
+    os.makedirs(dest_dir)
+    server, loc = _serve(tmp_path, {"a.txt": src})
+    try:
+        staging.fetch("a.txt", loc, dest_dir, run_id="run-1")
+        staging.fetch("nope.txt", loc, dest_dir, run_id="run-1")
+        stats = server.stats()
+        assert stats["served"] == 1 and stats["bytes_served"] == 5
+        assert stats["refused"] == 1 and stats["published"] == 1
+    finally:
+        server.stop(0)
+
+
+# --------------------------------------------------------------------------------------------
+# the agent seam: publish on one agent, locate through the registry, fetch on another
+# --------------------------------------------------------------------------------------------
+
+def _agent(tmp_path, agent_id=7, port=20007):
+    """A ResourceAgent with only what the publish path touches."""
+    from unittest.mock import MagicMock
+
+    from swarm.agents.resource_agent import ResourceAgent
+    a = ResourceAgent.__new__(ResourceAgent)
+    a.logger = MagicMock()
+    a.agent_id = agent_id
+    a.grpc_config = {"host": "127.0.0.1", "port": port}
+    a.topology = MagicMock(level=0, group=0)
+    a.repository = MagicMock()
+    a.staged_files = staging.PublishedFiles()
+    a._unpersisted_completions = {}
+    a._unpublished_lock = threading.RLock()
+    return a
+
+
+class _Job:
+    def __init__(self, job_id="j1"):
+        self.job_id = job_id
+
+    def to_dict(self):
+        return {"id": self.job_id, "exit_status": 0}
+
+
+def test_publishing_records_where_each_output_is(tmp_path):
+    work = str(tmp_path / "work")
+    _write(os.path.join(work, "out.json"), b"{}")
+    staging.configure(enabled=True, port_offset=1000)
+    runner.configure(mode="real", work_dir=work)
+    a = _agent(tmp_path, agent_id=7, port=20007)
+
+    locations = a._publish_locations(_Job(), ["out.json"])
+
+    assert set(locations) == {"out.json"}
+    entries = locations["out.json"]
+    assert isinstance(entries, list) and len(entries) == 1, \
+        "no staging site configured, so the peer is the only location"
+    loc = entries[0]
+    assert loc["agent_id"] == "7"
+    assert loc["host"] == "127.0.0.1"
+    assert loc["port"] == 21007, "the data port is the consensus port plus the offset"
+    assert a.staged_files.path_for("out.json") == os.path.join(work, "out.json")
+
+
+def test_with_staging_off_nothing_is_published(tmp_path):
+    work = str(tmp_path / "work")
+    _write(os.path.join(work, "out.json"), b"{}")
+    runner.configure(mode="real", work_dir=work)
+    staging.configure(enabled=False)
+    a = _agent(tmp_path)
+
+    assert a._publish_locations(_Job(), ["out.json"]) == {}
+    assert len(a.staged_files) == 0
+
+
+def test_a_declared_output_that_was_never_written_is_reported_at_the_producer(tmp_path):
+    """The job exited 0 and said it wrote this. Here is where that is visible; the location is
+    still recorded so a consumer's refusal names this agent and this path."""
+    work = str(tmp_path / "work")
+    os.makedirs(work)
+    staging.configure(enabled=True)
+    runner.configure(mode="real", work_dir=work)
+    a = _agent(tmp_path)
+
+    locations = a._publish_locations(_Job(), ["missing.json"])
+
+    assert "missing.json" in locations
+    logged = " ".join(str(c.args) for c in a.logger.error.call_args_list)
+    assert "missing.json" in logged and "does not exist" in logged
+
+
+def test_locations_ride_the_completion_transaction(tmp_path):
+    """The same one-write rule the names follow. A descendant released by a name it cannot
+    locate would refuse to stage — a torn write that reads as a staging bug."""
+    work = str(tmp_path / "work")
+    _write(os.path.join(work, "out.json"), b"{}")
+    staging.configure(enabled=True)
+    runner.configure(mode="real", work_dir=work)
+    a = _agent(tmp_path)
+    locations = a._publish_locations(_Job(), ["out.json"])
+
+    a._persist_completion(_Job(), ["out.json"], locations)
+
+    kwargs = a.repository.save.call_args.kwargs
+    assert kwargs["produced_data"] == ["out.json"]
+    assert kwargs["produced_locations"] == locations
+    assert kwargs["produced_locations"]["out.json"][0]["port"] == 21007
+
+
+def test_the_whole_loop_producer_to_registry_to_consumer(tmp_path):
+    """End to end across two agents with a real server and a real transfer: A produces and
+    publishes, the registry carries the location, B stages it into its own work dir."""
+    import socket
+    s = socket.socket(); s.bind(("127.0.0.1", 0)); free = s.getsockname()[1]; s.close()
+
+    work_a = str(tmp_path / "a")
+    _write(os.path.join(work_a, "parent.out"), b"produced by A")
+    staging.configure(enabled=True, port_offset=0)       # data port == the port we bound
+    runner.configure(mode="real", work_dir=work_a)
+    producer = _agent(tmp_path, agent_id=3, port=free)
+    locations = producer._publish_locations(_Job("parent"), ["parent.out"])
+
+    server = staging.TransferServer(producer.staged_files, "127.0.0.1", free, run_id="run-1")
+    server.start()
+    try:
+        # The registry is the only thing that crosses between them.
+        registry = dict(locations)
+        work_b = str(tmp_path / "b")
+        os.makedirs(work_b)
+        runner.configure(mode="real", work_dir=work_b)
+        staged, refusal = runner.stage_inputs(
+            [_Node("parent.out")], work_b,
+            locator=lambda names: {n: registry[n] for n in names if n in registry},
+            run_id="run-1", requester="9")
+
+        assert refusal == "", refusal
+        assert staged == ["parent.out"]
+        assert open(os.path.join(work_b, "parent.out"), "rb").read() == b"produced by A"
+    finally:
+        server.stop(0)
+
+
+# --------------------------------------------------------------------------------------------
+# the location registry (fakeredis, no server needed)
+# --------------------------------------------------------------------------------------------
+
+def _repo():
+    import fakeredis
+
+    from swarm.database.repository import Repository
+    return Repository(redis_client=fakeredis.FakeStrictRedis(decode_responses=True))
+
+
+def test_a_location_round_trips_through_the_registry():
+    repo = _repo()
+    loc = {"agent_id": "3", "host": "10.0.0.3", "port": 21003, "produced_at": 1.0}
+    store = {"agent_id": "store", "host": "10.0.0.1", "port": 21000, "produced_at": 2.0}
+    repo.save({"id": "j1", "state": 8}, produced_data=["a.txt"],
+              produced_locations={"a.txt": [loc, store]})
+
+    assert repo.data_available(["a.txt"]) is True
+    got = repo.data_locations(["a.txt"])
+    assert got == {"a.txt": [loc, store]}
+    assert got["a.txt"][0]["agent_id"] == "3", "the producer is first: one hop is the fast path"
+    assert got["a.txt"][-1]["agent_id"] == "store", "the staging site is the fallback, last"
+
+
+def test_a_single_location_dict_is_read_as_a_one_element_list():
+    """A rolling deploy genuinely mixes the two shapes — on 2026-09-21 the staging code was on
+    5 of 92 agents — so a record written by the first revision must still be readable."""
+    repo = _repo()
+    loc = {"agent_id": "3", "host": "10.0.0.3", "port": 21003}
+    repo.redis.hset(repo._data_loc_key(), mapping={"a.txt": json.dumps(loc)})
+    assert repo.data_locations(["a.txt"]) == {"a.txt": [loc]}
+
+
+def test_readiness_and_location_land_in_the_same_write():
+    """The invariant: a name can never be observable as ready without its location. As two
+    writes, a descendant released between them refuses to stage and it reads as a staging bug."""
+    repo = _repo()
+    repo.save({"id": "j1", "state": 8},
+              produced_data=["x", "y"],
+              produced_locations={"x": {"host": "h", "port": 1}, "y": {"host": "h", "port": 1}})
+    ready = repo.data_available(["x", "y"])
+    located = repo.data_locations(["x", "y"])
+    assert ready and set(located) == {"x", "y"}
+
+
+def test_a_name_with_no_location_is_absent_not_guessed():
+    """Staging off: the name is ready, the shared mount is the location. The caller must be able
+    to tell that from "produced somewhere unreachable"."""
+    repo = _repo()
+    repo.save({"id": "j1", "state": 8}, produced_data=["a.txt"])
+    assert repo.data_available(["a.txt"]) is True
+    assert repo.data_locations(["a.txt"]) == {}
+
+
+def test_a_corrupt_location_reads_as_absent():
+    repo = _repo()
+    repo.redis.hset(repo._data_loc_key(), mapping={"bad": "{not json"})
+    assert repo.data_locations(["bad"]) == {}
+
+
+def test_the_location_key_is_run_scoped_and_cleanable():
+    """Both halves, for the same reasons as the readiness key: `delete_all("*")` must reach it
+    between runs, and a cell that skipped cleanup must not inherit locations pointing at an
+    agent that is no longer serving that file."""
+    repo = _repo()
+    key = repo._data_loc_key()
+    assert key.count(":") >= 2, "a bare key survives delete_all('*')"
+    assert str(repo.run_id) in key
+
+
+def test_locations_for_unknown_names_are_simply_missing():
+    repo = _repo()
+    repo.save({"id": "j1", "state": 8}, produced_data=["a"],
+              produced_locations={"a": {"host": "h", "port": 1}})
+    got = repo.data_locations(["a", "never-produced"])
+    assert set(got) == {"a"}
+    assert repo.data_locations([]) == {}
+
+
+# --------------------------------------------------------------------------------------------
+# stage-out: the durability half (docs/STAGING_DESIGN.md §6)
+# --------------------------------------------------------------------------------------------
+
+def _store(tmp_path, run_id="run-1"):
+    """A staging site: a transfer server with a store directory, so it accepts uploads."""
+    import socket
+    s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
+    store_dir = str(tmp_path / "store")
+    server = staging.TransferServer(staging.PublishedFiles(), "127.0.0.1", port,
+                                    run_id=run_id, store_dir=store_dir)
+    server.start()
+    return server, port, store_dir
+
+
+def test_an_output_is_pushed_to_the_staging_site(tmp_path):
+    server, port, store_dir = _store(tmp_path)
+    try:
+        staging.configure(enabled=True, store_host="127.0.0.1", store_port=port)
+        src = _write(str(tmp_path / "w" / "out.json"), b'{"v":1}' * 500)
+
+        result = staging.put("out.json", src, run_id="run-1", sender="4")
+
+        assert result.ok, result.reason
+        assert result.bytes_sent == os.path.getsize(src)
+        assert result.elapsed_s >= 0.0, "the cost is measured, not assumed"
+        # Keyed by (run, name): the store serves many runs and workflow names collide.
+        assert open(os.path.join(store_dir, "run-1", "out.json"), "rb").read() \
+            == open(src, "rb").read()
+        assert server.stats()["stored"] == 1
+    finally:
+        server.stop(0)
+
+
+def test_a_stored_file_can_then_be_fetched_from_the_store(tmp_path):
+    """The store is a peer like any other from a consumer's point of view — which is what makes
+    it a fallback rather than a special case."""
+    server, port, _ = _store(tmp_path)
+    try:
+        staging.configure(enabled=True, store_host="127.0.0.1", store_port=port)
+        src = _write(str(tmp_path / "w" / "out.json"), b"durable")
+        assert staging.put("out.json", src, run_id="run-1").ok
+        dest = str(tmp_path / "consumer"); os.makedirs(dest)
+
+        out = staging.fetch("out.json", {"host": "127.0.0.1", "port": port}, dest,
+                            run_id="run-1")
+
+        assert out.ok, out.reason
+        assert open(os.path.join(dest, "out.json"), "rb").read() == b"durable"
+    finally:
+        server.stop(0)
+
+
+def test_an_ordinary_agent_refuses_uploads(tmp_path):
+    """The capability is granted by configuration, not assumed from the request: an agent
+    serves what it produced and is not a dumping ground."""
+    src = _write(str(tmp_path / "w" / "x.txt"), b"x")
+    server, loc = _serve(tmp_path, {"other.txt": src})     # no store_dir
+    try:
+        staging.configure(enabled=True, store_host="127.0.0.1", store_port=loc["port"])
+        result = staging.put("x.txt", src, run_id="run-1")
+        assert not result.ok and "not a staging site" in result.reason
+    finally:
+        server.stop(0)
+
+
+def test_a_traversing_name_is_refused_by_the_store(tmp_path):
+    server, port, store_dir = _store(tmp_path)
+    try:
+        staging.configure(enabled=True, store_host="127.0.0.1", store_port=port)
+        src = _write(str(tmp_path / "w" / "x.txt"), b"x")
+        # Refused client-side before a connection is made, same as fetch.
+        assert not staging.put("../escape.txt", src, run_id="run-1").ok
+        assert not os.path.exists(os.path.join(os.path.dirname(store_dir), "escape.txt"))
+    finally:
+        server.stop(0)
+
+
+def test_a_re_upload_is_idempotent_and_never_truncates(tmp_path):
+    """A re-run after reassignment uploads the same name again. `os.link`, not `os.replace`:
+    the stored copy something may already be reading must not be truncated. A DIFFERENT body
+    is refused rather than acknowledged since code review 2026-10-05 §65."""
+    server, port, store_dir = _store(tmp_path)
+    try:
+        staging.configure(enabled=True, store_host="127.0.0.1", store_port=port)
+        first = _write(str(tmp_path / "w" / "out.txt"), b"first copy")
+        assert staging.put("out.txt", first, run_id="run-1").ok
+        second = _write(str(tmp_path / "w2" / "out.txt"), b"second")
+        assert not staging.put("out.txt", second, run_id="run-1").ok
+
+        assert open(os.path.join(store_dir, "run-1", "out.txt"), "rb").read() == b"first copy"
+    finally:
+        server.stop(0)
+
+
+def test_with_no_store_configured_stage_out_says_so(tmp_path):
+    staging.configure(enabled=True)          # store_host empty
+    src = _write(str(tmp_path / "w" / "x.txt"), b"x")
+    result = staging.put("x.txt", src, run_id="run-1")
+    assert not result.ok and "no staging site configured" in result.reason
+
+
+# --------------------------------------------------------------------------------------------
+# peer-first, store-fallback — the reason the location is a list
+# --------------------------------------------------------------------------------------------
+
+def test_fetch_any_prefers_the_producer_and_never_reaches_the_store(tmp_path):
+    """One hop is the fast path. Going to the store first would make every DAG edge pay two
+    WAN hops for a durability guarantee it does not need while the producer is alive."""
+    producer_file = _write(str(tmp_path / "p" / "x.txt"), b"from the producer")
+    peer, peer_loc = _serve(tmp_path, {"x.txt": producer_file})
+    store, port, store_dir = _store(tmp_path)
+    _write(os.path.join(store_dir, "x.txt"), b"from the store")
+    store.published.publish("x.txt", os.path.join(store_dir, "x.txt"))
+    dest = str(tmp_path / "c"); os.makedirs(dest)
+    try:
+        out = staging.fetch_any("x.txt", [peer_loc, {"agent_id": "store", "host": "127.0.0.1",
+                                                     "port": port}],
+                                dest, run_id="run-1")
+        assert out.ok, out.reason
+        assert open(os.path.join(dest, "x.txt"), "rb").read() == b"from the producer"
+        assert store.stats()["served"] == 0, "the store must not have been touched"
+    finally:
+        peer.stop(0); store.stop(0)
+
+
+def test_the_store_serves_when_the_producer_is_gone(tmp_path):
+    """**The §6 fix, demonstrated.** The producer dies after publishing; its job is COMPLETE so
+    nothing re-runs it, and its name is in the readiness registry so the descendant is released.
+    Before stage-out that descendant simply refused. Now it is served."""
+    producer_file = _write(str(tmp_path / "p" / "x.txt"), b"produced then lost")
+    peer, peer_loc = _serve(tmp_path, {"x.txt": producer_file})
+    store, port, store_dir = _store(tmp_path)
+    staging.configure(enabled=True, store_host="127.0.0.1", store_port=port)
+    assert staging.put("x.txt", producer_file, run_id="run-1").ok    # staged out while alive
+
+    peer.stop(0)                                                     # the producer dies
+    dest = str(tmp_path / "c"); os.makedirs(dest)
+    try:
+        out = staging.fetch_any("x.txt", [peer_loc, {"agent_id": "store", "host": "127.0.0.1",
+                                                     "port": port}],
+                                dest, run_id="run-1")
+        assert out.ok, out.reason
+        assert open(os.path.join(dest, "x.txt"), "rb").read() == b"produced then lost"
+    finally:
+        store.stop(0)
+
+
+def test_every_location_is_named_when_all_of_them_fail(tmp_path):
+    """"could not reach agent-4" alone would hide that the store refused it too, which is the
+    difference between a dead agent and a file that was never stored."""
+    staging.configure(enabled=True, timeout_s=1.0)
+    dest = str(tmp_path / "c"); os.makedirs(dest)
+    out = staging.fetch_any("x.txt",
+                            [{"agent_id": "4", "host": "127.0.0.1", "port": 1},
+                             {"agent_id": "store", "host": "127.0.0.1", "port": 2}],
+                            dest, run_id="run-1")
+    assert not out.ok
+    assert "2 location(s)" in out.reason
+    assert "4:" in out.reason and "store:" in out.reason
+
+
+def test_no_recorded_location_is_its_own_message(tmp_path):
+    dest = str(tmp_path / "c"); os.makedirs(dest)
+    out = staging.fetch_any("x.txt", [], dest, run_id="run-1")
+    assert not out.ok and "no location is recorded" in out.reason
+
+
+# --------------------------------------------------------------------------------------------
+# the producer stages out BEFORE the name is published
+# --------------------------------------------------------------------------------------------
+
+def test_the_producer_records_peer_then_store(tmp_path, monkeypatch):
+    # `_publish_locations` takes the run from the environment, as the agent does; a store is
+    # keyed by (run, name) and refuses an upload that carries no run.
+    monkeypatch.setenv("SWARM_RUN_ID", "run-1")
+    server, port, store_dir = _store(tmp_path, run_id="run-1")
+    try:
+        work = str(tmp_path / "work")
+        _write(os.path.join(work, "out.json"), b"{}")
+        staging.configure(enabled=True, store_host="127.0.0.1", store_port=port)
+        runner.configure(mode="real", work_dir=work)
+        a = _agent(tmp_path, agent_id=7, port=20007)
+
+        entries = a._publish_locations(_Job(), ["out.json"])["out.json"]
+
+        assert [e["agent_id"] for e in entries] == ["7", "store"], "peer first, store last"
+        assert os.path.isfile(os.path.join(store_dir, "run-1", "out.json")), \
+            "the push happens before the caller publishes the name, or the window it insures " \
+            "against is exactly the window left open"
+    finally:
+        server.stop(0)
+
+
+def test_a_failed_stage_out_withholds_the_name_until_a_retry_succeeds(tmp_path):
+    """This used to publish the name with a peer-only location, breaking the guarantee stage-out
+    exists for: a name is never visible without a durable copy (code review 2026-10-05 §66).
+    The name is now withheld and queued; `_retry_stage_out` publishes it once a push lands."""
+    work = str(tmp_path / "work")
+    _write(os.path.join(work, "out.json"), b"{}")
+    staging.configure(enabled=True, store_host="127.0.0.1", store_port=1, store_timeout_s=1.0)
+    runner.configure(mode="real", work_dir=work)
+    a = _agent(tmp_path)
+
+    locations = a._publish_locations(_Job(), ["out.json"])
+
+    assert "out.json" not in locations, "a name without a durable copy must not be published"
+    assert a._last_withheld == ["out.json"]
+    assert [p["name"] for p in a._pending_stage_out] == ["out.json"]
+    logged = " ".join(str(c.args) for c in a.logger.error.call_args_list)
+    assert "STAGE_OUT" in logged and "withholding" in logged
+
+
+# --------------------------------------------------------------------------------------------
+# the store's namespace is (run, name) — found by the stop-time review gate
+# --------------------------------------------------------------------------------------------
+
+def test_two_runs_producing_the_same_name_do_not_collide(tmp_path):
+    """**The stale-serve bug.** The registry keys are run-scoped but the store directory was
+    flat, so run 2's `x.txt` hit the never-overwrite rule against run 1's — and that collision
+    resolves silently in favour of the OLDER file, which the store then serves to run 2's
+    consumers. Workflow file names are a flat namespace (62 colliding names measured in the
+    shipped profile), so two runs of the same workflow is the *expected* case, not a corner."""
+    server, port, store_dir = _store(tmp_path, run_id="")      # a site serving any run
+    try:
+        staging.configure(enabled=True, store_host="127.0.0.1", store_port=port)
+        first = _write(str(tmp_path / "r1" / "x.txt"), b"run one output")
+        second = _write(str(tmp_path / "r2" / "x.txt"), b"run two output")
+        assert staging.put("x.txt", first, run_id="run-1").ok
+        assert staging.put("x.txt", second, run_id="run-2").ok
+
+        assert open(os.path.join(store_dir, "run-1", "x.txt"), "rb").read() == b"run one output"
+        assert open(os.path.join(store_dir, "run-2", "x.txt"), "rb").read() == b"run two output"
+
+        # And each run fetches its own, not whichever was stored first.
+        for run, expected in (("run-1", b"run one output"), ("run-2", b"run two output")):
+            dest = str(tmp_path / f"c-{run}"); os.makedirs(dest)
+            out = staging.fetch("x.txt", {"host": "127.0.0.1", "port": port}, dest, run_id=run)
+            assert out.ok, out.reason
+            assert open(os.path.join(dest, "x.txt"), "rb").read() == expected
+    finally:
+        server.stop(0)
+
+
+def test_a_store_refuses_an_upload_with_no_run(tmp_path):
+    """Without a run there is no namespace to file it under, and a flat store is exactly the
+    bug above."""
+    server, port, _ = _store(tmp_path, run_id="")
+    try:
+        staging.configure(enabled=True, store_host="127.0.0.1", store_port=port)
+        src = _write(str(tmp_path / "w" / "x.txt"), b"x")
+        result = staging.put("x.txt", src, run_id="")
+        assert not result.ok and "no run_id" in result.reason
+    finally:
+        server.stop(0)
+
+
+def test_a_within_run_collision_is_refused_not_acknowledged(tmp_path, caplog):
+    """Keeping the first copy is the never-overwrite rule — something may be reading it — but
+    two different bodies under one name inside a single run is a real collision. It used to be
+    logged and ACKNOWLEDGED, so the uploader believed its bytes were durable when the store
+    held another's; it is refused now (code review 2026-10-05 §65)."""
+    import logging
+    server, port, store_dir = _store(tmp_path, run_id="run-1")
+    try:
+        staging.configure(enabled=True, store_host="127.0.0.1", store_port=port)
+        a = _write(str(tmp_path / "a" / "out.txt"), b"first body")
+        b = _write(str(tmp_path / "b" / "out.txt"), b"second body, different")
+        assert staging.put("out.txt", a, run_id="run-1").ok
+        with caplog.at_level(logging.ERROR, logger="swarm.execution.staging"):
+            result = staging.put("out.txt", b, run_id="run-1")
+            assert not result.ok and "different content" in result.reason
+
+        assert open(os.path.join(store_dir, "run-1", "out.txt"), "rb").read() == b"first body"
+        assert "DIFFERENT content" in caplog.text
+    finally:
+        server.stop(0)
+
+
+def test_an_identical_re_upload_is_silent(tmp_path, caplog):
+    """A deterministic re-run after reassignment uploads the same bytes; that is not a
+    collision and must not be reported as one."""
+    import logging
+    server, port, _ = _store(tmp_path, run_id="run-1")
+    try:
+        staging.configure(enabled=True, store_host="127.0.0.1", store_port=port)
+        src = _write(str(tmp_path / "w" / "out.txt"), b"same bytes")
+        assert staging.put("out.txt", src, run_id="run-1").ok
+        with caplog.at_level(logging.ERROR, logger="swarm.execution.staging"):
+            assert staging.put("out.txt", src, run_id="run-1").ok
+        assert "DIFFERENT content" not in caplog.text
+    finally:
+        server.stop(0)
+
+
+def test_a_run_id_cannot_climb_out_of_the_store(tmp_path):
+    """The run id reaches the store over the wire and is joined onto a directory, so it gets
+    the same containment rule the file names get."""
+    server, port, store_dir = _store(tmp_path, run_id="")
+    try:
+        staging.configure(enabled=True, store_host="127.0.0.1", store_port=port)
+        src = _write(str(tmp_path / "w" / "x.txt"), b"x")
+        assert staging.put("x.txt", src, run_id="../../escape").ok
+        assert not os.path.exists(os.path.join(os.path.dirname(store_dir), "escape"))
+        assert os.path.isfile(os.path.join(store_dir, "escape", "x.txt"))
+    finally:
+        server.stop(0)
+
+
+def test_an_agent_still_serves_bare_names(tmp_path):
+    """Only a store is keyed by (run, name). An agent serves one run's outputs, and the run
+    equality check already guards it — the key must not change underneath it."""
+    src = _write(str(tmp_path / "p" / "x.txt"), b"agent output")
+    server, loc = _serve(tmp_path, {"x.txt": src}, run_id="run-1")
+    dest = str(tmp_path / "c"); os.makedirs(dest)
+    try:
+        out = staging.fetch("x.txt", loc, dest, run_id="run-1")
+        assert out.ok, out.reason
+        assert open(os.path.join(dest, "x.txt"), "rb").read() == b"agent output"
+    finally:
+        server.stop(0)
+
+
+# --------------------------------------------------------------------------------------------
+# an agent that does not know its run must fail closed — found by the stop-time review gate
+# --------------------------------------------------------------------------------------------
+
+def test_an_agent_with_no_run_id_serves_nothing(tmp_path):
+    """The guard used to require BOTH sides non-empty before comparing, so an agent whose
+    SWARM_RUN_ID was empty skipped it and served its names to *any* run. This repo documents
+    agents outliving their run, so run 1's agent — still listening — would answer a run-2
+    consumer with run 1's file of the same name. The names collide by construction."""
+    src = _write(str(tmp_path / "p" / "x.txt"), b"run one output")
+    server, loc = _serve(tmp_path, {"x.txt": src}, run_id="")      # agent does not know its run
+    dest = str(tmp_path / "c"); os.makedirs(dest)
+    try:
+        out = staging.fetch("x.txt", loc, dest, run_id="run-2")
+        assert not out.ok
+        assert "does not know its run" in out.reason
+        assert not os.path.exists(os.path.join(dest, "x.txt"))
+    finally:
+        server.stop(0)
+
+
+def test_an_agent_refuses_a_fetch_that_names_no_run(tmp_path):
+    """The other half of the same short circuit: an empty *request* run used to skip the check
+    too, so anyone omitting it got served."""
+    src = _write(str(tmp_path / "p" / "x.txt"), b"mine")
+    server, loc = _serve(tmp_path, {"x.txt": src}, run_id="run-1")
+    dest = str(tmp_path / "c"); os.makedirs(dest)
+    try:
+        out = staging.fetch("x.txt", loc, dest, run_id="")
+        assert not out.ok and "but this agent serves" in out.reason
+    finally:
+        server.stop(0)
+
+
+def test_a_store_still_serves_many_runs(tmp_path):
+    """A store is exempt from that rule and must stay exempt: its namespace is already
+    (run, name), which is what lets one site back a whole campaign."""
+    server, port, _ = _store(tmp_path, run_id="")
+    try:
+        staging.configure(enabled=True, store_host="127.0.0.1", store_port=port)
+        for run, body in (("run-1", b"one"), ("run-2", b"two")):
+            src = _write(str(tmp_path / run / "x.txt"), body)
+            assert staging.put("x.txt", src, run_id=run).ok
+        for run, body in (("run-1", b"one"), ("run-2", b"two")):
+            dest = str(tmp_path / f"c-{run}"); os.makedirs(dest)
+            out = staging.fetch("x.txt", {"host": "127.0.0.1", "port": port}, dest, run_id=run)
+            assert out.ok and open(os.path.join(dest, "x.txt"), "rb").read() == body
+    finally:
+        server.stop(0)
+
+
+def test_staging_without_a_run_id_is_refused_at_startup(tmp_path, monkeypatch):
+    """Not just when a store is configured: an agent that does not know its run cannot serve
+    safely either, so the whole feature requires it."""
+    from unittest.mock import MagicMock
+
+    from swarm.agents.resource_agent import ResourceAgent
+    monkeypatch.delenv("SWARM_RUN_ID", raising=False)
+    a = ResourceAgent.__new__(ResourceAgent)
+    a.logger = MagicMock()
+    a.agent_id = 1
+    a.grpc_config = {"host": "127.0.0.1", "port": 20001}
+    a.repository = MagicMock()
+
+    with pytest.raises(ValueError) as exc:
+        a._configure_staging({"staging": {"enabled": True}}, "/tmp/w", "real")
+    assert "SWARM_RUN_ID is empty" in str(exc.value)
+
+
+def test_staging_off_needs_no_run_id(tmp_path, monkeypatch):
+    """The shipped default must not start demanding an environment variable."""
+    from unittest.mock import MagicMock
+
+    from swarm.agents.resource_agent import ResourceAgent
+    monkeypatch.delenv("SWARM_RUN_ID", raising=False)
+    a = ResourceAgent.__new__(ResourceAgent)
+    a.logger = MagicMock()
+    a.agent_id = 1
+    a.grpc_config = {"host": "127.0.0.1", "port": 20001}
+    a.repository = MagicMock()
+
+    a._configure_staging({"staging": {"enabled": False}}, "/tmp/w", "simulate")   # no raise
+
+
+def test_an_explicit_store_restriction_binds_downloads_too(tmp_path):
+    """`--run-id` is an operator saying "this site is for one run". Exempting the store from
+    the equality check — correct for the *namespace* — silently dropped that restriction on
+    downloads, so a site restarted with a restriction still served every run it had already
+    accumulated, because startup re-publishes them all."""
+    # A site that already holds two runs' files, then is restricted to one.
+    open_site, port, store_dir = _store(tmp_path, run_id="")
+    try:
+        staging.configure(enabled=True, store_host="127.0.0.1", store_port=port)
+        for run, body in (("run-1", b"one"), ("run-2", b"two")):
+            src = _write(str(tmp_path / run / "x.txt"), body)
+            assert staging.put("x.txt", src, run_id=run).ok
+    finally:
+        open_site.stop(0)
+
+    published = staging.PublishedFiles()
+    published.publish_all({f"run-1/x.txt": os.path.join(store_dir, "run-1", "x.txt"),
+                           f"run-2/x.txt": os.path.join(store_dir, "run-2", "x.txt")})
+    import socket
+    s = socket.socket(); s.bind(("127.0.0.1", 0)); port2 = s.getsockname()[1]; s.close()
+    restricted = staging.TransferServer(published, "127.0.0.1", port2, run_id="run-2",
+                                        store_dir=store_dir)
+    restricted.start()
+    try:
+        staging.configure(enabled=True, store_host="127.0.0.1", store_port=port2)
+        dest = str(tmp_path / "c"); os.makedirs(dest)
+
+        out = staging.fetch("x.txt", {"host": "127.0.0.1", "port": port2}, dest, run_id="run-1")
+        assert not out.ok, "a restricted site must not serve another run"
+        assert "restricted to" in out.reason
+
+        out = staging.fetch("x.txt", {"host": "127.0.0.1", "port": port2}, dest, run_id="run-2")
+        assert out.ok and open(os.path.join(dest, "x.txt"), "rb").read() == b"two"
+
+        src = _write(str(tmp_path / "r3" / "x.txt"), b"three")
+        assert not staging.put("x.txt", src, run_id="run-3").ok, "and must not take one either"
+    finally:
+        restricted.stop(0)
+
+
+def test_an_unrestricted_store_still_serves_every_run(tmp_path):
+    """The default. The (run, name) namespace is what keeps it safe, so the restriction must
+    stay optional rather than become required."""
+    server, port, _ = _store(tmp_path, run_id="")
+    try:
+        staging.configure(enabled=True, store_host="127.0.0.1", store_port=port)
+        for run, body in (("run-1", b"one"), ("run-9", b"nine")):
+            src = _write(str(tmp_path / run / "y.txt"), body)
+            assert staging.put("y.txt", src, run_id=run).ok
+            dest = str(tmp_path / f"c{run}"); os.makedirs(dest)
+            out = staging.fetch("y.txt", {"host": "127.0.0.1", "port": port}, dest, run_id=run)
+            assert out.ok and open(os.path.join(dest, "y.txt"), "rb").read() == body
+    finally:
+        server.stop(0)

@@ -83,7 +83,7 @@ This adapter pattern is the key integration point — a new consensus engine onl
 
 ### 2.3 Cost-Based Self-Selection
 
-The `SelectionEngine` (`swarm/selection/engine.py`) computes a cost matrix across all candidates (jobs) and assignees (agents). An agent only proposes for a job if it computes itself as the minimum-cost agent. The `selection_threshold_pct` parameter further restricts proposals to agents within a configured percentage of the global minimum cost. This mechanism ensures that typically only 1-3 agents propose for the same job (p = O(1)), keeping the proposal phase lightweight.
+The `SelectionEngine` (`swarm/selection/engine.py`) computes a cost matrix across all candidates (jobs) and assignees (agents). An agent only proposes for a job if it computes itself as the minimum-cost agent. That single rule is what keeps typically 1-3 agents proposing for the same job (p = O(1)) and the proposal phase lightweight. An earlier revision of this paragraph credited a `selection_threshold_pct` tolerance as a second restriction; that key never had any effect and was removed on 2026-09-20 (code review §7), so the restriction was always the argmin rule alone. The reason the figure is not exactly 1 is that each agent builds the matrix from its own view of its peers and several can each believe they are cheapest — ~3.7 bidders per job measured. `job_selection.designate_bidder` cuts that to ~1 for LLM agents only; `_designate_bidders` runs in `LlmAgent.selection_main` alone, so a rule-based fleet has no knob here.
 
 ---
 
@@ -633,6 +633,8 @@ The migration is designed as four incremental phases, each independently useful 
 - Integrated with `ResourceAgent` via the `_SwimAdapter` class; started lazily in `on_periodic`
 - Config toggle: `failure_detection.protocol: "heartbeat" | "swim"`
 - SWIM runs in parallel with heartbeat; **heartbeat remains authoritative for job reassignment in this phase** — SWIM's faster detection primarily informs peer liveness for cost/query sampling
+- **It is authoritative for nothing a quorum is taken over (2026-09-20, code review §6).** SWIM's FAILED set used to gate consensus `broadcast` while `calculate_quorum` counted `neighbor_map`, which still held those peers: a false positive removed a live voter without lowering the bar it had to clear. SWIM false-fails under consensus bursts — acks queue behind the single inbound consumer and blow the probe window — so it fired hardest in the regime where it cost the most. The skip set is now heartbeat's alone and is a subset of what the quorum denominator already excludes. Lowering the denominator to match was the wrong half of the choice: SWIM's view differs per agent, so that would let two disjoint quorums form on a false positive
+- **A FAILED verdict is recoverable.** `_merge_one` ranked claims by severity alone, so the ALIVE-at-incarnation+1 that `_maybe_refute` emits was rejected everywhere, and `_pick_probe_target` never probes a FAILED member — so the peer was gone from the live sample and the gossip fan-out for the rest of the run. `_supersedes` takes incarnation first (only the subject raises its own, so a higher one is first-hand word from it) and severity only within one incarnation, dropping a stale rumour however severe. `tests/test_swim_advisory.py`
 
 **Validation status:** Unit-level behavior covered indirectly; the false-positive-rate and detection-latency comparison under `kill_agents.py` at scale is still pending.
 

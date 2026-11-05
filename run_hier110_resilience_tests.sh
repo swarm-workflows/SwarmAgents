@@ -60,6 +60,12 @@ echo "=============================================="
 build_cmd() {
     local run_dir="$1"
     local use_config_dir="$2"   # "true" or "false"
+    # Upper bound on agents this run SIGKILLs. Kill targets here are picked from live Redis
+    # after run_test.py has started, so the ids cannot be declared up front (which
+    # --expect-silent-agents would prefer); the --count passed to pick_active_agents.py is the
+    # bound. Without it, run_test.py fails a failure run for the missing metrics of the very
+    # agents the scenario killed on purpose.
+    local max_killed="${3:-0}"
     local cmd="python3.11 run_test.py"
     cmd+=" --mode ${MODE}"
     cmd+=" --agent-type resource"
@@ -85,6 +91,9 @@ build_cmd() {
     cmd+=" --remote-repo-dir ${BASE_DIR}"
     if [[ "${use_config_dir}" == "true" ]]; then
         cmd+=" --use-config-dir"
+    fi
+    if [[ "${max_killed}" -gt 0 ]]; then
+        cmd+=" --allow-missing-metrics ${max_killed}"
     fi
     echo "${cmd}"
 }
@@ -176,7 +185,10 @@ run_failure() {
 
     # Start test in background (always use --use-config-dir for failure runs)
     local cmd
-    cmd=$(build_cmd "${run_dir}" "true")
+    # The kill count is whatever --count pick_active_agents.py was given for this scenario.
+    local max_killed
+    max_killed=$(echo "${pick_args}" | sed -n 's/.*--count[= ]\{1,\}\([0-9]\{1,\}\).*/\1/p')
+    cmd=$(build_cmd "${run_dir}" "true" "${max_killed:-0}")
     cd "${BASE_DIR}"
     echo "  CMD: ${cmd}"
     eval "${cmd}" > "${run_dir}/logs/run_test.stdout.log" 2>&1 &

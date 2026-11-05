@@ -125,6 +125,7 @@ def _make_engine(agent_id=1, peers=(2, 3, 4), my_cost=1.0, cas=None,
         agent_id=agent_id, host=host, transport=transport, router=router,
         k=k, alpha=alpha, beta=beta, max_rounds=20,
         round_timeout_s=0.5, tick_interval_s=0.01,
+        max_inflight=32,     # pinned: batching tests coalesce 20 jobs and must not hit the cap
         # Tests drive _tick(now=...) with a synthetic timeline starting at 0.0; the
         # engine's own clock must match or propose() stamps wall-clock deadlines that
         # the _tick send gate compares against synthetic `now`.
@@ -503,3 +504,111 @@ class SnowNonBlockingSendTests(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class SnowOutgoingHeldThroughFinalizeTests(unittest.TestCase):
+    """A proposal stays in `outgoing` until its finalize has run the host callbacks.
+
+    An agent prices its open proposals as committed work (`job_selection.cost_model:
+    utilization`), and a won job only reaches its selected queue inside `on_leader_elected`,
+    after the CAS and the object fetch run on the pool. `_finalize` used to drop the proposal
+    first, so for those WAN round trips the agent priced other jobs as if it held nothing
+    (stop-time review, 2026-10-16)."""
+
+    def _finalize_with_probe(self, cas=None, candidate=1):
+        eng, host, _, _ = _make_engine(agent_id=1, peers=[2, 3, 4], cas=cas)
+        seen = []
+        host.on_leader_elected = lambda obj, p_id: seen.append(
+            eng.outgoing.contains(object_id=obj.object_id))
+        host.on_participant_commit = lambda obj, leader, p_id: seen.append(
+            eng.outgoing.contains(object_id=obj.object_id))
+        eng.propose([ProposalInfo(p_id="p", object_id="job-z", cost=1.0, agent_id="1")])
+        state = eng._states["job-z"]
+        eng._finalize(state, candidate, reason="test")
+        return eng, seen
+
+    def test_held_while_the_leader_callback_runs_then_released(self):
+        eng, seen = self._finalize_with_probe()
+        self.assertEqual(seen, [True])
+        self.assertFalse(eng.outgoing.contains(object_id="job-z"))
+
+    def test_released_when_another_agent_wins(self):
+        cas = _FakeCAS()
+        cas.claim("job-z", 7)
+        eng, seen = self._finalize_with_probe(cas=cas)
+        self.assertFalse(eng.outgoing.contains(object_id="job-z"))
+
+    def test_released_when_the_finalize_raises(self):
+        eng, host, _, _ = _make_engine(agent_id=1, peers=[2, 3, 4])
+        host.get_object = lambda oid: (_ for _ in ()).throw(RuntimeError("redis down"))
+        eng.propose([ProposalInfo(p_id="p", object_id="job-e", cost=1.0, agent_id="1")])
+        eng._finalize(eng._states["job-e"], 1, reason="test")
+        self.assertFalse(eng.outgoing.contains(object_id="job-e"))
+        self.assertEqual(eng.finalize_errors, 1)
+
+    def test_a_newer_proposal_for_the_same_job_is_not_removed(self):
+        eng, host, _, _ = _make_engine(agent_id=1, peers=[2, 3, 4])
+        eng.propose([ProposalInfo(p_id="old", object_id="job-n", cost=1.0, agent_id="1")])
+        old = eng._states["job-n"]
+        with eng._lock:
+            old.finalized = True
+            eng._states.pop("job-n")
+        eng.propose([ProposalInfo(p_id="new", object_id="job-n", cost=1.0, agent_id="1")])
+        eng._release_outgoing(old)
+        self.assertTrue(eng.outgoing.contains(object_id="job-n", p_id="new"))
+        self.assertFalse(eng.outgoing.contains(object_id="job-n", p_id="old"))
+
+
+class SnowTieToleranceTests(unittest.TestCase):
+    """A peer backs itself only when cheaper than the initiator by more than `tie_tolerance`
+    (default 5 %) of the initiator's cost (2026-10-19). With load-aware costs the cheapest agent
+    flips round to round; under the strict rule each flip reset β, and a three-coordinator tier
+    took 26-30 s per decision at a burst."""
+
+    def _answer(self, my_cost, init_cost, tol=None, init_agent=2):
+        eng, host, _, _ = _make_engine(agent_id=1, peers=[2, 3], my_cost=my_cost)
+        if tol is not None:
+            eng.tie_tolerance = tol
+        return eng, eng._answer_query("q", "job-t", init_agent, init_cost)
+
+    def test_the_default_is_five_percent(self):
+        eng, _h, _t, _c = _make_engine()
+        self.assertAlmostEqual(eng.tie_tolerance, 0.05)
+
+    def test_a_peer_within_the_tolerance_backs_the_initiator(self):
+        eng, ans = self._answer(0.97, 1.00)
+        self.assertEqual(ans["preferred_agent"], 2)
+        self.assertEqual(eng.tolerance_yields, 1)
+
+    def test_a_clearly_cheaper_peer_backs_itself(self):
+        eng, ans = self._answer(0.90, 1.00)
+        self.assertEqual(ans["preferred_agent"], 1)
+        self.assertEqual(eng.tolerance_yields, 0)
+
+    def test_zero_restores_the_strict_rule(self):
+        _eng, ans = self._answer(0.97, 1.00, tol=0.0)
+        self.assertEqual(ans["preferred_agent"], 1)
+
+    def test_a_dearer_peer_backs_the_initiator_as_before(self):
+        eng, ans = self._answer(1.20, 1.00)
+        self.assertEqual(ans["preferred_agent"], 2)
+        self.assertEqual(eng.tolerance_yields, 0)
+
+    def test_an_initiator_with_no_cost_still_loses_to_any_price(self):
+        _eng, ans = self._answer(5.0, None)
+        self.assertEqual(ans["preferred_agent"], 1)
+
+    def test_an_infeasible_peer_never_backs_itself(self):
+        _eng, ans = self._answer(float("inf"), 1.0)
+        self.assertEqual(ans["preferred_agent"], 2)
+
+    def test_the_tolerance_is_clamped(self):
+        eng, _h, _t, _c = _make_engine()
+        from swarm.consensus.gossip_engine import GossipConsensusEngine
+        e2 = GossipConsensusEngine(agent_id=1, host=eng.host, transport=eng.transport,
+                                   router=eng.router, tie_tolerance=3.0)
+        self.assertEqual(e2.tie_tolerance, 0.5)
+
+    def test_yields_are_reported(self):
+        eng, _ans = self._answer(0.99, 1.00)
+        self.assertEqual(eng.consensus_stats()["tolerance_yields"], 1)

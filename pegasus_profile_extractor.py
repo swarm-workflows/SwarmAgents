@@ -35,6 +35,7 @@ import json
 import math
 import os
 import re
+import shlex
 import sqlite3
 import sys
 from typing import Dict, List, Optional, Tuple
@@ -83,7 +84,18 @@ def _find_abstract_workflow(run_dir: str) -> Optional[str]:
 
 
 def load_workflow_uses(run_dir: str) -> Dict[str, Dict[str, List[str]]]:
-    """Parse the abstract workflow -> {abs_job_id: {"input": [...], "output": [...]}}."""
+    """Parse the abstract workflow -> {abs_job_id: {"input", "output", "arguments"}}.
+
+    `arguments` is here because it is **the** source for them, and the obvious other
+    candidate is empty. `invocation.argv` in the stampede DB records the kickstart-level
+    command line, which for these workflows carries nothing: measured on the soilmoisture
+    run, every compute job had `argv = ''` while the workflow declares
+    `['--fetch', '--polygon-id', 'field1', ...]`. A job re-run from argv alone gets no
+    arguments at all and dies on its own usage message, which is exactly how this was found.
+
+    Keyed by abstract job id, the same key `uses` is keyed by, so the existing abs_task_id
+    lookup in `extract_run` resolves both at once.
+    """
     if yaml is None:
         return {}
     path = _find_abstract_workflow(run_dir)
@@ -96,14 +108,243 @@ def load_workflow_uses(run_dir: str) -> Dict[str, Dict[str, List[str]]]:
         abs_id = job.get("id")
         if not abs_id:
             continue
-        entry = {"input": [], "output": []}
+        entry = {"input": [], "output": [], "arguments": []}
         for use in job.get("uses", []) or []:
             ftype = use.get("type")
             lfn = use.get("lfn")
             if lfn and ftype in ("input", "output"):
                 entry[ftype].append(lfn)
+        # An argument is usually a plain string, but the Pegasus API also permits a File
+        # object, which round-trips through YAML as a mapping carrying its `lfn`. Rendering
+        # that with str() would put a Python dict repr on the command line.
+        for arg in job.get("arguments", []) or []:
+            if isinstance(arg, dict):
+                lfn = arg.get("lfn")
+                if lfn:
+                    entry["arguments"].append(str(lfn))
+            else:
+                entry["arguments"].append(str(arg))
         uses_map[abs_id] = entry
     return uses_map
+
+
+def cluster_task_ids(main_tasks) -> set:
+    """Distinct abstract task ids in one Condor job, straight from the stampede DB.
+
+    This is the clustering signal, and it must come from the DB rather than from the
+    abstract-workflow map, because it decides whether a job is safe to execute. The obvious
+    alternative -- counting the abstract ids that resolved against `workflow.yml` -- **fails
+    open**: that list is filtered by what is present in the workflow map, so a run with no
+    `workflow.yml` (absent file, or PyYAML not installed) yields an empty list for *every*
+    job, a clustered job is not recognised as one, and it goes on to execute the first task's
+    recorded argv as though it described the whole cluster.
+
+    Failing open is the wrong direction here. Missing metadata means we know *less* about a
+    job, which can only make executing it less safe, never more.
+    """
+    return {tid for (_transformation, tid, *_rest) in main_tasks if tid}
+
+
+def ordered_task_ids(main_tasks, known=None) -> List[str]:
+    """Abstract task ids in invocation order, each appearing once.
+
+    De-duplication is the point. One job instance can carry several invocation rows for the
+    same abstract task, and the caller accumulates that task's ARGUMENTS per entry — without
+    de-duplicating, because an argument list is ordered and a value may legitimately repeat.
+    Those two facts together turn a duplicate row into a doubled command line
+    (`--input a.csv --output b.json --input a.csv --output b.json`) that is still a single
+    task, so nothing flags it as a cluster and it runs.
+
+    Order is preserved rather than sorted: for a genuine cluster the sequence is the order
+    Pegasus ran the tasks in, and it is the only ordering information available.
+
+    `known` optionally restricts to ids present in the abstract workflow. Note the cluster
+    guard must NOT be derived from the filtered result — see `cluster_task_ids`.
+    """
+    seen = set()
+    out: List[str] = []
+    for (_transformation, tid, *_rest) in main_tasks:
+        if not tid or tid in seen:
+            continue
+        if known is not None and tid not in known:
+            continue
+        seen.add(tid)
+        out.append(tid)
+    return out
+
+
+def load_transformation_catalog(run_dir: str) -> Tuple[Dict[str, dict], Dict[str, dict]]:
+    """Parse the planned transformation catalog -> (transformations, containers).
+
+    This is where the *executable* of a job lives, and it is not in the stampede DB in any
+    usable form. The DB's `invocation.executable` is the path the job ran under **inside its
+    container** (`/srv/analyze_moisture`); the catalog holds the `pfn`, the host path of the
+    script that was staged there, plus which container it ran in and that container's image
+    URI. Both halves are needed to re-run the job anywhere else: the pfn says what code to
+    ship, the in-container path says what to invoke once it is shipped.
+
+    Preferred location is `<run_dir>/catalogs/transformations.yml` — the copy Pegasus *planned
+    with*, so it describes the run that actually happened. The workflow-root copy is a
+    fallback and can have been edited since; a run whose catalog was rewritten afterwards
+    would otherwise be described by a file that never governed it. Parent directories are
+    walked only after the planned copy is missing, and the walk stops at the filesystem root.
+
+    Returns two maps keyed by name. Both are empty when PyYAML is absent or no catalog is
+    found; callers must treat an unknown transformation as "not executable" rather than
+    guessing a path.
+    """
+    if yaml is None:
+        return {}, {}
+    candidates = [os.path.join(run_dir, "catalogs", "transformations.yml"),
+                  os.path.join(run_dir, "transformations.yml")]
+    probe = os.path.abspath(run_dir)
+    while True:
+        candidates.append(os.path.join(probe, "transformations.yml"))
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    path = next((c for c in candidates if os.path.isfile(c)), None)
+    if not path:
+        return {}, {}
+    try:
+        with open(path) as fh:
+            tc = yaml.safe_load(fh) or {}
+    except Exception as exc:  # noqa: BLE001 - a malformed catalog must not abort the whole run
+        # ...but it must not read as "no containers" either: every job would then run on the
+        # host's own libraries with nothing saying so (code review 2026-10-05 §57). The
+        # sentinel rides on every profile and the converter refuses execution on it.
+        return {CATALOG_ERROR_KEY: {"error": f"{path}: {exc}"}}, {}
+
+    containers: Dict[str, dict] = {}
+    for entry in tc.get("containers", []) or []:
+        name = entry.get("name")
+        if not name:
+            continue
+        containers[name] = {
+            "name": name,
+            "type": entry.get("type"),
+            "image": entry.get("image"),
+            "image_site": entry.get("image.site"),
+        }
+
+    transformations: Dict[str, dict] = {}
+    for entry in tc.get("transformations", []) or []:
+        name = entry.get("name")
+        if not name:
+            continue
+        sites = entry.get("sites", []) or []
+        # A transformation can be listed for several sites. Prefer a non-local execution site
+        # over "local": "local" is the submit host, whose pfn is frequently a wrapper rather
+        # than the science code. Order within a site list is not meaningful, so the choice has
+        # to be explicit rather than "first wins".
+        site = next((s for s in sites if s.get("name") not in (None, "local")), None)
+        if site is None:
+            site = sites[0] if sites else {}
+
+        def _entry(s):
+            return {"name": name, "pfn": s.get("pfn"), "type": s.get("type"),
+                    "site": s.get("name"), "container": s.get("container")}
+        transformations[name] = _entry(site)
+        # Every site's entry too: the one that describes a job is the site it RAN on
+        # (`job_instance.site`), which `catalog_entry_for` prefers. "First non-local" is only
+        # the fallback — with two execution sites it could pick a pfn or container Pegasus did
+        # not use for this job (§57).
+        transformations[name]["by_site"] = {s.get("name"): _entry(s) for s in sites
+                                            if s.get("name")}
+    return transformations, containers
+
+
+def resolve_arguments(clustered: bool, declared: List[str], resolved: bool,
+                      argv_raw: str, argv_list):
+    """(argument list, raw string) for one job. `None` means UNKNOWN and is refused at execution;
+    `[]` means the job genuinely takes none.
+
+    * A cluster has no single command line (several tasks run in sequence): unknown.
+    * The abstract workflow's declaration wins over the recorded argv, which is empty for every
+      compute job in these workflows.
+    * Nothing declared and nothing recorded — no workflow.yml, no PyYAML, or this job's abstract
+      id is not in it: unknown, not "none". `[]` is runnable and would run the job with no
+      arguments, the substitution the None/[] rule exists to prevent (code review §57).
+    * Otherwise the recorded argv as parsed (None when it could not be parsed).
+    """
+    if clustered:
+        return None, ""
+    if declared:
+        return list(declared), " ".join(declared)
+    if not resolved and not (argv_raw or "").strip():
+        return None, argv_raw or ""
+    return argv_list, argv_raw
+
+
+#: Key under which `load_transformation_catalog` reports a catalog it could not parse.
+CATALOG_ERROR_KEY = "__catalog_error__"
+
+
+def catalog_entry_for(transformations: Dict[str, dict], name: str, site: str) -> dict:
+    """The catalog entry for `name` at the site the job ran on, else the default choice."""
+    entry = transformations.get(name) or {}
+    return (entry.get("by_site") or {}).get(site) or {
+        k: v for k, v in entry.items() if k != "by_site"}
+
+
+def container_for(entry: dict, containers: Dict[str, dict]) -> Optional[dict]:
+    """The container a catalog entry names. A name the catalog does not define is returned as
+    an IMAGELESS container, not as None: None means "runs on the host", and a dangling name
+    would otherwise run the job on the host's own libraries silently. The imageless form is
+    exactly what `ExecutionSpec.runnable()` refuses (§57)."""
+    name = (entry or {}).get("container")
+    if not name:
+        return None
+    return containers.get(name) or {"name": name, "type": None, "image": None,
+                                    "image_site": None}
+
+
+def load_replica_catalog(run_dir: str) -> Dict[str, str]:
+    """Parse the replica catalog -> {lfn: host path}.
+
+    These are the run's ROOT INPUTS: files a workflow consumes but no job in it produces.
+    Nothing else records them. Job `data_in` lists what each job reads, but cannot say which
+    of those came from outside the run — that distinction is the difference between a file
+    that must be shipped with the workflow and one that appears when its parent job finishes.
+
+    Same lookup order as the transformation catalog: the run dir's planned copy first,
+    because it is the one Pegasus used, then the workflow root, then upwards.
+    """
+    if yaml is None:
+        return {}
+    candidates = [os.path.join(run_dir, "catalogs", "replicas.yml"),
+                  os.path.join(run_dir, "replicas.yml")]
+    probe = os.path.abspath(run_dir)
+    while True:
+        candidates.append(os.path.join(probe, "replicas.yml"))
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    path = next((c for c in candidates if os.path.isfile(c)), None)
+    if not path:
+        return {}
+    try:
+        with open(path) as fh:
+            rc = yaml.safe_load(fh) or {}
+    except Exception:  # noqa: BLE001 - a malformed catalog must not abort the run
+        return {}
+    out: Dict[str, str] = {}
+    for entry in rc.get("replicas", []) or []:
+        lfn = entry.get("lfn")
+        if not lfn:
+            continue
+        pfns = entry.get("pfns", []) or []
+        # Prefer a non-local site for the same reason the transformation catalog does; fall
+        # back to the first listed so a single-site catalog still resolves.
+        chosen = next((p for p in pfns if p.get("site") not in (None, "local")), None)
+        if chosen is None:
+            chosen = pfns[0] if pfns else {}
+        pfn = chosen.get("pfn")
+        if pfn:
+            out[str(lfn)] = str(pfn)
+    return out
 
 
 def load_cache_sites(run_dir: str) -> Dict[str, str]:
@@ -214,6 +455,8 @@ def extract_run(run_dir: str, job_types: List[str],
 
     # --- auxiliary per-run maps ---
     uses_map = load_workflow_uses(run_dir)
+    transformations_tc, containers_tc = load_transformation_catalog(run_dir)
+    replicas_rc = load_replica_catalog(run_dir)
     cache_sites = load_cache_sites(run_dir)
     sub_requests = load_sub_requests(run_dir)
     lfn_sizes = load_lfn_sizes(conn)
@@ -222,7 +465,9 @@ def extract_run(run_dir: str, job_types: List[str],
         return {
             "lfn": lfn,
             "site": cache_sites.get(lfn, fallback_site),
-            "size_bytes": lfn_sizes.get(lfn, 0),
+            # Absent when unknown — not 0. The converter keeps an absent size absent; an explicit
+            # 0 defeated that rule upstream and under-counted every job's data volume (§57).
+            "size_bytes": lfn_sizes.get(lfn),
         }
 
     # --- network aggregates from stage-in/stage-out transfer jobs ---
@@ -304,31 +549,72 @@ def extract_run(run_dir: str, job_types: List[str],
         rt = _stats(try_durations)
 
         main_tasks = conn.execute(
-            "SELECT transformation, abs_task_id FROM invocation "
+            "SELECT transformation, abs_task_id, executable, argv FROM invocation "
             "WHERE job_instance_id = ? AND abs_task_id IS NOT NULL",
             (ji_id,),
         ).fetchall()
         transformation = main_tasks[0][0] if main_tasks else ""
+        # `executable` is the path the job ran under *inside its container*; `argv` is the
+        # argument string as recorded. Both come from the same row as `transformation` so a
+        # clustered job cannot pair one task's name with another task's command line.
+        exec_path = (main_tasks[0][2] or "") if main_tasks else ""
+        argv_raw = (main_tasks[0][3] or "") if main_tasks else ""
+        try:
+            argv_list = shlex.split(argv_raw)
+        except ValueError:
+            # An unbalanced quote in a recorded command line is not worth aborting a run
+            # over, but silently returning [] would fabricate an argument-free job. Keep the
+            # raw string so the converter can refuse it rather than run something wrong.
+            argv_list = None
+        catalog_error = (transformations_tc.get(CATALOG_ERROR_KEY) or {}).get("error")
+        tc_entry = catalog_entry_for(transformations_tc, transformation, site)
+        container = container_for(tc_entry, containers_tc)
 
         # Abstract job id(s) -> input/output files from workflow.yml.
         # Prefer the DB's abs_task_id (handles custom job ids and clustered
         # jobs with multiple tasks); fall back to the _IDnnnnnnn suffix
         # convention in exec_job_id.
-        abs_ids = [t[1] for t in main_tasks if t[1] in uses_map]
+        # De-duplicated: duplicate invocation rows for one task would otherwise repeat that
+        # task's arguments and produce a doubled command line that still looks single-task.
+        abs_ids = ordered_task_ids(main_tasks, known=uses_map)
         if not abs_ids:
             m = ABS_ID_RE.search(exec_job_id)
             if m and m.group(1) in uses_map:
                 abs_ids = [m.group(1)]
-        uses = {"input": [], "output": []}
+        uses = {"input": [], "output": [], "arguments": []}
         for aid in abs_ids:
             for ftype in ("input", "output"):
                 for lfn in uses_map[aid][ftype]:
                     if lfn not in uses[ftype]:
                         uses[ftype].append(lfn)
+            # Not de-duplicated and not sorted: an argument list is ordered and a value may
+            # legitimately repeat.
+            uses["arguments"].extend(uses_map[aid].get("arguments", []))
+
+        # A CLUSTERED job bundles several tasks into one Condor job, and Pegasus runs them as
+        # separate sequential invocations -- not as one merged command line. `transformation`
+        # and `executable` above are taken from the FIRST task only, so concatenating every
+        # task's arguments would describe a job that never existed: task A's executable run
+        # with A's and B's flags together, the later ones overriding the earlier.
+        #
+        # There is no single (executable, argv) pair that represents such a job, so refuse to
+        # invent one. `None` is the "arguments unknown" value that `ExecutionSpec.runnable()`
+        # already rejects, so the job converts and schedules as before and declines to
+        # *execute* -- rather than executing something plausible and wrong. Input and output
+        # files are still unioned, which is correct for a cluster: it really does consume and
+        # produce all of them.
+        # From the DB, not from `abs_ids`: see `cluster_task_ids`. `abs_ids` is filtered by
+        # what resolved against workflow.yml, so using it here would stop recognising
+        # clusters exactly when the workflow metadata is missing.
+        task_ids = cluster_task_ids(main_tasks)
+        clustered = len(task_ids) > 1
+        argv_list, argv_raw = resolve_arguments(clustered, uses["arguments"], bool(abs_ids),
+                                                argv_raw, argv_list)
         input_files = [file_entry(lfn, site) for lfn in uses["input"]]
         output_files = [file_entry(lfn, site) for lfn in uses["output"]]
-        total_in = sum(f["size_bytes"] for f in input_files)
-        total_out = sum(f["size_bytes"] for f in output_files)
+        total_in = sum(f["size_bytes"] or 0 for f in input_files)
+        total_out = sum(f["size_bytes"] or 0 for f in output_files)
+        sizes_known = all(f["size_bytes"] is not None for f in input_files + output_files)
 
         # Condor resource requests
         req = sub_requests.get(exec_job_id, {})
@@ -340,6 +626,26 @@ def extract_run(run_dir: str, job_types: List[str],
             "job_id_db": job_id,
             "job_type": type_desc,
             "transformation_db": transformation,
+            # --- execution (what it takes to actually re-run this job) ---
+            # In-container path Pegasus invoked, the host path of the code that was staged
+            # there, and the container it ran in. Any of these may be None for a workflow
+            # with no catalog or no container; a consumer must check rather than assume.
+            "executable_db": exec_path or None,
+            "argv_db": argv_list,
+            "argv_raw_db": argv_raw or None,
+            # >1 when this Condor job bundled several tasks. Such a job is deliberately not
+            # executable (see above); it is recorded so a reader can tell "clustered" from
+            # "arguments genuinely could not be parsed", which are both argv_db=None.
+            "clustered_tasks_db": len(task_ids),
+            "pfn_db": tc_entry.get("pfn"),
+            "pfn_type_db": tc_entry.get("type"),
+            "container_db": container,
+            # The run's root inputs: {lfn: host path}. Run-level rather than per-job, and
+            # repeated on each profile so a single job record stays self-describing -- the
+            # converter reads it from whichever profile it is holding. Only the entries this
+            # job actually reads are its own concern; the whole map is carried because the
+            # converter bundles the union for the run.
+            "replicas_db": replicas_rc,
             # workflow-level
             "wf_uuid_db": wf_uuid,
             "dax_label_db": dax_label or "",
@@ -364,7 +670,11 @@ def extract_run(run_dir: str, job_types: List[str],
             "total_input_size_bytes_db": total_in,
             "total_output_size_bytes_db": total_out,
             # outcome
-            "exitcode_db": int(exitcode) if exitcode is not None else 0,
+            # None when the stampede DB recorded no outcome — not 0, which read as a success
+            # (and `should_fail: False`) for a job whose result is unknown (§57).
+            "exitcode_db": int(exitcode) if exitcode is not None else None,
+            "catalog_error_db": catalog_error,
+            "sizes_known_db": sizes_known,
             "execution_site_db": site,
             # retries / stats
             "try_number_stats": len(instances),

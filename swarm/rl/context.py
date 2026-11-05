@@ -55,6 +55,19 @@ class GroupSnapshot:
     # even when the arm is never tried — no refresh hysteresis after an
     # outage ends (design doc section 8.3).
     timeout_rate: float = 0.0
+    # When the freshest / stalest child record behind this snapshot was stamped, on the
+    # *child's* clock (P0-4). Timestamps rather than ages, because the age that matters is
+    # taken at the instant of the decision and an LLM delegation decides seconds after the
+    # snapshot is built. ``None`` means no observation at all — an unknown age, which is not
+    # the same as a large one and must never be substituted for one.
+    observed_at: Optional[float] = None
+    oldest_observed_at: Optional[float] = None
+    # The same two, but stamped on the COORDINATOR's clock when it took delivery of the
+    # record. `observed_at` minus a decision time is one term per clock, so any inter-host
+    # offset lands in the measurement; these two share a clock with the decision and so are
+    # immune to it. This is the pair the staleness figure is computed from.
+    received_at: Optional[float] = None
+    oldest_received_at: Optional[float] = None
 
 
 def _headroom(total: float, used: float) -> float:
@@ -64,12 +77,16 @@ def _headroom(total: float, used: float) -> float:
     return float(min(1.0, max(0.0, 1.0 - used / total)))
 
 
-def snapshots_from_children(children, delegation_infos) -> Dict[int, GroupSnapshot]:
+def snapshots_from_children(children, delegation_infos,
+                            seen_at: Optional[Dict[int, float]] = None
+                            ) -> Dict[int, GroupSnapshot]:
     """Aggregate per-group GroupSnapshots from a coordinator's view.
 
     *children*: iterable of AgentInfo-like records (``group``, ``capacities``,
     ``capacity_allocations``). *delegation_infos*: iterable of delegated-job
     tracking dicts (``{'groups': [...]}``) for in-flight counts.
+    *seen_at*: ``{agent_id: local_timestamp}`` of when the caller last took delivery of a
+    fresher record for each child, on the caller's own clock.
 
     Failure-rate fields are left at defaults — MABManager owns those and
     overwrites them from its outcome windows.
@@ -88,6 +105,8 @@ def snapshots_from_children(children, delegation_infos) -> Dict[int, GroupSnapsh
     for group, members in per_group.items():
         total_core = total_ram = total_gpu = 0.0
         used_core = used_ram = used_gpu = 0.0
+        stamps = []
+        local_stamps = []
         for child in members:
             caps = child.capacities
             alloc = child.capacity_allocations
@@ -97,12 +116,27 @@ def snapshots_from_children(children, delegation_infos) -> Dict[int, GroupSnapsh
             used_core += getattr(alloc, "core", 0) or 0
             used_ram += getattr(alloc, "ram", 0) or 0
             used_gpu += getattr(alloc, "gpu", 0) or 0
+            stamp = getattr(child, "last_updated", None)
+            if stamp:
+                stamps.append(float(stamp))
+            local = (seen_at or {}).get(getattr(child, "agent_id", None))
+            if local:
+                local_stamps.append(float(local))
         snapshots[group] = GroupSnapshot(
             active_children=len(members),
             cpu_headroom=_headroom(total_core, used_core),
             ram_headroom=_headroom(total_ram, used_ram),
             gpu_headroom=_headroom(total_gpu, used_gpu),
             inflight=inflight.get(group, 0),
+            # A group's load view is only as fresh as the child records it was aggregated
+            # from. Both ends are kept: the newest says how recently the coordinator heard
+            # anything about the group at all, the oldest how stale the worst contributor to
+            # these headroom numbers is. A group of nine where one child went quiet reads as
+            # fresh on the first and stale on the second, and that is the honest answer.
+            observed_at=max(stamps) if stamps else None,
+            oldest_observed_at=min(stamps) if stamps else None,
+            received_at=max(local_stamps) if local_stamps else None,
+            oldest_received_at=min(local_stamps) if local_stamps else None,
         )
     return snapshots
 
@@ -119,7 +153,9 @@ class ContextExtractor:
         cfg = config or {}
         self.job_types: List[str] = list(cfg.get("job_types", []))
         self.max_group_size = float(cfg.get("max_group_size", 10))
-        self.max_inflight = float(cfg.get("max_inflight", 32))
+        # 256, not 32: at Hier-90 a group held up to 242 delegated jobs and a cap of 32 read
+        # 1.0 for 47% of E1′ candidates (2026-10-14). Changing it changes `schema_version`.
+        self.max_inflight = float(cfg.get("max_inflight", 256))
         self.max_dtns = float(cfg.get("max_dtns", 4))
         self.long_job_threshold = float(cfg.get("long_job_threshold", 20.0))
         max_caps = cfg.get("max_caps", {})

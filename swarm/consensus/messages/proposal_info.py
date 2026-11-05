@@ -49,6 +49,7 @@ import threading
 from typing import Dict, List, Optional, Iterable, TypeVar, Callable
 
 from swarm.models.json_field import JSONField
+from swarm.utils.tiebreak import dominates
 
 
 T = TypeVar("T")
@@ -346,7 +347,11 @@ class ProposalContainer:
         """
         Return a better proposal for the same object_id (if any), based on:
           - Lower cost wins
-          - If equal cost, lexicographically smaller agent_id wins
+          - If equal cost, the lower tiebreak_rank for this object wins
+
+        The equal-cost arm was a lexicographic agent_id comparison, i.e. "lowest id wins every
+        tie". With coarse costs that decides most placements (finding 10), so it is now the same
+        per-object rank used by the selection engine and both consensus engines.
         """
         if not proposal or not proposal.object_id:
             return None
@@ -357,17 +362,9 @@ class ProposalContainer:
             for p in bucket.values():
                 if p.p_id == proposal.p_id:
                     continue
-                '''
-                if (p.cost < proposal.cost) or (
-                        p.cost == proposal.cost and (p.agent_id or "") < (proposal.agent_id or "")
-                ):
-                    best = p
-                    break
-                '''
-                # Find the minimum cost proposal
-                if best is None or p.cost < best.cost or (p.cost == best.cost and (p.agent_id or "") < (best.agent_id or
-                                                                                                        "")):
-                    if (p.cost < proposal.cost) or (p.cost == proposal.cost and (p.agent_id or "") < (proposal.agent_id
-                                                                                                      or "")):
+                # Keep the cheapest proposal that also beats the one being compared against.
+                if best is None or dominates(p.object_id, p.cost, p.agent_id, best.cost, best.agent_id):
+                    if dominates(proposal.object_id, p.cost, p.agent_id,
+                                 proposal.cost, proposal.agent_id):
                         best = p
             return best

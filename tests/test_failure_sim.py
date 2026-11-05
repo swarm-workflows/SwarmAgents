@@ -68,14 +68,19 @@ class TestSelectFailurePhase:
 class TestLivenessGate:
     def test_live_groups_from_children(self):
         class Child:
-            def __init__(self, group):
-                self.group = group
+            def __init__(self, agent_id, group):
+                self.agent_id, self.group = agent_id, group
 
         class Stub:
+            _agent_seen_at = {}  # no stamps yet: every child counts as live
+
+            def _detector_window_s(self):
+                return 67.0
+
             class children:
                 @staticmethod
                 def values():
-                    return [Child(0), Child(0), Child(3), Child(None)]
+                    return [Child(1, 0), Child(2, 0), Child(3, 3), Child(4, None)]
 
         live = ResourceAgent._get_live_child_groups(Stub())
         assert live == {0, 3}  # None group folds into 0; group with no

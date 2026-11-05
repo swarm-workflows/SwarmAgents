@@ -56,12 +56,40 @@ JOINED = MembershipUpdate.STATUS_JOINED
 SUSPECT = MembershipUpdate.STATUS_SUSPECT
 FAILED = MembershipUpdate.STATUS_FAILED
 
-# Rank for merge: failed dominates suspect dominates alive/joined.
+# Rank for merge: failed dominates suspect dominates alive/joined — AT THE SAME INCARNATION.
+# Incarnation is checked first; see `_supersedes`.
 _STATUS_RANK = {ALIVE: 0, JOINED: 0, SUSPECT: 1, FAILED: 2}
 
 
 def _rank(status: str) -> int:
     return _STATUS_RANK.get(status, -1)
+
+
+def _supersedes(new_status: str, new_inc: int, cur_status: str, cur_inc: int) -> bool:
+    """Whether an incoming membership claim replaces the one already held.
+
+    **Incarnation first, severity second.** Only the subject itself ever raises its own
+    incarnation (`_maybe_refute` bumps past whatever it was accused at), so a strictly higher
+    incarnation is first-hand word from the subject and outranks any second-hand rumour; a
+    strictly lower one is a rumour from before that word and is dropped. Within one
+    incarnation nobody has heard from the subject since, so the most severe claim wins.
+
+    Until 2026-09-20 this was rank dominance alone (code review 2026-09-18, §6), which broke
+    SWIM's recovery path outright: `_maybe_refute` emitted ALIVE at incarnation+1, and every
+    peer rejected it because ALIVE outranks nothing. A FAILED verdict was therefore permanent.
+    That matters because SWIM false-fails precisely under consensus bursts — acks queue behind
+    the single inbound consumer and blow the probe window — and a FAILED peer is never probed
+    again (`_pick_probe_target` skips it), so there was no second route back either. The peer
+    stayed out of Snow's live sample and out of the gossip fan-out for the rest of the run.
+
+    The dropped-stale-rumour half is the same rule the widely deployed implementation uses: a
+    suspicion or a confirmation older than what the subject has since refuted must not undo it.
+    """
+    if new_inc < cur_inc:
+        return False
+    if new_inc > cur_inc:
+        return True
+    return _rank(new_status) > _rank(cur_status)
 
 
 # -------- Host adapter protocol -------------------------------------------- #
@@ -122,6 +150,17 @@ class _PiggyEntry:
 
 # -------- SWIM membership manager ----------------------------------------- #
 
+#: The ONE default for every `failure_detection.swim.*` key (code review 2026-10-05 §G). There
+#: were three: this constructor (0.3 s probe / 8 s suspect), the agent's fallbacks (1 s / 20 s) and
+#: the shipped config (1 s / 60 s). These equal the shipped values; a test pins the agreement.
+SWIM_DEFAULTS = {
+    "period_ms": 1000,
+    "probe_timeout_ms": 1000,
+    "k_req": 3,
+    "suspect_timeout_s": 60.0,
+}
+
+
 class SwimMembership:
     """
     SWIM failure detector with infection-style update dissemination.
@@ -135,10 +174,10 @@ class SwimMembership:
     def __init__(
         self,
         host: SwimHost,
-        period_s: float = 1.0,
-        probe_timeout_s: float = 0.3,
-        k_req: int = 3,
-        suspect_timeout_s: float = 8.0,
+        period_s: float = SWIM_DEFAULTS["period_ms"] / 1000.0,
+        probe_timeout_s: float = SWIM_DEFAULTS["probe_timeout_ms"] / 1000.0,
+        k_req: int = SWIM_DEFAULTS["k_req"],
+        suspect_timeout_s: float = SWIM_DEFAULTS["suspect_timeout_s"],
         piggyback_count: int = 3,
         piggyback_max_per_msg: int = 8,
         time_fn: Callable[[], float] = time.time,
@@ -162,6 +201,7 @@ class SwimMembership:
         # Relay state: probe_id -> initiator agent_id (used when this node is
         # acting as a relay for someone else's ping-req).
         self._relay_initiators: dict[str, int] = {}
+        self._relay_targets: dict[str, int] = {}
 
         self._self_incarnation = 0
         self._stop = threading.Event()
@@ -221,12 +261,27 @@ class SwimMembership:
         sender = int(msg.source) if msg.source is not None else None
         if sender is None:
             return
+        updates = self._fresh_piggy()
+        with self._lock:
+            m = self._members.get(sender)
+            if m is None:
+                # A peer we did not know: it is alive (it just spoke to us) and new.
+                self._members[sender] = _Member(agent_id=sender, status=ALIVE, incarnation=0)
+            elif m.status in (SUSPECT, FAILED):
+                # First-hand proof of life from a peer we hold SUSPECT/FAILED. Only the subject
+                # may refute (by raising its incarnation), so TELL it: our ack carries our
+                # rumour about it, `_maybe_refute` on its side bumps the incarnation, and the
+                # ALIVE claim spreads on its next pings. Without this a false verdict was undone
+                # only if the victim happened to hear its own rumour inside the piggyback window
+                # (code review 2026-10-05 §11).
+                updates = [MembershipUpdate(agent_id=sender, status=m.status,
+                                            incarnation=m.incarnation)] + list(updates)
         # Reply directly with an ack covering ourselves.
         ack = SwimAck(
             source=self.host.agent_id,
             probe_id=msg.probe_id,
             target_agent=self.host.agent_id,
-            updates=self._fresh_piggy(),
+            updates=updates,
         )
         self._safe_send(sender, ack)
 
@@ -269,6 +324,10 @@ class SwimMembership:
             # Remember initiator so the ack-relay knows where to forward.
             self._indirect_acked.setdefault(relay_probe_id, False)
             self._relay_initiators[relay_probe_id] = initiator  # type: ignore[attr-defined]
+            # The target, kept apart from `_indirect_probes`: `on_ack` pops that entry before
+            # the forwarding loop runs, so the relayed ack went out with target_agent=None and a
+            # late relayed ack could never clear a suspicion (§11).
+            self._relay_targets[relay_probe_id] = target
         self._safe_send(target, ping)
 
     # ---- Protocol thread ------------------------------------------------- #
@@ -344,6 +403,10 @@ class SwimMembership:
                     del self._indirect_probes[pid]
                     self._indirect_acked.pop(pid, None)
                     self._relay_initiators.pop(pid, None)
+                    # Released with its siblings: the orphan sweep walks `_indirect_acked`, which
+                    # this branch has just cleared, so it never reaches this entry (stop-time
+                    # review of §11 — every timed-out relay leaked one).
+                    self._relay_targets.pop(pid, None)
         for probe in timed_out:
             self._mark_suspect(probe.target, reason="indirect-timeout")
 
@@ -360,18 +423,52 @@ class SwimMembership:
         # Relay ack forwarding: any indirect-probe ack should be re-emitted to
         # the original initiator. We do this opportunistically here for any
         # relay slots that have observed a true ack.
-        for pid, acked in list(self._indirect_acked.items()):
-            initiator = self._relay_initiators.get(pid)
-            if acked and initiator is not None and initiator != self.host.agent_id:
-                ack = SwimAck(
-                    source=self.host.agent_id,
-                    probe_id=pid,
-                    target_agent=self._indirect_probes.get(pid).target  # type: ignore[union-attr]
-                    if pid in self._indirect_probes else None,
-                    updates=self._fresh_piggy(),
-                )
-                self._safe_send(initiator, ack)
-                self._relay_initiators.pop(pid, None)
+        #
+        # The whole decision is taken under the lock, on the *live* flags, and the entries we
+        # are going to forward are claimed there too — reading a snapshot and deciding outside
+        # the lock loses acks. `on_ack` pops the probe and sets the flag in one step, so a
+        # snapshot taken a moment earlier says "not acked" while the probe has already gone,
+        # which is exactly the shape of the orphan branch below: it would delete a *fresh* ack
+        # and its relay destination, and the initiator would suspect a live peer. Claiming
+        # under the lock also means a later `on_ack` simply re-creates the entry and the next
+        # tick forwards it, rather than racing with this one.
+        to_forward: list[tuple[str, int, Optional[int]]] = []
+        with self._lock:
+            for pid in list(self._indirect_acked.keys()):
+                acked = self._indirect_acked.get(pid, False)
+                initiator = self._relay_initiators.get(pid)
+                probe = self._indirect_probes.get(pid)
+                if acked and initiator is not None and initiator != self.host.agent_id:
+                    target = probe.target if probe else self._relay_targets.get(pid)
+                    to_forward.append((pid, initiator, target))
+                    self._relay_initiators.pop(pid, None)
+                    self._indirect_acked.pop(pid, None)
+                    self._relay_targets.pop(pid, None)
+                elif acked:
+                    # Acked with nothing left to forward: either we were the initiator, or the
+                    # relay already forwarded it. `on_ack` pops the probe itself, so the
+                    # timeout sweep — which only walks `_indirect_probes` — never reaches this
+                    # entry, and it used to live for the life of the agent. Every successful
+                    # indirect probe left one behind and this loop walked all of them on every
+                    # tick, so failure-detection cost grew with uptime on exactly the long
+                    # runs a campaign is made of.
+                    self._indirect_acked.pop(pid, None)
+                    self._relay_initiators.pop(pid, None)
+                    self._relay_targets.pop(pid, None)
+                elif probe is None:
+                    # Orphaned: the probe is gone and the flag never went true.
+                    self._indirect_acked.pop(pid, None)
+                    self._relay_initiators.pop(pid, None)
+                    self._relay_targets.pop(pid, None)
+
+        for pid, initiator, target in to_forward:
+            ack = SwimAck(
+                source=self.host.agent_id,
+                probe_id=pid,
+                target_agent=target,
+                updates=self._fresh_piggy(),
+            )
+            self._safe_send(initiator, ack)
 
     # ---- Membership transitions ----------------------------------------- #
 
@@ -491,8 +588,7 @@ class SwimMembership:
                 ))
                 joined_callback = status in (ALIVE, JOINED)
             else:
-                if _rank(status) > _rank(m.status) or \
-                        (_rank(status) == _rank(m.status) and incarnation > m.incarnation):
+                if _supersedes(status, incarnation, m.status, m.incarnation):
                     prior = m.status
                     m.status = status if status in (ALIVE, JOINED, SUSPECT, FAILED) else m.status
                     m.incarnation = max(m.incarnation, incarnation)
@@ -517,6 +613,20 @@ class SwimMembership:
     # ---- Helpers --------------------------------------------------------- #
 
     def _pick_probe_target(self) -> Optional[int]:
+        # Admit agents the host knows but SWIM does not, on every pick — not only while SWIM knows
+        # nobody. Seeding once meant an agent that registered later was learned only through
+        # third-party piggyback, and the last to register could stay out of earlier agents' sets
+        # for the run, truncating Snow's sample and the gossip fan-out (§11). `setdefault`
+        # leaves every existing verdict — FAILED included — untouched.
+        try:
+            known = [int(p) for p in self.host.known_peers()
+                     if int(p) != int(self.host.agent_id)]
+        except Exception:
+            known = []
+        with self._lock:
+            for p in known:
+                if p not in self._members:
+                    self._members[p] = _Member(agent_id=p, status=ALIVE, incarnation=0)
         with self._lock:
             candidates = [
                 m.agent_id for m in self._members.values()

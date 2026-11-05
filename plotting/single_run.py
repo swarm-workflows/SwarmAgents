@@ -19,10 +19,12 @@ from swarm.models.job import Job, ObjectState
 from plotting.data import (
     load_metrics_from_repo,
     load_metrics_from_file,
+    set_expected_run_id,
     save_metrics,
     save_agents,
     save_jobs,
 )
+from plotting.stats import boxplot as _boxplot
 
 def collect_restarted_job_ids(output_dir: str, repo: Repository | None = None) -> Set[int]:
     """
@@ -519,7 +521,7 @@ def plot_scheduling_latency_and_jobs(run_dir: str,
         run_dir: Output directory containing job CSVs
         agent_count: Number of agents
         exclude_job_ids: Set of job IDs to exclude (e.g., restarted jobs)
-        label_suffix: Suffix for output filenames (e.g., '_no_restarts')
+        label_suffix: Suffix for output filenames (e.g., '_no_restarts', '_level1')
         level: Hierarchy level to plot (0, 1, etc.). If None, uses level0_jobs.csv
         save_csv: If True, export scheduling data to CSV files
         skip_plots: If True, skip plot generation
@@ -623,12 +625,22 @@ def plot_scheduling_latency_and_jobs(run_dir: str,
     plt.savefig(os.path.join(run_dir, f"scheduling_latency_histogram{label_suffix}.png"), bbox_inches="tight")
     plt.close()
 
-    # Print summary
-    print(f"[{('no_restarts' if label_suffix else 'all')}] "
-          f"Mean scheduling latency: {df['scheduling_latency'].mean():.4f} s")
-    print(f"[{('no_restarts' if label_suffix else 'all')}] "
-          f"Max scheduling latency: {df['scheduling_latency'].max():.4f} s")
-    print(f"\n[{('no_restarts' if label_suffix else 'all')}] Jobs per agent:")
+    # Print summary.
+    # The label used to be `'no_restarts' if label_suffix else 'all'`, i.e. derived from the
+    # truthiness of a filename suffix. That is right on the flat path, where the suffix is ""
+    # or "_no_restarts", and wrong on the hierarchical one, where it is "_level0"/"_level1"/
+    # "_level2" — all truthy — so a hierarchical run printed three blocks describing three
+    # different populations, each labelled "[no_restarts]", and no reader or tool could tell
+    # them apart. Label from the actual meaning instead.
+    if level is not None and label_suffix.startswith("_level"):
+        tag = f"level{level}"
+        if exclude_job_ids:
+            tag += ",no_restarts"
+    else:
+        tag = "no_restarts" if exclude_job_ids else "all"
+    print(f"[{tag}] Mean scheduling latency: {df['scheduling_latency'].mean():.4f} s")
+    print(f"[{tag}] Max scheduling latency: {df['scheduling_latency'].max():.4f} s")
+    print(f"\n[{tag}] Jobs per agent:")
     for agent_id, count in jobs_per_agent.items():
         print(f"  Agent {int(agent_id)}: {int(count)} jobs")
 
@@ -1573,7 +1585,7 @@ def plot_latency_comparison_by_agent_type(output_dir: str):
     data_to_plot = [llm_jobs['scheduling_latency'].dropna(), resource_jobs['scheduling_latency'].dropna()]
     labels = [f'LLM Agents\n(n={len(llm_jobs)})', f'Resource Agents\n(n={len(resource_jobs)})']
 
-    bp = axes[0, 0].boxplot(data_to_plot, labels=labels, patch_artist=True, showfliers=False)
+    bp = _boxplot(axes[0, 0], data_to_plot, labels, patch_artist=True, showfliers=False)
     bp['boxes'][0].set_facecolor('#FF6B6B')
     bp['boxes'][1].set_facecolor('#4ECDC4')
     axes[0, 0].set_ylabel('Scheduling Latency (s)', fontsize=11)
@@ -1886,7 +1898,7 @@ def plot_latency_comparison_by_hierarchy_level(output_dir: str):
         data_to_plot.append(df_level0['scheduling_latency'].dropna())
         labels.append(f'Level 0 (Bottom)\n(n={len(df_level0)})')
 
-    bp = axes[0, 0].boxplot(data_to_plot, labels=labels, patch_artist=True, showfliers=False)
+    bp = _boxplot(axes[0, 0], data_to_plot, labels, patch_artist=True, showfliers=False)
     colors = ['#9B59B6', '#4ECDC4', '#FF6B6B']  # Level 2: purple, Level 1: cyan, Level 0: red
     for patch, color in zip(bp['boxes'], colors[:len(bp['boxes'])]):
         patch.set_facecolor(color)
@@ -2078,7 +2090,7 @@ def plot_latency_comparison_by_hierarchy_level(output_dir: str):
         labels.append(f'Level 0 (Bottom)\n(n={len(df_level0)})')
 
     ax_box = axes[0]
-    bp = ax_box.boxplot(data_to_plot, labels=labels, patch_artist=True, showfliers=False)
+    bp = _boxplot(ax_box, data_to_plot, labels, patch_artist=True, showfliers=False)
     colors = ['#9B59B6', '#4ECDC4', '#FF6B6B']  # Level 2, Level 1, Level 0
     for patch, color in zip(bp['boxes'], colors[:len(bp['boxes'])]):
         patch.set_facecolor(color)
@@ -2448,11 +2460,18 @@ def parse_args():
     parser.add_argument("--skip-plots", action="store_true", help="Skip plot generation (useful with --save-csv)")
     parser.add_argument("--from-csv", action="store_true", help="Generate plots from existing CSV files without connecting to Redis")
     parser.add_argument("--failed-agents", type=str, default=None, help="Comma-separated list of agent IDs that actually failed (e.g., '1,3,5'). Only these will be counted in failure metrics. Useful to exclude intentionally shut down agents.")
+    parser.add_argument("--metrics-run-id", type=str, default=None,
+                        help="Only read metrics payloads stamped with this run id (run_test.py "
+                             "passes the id it launched the agents with). Without it, metrics "
+                             "left in Redis by an agent that outlived an earlier run are read "
+                             "as this run's.")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+
+    set_expected_run_id(args.metrics_run_id)
 
     failed_agent_list = args.failed_agents.split(',') if args.failed_agents else []
     print ("Failed agents: {}".format(failed_agent_list))
@@ -2486,9 +2505,11 @@ def main():
     if not args.from_csv:
         # For hierarchical topologies, fetch jobs from all levels (0, 1, 2)
         if args.hierarchical:
-            level0_jobs = repo.get_all_objects(key_prefix=Repository.KEY_JOB, level=0)
-            level1_jobs = repo.get_all_objects(key_prefix=Repository.KEY_JOB, level=1)
-            level2_jobs = repo.get_all_objects(key_prefix=Repository.KEY_JOB, level=2)
+            # Tagged with the group each record's key names, so level<N>_jobs.csv can say which
+            # group a delegated copy belonged to — including a copy no child picked up (T-5).
+            level0_jobs = repo.get_all_objects_with_group(key_prefix=Repository.KEY_JOB, level=0)
+            level1_jobs = repo.get_all_objects_with_group(key_prefix=Repository.KEY_JOB, level=1)
+            level2_jobs = repo.get_all_objects_with_group(key_prefix=Repository.KEY_JOB, level=2)
 
             # Tag jobs with their hierarchy level for analysis
             for job in level0_jobs:

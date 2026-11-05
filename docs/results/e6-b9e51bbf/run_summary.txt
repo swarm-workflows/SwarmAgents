@@ -1,0 +1,64 @@
+[2026-10-30 16:01:16] e6-hier30-pbft/run01: ok (exit 0, 663s)
+[2026-10-30 16:17:26] e6-hier30-pbft/run02: ok (exit 0, 902s)
+[2026-10-30 16:33:29] e6-hier30-pbft/run03: ok (exit 0, 896s)
+[2026-10-30 16:44:53] e6-hier30-snow/run01: ok (exit 0, 612s)
+[2026-10-30 16:56:28] e6-hier30-snow/run02: ok (exit 0, 627s)
+[2026-10-30 17:07:42] e6-hier30-snow/run03: ok (exit 0, 606s)
+[2026-10-30 17:07:42] SUMMARY: ok 6
+e6-hier30-pbft run01 sides 15 15 sites 5 4 held 186.6 ok apply_failed {} heal_failed {} lost_leader_races 0
+e6-hier30-pbft run02 sides 15 15 sites 5 4 held 186.6 ok apply_failed {} heal_failed {} lost_leader_races 0
+e6-hier30-pbft run03 sides 15 15 sites 5 4 held 186.6 ok apply_failed {} heal_failed {} lost_leader_races 0
+e6-hier30-snow run01 sides 15 15 sites 5 4 held 186.6 ok apply_failed {} heal_failed {} lost_leader_races 0
+e6-hier30-snow run02 sides 15 15 sites 5 4 held 186.6 ok apply_failed {} heal_failed {} lost_leader_races 0
+e6-hier30-snow run03 sides 15 15 sites 5 4 held 186.6 ok apply_failed {} heal_failed {} lost_leader_races 0
+e6-hier30-pbft run01 jobs 600 >30s 17 >60s 16 >250s 3 stalled jobs submitted before/during/after cut: 1 4 12
+e6-hier30-pbft run02 jobs 600 >30s 18 >60s 14 >250s 2 stalled jobs submitted before/during/after cut: 2 5 11
+e6-hier30-pbft run03 jobs 600 >30s 15 >60s 12 >250s 3 stalled jobs submitted before/during/after cut: 1 4 10
+e6-hier30-snow run01 jobs 600 >30s 1 >60s 1 >250s 0 stalled jobs submitted before/during/after cut: 0 1 0
+e6-hier30-snow run02 jobs 600 >30s 1 >60s 1 >250s 0 stalled jobs submitted before/during/after cut: 0 1 0
+e6-hier30-snow run03 jobs 600 >30s 0 >60s 0 >250s 0 stalled jobs submitted before/during/after cut: 0 0 0
+e6-hier30-pbft run01 executed 600 twice 0 unrun 0 restarts 2 unpersisted 3 false_verdicts 0 {'abandoned': 0, 'commit_lock_holds': 138, 'commit_splits_resolved': 7, 'cancelled': 0}
+e6-hier30-pbft run02 executed 600 twice 0 unrun 0 restarts 14 unpersisted 3 false_verdicts 0 {'abandoned': 0, 'commit_lock_holds': 132, 'commit_splits_resolved': 14, 'cancelled': 0}
+e6-hier30-pbft run03 executed 600 twice 0 unrun 0 restarts 23 unpersisted 0 false_verdicts 0 {'abandoned': 0, 'commit_lock_holds': 159, 'commit_splits_resolved': 10, 'cancelled': 0}
+e6-hier30-snow run01 executed 600 twice 0 unrun 0 restarts 0 unpersisted 0 false_verdicts 0 {'abandoned': 133, 'commit_lock_holds': 0, 'commit_splits_resolved': 0, 'cancelled': 0}
+e6-hier30-snow run02 executed 600 twice 0 unrun 0 restarts 0 unpersisted 0 false_verdicts 0 {'abandoned': 126, 'commit_lock_holds': 0, 'commit_splits_resolved': 0, 'cancelled': 0}
+e6-hier30-snow run03 executed 600 twice 0 unrun 0 restarts 0 unpersisted 0 false_verdicts 0 {'abandoned': 124, 'commit_lock_holds': 0, 'commit_splits_resolved': 0, 'cancelled': 0}
+cell run tier phase n sel_p50 sel_p95 sel_max wait_p50 wait_p95 wait_max no_sel_stamp
+e6-hier30-pbft run01 leaf before 127 0.07 0.17 0.37 0.64 1.86 276.79 0
+e6-hier30-pbft run01 leaf during 355 0.10 0.19 0.30 0.58 5.55 267.40 0
+e6-hier30-pbft run01 leaf after 118 0.10 60.07 60.40 1.53 62.11 79.46 0
+e6-hier30-pbft run01 coord before 128 0.10 0.17 0.49 nan nan nan 0
+e6-hier30-pbft run01 coord during 356 0.13 0.21 0.45 nan nan nan 0
+e6-hier30-pbft run01 coord after 116 0.11 0.19 0.45 nan nan nan 0
+e6-hier30-pbft run02 leaf before 128 0.07 0.13 0.36 0.70 1.75 315.40 0
+e6-hier30-pbft run02 leaf during 354 0.11 0.19 0.30 0.64 3.91 144.96 0
+e6-hier30-pbft run02 leaf after 118 0.08 0.30 60.31 1.11 60.75 132.57 0
+e6-hier30-pbft run02 coord before 128 0.08 0.16 0.31 nan nan nan 0
+e6-hier30-pbft run02 coord during 356 0.12 0.21 0.44 nan nan nan 0
+e6-hier30-pbft run02 coord after 116 0.12 60.17 301.08 nan nan nan 0
+e6-hier30-pbft run03 leaf before 128 0.08 0.17 0.62 0.87 1.85 281.19 0
+e6-hier30-pbft run03 leaf during 355 0.10 0.15 0.30 0.77 5.52 310.65 0
+e6-hier30-pbft run03 leaf after 117 0.05 0.15 60.15 1.32 60.52 136.40 0
+e6-hier30-pbft run03 coord before 128 0.08 0.17 0.42 nan nan nan 0
+e6-hier30-pbft run03 coord during 356 0.12 0.21 0.59 nan nan nan 0
+e6-hier30-pbft run03 coord after 116 0.10 0.20 301.32 nan nan nan 0
+e6-hier30-snow run01 leaf before 122 1.18 1.74 5.18 1.46 3.92 5.86 4
+e6-hier30-snow run01 leaf during 356 0.87 1.42 5.14 1.29 3.51 60.93 4
+e6-hier30-snow run01 leaf after 118 1.16 1.57 27.24 1.75 4.67 28.29 4
+e6-hier30-snow run01 coord before 127 1.21 1.94 3.42 nan nan nan 0
+e6-hier30-snow run01 coord during 357 1.21 1.91 2.73 nan nan nan 0
+e6-hier30-snow run01 coord after 116 1.21 1.70 2.92 nan nan nan 0
+e6-hier30-snow run02 leaf before 123 1.19 1.59 6.59 1.49 3.75 6.91 5
+e6-hier30-snow run02 leaf during 354 0.94 1.41 2.79 1.45 4.25 60.06 5
+e6-hier30-snow run02 leaf after 118 0.94 1.57 20.63 1.70 4.37 25.03 5
+e6-hier30-snow run02 coord before 128 1.22 1.70 2.74 nan nan nan 0
+e6-hier30-snow run02 coord during 356 1.22 1.94 2.88 nan nan nan 0
+e6-hier30-snow run02 coord after 116 1.25 2.75 3.88 nan nan nan 0
+e6-hier30-snow run03 leaf before 123 1.17 2.01 5.49 1.26 3.76 7.24 6
+e6-hier30-snow run03 leaf during 358 0.76 1.41 2.21 1.25 3.47 14.31 6
+e6-hier30-snow run03 leaf after 113 0.94 1.40 25.56 1.97 3.91 28.21 6
+e6-hier30-snow run03 coord before 128 1.20 1.94 3.79 nan nan nan 0
+e6-hier30-snow run03 coord during 356 1.20 1.63 2.31 nan nan nan 0
+e6-hier30-snow run03 coord after 116 1.09 1.52 2.69 nan nan nan 0
+
+[exited with code 0]

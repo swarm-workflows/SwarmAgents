@@ -36,11 +36,12 @@ See ``docs/GOSSIP_CONSENSUS_DESIGN.md`` for the protocol description.
 
 from __future__ import annotations
 
+import math
 import random
 import threading
 import time
 import uuid
-from collections import Counter
+from collections import Counter, OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Protocol
@@ -50,6 +51,8 @@ from swarm.consensus.messages.proposal_info import ProposalContainer, ProposalIn
 from swarm.consensus.messages.snow_batch import SnowQueryBatch, SnowResponseBatch
 from swarm.consensus.messages.snow_query import SnowQuery
 from swarm.consensus.messages.snow_response import SnowResponse
+from swarm.utils.instrumentation import RunningStats
+from swarm.utils.tiebreak import tiebreak_rank
 
 
 class SnowTransport(Protocol):
@@ -94,6 +97,50 @@ class _SnowState:
     d: Counter = field(default_factory=Counter)  # Snowball cumulative per-choice support
     last_choice: Optional[int] = None            # top choice of the previous successful round
     cost_of: Dict[int, float] = field(default_factory=dict)  # best-known cost per candidate
+    # Set once a peer's "already decided" hint for this job proved stale (no claim in Redis):
+    # from then on such a response is an ordinary vote, never a shortcut (§8).
+    ignore_decided_hints: bool = False
+    # The election this instance belongs to (`GossipConsensusEngine._generation`). An
+    # instance from an earlier generation — its job was reset after it started — may neither
+    # finalize nor be re-opened: it would claim, or re-insert, a decision for an election that
+    # is over.
+    gen: int = 0
+    # Why rounds failed, for the abandon line: no response at all / every voter abstained or
+    # hinted / fewer answers than peers queried (silence counts against α) / a full split.
+    fail_empty: int = 0
+    fail_abstain: int = 0
+    fail_short: int = 0
+    fail_split: int = 0
+    last_votes: list = field(default_factory=list)   # [(peer_pref, cost)] of the last failed round
+    # Query ids of this instance's recent rounds. A reply that misses its round is otherwise
+    # discarded, and from a host whose round trip exceeds `round_timeout_ms` EVERY reply misses:
+    # 89 at ~90 ms RTT from every other coordinator abandoned 80 jobs a run that its peers had
+    # long decided, each holding an inflight slot for ~37 s (2026-10-14). A late "already
+    # decided" hint is still the answer to this instance's question, so it is honoured.
+    recent_query_ids: deque = field(default_factory=lambda: deque(maxlen=RECENT_QUERY_IDS))
+
+
+#: How many of an instance's past round ids a late reply may still match (see `_SnowState`).
+RECENT_QUERY_IDS = 16
+
+
+#: The ONE default for every `consensus.snow.*` key (code review 2026-10-05 §G). The agent's
+#: fallbacks and this constructor's defaults used to be 20/20/500/32/32 while the shipped config
+#: says 10/6/300/16/16, so a config without the block silently ran a different regime from the
+#: one the shipped file documents. These equal the shipped values; a test pins the agreement.
+SNOW_DEFAULTS = {
+    "k": 10,
+    "alpha": 0.7,
+    "beta": 6,
+    "max_rounds": 100,
+    "round_timeout_ms": 300,
+    "tick_interval_ms": 50,
+    "local_sample_frac": 1.0,
+    "send_workers": 64,
+    "send_timeout_ms": 300,
+    "max_inflight": 16,
+    "tie_tolerance": 0.05,
+}
 
 
 class GossipConsensusEngine:
@@ -117,17 +164,20 @@ class GossipConsensusEngine:
         host: SnowHost,
         transport: SnowTransport,
         router: TopologyRouter,
-        k: int = 20,
-        alpha: float = 0.7,
-        beta: int = 20,
-        max_rounds: int = 100,
-        round_timeout_s: float = 0.5,
-        tick_interval_s: float = 0.05,
-        local_sample_frac: float = 1.0,
-        send_workers: int = 32,
-        send_timeout_s: float = 0.3,
-        max_inflight: int = 32,
-        time_fn: Callable[[], float] = time.time,
+        k: int = SNOW_DEFAULTS["k"],
+        alpha: float = SNOW_DEFAULTS["alpha"],
+        beta: int = SNOW_DEFAULTS["beta"],
+        max_rounds: int = SNOW_DEFAULTS["max_rounds"],
+        round_timeout_s: float = SNOW_DEFAULTS["round_timeout_ms"] / 1000.0,
+        tick_interval_s: float = SNOW_DEFAULTS["tick_interval_ms"] / 1000.0,
+        local_sample_frac: float = SNOW_DEFAULTS["local_sample_frac"],
+        send_workers: int = SNOW_DEFAULTS["send_workers"],
+        send_timeout_s: float = SNOW_DEFAULTS["send_timeout_ms"] / 1000.0,
+        max_inflight: int = SNOW_DEFAULTS["max_inflight"],
+        tie_tolerance: float = SNOW_DEFAULTS["tie_tolerance"],
+        # Monotonic by default (§38): every use is a duration or a deadline inside this process,
+        # and a stepped wall clock moved round deadlines and finalize latencies.
+        time_fn: Callable[[], float] = time.monotonic,
     ):
         self.agent_id = int(agent_id)
         self.host = host
@@ -135,7 +185,6 @@ class GossipConsensusEngine:
         self.router = router
         self.k = int(k)
         self.alpha = float(alpha)
-        self.alpha_k = max(1, int(round(alpha * k)))
         self.beta = int(beta)
         self.max_rounds = int(max_rounds)
         self.round_timeout_s = float(round_timeout_s)
@@ -151,19 +200,77 @@ class GossipConsensusEngine:
         # Max Snow decisions with an outstanding query round at once — bounds total send
         # demand to what the pool can drain (Snow's analog of PBFT max_pending_elections).
         self.max_inflight = max(1, int(max_inflight))
+        # A peer backs itself only when it is cheaper than the initiator by more than this
+        # fraction of the initiator's cost; otherwise it backs the initiator (`_answer_query`).
+        # 0 restores the strict rule. Clamped so a typo cannot make every peer always yield.
+        self.tie_tolerance = min(0.5, max(0.0, float(tie_tolerance)))
+        # Votes where this peer was cheaper, but within `tie_tolerance`, and backed the
+        # initiator instead of itself.
+        self.tolerance_yields = 0
         self._send_pool: Optional[ThreadPoolExecutor] = None
         self._send_sem: Optional[threading.BoundedSemaphore] = None
         self.sends_dropped = 0
+        self.cancelled_count = 0   # instances dropped because their election was reset
+        # object_id -> election generation, bumped by forget_decision. Only reset objects
+        # appear, so it stays small; bounded anyway (oldest first) like `conflicts`.
+        self._generation: "OrderedDict[str, int]" = OrderedDict()
+        self._generation_max = 65536
+        # object_id -> RLock serializing a finalize (generation check, CAS, host callbacks) with
+        # a reset of the same job (forget_decision). Checking the generation and then acting
+        # leaves a window a reset can land in; holding one lock across both closes it. Lock
+        # order is always this one, then `_lock`. Re-entrant because a host callback may itself
+        # reset the job it was handed (select_job's withdrawn path). One per job a run sees —
+        # thousands, not a growth problem — and never evicted while a run is live, since
+        # evicting a held lock would hand the same job a second one.
+        self._object_locks: Dict[str, threading.RLock] = {}
+        self._object_locks_guard = threading.Lock()
 
         # ProposalContainer parity with PBFT engine — agent code reads/clears these.
         self.outgoing = ProposalContainer()
         self.incoming = ProposalContainer()
         self.conflicts: Dict[str, int] = {}
+        # Same cap and the same reason as the PBFT engine: `conflicts` is diagnostic (it feeds
+        # `conflict_rounds`/`conflict_objects`), and it was unbounded here while PBFT capped it
+        # — so a long, high-churn run grew it without limit on exactly the engine that runs by
+        # default, and the two protocols' conflict columns were not counted the same way
+        # (code review §11). Oldest entries are evicted first; the aggregates stay exact for
+        # everything still tracked.
+        self._conflicts_max = 4096
 
         self._lock = threading.RLock()
+        # Counter lock, deliberately separate from `_lock`. These are incremented from the
+        # finalize pool workers and the driver tick thread; `d += 1` is a read-modify-write
+        # that loses increments under contention, i.e. it undercounts in exactly the
+        # saturated runs the mechanism figure is about. A separate lock because the
+        # increments must never be taken while `_lock` is held across a host callback.
+        self._stats_lock = threading.Lock()
         self._states: Dict[str, _SnowState] = {}
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+
+        # Finalization instrumentation (P0-4). Rounds-to-finalize is the mechanism figure's
+        # x-axis and, unlike the [SNOW_TIMING] log line it mirrors, survives into
+        # metrics.json — a run whose agent logs were rotated away can still be plotted.
+        self.rounds_to_finalize = RunningStats()
+        self.queries_to_finalize = RunningStats()
+        self.time_to_finalize = RunningStats()
+        self.finalized_count = 0
+        # Of `finalized_count`, the decisions this agent WON (the CAS named it). Every proposing
+        # agent runs its own Snow instance and the losers' instances converge too, so
+        # `finalized` is ≈ proposers-per-job × jobs, while PBFT's — counted at the winning
+        # proposer only — is ≈ jobs. `won` is the protocol-comparable count, and the only
+        # population the rounds/queries/time distributions describe (code review 2026-10-05 §38).
+        self.won_count = 0
+        # "Already decided" hints that proved stale and re-opened a vote (§8).
+        self.stale_decided_hints = 0
+        # Decided-hints that arrived after their round and still finalized the instance.
+        self.late_decided_hints = 0
+        # Finalizes refused because the vote converged on an agent not live here.
+        self.dead_candidate_refusals = 0
+        self.abandoned_count = 0
+        self.finalize_errors = 0
+        # CAS won, object unreadable: no assignment produced. Never folded into `finalized`.
+        self.finalize_lost = 0
 
     def _alpha_threshold(self, sample_size: int) -> int:
         """Supermajority vote count required, relative to the peers actually sampled
@@ -171,7 +278,12 @@ class GossipConsensusEngine:
         groups — where fewer than k peers exist — still reach a supermajority and
         commit, instead of never clearing a k-based threshold."""
         eff = min(int(self.k), int(sample_size)) if sample_size else int(self.k)
-        return max(1, int(round(self.alpha * eff)))
+        threshold = int(round(self.alpha * eff))
+        # Never let ONE vote decide a round when two or more peers voted: round(0.7 × 2) is 1,
+        # so with two peers sampled either one alone carried the round, and a tie between the
+        # initiator's candidate and a self-voter fell to response arrival order (code review
+        # 2026-10-05 §7). A single sampled peer is the only case one vote can decide.
+        return max(1, threshold, 2 if eff >= 2 else 1)
 
     # ---- Lifecycle ------------------------------------------------------- #
 
@@ -226,6 +338,7 @@ class GossipConsensusEngine:
                     preferred_cost=float(p.cost or 0.0),
                     round_deadline=now,  # send first query on next tick
                     started_at=now,
+                    gen=self._generation.get(p.object_id, 0),
                 )
                 st.cost_of[self.agent_id] = float(p.cost or 0.0)
                 self._states[p.object_id] = st
@@ -236,6 +349,70 @@ class GossipConsensusEngine:
     def on_proposal(self, msg) -> None: pass
     def on_prepare(self, msg) -> None: pass
     def on_commit(self, msg) -> None: pass
+
+    def election_lock(self, object_id: str) -> threading.RLock:
+        """The per-job lock a finalize holds from its generation check through its host
+        callbacks. The agent holds it across a whole reset — its own decision memory and local
+        winner as well as `forget_decision` — so a decision lands entirely before or entirely
+        after the reset; with only the engine half under it, a finalize's callbacks could
+        re-write the decision and winner the agent had just cleared (stop-time review)."""
+        return self._object_lock(object_id)
+
+    def _object_lock(self, object_id: str) -> threading.RLock:
+        with self._object_locks_guard:
+            lock = self._object_locks.get(object_id)
+            if lock is None:
+                lock = self._object_locks[object_id] = threading.RLock()
+            return lock
+
+    def forget_decision(self, object_id: str) -> None:
+        """The agent calls this when a job is up for election again (reselection timeout,
+        reset evidence, a coordinator taking a job back, a withdrawn copy). Snow's decision
+        memory is the Redis claim, which the agent releases itself (`release_assignment`);
+        what is engine-side is the instance still voting on the OLD election, and it is
+        cancelled here.
+
+        Left running, it kept a `max_inflight` slot and kept sending until `max_rounds`
+        (measured: 1,008 s on a leaf whose copy had been withdrawn 7 minutes earlier), while
+        `propose` skipped the fresh election as "already in flight" — so a restart could not
+        restart anything until the stale instance abandoned. In the first E1′ cells abandoned
+        instances outnumbered decisions (3,976-4,316 vs 3,600 per Hier-90 Snow run). Not
+        counted as abandoned: nothing was given up, the election it belonged to is over.
+        """
+        # Waits for a finalize of this job that is already past its generation check, so the
+        # reset is ordered strictly before or strictly after it — never inside it.
+        with self._object_lock(object_id), self._lock:
+            # A new generation, so an instance of the old one that is NOT in `_states` any more
+            # — finalized, its CAS and callbacks queued on the pool — is refused there too
+            # (`_is_current`) rather than claiming or re-opening the election that just ended.
+            self._generation[object_id] = self._generation.get(object_id, 0) + 1
+            self._generation.move_to_end(object_id)
+            while len(self._generation) > self._generation_max:
+                self._generation.popitem(last=False)
+            state = self._states.pop(object_id, None)
+            if state is not None and not state.finalized:
+                state.finalized = True
+                with self._stats_lock:
+                    self.cancelled_count += 1
+            self.outgoing.remove_object(object_id=object_id)
+            self.incoming.remove_object(object_id=object_id)
+
+    def _is_current(self, state: _SnowState) -> bool:
+        """Is this instance from the job's current election? Caller holds `_lock`, or accepts
+        that the answer can turn False right after (see `_finalize_work_inner`)."""
+        return state.gen == self._generation.get(state.proposal.object_id, 0)
+
+    def _drop_obsolete(self, state: _SnowState, where: str) -> bool:
+        """True (and counted, and logged) when *state* belongs to an election already reset."""
+        with self._lock:
+            current = self._is_current(state)
+        if current:
+            return False
+        with self._stats_lock:
+            self.cancelled_count += 1
+        self.host.log_debug(f"[snow] {where} of {state.proposal.object_id} dropped: its "
+                            f"election was reset after it started")
+        return True
 
     # ---- Snow-message handlers (called from inbound thread) ------------- #
 
@@ -257,18 +434,41 @@ class GossipConsensusEngine:
 
         my_cost = self.host.my_cost_for_job(job_id)
         # Dominance rule: if I'm cheaper than the initiator's preferred, vote
-        # for myself; otherwise yield to the initiator's candidate. Ties broken
-        # by lexicographic agent_id to match the PBFT engine's tiebreak.
+        # for myself; otherwise yield to the initiator's candidate. Exact ties go
+        # to the lower tiebreak_rank for this job — the same rule the PBFT engine
+        # and the selection tie-break use, so all three agree on a winner without
+        # any of them systematically favouring low agent ids (finding 10).
         if my_cost is None:
-            # Can't evaluate locally — yield.
-            preferred = int(q_preferred) if q_preferred is not None else self.agent_id
-            cost_out = float(q_cost or 0.0)
+            # No opinion: ABSTAIN. This used to answer with the initiator's candidate, which
+            # the initiator tallied as a vote for it — so every peer that did not hold the job
+            # (or could not price it) endorsed whoever asked first. An abstention names no
+            # candidate; the initiator counts it toward neither side and takes α over the peers
+            # that did vote (code review 2026-10-05 §3).
+            return {"query_id": query_id, "job_id": job_id,
+                    "preferred_agent": None, "cost": None, "already_decided": False}
         else:
             init_cost = float(q_cost) if q_cost is not None else float("inf")
             init_agent = int(q_preferred) if q_preferred is not None else -1
-            mine_dominates = (my_cost < init_cost) or (
-                my_cost == init_cost and self.agent_id < init_agent
-            )
+            # An infeasible peer (cost +inf) never prefers itself, not even on an exact tie
+            # with an initiator that sent no cost.
+            strict = math.isfinite(my_cost) and ((my_cost < init_cost) or (
+                my_cost == init_cost
+                and tiebreak_rank(job_id, self.agent_id) < tiebreak_rank(job_id, init_agent)
+            ))
+            # Tie tolerance: a peer cheaper than the initiator by no more than `tie_tolerance`
+            # of the initiator's cost backs the initiator. With costs that price load, which
+            # agent is cheapest flips as each takes work; under the strict rule every flip reset
+            # the β count, and in a three-coordinator tier (both peers must agree) decisions
+            # took 26-30 s at a burst against 15-17 s before the costs were balanced
+            # (docs/results/e0-e1-f45d9ff1/README.md §4.3). The Redis claim still makes the
+            # decision exactly-once; the price of the tolerance is a placement at most
+            # `tie_tolerance` dearer than the best the peer knows of.
+            mine_dominates = strict and (
+                self.tie_tolerance <= 0 or not math.isfinite(init_cost)
+                or my_cost < init_cost * (1.0 - self.tie_tolerance))
+            if strict and not mine_dominates:
+                with self._stats_lock:
+                    self.tolerance_yields += 1
             if mine_dominates:
                 preferred = self.agent_id
                 cost_out = my_cost
@@ -310,14 +510,32 @@ class GossipConsensusEngine:
             if state is None or state.finalized:
                 return
             if state.pending_query_id != query_id:
-                return  # response for a prior round; discard
-            state.pending_responses.append(SnowResponse(
-                source=None, query_id=query_id, job_id=job_id,
-                preferred_agent=preferred_agent, cost=cost,
-                already_decided=bool(already_decided)))
-            # If a peer reports the job is already decided, fast-finalize.
-            if already_decided and preferred_agent is not None:
-                self._finalize(state, int(preferred_agent), reason="peer-decided")
+                # A reply for an earlier round of THIS instance. Its vote answered a question the
+                # instance has since moved past and is discarded, but a decided-hint is still
+                # true of the job: honour it, verified against the claim like a timely one.
+                late_hint = (query_id in state.recent_query_ids and already_decided
+                             and preferred_agent is not None and not state.ignore_decided_hints)
+                if not late_hint:
+                    return
+                with self._stats_lock:
+                    self.late_decided_hints += 1
+                fast = True
+            else:
+                fast = None
+            if fast is None:
+                state.pending_responses.append(SnowResponse(
+                    source=None, query_id=query_id, job_id=job_id,
+                    preferred_agent=preferred_agent, cost=cost,
+                    already_decided=bool(already_decided)))
+                # If a peer reports the job is already decided, fast-finalize — VERIFIED
+                # against the authoritative claim in `_finalize_work_inner`, never on the
+                # peer's word.
+                fast = (already_decided and preferred_agent is not None
+                        and not state.ignore_decided_hints)
+        # Outside `_lock`: with no pool (after `stop()`) `_finalize` runs the Redis CAS and the
+        # host callbacks inline, and those must never run holding the engine lock.
+        if fast:
+            self._finalize(state, int(preferred_agent), reason="peer-decided")
 
     def on_snow_response(self, msg: SnowResponse) -> None:
         self._absorb_response(msg.job_id, msg.query_id, msg.preferred_agent,
@@ -390,8 +608,13 @@ class GossipConsensusEngine:
             self._finalize(state, self.agent_id, reason="single-node")
             return None
         query_id = uuid.uuid4().hex
+        own_now = self._own_cost_now(state)
         with self._lock:
+            if own_now is not None and state.preferred == self.agent_id:
+                state.preferred_cost = own_now
+                state.cost_of[self.agent_id] = own_now
             state.pending_query_id = query_id
+            state.recent_query_ids.append(query_id)
             state.pending_responses = []
             state.round_deadline = now + self.round_timeout_s
             state.last_round_at = now
@@ -405,6 +628,27 @@ class GossipConsensusEngine:
             "round": state.round_no,
         }
         return peers, item
+
+    def _own_cost_now(self, state: _SnowState) -> Optional[float]:
+        """This agent's cost for the job NOW, in the units a peer answers in, while the vote
+        still backs this agent; None when it backs someone else or the host cannot say.
+
+        The advertised cost used to be frozen at proposal time for the whole instance (up to
+        `max_rounds`, ~170 s under load), while every peer compares it with its own CURRENT
+        cost. Once this agent's load fell, its stale price sat above its real one, a peer
+        falling in that gap voted for itself on every round, and with two peers one defection
+        blocks α — so every coordinator of a group split on every round and abandoned.
+        Measured 2026-10-12 (aa2b9bb9 diagnostics, Hybrid+LinUCB Hier-90): all 42,863 failed
+        rounds of 429 abandons were full splits, advertised 0.63 against an own cost of 0.55
+        and a peer voting itself at 0.61. Re-priced here from `my_cost_for_job`, the very
+        number this agent answers peers with, so a proposal and an answer cannot disagree."""
+        if state.preferred != self.agent_id:
+            return None
+        try:
+            cost = self.host.my_cost_for_job(state.proposal.object_id)
+        except Exception:
+            return None
+        return None if cost is None else float(cost)
 
     def _flush_query_batches(self, pending_sends: List[tuple], now: float) -> None:
         buckets: Dict[int, List[dict]] = {}
@@ -441,20 +685,31 @@ class GossipConsensusEngine:
             # No-one responded; reset confidence and retry.
             with self._lock:
                 state.confidence = 0
+                state.fail_empty += 1
             self._maybe_abort_or_continue(state, now)
             return
 
+        # A decided-hint is a claim to verify, never a vote: counted as one, several peers with
+        # the same stale map converged the vote on an agent that had since died, and the
+        # ordinary finalize then claimed the freed key for it (stop-time review of §8).
         counts = Counter(int(r.preferred_agent) for r in responses
-                         if r.preferred_agent is not None)
+                         if r.preferred_agent is not None and not r.already_decided)
         if not counts:
             with self._lock:
                 state.confidence = 0
+                state.fail_abstain += 1
             self._maybe_abort_or_continue(state, now)
             return
         top_choice, top_count = counts.most_common(1)[0]
         # Supermajority relative to the peers actually queried this round, so small
-        # groups (fewer than k peers) can still clear the threshold and commit.
-        alpha_threshold = self._alpha_threshold(state.queried or len(responses))
+        # groups (fewer than k peers) can still clear the threshold and commit. Abstentions
+        # (a peer with no opinion on this job) leave the denominator: they are neither for
+        # nor against. A peer that did not answer at all stays in it — silence is not an
+        # abstention, and dropping it would let one fast responder decide a round.
+        abstained = sum(1 for r in responses
+                        if r.preferred_agent is None or r.already_decided)
+        sampled = state.queried or len(responses)
+        alpha_threshold = self._alpha_threshold(max(sum(counts.values()), sampled - abstained))
 
         with self._lock:
             if top_count >= alpha_threshold:
@@ -481,9 +736,14 @@ class GossipConsensusEngine:
                 state.last_choice = top_choice
             else:
                 state.confidence = 0
-                self.conflicts[state.proposal.object_id] = (
-                    self.conflicts.get(state.proposal.object_id, 0) + 1
-                )
+                if len(responses) < sampled:
+                    state.fail_short += 1
+                else:
+                    state.fail_split += 1
+                state.last_votes = [
+                    (r.preferred_agent, None if r.cost is None else round(float(r.cost), 3))
+                    for r in responses]
+                self._bump_conflict(state.proposal.object_id)
 
             ready_to_commit = state.confidence >= self.beta
 
@@ -497,10 +757,20 @@ class GossipConsensusEngine:
             elapsed = now - state.started_at if state.started_at else -1.0
             # Same grep surface as SNOW_TIMING — an overloaded tier abandoning every
             # decision must be visible, not inferred from the absence of finalizes.
+            try:
+                own_now = self.host.my_cost_for_job(state.proposal.object_id)
+            except Exception:
+                own_now = None
             self.host.log_warn(
                 f"[SNOW_ABANDON] Object:{state.proposal.object_id} rounds={state.round_no} "
-                f"elapsed={elapsed:.3f}s — max_rounds exhausted, leaving for reselection"
+                f"elapsed={elapsed:.3f}s — max_rounds exhausted, leaving for reselection "
+                f"preferred={state.preferred} advertised={state.preferred_cost:.3f} "
+                f"own_now={own_now if own_now is None else round(float(own_now), 3)} "
+                f"fails(empty/abstain/short/split)={state.fail_empty}/{state.fail_abstain}/"
+                f"{state.fail_short}/{state.fail_split} last_votes={state.last_votes}"
             )
+            with self._stats_lock:
+                self.abandoned_count += 1
             with self._lock:
                 state.finalized = True
                 self.outgoing.remove_object(object_id=state.proposal.object_id)
@@ -516,7 +786,12 @@ class GossipConsensusEngine:
             if state.finalized:
                 return
             state.finalized = True
-            self.outgoing.remove_object(object_id=state.proposal.object_id)
+            # `outgoing` keeps this proposal until `_finalize_work` has run the host callbacks
+            # (`_release_outgoing`): an agent prices its open proposals as committed work (the
+            # `utilization` cost model), and the job only reaches the agent's selected queue
+            # inside `on_leader_elected`, after the CAS and the object fetch — WAN round trips
+            # on the pool. Removing it here left a gap in which the agent priced other jobs as
+            # if it held nothing (stop-time review, 2026-10-16). PBFT already orders it so.
             self.incoming.remove_object(object_id=state.proposal.object_id)
 
         pool = self._send_pool
@@ -532,14 +807,72 @@ class GossipConsensusEngine:
 
     def _finalize_work(self, state: _SnowState, candidate: int, reason: str) -> None:
         try:
-            self._finalize_work_inner(state, candidate, reason)
+            # The whole decision — generation check, CAS, callbacks — under the job's lock, so a
+            # reset (forget_decision) cannot land between the check and what it guards.
+            with self._object_lock(state.proposal.object_id):
+                self._finalize_work_inner(state, candidate, reason)
         except Exception as exc:
             # Runs on pool workers whose Future nobody reads — never let an error vanish.
+            # Counted as well as logged: `_finalize` has already marked the state finalized
+            # and dropped the object, so without this the decision is neither `finalized` nor
+            # `abandoned` and the accounting silently fails to add up. A run where this is
+            # non-zero has lost assignments, which is a correctness signal, not a log line.
+            with self._stats_lock:
+                self.finalize_errors += 1
             self.host.log_warn(
                 f"[snow] finalize of {state.proposal.object_id} failed: {exc}")
+        finally:
+            self._release_outgoing(state)
+
+    def _release_outgoing(self, state: _SnowState) -> None:
+        """Drop this instance's proposal from `outgoing` once its finalize has run, on every
+        exit path. By proposal id, so a newer election's proposal for the same job is never
+        touched; and not if the instance was re-opened (`_reopen`), which is voting again."""
+        with self._lock:
+            if state.finalized:
+                self.outgoing.remove_proposal(state.proposal.p_id,
+                                              object_id=state.proposal.object_id)
 
     def _finalize_work_inner(self, state: _SnowState, candidate: int, reason: str) -> None:
-        winner = self.host.try_claim_assignment(state.proposal.object_id, candidate)
+        # Queued on the pool before the job was reset: the election it would decide is over.
+        if self._drop_obsolete(state, "finalize"):
+            return
+        if reason == "peer-decided":
+            # One peer's LOCAL map said the job was decided. That map can be stale: after an
+            # agent dies, the first detector releases its claim and resets the job, while a peer
+            # that has not detected the failure yet still maps the job to the dead agent. CAS-ing
+            # on its word then gave the freed claim to the corpse — the reassignment claim's TTL
+            # already spent, so the job was stranded (code review 2026-10-05 §8). The claim in
+            # Redis is the authority: use it if it exists; if it does not, the hint was stale —
+            # re-open this instance and decide by vote. (This runs on a pool worker, so the
+            # Redis read does not touch the inbound thread.)
+            existing = self.host.get_assignment(state.proposal.object_id)
+            if existing is None:
+                with self._stats_lock:
+                    self.stale_decided_hints += 1
+                self.host.log_info(
+                    f"[SNOW_STALE_HINT] Object:{state.proposal.object_id} a peer reported it "
+                    f"decided for {candidate} but no claim exists; re-opening the vote")
+                self._reopen(state)
+                return
+            # The claim IS the decision: use it read-only. Passing it to the CAS as a candidate
+            # (as this did) re-opened the hole — a reassigner releasing the claim between the
+            # read above and the CAS left a freed key, and the CAS claimed it for the agent the
+            # stale claim named (stop-time review).
+            winner = int(existing)
+        elif int(candidate) != self.agent_id and not self._candidate_live(int(candidate)):
+            # Never claim a job FOR an agent this agent believes dead: the claim is permanent
+            # until someone releases it, and the dead agent will not run the job. Re-open and
+            # let the vote find a live winner.
+            with self._stats_lock:
+                self.dead_candidate_refusals += 1
+            self.host.log_info(
+                f"[SNOW_DEAD_CANDIDATE] Object:{state.proposal.object_id} vote converged on "
+                f"{candidate}, which is not live here; re-opening the vote")
+            self._reopen(state)
+            return
+        else:
+            winner = self.host.try_claim_assignment(state.proposal.object_id, candidate)
 
         # Per-decision latency instrumentation: separates Snow round time from any
         # downstream queue/serialization tax so the ~9s selection cost can be diagnosed.
@@ -548,10 +881,42 @@ class GossipConsensusEngine:
             f"[SNOW_TIMING] Object:{state.proposal.object_id} rounds={state.round_no} "
             f"queried={state.queried} elapsed={elapsed:.3f}s reason={reason}"
         )
-
+        if int(winner) != self.agent_id and not self._candidate_live(int(winner)):
+            # The decision names an agent this agent believes dead (a claim not yet released by
+            # the failed-agent path, or one read just before it was). Do not commit to it here:
+            # a local "decided for a corpse" stops this agent proposing the job, and if the reset
+            # has already landed nothing would ever undo it. Leave the job undecided; the
+            # failed-agent path releases the claim and returns it to the pool.
+            with self._stats_lock:
+                self.dead_candidate_refusals += 1
+            self.host.log_info(
+                f"[SNOW_DEAD_WINNER] Object:{state.proposal.object_id} decided for {winner}, "
+                f"which is not live here; not committing locally")
+            return
         obj = self.host.get_object(state.proposal.object_id)
         if obj is None:
+            # The CAS succeeded — the claim key now names `winner` — but the object is in
+            # neither the local pending queue nor Redis, so no leader is elected and no
+            # participant commits. The decision produced no assignment, and until 2026-09-20
+            # it was still counted in `finalized`: a flattering overcount, and the loss was
+            # visible nowhere (only an exception reaches `finalize_errors`). Recoverable only
+            # if the winner re-proposes, and if the winner is *this* agent the claim key is
+            # now held by an agent that will not act on it (code review §11).
+            with self._stats_lock:
+                self.finalize_lost += 1
+            self.host.log_warn(
+                f"[snow] finalize of {state.proposal.object_id} LOST: claim went to "
+                f"{winner} but the object could not be read"
+                f"{' (that is this agent, so the claim is held and idle)' if int(winner) == self.agent_id else ''}"
+                f"; reason={reason}")
             return
+
+        # Re-checked before the callbacks. Under the job's lock a reset from another thread
+        # cannot land here; this catches a reset made on THIS thread by the CAS's host side
+        # (the lock is re-entrant), which must not be followed by a callback for the old election.
+        if self._drop_obsolete(state, "callback"):
+            return
+
         if int(winner) == self.agent_id:
             self.host.log_info(
                 f"[SNOW_LEADER] Object:{state.proposal.object_id} "
@@ -565,6 +930,91 @@ class GossipConsensusEngine:
                 f"leader:{winner} reason={reason}"
             )
             self.host.on_participant_commit(obj, int(winner), state.proposal.p_id)
+
+        # Counted last, and only here: `_finalize_work` charges any exception to
+        # `finalize_errors`, so incrementing before the host callbacks reported a single
+        # decision as *both* finalized and failed — and `finalized + abandoned +
+        # finalize_errors` is supposed to be the whole population, which is the only reason
+        # the error counter is worth having. The distribution summaries move with the count
+        # for the same reason: they must describe the population they are counted with.
+        won = int(winner) == self.agent_id
+        with self._stats_lock:
+            self.finalized_count += 1
+            if won:
+                self.won_count += 1
+        if won:
+            self.rounds_to_finalize.add(state.round_no)
+            self.queries_to_finalize.add(state.queried)
+            if elapsed >= 0:
+                self.time_to_finalize.add(elapsed)
+
+    def _candidate_live(self, agent_id: int) -> bool:
+        check = getattr(self.host, "is_agent_live", None)
+        return True if check is None else bool(check(agent_id))
+
+    def _reopen(self, state: _SnowState) -> None:
+        """Put a finalized-but-unclaimed instance back in play, ignoring decided-hints.
+
+        Never for an obsolete instance, and never over a newer one: after a reset the job may
+        already have a fresh instance in `_states`, and re-inserting this one replaced it with
+        an election that is over (stop-time review, 2026-10-10)."""
+        with self._lock:
+            oid = state.proposal.object_id
+            if not self._is_current(state) or self._states.get(oid, state) is not state:
+                return
+            state.finalized = False
+            state.ignore_decided_hints = True
+            state.pending_query_id = None
+            state.pending_responses = []
+            state.confidence = 0
+            state.round_deadline = self._time()
+            self.outgoing.add_proposal(state.proposal)
+            self._states[state.proposal.object_id] = state
+
+    def _bump_conflict(self, object_id: str) -> None:
+        """Count one round that failed the alpha threshold, bounded. Mirrors the PBFT engine's
+        `_bump_conflict` so the two protocols' conflict columns mean the same thing."""
+        if object_id not in self.conflicts and len(self.conflicts) >= self._conflicts_max:
+            self.conflicts.pop(next(iter(self.conflicts)), None)   # evict oldest
+        self.conflicts[object_id] = self.conflicts.get(object_id, 0) + 1
+
+    def consensus_stats(self) -> Dict[str, object]:
+        """Per-agent finalization accounting, in the shape the PBFT engine also emits.
+
+        `abandoned` is reported alongside `finalized` on purpose: a tier that abandons most
+        decisions has a *flattering* rounds-to-finalize distribution, because only the easy
+        objects reach the finalize path at all. The two numbers are only meaningful together.
+        """
+        stats: Dict[str, object] = {
+            "protocol": "snow",
+            "finalized": self.finalized_count,
+            "won": self.won_count,
+            "abandoned": self.abandoned_count,
+            "tolerance_yields": self.tolerance_yields,
+            "stale_decided_hints": self.stale_decided_hints,
+            # Decided-hints that arrived after their round ended and still finalized the
+            # instance (see `_SnowState.recent_query_ids`).
+            "late_decided_hints": self.late_decided_hints,
+            "dead_candidate_refusals": self.dead_candidate_refusals,
+            # Decisions that left the pending set without reaching either outcome: the CAS or
+            # a host callback raised.
+            "finalize_errors": self.finalize_errors,
+            # Decisions whose CAS succeeded but whose object could not be read, so no
+            # assignment was produced. Deliberately NOT in `finalized`, and not in the
+            # rounds/queries/time distributions either — those describe decisions that placed
+            # a job. finalized + abandoned + errors + lost is the whole population.
+            "finalize_lost": self.finalize_lost,
+            "sends_dropped": self.sends_dropped,
+            # Instances dropped because the agent reset their election (forget_decision) —
+            # neither a decision nor an abandonment; the reset's new instance is counted anew.
+            "cancelled": self.cancelled_count,
+            "conflict_rounds": sum(self.conflicts.values()),
+            "conflict_objects": len(self.conflicts),
+        }
+        stats.update(self.rounds_to_finalize.summary("rounds_"))
+        stats.update(self.queries_to_finalize.summary("queries_"))
+        stats.update(self.time_to_finalize.summary("finalize_s_"))
+        return stats
 
     # ---- Helpers --------------------------------------------------------- #
 
@@ -620,14 +1070,16 @@ class GossipConsensusEngine:
             self._do_send(dest, payload)
             return True
         if not sem.acquire(blocking=False):
-            self.sends_dropped += 1
+            with self._stats_lock:
+                self.sends_dropped += 1
             return False
         try:
             pool.submit(self._do_send_release, dest, payload)
             return True
         except RuntimeError:  # pool shutting down
             sem.release()
-            self.sends_dropped += 1
+            with self._stats_lock:
+                self.sends_dropped += 1
             return False
 
     def _do_send_release(self, dest: int, payload: object) -> None:

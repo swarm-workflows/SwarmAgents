@@ -45,6 +45,7 @@ from swarm.models.agent_info import AgentInfo
 from swarm.utils.thread_safe_dict import ThreadSafeDict
 from swarm.topology.topology import Topology, TopologyType
 from swarm.utils.iterable_queue import IterableQueue
+from swarm.utils.yaml_strict import safe_load as yaml_safe_load_strict
 
 
 class Agent(Observer):
@@ -62,9 +63,13 @@ class Agent(Observer):
 
 
         with open(config_file, 'r') as f:
-            self.config = yaml.safe_load(f)
+            # Strict: a duplicate key raises rather than silently keeping the last value.
+            # `runtime.peer_expiry_seconds` was defined twice in the shipped config for the whole
+            # campaign, so the documented 300 s was really 45 s and nothing said so.
+            self.config = yaml_safe_load_strict(f)
 
         self.queues = AgentQueues()
+        self._init_stop_state()
         self.grpc_config = self.config.get("grpc", {})
         self.log_config = self.config.get("logging", {})
         self.runtime_config = self.config.get("runtime", {})
@@ -77,18 +82,192 @@ class Agent(Observer):
                                               decode_responses=True)
         self.repository = Repository(redis_client=self.redis_client)
 
+        self._configure_job_execution_simulation()
+        self._configure_real_execution()
+
         self.condition = threading.Condition()
         self.shutdown = False
         self.shutdown_path = "./shutdown"
 
         self.transport = GrpcTransport(host=self.grpc_host, port=self.grpc_port,
                                        logger=self.logger, on_peer_status=self.on_peer_status)
+        self._configure_fanout()
 
         self.threads = {
             "periodic": threading.Thread(target=self._do_periodic, daemon=True),
             "inbound": threading.Thread(target=self._do_inbound, daemon=True),
         }
         self.last_non_empty_time = time.time()
+
+    def _configure_job_execution_simulation(self) -> None:
+        """Apply `runtime.wall_time_*` to the process-wide job execution simulation.
+
+        Warns when the legacy flat-1 s policy is selected, because a run under it cannot report
+        makespan, throughput or utilisation honestly — every job takes the same time regardless
+        of its real duration.
+        """
+        from swarm.models.job import Job
+
+        scale = float(self.runtime_config.get("wall_time_scale", 1.0))
+        Job.configure_execution_simulation(
+            scale=scale,
+            min_s=float(self.runtime_config.get("wall_time_min_s", 0.0)),
+            max_s=float(self.runtime_config.get("wall_time_max_s", 120.0)),
+        )
+        if scale <= 0:
+            self.logger.warning(
+                "[EXEC_SIM] runtime.wall_time_scale=%s — every job will simulate a flat 1s "
+                "regardless of its wall_time. Makespan, throughput and utilisation from this "
+                "run are NOT meaningful.", scale)
+        else:
+            self.logger.info(
+                "[EXEC_SIM] wall_time_scale=%s min=%ss max=%ss", scale,
+                Job._WALL_TIME_MIN_S, Job._WALL_TIME_MAX_S)
+
+    def _configure_real_execution(self) -> None:
+        """Apply `runtime.execution` to the process-wide real-execution policy.
+
+        Default is `simulate`, so an agent that says nothing about execution behaves exactly
+        as it always has. `real` is logged at WARNING because it changes what the run *is* —
+        exit statuses become the processes' own rather than the replayed ones, and job
+        durations become real work rather than a scaled wall_time — and because a run that
+        was meant to be simulated and quietly executed instead would be hard to spot
+        afterwards from the metrics alone.
+        """
+        from swarm.execution import runner
+
+        cfg = (self.runtime_config.get("execution") or {}) if self.runtime_config else {}
+        # Resolved in runner.resolve_mode, which owns the default and the refusal — anything
+        # else that needs to know what this run will do (run_test.py's bundle validation) asks
+        # the same function rather than re-deriving it.
+        mode = runner.resolve_mode(cfg)
+
+        work_dir = str(cfg.get("work_dir", "") or "")
+        # A shared scratch per run, so logical file names resolve between jobs of one DAG
+        # while two concurrent runs cannot overwrite each other's outputs.
+        run_id = os.environ.get("SWARM_RUN_ID", "")
+        if work_dir and run_id:
+            work_dir = os.path.join(work_dir, run_id)
+
+        # A bundle expands to the three roots. `pegasus_to_swarm_converter.py` writes
+        # `code/`, `inputs/` and (optionally) `images/` into its output directory, so
+        # pointing at that directory is all a converted workflow needs — which is the point
+        # of bundling: copy the directory anywhere and run it.
+        #
+        # Explicit `roots` entries still win. Images are normally NOT bundled (they are
+        # gigabytes), so `roots.images` pointing at each host's local image store alongside
+        # `bundle` is the expected combination rather than an exception.
+        roots = dict(cfg.get("roots", {}) or {})
+        bundle = str(cfg.get("bundle", "") or "")
+        if bundle:
+            for kind, sub in (("code", "code"), ("inputs", "inputs"), ("images", "images")):
+                roots.setdefault(kind, os.path.join(bundle, sub))
+
+        runner.configure(
+            mode=mode,
+            work_dir=work_dir,
+            timeout_s=float(cfg.get("timeout_s", 3600.0)),
+            container_runtime=str(cfg.get("container_runtime", "auto")),
+            path_rewrites=cfg.get("path_rewrites", ()) or (),
+            image_overrides=dict(cfg.get("image_overrides", {}) or {}),
+            capture_output=bool(cfg.get("capture_output", True)),
+            apptainer_containall=bool(cfg.get("apptainer_containall", True)),
+            allow_runtime_substitution=bool(cfg.get("allow_runtime_substitution", False)),
+            pull_timeout_s=float(cfg.get("pull_timeout_s", 1800.0)),
+            roots=roots,
+        )
+        if mode == "real":
+            self.logger.warning(
+                "[EXEC] runtime.execution.mode=real — jobs will RUN, not simulate. "
+                "work_dir=%s timeout=%ss runtime=%s", work_dir,
+                cfg.get("timeout_s", 3600.0), cfg.get("container_runtime", "auto"))
+
+        self._configure_staging(cfg, work_dir, mode)
+
+    def _configure_staging(self, execution_cfg: dict, work_dir: str, mode: str) -> None:
+        """Install the staging policy and, when it is on, start this agent's data endpoint.
+
+        Off by default, so an existing run is untouched: `stage_inputs` then resolves an input
+        in the working directory or under `roots.inputs` exactly as before, and nothing here
+        listens. See `docs/STAGING_DESIGN.md`.
+        """
+        from swarm.execution import staging
+
+        cfg = dict((execution_cfg or {}).get("staging", {}) or {})
+        try:
+            pol = staging.configure(**cfg)
+        except ValueError as exc:
+            # A misspelled staging key is refused rather than ignored, for the same reason an
+            # unknown `mode` is: a run that looks staged and is not cannot be told apart
+            # afterwards from one that never asked.
+            self.logger.error("[STAGE] %s", exc)
+            raise
+
+        if not pol.enabled:
+            return
+        if mode != "real":
+            self.logger.warning(
+                "[STAGE] staging is enabled but runtime.execution.mode=%s, so no job produces "
+                "a file to stage; nothing will be served.", mode)
+
+        if not staging.token():
+            self.logger.warning(
+                "[STAGE] %s is not set: this agent's data endpoint accepts any request, so any "
+                "host that can reach it can read this run's files. Export a shared token on "
+                "every agent and the staging site.", staging.TOKEN_ENV)
+
+        if str(self.grpc_host) in ("0.0.0.0", "::", ""):
+            # The location record advertises this address to peers, and it is the same field
+            # consensus already dials, so a wildcard here is broken for both. Worth saying out
+            # loud at startup: as a location it fails at the far end, one fetch at a time.
+            # Refused, not logged (§73): every location this agent published would be undialable,
+            # and the failure would surface one fetch at a time on other agents.
+            raise ValueError(
+                f"runtime.execution.staging is enabled but grpc.host is {self.grpc_host!r}: a "
+                f"wildcard cannot be dialled by a peer, so every location this agent publishes "
+                f"would be unusable. Set grpc.host to the address peers reach this agent on "
+                f"(generate_configs.py --agent-hosts-file).")
+
+        if not os.environ.get("SWARM_RUN_ID", ""):
+            # Required whenever staging is on, not only when a store is configured. Two
+            # separate failures ride on it. An agent that does not know its run cannot tell
+            # whether a fetch belongs to it, and this repo documents agents outliving their
+            # run — so it would serve a later run its predecessor's file of the same name.
+            # And a staging site files uploads under the run, so every stage-out would be
+            # refused one file at a time and the run would end with no durable copy of
+            # anything. Refused at startup: a configuration fault that repeats for every job,
+            # the same reason an unknown execution mode raises rather than defaulting.
+            raise ValueError(
+                "runtime.execution.staging.enabled is true but SWARM_RUN_ID is empty. An agent "
+                "that does not know its run cannot tell a fetch for this run from one for a "
+                "previous run's identically named file, and a staging site would refuse every "
+                "upload. run_test.py exports SWARM_RUN_ID; an agent started by hand must too.")
+
+        self.staged_files = staging.PublishedFiles()
+        staging.set_context(locator=self.repository.data_locations,
+                            run_id=os.environ.get("SWARM_RUN_ID", ""),
+                            agent_id=str(self.agent_id),
+                            published=self.staged_files,
+                            produced=self.repository.produced_names)
+        port = staging.data_port(self.grpc_port, pol)
+        self.transfer_server = staging.TransferServer(
+            self.staged_files, self.grpc_host, port,
+            run_id=os.environ.get("SWARM_RUN_ID", ""), pol=pol)
+        try:
+            self.transfer_server.start()
+        except Exception as exc:                # noqa: BLE001
+            # Refuse loudly: with staging on and no endpoint, this agent's outputs are
+            # unreachable and every descendant of every job it runs would refuse to stage —
+            # which reads as a workflow fault a long way from its cause.
+            self.logger.error(
+                "[STAGE] could not start the data endpoint on %s:%d (%s). With staging on, "
+                "this agent's outputs would be unreachable to every peer.",
+                self.grpc_host, port, exc)
+            raise
+        self.logger.warning(
+            "[STAGE] staging ON — outputs are served from this agent on %s:%d and fetched from "
+            "peers on demand. The work dir must be LOCAL (%s); a shared one makes every fetch a "
+            "no-op and measures nothing.", self.grpc_host, port, work_dir)
 
     @property
     def live_agent_count(self) -> int:
@@ -155,7 +334,64 @@ class Agent(Observer):
             self.logger.error(traceback.format_exc())
             self.stop()
 
-    def stop(self):
+    def _init_stop_state(self):
+        """Set up the teardown guard. Kept as one method so a test double cannot drift from
+        it: a stub that built its own `threading.Lock()` here tested the stub's lock and
+        reported the shipped self-deadlock as fixed.
+
+        stop() is reached from two directions — the SIGTERM handler in main.py and the
+        periodic thread's own shutdown condition — and the stop script touches the shutdown
+        flag and signals in the same breath, so both commonly fire. on_shutdown persists
+        metrics, so running it twice concurrently let an earlier snapshot land on top of a
+        later one.
+        """
+        # RLock, not Lock: a signal handler runs on whichever thread the signal is delivered
+        # to, so SIGTERM landing while that same thread is inside stop()'s critical section
+        # would block on a lock it already holds — a self-deadlock reached BEFORE the
+        # re-entry check could catch it, ending in SIGKILL with no metrics saved.
+        self._stop_lock = threading.RLock()
+        self._stopped = False
+        # Set once teardown has actually finished. A second caller waits on this rather than
+        # returning straight away: the SIGTERM handler os._exit()s the process the moment
+        # stop() returns, and the stop script touches the shutdown flag and signals in the
+        # same breath — so the periodic thread is usually already inside save_results when the
+        # signal lands, and returning early killed the process mid-write.
+        self._stop_complete = threading.Event()
+        self._stop_thread_ident = None
+
+    def stop(self, wait_timeout: float = 60.0) -> bool:
+        """Run teardown once, and do not return until it has finished.
+
+        `wait_timeout` bounds how long a second caller waits for the first caller's teardown;
+        it exists for the SIGTERM handler, which exits the process as soon as this returns.
+
+        Returns False only when called re-entrantly **on the thread already running
+        teardown** — a signal delivered to that very thread, say. The caller must not exit the
+        process in that case: the teardown it interrupted has not finished, and unwinding to it
+        is the only way it ever will. True otherwise, including when the wait timed out (the
+        stop script's SIGKILL is close behind at that point, so exiting is no worse).
+        """
+        with self._stop_lock:
+            first = not self._stopped
+            if first:
+                # Ident BEFORE the flag, and the order is load-bearing: a signal arriving on
+                # this thread between the two would otherwise see `_stopped` set with no
+                # matching ident, and wait out the full timeout on an event only the thread it
+                # just interrupted can set.
+                self._stop_thread_ident = threading.get_ident()
+                self._stopped = True
+        if not first:
+            if self._stop_thread_ident == threading.get_ident():
+                # Re-entered from inside teardown itself; waiting here would deadlock on an
+                # event only this thread can set.
+                self.logger.debug("stop() re-entered on the teardown thread; ignoring")
+                return False
+            self.logger.debug("stop() already running elsewhere; waiting for it to finish")
+            if not self._stop_complete.wait(timeout=max(0.0, wait_timeout)):
+                self.logger.warning(
+                    f"[SHUTDOWN] teardown still running after {wait_timeout:.0f}s; "
+                    f"proceeding without it — metrics for this agent may be incomplete")
+            return True
         try:
             self.shutdown = True
             self.queues.message_event.set()
@@ -168,11 +404,26 @@ class Agent(Observer):
         except Exception as e:
             self.logger.error(f"Exception occurred in shutdown: {e}")
             self.logger.error(traceback.format_exc())
+        finally:
+            # Released even on the exception path: a waiter must never be left blocked by a
+            # teardown that failed.
+            self._stop_complete.set()
+        return True
 
     def on_shutdown(self):
         pass
 
+    def mark_nonblocking_thread(self) -> None:
+        """Register the calling thread as one that must never wait on Redis inside a consensus
+        handler (`_HostAdapter.get_object` then reports a job it does not hold as missing and the
+        message is stashed for the background fetcher). The inbound consumer, the periodic thread
+        — which writes the heartbeat, refreshes the neighbour view and runs the failure detector
+        — and the job fetcher itself."""
+        idents = self.__dict__.setdefault("_nonblocking_thread_idents", set())
+        idents.add(threading.get_ident())
+
     def _do_periodic(self):
+        self.mark_nonblocking_thread()
         while not self.shutdown:
             try:
                 self.on_periodic()
@@ -191,6 +442,10 @@ class Agent(Observer):
 
     def _do_inbound(self):
         self.logger.info("Inbound Message Handler - Start")
+        # Which thread is the single inbound consumer: paths that would block it (a Redis
+        # round trip in `get_object`) take a non-blocking route when called from it.
+        self._inbound_thread_ident = threading.get_ident()
+        self.mark_nonblocking_thread()
         while not self.shutdown:
             try:
                 self.queues.message_event.wait(timeout=0.5)
@@ -248,24 +503,44 @@ class Agent(Observer):
         except Exception as e:
             self.logger.debug(f"Failed to enqueue message: {message}, error: {e}")
 
-    def broadcast(self, message: Message):
-        # Skip peers known to be FAILED (SWIM failed set and/or heartbeat detection) —
-        # otherwise every consensus phase pays full send timeouts for dead peers.
-        # SWIM SUSPECT peers still receive traffic so they can refute the suspicion.
-        peers = self.topology.peers
-        skip = set()
-        swim = getattr(self, "swim", None)
-        if swim is not None:
-            try:
-                skip.update(swim.failed_agents())
-            except Exception:
-                pass
+    def consensus_skip_set(self) -> set:
+        """Peers a consensus phase must NOT send to.
+
+        Exactly the peers heartbeat detection has declared failed — the same authority
+        `calculate_quorum` counts through, since `_remove_failed_agents` takes them out of
+        `neighbor_map` and `_refresh_agent_map` refuses to re-add them while they are in here.
+        The two sets are therefore the same set by construction, which is the point: **an agent
+        must never silence a peer it still counts towards quorum.**
+
+        **SWIM is deliberately not consulted** (code review 2026-09-18, §6). It used to be, and
+        a SWIM false-FAILED then removed a live peer from every consensus phase while quorum
+        went on being computed over `neighbor_map`, which still contained it. Under PBFT that
+        peer could not vote and the job waited out a reselection timeout; under Snow it merely
+        abstained. SWIM false-fails precisely under consensus bursts — acks queue behind the
+        single inbound consumer and blow the probe window, which is why `live_peer_ids` already
+        treats an empty SWIM live set as a false reading — so the regime where the skip cost
+        the most was the regime it fired most in, and the collapse cell was biased against
+        PBFT for a reason that is not PBFT. The docs say heartbeat is authoritative; this is
+        what makes that true for `broadcast` as well as for reassignment. SWIM keeps its real
+        jobs: Snow's live-peer sample and gossip fan-out, neither of which is a quorum.
+
+        The efficiency this gives up is small. Skipping was introduced in the same commit as
+        the fire-and-forget broadcast pool (`85f26208`), and it is the pool that removed the
+        ~8.7 s serial block per dead peer per phase; what remains is pool slots held for a
+        dead peer's send timeout until heartbeat evicts it, which the bounded semaphore already
+        sheds and counts rather than letting it block.
+        """
         failed_map = getattr(self, "failed_agents", None)
-        if failed_map is not None:
-            try:
-                skip.update(failed_map.keys())
-            except Exception:
-                pass
+        if failed_map is None:
+            return set()
+        try:
+            return set(failed_map.keys())
+        except Exception:
+            return set()
+
+    def broadcast(self, message: Message):
+        peers = self.topology.peers
+        skip = self.consensus_skip_set()
         if skip:
             peers = [p for p in peers if p not in skip]
         self.transport.broadcast(payload=message,
@@ -281,8 +556,39 @@ class Agent(Observer):
                       dest=peer_info.agent_id, src=self.agent_id,
                       timeout=timeout, retries=retries)
 
+    def _configure_fanout(self) -> None:
+        """Size the transport's send pool from `runtime.fanout_workers` / `runtime.fanout_queue`
+        (defaults in `grpc_transport`, one place). A send that finds the queue full is dropped
+        and counted, never retried, so the queue must hold a burst's worth of votes."""
+        from swarm.comm.grpc_transport import FANOUT_QUEUE_DEFAULT, FANOUT_WORKERS_DEFAULT
+        workers = int(self.runtime_config.get("fanout_workers", FANOUT_WORKERS_DEFAULT))
+        queue_len = int(self.runtime_config.get("fanout_queue", FANOUT_QUEUE_DEFAULT))
+        if workers < 1 or queue_len < workers:
+            raise ValueError(f"runtime.fanout_workers ({workers}) must be >= 1 and "
+                             f"runtime.fanout_queue ({queue_len}) >= it")
+        self.transport.bcast_workers = workers
+        self.transport.bcast_queue = queue_len
+
+    def send_async(self, dest: int, payload: object) -> None:
+        """Fire-and-forget unicast on the transport's send pool. For best-effort protocol
+        traffic (SWIM probes and acks) sent from threads that must not wait on a peer: an ack
+        sent synchronously from the inbound consumer cost a WAN round trip per ping — 250 s of
+        one leaf's consumer in a Hier-90 Hybrid run (inbound_timing, 43596385)."""
+        peer_info = self.neighbor_map.get(dest)
+        if peer_info is None:
+            return
+        sender = getattr(self.transport, "send_async", None)
+        if sender is None:
+            self.send(dest, payload)
+            return
+        sender(host=peer_info.host, port=peer_info.port, payload=payload,
+               dest=peer_info.agent_id, src=self.agent_id)
+
     def calculate_quorum(self) -> int:
-        # Simple majority quorum calculation
+        # Simple majority over the live set. `live_agent_count` is `len(neighbor_map)`, and
+        # `consensus_skip_set` is a subset of what that map already excludes — see the note
+        # there: the peers we refuse to talk to and the peers we count must be one set, or a
+        # quorum can be made unreachable by construction.
         return (self.live_agent_count // 2) + 1
 
 

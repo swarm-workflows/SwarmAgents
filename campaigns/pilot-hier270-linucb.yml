@@ -1,0 +1,45 @@
+# Pilot before E1' Hier-270 (approved 2026-11-05): the LinUCB column at Hier-270 has never run.
+# --groups-per-coordinator 3 gives 9 coordinators over 27 leaf groups (9 of 9 + 18 of 10, 261
+# leaves); PBFT keeps counter-proposals on there (the 9-coordinator rule). One burst run per engine.
+# Pass: each run ok, 0 undecided/stranded, 0 twice, no PBFT drop storm (msgs_dropped), delegations
+# not all `trivial`.
+#
+#   tmux new -s h270lin 'python3.11 campaign.py campaigns/pilot-hier270-linucb.yml --python python3.11 2>&1 | tee /root/pilot-hier270-linucb.out'
+out: runs/pilot-hier270-linucb-ed8c9101
+
+defaults:
+  runner: run_test.py
+  repeats: 1
+  retries: 1
+  timeout_s: 10800
+  args:
+    mode: remote
+    agent-type: resource
+    db-host: database
+    agent-hosts-file: agent_hosts.txt
+    agents-per-host: 3
+    agents: 270
+    jobs: 5400
+    pegasus-jobs-dir: /root/workloads/jobs_5400
+    runtime: 5400
+    master-fleet-size: 270
+    seed: 42                   # also seeds the Poisson arrivals: every engine sees the same times
+    rtt-samples: 20
+    all-dtns: true
+    topology: hierarchical
+    hierarchical-level1-agent-type: resource
+    inflight-drain-max-s: 1800
+
+gate:
+  redis: {host: database, port: 6379}
+  clock_check: ./fix_slice_clocks.sh --check
+  retries: 3
+  wait_s: 300
+
+cells:
+  - name: p-hier270-pbft-linucb-shared
+    args: {groups-per-coordinator: 3, delegation-policy: bandit, base-config: campaigns/config_pbft_linucb_shared.yml}
+  - name: p-hier270-snow-linucb-shared
+    args: {groups-per-coordinator: 3, delegation-policy: bandit, base-config: campaigns/config_snow_linucb_shared.yml}
+  - name: p-hier270-hybrid-linucb-shared
+    args: {groups-per-coordinator: 3, delegation-policy: bandit, base-config: campaigns/config_hybrid_linucb_shared.yml}

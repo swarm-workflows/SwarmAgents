@@ -19,6 +19,9 @@
 # SOFTWARE.
 #
 # Author: Komal Thareja(kthare10@renci.org)
+import contextlib
+import copy
+import math
 import os
 import random
 import threading
@@ -27,8 +30,8 @@ import traceback
 from concurrent.futures.thread import ThreadPoolExecutor
 from typing import Optional
 
-from swarm.consensus.engine import ConsensusEngine
-from swarm.consensus.gossip_engine import GossipConsensusEngine
+from swarm.consensus.engine import COUNTER_MARGIN_DEFAULT, ConsensusEngine
+from swarm.consensus.gossip_engine import SNOW_DEFAULTS, GossipConsensusEngine
 from swarm.consensus.interfaces import ConsensusHost, ConsensusTransport, TopologyRouter
 from swarm.consensus.messages.message import MessageType
 from swarm.consensus.messages.gossip_state import GossipState
@@ -39,12 +42,16 @@ from swarm.consensus.messages.swim_ack import SwimAck
 from swarm.consensus.messages.swim_ping import SwimPing
 from swarm.consensus.messages.swim_ping_req import SwimPingReq
 from swarm.gossip.disseminator import GossipStateDisseminator
-from swarm.membership.swim import SwimMembership
+from swarm.membership.swim import SWIM_DEFAULTS, SwimMembership
 from swarm.models.data_node import DataNode
 from swarm.models.object import Object
 from swarm.selection.engine import SelectionEngine
 from swarm.selection.penalties import apply_multiplicative_penalty
 from swarm.topology.topology import TopologyType
+from swarm.utils.instrumentation import (DecisionLog, DecisionRecord, SelectionCounters,
+                                        context_age, flatten_for_prom, render_prom,
+                                        snapshot_view,
+                                        write_textfile)
 from swarm.utils.metrics import Metrics
 from swarm.utils.resource_queues import ResourceAgentQueues
 from swarm.utils.thread_safe_dict import ThreadSafeDict
@@ -61,11 +68,121 @@ from swarm.models.job import Job, ObjectState
 from swarm.models.quantum import QuantumBackend
 from swarm.quantum.measurement_layer import MeasurementLayer
 from swarm.quantum.split import build_post_process_job, experiment_id_for, split_comm_penalty
-from swarm.rl.context import snapshots_from_children
+from swarm.rl.context import GroupSnapshot, snapshots_from_children
 from swarm.rl.mab_manager import MABManager
 
+from swarm.agents.cost_scale import CostScale
+from swarm.utils.tiebreak import tiebreak_rank
 from swarm.utils.utils import generate_id, job_capacities
 
+
+#: The two regimes a hierarchical coordinator can score a job under. See
+#: `job_selection.coordinator_cost_matrix` in config_swarm_multi.yml for what each means.
+COORDINATOR_COST_MATRIX_MODES = ("self", "peers")
+
+
+def resolve_coordinator_cost_matrix(job_cfg: dict) -> str:
+    """Resolve `job_selection.coordinator_cost_matrix`, refusing an unknown value.
+
+    One function, called from one place, because a key resolved twice acquires two defaults
+    and the effective value then depends on which copy ran (`peer_expiry_seconds` shipped
+    that way for the whole campaign). Refusing rather than defaulting is the same rule the
+    consensus engine name follows: the two regimes differ by a factor of the coordinator
+    count in proposals per job, so a typo would produce a cell that cannot be interpreted and
+    nothing in the run would say which one it was.
+    """
+    mode = str((job_cfg or {}).get("coordinator_cost_matrix", "self")).lower()
+    if mode not in COORDINATOR_COST_MATRIX_MODES:
+        raise ValueError(
+            f"job_selection.coordinator_cost_matrix {mode!r} is not one of "
+            f"{' or '.join(repr(m) for m in COORDINATOR_COST_MATRIX_MODES)}. Refused rather "
+            "than defaulted: the two differ by a factor of the coordinator count in proposals "
+            "per job, and a run that silently took the other one would be uninterpretable.")
+    return mode
+
+
+
+#: How the analytic plane prices a job on an agent. See `job_selection.cost_model` in
+#: config_swarm_multi.yml and docs/results/e0-e1-fc9eb220/README.md §9 for why it changed.
+COST_MODELS = ("utilization", "capacity")
+#: The default when the key is absent. `utilization` since 2026-10-16; `capacity` is the
+#: model every run before then used, kept so those runs can be reproduced.
+COST_MODEL_DEFAULT = "utilization"
+
+
+#: The state indices the periodic scan reads at this agent's tier, in ONE pipelined (MULTI)
+#: read. PENDING / READY / COMPLETE (and RUNNING) drive the local queues; EVERY index feeds the
+#: withdrawn-job purge, because withdrawal deletes the record and so removes it from all of them.
+#: Until 2026-11-05 only those four were read: a coordinator-tier job whose record sat in
+#: PRE_PREPARE / PREPARE / COMMIT for two scans — any election slow enough to reach the
+#: reselection timeout — read as withdrawn, every coordinator dropped it, and nobody ever
+#: re-elected it (Hier-270 pilot, runs/pilot-counter-margin2, job 2646).
+SCAN_STATES = tuple(s.value for s in ObjectState)
+
+
+def resolve_pbft_counter_propose(consensus_cfg: dict) -> bool:
+    """Resolve `consensus.pbft.counter_propose` (default true), refusing a non-boolean.
+
+    True: a PBFT coordinator under `coordinator_cost_matrix: self` that receives a proposal for a
+    job it has not proposed compares that proposal's cost with its own and proposes itself if it
+    is cheaper (`ConsensusEngine._counter_proposal`). False: it PREPAREs the first proposal it
+    hears, which is every PBFT run before 2026-10-19 and made the tier a Redis-scan race won by
+    the coordinator nearest the database (docs/results/e0-e1-f45d9ff1/README.md §7).
+    """
+    value = ((consensus_cfg or {}).get("pbft") or {}).get("counter_propose", True)
+    if not isinstance(value, bool):
+        raise ValueError(f"consensus.pbft.counter_propose must be true or false, not {value!r}")
+    return value
+
+
+def resolve_pbft_counter_margin(consensus_cfg: dict) -> float:
+    """Resolve `consensus.pbft.counter_margin` (default `COUNTER_MARGIN_DEFAULT`, 0.05), refusing
+    anything but a number in [0, 1).
+
+    A coordinator counters a peer's PBFT proposal only when it is cheaper by more than this
+    fraction of the peer's cost (`ConsensusEngine._counter_proposal`). 0 = the strict rule of
+    2026-10-19..2026-11-05, under which near-tie counters deadlocked a 27-coordinator tier.
+    """
+    value = ((consensus_cfg or {}).get("pbft") or {}).get("counter_margin", COUNTER_MARGIN_DEFAULT)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not (0.0 <= value < 1.0):
+        raise ValueError(f"consensus.pbft.counter_margin must be a number in [0, 1), not {value!r}")
+    return float(value)
+
+
+def resolve_cost_model(job_cfg: dict) -> str:
+    """Resolve `job_selection.cost_model`, refusing an unknown value.
+
+    ``capacity`` (the model until 2026-10-16) prices a job by its demand over the agent's TOTAL
+    capacity and multiplies by `_projected_load_factor`. Measured on the fc9eb220 campaign, a
+    2-core leaf prices a job at 29x a 32-core leaf and the load factor never exceeded 1.32x at a
+    coordinator, so in every cell 54-74 of 81-87 leaves never ran a job and under Snow the four
+    smallest coordinator groups never won one.
+
+    ``utilization`` prices it by the agent's COMMITTED utilization once the job is added:
+    (scheduled + backlog + demand) / capacity per resource the job uses. An idle agent prices
+    exactly as under ``capacity``; a busy one prices its queue in, so a free small agent beats a
+    saturated large one. The load factor is then 1.0 for the analytic plane (it would count the
+    same load twice).
+
+    One function, one default, refused rather than defaulted: the two models place jobs on
+    different agents, so a typo would mislabel a whole cell.
+    """
+    model = str((job_cfg or {}).get("cost_model", COST_MODEL_DEFAULT)).lower()
+    if model not in COST_MODELS:
+        raise ValueError(
+            f"job_selection.cost_model {model!r} is not one of "
+            f"{' or '.join(repr(m) for m in COST_MODELS)}. Refused rather than defaulted: the "
+            "two models place jobs on different agents, and a run that silently took the other "
+            "one would be mislabelled.")
+    return model
+
+
+#: `runtime.reselection_timeout_s` when the key is absent; equal to the shipped config.
+RESELECTION_TIMEOUT_DEFAULT_S = 300.0
+#: `runtime.decided_unpersisted_grace_s` when the key is absent; equal to the shipped config.
+DECIDED_UNPERSISTED_GRACE_DEFAULT_S = 60.0
+#: `runtime.failure_threshold_seconds` when the key is absent; equal to the shipped config.
+FAILURE_THRESHOLD_DEFAULT_S = 60
 
 class _HostAdapter(ConsensusHost):
     def __init__(self, agent: "ResourceAgent"):
@@ -77,15 +194,38 @@ class _HostAdapter(ConsensusHost):
         if job:
             return job
 
+        # Never a Redis round trip on the single inbound consumer: a leaf paid one per message
+        # for every job it did not hold, and none at all was cached for a job past PENDING, so
+        # one leaf spent 310 s of its consumer in this GET (7,371 calls on another) while its
+        # inbound queue grew to 3,477 messages and the jobs it had won waited minutes to be
+        # acted on (inbound_timing, 43596385). From the consumer the job is reported missing;
+        # the engine stashes the message (`set_pending_*`), the stash queues the job for the
+        # background fetcher, and the fetcher replays the stash once the job is local
+        # (`_job_fetch_batch`). Every other caller — a Snow finalize on its pool — still reads
+        # Redis here, since it has nowhere to stash.
+        # Not the inbound consumer alone: stashed messages are REPLAYED on the periodic thread
+        # (and the fetcher), and a replayed batch names up to ten jobs, each a synchronous GET
+        # here. Moving the GET off the consumer moved it onto the thread that writes the
+        # heartbeat and runs the failure detector: Hier-90 PBFT on e669e79c, agent 43's periodic
+        # thread spent ~5 min there (154 s of GETs), judged 8 live peers FAILED from a 70 s old
+        # view, and 47-77 jobs per run executed twice.
+        if threading.get_ident() in self.agent.__dict__.get("_nonblocking_thread_idents", ()):
+            self.agent.inbound_fetch_deferred = getattr(self.agent, "inbound_fetch_deferred", 0) + 1
+            return None
+
         # Not in local queue - fetch from Redis on-demand
         # This allows agents to vote on proposals even if they haven't pulled the job locally yet
         try:
+            began = time.monotonic()
             job_data = self.agent.repository.get(
                 obj_id=object_id,
                 key_prefix=Repository.KEY_JOB,
                 level=self.agent.topology.level,
                 group=self.agent.topology.group
             )
+            # A WAN round trip, usually on the single inbound thread: timed so a slow consumer
+            # can be attributed (see `_note_handler_time`).
+            self.agent._note_handler_time("get_object_redis", time.monotonic() - began)
             if job_data:
                 self.agent.logger.debug(f"Fetched job {object_id} from Redis for consensus voting")
                 job = Job()
@@ -105,15 +245,68 @@ class _HostAdapter(ConsensusHost):
     _PENDING_MAX_OBJECTS = 2048
     _PENDING_MAX_PER_OBJECT = 32
 
+    @staticmethod
+    def _only_object(msg, object_id: str):
+        """A shallow copy of a Proposal/Prepare/Commit carrying only *object_id*'s entries.
+
+        A consensus message batches entries for up to ~10 jobs, and the engine stashes the WHOLE
+        message once per job it is missing. Replayed whole, it re-ran every other job in it;
+        once replay could no longer read Redis (e0550584), each job still missing re-stashed the
+        whole message again, so one message bred copies on every replay until the 32-per-job
+        cap dropped real votes: up to 17,970 dropped at one Hier-30 agent, 431-637 reselection
+        resets per Hier-30 run and 6,560 at Hier-90, jobs left unrun (f3fdb42a). Stashed per
+        job, a replay touches only the job it was stashed for, so it cannot re-stash anything."""
+        entries = getattr(msg, "_proposals", None)
+        if entries is None:
+            return msg
+        mine = [p for p in entries if getattr(p, "object_id", None) == object_id]
+        if len(mine) == len(entries):
+            return msg
+        clone = copy.copy(msg)
+        clone._proposals = mine
+        return clone
+
     def _stash_pending(self, store: dict, object_id: str, msg) -> None:
-        if object_id not in store and len(store) >= self._PENDING_MAX_OBJECTS:
-            self.agent.pending_consensus_dropped += 1
-            return
-        bucket = store.setdefault(object_id, [])
-        if len(bucket) >= self._PENDING_MAX_PER_OBJECT:
-            self.agent.pending_consensus_dropped += 1
-            return
-        bucket.append(msg)
+        # Under the agent's stash lock: setdefault-then-append on the inbound thread raced the
+        # periodic thread's pop of the same bucket, and a vote appended to a bucket just popped
+        # was lost with nothing counting it (code review 2026-10-05 §9).
+        agent = self.agent
+        with agent._pending_lock:
+            stashed_at = agent.__dict__.setdefault("_pending_stashed_at", {})
+            if object_id not in store and len(store) >= self._PENDING_MAX_OBJECTS:
+                self._expire_stash_locked(stashed_at)
+            if object_id not in store and len(store) >= self._PENDING_MAX_OBJECTS:
+                agent.pending_consensus_dropped += 1
+                return
+            stashed_at.setdefault(object_id, time.monotonic())
+            bucket = store.setdefault(object_id, [])
+            if len(bucket) >= self._PENDING_MAX_PER_OBJECT:
+                self.agent.pending_consensus_dropped += 1
+                return
+            bucket.append(self._only_object(msg, object_id))
+        # After the stash, never before: the fetcher replays what is stashed, so a request made
+        # first could fetch and replay before this message was in it.
+        agent._request_job_fetch(object_id)
+
+    #: How long a stashed message waits for its job (§G). Only a job id appearing in the PENDING
+    #: scan drained the stash, so messages for a job that never becomes PENDING here (a child
+    #: copy withdrawn by its coordinator) lived forever, and once 2048 such objects had
+    #: accumulated every later out-of-order vote was dropped. Far above any delivery lag.
+    _PENDING_STASH_TTL_S = 300.0
+
+    def _expire_stash_locked(self, stashed_at: dict) -> int:
+        """Drop every object stashed longer than the TTL, from all three stores. Caller holds
+        `_pending_lock`. Counted in `pending_consensus_expired`, never in `dropped`."""
+        agent = self.agent
+        cutoff = time.monotonic() - self._PENDING_STASH_TTL_S
+        old = [oid for oid, t in stashed_at.items() if t < cutoff]
+        for oid in old:
+            stashed_at.pop(oid, None)
+            for store in (agent.pending_proposals, agent.pending_prepares, agent.pending_commits):
+                store.pop(oid, None)
+        if old:
+            agent.pending_consensus_expired = getattr(agent, "pending_consensus_expired", 0) + len(old)
+        return len(old)
 
     def set_pending_proposal(self, proposal, object_id: str):
         self._stash_pending(self.agent.pending_proposals, object_id, proposal)
@@ -126,8 +319,44 @@ class _HostAdapter(ConsensusHost):
 
     def is_agreement_achieved(self, object_id: str): return self.agent.is_job_completed(object_id)
     def calculate_quorum(self): return self.agent.calculate_quorum()
-    def on_leader_elected(self, obj: Object, proposal_id: str): self.agent.select_job(obj)
+    def live_voter_ids(self): return set(self.agent.neighbor_map.keys())
+
+    def counter_proposal_cost(self, object_id: str):
+        """This agent's proposal-unit price for a job it has not proposed, when it is a candidate
+        for every job (PBFT engine only; see `ResourceAgent.counter_proposal_cost`). Local-only:
+        called from the inbound consumer thread."""
+        return self.agent.counter_proposal_cost(object_id)
+
+    def on_counter_proposals(self, proposals) -> None:
+        """Count counter-proposals in the per-tier proposal measurement, like selection's."""
+        self.agent._note_proposals(proposals, assignees=1)
+    def on_leader_elected(self, obj: Object, proposal_id: str):
+        # Decided is a LOCAL fact from this instant. `select_job` only persists READY, and the
+        # consensus dedupe set is fed by `schedule_job` (~0.5 s later at a leaf) or by the
+        # periodic Redis scan — and at a coordinator not until the delegation monitor marks the
+        # job COMPLETE. In that window every straggler message for the job found it "not
+        # achieved" and re-ran the decision (see ConsensusEngine._finalized). Recording it here
+        # closes the window on the host side too, whichever engine is running.
+        #
+        # Check-and-set, not a plain write: two paths can elect this agent for one job — the
+        # engine's own finalize and the claim sweep (`_adopt_unannounced_claims`), which reads
+        # a claim naming this agent and acts on it. The sweep's "not yet decided" snapshot was
+        # taken before the finalize recorded the decision, so both scheduled the job and it ran
+        # twice on the same agent (first slice pilot under Snow: 15 of 600 jobs, 2026-10-07).
+        # Whichever arrives second is refused here. A reset forgets the decision first, so a
+        # job genuinely re-elected after one still passes.
+        if not self.agent._claim_decision(obj.object_id):
+            self.agent.logger.warning(
+                f"[LEADER_DUP] {obj.object_id} was already decided here ({proposal_id}); "
+                f"not selecting it a second time")
+            self.agent.duplicate_leader_refusals = (
+                getattr(self.agent, "duplicate_leader_refusals", 0) + 1)
+            return
+        began = time.monotonic()
+        self.agent.select_job(obj)
+        self.agent._note_handler_time("select_job", time.monotonic() - began)
     def on_participant_commit(self, obj: Object, leader_id: int, proposal_id: str):
+        self.agent._note_decided(obj.object_id)
         obj.state = ObjectState.COMMIT
         # If proposal was committed and leader is a peer (not self)
         self.agent.job_assignments.set(obj.object_id, int(leader_id))
@@ -142,7 +371,14 @@ class _HostAdapter(ConsensusHost):
     # --- Snow-engine extensions (no-ops for PBFT, used by GossipConsensusEngine).
     def live_peer_ids(self):
         if self.agent.swim is not None:
-            live = [a for a in self.agent.swim.live_agents() if a != self.agent.agent_id]
+            # SWIM-live AND deliverable. `Agent.send` silently drops a destination that is not in
+            # `neighbor_map`, while the engine still counted it as queried — so a peer heartbeat
+            # had evicted but SWIM still saw alive held every round it was sampled into to the
+            # full round timeout, and `queries_` overstated what was sent (code review
+            # 2026-10-05 §12). The sample is now drawn from peers a query can reach.
+            reachable = self.agent.neighbor_map
+            live = [a for a in self.agent.swim.live_agents()
+                    if a != self.agent.agent_id and a in reachable]
             if live:
                 return live
             # An EMPTY SWIM live set is almost always a false reading — under consensus
@@ -157,17 +393,14 @@ class _HostAdapter(ConsensusHost):
         # thread. The previous get_object() Redis fallback + fresh _generate_agent_info()
         # cost a WAN round-trip (plus child aggregation) per query, collapsing inbound
         # throughput (queue pinned at 20k, responses stale, every decision abandoning at
-        # max_rounds). A peer that doesn't know the job locally yields to the initiator's
-        # preferred candidate — the engine already treats cost=None exactly that way.
-        obj = self.agent.queues.pending_queue.get(object_id)
-        if obj is None:
-            return None
-        try:
-            info = self.agent.last_agent_info or self.agent._generate_agent_info()
-            return float(self.agent._cost_job_on_agent(obj, info))
-        except Exception as exc:
-            self.agent.logger.debug(f"my_cost_for_job({object_id}) failed: {exc}")
-            return None
+        # max_rounds). A peer that doesn't know the job locally answers None, which the
+        # engine sends as an abstention (it used to count as a vote for the initiator).
+        #
+        # Delegated to the agent so a subclass can answer from its OWN decision plane.
+        # It used to inline the analytic cost here, which meant an LlmAgent priced a job
+        # analytically when answering a query and with the LLM when proposing — the LLM's
+        # verdict never entered the protocol at all (chaos finding 11).
+        return self.agent.wire_cost_for_job(object_id)
 
     def try_claim_assignment(self, object_id: str, agent_id: int) -> int:
         return self.agent.repository.try_claim_assignment(
@@ -180,6 +413,12 @@ class _HostAdapter(ConsensusHost):
             job_id=object_id,
             level=self.agent.topology.level, group=self.agent.topology.group,
         )
+
+    def is_agent_live(self, agent_id: int) -> bool:
+        # Heartbeat's view — the authority for liveness (SWIM is advisory). In neighbor_map and
+        # not judged failed. Local, so safe on any thread.
+        return (int(agent_id) in self.agent.neighbor_map
+                and int(agent_id) not in self.agent.failed_agents)
 
     def get_assignment_local(self, object_id: str):
         # Peer-side already-decided short-circuit from LOCAL knowledge only (the
@@ -202,6 +441,10 @@ class _TransportAdapter(ConsensusTransport):
         self.agent.send(dest, payload)
     def broadcast(self, payload: object) -> None:
         self.agent.broadcast(payload)
+    def send_async(self, dest: int, payload: object) -> None:
+        # Fire-and-forget on the transport's send pool, for sends from threads that must not
+        # wait on a peer (a commit certificate resent from the periodic thread).
+        self.agent.send_async(dest, payload)
     def send_besteffort(self, dest: int, payload: object, timeout_s: float = 0.3) -> None:
         # Low-latency, no-retry send for best-effort Snow queries/responses so a slow or
         # unreachable peer can't stall the Snow driver.
@@ -227,7 +470,10 @@ class _SwimAdapter:
         self.agent_id = agent.agent_id
 
     def send(self, dest: int, payload: object) -> None:
-        self.agent.send(dest, payload)
+        # Fire-and-forget: acks are sent from the inbound consumer and probes from the periodic
+        # thread (which also writes the heartbeat); neither may wait on a peer. A lost probe or
+        # ack is what SWIM's indirect probing exists for.
+        self.agent.send_async(dest, payload)
 
     def known_peers(self):
         # neighbor_map is the canonical peer set; SWIM seeds from it.
@@ -288,6 +534,10 @@ class _GossipAdapter:
 class ResourceAgent(Agent):
     def __init__(self, agent_id: int, config_file: str, debug: bool = False):
         super().__init__(agent_id, config_file, debug)
+        # Teardown saves metrics twice (before and after the executor drain). Serialising the
+        # two saves keeps the pre-drain payload from landing on top of the post-drain one when
+        # stop() is entered from both the SIGTERM handler and the periodic thread.
+        self._save_results_lock = threading.RLock()
         consensus_cfg = self.config.get("consensus", {})
         protocol = (consensus_cfg.get("protocol") or "pbft").lower()
         host = _HostAdapter(self)
@@ -296,30 +546,45 @@ class ResourceAgent(Agent):
 
         def _make_engine(engine_name: str):
             """Build a consensus engine by name ('pbft' | 'snow')."""
+            if engine_name not in ("pbft", "snow"):
+                raise ValueError(
+                    f"consensus engine {engine_name!r} is not one of 'pbft' or 'snow'. "
+                    "Refused rather than defaulted: a typo used to fall through to PBFT "
+                    "silently, so a cell labelled Snow or Hybrid in the results table could "
+                    "have been PBFT throughout, and nothing in the run would say so.")
             if engine_name == "snow":
                 snow_cfg = consensus_cfg.get("snow", {})
+
+                def snow_get(key):
+                    return snow_cfg.get(key, SNOW_DEFAULTS[key])
                 return GossipConsensusEngine(
                     agent_id=agent_id,
                     host=host,
                     transport=transport,
                     router=router,
-                    k=int(snow_cfg.get("k", 20)),
-                    alpha=float(snow_cfg.get("alpha", 0.7)),
-                    beta=int(snow_cfg.get("beta", 20)),
-                    max_rounds=int(snow_cfg.get("max_rounds", 100)),
-                    round_timeout_s=float(snow_cfg.get("round_timeout_ms", 500)) / 1000.0,
-                    tick_interval_s=float(snow_cfg.get("tick_interval_ms", 50)) / 1000.0,
-                    local_sample_frac=float(snow_cfg.get("local_sample_frac", 1.0)),
-                    send_workers=int(snow_cfg.get("send_workers", 32)),
-                    send_timeout_s=float(snow_cfg.get("send_timeout_ms", 300)) / 1000.0,
-                    max_inflight=int(snow_cfg.get("max_inflight", 32)),
+                    k=int(snow_get("k")),
+                    alpha=float(snow_get("alpha")),
+                    beta=int(snow_get("beta")),
+                    max_rounds=int(snow_get("max_rounds")),
+                    round_timeout_s=float(snow_get("round_timeout_ms")) / 1000.0,
+                    tick_interval_s=float(snow_get("tick_interval_ms")) / 1000.0,
+                    local_sample_frac=float(snow_get("local_sample_frac")),
+                    send_workers=int(snow_get("send_workers")),
+                    send_timeout_s=float(snow_get("send_timeout_ms")) / 1000.0,
+                    max_inflight=int(snow_get("max_inflight")),
+                    tie_tolerance=float(snow_get("tie_tolerance")),
                 )
-            return ConsensusEngine(agent_id, host, transport, router=router)
+            return ConsensusEngine(agent_id, host, transport, router=router,
+                                   counter_margin=resolve_pbft_counter_margin(consensus_cfg))
 
         # Phase 4 hybrid: PBFT within small level-0 worker groups; Snow across the
         # (potentially large) coordinator tiers where flat PBFT hits O(g^2). Engine is
         # chosen from the agent's immutable topology level; consensus only ever flows
         # among same-level peers, so a level exchanges messages of a single engine type.
+        if protocol not in ("pbft", "snow", "hybrid"):
+            raise ValueError(
+                f"consensus.protocol {protocol!r} is not one of 'pbft', 'snow' or 'hybrid'. "
+                "Refused rather than defaulted to 'pbft' — see _make_engine.")
         if protocol == "hybrid":
             hybrid_cfg = consensus_cfg.get("hybrid", {})
             level0_engine = (hybrid_cfg.get("level0") or "pbft").lower()
@@ -364,8 +629,7 @@ class ResourceAgent(Agent):
 
         self._load = 0
         self.metrics = Metrics()
-        self.completed_lock = threading.RLock()
-        self.completed_jobs_set = set()
+        self._init_decision_state()
         self.queues = ResourceAgentQueues()
 
         self.threads.update({
@@ -395,8 +659,25 @@ class ResourceAgent(Agent):
         self.connectivity_penalty_factor = job_cfg.get("connectivity_penalty_factor", 1.0)
         # Multiplier for quantum backend quality penalty (error rate + calibration downtime)
         self.quantum_penalty_factor = job_cfg.get("quantum_penalty_factor", 1.0)
-        # % above min cost allowed in candidate selection (lower = stricter, higher = more agents considered)
-        self.selection_threshold_pct = job_cfg.get("selection_threshold_pct", 10.0)
+        self._warn_removed_job_selection_keys(job_cfg)
+        # Which assignees a coordinator (level > 0) scores a job against.
+        #   "self"  - this agent only. The shipped behaviour and the one behind every
+        #             hierarchical number measured so far: each coordinator proposes itself
+        #             for every job it holds, so the coordinator tier runs one consensus
+        #             decision per coordinator per job rather than one per job.
+        #   "peers" - the coordinator peers in `neighbor_map`, exactly as level 0 does. The
+        #             plumbing for it already exists and is dead code under "self": a
+        #             parent's published AgentInfo carries its subtree's aggregate
+        #             capacities/allocations/load, and `is_job_feasible` prices a peer
+        #             parent off `max_child_capacity`. It is an arm of E5, not a fix to
+        #             switch on quietly, because it moves every hierarchical number.
+        # Validated rather than defaulted, for the reason spelled out in `_make_engine`: a
+        # typo that silently selected the other regime would mislabel a whole cell. Resolved
+        # in one place (the module-level function) so the key cannot acquire a second default.
+        self.coordinator_cost_matrix = resolve_coordinator_cost_matrix(job_cfg)
+        self.cost_model = resolve_cost_model(job_cfg)
+        self.pbft_counter_propose = resolve_pbft_counter_propose(self.config.get("consensus", {}))
+        self._refuse_unsupported_delegation_policy()
 
         self.selector = SelectionEngine(
             feasible=lambda job, agent: self.is_job_feasible(job, agent),
@@ -413,14 +694,25 @@ class ResourceAgent(Agent):
 
         # Track failed agents and job assignments
         self.failed_agents = ThreadSafeDict[int, float]()  # agent_id -> failure_timestamp
+        # agent_id -> the peer's own `last_updated` on the record that was judged failed. A
+        # record newer than this is a heartbeat the peer wrote AFTER the verdict, which is the
+        # only evidence that readmits it (`_readmit_if_heartbeat_resumed`). Both stamps are
+        # the peer's own clock, so no inter-host offset enters the comparison.
+        self._failed_last_seen: dict[int, float] = {}
         self.job_assignments = ThreadSafeDict[str, int]()  # job_id -> assigned_agent_id
+        # Reselection resets are written by a background writer, never on the periodic thread
+        # that also writes this agent's heartbeat (see _persist_restart).
+        self._restart_writes_async = True
 
         # Consensus messages that arrived before their job (see _HostAdapter.set_pending_*).
         # Replayed by _replay_pending_consensus once the job lands in the pending queue.
+        self._pending_lock = threading.Lock()
         self.pending_proposals: dict[str, list] = {}
         self.pending_prepares: dict[str, list] = {}
         self.pending_commits: dict[str, list] = {}
         self.pending_consensus_dropped = 0
+        self.pending_consensus_expired = 0
+        self._pending_stashed_at: dict[str, float] = {}   # object_id -> monotonic first stash
 
         # Latest AgentInfo snapshot (refreshed each periodic tick). Hot paths — e.g.
         # per-SnowQuery cost answers on the inbound thread — reuse this instead of
@@ -430,12 +722,27 @@ class ResourceAgent(Agent):
         # Track jobs delegated to children for hierarchical monitoring
         # Maps: job_id -> {'delegated_at': timestamp, 'groups': [list of child groups]}
         self.delegated_jobs = ThreadSafeDict[str, dict]()  # job_id -> delegation_info
+        # Output names a completed job produced but could not publish (see `_publish_produced`).
+        # Retried on every periodic tick: a publish that is merely dropped gates every
+        # descendant of that job for the rest of the run, which looks like a livelock and is
+        # indistinguishable from a workflow that is genuinely waiting.
+        self._unpublished_data: set[str] = set()
+        # Completed jobs whose outcome+outputs transaction failed, keyed by job id. Retried
+        # whole: publishing without the completion would release descendants of a job that is
+        # not recorded as done, and completing without the names strands them.
+        self._unpersisted_completions: dict = {}
+        self._unpublished_lock = threading.RLock()
 
         # MAB (Multi-Armed Bandit) configuration for hierarchical delegation
         mab_cfg = self.config.get("mab", {})
         self.mab_enabled = mab_cfg.get("enabled", False)
         self.mab_config = mab_cfg
-        self.mab_top_k = mab_cfg.get("top_k", 1)
+        self.mab_top_k = int(mab_cfg.get("top_k", 1))
+        if self.mab_top_k < 1:
+            # 0 delegated every job to NO group: `random.sample(.., 0)`, `select_top_k(.., 0)`
+            # and `ranked[:0]` all return [], and the monitor then discarded the entry because
+            # `any([])` is false — jobs vanished with no error (code review 2026-10-05 §33).
+            raise ValueError(f"mab.top_k must be at least 1, got {self.mab_top_k}")
         self.mab_manager = None  # Lazily initialised in _init_mab() once children are known
 
         # Failure simulation for MAB testing
@@ -457,6 +764,8 @@ class ResourceAgent(Agent):
         # Max retries before retiring an infeasible job (0 = infinite retries)
         self.max_infeasible_retries = self.runtime_config.get("max_infeasible_retries", 10)
 
+        self._init_instrumentation()
+
         # SWIM membership (Phase 1 of gossip-consensus migration). Enabled when
         # `failure_detection.protocol` is "swim"; otherwise the legacy heartbeat
         # path remains authoritative and SWIM stays inert.
@@ -467,13 +776,13 @@ class ResourceAgent(Agent):
             swim_cfg = fd_cfg.get("swim", {})
             self.swim = SwimMembership(
                 host=_SwimAdapter(self),
-                period_s=float(swim_cfg.get("period_ms", 1000)) / 1000.0,
+                period_s=float(swim_cfg.get("period_ms", SWIM_DEFAULTS["period_ms"])) / 1000.0,
                 # WAN-realistic defaults: acks can queue behind consensus bursts on the
                 # single inbound consumer, so a LAN-tuned 300ms probe window false-fails
                 # healthy peers (observed as constant late-ack flapping).
-                probe_timeout_s=float(swim_cfg.get("probe_timeout_ms", 1000)) / 1000.0,
-                k_req=int(swim_cfg.get("k_req", 3)),
-                suspect_timeout_s=float(swim_cfg.get("suspect_timeout_s", 20.0)),
+                probe_timeout_s=float(swim_cfg.get("probe_timeout_ms", SWIM_DEFAULTS["probe_timeout_ms"])) / 1000.0,
+                k_req=int(swim_cfg.get("k_req", SWIM_DEFAULTS["k_req"])),
+                suspect_timeout_s=float(swim_cfg.get("suspect_timeout_s", SWIM_DEFAULTS["suspect_timeout_s"])),
             )
 
         # Gossip state dissemination (Phase 2). Off by default; turn on with
@@ -492,11 +801,32 @@ class ResourceAgent(Agent):
 
     @property
     def peer_expiry_seconds(self) -> int:
-        return self.runtime_config.get("peer_expiry_seconds", 20)
+        # 300 to agree with `_agent_key_ttl_s` and the documented default; this property used to
+        # say 20, so the same key had two different code defaults in one file.
+        return self.runtime_config.get("peer_expiry_seconds", 300)
 
     @property
     def reselection_timeout_s(self) -> float:
-        return self.runtime_config.get("reselection_timeout_s", 60.00)
+        # One default (§G): the shipped config's 300. The fallback was 60, so a config without
+        # the key ran a 5x shorter timeout — and delegation_timeout_s derives from this one.
+        return self.runtime_config.get("reselection_timeout_s", RESELECTION_TIMEOUT_DEFAULT_S)
+
+    @property
+    def decided_unpersisted_grace_s(self) -> float:
+        """PBFT: how long a job this agent saw decided may stay PENDING in Redis before the
+        decision is treated as one nobody acted on (see `_decided_but_unpersisted`). 0 disables."""
+        return float(self.runtime_config.get("decided_unpersisted_grace_s",
+                                             DECIDED_UNPERSISTED_GRACE_DEFAULT_S))
+
+    @property
+    def shutdown_drain_timeout_s(self) -> float:
+        """Teardown's budget for jobs already running, in seconds.
+
+        Only bounds how long teardown waits; metrics are saved before the drain either way.
+        The only cost of a short value is that the last few job completions miss the final
+        payload, so it deliberately does not scale with runtime.wall_time_max_s.
+        """
+        return float(self.runtime_config.get("shutdown_drain_timeout_s", 20.0))
 
     @property
     def delegation_timeout_s(self) -> float:
@@ -509,6 +839,39 @@ class ResourceAgent(Agent):
         to complete their selection process.
         """
         return self.runtime_config.get("delegation_timeout_s", self.reselection_timeout_s * 2)
+
+    @property
+    def delegation_exec_grace_s(self) -> float:
+        """How long past `delegation_timeout_s` the delegation monitor keeps waiting for a job
+        a child has already picked up (persisted READY/RUNNING) to finish, before dropping it
+        from tracking without reporting an outcome to the bandit.
+
+        `delegation_timeout_s` bounds selection: a job still PENDING at the children after it
+        is reassigned. Execution is a separate budget — a scheduled job runs for its simulated
+        wall time, up to `runtime.wall_time_max_s` — so the default is that cap when one is set.
+        Reading it from `Job` rather than from the config again keeps one key, one default.
+        With no cap (`wall_time_max_s: 0`) fall back to 30 min; the Pegasus tail is ~2000 s.
+
+        Under `runtime.execution.mode: real` a job carrying an `execution` block is bounded by
+        the runner's `timeout_s` (3600 s shipped), never by the simulated cap — and a mixed run
+        carries both kinds, so the budget is the LARGER of the two. Read from the installed
+        `ExecutionPolicy`, the same object the runner enforces, not from the config again. Until
+        2026-10-06 this read the simulated cap alone, so a coordinator dropped every real job
+        longer than `delegation_timeout_s + 120 s` with no bandit outcome (code review §68).
+        """
+        configured = self.runtime_config.get("delegation_exec_grace_s")
+        if configured is not None:
+            return float(configured)
+        cap = float(getattr(Job, "_WALL_TIME_MAX_S", 0.0) or 0.0)
+        budget = cap if cap > 0 else 1800.0
+        try:
+            from swarm.execution import runner as _runner
+            pol = _runner.policy()
+            if pol is not None and pol.enabled():
+                budget = max(budget, float(pol.timeout_s or 0.0))
+        except Exception as e:  # the policy is process state; never let it break a tick
+            self.logger.debug(f"Execution policy unreadable for the grace budget: {e}")
+        return budget
 
     @property
     def capacities(self) -> Capacities:
@@ -551,11 +914,97 @@ class ResourceAgent(Agent):
             logger=self.logger,
             group_snapshot_provider=self._build_group_snapshots,
             delegation_timeout_s=self.delegation_timeout_s,
+            outcome_horizon_s=self.delegation_timeout_s + self.delegation_exec_grace_s,
         )
         self.mab_manager.load_state()
         self.logger.info(
             f"MAB initialised for agent {self.agent_id} with child groups {child_groups}"
         )
+
+    def _effective_delegation_top_k(self) -> int:
+        """How many child groups this agent will actually delegate one job to.
+
+        Must be the number `_select_child_groups` really uses, because the reachability guard
+        compares the candidate count against it. On the bandit path that is always `mab.top_k`
+        — `delegation.top_k` is an LLM-policy knob that this path never consults, so reading it
+        here would warn about healthy bandit runs and miss inert ones at the same time.
+        """
+        return int(self.mab_top_k)
+
+    #: Seconds between repeats of the delegation-reachability warning while it still applies.
+    _DELEGATION_REACH_WARN_S = 300
+
+    def _warn_if_delegation_cannot_choose(self) -> None:
+        """Warn while a delegation policy is configured but has nothing to choose between.
+
+        Judged on the groups this coordinator **actively leads**, not the ones assigned to it.
+        `scheduling_main` filters candidates through `_get_active_child_groups()`, and under
+        co-parenting those differ sharply: every group is led by its lowest-ID live co-parent,
+        so with all coordinators up, leadership concentrates rather than spreads. Measured on a
+        generated Hier-30 fleet (5 coordinators, all alive), groups actively led per coordinator:
+
+            --co-parents 1 -> [1, 1, 1, 1, 1]      0 of 5 have a choice
+            --co-parents 2 -> [0, 1, 1, 1, 2]      1 of 5
+            --co-parents 5 -> [0, 0, 0, 0, 5]      1 of 5, the rest idle
+
+        So co-parenting is a *failover* mechanism, not a fan-out one, and raising K does not
+        give more coordinators a routing decision — it gives one coordinator all of them. A
+        check against `topology.children` would have called K=2 healthy for all five.
+
+        With one candidate there is no decision: the bandit returns its only arm and LLM
+        delegation short-circuits without calling the model. Nothing else shows it — the run
+        completes and the numbers look plausible.
+
+        A fan-out covering every candidate is the same inertness reached through config rather
+        than topology: `top_k >= len(candidates)` means every candidate is delegated to no
+        matter how the policy ranks them, so `select_groups` returns them all and the LLM path
+        short-circuits. Both cases are warned about.
+
+        Re-checked on every heartbeat rather than latched: at startup `neighbor_map` is empty,
+        every co-parent believes it leads everything, and a once-only check would record that
+        first optimistic reading and never correct it. Leadership also moves at runtime when a
+        co-parent dies, in either direction.
+        """
+        if self.topology.children is None:
+            return  # not a coordinator; nothing to delegate
+        policy = getattr(self, "delegation_policy", "bandit")
+        if not (self.mab_enabled or policy != "bandit"):
+            return
+
+        active = self._get_active_child_groups()
+        top_k = self._effective_delegation_top_k()
+
+        if len(active) <= 1:
+            cause = (
+                f"actively leads {len(active)} of its {len(self.topology.children)} assigned "
+                f"child group(s) (leads {active} of {self.topology.children}), so it never has "
+                f"more than one candidate. Note --co-parents does NOT fix this: leadership "
+                f"goes to the lowest-ID live co-parent, so raising it concentrates groups on "
+                f"one coordinator instead of giving each a choice")
+        elif top_k >= len(active):
+            # Every candidate is delegated to regardless of the ranking, so the policy is
+            # asked for an opinion that cannot change the outcome. Same silent inertness as
+            # the one-candidate case, reached through config instead of topology.
+            cause = (
+                f"has a fan-out of {top_k} covering all {len(active)} of its candidate groups "
+                f"{active}, so every candidate is delegated to whatever the policy says. Lower "
+                f"delegation.top_k (or mab.top_k) below the number of groups this coordinator "
+                f"leads")
+        else:
+            # Cleared, not latched: losing leadership later must warn again.
+            self._delegation_reach_warned_at = None
+            return
+
+        now = time.time()
+        last = getattr(self, "_delegation_reach_warned_at", None)
+        if last is not None and now - last < self._DELEGATION_REACH_WARN_S:
+            return
+        self._delegation_reach_warned_at = now
+        self.logger.warning(
+            "[DELEGATION] %s is configured but this coordinator %s; the policy can never "
+            "choose and every delegation is recorded as trivial.",
+            f"delegation.policy={policy}" if policy != "bandit" else "the delegation bandit",
+            cause)
 
     def _build_group_snapshots(self):
         """Current per-child-group load view for contextual MAB selection.
@@ -566,17 +1015,32 @@ class ResourceAgent(Agent):
         return snapshots_from_children(
             self.children.values(),
             (info for _, info in self.delegated_jobs.items()),
+            seen_at=self._agent_seen_at,
         )
 
     def _get_live_child_groups(self) -> set:
-        """Groups with at least one fresh child heartbeat in the children map
-        (stale entries are pruned by peer expiry). Used to gate delegation:
-        a dead group must not be offered to the bandit at all — idle-default
-        features plus an empty failure history make it look attractive
-        (Scenario C dog-piling). Genuinely new groups do heartbeat, so
-        cold-start optimism is preserved."""
-        return {child.group if child.group is not None else 0
-                for child in self.children.values()}
+        """Groups with at least one child whose record moved within the failure detector's
+        window (`_detector_window_s`), on this agent's monotonic clock. Used to gate
+        delegation: a dead group must not be offered to the bandit at all — idle-default
+        features plus an empty failure history make it look attractive (Scenario C
+        dog-piling). Genuinely new groups do heartbeat, so cold-start optimism is preserved.
+
+        Until 2026-10-28 this was every group with an entry in the children map, and a child
+        entry is evicted only at `peer_expiry_seconds` (300 s shipped). E2 at c9c980b8 killed a
+        whole group for 180 s and its coordinators delegated to it until ~170 s into the outage
+        in every Snow run: the gate never closed. It reads the stamps instead of evicting
+        earlier, so nothing else that reads the children map changes. A child with no stamp
+        yet counts as live (the old behaviour) rather than being refused on a missing input.
+        """
+        window = self._detector_window_s()
+        now = time.monotonic()
+        seen_at = self._agent_seen_at
+        live = set()
+        for child in self.children.values():
+            seen = seen_at.get(child.agent_id)
+            if seen is None or now - seen <= window:
+                live.add(child.group if child.group is not None else 0)
+        return live
 
     @property
     def empty_timeout_seconds(self):
@@ -610,16 +1074,50 @@ class ResourceAgent(Agent):
             return False
         return True
 
+    def _gate_on_data_predicates(self, pending_jobs: list) -> list:
+        """Drop jobs whose data predicate is not satisfied yet, and send them to the back of
+        the pending queue so they are retried rather than lost.
+
+        A method rather than inline loop code because `LlmAgent.selection_main` is a full
+        override of the selection loop and had no gate at all, so an LLM-agent run of a
+        DAG-gated workflow **ignored the DAG** and could schedule a child before its parent
+        wrote the files it reads (code review §11). Two copies of a gate is how that happened;
+        one copy is the fix.
+        """
+        gated = [j for j in pending_jobs if not self._data_predicate_ready(j)]
+        if not gated:
+            return pending_jobs
+        for job in gated:
+            self.queues.pending_queue.move_to_end(job)
+        blocked = {id(j) for j in gated}
+        return [j for j in pending_jobs if id(j) not in blocked]
+
     def _data_predicate_ready(self, job: Job) -> bool:
         """
-        True when the job's data predicate is satisfied (or absent). Gated
-        jobs are not proposed for selection — computation is steered by the
-        availability of quantum measurement data.
+        True when the job's data predicate is satisfied (or absent). Gated jobs are not
+        proposed for selection — computation is steered by the availability of data.
+
+        Two kinds of predicate share this gate, dispatched on shape rather than on a flag so
+        that predicates written before the second kind existed keep working:
+
+        * ``{"experiment_id", "min_snapshots", ...}`` — the quantum measurement stream.
+        * ``{"kind": "files", "files": [...]}`` — a **workflow DAG edge**. A Pegasus DAG's
+          dependencies *are* file dependencies, so a job is runnable exactly when every input
+          it does not bring with it has been produced by some other job. Gating on names
+          rather than on parent job ids is what lets the converter recover the edges by
+          matching one job's outputs against another's inputs, without the scheduler ever
+          being told the graph.
+
+        A failure to *check* is never treated as satisfied: an unreachable Redis would
+        otherwise release the whole DAG at once, which is the one error this gate exists to
+        prevent.
         """
         pred = job.data_predicate
         if not pred:
             return True
         try:
+            if pred.get("kind") == "files" or "files" in pred:
+                return self.repository.data_available(list(pred.get("files") or []))
             return self.measurement_layer.predicate_satisfied(
                 pred.get("experiment_id", ""), int(pred.get("min_snapshots", 1)))
         except Exception as e:
@@ -641,11 +1139,14 @@ class ResourceAgent(Agent):
 
     @staticmethod
     def resource_usage_score(allocated: Capacities, total: Capacities):
-        if allocated == total:
-            return 0
-        core = (allocated.core / total.core) * 100
-        ram = (allocated.ram / total.ram) * 100
-        disk = (allocated.disk / total.disk) * 100
+        # Each dimension guarded on its own total. This used to return 0 when `allocated ==
+        # total` — meant for the empty/empty case, it also made an agent allocated EXACTLY to
+        # capacity advertise load 0, i.e. idle, at the moment it was fullest (§G).
+        def pct(a, t):
+            return (float(a or 0) / float(t)) * 100 if t else 0.0
+        core = pct(allocated.core, total.core)
+        ram = pct(allocated.ram, total.ram)
+        disk = pct(allocated.disk, total.disk)
 
         return round((core + ram + disk) / 3, 2)
 
@@ -658,8 +1159,10 @@ class ResourceAgent(Agent):
         - Too low (< 15s): False positives from temporary network issues
         - Too high (> 60s): Slow failure detection, jobs stuck longer
         - Recommended: 30s for local, 45-60s for remote deployments
+
+        Falls back to the shipped 60 s (§G; the fallback was 30 while the shipped file said 60).
         """
-        return self.runtime_config.get("failure_threshold_seconds", 30)
+        return self.runtime_config.get("failure_threshold_seconds", FAILURE_THRESHOLD_DEFAULT_S)
 
     @property
     def max_failed_agents(self) -> int:
@@ -698,7 +1201,7 @@ class ResourceAgent(Agent):
 
     @property
     def enable_agent_recovery(self) -> bool:
-        """Allow recovered agents to rejoin the pool when their gRPC channel comes back UP."""
+        """Allow a failed agent to rejoin the pool once it writes a fresh heartbeat to Redis."""
         return self.runtime_config.get("enable_agent_recovery", True)
 
     def __on_proposal(self, incoming: Proposal):
@@ -710,9 +1213,106 @@ class ResourceAgent(Agent):
     def __on_commit(self, incoming: Commit):
         self.engine.on_commit(incoming)
 
+    #: How long a job found past PENDING (or absent) is not fetched again for a stashed message.
+    _FETCH_NEGATIVE_TTL_S = 10.0
+
+    def _request_job_fetch(self, job_id: str) -> None:
+        """Queue *job_id* for the background fetcher (see `_HostAdapter.get_object`)."""
+        if not job_id:
+            return
+        neg = self.__dict__.setdefault("_fetch_negative", {})
+        if neg.get(job_id, 0.0) > time.monotonic():
+            return
+        guard = self.__dict__.setdefault("_fetch_guard", threading.Lock())
+        with guard:
+            inflight = self.__dict__.setdefault("_fetch_inflight", set())
+            if job_id in inflight:
+                return
+            inflight.add(job_id)
+            q = self.__dict__.get("_fetch_queue")
+            if q is None:
+                import queue as _queue
+                q = self._fetch_queue = _queue.Queue()
+                threading.Thread(target=self._job_fetch_loop, name="job-fetch",
+                                 daemon=True).start()
+        q.put(job_id)
+
+    def _job_fetch_loop(self) -> None:
+        import queue as _queue
+        # The fetcher replays stashes too; a replay naming a job it does not hold re-stashes
+        # that message and requests the job rather than reading Redis inline.
+        mark = getattr(self, "mark_nonblocking_thread", None)
+        if mark is not None:
+            mark()
+        while not getattr(self, "shutdown", False):
+            try:
+                first = self._fetch_queue.get(timeout=0.5)
+            except _queue.Empty:
+                continue
+            time.sleep(0.05)                      # let a burst coalesce into one MGET
+            ids = [first]
+            while len(ids) < 256:
+                try:
+                    ids.append(self._fetch_queue.get_nowait())
+                except _queue.Empty:
+                    break
+            try:
+                self._job_fetch_batch(ids)
+            except Exception as e:                # never let the fetcher die
+                try:
+                    self.logger.warning(f"job fetch of {len(ids)} ids failed: {e}")
+                    with self._fetch_guard:
+                        self._fetch_inflight.difference_update(ids)
+                except Exception:
+                    pass
+
+    def _job_fetch_batch(self, ids: list) -> None:
+        """One MGET for jobs that consensus messages named before this agent held them: a
+        PENDING record joins the pending queue and its stashed messages are replayed; anything
+        else is remembered for `_FETCH_NEGATIVE_TTL_S` so a stream of stragglers about a job
+        decided elsewhere costs one fetch, not one per message. Runs on the fetcher thread."""
+        began = time.monotonic()
+        fetched = self.repository.get_many(ids, key_prefix=Repository.KEY_JOB,
+                                           level=self.topology.level, group=self.topology.group)
+        self._note_handler_time("job_fetch_batch", time.monotonic() - began)
+        neg = self.__dict__.setdefault("_fetch_negative", {})
+        now = time.monotonic()
+        for job_id in ids:
+            record = fetched.get(job_id)
+            if record and self._record_is_pending(record):
+                if self.queues.pending_queue.get(job_id) is None:
+                    job = Job()
+                    job.from_dict(record)
+                    self.queues.pending_queue.add(job)
+                    self.queues.pending_event.set()
+                self._replay_pending_consensus(job_id)
+            else:
+                neg[job_id] = now + self._FETCH_NEGATIVE_TTL_S
+        if len(neg) > 8192:
+            for k in [k for k, t in neg.items() if t <= now]:
+                neg.pop(k, None)
+        with self._fetch_guard:
+            self._fetch_inflight.difference_update(ids)
+
+    def _note_handler_time(self, key: str, seconds: float) -> None:
+        """Time spent on the inbound path, by message type (and by the slow calls inside it).
+        A leaf's inbound queue reached 3,477 messages in the Hybrid+LinUCB pilot (ee76e05b)
+        while it received ~10 messages/s, and only calls of a whole second or more were ever
+        logged, so where the consumer's time went was not measurable. Exported as
+        `inbound_timing` in metrics.json."""
+        table = self.__dict__.setdefault("_inbound_timing", {})
+        row = table.get(key)
+        if row is None:
+            row = table[key] = [0, 0.0, 0.0]
+        row[0] += 1
+        row[1] += seconds
+        if seconds > row[2]:
+            row[2] = seconds
+
     def _process(self, messages: list[dict]):
         for message in messages:
             message_type = MessageType(message.get('message_type'))
+            began_mono = time.monotonic()
             try:
                 begin = time.time()
                 incoming = MessageBuilder.from_dict(message)
@@ -767,16 +1367,61 @@ class ResourceAgent(Agent):
             except Exception as e:
                 self.logger.error(f"Error while processing message {type(message)}, {e}")
                 self.logger.error(traceback.format_exc())
+            finally:
+                self._note_handler_time(message_type.name, time.monotonic() - began_mono)
 
     def _update_pending_jobs(self, jobs: list[str]):
         # One MGET for every job we don't have locally — the per-id get() loop paid a
-        # WAN round-trip per pending job on every periodic tick.
-        missing = [j for j in jobs if j not in self.queues.pending_queue]
+        # WAN round-trip per pending job on every periodic tick. Decided jobs are fetched
+        # too, even when held locally: their record is the only evidence of whether the
+        # PENDING is a reset (see _reset_evidence).
+        with self.completed_lock:
+            decided = set(self._decided_jobs)
+        missing = [j for j in jobs if j not in self.queues.pending_queue or j in decided]
         fetched = self.repository.get_many(
             missing, key_prefix=Repository.KEY_JOB,
             level=self.topology.level, group=self.topology.group) if missing else {}
+        # Under Snow a decision IS a claim, so a PENDING record with no claim was reset, whatever
+        # its timestamp says. The timestamp rule alone missed a reset that landed just BEFORE
+        # this agent recorded the decision (it read a claim, the claim was released and the job
+        # reset, then the commit landed): the reset's stamp is earlier than the decision, so the
+        # job stayed "decided" here for the rest of the run (stop-time review). PBFT writes no
+        # claims, so it keeps the timestamp rule alone.
+        unclaimed: set = set()
+        if isinstance(self.engine, GossipConsensusEngine):
+            decided_pending = [j for j in jobs if j in decided]
+            if decided_pending:
+                try:
+                    claims = self.repository.get_assignments(
+                        decided_pending, level=self.topology.level, group=self.topology.group)
+                    unclaimed = {j for j in decided_pending if j not in claims}
+                except Exception as e:
+                    self.logger.debug(f"Claim check for decided jobs skipped: {e}")
         for job_id in jobs:
             job = fetched.get(job_id)
+            # The PENDING id list is a snapshot and the batch fetch came later. A record that
+            # moved to READY/RUNNING in between is not up for election: treating it as one
+            # dropped it from the dedupe set, forgot the decision and put a READY record back
+            # in `pending_queue` — the straggler window reopened for a tick (code review
+            # 2026-10-05 §21). Only a record that still says PENDING is evidence of anything.
+            if job is not None and not self._record_is_pending(job):
+                continue
+            # Redis says this job is up for election again — a reassignment after an agent
+            # failure, or any other return to the pool. Drop it from the consensus dedupe set
+            # or `is_agreement_achieved` stays true here and every commit for it is skipped,
+            # so the job would be reset by one agent and ignored by all of them.
+            with self.completed_lock:
+                self.completed_jobs_set.discard(job_id)
+            if job_id in decided:
+                # A decision this agent witnessed, and Redis still says PENDING. That is a
+                # reset only if the record says so; otherwise it is a leader that has not
+                # persisted READY yet, and the local object (COMMIT) must not be replaced by
+                # the stale PENDING record or the decision forgotten.
+                if not (job_id in unclaimed or self._reset_evidence(job_id, job)
+                        or self._decided_but_unpersisted(job_id, job)):
+                    continue
+                if not self._forget_decided(job_id, wait=False):
+                    continue                     # being decided right now; next scan
             if job:
                 job_obj = Job()
                 job_obj.from_dict(job)
@@ -787,21 +1432,105 @@ class ResourceAgent(Agent):
         self.queues.pending_event.set()
 
     def _replay_pending_consensus(self, job_id: str) -> None:
-        for msg in self.pending_proposals.pop(job_id, []):
+        lock = getattr(self, "_pending_lock", None) or threading.Lock()
+        with lock:
+            proposals = self.pending_proposals.pop(job_id, [])
+            prepares = self.pending_prepares.pop(job_id, [])
+            commits = self.pending_commits.pop(job_id, [])
+            stashed_at = self.__dict__.get("_pending_stashed_at")
+            if stashed_at is not None:
+                stashed_at.pop(job_id, None)
+        for msg in proposals:
             try:
                 self.engine.on_proposal(msg)
             except Exception as e:
                 self.logger.warning(f"Replaying pending proposal for {job_id} failed: {e}")
-        for msg in self.pending_prepares.pop(job_id, []):
+        for msg in prepares:
             try:
                 self.engine.on_prepare(msg)
             except Exception as e:
                 self.logger.warning(f"Replaying pending prepare for {job_id} failed: {e}")
-        for msg in self.pending_commits.pop(job_id, []):
+        for msg in commits:
             try:
                 self.engine.on_commit(msg)
             except Exception as e:
                 self.logger.warning(f"Replaying pending commit for {job_id} failed: {e}")
+
+    #: Undecided local jobs whose Snow claim is checked per periodic tick (round-robin).
+    _CLAIM_SWEEP_BATCH = 256
+
+    def _adopt_unannounced_claims(self) -> None:
+        """Act on Snow claims nobody announced to this agent.
+
+        A Snow instance claims a job for whichever candidate its vote converged on, and only
+        the agent that wins the CAS *for itself* is told. When the vote converged on a peer
+        that never ran its own instance for the job — it answered queries as the cheaper
+        candidate but its own selection did not propose — the claim named that peer and
+        nothing ever told it: the job sat claimed and unrun until the reselection timeout,
+        whose reset could not help because the claim still named the same agent (code review
+        2026-10-05 §7). The claim is the decision, so read it: a claim naming this agent is
+        an election this agent won; one naming another is a decided job to stop proposing.
+        Snow only — PBFT writes no claims. Bounded per tick and round-robin over the queue.
+        """
+        if not isinstance(self.engine, GossipConsensusEngine):
+            return
+        with self.completed_lock:
+            decided = set(self._decided_jobs)
+        undecided = [j for j in self.queues.pending_queue.ids() if j not in decided]
+        if not undecided:
+            return
+        start = getattr(self, "_claim_sweep_at", 0) % len(undecided)
+        batch = (undecided[start:] + undecided[:start])[:self._CLAIM_SWEEP_BATCH]
+        self._claim_sweep_at = start + len(batch)
+        try:
+            claims = self.repository.get_assignments(
+                batch, level=self.topology.level, group=self.topology.group)
+        except Exception as e:
+            self.logger.debug(f"Claim sweep skipped: {e}")
+            return
+        host = self.engine.host
+        for job_id, assignee in claims.items():
+            job = self.queues.pending_queue.get(job_id)
+            if job is None:
+                continue
+            if int(assignee) == int(self.agent_id):
+                self.logger.info(f"[SNOW_ADOPT] {job_id} is claimed for this agent but was "
+                                 f"never announced here; acting as leader")
+                job.leader_id = self.agent_id
+                host.on_leader_elected(job, "adopted-claim")
+            else:
+                host.on_participant_commit(job, int(assignee), "adopted-claim")
+
+    def _purge_vanished_jobs(self, present: set) -> None:
+        """Drop local pending jobs whose Redis record is gone.
+
+        A coordinator withdraws a delegated job by DELETING the child-tier record, and a
+        deleted key is in no state index — so the READY/COMPLETE scans never removed it and
+        every child kept the job PENDING locally and kept proposing it. When load allowed, the
+        winner's `select_job` re-created the record and ran the job while the coordinator had
+        already re-delegated it elsewhere (code review 2026-10-05 §15).
+
+        `present` is every id in ANY of this tier's state indices (`SCAN_STATES`; a record mid-
+        election is in PRE_PREPARE/PREPARE/COMMIT, not withdrawn). A job must
+        be absent from two consecutive scans before it is dropped: the index sets are read
+        without a transaction, so one scan can catch a job between two of them, and dropping a
+        job mid-election on that would abort an election for nothing. (A wrong drop would still
+        heal — the next scan re-adds a PENDING record — but not without that cost.)
+        """
+        absent = {j for j in self.queues.pending_queue.ids() if j not in present}
+        previously = getattr(self, "_absent_once", set())
+        deferred = set()
+        for job_id in absent & previously:
+            # The periodic thread: never wait on a finalize's election lock (heartbeat).
+            if not self._forget_decided(job_id, wait=False):
+                deferred.add(job_id)             # being decided right now; next scan
+                continue
+            self.queues.pending_queue.remove(job_id)
+            self.engine.incoming.remove_object(object_id=job_id)
+            self.engine.outgoing.remove_object(object_id=job_id)
+            self.logger.info(f"[PURGE] Job {job_id} has no record at this tier any more "
+                             f"(withdrawn); dropped from the local pending queue")
+        self._absent_once = (absent - previously) | deferred
 
     def _update_ready_jobs(self, jobs: list[str]):
         for j in jobs:
@@ -809,8 +1538,70 @@ class ResourceAgent(Agent):
             self.engine.outgoing.remove_object(object_id=j)
             self.queues.pending_queue.remove(j)
 
+    def _publish_produced(self, job_id: str, names: list) -> bool:
+        """Announce the outputs of a completed job out-of-band, and keep them if that fails.
+
+        The normal path does **not** come through here: `execute_job` publishes inside the
+        same transaction that writes the job's COMPLETE state, so the two cannot separate.
+        This is the out-of-band route for a caller that has no such write to attach to, and
+        the retry queue behind it covers a transient Redis failure on that route.
+
+        Non-raising, for the same reason `_note_bid` is: a bookkeeping error must not turn a
+        job that really completed into a failed one. But swallowing it is not enough either —
+        the names are what release this job's descendants, so a dropped publish gates the rest
+        of that subtree for the whole run, and a transient Redis blip is indistinguishable
+        from a workflow that is legitimately waiting. Unpublished names are kept and retried
+        on every periodic tick until they land.
+        """
+        if not names:
+            return True
+        try:
+            self.repository.mark_data_available(list(names))
+            self.logger.debug(f"[DATA_READY] {job_id} produced {list(names)}")
+            return True
+        except Exception as e:
+            # The recovery path must not raise either: it runs inside `execute_job`, whose
+            # own handler would mark this completed job FAILED — turning a bookkeeping blip
+            # into a wrong outcome, which is the P0-9 mistake in a new place.
+            try:
+                with self._unpublished_lock:
+                    self._unpublished_data.update(str(n) for n in names)
+                    pending = len(self._unpublished_data)
+                self.logger.warning(
+                    f"Failed to publish produced data for {job_id}: {e} — "
+                    f"queued for retry ({pending} name(s) pending)")
+            except Exception:
+                pass
+            return False
+
+    def _retry_unpublished_data(self) -> None:
+        """Re-announce anything a completed job produced but could not publish."""
+        with self._unpublished_lock:
+            if not self._unpublished_data:
+                return
+            pending = sorted(self._unpublished_data)
+        try:
+            self.repository.mark_data_available(pending)
+        except Exception as e:
+            self.logger.debug(f"[DATA_READY] retry of {len(pending)} name(s) failed: {e}")
+            return
+        with self._unpublished_lock:
+            self._unpublished_data.difference_update(pending)
+        self.logger.info(f"[DATA_READY] republished {len(pending)} name(s) after an earlier failure")
+
     def _update_completed_jobs(self, jobs: list[str]):
-        self.update_jobs(jobs, self.completed_jobs_set, self.completed_lock)
+        # Only ids not already settled here (§G). The periodic scan passes EVERY RUNNING and
+        # COMPLETE id on every 0.5 s tick, and three container operations per id made the tick
+        # O(completed) on the thread that also does READY removal and failure detection. An id
+        # already in the set has had this cleanup; a reset discards it from the set first
+        # (`_update_pending_jobs`, `_restart_selection`), so a re-settled job is cleaned again.
+        with self.completed_lock:
+            jobs = [j for j in jobs if j not in self.completed_jobs_set]
+            if not jobs:
+                return
+            self.completed_jobs_set.update(jobs)
+            for j in jobs:
+                self._decided_jobs.pop(j, None)          # promoted; no need to hold both
         for j in jobs:
             self.engine.incoming.remove_object(object_id=j)
             self.engine.outgoing.remove_object(object_id=j)
@@ -823,16 +1614,145 @@ class ResourceAgent(Agent):
             diff = int(time.time() - job.last_transition_at)
             if diff > self.reselection_timeout_s:
                 self.logger.info(f"RESTART: Job: {job} reset to Pending")
+                self._log_restart_view(job.job_id)
                 print(f"RESTART: Job: {job} reset to Pending {self.reselection_timeout_s} seconds")
-                job.state = ObjectState.PENDING
-                self.engine.outgoing.remove_object(object_id=job.job_id)
-                self.engine.incoming.remove_object(object_id=job.job_id)
-                if job.job_id in self.completed_jobs_set:
-                    self.completed_jobs_set.remove(job.job_id)
-                job_id = job.job_id
-                self.metrics.restarts[job_id] = self.metrics.restarts.get(job_id, 0) + 1
+                # One reset, under the election lock: a decision for the old election lands
+                # wholly before it or wholly after it (and is dropped as obsolete). NEVER waited
+                # for: this is the periodic thread, which also writes the heartbeat, and a burst
+                # of 180 restarts each queued behind a finalize's WAN CAS kept a coordinator
+                # silent for 81 s — a peer declared it FAILED, reassigned its 133 in-flight jobs
+                # and 47 ran twice (first run on 59d425b6, 2026-10-10). A job whose lock is held
+                # is being decided right now, which is what a restart wants anyway; it is
+                # skipped and re-examined on the next pass.
+                lock = self._election_lock(job.job_id)
+                if not self._try_lock(lock):
+                    continue
+                try:
+                    job.state = ObjectState.PENDING
+                    self.engine.outgoing.remove_object(object_id=job.job_id)
+                    self.engine.incoming.remove_object(object_id=job.job_id)
+                    with self.completed_lock:
+                        self.completed_jobs_set.discard(job.job_id)
+                    self._forget_decided(job.job_id)
+                    job_id = job.job_id
+                    self.metrics.restarts[job_id] = self.metrics.restarts.get(job_id, 0) + 1
+                finally:
+                    self._unlock(lock)
+                self._persist_restart(job)
 
                 # TODO restart selection for jobs which were assigned to neighbor which just went down
+
+    def _log_restart_view(self, job_id: str) -> None:
+        """One INFO line with this agent's view of a vote it is about to reset: every proposal it
+        holds (proposer, cost, who prepared, who committed), what it committed to, the quorum,
+        and whether messages for the job are still stashed or its fetch is suppressed. Diagnoses
+        why an election stalled for a whole reselection timeout without DEBUG logging, which
+        would slow every agent and change what is measured."""
+        try:
+            eng = self.engine
+            props = []
+            for container in (getattr(eng, "outgoing", None), getattr(eng, "incoming", None)):
+                if container is None:
+                    continue
+                for p in container.get_proposals_by_object_id(job_id) or []:
+                    props.append(f"{p.p_id[:8]}@{p.agent_id}:{p.cost}:P{sorted(map(str, p.prepares))}"
+                                 f":C{sorted(map(str, p.commits))}")
+            ledger = getattr(eng, "_commit_ledger", {}).get(job_id, {})
+            stashed = [len(store.get(job_id, [])) for store in
+                       (self.pending_proposals, self.pending_prepares, self.pending_commits)]
+            neg = self.__dict__.get("_fetch_negative", {}).get(job_id)
+            self.logger.info(
+                f"[RESTART_VIEW] Job {job_id} quorum={self.calculate_quorum()} "
+                f"live={self.live_agent_count} committed_to="
+                f"{getattr(eng, '_committed_to', {}).get(job_id)} props={props} "
+                f"ledger={ {k[:8]: sorted(map(str, v[1])) for k, v in ledger.items()} } "
+                f"stashed(P/Pr/C)={stashed} fetch_suppressed={neg is not None and neg > time.monotonic()}")
+        except Exception as exc:
+            self.logger.debug(f"[RESTART_VIEW] {job_id} failed: {exc}")
+
+    @staticmethod
+    def _try_lock(lock) -> bool:
+        acquire = getattr(lock, "acquire", None)
+        if acquire is None:                      # contextlib.nullcontext — PBFT, no lock
+            return True
+        return bool(acquire(blocking=False))
+
+    @staticmethod
+    def _unlock(lock) -> None:
+        release = getattr(lock, "release", None)
+        if release is not None:
+            release()
+
+    def _persist_restart(self, job: Job) -> None:
+        """Hand a reselection reset to the restart writer (PBFT only) — see
+        `_persist_restart_now`. Never written on the calling (periodic, heartbeat) thread: the
+        write is a WATCH/MULTI round trip to Redis per job, and a burst of them there is what
+        let a peer judge a live coordinator dead (see `_restart_selection`). Snow needs none of
+        this — a Snow peer already reads a PENDING record with no claim as a reset."""
+        if isinstance(getattr(self, "engine", None), GossipConsensusEngine):
+            return
+        record = job.to_dict()                    # snapshot now; the job object keeps moving
+        if not getattr(self, "_restart_writes_async", False):
+            self._persist_restart_now(job.job_id, record)
+            return
+        q = getattr(self, "_restart_queue", None)
+        if q is None:
+            import queue as _queue
+            q = self._restart_queue = _queue.Queue()
+            threading.Thread(target=self._restart_writer_loop, name="restart-writer",
+                             daemon=True).start()
+        q.put((job.job_id, record))
+
+    def _restart_writer_loop(self) -> None:
+        while not getattr(self, "shutdown", False):
+            job_id, record = self._restart_queue.get()
+            try:
+                self._persist_restart_now(job_id, record)
+            except Exception as e:                # never let the writer die
+                self.logger.warning(f"RESTART: writer failed on {job_id}: {e}")
+
+    def _persist_restart_now(self, job_id: str, record_out: dict) -> None:
+        """Make a reselection-timeout reset visible to the peers that witnessed a decision.
+
+        The reset above is local. A peer that finalized the job as a PBFT participant holds
+        it as decided and skips every later message for it; it forgets that only on *reset
+        evidence* — a PENDING record stamped after its decision (`_reset_evidence`) — and
+        nothing wrote one. So when the decided leader never selected the job (a proposer that
+        dropped its own winning proposal for a cheaper late one, which then got no votes
+        because the rest of the tier had decided), the job could never reach quorum again and
+        sat PENDING until the run retired it as infeasible: 2 of 600 and 1 of 1800 jobs in the
+        first E0 cells, 2026-10-09. Writing the reset closes that.
+
+        Conditional on the record still being PENDING: a record another agent has already
+        taken (READY/RUNNING/...) means the decision did land, so this agent stands down as a
+        participant instead of re-electing it; a missing record is a withdrawn copy.
+        """
+        seen = {}
+
+        def still_pending(cur) -> bool:
+            seen["record"] = cur
+            return bool(cur) and self._record_is_pending(cur)
+
+        try:
+            if self.repository.save(obj=record_out, key_prefix=Repository.KEY_JOB,
+                                    level=self.topology.level, group=self.topology.group,
+                                    precondition=still_pending):
+                self.restarts_persisted = getattr(self, "restarts_persisted", 0) + 1
+                return
+        except Exception as e:
+            self.logger.warning(f"RESTART: could not persist the reset of {job_id}: {e}")
+            return
+        record = seen.get("record")
+        if self._decided_by_other(record):
+            winner = record.get("leader_id")
+            self.logger.info(f"RESTART: {job_id} is already {record.get('state')} under "
+                             f"agent {winner}; standing down")
+            self._note_decided(job_id)
+            try:
+                self.job_assignments.set(job_id, int(winner))
+            except (TypeError, ValueError):
+                pass
+            self.queues.pending_queue.remove(job_id)
 
     def _is_leader_for_group(self, group_id) -> bool:
         """
@@ -884,7 +1804,8 @@ class ResourceAgent(Agent):
         if not self.topology.children:
             return
 
-        current_time = time.time()
+        current_time = time.time()            # exported with rewards; NOT used for durations
+        now_mono = time.monotonic()
         jobs_to_reassign = []
         jobs_processed = []
         mab_active = self.mab_enabled and self.mab_manager is not None
@@ -913,65 +1834,110 @@ class ResourceAgent(Agent):
                 self.delegated_jobs.remove(job_id)
                 continue
 
-            time_since_delegation = current_time - delegated_at
+            # Monotonic when the delegation recorded it: an NTP step (the slice steps at 0.1 s of
+            # drift) between delegation and now would otherwise move a timeout and the shaped
+            # latency (code review 2026-10-05 §33). Entries without it fall back to wall time.
+            if delegation_info.get('delegated_mono') is not None:
+                time_since_delegation = now_mono - float(delegation_info['delegated_mono'])
+            else:
+                time_since_delegation = current_time - delegated_at
             timed_out = time_since_delegation > self.delegation_timeout_s
+            # Every tick reads every copy, bandit or not. Without a bandit this loop used to
+            # skip a job until `delegation_timeout_s` had passed, so an analytic coordinator
+            # learned that its child had finished up to 600 s late: its record sat READY, the
+            # runner's drain waited on it, and every analytic hierarchical cell ended ~10 min
+            # after its last job (first slice pilot, 2026-10-07). The skip saved nothing — the
+            # prefetch above has already paid the Redis round trip — and every bandit-only step
+            # below is guarded on `mab_active`.
 
-            # When MAB is disabled and timeout hasn't elapsed, skip checking
-            if not mab_active and not timed_out:
-                continue
+            # Read EVERY copy before deciding. With fan-out > 1 this loop used to break on the
+            # first PENDING copy past the timeout even when another group's copy was RUNNING,
+            # then charged a timeout to every group (the executing one included) and pulled the
+            # job back while it ran — a second execution once it was re-delegated (code review
+            # 2026-10-05 §16). Terminal beats in-progress beats unpicked, across all copies.
+            copies = {}
+            for child_group in child_groups:
+                job_data = prefetched.get((job_id, child_group))
+                if job_data:
+                    copies[child_group] = job_data.get('state', ObjectState.PENDING.value)
+            job_found = bool(copies)
+            terminal = [g for g in child_groups
+                        if copies.get(g) in (ObjectState.COMPLETE.value, ObjectState.FAILED.value)]
+            in_progress = [g for g in child_groups
+                           if g in copies and g not in terminal
+                           and copies[g] != ObjectState.PENDING.value]
+            unpicked = [g for g in child_groups if copies.get(g) == ObjectState.PENDING.value]
+            if (terminal or in_progress) and not delegation_info.get('picked'):
+                # A child holds it now and counts it in its own allocations or backlog, which
+                # this coordinator aggregates — stop counting it here (`compute_backlog`).
+                delegation_info = dict(delegation_info, picked=True)
+                if not terminal:
+                    self.delegated_jobs.set(job_id, delegation_info)
 
-            # Check job state in Redis at child level(s)
-            job_still_pending = False
-            job_found = False
             job_complete = False
             job_exit_status = 0
             completed_group = None
+            job_still_pending = False
 
-            for child_group in child_groups:
-                try:
-                    job_data = prefetched.get((job_id, child_group))
+            if terminal:
+                # FAILED is terminal too: `_restore_infeasible_jobs` sets it once a job exhausts
+                # `max_infeasible_retries`, i.e. the group could not run it at all. Testing only
+                # for COMPLETE sent such a job down the in-progress branch, where it waited out
+                # the timeout and the execution grace and was dropped with no outcome — losing
+                # exactly the signal C1 is about (`runs/smoke-g4-bandit`, 2 of 400 jobs).
+                completed_group = terminal[0]
+                job_data = prefetched.get((job_id, completed_group))
+                job_complete = True
+                job_exit_status = (1 if copies[completed_group] == ObjectState.FAILED.value
+                                   else int(job_data.get('exit_status', 0) or 0))
+                self.logger.debug(
+                    f"Delegated job {job_id} {copies[completed_group]} at child group "
+                    f"{completed_group}, exit_status={job_exit_status}")
+                jobs_processed.append((job_id, job_exit_status))
+            elif in_progress:
+                # Picked up by a child, not finished. Since P0-9 the child persists RUNNING for
+                # the job's whole execution, so this can legitimately outlast
+                # `delegation_timeout_s` (which bounds selection, not execution).
+                if (time_since_delegation > self.delegation_timeout_s + self.delegation_exec_grace_s
+                        and not delegation_info.get('bandit_closed')):
+                    self.logger.warning(
+                        f"Delegated job {job_id} still {copies[in_progress[0]]} at child group "
+                        f"{in_progress[0]} {time_since_delegation:.0f}s after delegation "
+                        f"(grace {self.delegation_exec_grace_s:.0f}s past the "
+                        f"{self.delegation_timeout_s:.0f}s timeout) — closing its bandit "
+                        f"outcome; still watching for its completion")
+                    # NOT a completion: the parent record is left as it is (§17 — writing
+                    # COMPLETE here recorded a job nobody finished, and if its group died the
+                    # job was lost under a COMPLETE label). Nor is it the end of tracking: this
+                    # used to drop the job, so its completion was never propagated, this tier's
+                    # record stayed READY for the rest of the run and the runner's in-flight
+                    # drain waited 600 s on it and stopped TRUNCATED — a leaf that queued a
+                    # delegated job for 11 min (pilot ee76e05b, 3 jobs; PBFT+LinUCB runs 1 and 4
+                    # of the 3482e92c campaign, 5 and 29). Only the bandit's window closes here:
+                    # a late completion still reaches this record, and the bandit hears nothing.
+                    delegation_info = dict(delegation_info, bandit_closed=True)
+                    self.delegated_jobs.set(job_id, delegation_info)
+            elif unpicked and timed_out:
+                job_still_pending = True
+                self.logger.warning(
+                    f"Delegated job {job_id} still PENDING at level {self.topology.level - 1}, "
+                    f"groups {unpicked} after {time_since_delegation:.1f}s "
+                    f"(timeout: {self.delegation_timeout_s:.1f}s)")
 
-                    if job_data:
-                        job_found = True
-                        job_state = job_data.get('state', ObjectState.PENDING.value)
-
-                        if job_state == ObjectState.COMPLETE.value:
-                            job_complete = True
-                            completed_group = child_group
-                            job_exit_status = int(job_data.get('exit_status', 0))
-                            self.logger.debug(
-                                f"Delegated job {job_id} COMPLETE at child group {child_group}, "
-                                f"exit_status={job_exit_status}"
-                            )
-                            jobs_processed.append(job_id)
-                            break
-                        elif job_state == ObjectState.PENDING.value:
-                            if timed_out:
-                                job_still_pending = True
-                                self.logger.warning(
-                                    f"Delegated job {job_id} still PENDING at level {self.topology.level - 1}, "
-                                    f"group {child_group} after {time_since_delegation:.1f}s "
-                                    f"(timeout: {self.delegation_timeout_s:.1f}s)"
-                                )
-                                break
-                        else:
-                            # Job in progress (READY, RUNNING, etc.) — not yet done
-                            if timed_out:
-                                # Job was picked up but hasn't finished — processed
-                                self.logger.debug(
-                                    f"Delegated job {job_id} processed by children (state: {job_state})"
-                                )
-                                jobs_processed.append(job_id)
-
-                except Exception as e:
-                    self.logger.error(
-                        f"Error checking delegated job {job_id} at level {self.topology.level - 1}, "
-                        f"group {child_group}: {e}"
-                    )
+            # Once one group has the job, the others' unpicked copies are duplicates waiting to
+            # happen: withdraw them. (Children drop a job whose record vanished — §15.)
+            if (terminal or in_progress) and unpicked:
+                kept = self._withdraw_child_copies(job_id, unpicked)
+                gone = [g for g in unpicked if g not in kept]
+                delegation_info = dict(delegation_info,
+                                       groups=[g for g in child_groups if g not in gone])
+                if job_id not in [j for j, _ in jobs_processed]:
+                    self.delegated_jobs.set(job_id, delegation_info)
 
             # Feed MAB reward for completed jobs — credit the group where
             # completion was observed (works for any top_k)
-            if mab_active and job_complete and completed_group is not None:
+            if (mab_active and job_complete and completed_group is not None
+                    and not delegation_info.get('bandit_closed')):
                 success = (job_exit_status == 0)
                 latency_s = time_since_delegation if delegated_at else None
                 reward = self.mab_manager.report_outcome(
@@ -984,9 +1950,14 @@ class ResourceAgent(Agent):
             if timed_out and (not job_found or job_still_pending):
                 jobs_to_reassign.append((job_id, delegation_info, time_since_delegation))
 
-        for job_id in jobs_processed:
+        for job_id, exit_status in jobs_processed:
             self.delegated_jobs.remove(job_id)
-            # Propagate completion to L1: mark the parent-level job as COMPLETE
+            if exit_status is None:
+                continue            # grace drop: no outcome to record (see above)
+            # Propagate completion to this tier's record, WITH the outcome. Only `state` was
+            # copied, so a parent record read COMPLETE with exit_status 0 for a job its child
+            # failed — and in a three-level fleet the tier above reads this record, so its
+            # bandit was credited a success for every delegated job (§17).
             try:
                 parent_job_data = self.repository.get(
                     obj_id=job_id,
@@ -996,6 +1967,7 @@ class ResourceAgent(Agent):
                 )
                 if parent_job_data:
                     parent_job_data['state'] = ObjectState.COMPLETE.value
+                    parent_job_data['exit_status'] = int(exit_status)
                     self.repository.save(
                         obj=parent_job_data,
                         key_prefix=Repository.KEY_JOB,
@@ -1004,7 +1976,7 @@ class ResourceAgent(Agent):
                     )
                     self.logger.info(
                         f"Delegated job {job_id} completed at child level — "
-                        f"marked COMPLETE at level {self.topology.level}"
+                        f"marked COMPLETE (exit={exit_status}) at level {self.topology.level}"
                     )
             except Exception as e:
                 self.logger.error(
@@ -1024,6 +1996,151 @@ class ResourceAgent(Agent):
                         (current_time, reward)
                     )
             self._reassign_delegated_job(job_id, delegation_info, time_since_delegation)
+
+    def _delegate_to_children(self, job: Job, capable_groups) -> None:
+        """Hand a job this coordinator won to its child groups: record where it went, write
+        the child copies, then (only then) update local state and start monitoring it."""
+        job_id = job.job_id
+        selected_groups = self._delegate_child_groups(job, capable_groups)
+
+        # This tier's record says where the job went, BEFORE any child copy
+        # exists: a peer coordinator that finds it after this agent dies can
+        # then tell "the children have it" from "it never left the tier"
+        # (§13). Written first so a failure below leaves a record naming
+        # groups that have no copy — which the recovery path treats as
+        # never-left — rather than child copies no record points at.
+        job.delegated_groups = list(selected_groups)
+        self.repository.save(obj=job.to_dict(), key_prefix=Repository.KEY_JOB,
+                             level=self.topology.level,
+                             group=self.topology.group)
+
+        # The child copy is a SEPARATE object. This used to set level and
+        # state on `job` itself — the object still sitting in this agent's
+        # pending queue until the next READY scan — so for up to a tick the
+        # selection loop saw a PENDING job it had just delegated and proposed
+        # it again (§20).
+        child = Job()
+        child.from_dict(job.to_dict())
+        child.delegated_groups = []
+        child.level = self.topology.level - 1
+        child.state = ObjectState.PENDING
+        child.mark_submitted()
+        child.mark_assigned()
+
+        for child_group in selected_groups:
+            self.repository.save(
+                obj=child.to_dict(),
+                key_prefix=Repository.KEY_JOB,
+                level=self.topology.level - 1,
+                group=child_group
+            )
+            self.logger.debug(
+                f"Delegated job {job_id} to level {self.topology.level - 1}, "
+                f"group {child_group}")
+
+        # Local state only after every write landed (§19): a raise above
+        # leaves the job in selected_queue for the next pass.
+        self.queues.selected_queue.remove(job_id)
+
+        # Track delegated job for monitoring
+        self.delegated_jobs.set(job_id, {
+            'delegated_at': time.time(),
+            'delegated_mono': time.monotonic(),
+            'groups': selected_groups,
+            # Counted in this coordinator's backlog until a child picks the job up
+            # (`compute_backlog`); `_monitor_delegated_jobs` sets 'picked'.
+            'capacities': job.capacities.to_dict() if job.capacities else {},
+        })
+
+        self.logger.debug(
+            f"Tracking delegated job {job_id} for monitoring "
+            f"(timeout: {self.delegation_timeout_s:.1f}s)"
+        )
+
+    @property
+    def refusal_retries_max(self) -> int:
+        """`runtime.execution.refusal_retries`: how many times a job refused for a transient
+        reason is returned to the pool before the refusal is recorded as its outcome."""
+        cfg = (self.runtime_config.get("execution") or {}) if self.runtime_config else {}
+        return max(0, int(cfg.get("refusal_retries", 3)))
+
+    def _retry_refused(self, job: Job) -> bool:
+        """Return a job whose execution was refused for a TRANSIENT reason to the pool.
+
+        A transient refusal — an input whose producer or staging site could not be reached, a
+        fetch past its deadline, a registry lookup that failed — used to be persisted as the
+        job's outcome (exit 1, COMPLETE), so one network hiccup failed the job and gated its
+        whole subtree for the rest of the run. Now the job goes back to PENDING with its claim
+        released, so it is re-elected, possibly onto an agent that can reach the producer. The
+        attempt count rides on the job record so the cap holds across agents; past it the
+        refusal is recorded as before. True when the job was returned to the pool.
+        """
+        job_id = job.job_id
+        if job.refusal_retries >= self.refusal_retries_max:
+            self.logger.warning(
+                f"[REFUSAL] {job_id} refused again ({job.refusal_reason}); "
+                f"{job.refusal_retries} retries used, recording the refusal")
+            return False
+        # Release, re-record and forget as one reset under the job's election lock.
+        with self._election_lock(job_id):
+            job.refusal_retries += 1
+            job.state = ObjectState.PENDING
+            job.leader_id = None
+            job.exit_status = None
+            try:
+                # Release the claim BEFORE the record says PENDING. The other order left a window
+                # in which a peer saw PENDING, re-elected the job, and its CAS still returned this
+                # agent — so every peer took the participant path and nobody ran it. Releasing
+                # first is safe: nobody elects a job whose record still reads COMPLETE.
+                self.repository.release_assignment(job_id, level=self.topology.level,
+                                                   group=self.topology.group)
+                self.repository.save(obj=job.to_dict(), key_prefix=Repository.KEY_JOB,
+                                     level=self.topology.level, group=self.topology.group)
+            except Exception as e:
+                # Could not put it back: record the refusal instead (the completion write has its
+                # own retry queue), rather than leave a job nobody holds.
+                self.logger.error(f"[REFUSAL] could not return {job_id} to the pool ({e}); "
+                                  f"recording the refusal")
+                job.refusal_retries -= 1
+                job.state = ObjectState.COMPLETE
+                job.exit_status = 1
+                return False
+            self.queues.ready_queue.remove(job_id)
+            with self.completed_lock:
+                self.completed_jobs_set.discard(job_id)
+            self._forget_decided(job_id)
+        self.metrics.refusal_retries += 1
+        self.logger.warning(
+            f"[REFUSAL] {job_id} refused for a transient reason ({job.refusal_reason}); "
+            f"returned to the pool (retry {job.refusal_retries}/{self.refusal_retries_max})")
+        if not self.queues.ready_queue.gets():
+            self.start_idle()
+        return True
+
+    def _withdraw_child_copies(self, job_id: str, groups) -> list:
+        """Delete this job's still-PENDING child-tier records in `groups`; return the groups
+        whose copy could NOT be withdrawn because a child picked it up first (or the delete
+        failed). The delete is conditional on the copy still being PENDING — an unconditional
+        delete raced a child saving READY and withdrew a copy that was already running. Each
+        group's agents drop a withdrawn copy on their next scans (`_purge_vanished_jobs`), and
+        `select_job` refuses to re-create one (`require_existing`)."""
+        kept = []
+        for child_group in groups:
+            try:
+                if not self.repository.delete_if_state(
+                        job_id, ObjectState.PENDING, key_prefix=Repository.KEY_JOB,
+                        level=self.topology.level - 1, group=child_group):
+                    kept.append(child_group)
+                else:
+                    # The deleted copy is in no export; this is when it stopped being in
+                    # flight in that group (context error, T-5).
+                    self.metrics.delegation_withdrawals.append(
+                        (str(job_id), int(child_group), time.time()))
+            except Exception as e:
+                kept.append(child_group)
+                self.logger.error(
+                    f"Error withdrawing job {job_id} from child group {child_group}: {e}")
+        return kept
 
     def _reassign_delegated_job(self, job_id: str, delegation_info: dict, time_since_delegation: float):
         """
@@ -1069,6 +2186,17 @@ class ResourceAgent(Agent):
                 self.delegated_jobs.remove(job_id)
                 return
 
+            # Withdraw the unpicked copies BEFORE anything is put back up for election, and only
+            # while they are still PENDING. A child that picked the job up since the monitor
+            # looked owns it now: pulling it back here as well would run it twice. Keep
+            # tracking it instead; the monitor will see the picked copy next tick.
+            kept = self._withdraw_child_copies(job_id, child_groups)
+            if kept:
+                self.logger.info(
+                    f"Delegated job {job_id} was picked up by child group(s) {kept} while being "
+                    f"pulled back; leaving it with them")
+                return
+
             # Mark job with a flag to prevent proposing for it
             # This prevents the parent from competing with children
             if not hasattr(job_obj, 'delegation_failed'):
@@ -1108,55 +2236,86 @@ class ResourceAgent(Agent):
                         )
                     except Exception:
                         pass
+                # Recorded like a timeout reassignment. The child copies are deleted, so this
+                # record is the only evidence of when they stopped being in flight; without it
+                # the context-error column (T-5) cannot end those copies and refuses to score
+                # every later decision on their groups.
+                self.metrics.delegation_reassignments[job_id] = {
+                    'reassigned_at': time.time(),
+                    'time_at_child_level': time_since_delegation,
+                    'child_groups': child_groups,
+                    'delegation_failed_count': fail_count,
+                    'reason': 'infeasible_after_max_attempts',
+                }
                 return
 
-            # Reset job state to PENDING for parent level
-            job_obj.state = ObjectState.PENDING
-
-            # Add back to parent's pending queue if not already there
-            if job_id not in self.queues.pending_queue:
-                self.queues.pending_queue.add(job_obj)
-                self.logger.info(
-                    f"Re-added delegated job {job_id} to parent queue "
-                    f"(was stuck at child level for {time_since_delegation:.1f}s)"
-                )
-            else:
-                # Update the existing job in the queue
-                existing_job = self.queues.pending_queue.get(job_id)
-                if existing_job:
-                    existing_job.delegation_failed = job_obj.delegation_failed
-                    existing_job.delegation_failed_count = job_obj.delegation_failed_count
-                    existing_job.add_delegation_failed_agents(self.agent_id)
-
-            # Remove from child level(s) in Redis to avoid duplicate processing
-            for child_group in child_groups:
+            # The whole take-back under the job's election lock: forget, release the claim, put
+            # the record back. A Snow decision for the old election either lands before it (and
+            # is undone by it) or after it (and is dropped as obsolete) — never between the
+            # release and the forget, where it would re-claim the job for this coordinator,
+            # which has just barred itself from it.
+            with self._election_lock(job_id):
+                # Reset job state to PENDING for parent level — and forget that it was decided, or
+                # the fresh election's messages are skipped as stragglers of the old one.
+                job_obj.state = ObjectState.PENDING
+                job_obj.delegated_groups = []
+                self._forget_decided(job_id)
+                # And release the exactly-once claim, which still names THIS coordinator. Under
+                # Snow every re-finalization otherwise returned this agent from the CAS — which has
+                # just barred itself via `delegation_failed_agents` and will never propose — so
+                # every peer took the participant path, nobody ran `select_job`, and under
+                # `coordinator_cost_matrix: self` the job was retired FAILED after
+                # `max_infeasible_retries`: a feasible job lost per delegation timeout (§14).
                 try:
-                    # Delete from child level
-                    self.repository.delete(
-                        obj_id=job_id,
-                        key_prefix=Repository.KEY_JOB,
-                        level=self.topology.level - 1,
-                        group=child_group
+                    self.repository.release_assignment(job_id, level=self.topology.level,
+                                                       group=self.topology.group)
+                except Exception as e:
+                    self.logger.error(f"Could not release the assignment claim on {job_id}: {e}")
+
+                # Add back to parent's pending queue if not already there
+                if job_id not in self.queues.pending_queue:
+                    self.queues.pending_queue.add(job_obj)
+                    self.logger.info(
+                        f"Re-added delegated job {job_id} to parent queue "
+                        f"(was stuck at child level for {time_since_delegation:.1f}s)"
                     )
-                    self.logger.debug(
-                        f"Removed job {job_id} from child level {self.topology.level - 1}, group {child_group}"
-                    )
+                else:
+                    # Update the existing job in the queue
+                    existing_job = self.queues.pending_queue.get(job_id)
+                    if existing_job:
+                        existing_job.delegation_failed = job_obj.delegation_failed
+                        existing_job.delegation_failed_count = job_obj.delegation_failed_count
+                        existing_job.add_delegation_failed_agents(self.agent_id)
+
+                # Remove from child level(s) in Redis to avoid duplicate processing
+                for child_group in child_groups:
+                    try:
+                        # Delete from child level
+                        self.repository.delete(
+                            obj_id=job_id,
+                            key_prefix=Repository.KEY_JOB,
+                            level=self.topology.level - 1,
+                            group=child_group
+                        )
+                        self.logger.debug(
+                            f"Removed job {job_id} from child level {self.topology.level - 1}, group {child_group}"
+                        )
+                    except Exception as e:
+                        self.logger.error(
+                            f"Error removing job {job_id} from child group {child_group}: {e}"
+                        )
+                # Add to redis for parent's level to be picked for consensus again
+                try:
+                    self.repository.save(obj=job_obj.to_dict(), key_prefix=Repository.KEY_JOB,
+                                         level=self.topology.level, group=self.topology.group)
                 except Exception as e:
                     self.logger.error(
-                        f"Error removing job {job_id} from child group {child_group}: {e}"
+                        f"Error adding job {job_id} to parent's group {self.topology.group} level: {self.topology.level}: {e}"
                     )
-            # Add to redis for parent's level to be picked for consensus again
-            try:
-                self.repository.save(obj=job_obj.to_dict(), key_prefix=Repository.KEY_JOB,
-                                     level=self.topology.level, group=self.topology.group)
-            except Exception as e:
-                self.logger.error(
-                    f"Error adding job {job_id} to parent's group {self.topology.group} level: {self.topology.level}: {e}"
-                )
-                traceback.format_exc()
+                    traceback.format_exc()
 
-            # Remove from delegated tracking
-            self.delegated_jobs.remove(job_id)
+                # Remove from delegated tracking
+                self.delegated_jobs.remove(job_id)
 
             self.metrics.delegation_reassignments[job_id] = {
                 'reassigned_at': time.time(),
@@ -1191,6 +2350,7 @@ class ResourceAgent(Agent):
             level=self.topology.level,
             groups=[self.topology.group]
         )
+        self._neighbors_refreshed_mono = time.monotonic()
 
     def _refresh_children(self, current_time: float):
         """
@@ -1222,6 +2382,19 @@ class ResourceAgent(Agent):
         Updates the target map with agents that are fresh and present in Redis,
         and removes agents that are stale or no longer in the store.
 
+        Staleness is ONE test — ``current_time - last_updated > peer_expiry_seconds`` — and it
+        applies to existing entries as well as new ones. Until 2026-09-20 it applied only at
+        insertion: an existing entry was *updated* when Redis had a fresher record and *removed*
+        only when the key was gone, and the key's TTL is ``2 × peer_expiry_seconds`` (600 s
+        shipped). A child that died therefore stayed in ``children`` for ten minutes with a frozen
+        record whose headroom read idle, ``_get_live_child_groups`` did not gate it, and the
+        bandit was steered away from the dead group only by its own delegation timeouts — so
+        F5 "time-to-re-adoption" measured timeout learning plus Redis TTL, not liveness
+        detection (code review 2026-09-18, §5). The test uses the record's own wall-clock
+        stamp against this host's, as the insertion path always has: the offsets measured on
+        the slice (≤1.1 s) are noise against a 300 s threshold, and a record whose clock is off
+        by more than the threshold is already refused at insertion, so this adds no failure mode.
+
         :param current_time: The current timestamp for evaluating staleness.
         :type current_time: float
         :param target_dict: A thread-safe dictionary mapping agent IDs to AgentInfo objects.
@@ -1232,6 +2405,7 @@ class ResourceAgent(Agent):
         :type groups: list[int]
         """
         active_ids = set()
+        stale_after = self._staleness_eviction_threshold(level)
 
         for group in groups:
             agent_dicts = self.repository.get_all_objects(
@@ -1242,8 +2416,10 @@ class ResourceAgent(Agent):
             for agent_data in agent_dicts:
                 agent = AgentInfo.from_dict(agent_data)
 
-                # Skip agents that have been marked as failed
-                if agent.agent_id in self.failed_agents:
+                # Skip agents that have been marked as failed, unless the record is a heartbeat
+                # written after the verdict — then the peer is back and rejoins here.
+                if (agent.agent_id in self.failed_agents
+                        and not self._readmit_if_heartbeat_resumed(agent)):
                     self.logger.debug(
                         f"Skipping failed agent {agent.agent_id} during neighbor refresh "
                         f"(failed at {self.failed_agents.get(agent.agent_id)})"
@@ -1276,6 +2452,7 @@ class ResourceAgent(Agent):
                     time_since_update = current_time - agent.last_updated
                     if time_since_update <= self.peer_expiry_seconds:
                         target_dict.set(agent.agent_id, agent)
+                        self._note_agent_seen(agent.agent_id)
                         self.logger.debug(
                             f"Added new agent {agent.agent_id} to map "
                             f"(last_updated: {time_since_update:.1f}s ago)"
@@ -1288,15 +2465,73 @@ class ResourceAgent(Agent):
                 elif agent.last_updated > existing.last_updated:
                     # Existing agent - update with newer data from Redis
                     target_dict.set(agent.agent_id, agent)
+                    # Stamped only when the record is genuinely FRESHER. Re-reading the same
+                    # record must not refresh the local stamp, or a peer that went silent
+                    # would keep reporting an age of zero and the staleness metric would say
+                    # the coordinator's view is perfect right up until the peer is evicted.
+                    self._note_agent_seen(agent.agent_id)
+                elif agent.agent_id != self.agent_id \
+                        and current_time - existing.last_updated > stale_after:
+                    # Existing agent whose record has stopped moving: the key is still in
+                    # Redis (TTL is twice the expiry threshold) but the peer is not writing
+                    # it. Evict it here rather than when the key expires, and drop it from
+                    # active_ids so the sweep below does not read "present in Redis" as alive.
+                    # The insertion path above refuses a record this old, so it will not be
+                    # re-added until the peer writes a fresh one — which is exactly a rejoin.
+                    active_ids.discard(agent.agent_id)
+                    target_dict.remove(agent.agent_id)
+                    self._agent_seen_at.pop(agent.agent_id, None)
+                    self.logger.warning(
+                        f"Removed stale agent {agent.agent_id} from map (level {level}, "
+                        f"group {agent.group}): no update for "
+                        f"{current_time - existing.last_updated:.1f}s, "
+                        f"threshold {stale_after:.1f}s; key still in Redis"
+                    )
 
         # Remove agents from map that are no longer active in Redis
         # (but keep agents that are still being processed/committed)
         for agent_id in list(target_dict.keys()):
             if agent_id != self.agent_id and agent_id not in active_ids:
                 target_dict.remove(agent_id)
+                self._agent_seen_at.pop(agent_id, None)
                 self.logger.info(
                     f"Removed agent {agent_id} from map (no longer in Redis)"
                 )
+
+    def _staleness_eviction_threshold(self, level: int) -> float:
+        """How long an existing map entry may go without a fresher Redis record before it is
+        evicted.
+
+        `peer_expiry_seconds` for a child tier. For this agent's OWN tier it is floored at the
+        failure detector's threshold plus its jitter headroom, because `_detect_failed_agents`
+        scans `neighbor_map` and is the only thing that reassigns a dead peer's jobs: evicting
+        an entry before the detector has judged it would remove the peer silently, no failure
+        would ever be recorded, and every job that peer held would be stranded for the run —
+        the defect closed on 2026-09-15, reopened from the other end. The shipped config
+        already orders them safely (60 s detection, 300 s expiry), but nothing enforced it, and
+        `peer_expiry_seconds` has been silently 45 s before now (the duplicate-key bug), which
+        is exactly the inverted order. The detector's jitter reaches 1.1x, plus one tick of
+        slack so a threshold equal on paper does not race.
+        """
+        base = float(self.peer_expiry_seconds)
+        if level != self.topology.level:
+            return base
+        return max(base, self._detector_window_s())
+
+    def _detector_window_s(self) -> float:
+        """How long a peer may go without a fresher record before the failure detector has
+        judged it: `failure_threshold_seconds` with the detector's 1.1x jitter plus one tick.
+        One definition for the own-tier eviction floor and the child-group liveness gate."""
+        return float(self.failure_threshold_seconds) * 1.1 + 1.0
+
+    def _note_agent_seen(self, agent_id: int) -> None:
+        """Record, on this agent's own monotonic clock, that a fresher record arrived.
+
+        `time.monotonic()`, not `time.time()`: these values are only ever subtracted from
+        another monotonic reading taken in this same process, and monotonic is the only
+        clock an NTP step cannot move.
+        """
+        self._agent_seen_at[agent_id] = time.monotonic()
 
     def _generate_agent_info(self) -> AgentInfo:
         """
@@ -1330,6 +2565,7 @@ class ResourceAgent(Agent):
                 capacity_allocations=self.capacity_allocations,
                 load=self._load,
                 proposed_load=proposed_load,
+                capacity_backlog=self.compute_backlog(),
                 last_updated=current_time,
                 dtns=self.config.get("dtns"),
                 quantum_backend=self.quantum_backend,
@@ -1341,6 +2577,7 @@ class ResourceAgent(Agent):
         else:
             total_capacities = Capacities()
             total_allocations = Capacities()
+            total_backlog = self.compute_backlog()   # own undelegated + unpicked delegations
             max_child_capacity = None  # Track max capacity across all children
 
             # Aggregate DTNs with proper connectivity score averaging
@@ -1358,6 +2595,7 @@ class ResourceAgent(Agent):
                     continue
                 total_capacities += child.capacities
                 total_allocations += child.capacity_allocations
+                total_backlog += child.capacity_backlog or Capacities()
 
                 # Compute element-wise maximum capacity across children
                 if max_child_capacity is None:
@@ -1403,6 +2641,7 @@ class ResourceAgent(Agent):
                 agent_id=self.agent_id,
                 capacities=total_capacities,
                 capacity_allocations=total_allocations,
+                capacity_backlog=total_backlog,
                 max_child_capacity=max_child_capacity,  # Set max capacity for hierarchical feasibility
                 load=self._load,
                 last_updated=current_time,
@@ -1418,29 +2657,65 @@ class ResourceAgent(Agent):
 
     def _agent_key_ttl_s(self) -> int:
         """TTL for this agent's Redis key: comfortably above the peer-expiry threshold
-        (refreshed every ~0.5s tick, so only a dead agent's key ever expires)."""
+        (refreshed every ~0.5s tick, so only a dead agent's key ever expires).
+
+        Also floored at twice the own-tier eviction threshold (§G). A peer whose key expires is
+        gone from the next Redis refresh, so a TTL below the failure detector's threshold lets a
+        dead peer vanish before `_detect_failed_agents` has judged it — no failure recorded, its
+        jobs stranded. The shipped 300 s expiry / 60 s detection is safe; nothing enforced it."""
         expiry = int(self.runtime_config.get("peer_expiry_seconds", 300))
-        return max(60, expiry * 2)
+        detector = float(self.failure_threshold_seconds) * 1.1 + 1.0
+        return int(max(60, expiry * 2, math.ceil(detector * 2)))
+
+    def _neighbor_refresh_full_s(self) -> float:
+        """`runtime.neighbor_refresh_full_s`, resolved in one place: 5 s with gossip, every
+        tick (0) without."""
+        default = 5.0 if getattr(self, "gossip", None) is not None else 0.0
+        return float(self.runtime_config.get("neighbor_refresh_full_s", default))
 
     def _should_full_neighbor_refresh(self, now: float) -> bool:
         """Full (Redis) neighbor refresh cadence. Per-tick without gossip (status quo);
         with gossip enabled the default drops to 5s — gossip keeps `load` fresh in
         between, and liveness is SWIM's job anyway (5s lag is far under the 45-300s
         peer-expiry threshold)."""
-        default = 5.0 if self.gossip is not None else 0.0
-        interval = float(self.runtime_config.get("neighbor_refresh_full_s", default))
+        interval = self._neighbor_refresh_full_s()
         last = getattr(self, "_last_full_neighbor_refresh", 0.0)
         if now - last >= interval:
             self._last_full_neighbor_refresh = now
             return True
         return False
 
+    _GOSSIP_DIMS = (("cpu", "core"), ("ram", "ram"), ("disk", "disk"), ("gpu", "gpu"))
+
+    @classmethod
+    def _gossip_utilization(cls, info: AgentInfo) -> dict:
+        """Per-resource utilization and backlog of `info`, in percent of its capacity, for the
+        gossip entry. Read from the agent's full AgentInfo, NOT `self.capacity_allocations`:
+        for a coordinator that property is its own (empty) ready queue while its capacity is
+        its children's sum, so the legacy publish reads 0 % for every coordinator."""
+        cap = info.capacities or Capacities()
+        alloc = info.capacity_allocations or Capacities()
+        backlog = info.capacity_backlog or Capacities()
+        out = {}
+        for prefix, dim in cls._GOSSIP_DIMS:
+            total = float(getattr(cap, dim, 0) or 0)
+            out[f"{prefix}_util"] = float(getattr(alloc, dim, 0) or 0) / total * 100.0 if total else 0.0
+            out[f"{prefix}_backlog"] = float(getattr(backlog, dim, 0) or 0) / total * 100.0 if total else 0.0
+        return out
+
     def _apply_gossip_overlay(self) -> None:
         """Refresh the fast-changing `load` on neighbor_map entries from the gossip
         cache. Gossip propagates in ~1-2 epidemic rounds, so between full refreshes
-        selection costs use FRESHER load than the old per-tick Redis poll provided."""
+        selection costs use FRESHER load than the old per-tick Redis poll provided.
+
+        Under the `utilization` cost model the per-resource allocations and backlog are
+        refreshed the same way, rebuilt from the percentages against the capacity this agent
+        already holds for the peer — they are what that model prices, and the full refresh is
+        5 s apart. New objects, never mutated in place: a copy taken for batch assignment
+        shares them."""
         if self.gossip is None:
             return
+        utilization = self.cost_model == "utilization"
         try:
             for entry in self.gossip.snapshot():
                 if entry.agent_id == self.agent_id:
@@ -1448,6 +2723,14 @@ class ResourceAgent(Agent):
                 info = self.neighbor_map.get(entry.agent_id)
                 if info is not None:
                     info.load = float(entry.load)
+                    if utilization and info.capacities is not None:
+                        alloc, backlog = {}, {}
+                        for prefix, dim in self._GOSSIP_DIMS:
+                            total = float(getattr(info.capacities, dim, 0) or 0)
+                            alloc[dim] = float(getattr(entry, f"{prefix}_util", 0) or 0) * total / 100.0
+                            backlog[dim] = float(getattr(entry, f"{prefix}_backlog", 0) or 0) * total / 100.0
+                        info.capacity_allocations = Capacities(**alloc)
+                        info.capacity_backlog = Capacities(**backlog)
         except Exception as exc:
             self.logger.debug(f"[gossip] overlay failed: {exc}")
 
@@ -1471,28 +2754,38 @@ class ResourceAgent(Agent):
         # Refresh our own gossip entry every tick so peers' TTLs don't expire us.
         if self.gossip is not None:
             try:
-                cap = self._capacities
-                alloc = self.capacity_allocations
-                self.gossip.publish_local(
-                    cpu_util=(alloc.core / cap.core * 100.0) if cap.core else 0.0,
-                    ram_util=(alloc.ram / cap.ram * 100.0) if cap.ram else 0.0,
-                    disk_util=(alloc.disk / cap.disk * 100.0) if cap.disk else 0.0,
-                    load=float(self._load),
-                )
+                if self.cost_model == "utilization" and self.last_agent_info is not None:
+                    self.gossip.publish_local(**self._gossip_utilization(self.last_agent_info),
+                                              load=float(self._load))
+                else:
+                    cap = self._capacities
+                    alloc = self.capacity_allocations
+                    self.gossip.publish_local(
+                        cpu_util=(alloc.core / cap.core * 100.0) if cap.core else 0.0,
+                        ram_util=(alloc.ram / cap.ram * 100.0) if cap.ram else 0.0,
+                        disk_util=(alloc.disk / cap.disk * 100.0) if cap.disk else 0.0,
+                        load=float(self._load),
+                    )
             except Exception as exc:
                 self.logger.debug(f"[gossip] publish_local failed: {exc}")
 
+        self._export_textfile_metrics()
+        self._retry_unpublished_data()
+        self._retry_stage_out()
+        self._retry_unpersisted_completions()
         self._restart_selection()
         self._monitor_delegated_jobs()
         current_time = int(time.time())
         self._refresh_children(int(current_time))
         self._init_mab()
+        self._warn_if_delegation_cannot_choose()
 
         # Detect and handle agent failures
         failed_agents = self._detect_failed_agents(current_time)
         if failed_agents:
             self._remove_failed_agents(failed_agents)
             self._check_failure_threshold()
+        self._resweep_failed_agent_jobs(current_time)
 
         agent_info = self._generate_agent_info()
         self.last_agent_info = agent_info  # snapshot reused by inbound hot paths
@@ -1517,11 +2810,16 @@ class ResourceAgent(Agent):
         group = self.topology.group
         state_map = self.repository.get_all_ids_multi(
             key_prefix=Repository.KEY_JOB, level=self.topology.level,
-            group=group, states=[ObjectState.PENDING.value, ObjectState.READY.value,
-                                 ObjectState.COMPLETE.value])
+            group=group, states=list(SCAN_STATES))
         self._update_pending_jobs(jobs=state_map.get(ObjectState.PENDING.value, []))
         self._update_ready_jobs(jobs=state_map.get(ObjectState.READY.value, []))
-        self._update_completed_jobs(jobs=state_map.get(ObjectState.COMPLETE.value, []))
+        self._purge_vanished_jobs(present={j for ids in state_map.values() for j in ids})
+        self._adopt_unannounced_claims()
+        # A job a peer has scheduled is persisted RUNNING until it finishes (P0-9); for
+        # consensus purposes it is as settled as a COMPLETE one, so both feed the dedupe set.
+        self._update_completed_jobs(
+            jobs=state_map.get(ObjectState.RUNNING.value, [])
+            + state_map.get(ObjectState.COMPLETE.value, []))
 
         if self.debug:
             self.save_consensus_votes()
@@ -1546,6 +2844,7 @@ class ResourceAgent(Agent):
                 f"inbound_q={self.queues.message_queue.qsize()}",
                 f"msgs_dropped={self.messages_dropped}",
                 f"pending_consensus_dropped={self.pending_consensus_dropped}",
+                f"pending_consensus_expired={self.pending_consensus_expired}",
                 f"watch_retries={self.repository.watch_retries}/{self.repository.saves} saves",
             ]
             t = getattr(self, "transport", None)
@@ -1556,6 +2855,67 @@ class ResourceAgent(Agent):
                     f"bcast_dropped={getattr(t, 'bcast_sends_dropped', 0)}")
             if isinstance(self.engine, GossipConsensusEngine):
                 parts.append(f"snow_sends_dropped={self.engine.sends_dropped}")
+            # How often this agent could answer a peer's consensus query from its own decision
+            # plane rather than abstaining. On the LLM plane a low rate means the fleet is
+            # deciding with few real LLM-vs-LLM comparisons, which is what E4 needs to report.
+            hits = getattr(self, "llm_wire_cost_hits", None)
+            if hits is not None:
+                misses = getattr(self, "llm_wire_cost_misses", 0)
+                total = hits + misses
+                parts.append(f"wire_cost_hit_rate={(hits / total if total else 0.0):.2f} "
+                             f"({hits}/{total})")
+            # Bid spread. A plane whose bids nearly all tie cannot be ordering agents, whatever
+            # else a run shows — 59%/92% modal share is what made the LLM's output near-inert.
+            dist = getattr(self, "bid_distribution", None)
+            if callable(dist):
+                d = dist()
+                if d["count"]:
+                    parts.append(f"bids={d['count']} distinct={d['distinct']} "
+                                 f"modal_share={d['modal_share']:.2f}")
+            pacing = getattr(self, "bid_pacing_stats", None)
+            if callable(pacing):
+                pc = pacing()
+                if pc["mode"] != "none":
+                    parts.append(f"pacing={pc['mode']} target={pc['target']}s "
+                                 f"waits={pc['waits']} held={pc['seconds']}s")
+            # Delegation decisions the model actually made, and how often it could not. A
+            # coordinator whose fallback count dominates is running the bandit under an LLM
+            # label, which would otherwise only show up in post-hoc analysis.
+            deleg = getattr(self, "delegation_stats", None)
+            if callable(deleg):
+                dg = deleg()
+                if dg["policy"] != "bandit":
+                    parts.append(f"delegate={dg['policy']} calls={dg['calls']}/{dg['attempts']} "
+                                 f"fallbacks={dg['fallbacks']} empty={dg['empty']} "
+                                 f"trivial={dg['trivial']} filled={dg['filled']} "
+                                 f"mean={dg['mean_s']}s")
+                    if dg.get("disabled"):
+                        parts.append(f"delegate_DISABLED=\"{dg['disabled']}\"")
+            # Context age at decision time (P0-4). In the [STATS] line as well as
+            # metrics.json because a coordinator whose view is minutes stale is delegating on
+            # fiction, and that is worth seeing while a run is live rather than after it.
+            # `skew` is not a distribution statistic: any non-zero value means child and
+            # coordinator clocks disagree and the age column should not be reported.
+            dl = getattr(self, "decision_log", None)
+            if dl is not None:
+                ds = dl.summary()
+                if ds["decisions"]:
+                    parts.append(
+                        f"delegations={ds['decisions']} "
+                        f"policies={','.join(f'{k}:{v}' for k, v in sorted(ds['by_policy'].items()))} "
+                        f"ctx_age_p50={ds['ctx_age_p50']}s p95={ds['ctx_age_p95']}s "
+                        f"unknown={ds['ctx_unknown_groups']} skew={ds['ctx_skewed_ages']}")
+            # Proposals this agent put to consensus, and how wide the matrix behind them
+            # was. `width=1` is the self-only regime, in which the tier's proposals per job
+            # is the number of agents holding the job rather than one.
+            sc = getattr(self, "selection_counters", None)
+            if sc is not None:
+                sel = sc.snapshot()
+                if sel["proposals_issued"]:
+                    parts.append(f"proposals={sel['proposals_issued']} "
+                                 f"jobs={sel['jobs_proposed']} "
+                                 f"reproposals={sel['reproposals']} "
+                                 f"width={sel['matrix_assignees_mean']}")
             self.logger.info("[STATS] " + " ".join(parts))
         except Exception as exc:
             self.logger.debug(f"stats logging failed: {exc}")
@@ -1563,8 +2923,9 @@ class ResourceAgent(Agent):
     def is_job_feasible(self, job: Job, agent: AgentInfo) -> bool:
         """
         Check if a job is feasible for a given agent based on:
-          - Current load threshold
-          - Resource availability
+          - Resource availability against TOTAL capacity (a job must fit on the agent at all;
+            there is no load or free-capacity threshold here — how busy an agent is enters
+            through the cost, see `job_selection.cost_model`)
           - Connectivity to required DTNs for data_in and data_out
 
         For hierarchical agents (level > 0), feasibility is checked against
@@ -1582,13 +2943,9 @@ class ResourceAgent(Agent):
         if self.topology.children and agent.agent_id in job.delegation_failed_agents:
             return False
 
-        # Cache required DTNs for efficiency (computed once, reused multiple times)
-        # Combines data_in and data_out DTN requirements into a single frozenset
-        # "local" DTN is excluded — it means local filesystem, not a remote data transfer node
-        if not hasattr(job, "_required_dtns_cache"):
-            rin = {e.name for e in (job.data_in or [])}
-            rout = {e.name for e in (job.data_out or [])}
-            job._required_dtns_cache = frozenset((rin | rout) - {"local"})
+        # Required DTNs, `local` excluded — Job.required_dtns is the one definition of that
+        # set (cost used to keep its own, and disagreed; code review §8).
+        required_dtns = job.required_dtns()
 
         # Special handling when checking feasibility for self as a parent agent
         # Parent agents must verify that at least ONE actual child can execute the job
@@ -1612,8 +2969,7 @@ class ResourceAgent(Agent):
                     continue  # Skip this child, try next
 
                 # Check child DTN connectivity only if job requires DTNs
-                # Jobs without DTN requirements (empty _required_dtns_cache) skip this check
-                if job._required_dtns_cache:
+                if required_dtns:
                     # Extract child's available DTN names (handle dict vs list formats)
                     if isinstance(child_info.dtns, dict):
                         child_dtn_names = child_info.dtns.keys()
@@ -1622,7 +2978,7 @@ class ResourceAgent(Agent):
                                           for x in (child_info.dtns or [])]
 
                     # Check if child has ALL required DTNs
-                    if not all(d in child_dtn_names for d in job._required_dtns_cache):
+                    if not all(d in child_dtn_names for d in required_dtns):
                         continue  # Skip this child, try next
 
                 # Found a feasible child: has sufficient capacity AND all required DTNs (if any)
@@ -1692,11 +3048,11 @@ class ResourceAgent(Agent):
             agent_dtn_names = [getattr(x, "name", None) or (x.get("name") if isinstance(x, dict) else None)
                                for x in (agent.dtns or [])]
 
-        for d in job._required_dtns_cache:
+        for d in required_dtns:
             if d not in agent_dtn_names:
                 self.logger.debug(
                     f"[DTN] Agent {agent.agent_id} missing DTN '{d}' for Job {job.job_id}. "
-                    f"Job requires: {job._required_dtns_cache}, Agent has: {set(agent_dtn_names)}"
+                    f"Job requires: {required_dtns}, Agent has: {set(agent_dtn_names)}"
                 )
                 return False
 
@@ -1708,8 +3064,39 @@ class ResourceAgent(Agent):
 
         return self.resource_usage_score(allocated=allocations, total=self.capacities)
 
+    def compute_backlog(self) -> Capacities:
+        """Work this agent has won but not yet scheduled, in capacity units, for
+        `AgentInfo.capacity_backlog` (read by the `utilization` cost model).
+
+        A leaf: its selected queue — the scheduler holds a won job there until capacity frees,
+        so this is the queue behind its scheduled work. A coordinator adds the jobs it has
+        delegated that no child has picked up yet: until a leaf wins a delegated job it is in no
+        leaf's allocations or backlog, and without it a coordinator that had just taken a burst
+        would still advertise itself idle. Once a child picks the job up it is counted in that
+        child's allocations or backlog, which `_generate_agent_info` aggregates. Open proposals
+        are deliberately NOT counted (unlike `compute_proposed_load`): a job under proposal is
+        the job being priced, so an initiator would count it twice and every peer would
+        undercut it — the code review 2026-10-05 §1 defect by another route.
+        """
+        backlog = Capacities()
+        for job in self.queues.selected_queue.gets():
+            backlog += job.capacities
+        if self.topology.children:
+            for _, info in self.delegated_jobs.items():
+                caps = info.get("capacities")
+                if caps and not info.get("picked"):
+                    backlog += Capacities.from_dict(caps)
+        return backlog
+
     def compute_proposed_load(self):
+        """Load this agent has committed to but is not yet running: its open proposals AND the
+        jobs it has won and not yet scheduled (`selected_queue`). The selected backlog counted
+        in neither this nor `load` (§G), so an agent with a deep won-but-waiting backlog
+        advertised "merely full" and peers' projected load factor kept steering work to it.
+        `load` itself stays actual allocation — it is also the utilisation metric."""
         allocations = Capacities()
+        for job in self.queues.selected_queue.gets():
+            allocations += job.capacities
         for j in self.engine.outgoing.objects():
             if j not in self.queues.ready_queue and j not in self.queues.selected_queue:
                 job = self.queues.pending_queue.get(j)
@@ -1719,12 +3106,6 @@ class ResourceAgent(Agent):
         return self.resource_usage_score(allocated=allocations, total=self.capacities)
 
     def _job_sig(self, job: Job) -> tuple:
-        # Required DTNs can be expensive to rebuild; compute once and reuse
-        # "local" DTN is excluded — it means local filesystem, not a remote data transfer node
-        if not hasattr(job, "_required_dtns_cache"):
-            rin = {e.name for e in (job.data_in or [])}
-            rout = {e.name for e in (job.data_out or [])}
-            job._required_dtns_cache = frozenset((rin | rout) - {"local"})
         caps = job.capacities
         spec = job.quantum
         quantum_sig = None
@@ -1737,8 +3118,14 @@ class ResourceAgent(Agent):
         pred = job.data_predicate
         pred_sig = None
         if pred:
-            pred_sig = (pred.get("experiment_id"), int(pred.get("min_snapshots", 1)),
-                        int(pred.get("total_snapshots", 1)))
+            if pred.get("kind") == "files" or "files" in pred:
+                # Part of the signature for the same reason the quantum fields are: two jobs
+                # identical but for which files they wait on are not interchangeable, and a
+                # cache that conflated them would price one with the other's cost.
+                pred_sig = ("files", tuple(sorted(str(f) for f in (pred.get("files") or []))))
+            else:
+                pred_sig = (pred.get("experiment_id"), int(pred.get("min_snapshots", 1)),
+                            int(pred.get("total_snapshots", 1)))
         return (
             job.job_id,
             round(caps.core, 3),
@@ -1748,10 +3135,14 @@ class ResourceAgent(Agent):
             round(getattr(caps, "qubits", 0.0), 3),
             round(job.wall_time or 0.0, 3),
             job.job_type or "",
-            job._required_dtns_cache,
+            job.required_dtns(),
             quantum_sig,
             job.sub_role,
             pred_sig,
+            # Feasibility reads it (a coordinator that failed to delegate a job bars itself), so
+            # the cache must too (§G). It was safe only while the 60 s cache TTL was shorter than
+            # the delegation timeout — a coincidence of two config values, not a rule.
+            tuple(sorted(int(a) for a in (job.delegation_failed_agents or ()))),
             #job.state.value,  # flips when PENDING→READY/COMPLETE, invalidates cache automatically
         )
 
@@ -1776,12 +3167,28 @@ class ResourceAgent(Agent):
                 round(backend.gate_fidelity, 4), round(backend.error_rate, 4),
                 round(backend.calibration_downtime_pct, 3),
             )
+        # Under `utilization` the cost depends on what the agent holds, so the cache key must
+        # too: without it a cached idle price would be served for up to the cache TTL (60 s)
+        # while the agent filled up. Under `capacity` it is absent, as it always was — load
+        # enters there through the factor applied outside the cache.
+        held = self._committed(agent)
+        if held is not None and getattr(agent, "agent_id", None) == getattr(self, "agent_id", None):
+            # The price of a job on THIS agent depends on which of its open proposals is left out
+            # (`_open_proposal_capacities`), so the key carries the set, not only its total.
+            held_sig_ids = tuple(sorted(str(j) for j in self._open_proposal_ids()))
+        else:
+            held_sig_ids = None
+        held_sig = None if held is None else (held_sig_ids,) + (
+            round(float(held.core or 0), 3), round(float(held.ram or 0), 3),
+            round(float(held.disk or 0), 3), round(float(getattr(held, "gpu", 0) or 0), 3),
+            round(float(getattr(held, "qubits", 0) or 0), 3))
         return (
             agent.agent_id, agent.version,
             caps.core, caps.ram, caps.disk, caps.gpu, getattr(caps, "qubits", 0),
             #round(caps.core, 3), round(caps.ram, 3), round(caps.disk, 3), round(getattr(caps, "gpu", 0.0), 3),
             dtn_pairs,
             backend_sig,
+            held_sig,
         )
 
     def compute_job_cost(
@@ -1790,7 +3197,8 @@ class ResourceAgent(Agent):
             total: Capacities,
             dtns: dict[str, DataNode],
             backend: Optional[QuantumBackend] = None,
-            site: Optional[str] = None
+            site: Optional[str] = None,
+            committed: Optional[Capacities] = None,
     ) -> float:
         """
         Compute the cost of executing a job on an agent based on weighted resource usage,
@@ -1811,6 +3219,11 @@ class ResourceAgent(Agent):
         :type dtns: dict[str, DataNode]
         :param backend: Quantum backend of the agent (None for classical agents)
         :type backend: Optional[QuantumBackend]
+        :param committed: Work the agent already holds (scheduled + backlog), for the
+            ``utilization`` cost model. Each ratio then becomes (committed + demand) / total for
+            every resource the job uses, so the cost prices the agent's queue. None (the
+            ``capacity`` model, and any caller that does not know) gives demand / total — the
+            same number an idle agent gets under ``utilization``.
         :return: Calculated job cost (higher is more expensive).
         :rtype: float
         """
@@ -1888,12 +3301,22 @@ class ResourceAgent(Agent):
         total_qubits = getattr(total, "qubits", 0) or 1
         job_qubits = getattr(job.capacities, "qubits", 0)
 
-        # Resource usage ratios
-        core_ratio = job.capacities.core / total.core
-        ram_ratio = job.capacities.ram / total.ram
-        disk_ratio = job.capacities.disk / total.disk
-        gpu_ratio = job_gpu / total_gpu
-        qpu_ratio = job_qubits / total_qubits
+        # Resource usage ratios. With `committed` (the `utilization` model) each one is the
+        # agent's utilization of that resource once this job is added, counted only for the
+        # resources the job uses: a GPU-bound neighbour must not make a CPU-only job dearer.
+        # Without it, demand / total, exactly as before.
+        def _ratio(demand, held, cap):
+            demand = float(demand or 0)
+            if committed is None or demand <= 0:
+                return demand / cap
+            return (float(held or 0) + demand) / cap
+
+        held = committed or Capacities()
+        core_ratio = _ratio(job.capacities.core, held.core, total.core)
+        ram_ratio = _ratio(job.capacities.ram, held.ram, total.ram)
+        disk_ratio = _ratio(job.capacities.disk, held.disk, total.disk)
+        gpu_ratio = _ratio(job_gpu, getattr(held, "gpu", 0), total_gpu)
+        qpu_ratio = _ratio(job_qubits, getattr(held, "qubits", 0), total_qubits)
 
         # Weighted base score
         base_score = (
@@ -1919,16 +3342,21 @@ class ResourceAgent(Agent):
         else:
             time_penalty = 1 + (effective_wall_time / long_job_threshold) ** 2
 
-        # DTN connectivity penalty
+        # DTN connectivity penalty. `Job.required_dtns` excludes `local`, which is the whole
+        # point: this block used to build the set itself and keep it, so a job naming `local`
+        # scored 0.0 there on every agent (nobody holds a DTN by that name), `avg_conn` went to
+        # 0 and the penalty to its maximum — every cost in a converted-workflow run multiplied
+        # by `1 + connectivity_penalty_factor`, i.e. doubled at the shipped factor of 1.0,
+        # while feasibility was meanwhile treating `local` as no requirement at all
+        # (code review 2026-09-18, §8). A job with no remote DTN now keeps `avg_conn = 1.0`
+        # and pays no connectivity penalty, which is what "the data is already here" means.
         avg_conn = 1.0
-        if hasattr(job, "data_in") or hasattr(job, "data_out"):
-            required_dtns = {entry.name for entry in (job.data_in or [])} | \
-                            {entry.name for entry in (job.data_out or [])}
+        required_dtns = job.required_dtns()
+        if required_dtns:
             agent_dtn_scores = {dtn.name: getattr(dtn, "connectivity_score", 1.0)
                                 for dtn in dtns.values()}
             scores = [agent_dtn_scores.get(dtn, 0.0) for dtn in required_dtns]
-            if scores:
-                avg_conn = sum(scores) / len(scores)
+            avg_conn = sum(scores) / len(scores)
 
         connectivity_penalty = 1 + connectivity_penalty_factor * (1 - avg_conn)
 
@@ -1944,6 +3372,9 @@ class ResourceAgent(Agent):
         # job is ever costed, so the lookup is stable and cacheable.
         comm_penalty = 1.0
         pred = job.data_predicate
+        if pred and pred.get("kind") == "files":
+            # A DAG edge, not a measurement stream: there is no producer site to look up.
+            pred = None
         if pred and self.split_comm_penalty_factor > 0:
             producer_site = self.measurement_layer.producer_site(pred.get("experiment_id", ""))
             comm_penalty = split_comm_penalty(
@@ -1957,12 +3388,197 @@ class ResourceAgent(Agent):
         return round(cost, 2)
 
 
+    def _selection_assignees(self) -> list:
+        """The assignees this agent scores pending jobs against.
+
+        Level 0 scores every live peer, so exactly one agent proposes each job and the tier
+        runs one consensus decision per job.
+
+        Level > 0 depends on `job_selection.coordinator_cost_matrix`:
+
+        * ``self`` (shipped) scores this agent alone, so every coordinator holding the job
+          proposes ITSELF and the tier runs one decision per coordinator per job. This is the
+          `# TEMP HACK` that predates the key, now named and measured rather than hidden:
+          `proposers_per_job_l1` is what separates it from PBFT's own cost in E5/F2.
+        * ``peers`` scores the coordinator peers exactly as level 0 does. The inputs are
+          already subtree-wide — a parent publishes its children's aggregate capacities,
+          allocations and load in its own AgentInfo, and `is_job_feasible` prices a peer
+          parent off `max_child_capacity` — so this path makes that optimistic estimate
+          load-bearing, with the delegation-timeout recovery documented there as its failure
+          mode. An experiment arm; it moves every hierarchical number.
+        """
+        agents_map = self.neighbor_map
+        own = self._own_selection_info(agents_map.get(self.agent_id))
+        if int(self.topology.level) > 0 and self.coordinator_cost_matrix == "self":
+            # Preserved verbatim from the hack, `None` entry included: an agent whose own
+            # record has not yet landed in neighbor_map scores nothing this pass and retries,
+            # which is what it did before the key existed.
+            return [own]
+        return [own if aid == self.agent_id else info
+                for aid, info in ((aid, agents_map.get(aid)) for aid in list(agents_map.keys()))
+                if (own if aid == self.agent_id else info) is not None]
+
+    def _assign_batch(self, agents: list, jobs: list) -> list:
+        """`(agent, cost)` per job: the minimum-cost assignee in this agent's view, None/inf for
+        a job no agent can run. The cost is in proposal units (load factor applied).
+
+        Under `capacity` one matrix for the whole batch, as before. Under `utilization` the jobs
+        are assigned in order and each assignment is added to its agent's backlog before the
+        next job is priced. Priced from one snapshot, a batch (up to `jobs_per_proposal`, 20 in
+        the campaign configs) would otherwise go whole to whichever agent looked emptiest — a
+        2-core leaf handed 20 jobs at once. The copies carry the extra backlog only for this
+        pass; the agents' real state is untouched.
+        """
+        tie_break = (lambda ag, s, cand: tiebreak_rank(
+            getattr(cand, "job_id", ""), getattr(ag, "agent_id", "")))
+        if self.cost_model != "utilization":
+            cost_matrix = self.selector.compute_cost_matrix(assignees=agents, candidates=jobs)
+            penalised = apply_multiplicative_penalty(
+                cost_matrix=cost_matrix, assignees=agents, factor_fn=self._selection_load_factor)
+            return self.selector.pick_agent_per_candidate(
+                assignees=agents, candidates=jobs, cost_matrix=penalised,
+                objective="min", tie_break_key=tie_break)
+
+        current = list(agents)
+        out = []
+        for job in jobs:
+            matrix = self.selector.compute_cost_matrix(assignees=current, candidates=[job])
+            matrix = apply_multiplicative_penalty(
+                cost_matrix=matrix, assignees=current, factor_fn=self._selection_load_factor)
+            [(chosen, cost)] = self.selector.pick_agent_per_candidate(
+                assignees=current, candidates=[job], cost_matrix=matrix,
+                objective="min", tie_break_key=tie_break)
+            out.append((chosen, cost))
+            if chosen is None or cost == float("inf") or job.capacities is None:
+                continue
+            idx = next(i for i, a in enumerate(current) if a is chosen)
+            bumped = AgentInfo.update(chosen)
+            backlog = Capacities()
+            backlog += chosen.capacity_backlog or Capacities()
+            backlog += job.capacities
+            bumped.capacity_backlog = backlog
+            current[idx] = bumped
+        return self._reprice_own_proposals(agents, jobs, out)
+
+    def _reprice_own_proposals(self, agents: list, jobs: list, out: list) -> list:
+        """Put the jobs this agent is about to propose at the price it will answer for them.
+
+        Once proposed, each is an open proposal, so the wire price of job j counts the rest of
+        the batch (`_open_proposal_capacities`) — not only the jobs assigned before it, which is
+        all the sequential pass saw. Proposing at the sequential price would advertise the first
+        job of a batch below, and the last above, what this agent then answers a peer with.
+        """
+        own = next((a for a in agents if getattr(a, "agent_id", None) == self.agent_id), None)
+        mine = [k for k, (chosen, cost) in enumerate(out)
+                if chosen is not None and chosen.agent_id == self.agent_id
+                and cost != float("inf")]
+        if own is None or not mine:
+            return out
+        batch = Capacities()
+        if self._counts_open_proposals():
+            for k in mine:
+                if jobs[k].capacities is not None:
+                    batch += jobs[k].capacities
+        for k in mine:
+            job = jobs[k]
+            held = self._committed(own, job)
+            held += batch
+            if self._counts_open_proposals() and job.capacities is not None:
+                held -= job.capacities
+            cost = self.compute_job_cost(job=job, total=own.capacities, dtns=own.dtns,
+                                         backend=own.quantum_backend, site=own.site,
+                                         committed=held)
+            out[k] = (out[k][0], cost * self._selection_load_factor(own))
+        return out
+
+    def _own_selection_info(self, mapped: Optional[AgentInfo]) -> Optional[AgentInfo]:
+        """This agent's own column in its cost matrix. Under `utilization` it is the per-tick
+        snapshot (`last_agent_info`), because its own `neighbor_map` entry is refreshed from
+        Redis only every `neighbor_refresh_full_s` (5 s with gossip, which skips self) — an
+        agent pricing its own queue from a 5 s old copy would keep taking work it no longer
+        has room for. It also matches what `wire_cost_for_job` answers peers with. Under
+        `capacity` the mapped entry, as before. A not-yet-registered agent stays None either
+        way, so the barrier semantics above are unchanged."""
+        if mapped is None or self.cost_model != "utilization":
+            return mapped
+        return getattr(self, "last_agent_info", None) or mapped
+
+    def _note_proposals(self, proposals, assignees: int | None = None) -> None:
+        """Record a proposal batch for the proposals-per-job-by-tier measurement.
+
+        Called immediately before `engine.propose`, on every path that proposes, so what is
+        counted is proposals actually put to consensus — not jobs considered, and not passes
+        of the selection loop (`gets()` peeks, so an unplaced job comes back ~2x/s).
+
+        It cannot raise. It is called from inside `selection_main`'s per-pass `try`, whose
+        `except` abandons the whole batch, so a broken counter here would stop the agent
+        proposing rather than merely lose a number — the same trap `_note_bid` carries a
+        guard for, and the general rule that bookkeeping about a job must never change what
+        happens to the job.
+        """
+        counters = getattr(self, "selection_counters", None)
+        if counters is None:
+            return
+        try:
+            counters.record_proposals(
+                [getattr(p, "object_id", "") for p in proposals], assignees=assignees)
+        except Exception as exc:                                  # pragma: no cover - defensive
+            logger = getattr(self, "logger", None)
+            if logger is not None:
+                logger.debug(f"proposal counters unavailable: {exc}")
+
+    @property
+    def selection_barrier_s(self) -> float:
+        """How long `selection_main` waits for the whole group to register before starting.
+
+        Defaults to `failure_threshold_seconds`: a peer that has not shown up within the time
+        this run would take to declare a live peer dead is treated the same way. One key
+        governs both judgements.
+        """
+        configured = self.runtime_config.get("selection_barrier_s")
+        return float(configured if configured is not None else self.failure_threshold_seconds)
+
+    def _await_peers(self) -> dict:
+        """Wait for the group to register, then start — with a bound.
+
+        The barrier used to be `while live != configured: sleep`, with no timeout. One agent
+        that never registered — a crash at startup, a coordinator on a host without the LLM
+        API key — left EVERY other agent in its group here for the whole run: no selection
+        ever started, and the run looked busy until the cap expired. It was also an equality
+        test, so a group that came up one agent OVER (a dynamic agent registering early)
+        never released either.
+
+        Now: release as soon as at least `configured_agent_count` agents are live, or once
+        `selection_barrier_s` has elapsed, whichever is first; on timeout say who is missing,
+        at WARNING, and proceed with the peers there are. Quorum is computed from the live
+        set anyway, so starting short is what the protocol already does after a failure.
+        Returns what happened, for the metrics payload.
+        """
+        deadline = time.monotonic() + max(0.0, self.selection_barrier_s)
+        waited_from = time.monotonic()
+        last_log = 0.0
+        while not self.shutdown and self.live_agent_count < self.configured_agent_count:
+            now = time.monotonic()
+            if now >= deadline:
+                missing = self.configured_agent_count - self.live_agent_count
+                self.logger.warning(
+                    f"[SEL_BARRIER] {self.live_agent_count}/{self.configured_agent_count} "
+                    f"agents registered after {self.selection_barrier_s:.0f}s; starting "
+                    f"selection {missing} short. Missing agents never registered in Redis — "
+                    f"check their logs (a crash at startup looks like this).")
+                return {"waited_s": round(now - waited_from, 3), "live": self.live_agent_count,
+                        "configured": self.configured_agent_count, "short": missing}
+            if now - last_log >= 5.0:
+                last_log = now
+                self.logger.info(f"[SEL_WAIT] Waiting for Peer map to be populated: "
+                                 f"{self.live_agent_count}/{self.configured_agent_count}")
+            time.sleep(0.5)
+        return {"waited_s": round(time.monotonic() - waited_from, 3), "live": self.live_agent_count,
+                "configured": self.configured_agent_count, "short": 0}
+
     def selection_main(self):
         self.logger.info(f"Starting agent: {self}")
-        while self.live_agent_count != self.configured_agent_count:
-            time.sleep(0.5)
-            self.logger.info(f"[SEL_WAIT] Waiting for Peer map to be populated: "
-                             f"{self.live_agent_count}/{self.configured_agent_count}!")
+        self.startup_barrier = self._await_peers()
 
         while not self.shutdown:
             try:
@@ -1977,49 +3593,19 @@ class ResourceAgent(Agent):
                     self.queues.pending_event.clear()
                     continue
 
-                # Data-triggered gating: jobs whose data predicate isn't
-                # satisfied yet (e.g. "at least N snapshots from experiment X")
-                # stay PENDING at the back of the queue until the data exists
-                gated = [j for j in pending_jobs if not self._data_predicate_ready(j)]
-                if gated:
-                    for job in gated:
-                        self.queues.pending_queue.move_to_end(job)
-                    pending_jobs = [j for j in pending_jobs if j not in gated]
-                    if not pending_jobs:
-                        time.sleep(0.5)
-                        continue
+                pending_jobs = self._gate_on_data_predicates(pending_jobs)
+                if not pending_jobs:
+                    time.sleep(0.5)
+                    continue
 
                 proposals = []
                 jobs = []
 
                 # Step 1: Compute cost matrix ONCE for all agents and jobs
-                agents_map = self.neighbor_map
-                agent_ids = list(agents_map.keys())
-                agents = [agents_map.get(aid) for aid in agent_ids if agents_map.get(aid) is not None]
+                agents = self._selection_assignees()
 
-                # TEMP HACK
-                if self.topology.level > 0:
-                    agents = [agents_map.get(self.agent_id)]
-
-                # Build once
-                cost_matrix = self.selector.compute_cost_matrix(
-                    assignees=agents,
-                    candidates=pending_jobs,
-                )
-
-                cost_matrix_with_penalities = apply_multiplicative_penalty(cost_matrix=cost_matrix,
-                                                                           assignees=agents,
-                                                                           factor_fn=self._projected_load_factor)
-
-                # Step 2: Use existing helper to get the best agent per job
-                assignments = self.selector.pick_agent_per_candidate(
-                    assignees=agents,
-                    candidates=pending_jobs,
-                    cost_matrix=cost_matrix_with_penalities,
-                    objective="min",
-                    threshold_pct=self.selection_threshold_pct,  # e.g., 10 means within +10% of best
-                    tie_break_key=lambda ag, s: getattr(ag, "agent_id", "")
-                )
+                # Step 2: the best agent per job (see `_assign_batch`)
+                assignments = self._assign_batch(agents, pending_jobs)
 
                 # Step 3: If this agent is assigned, start proposal
                 for job, (selected_agent, cost) in zip(pending_jobs, assignments):
@@ -2061,7 +3647,12 @@ class ResourceAgent(Agent):
                             p_id=generate_id(),
                             object_id=job.job_id,
                             agent_id=self.agent_id,
-                            cost=round((cost + self.agent_id), 2)
+                            # Advertise the real cost. This used to be `cost + self.agent_id`,
+                            # which made every proposal cost unique and so served as a tie-break
+                            # — but a raw id is a ±N swing on a 0-100 scale for an N-agent fleet,
+                            # larger than most genuine cost differences and always favouring low
+                            # ids. Peers now break exact ties on tiebreak_rank instead.
+                            cost=self.proposal_cost(job, cost)
                         )
                         proposals.append(proposal)
                         job.state = ObjectState.PRE_PREPARE
@@ -2071,6 +3662,7 @@ class ResourceAgent(Agent):
                     self.logger.debug(f"Identified jobs to propose: {proposals}")
                     if self.debug:
                         self.logger.info(f"Identified jobs to select: {jobs}")
+                    self._note_proposals(proposals, assignees=len(agents))
                     self.engine.propose(proposals=proposals)
                     proposals.clear()
 
@@ -2085,10 +3677,6 @@ class ResourceAgent(Agent):
                 # Periodically restore BLOCKED infeasible jobs back to PENDING
                 # This allows them to be retried after other jobs have been processed
                 self._restore_infeasible_jobs()
-
-                # Periodically check for orphaned jobs (in consensus states but no active proposals)
-                # This handles jobs stuck due to agent failures where consensus was cleared
-                #self._reset_orphaned_jobs()
 
                 # Skip the inter-batch wait ONLY when this iteration proposed something
                 # AND the batch came back full (real backlog likely behind it). Skipping
@@ -2105,30 +3693,212 @@ class ResourceAgent(Agent):
                 self.logger.error(traceback.format_exc())
         self.logger.info(f"Agent: {self} stopped with restarts: {self.metrics.restarts}!")
 
+    # ---------- Instrumentation (P0-4) -------------------------------------------------
+
+    def _init_instrumentation(self) -> None:
+        """Set up the P0-4 containers from the `instrumentation:` config block.
+
+        One method, called by `__init__` and by every test double that builds an agent with
+        `__new__`, because a double that assembles this state itself will exercise the state
+        it built and not the state the agent ships with — the trap that let a deadlock test
+        pass against the deadlock (`swarm-test-the-default-not-your-example`).
+        """
+        instr_cfg = (self.config.get("instrumentation", {}) or {}) if self.config else {}
+        self.decision_log = DecisionLog(
+            max_records=int(instr_cfg.get("decision_log_max", 20000)))
+        # Proposals this agent issued, tagged with the tier it sits at. `getattr` because a
+        # test double built with `__new__` calls this before it has a topology, and losing
+        # instrumentation must never be what stops an agent from starting.
+        topo = getattr(self, "topology", None)
+        self.selection_counters = SelectionCounters(
+            level=int(topo.level) if topo is not None else None)
+        # Which policy actually decided the delegation in flight. Thread-local because the
+        # wrapper that reads it and the policy that writes it are separated by an override
+        # chain; delegation runs on one thread today, and this keeps that from being a
+        # correctness assumption.
+        self._decision_ctx = threading.local()
+        self._textfile_dir = instr_cfg.get("textfile_dir") or None
+        self._textfile_period_s = float(instr_cfg.get("textfile_period_s", 15.0))
+        self._textfile_last = 0.0
+        # When THIS agent last took delivery of a fresher record for each peer, on its own
+        # MONOTONIC clock. Kept beside the agent map rather than on AgentInfo for two
+        # reasons: it must not be serialised back into Redis (a local observation, and a
+        # monotonic value is meaningless off this host), and it must never be compared with
+        # a timestamp from anywhere else.
+        #
+        # This is what makes context age usable on a real fleet. An age computed from the
+        # child's `last_updated` is (decision - child_stamp), one term per clock, so any
+        # inter-host offset lands directly in the measurement: measured on the slice
+        # 2026-09-14, 66 of 92 hosts had not reached an NTP server in 30 days and were
+        # free-running 0.4-1.1 s apart, which drove 229 of one coordinator's 229 decisions
+        # to a negative age. One clock fixes that -- but it has to be the MONOTONIC one,
+        # because the repaired fleet now steps its wall clock whenever it drifts past 0.1 s
+        # (`makestep 0.1 -1`), and a wall-clock pair spanning a step is wrong by the step.
+        self._agent_seen_at: dict = {}
+
+    def llm_usage_snapshot(self) -> dict:
+        """Per-call-site LLM accounting. Empty for a rule-based agent; `LlmAgent` overrides."""
+        return {}
+
+    def instrumentation_snapshot(self) -> dict:
+        """Everything P0-4 measures, in one dict.
+
+        Rendered twice from here — into `metrics.json` at teardown and into the node_exporter
+        textfile while the run is live — so the two exports cannot disagree about what a
+        counter means. Every section is defensive: instrumentation that raises at teardown
+        would cost the run its metrics, which is the failure P0-0's §0.8 already paid for once.
+        """
+        snapshot: dict = {}
+        try:
+            counters = getattr(self.transport, "counters", None)
+            if counters is not None:
+                snapshot["messages"] = counters.snapshot()
+        except Exception as exc:
+            self.logger.debug(f"message counters unavailable: {exc}")
+        try:
+            stats_fn = getattr(self.engine, "consensus_stats", None)
+            if callable(stats_fn):
+                snapshot["consensus"] = stats_fn()
+        except Exception as exc:
+            self.logger.debug(f"consensus stats unavailable: {exc}")
+        try:
+            selection = self.selection_counters.snapshot()
+            if selection.get("proposals_issued"):
+                snapshot["selection"] = selection
+        except Exception as exc:
+            self.logger.debug(f"selection counters unavailable: {exc}")
+        try:
+            summary = self.decision_log.summary()
+            if summary.get("decisions"):
+                snapshot["delegation"] = summary
+        except Exception as exc:
+            self.logger.debug(f"delegation summary unavailable: {exc}")
+        try:
+            usage = self.llm_usage_snapshot()
+            if usage:
+                snapshot["llm"] = usage
+        except Exception as exc:
+            self.logger.debug(f"llm usage unavailable: {exc}")
+        return snapshot
+
+    def _export_textfile_metrics(self) -> None:
+        """Write the live instrumentation for node_exporter's textfile collector.
+
+        Off unless `instrumentation.textfile_dir` is set. Rate-limited because `on_periodic`
+        ticks twice a second and the collector scrapes at 15s; a write per tick would be 30x
+        the fsyncs for no extra resolution.
+        """
+        if not self._textfile_dir:
+            return
+        now = time.time()
+        if now - self._textfile_last < self._textfile_period_s:
+            return
+        self._textfile_last = now
+        try:
+            labels = {"agent": str(self.agent_id)}
+            run_id = os.environ.get("SWARM_RUN_ID")
+            if run_id:
+                labels["run_id"] = run_id
+            samples = list(flatten_for_prom("swarm", self.instrumentation_snapshot(), labels))
+            path = os.path.join(self._textfile_dir, f"swarm_agent_{self.agent_id}.prom")
+            write_textfile(path, render_prom(samples))
+        except Exception as exc:
+            # A metrics sink is never allowed to take the agent with it.
+            self.logger.debug(f"textfile export failed: {exc}")
+
     def save_results(self):
+        """Persist this agent's metrics payload to Redis.
+
+        Every container here is snapshotted with deepcopy first. The pre-drain call in
+        on_shutdown runs while job threads are still appending to `metrics.load`, incrementing
+        `metrics.restarts` and mutating `engine.conflicts`; serialising those live would either
+        raise ("dictionary changed size during iteration") or, worse, write a valid JSON
+        document whose sections came from different instants.
+        """
         self.logger.info("Saving Results")
+        with self._save_results_lock:
+            self._save_results_locked()
+
+    def _save_results_locked(self):
         agent_metrics = {
             "id": self.agent_id,
-            "restarts": self.metrics.restarts,
-            "conflicts": self.engine.conflicts,
-            "idle_time": self.metrics.idle_time,
-            "load_trace": self.metrics.load,
-            "agent_failures": self.metrics.agent_failures,
-            "reassignments": self.metrics.reassignments,
-            "delegation_reassignments": self.metrics.delegation_reassignments,
-            "quorum_changes": self.metrics.quorum_changes,
+            # Which run this payload belongs to. An agent that outlives its run writes its
+            # metrics whenever it is finally killed, which can land after the next run has
+            # already flushed Redis — so run_id is what lets the collector tell the two apart
+            # instead of silently reporting run N's numbers as run N+1's.
+            "run_id": os.environ.get("SWARM_RUN_ID"),
+            "saved_at": time.time(),
+            "restarts": copy.deepcopy(self.metrics.restarts),
+            "conflicts": copy.deepcopy(self.engine.conflicts),
+            "idle_time": copy.deepcopy(self.metrics.idle_time),
+            "load_trace": copy.deepcopy(self.metrics.load),
+            "agent_failures": copy.deepcopy(self.metrics.agent_failures),
+            "reassignments": copy.deepcopy(self.metrics.reassignments),
+            "delegation_reassignments": copy.deepcopy(self.metrics.delegation_reassignments),
+            "delegation_withdrawals": [list(w) for w in
+                                       getattr(self.metrics, "delegation_withdrawals", [])],
+            "quorum_changes": copy.deepcopy(self.metrics.quorum_changes),
             "failed_agents": self.failed_agents.to_dict(),
             "failed_agents_count": len(self.failed_agents),
             "final_quorum": self.calculate_quorum(),
             "infeasible_retired": getattr(self.metrics, 'infeasible_retired', []),
+            "executed_jobs": list(getattr(self.metrics, 'executed_jobs', [])),
+            # Leader elections refused because the job was already decided here — each one a
+            # double execution prevented (see _HostAdapter.on_leader_elected).
+            "duplicate_leader_refusals": int(getattr(self, "duplicate_leader_refusals", 0)),
+            # Elections this agent won that the job record had already given to another agent
+            # (select_job's precondition) — each one a double execution prevented. PBFT only.
+            "lost_leader_races": int(getattr(self, "lost_leader_races", 0)),
+            # Reselection-timeout resets written to the job record so peers re-vote
+            # (_persist_restart). Non-zero means an election stalled for the full timeout.
+            "restarts_persisted": int(getattr(self, "restarts_persisted", 0)),
+            "decided_unpersisted_resets": int(getattr(self, "decided_unpersisted_resets", 0)),
+            # `job_selection.cost_model` this agent priced with. Absent from payloads written
+            # before 2026-10-16, which all priced with `capacity`.
+            "cost_model": self.cost_model,
+            "inbound_fetch_deferred": int(getattr(self, "inbound_fetch_deferred", 0)),
+            "fd_refreshed_stale_view": int(getattr(self, "fd_refreshed_stale_view", 0)),
+            "fd_skipped_stale_view": int(getattr(self, "fd_skipped_stale_view", 0)),
+            "inbound_timing": {k: {"n": v[0], "total_s": round(v[1], 3), "max_s": round(v[2], 3)}
+                               for k, v in dict(self.__dict__.get("_inbound_timing", {})).items()},
+            "refusal_retries": int(getattr(self.metrics, 'refusal_retries', 0)),
+            # When THIS agent's failure-simulation clock started. Failure phases are resolved
+            # against it per agent, and a 30-host remote launch spreads starts over a minute,
+            # so the oracle (P1-1) cannot resolve which phase a decision fell in from the run
+            # start alone -- it would misattribute every decision near a phase boundary.
+            "failure_sim_start": getattr(self, "failure_sim_start", None),
+            # How the selection barrier resolved: `short` > 0 means this agent started with
+            # fewer peers than the topology promised, and every consensus number it produced
+            # is from a smaller group than the cell claims.
+            "startup_barrier": getattr(self, "startup_barrier", None),
         }
         if self.mab_enabled and self.mab_manager:
-            agent_metrics["mab_stats"] = self.mab_manager.get_stats()
-            agent_metrics["mab_selections"] = self.metrics.mab_selections
+            agent_metrics["mab_stats"] = copy.deepcopy(self.mab_manager.get_stats())
+            agent_metrics["mab_selections"] = copy.deepcopy(self.metrics.mab_selections)
             agent_metrics["mab_rewards"] = {
-                str(k): v for k, v in self.metrics.mab_rewards.items()
+                str(k): copy.deepcopy(v) for k, v in list(self.metrics.mab_rewards.items())
             }
             self.mab_manager.save_state()
+        # LLM group delegation (P0-1). Exported outside the MAB block: `delegation.policy: llm`
+        # is usable with the bandit off, and that arm is precisely the one E4 needs counted.
+        if self.metrics.llm_delegations:
+            agent_metrics["llm_delegations"] = copy.deepcopy(self.metrics.llm_delegations)
+        instrumentation = self.instrumentation_snapshot()
+        if instrumentation:
+            agent_metrics["instrumentation"] = instrumentation
+        # Per-decision rows, kept separate from the summary because the oracle (P1-1) labels
+        # them offline and F6 joins regret against the context age of the same row. Omitted
+        # entirely for an agent that never delegated, so a leaf agent's payload is unchanged.
+        decisions = self.decision_log.records()
+        if decisions:
+            agent_metrics["delegation_decisions"] = decisions
+        deleg_stats = getattr(self, "delegation_stats", None)
+        if callable(deleg_stats):
+            dg = deleg_stats()
+            # Only when this agent was actually configured to delegate with the model, or did.
+            # A default run's metrics payload keeps exactly the keys it always had.
+            if dg["policy"] != "bandit" or dg["attempts"] or dg["trivial"]:
+                agent_metrics["llm_delegation_stats"] = dg
         self.repository.save(obj=agent_metrics, key=f"{Repository.KEY_METRICS}:{self.agent_id}")
         self.logger.info("Results saved")
 
@@ -2253,8 +4023,212 @@ class ResourceAgent(Agent):
         with lock:
             job_set.update(jobs)
 
+    # Keys that were documented, are still present in generated configs, and are read by
+    # nothing. An operator is told once at startup rather than left to infer it from behaviour
+    # that does not change — silence is exactly how `selection_threshold_pct` survived being
+    # described as the candidate-pool control in three places while selecting nothing.
+    _REMOVED_JOB_SELECTION_KEYS = {
+        "selection_threshold_pct": (
+            "it was compared against the very cost it selected, so it could never reject "
+            "anything (code review 2026-09-20, §7). There is no replacement for a rule-based "
+            "agent: it proposes exactly when it computes itself the cheapest assignee, and "
+            "nothing widens or narrows that. job_selection.designate_bidder narrows bidders "
+            "per job (measured as bidders_per_job / designate_forced_share) but is read only "
+            "by LlmAgent, so setting it on a resource agent does nothing either"
+        ),
+    }
+
+    def _warn_removed_job_selection_keys(self, job_cfg: dict) -> None:
+        """Log any `job_selection` key this agent no longer honours.
+
+        57 generated config files carry `selection_threshold_pct`, so removing it quietly would
+        leave every one of them reading as if it tuned something. Nothing here changes
+        behaviour: these keys had none.
+        """
+        for key, why in self._REMOVED_JOB_SELECTION_KEYS.items():
+            value = job_cfg.get(key)
+            if value is None:
+                continue
+            self.logger.warning(
+                "[CONFIG] job_selection.%s=%s is IGNORED and always was: %s.", key, value, why)
+
+    def _init_decision_state(self) -> None:
+        """The consensus dedupe state, assembled in one place.
+
+        `completed_jobs_set` is the set consensus deduplicates on — a job in it is out of
+        election, whatever its execution outcome. `_decided_jobs` holds jobs this agent has
+        seen FINALIZED (as leader or participant) that have not reached that set yet:
+        `select_job` only persists READY, the set is fed by `schedule_job` ~0.5 s later at a
+        leaf, and at a coordinator not until the delegation monitor marks the job COMPLETE.
+        In that window every straggler consensus message found the job "not achieved" and
+        re-ran the decision. Both are read by `is_job_completed`, and a job is discarded from
+        both wherever it is genuinely up for election again.
+
+        One method, called by `__init__` and by every test double built with `__new__`, so a
+        double cannot exercise a differently-assembled state than the one that ships.
+        """
+        self.completed_lock = threading.RLock()
+        self.completed_jobs_set = set()
+        self._decided_jobs: dict = {}      # job_id -> time.time() at finalize (wall: see _note_decided)
+
     def is_job_completed(self, job_id: str) -> bool:
-        return job_id in self.completed_jobs_set
+        return job_id in self.completed_jobs_set or job_id in self._decided_jobs
+
+    #: Slack when comparing a Redis record's `last_transition_at` (another host's wall clock)
+    #: with this agent's decision time. The two events this separates are a write latency
+    #: apart on one side and a failure-detection window (30-60 s) apart on the other, so a
+    #: second of slack costs nothing and absorbs any residual clock offset.
+    _RESET_EVIDENCE_SLACK_S = 1.0
+
+    def _note_decided(self, job_id: str) -> None:
+        # Wall clock, deliberately: it is compared with `last_transition_at` in job records
+        # written by other hosts, which is wall clock too.
+        with self.completed_lock:
+            self._decided_jobs[job_id] = time.time()
+
+    def _claim_decision(self, job_id: str) -> bool:
+        """Record *job_id* as decided here unless it already is; True only for the first
+        caller. The one gate every path that would SELECT a job as leader goes through."""
+        with self.completed_lock:
+            if job_id in self._decided_jobs or job_id in self.completed_jobs_set:
+                return False
+            self._decided_jobs[job_id] = time.time()
+            return True
+
+    def _election_lock(self, job_id: str):
+        """The engine's per-job election lock (Snow), or a no-op (PBFT, which finalizes on the
+        inbound thread under its own lock and queues no decision work). Held across a whole
+        reset so a Snow decision for the old election cannot land in the middle of one."""
+        lock_for = getattr(getattr(self, "engine", None), "election_lock", None)
+        lock = lock_for(job_id) if callable(lock_for) else None
+        return lock if lock is not None else contextlib.nullcontext()
+
+    def _forget_decided(self, job_id: str, wait: bool = True) -> bool:
+        """The job is up for election again: drop the local decision memory here AND in the
+        engine, or its next election's messages are skipped as stragglers of the last one.
+        All of it under the job's election lock — see `_election_lock`.
+
+        `wait=False` is for the periodic thread, which also writes the heartbeat: it returns
+        False instead of queuing behind a finalize that holds the lock (the job is being
+        decided right now), and the caller re-examines the job on its next pass."""
+        lock = self._election_lock(job_id)
+        if wait:
+            with lock:
+                self._forget_decided_locked(job_id)
+            return True
+        if not self._try_lock(lock):
+            return False
+        try:
+            self._forget_decided_locked(job_id)
+        finally:
+            self._unlock(lock)
+        return True
+
+    def _forget_decided_locked(self, job_id: str) -> None:
+        with self.completed_lock:
+            self._decided_jobs.pop(job_id, None)
+        # And the local winner. Snow peers answer "already decided for X" from this map
+        # (`get_assignment_local`) without a Redis read, so an entry that outlives the decision
+        # turns every answer into a stale hint — a hint is not a vote, every round came back
+        # empty, and the vote was abandoned at max_rounds every reselection period until the
+        # cap. Found in the first E1′ bandit cells (2026-10-10): a coordinator took back a job
+        # its child group never placed, released the claim and forgot the decision, but it and
+        # both peers kept answering "decided for 88"; 6-8 jobs per run stranded, 4 runs capped.
+        jobs_map = getattr(self, "job_assignments", None)
+        if jobs_map is not None:
+            jobs_map.remove(job_id)
+        forget = getattr(self.engine, "forget_decision", None)
+        if callable(forget):
+            forget(job_id)
+
+    def _reset_evidence(self, job_id: str, record: Optional[dict]) -> bool:
+        """Does this PENDING *record* prove the job was returned to the pool AFTER we saw it
+        decided? Evidence, not elapsed time.
+
+        Elapsed time was tried first and is the wrong discriminator: a leader delayed before
+        persisting READY — Redis slow under exactly the load that also delays the stragglers —
+        leaves the same old PENDING record in place however long it takes, and forgetting the
+        decision on a timer re-opened the straggler window at the worst moment. What a reset
+        actually does is WRITE the record: every path that returns a job to the pool sets
+        `state = PENDING` through the `Object.state` setter, which stamps
+        `last_transition_at`, so a reset record carries a transition time later than our
+        decision, and the untouched pre-election record carries one earlier. Absent evidence
+        (no record, no stamp) keeps the decision: a guess in either direction is the defect.
+        """
+        with self.completed_lock:
+            decided_at = self._decided_jobs.get(job_id)
+        if decided_at is None or not record:
+            return False
+        # A record that has moved past PENDING is a decision in progress, not a reset — its
+        # transition stamp is later than ours precisely because the leader persisted READY
+        # (code review 2026-10-05 §21).
+        if not self._record_is_pending(record):
+            return False
+        try:
+            transitioned_at = float(record.get("last_transition_at") or 0.0)
+        except (TypeError, ValueError):
+            return False
+        return transitioned_at > decided_at + self._RESET_EVIDENCE_SLACK_S
+
+    def _decided_but_unpersisted(self, job_id: str, record: Optional[dict]) -> bool:
+        """PBFT: was this job decided here long enough ago that its leader should have written
+        READY, and the record still says PENDING? Then nobody is acting on the decision and the
+        job is re-elected rather than left to the reselection timeout — which a decided job never
+        reaches anyway, since a decided job is out of the consensus states it scans.
+
+        Elapsed time, which `_reset_evidence` deliberately is not: there it would decide that a
+        reset HAPPENED; here it decides only that a decision is not being acted on, and the
+        grace (60 s) is far past the persist path's normal latency (milliseconds) and past the
+        ~20 s inbox lag measured on the busiest coordinator, so stragglers are long done. A
+        leader that does write READY after all cannot run the job twice: the new winner's
+        `select_job` persists under `not_decided_elsewhere` and steps aside. The case it exists
+        for is a decision with no live leader — job 1063 (Hier-90 PBFT run05, 2026-10-10)
+        finalized for 84 at agent 83 and for 83 everywhere else, so neither ran it. The sticky
+        COMMIT (`ConsensusEngine._committed_to`) removes that cause; this bounds any other.
+        Snow is excluded: its decision is a claim, and a PENDING record with no claim is
+        already read as a reset."""
+        if isinstance(getattr(self, "engine", None), GossipConsensusEngine):
+            return False
+        if not record or not self._record_is_pending(record):
+            return False
+        grace = self.decided_unpersisted_grace_s
+        if grace <= 0:
+            return False
+        with self.completed_lock:
+            decided_at = self._decided_jobs.get(job_id)
+        if decided_at is None or time.time() - decided_at <= grace:
+            return False
+        # First tell the leader. Participants hold a commit certificate the leader may never
+        # have counted (a cheaper uncommitted proposal had replaced its own, and it dropped the
+        # commits as worse): on a steady-arrival Hier-90 pilot (2026-10-14) six coordinators
+        # finalized agent 90's proposal for three jobs, 90 never did, and the re-election that
+        # followed did not land before the run ended. Re-elect only if the job is still PENDING
+        # a second grace later, or at once when there is no certificate to send.
+        resent = self.__dict__.setdefault("_certificate_resent", set())
+        if time.time() - decided_at <= 2 * grace and job_id not in resent:
+            resend = getattr(self.engine, "resend_certificate", None)
+            if callable(resend) and resend(job_id):
+                resent.add(job_id)
+                return False
+        if job_id in resent and time.time() - decided_at <= 2 * grace:
+            return False
+        resent.discard(job_id)
+        self.decided_unpersisted_resets = getattr(self, "decided_unpersisted_resets", 0) + 1
+        self.logger.info(f"[DECIDED_UNPERSISTED] Job {job_id} decided "
+                         f"{time.time() - decided_at:.0f}s ago and still PENDING; re-electing")
+        return True
+
+    @staticmethod
+    def _record_is_pending(record: dict) -> bool:
+        """Does this Redis job record say PENDING? Absent state is parsed as PENDING by
+        `Job.from_dict`, so it is treated the same here; an unparseable one is not."""
+        raw = record.get("state")
+        if raw is None or raw == "":
+            return True
+        try:
+            return ObjectState(raw) == ObjectState.PENDING
+        except (ValueError, TypeError):
+            return False
 
     def _get_child_groups_for_job(self, job: Job) -> list[int]:
         """
@@ -2269,12 +4243,15 @@ class ResourceAgent(Agent):
         if not self.topology.children:
             return []
 
-        # Extract required DTNs from job
-        required_dtns = set()
-        if hasattr(job, 'data_in') and job.data_in:
-            required_dtns.update(e.name for e in job.data_in)
-        if hasattr(job, 'data_out') and job.data_out:
-            required_dtns.update(e.name for e in job.data_out)
+        # `Job.required_dtns` excludes `local`, and this site used to rebuild the set without
+        # that exclusion — the same defect as in `compute_job_cost` but with a worse outcome
+        # (code review 2026-09-18, §8). No child holds a DTN named `local`, so an all-local
+        # converted-workflow job matched NO group, fell through to the "delegate to all active
+        # groups" fallback, and logged two warnings per job — one of them blaming the
+        # feasibility check, which had correctly ignored `local` all along. The capability
+        # filter was therefore off for every job in a workflow cell, so the bandit's candidate
+        # set was the whole fleet rather than the DTN-capable subset.
+        required_dtns = job.required_dtns()
 
         # If no DTN requirements, all active groups can handle it
         if not required_dtns:
@@ -2321,6 +4298,145 @@ class ResourceAgent(Agent):
             )
 
         return capable_groups
+
+    def _decision_snapshots(self, group_ids: list) -> dict:
+        """`{group_id: GroupSnapshot}` for *group_ids*: the view a delegation decides on.
+
+        The manager's failure and timeout history merged into the agent's live load data when
+        there is a bandit, live load alone when there is not. Built once per decision and
+        handed to whichever policy runs, so `delegation.policy: bandit` and `llm` differ in the
+        decision rule and not in the information — and so the context age recorded for the
+        decision is the age of the view the decision actually used.
+        """
+        if self.mab_enabled and self.mab_manager:
+            return self.mab_manager.snapshots_for(group_ids)
+        base = self._build_group_snapshots() or {}
+        return {g: base.get(g, GroupSnapshot()) for g in group_ids}
+
+    def _note_decision_policy(self, policy: str) -> None:
+        """Record which rule actually made the delegation decision in flight.
+
+        Called by the policy, read by `_delegate_child_groups`. The configured policy is not
+        the answer: an LLM decision that fell back to the bandit must be counted as a bandit
+        decision or E4's arms describe calls that never happened.
+        """
+        self._decision_ctx.policy = policy
+
+    def _delegate_child_groups(self, job, capable_groups: list) -> list:
+        """Instrumented entry to the delegation decision (P0-4).
+
+        Wraps `_select_child_groups` rather than living inside it, so exactly one record is
+        written per decision no matter how many times the policy chain re-enters itself —
+        `LlmAgent` calls `super()._select_child_groups(...)` on every one of its five fallback
+        paths, and instrumenting the overridable method would count those twice and attribute
+        the decision to the wrong rule.
+
+        Context age is taken at `decided_at`, **after** the policy returns. Under
+        `delegation.policy: llm` that is seconds after the snapshots were built, and that gap
+        is precisely what the interaction claim is about; freezing the age at build time would
+        define the effect away. `decide_s` is recorded alongside, so the age at build is
+        recoverable as `age - decide_s`.
+        """
+        self._decision_ctx.policy = None
+        snapshots = None
+        view = {}
+        try:
+            snapshots = self._decision_snapshots(capable_groups)
+            # What the policy is about to see, captured before it runs (T-5): the manager
+            # writes its history into these objects, and the in-flight count is what the
+            # context-error column is checked against.
+            view = snapshot_view(snapshots, capable_groups)
+        except Exception as exc:
+            # Instrumentation must never be the reason a job fails to be delegated.
+            self.logger.debug(f"Decision snapshot build failed: {exc}")
+
+        # Monotonic for the two durations (how long the policy took, how old the view was),
+        # wall-clock only for `ts`, which exists to join a decision against the job records.
+        # A policy call can span an NTP step -- an LLM decision takes seconds and the fleet
+        # steps at 0.1 s of drift -- and a wall-clock duration across one is wrong by the
+        # step, or negative.
+        manager = getattr(self, "mab_manager", None)
+        if manager is not None:
+            manager.pop_eligible()          # drop anything left by a decision not recorded here
+        started_at = time.monotonic()
+        selected = self._select_child_groups(job, capable_groups, snapshots=snapshots)
+        decided_at = time.monotonic()
+        eligible = manager.pop_eligible() if manager is not None else None
+
+        try:
+            policy = getattr(self._decision_ctx, "policy", None) or "unknown"
+            self.decision_log.add(DecisionRecord(
+                ts=time.time(),
+                job_id=str(getattr(job, "job_id", "")),
+                job_type=getattr(job, "job_type", None),
+                policy=policy,
+                n_candidates=len(capable_groups),
+                candidates=[int(g) for g in capable_groups],
+                selected=[int(g) for g in (selected or [])],
+                decide_s=decided_at - started_at,
+                age=context_age(snapshots or {}, selected or [],
+                                now=time.time(), now_monotonic=decided_at),
+                view=view,
+                eligible=eligible,
+            ))
+        except Exception as exc:
+            self.logger.debug(f"Decision record failed: {exc}")
+        return selected
+
+    def _select_child_groups(self, job, capable_groups: list, top_k: int = None,
+                             snapshots: dict = None) -> list:
+        """Choose which of *capable_groups* this job is delegated to.
+
+        The delegation decision point. Feasibility, the liveness gate and the fallbacks have
+        already run, so every group here can and should be able to take the job — what is left
+        is a *policy* choice. `LlmAgent` overrides this to put the LLM in that seat (P0-1);
+        keeping it as one method is what makes bandit and LLM delegation directly comparable
+        for E4, since both see exactly the same candidate list.
+
+        Default (*top_k* None): the bandit if one is configured, otherwise `mab.top_k` groups
+        chosen at random (recorded as `random`). One fan-out key for both paths.
+
+        It used to be every capable group when no bandit was configured — the pre-MAB
+        behaviour. That was harmless while every coordinator led one group (G=1), and became
+        the default failure mode when `--groups-per-coordinator` moved to 2 on 2026-09-18:
+        the job is saved once per selected group under a group-scoped key and each group
+        executes its own copy (the exactly-once claim is per group), so every analytic
+        hierarchical run — E0 and the analytic half of E1' — ran every job twice. Measured on
+        `p11-oracle3` before the fan-out default changed: 400 jobs, 952 leaf completions, up to
+        6 executions of one job. A scheduler that hands every job to everyone is a broadcast,
+        not a baseline; a context-blind random pick at the configured fan-out is the honest
+        no-learning arm, and the oracle scores it (unlike `all`, which it excludes).
+
+        *top_k* is passed by another policy falling back to this one, and it means "whatever
+        you decide, hand the job to this many groups". Fan-out is a load and fairness variable
+        in its own right, so a policy that fails must not quietly change it: without this, a
+        coordinator running `delegation.policy: llm` with `top_k: 1` and no bandit delegated to
+        *every* capable group the moment its LLM erred — failing would once again have been
+        rewarded, this time with fan-out instead of speed.
+        """
+        k = self.mab_top_k if top_k is None else int(top_k)
+        # A fan-out covering every candidate is not a decision, whichever policy is
+        # configured: `select_groups` returns them all without consulting the bandit. Labelling
+        # it `bandit` would put inert delegations in the same bucket as real ones, which is
+        # exactly the inertness `_warn_if_delegation_cannot_choose` exists to surface.
+        covers_all = k >= len(capable_groups)
+        if self.mab_enabled and self.mab_manager:
+            self._note_decision_policy("bandit_all" if covers_all else "bandit")
+            selected_groups = self.mab_manager.select_groups(
+                capable_groups, job, top_k=k, snapshots=snapshots
+            )
+            for g in selected_groups:
+                self.metrics.mab_selections[g] = \
+                    self.metrics.mab_selections.get(g, 0) + 1
+            return selected_groups
+        # No bandit and no model: nothing here ranks groups, so choose at random rather than
+        # by list order. `capable_groups[:k]` would send every job of a sustained LLM outage
+        # to the lowest group id, and that hot spot would read as a placement effect in E4.
+        if covers_all:
+            self._note_decision_policy("all")
+            return list(capable_groups)
+        self._note_decision_policy("random")
+        return random.sample(list(capable_groups), max(k, 0))
 
     def scheduling_main(self):
         """
@@ -2375,44 +4491,7 @@ class ResourceAgent(Agent):
                                 f"{job_id}; delegating ungated"
                             )
 
-                        # MAB-guided selection: pick top_k groups instead of all
-                        if self.mab_enabled and self.mab_manager:
-                            selected_groups = self.mab_manager.select_groups(
-                                capable_groups, job, top_k=self.mab_top_k
-                            )
-                            for g in selected_groups:
-                                self.metrics.mab_selections[g] = \
-                                    self.metrics.mab_selections.get(g, 0) + 1
-                        else:
-                            selected_groups = capable_groups
-
-                        self.queues.selected_queue.remove(job_id)
-                        job.level = self.topology.level - 1
-                        job.state = ObjectState.PENDING
-                        job.mark_submitted()
-                        job.mark_assigned()
-
-                        for child_group in selected_groups:
-                            self.repository.save(
-                                obj=job.to_dict(),
-                                key_prefix=Repository.KEY_JOB,
-                                level=self.topology.level - 1,
-                                group=child_group
-                            )
-                            self.logger.debug(
-                                f"Delegated job {job_id} to level {self.topology.level - 1}, "
-                                f"group {child_group}")
-
-                        # Track delegated job for monitoring
-                        self.delegated_jobs.set(job_id, {
-                            'delegated_at': time.time(),
-                            'groups': selected_groups
-                        })
-
-                        self.logger.debug(
-                            f"Tracking delegated job {job_id} for monitoring "
-                            f"(timeout: {self.delegation_timeout_s:.1f}s)"
-                        )
+                        self._delegate_to_children(job, capable_groups)
 
                     # Leaf agent: schedule job if load allows
                     else:
@@ -2431,13 +4510,60 @@ class ResourceAgent(Agent):
     def schedule_job(self, job: Job):
         self.end_idle()
         self.logger.info(f"[SCHEDULED]: {job.job_id} on agent: {self.agent_id}")
-        # Add the job to the list of allocated jobs
-        self.queues.ready_queue.add(job)
 
+        # Persisted RUNNING, not COMPLETE: the persisted state is what the parent
+        # coordinator's delegation monitor reads, and `exit_status` is still at its default of
+        # 0 until `execute_job` finishes. Writing COMPLETE here made the monitor credit the
+        # bandit with a success the moment the job was scheduled (P0-9: on `p11-oracle2` the
+        # leaves injected 83 failures and the bandit recorded 19). Only `execute_job` may
+        # write COMPLETE.
+        #
+        # And written BEFORE any local state changes (code review 2026-10-05 §19). The job used
+        # to enter `ready_queue` and the completed set first, so a failed write left a job that
+        # held capacity, was never submitted, and sat READY in Redis under a live leader — a
+        # state no recovery path covers. `scheduling_main` has already taken it out of
+        # `selected_queue`, so a failed write puts it back there for the next pass.
+        job.state = ObjectState.RUNNING
+        try:
+            saved = self.repository.save(obj=job.to_dict(), key_prefix=Repository.KEY_JOB,
+                                         level=self.topology.level, group=self.topology.group,
+                                         require_existing=True)
+        except Exception as e:
+            job.state = ObjectState.READY
+            self.queues.selected_queue.add(job)
+            self.logger.error(f"[SCHEDULED] could not persist {job.job_id} RUNNING ({e}); "
+                              f"will retry")
+            return
+        if saved is False:
+            self.logger.info(f"[SCHEDULED] {job.job_id} was withdrawn before it could run "
+                             f"here; dropping it")
+            self.queues.pending_queue.remove(job.job_id)
+            self._forget_decided(job.job_id)
+            return
+
+        self.queues.ready_queue.add(job)
+        # Out of consensus from here on (the local "completed" set is the consensus dedupe
+        # set, not the execution outcome).
         self._update_completed_jobs(jobs=[job.job_id])
-        job.state = ObjectState.COMPLETE
-        self.repository.save(obj=job.to_dict(), level=self.topology.level, group=self.topology.group)
         self.executor.submit(self.execute_job, job)
+
+    #: States in which a job record names the agent that won its election at this tier.
+    _DECIDED_STATES = frozenset({ObjectState.READY, ObjectState.RUNNING,
+                                 ObjectState.COMPLETE, ObjectState.FAILED})
+
+    def _decided_by_other(self, record: Optional[dict]) -> bool:
+        """Does this persisted job *record* show the job decided under another agent?
+        Absent or unreadable fields mean no: refusing on a guess would strand the job."""
+        if not record:
+            return False
+        raw, leader = record.get("state"), record.get("leader_id")
+        if raw is None or leader is None or str(leader) == str(self.agent_id):
+            return False
+        try:
+            state = ObjectState(raw) if isinstance(raw, int) else ObjectState[str(raw)]
+        except (KeyError, ValueError):
+            return False
+        return state in self._DECIDED_STATES
 
     def select_job(self, job: Job):
         print(f"[SELECTED]: {job.job_id} on agent: {self.agent_id}")
@@ -2446,8 +4572,50 @@ class ResourceAgent(Agent):
         self.job_assignments.set(job.job_id, self.agent_id)
 
         job.state = ObjectState.READY
-        self.repository.save(obj=job.to_dict(), key_prefix=Repository.KEY_JOB,
-                             level=self.topology.level, group=self.topology.group)
+        # require_existing: a job is selected from a record this tier holds, so a missing
+        # record means a coordinator WITHDREW this copy (a delegated job pulled back, or handed
+        # to another group). An unconditional save re-created it and this group ran a job the
+        # coordinator had already given elsewhere (code review 2026-10-05 §15).
+        #
+        # precondition: the record must not already show ANOTHER agent as the decided leader.
+        # PBFT can finalize one job twice in one tier — a voter that committed to one proposal
+        # switches to a cheaper one and commits again, and its first COMMIT stays counted, so
+        # a proposer whose inbox is ~20 s behind (inbound_q ~2000 at a Hier-90 coordinator)
+        # reaches quorum on its own proposal after a peer has already won. Each winner then
+        # delegated to its own group and the job ran twice: 8 of 12,000 jobs in the first
+        # E0 cells, 2026-10-09. The engine is unchanged; this makes the persisted record the
+        # tie-breaker under one WATCH, so whichever winner writes second steps aside. Snow's
+        # Redis claim already gives this, so it never trips there.
+        seen = {}
+
+        def not_decided_elsewhere(cur) -> bool:
+            seen["record"] = cur
+            return not self._decided_by_other(cur)
+
+        if self.repository.save(obj=job.to_dict(), key_prefix=Repository.KEY_JOB,
+                                level=self.topology.level, group=self.topology.group,
+                                require_existing=True,
+                                precondition=not_decided_elsewhere) is False:
+            record = seen.get("record")
+            if self._decided_by_other(record):
+                winner = record.get("leader_id")
+                self.logger.warning(f"[LEADER_LOST] {job.job_id} is already {record.get('state')} "
+                                    f"under agent {winner}; not selecting it here")
+                self.lost_leader_races = getattr(self, "lost_leader_races", 0) + 1
+                # A participant now: the decision stands (stragglers stay skipped), the
+                # assignee is the agent the record names.
+                try:
+                    self.job_assignments.set(job.job_id, int(winner))
+                except (TypeError, ValueError):
+                    self.job_assignments.remove(job.job_id)
+                self.queues.pending_queue.remove(job.job_id)
+                return
+            self.logger.info(f"[SELECTED] {job.job_id} was withdrawn before it could be "
+                             f"selected here; dropping it")
+            self.job_assignments.remove(job.job_id)
+            self.queues.pending_queue.remove(job.job_id)
+            self._forget_decided(job.job_id)
+            return
         # Add the job to the list of allocated jobs
         self.queues.selected_queue.add(job)
         self.queues.selected_event.set()
@@ -2458,9 +4626,24 @@ class ResourceAgent(Agent):
         return self._has_sufficient_capacity(job, available)
 
     def execute_job(self, job: Job):
+        """Run the job, then record the outcome — two concerns, deliberately separated.
+
+        They used to share one `try`, so a failure to *persist* was handled as a failure to
+        *execute*: a job that ran fine had its `exit_status` rewritten to 1, was persisted
+        COMPLETE (so reselection would never revisit it) and published none of its outputs,
+        which stranded every descendant in the DAG for the rest of the run. A Redis blip is
+        not a job failure and must not be recorded as one.
+        """
+        job_id = job.job_id
         try:
-            job_id = job.job_id
+            # A Job rebuilt from Redis has the default `Job` logger, which is not the agent's
+            # and is not wired to the agent's log file — so everything Job.execute() reports,
+            # including a real-execution REFUSAL and its reason, went nowhere visible. The
+            # job ran, failed, and the log said only that it failed. Hand it the agent's
+            # logger so its own account of what happened lands with the rest of the run.
+            job.logger = self.logger
             self.logger.info(f"[EXECUTE] Starting job {job_id} on agent {self.agent_id}")
+            self.metrics.executed_jobs.append(job_id)
             if job.sub_role == "quantum":
                 # Split hybrid: produce snapshot batches into the measurement layer
                 job.execute_producer(self.measurement_layer, site=self.site)
@@ -2486,40 +4669,299 @@ class ResourceAgent(Agent):
                         f"[FAILURE_SIM] Injected failure for job {job_id} on agent {self.agent_id} "
                         f"(rate={fail_rate:.2f})"
                     )
+        except Exception as e:
+            # A real execution failure — the only thing that may set a non-zero exit status.
+            self.logger.error(f"[ERROR] Job {job} failed on agent {self.agent_id}: {e}")
+            self.logger.error(traceback.format_exc())
+            job.exit_status = 1
+            job.state = ObjectState.COMPLETE
 
-            # Self-expanding pool: successful one-shot quantum jobs with
-            # post_process push a classical post-processing job (data-triggered)
-            if job.sub_role is None and job.exit_status == 0:
+        # A refused job never started a process: it is not an execution, and counting it
+        # would make every retried refusal read as a double execution in `jobs_executed_twice`.
+        if job.refusal_reason:
+            try:
+                self.metrics.executed_jobs.remove(job_id)
+            except ValueError:
+                pass
+
+        # A refusal that may not recur goes back to the pool instead of being recorded as
+        # the job's outcome (code review 2026-10-05 §61).
+        if job.refusal_reason and job.refusal_transient and self._retry_refused(job):
+            return
+
+        # Self-expanding pool: successful one-shot quantum jobs with post_process push a
+        # classical post-processing job (data-triggered). Outside the execution try and
+        # non-raising: pushing a successor is a side effect, not part of this job's outcome.
+        if job.sub_role is None and job.exit_status == 0:
+            try:
                 self._maybe_push_post_process(job)
+            except Exception as e:
+                self.logger.warning(f"Post-process push failed for {job_id}: {e}")
 
-            # Always persist job with exit_status so parent coordinator can read outcome
-            self.repository.save(
-                obj=job.to_dict(),
-                key_prefix=Repository.KEY_JOB,
-                level=self.topology.level,
-                group=self.topology.group,
-            )
+        # Persist the outcome and publish what the job produced in ONE write. The names are
+        # what release this job's descendants, so as two writes an agent dying in between
+        # gated the whole subtree for the rest of the run — and a retry queue cannot cover
+        # that, because the queue dies with the agent. In one transaction there is no
+        # in-between. Only on success: a failed job's outputs do not exist, and releasing a
+        # child on its parent's failure would run it against inputs never written.
+        produced = ([d.file for d in (job.data_out or []) if getattr(d, "file", None)]
+                    if job.exit_status == 0 else None)
+        # Never allowed to skip the completion write (§73): an exception here used to leave the
+        # job RUNNING with no retry queue covering it. A failure publishes no locations, and
+        # consumers then refuse the names loudly rather than the job silently never finishing.
+        try:
+            locations = self._publish_locations(job, produced)
+        except Exception as e:
+            self.logger.error(f"[STAGE] publishing outputs of {job_id} failed ({e}); "
+                              f"recording the completion without locations")
+            locations, self._last_withheld = {}, []
+        withheld = set(getattr(self, "_last_withheld", []) or [])
+        if produced and withheld:
+            produced = [n for n in produced if str(n) not in withheld]
+        self._persist_completion(job, produced, locations)
 
+        try:
             self.queues.ready_queue.remove(job_id)
             exit_status_str = "SUCCESS" if job.exit_status == 0 else f"FAILED (exit={job.exit_status})"
             self.logger.info(f"[COMPLETE] Job {job_id} {exit_status_str} on agent {self.agent_id}")
             if not self.queues.ready_queue.gets():
                 self.start_idle()
         except Exception as e:
-            self.logger.error(f"[ERROR] Job {job} failed on agent {self.agent_id}: {e}")
-            self.logger.error(traceback.format_exc())
-            # Persist failure status even on exception
+            self.logger.error(f"Post-completion bookkeeping failed for {job_id}: {e}")
+
+    def _publish_locations(self, job: Job, produced: Optional[list]) -> dict:
+        """Make this job's outputs fetchable, and say where they are.
+
+        Returns `{name: location}` for `_persist_completion` to write in the same transaction
+        as the completion — the same one-write rule the names themselves follow, one step
+        further on. A descendant that could see a name as ready but not find out where it is
+        would be released and then refuse to stage, which reads as a staging bug and is really
+        a torn write.
+
+        Empty when staging is off, which is the shipped default: the shared mount is then the
+        location and there is nothing to serve.
+        """
+        if not produced:
+            return {}
+        from swarm.execution import runner as _runner
+        from swarm.execution import staging as _staging
+
+        if not _staging.policy().enabled:
+            return {}
+        published = getattr(self, "staged_files", None)
+        if published is None:
+            return {}
+
+        pol = _staging.policy()
+        run_id = os.environ.get("SWARM_RUN_ID", "")
+        work_dir = _runner.policy().work_dir
+        locations: dict = {}
+        self._last_withheld = []
+        if not work_dir:
+            # Simulate mode, or real mode with no work dir: there are no produced files, and an
+            # empty work_dir resolved outputs against the agent's OWN cwd — serving whatever
+            # same-named file happened to be there (§73).
+            return {}
+        for name in produced:
+            rel = _staging.safe_relpath(name)
+            if rel is None:
+                # Absolute or escaping (`..`): not stageable, and joined onto the work dir it
+                # would name a file outside it.
+                self.logger.error(
+                    "[STAGE] job %s output %r is not a contained relative name; it gets no "
+                    "location", job.job_id, name)
+                continue
+            # The path the job wrote it at — the LFN relative to its working directory,
+            # directories included (§64).
+            path = os.path.join(work_dir, rel)
+            if not os.path.isfile(path):
+                # The job exited 0 and declared this output but did not write it. That is a
+                # workflow (or converter) fault, and here is where it is visible; the location
+                # is still recorded so a consumer's refusal names this agent and this path
+                # rather than trailing off into "not found anywhere".
+                self.logger.error(
+                    "[STAGE] job %s exited 0 and declared output %r, but %s does not exist. "
+                    "Descendants will refuse to stage it.", job.job_id, name, path)
+            published.publish(str(name), path)
+            # The digest of what THIS producer wrote, on every location: the consumer checks
+            # what it was served against it, which the transfer digest alone cannot do (§65).
+            sha = _staging.file_sha256(path) if os.path.isfile(path) else None
+
+            # Peer first: one hop, straight from here, which is the common case.
+            entries = [{
+                "agent_id": str(self.agent_id),
+                "host": self.grpc_host,
+                "port": _staging.data_port(self.grpc_port),
+                "produced_at": time.time(),
+                "sha256": sha,
+            }]
+
+            # Then the staging site, pushed **now**, before the caller publishes the name.
+            # The order is the whole guarantee: a name becomes visible only once a durable copy
+            # exists, so a descendant released by it can always be served even if this agent
+            # dies a moment later. Doing it after the publish would leave exactly the window
+            # the push is insuring against.
+            if pol.store_host and os.path.isfile(path):
+                result = _staging.put(str(name), path, run_id=run_id,
+                                      sender=str(self.agent_id))
+                if result.ok:
+                    entries.append({
+                        "agent_id": "store",
+                        "host": pol.store_host,
+                        "port": int(pol.store_port),
+                        "produced_at": time.time(),
+                        "sha256": sha,
+                    })
+                    # Logged with the elapsed time because stage-out sits on the critical path
+                    # of every DAG edge and therefore lands on makespan. It is a measured cost,
+                    # not an assumed one.
+                    self.logger.info(
+                        "[STAGE_OUT] %s (%d bytes) to %s:%s in %.3fs",
+                        name, result.bytes_sent, pol.store_host, pol.store_port,
+                        result.elapsed_s)
+                else:
+                    # WITHHELD, not published peer-only. Publishing it anyway broke the one
+                    # guarantee stage-out exists for — a name is never visible without a durable
+                    # copy (code review 2026-10-05 §66). The completion is still written; the
+                    # name is published by `_retry_stage_out` once a push succeeds, and its
+                    # descendants wait until then rather than risk a copy that dies with us.
+                    self.logger.error(
+                        "[STAGE_OUT] %s could NOT be staged out (%s); withholding it until a "
+                        "retry succeeds", name, result.reason)
+                    self._last_withheld.append(str(name))
+                    pending = getattr(self, "_pending_stage_out", None)
+                    if pending is None:
+                        pending = self._pending_stage_out = []
+                    pending.append({"job_id": job.job_id, "name": str(name), "path": path,
+                                    "peer": entries[0], "sha256": sha, "attempts": 1})
+                    continue
+            locations[str(name)] = entries
+        return locations
+
+    def _retry_stage_out(self) -> None:
+        """Re-push outputs whose stage-out failed; publish each once a durable copy exists.
+
+        Names and locations are written together (`Repository.publish_data`, one MULTI), the
+        same one-write rule the completion follows. A push that keeps failing keeps the name
+        withheld — its descendants wait, visibly, rather than run against a copy that dies
+        with this agent (§66)."""
+        pending = getattr(self, "_pending_stage_out", None)
+        if not pending:
+            return
+        from swarm.execution import staging as _staging
+        pol = _staging.policy()
+        run_id = os.environ.get("SWARM_RUN_ID", "")
+        still = []
+        for item in pending:
+            result = _staging.put(item["name"], item["path"], run_id=run_id,
+                                  sender=str(self.agent_id))
+            if not result.ok:
+                item["attempts"] += 1
+                if item["attempts"] % 20 == 0:
+                    self.logger.error("[STAGE_OUT] %s still not staged out after %d attempts "
+                                      "(%s); its descendants are waiting",
+                                      item["name"], item["attempts"], result.reason)
+                still.append(item)
+                continue
+            entries = [item["peer"], {"agent_id": "store", "host": pol.store_host,
+                                      "port": int(pol.store_port), "produced_at": time.time(),
+                                      "sha256": item["sha256"]}]
             try:
-                job.exit_status = 1
-                job.state = ObjectState.COMPLETE
-                self.repository.save(
-                    obj=job.to_dict(),
+                self.repository.publish_data([item["name"]], {item["name"]: entries})
+                self.logger.info("[STAGE_OUT] %s staged out on retry %d and published",
+                                 item["name"], item["attempts"])
+            except Exception as e:
+                self.logger.warning(f"[STAGE_OUT] publishing {item['name']} failed: {e}")
+                still.append(item)
+        self._pending_stage_out = still
+
+    def _still_ours(self, record: Optional[dict]) -> bool:
+        """A completion may be written only over a record that still names this agent as the
+        job's leader and is not already COMPLETE. Otherwise the job was reset or reassigned while
+        this agent ran it — a false failure verdict, a withdrawal — and this outcome is a
+        duplicate's: writing it would overwrite the new leader's record, and a retry queued
+        earlier would re-save a stale payload over a newer one (code review 2026-10-05 §65)."""
+        # Refuse only on POSITIVE evidence that the record moved on. A missing leader is not
+        # such evidence — refusing it would leave a job RUNNING for ever on any path that did
+        # not stamp one.
+        if not record:
+            return False                                   # withdrawn
+        if record.get("state") in (ObjectState.COMPLETE.value, ObjectState.PENDING.value):
+            return False                                   # finished elsewhere, or reset
+        leader = record.get("leader_id")
+        return leader is None or str(leader) == str(self.agent_id)
+
+    def _persist_completion(self, job: Job, produced: Optional[list],
+                            locations: Optional[dict] = None) -> bool:
+        """Write a finished job's outcome, with its outputs, in one transaction.
+
+        On failure the *whole* record is queued and retried on the periodic tick — the
+        outcome and the names together, because publishing without the completion would
+        release descendants of a job that is not recorded as done, and completing without the
+        names is exactly the stranding this method exists to prevent. Non-raising: the job has
+        already run, and its result must not depend on Redis being reachable at this instant.
+        """
+        try:
+            written = self.repository.save(
+                obj=job.to_dict(),
+                key_prefix=Repository.KEY_JOB,
+                level=self.topology.level,
+                group=self.topology.group,
+                produced_data=produced,
+                produced_locations=locations or None,
+                precondition=self._still_ours,
+            )
+            if written is False:
+                self.logger.warning(
+                    f"[COMPLETE] {job.job_id}: the record no longer names this agent as its "
+                    f"leader (reset or reassigned while it ran); this outcome is not recorded")
+                return True
+            if produced:
+                self.logger.debug(f"[DATA_READY] {job.job_id} produced {produced}")
+            return True
+        except Exception as e:
+            try:
+                with self._unpublished_lock:
+                    self._unpersisted_completions[job.job_id] = (job.to_dict(),
+                                                                 list(produced or []),
+                                                                 dict(locations or {}))
+                    pending = len(self._unpersisted_completions)
+                self.logger.warning(
+                    f"Failed to persist completion of {job.job_id}: {e} — queued for retry "
+                    f"({pending} completion(s) pending). The job's outcome is unchanged.")
+            except Exception:
+                pass
+            return False
+
+    def _retry_unpersisted_completions(self) -> None:
+        """Re-write completions whose transaction failed, outcome and outputs together."""
+        with self._unpublished_lock:
+            if not self._unpersisted_completions:
+                return
+            pending = list(self._unpersisted_completions.items())
+        for job_id, (payload, produced, locations) in pending:
+            try:
+                written = self.repository.save(
+                    obj=payload,
                     key_prefix=Repository.KEY_JOB,
                     level=self.topology.level,
                     group=self.topology.group,
+                    produced_data=produced or None,
+                    produced_locations=locations or None,
+                    precondition=self._still_ours,
                 )
             except Exception as e:
-                self.logger.error(f"Failed to persist failure status for job {job}: {e}")
+                self.logger.debug(f"[DATA_READY] completion retry for {job_id} failed: {e}")
+                continue
+            with self._unpublished_lock:
+                self._unpersisted_completions.pop(job_id, None)
+            if written is False:
+                self.logger.warning(
+                    f"[DATA_READY] dropped the queued completion of {job_id}: the record has "
+                    f"moved on (reset or reassigned) since it was queued")
+            else:
+                self.logger.info(
+                    f"[DATA_READY] re-persisted completion of {job_id} after an earlier failure")
 
     def _maybe_push_post_process(self, job: Job):
         """
@@ -2593,6 +5035,18 @@ class ResourceAgent(Agent):
         (agent, job type) — the regime where contextual delegation beats
         context-blind (see docs/CONTEXTUAL_BANDIT_DESIGN.md section 8)."""
         entry = per_agent.get(agent_key)
+        if entry is None:
+            # YAML parses `{3: 0.5}` -- the form this config's own comment documents -- with
+            # INT keys, while every caller passes `str(agent_id)`. So the documented form
+            # matched nothing and every agent silently fell through to the base rate, which
+            # is the whole point of a per-agent profile gone. It also made the run and the
+            # oracle disagree: `run_meta.json` archives the profile through JSON, whose keys
+            # are always strings, so the oracle WOULD match a key the run had ignored and
+            # would score routing against a world the run never ran in.
+            try:
+                entry = per_agent.get(int(agent_key))
+            except (TypeError, ValueError):
+                entry = None
         if entry is not None:
             if isinstance(entry, dict):
                 if job_type is not None and job_type in entry:
@@ -2633,12 +5087,270 @@ class ResourceAgent(Agent):
             except Exception as exc:
                 self.logger.debug(f"snow engine stop raised: {exc}")
 
-        self.executor.shutdown(wait=True)
-        self.save_results()
+        # Metrics are written BEFORE the executor drain, not after. A job now simulates its
+        # real wall time (up to runtime.wall_time_max_s), so `shutdown(wait=True)` can hold
+        # teardown for minutes while the runner is already reading metrics out of Redis — which
+        # is how smoke-g2-bandit and smoke-g2-llm each produced a metrics.json holding one agent
+        # out of thirty. Saving first makes the payload independent of the drain; the second save
+        # upgrades it with whatever the drain finished in time to add.
+        self._save_results_safely("pre-drain")
+        self._drain_executor(self.shutdown_drain_timeout_s)
+        self._save_results_safely("post-drain")
+
+    def _drain_executor(self, timeout_s: float) -> None:
+        """Stop the job executor, waiting at most `timeout_s` for jobs already running.
+
+        Queued-but-unstarted jobs are cancelled: at teardown each would only start a fresh
+        simulated wall-time sleep, and nothing is left to consume the result.
+        """
+        drained = threading.Event()
+
+        def _shutdown():
+            try:
+                self.executor.shutdown(wait=True, cancel_futures=True)
+            finally:
+                drained.set()
+
+        threading.Thread(target=_shutdown, name="ExecutorDrain", daemon=True).start()
+        if not drained.wait(timeout=max(0.0, timeout_s)):
+            self.logger.warning(
+                f"[SHUTDOWN] job executor still draining after {timeout_s:.1f}s "
+                f"(runtime.shutdown_drain_timeout_s); metrics are saved without it"
+            )
+            # Real jobs run in their own sessions (so a timeout can kill the whole tree) and
+            # therefore do NOT die with the agent: kill them, and their containers, now (§62).
+            try:
+                from swarm.execution import runner
+                killed = runner.terminate_all()
+                if killed:
+                    self.logger.warning(f"[SHUTDOWN] killed {killed} still-running job(s)")
+            except Exception as exc:
+                self.logger.error(f"[SHUTDOWN] could not kill running jobs: {exc}")
+
+    def _save_results_safely(self, stage: str) -> None:
+        """`save_results` must never abort teardown.
+
+        The pre-drain save runs while job threads may still be mutating the metrics
+        containers, so a serialization race is possible; losing that save is recoverable
+        (the post-drain one follows), leaving the agent alive is not.
+        """
+        try:
+            self.save_results()
+        except Exception as exc:
+            self.logger.error(f"[SHUTDOWN] {stage} save_results failed: {exc}")
+            self.logger.error(traceback.format_exc())
 
     def _cost_job_on_agent(self, job: Job, agent: AgentInfo) -> float:
         return self.compute_job_cost(job=job, total=agent.capacities, dtns=agent.dtns,
+                                     backend=agent.quantum_backend, site=agent.site,
+                                     committed=self._committed(agent, job))
+
+    def _cost_job_on_agent_unloaded(self, job: Job, agent: AgentInfo) -> float:
+        """The analytic cost with no committed work priced in, whatever the cost model: for a
+        caller whose cost then takes `_projected_load_factor` (the LLM plane's analytic
+        fallback), which would otherwise count load twice under `utilization`."""
+        return self.compute_job_cost(job=job, total=agent.capacities, dtns=agent.dtns,
                                      backend=agent.quantum_backend, site=agent.site)
+
+    def _committed(self, agent: AgentInfo, job: Optional[Job] = None) -> Optional[Capacities]:
+        """What `agent` already holds, as the `utilization` cost model reads it: scheduled work
+        plus backlog, and — when `agent` is THIS agent — its open proposals other than `job`
+        (`_open_proposal_capacities`). None under `capacity`, which ignores all three (and
+        prices load through `_projected_load_factor` instead)."""
+        if self.cost_model != "utilization":
+            return None
+        held = Capacities()
+        held += agent.capacity_allocations or Capacities()
+        held += agent.capacity_backlog or Capacities()
+        if getattr(agent, "agent_id", None) == getattr(self, "agent_id", None):
+            held += self._open_proposal_capacities(
+                exclude=getattr(job, "job_id", None) if job is not None else None)
+        return held
+
+    def _counts_open_proposals(self) -> bool:
+        """Whether this agent's open proposals are commitments it should price in. At level 0 (and
+        a coordinator scoring its peers) an agent proposes a job only when it is the cheapest
+        assignee, so an open proposal is work it expects to win. Under
+        `coordinator_cost_matrix: self` EVERY coordinator proposes EVERY job and one wins each:
+        counting them would charge each coordinator the whole tier's pending load, which a large
+        group absorbs better than a small one — the herding this model exists to remove."""
+        return int(getattr(getattr(self, "topology", None), "level", 0) or 0) == 0 or \
+            getattr(self, "coordinator_cost_matrix", "self") == "peers"
+
+    def _open_proposal_ids(self) -> list:
+        """Jobs this agent has proposed and not yet won or lost, as `compute_proposed_load` reads
+        them (a won job has moved to the selected or ready queue and is counted there)."""
+        engine = getattr(self, "engine", None)
+        queues = getattr(self, "queues", None)
+        if engine is None or queues is None or not self._counts_open_proposals():
+            return []
+        try:
+            return [j for j in engine.outgoing.objects()
+                    if j not in queues.ready_queue and j not in queues.selected_queue]
+        except Exception:
+            return []
+
+    def _open_proposal_capacities(self, exclude: Optional[str] = None) -> Capacities:
+        """Demand of this agent's open proposals, `exclude` (the job being priced) left out.
+
+        This is what makes a batch's reservations survive consensus. `_assign_batch` spreads a
+        batch by reserving each assignment before pricing the next; once proposed, those
+        reservations are this agent's open proposals, and every price it puts on the wire —
+        its proposal, a Snow re-price, an answer to a peer's query about ANOTHER job — counts
+        them. Without this a large agent that had just proposed 17 jobs still answered a query
+        about the 18th at its idle price, voted for itself and pulled the batch back (stop-time
+        review). The job being priced is left out: counting it as well as its demand made the
+        initiator dearer than any peer, the code review 2026-10-05 §1 undercut by another route.
+        """
+        caps = Capacities()
+        queues = getattr(self, "queues", None)
+        for job_id in self._open_proposal_ids():
+            if job_id == exclude:
+                continue
+            job = queues.pending_queue.get(job_id) if queues is not None else None
+            if job is not None and job.capacities is not None:
+                caps += job.capacities
+        return caps
+
+    def _selection_load_factor(self, agent: AgentInfo) -> float:
+        """The load factor for an ANALYTIC cost: 1.0 under `utilization`, whose cost already
+        prices the agent's committed work (applying `_projected_load_factor` too would count it
+        twice), and `_projected_load_factor` under `capacity`. An LLM-plane cost always takes
+        `_projected_load_factor`: the model's verdict says nothing about load."""
+        if self.cost_model == "utilization":
+            return 1.0
+        return self._projected_load_factor(agent)
+
+    # ---------- Cost that crosses the wire ----------------------------------------------
+    # Both planes emit 0..100 and are compared raw; `COST_SCALE` only tags which plane a cost
+    # came from, for instrumentation. See swarm/agents/cost_scale.py for the measurement.
+    COST_SCALE: str = CostScale.ANALYTIC
+
+    #: Resolved per agent from `job_selection.cost_model` in `__init__`; the class attribute is
+    #: the same default, so a test double built with `__new__` exercises the shipped model.
+    cost_model: str = COST_MODEL_DEFAULT
+
+    #: Whether this agent type implements `delegation.policy: llm`. Only `LlmAgent` does.
+    SUPPORTS_LLM_DELEGATION: bool = False
+
+    def _refuse_unsupported_delegation_policy(self) -> None:
+        """A coordinator asked to delegate by LLM must be able to, or the run must not start.
+
+        `delegation.policy` was read only by `LlmAgent._init_delegation`. Level-1 agents
+        default to `resource` since 2026-09-18, so `--delegation-policy llm` on a hierarchy had
+        the bandit (or random) choose every group with no warning, while run_meta.json labelled
+        the run as the LLM arm of E4 (code review 2026-10-05 §23). Same shape as
+        `designate_bidder` on a resource agent; refused rather than logged because the label is
+        what moves a result between arms.
+        """
+        policy = str(((self.config.get("delegation") or {}).get("policy")) or "bandit").lower()
+        if (policy == "llm" and not self.SUPPORTS_LLM_DELEGATION
+                and getattr(self.topology, "children", None)):
+            raise ValueError(
+                f"delegation.policy: llm on agent {self.agent_id}, a {type(self).__name__} "
+                f"coordinator, which cannot delegate by LLM — it would silently use the bandit. "
+                f"Launch LLM coordinators (--hierarchical-level1-agent-type llm) or use "
+                f"delegation.policy: bandit.")
+
+    def native_cost_for_job(self, object_id: str):
+        """`(native_cost, scale)` for this agent on this job, or None if it cannot say.
+
+        Must not block: this is called from the inbound consensus consumer thread. None means
+        "no opinion", which Snow sends as an abstention. This is the BASE cost; peers are
+        answered through `wire_cost_for_job`, which puts it in proposal units.
+        """
+        obj = self.queues.pending_queue.get(object_id)
+        if obj is None:
+            return None
+        try:
+            info = self._own_agent_info()
+            # ANALYTIC explicitly, not `self.COST_SCALE`: this method computes the analytic
+            # cost, so that is the scale it must report even when a subclass's own plane is
+            # something else. A subclass calling up to it for a fallback would otherwise get
+            # its own label on someone else's number.
+            return float(self._cost_job_on_agent(obj, info)), CostScale.ANALYTIC
+        except Exception as exc:
+            self.logger.debug(f"native_cost_for_job({object_id}) failed: {exc}")
+            return None
+
+    def _own_agent_info(self) -> AgentInfo:
+        return self.last_agent_info or self._generate_agent_info()
+
+    def wire_cost_for_job(self, object_id: str):
+        """This agent's own cost for a job, in the units it would PROPOSE it at; None if it
+        cannot say; +inf if it cannot run the job.
+
+        A Snow peer compares this number against the initiator's advertised cost, so it must be
+        built exactly as `selection_main` builds a proposal: feasibility first (infeasible → inf),
+        the base cost from this agent's decision plane (`native_cost_for_job`), times the load
+        factor `selection_main` applies to that plane, rounded by `proposal_cost`. It used to return the base cost
+        alone — no load factor, no feasibility — so any initiator under load advertised a number
+        every peer could undercut, every peer voted for itself, no candidate reached α, and the
+        job abandoned to the reselection timeout; Snow placement ignored load and capacity while
+        PBFT's did not (code review 2026-10-05 §1). Shared by both planes because the LLM plane
+        proposes the same way, so its cached verdict needs the same treatment.
+
+        Only a job in this agent's pending queue is answered — the guard the analytic plane
+        always had and the LLM verdict cache did not (§26): a verdict about a job this agent no
+        longer holds is about a state that has moved on.
+        """
+        job = self.queues.pending_queue.get(object_id) if object_id else None
+        if job is None:
+            return None
+        try:
+            info = self._own_agent_info()
+            if not self.is_job_feasible(job, info):
+                return float("inf")
+        except Exception as exc:
+            self.logger.debug(f"wire_cost_for_job({object_id}) feasibility failed: {exc}")
+            return None
+        got = self.native_cost_for_job(object_id)
+        if got is None:
+            return None
+        native, scale = got
+        # The factor `selection_main` applies to a cost from this plane, so an answer and a
+        # proposal stay in one unit: 1.0 for an analytic cost under `utilization` (it already
+        # prices load), the projected-load factor otherwise.
+        return self.proposal_cost(job, float(native) * self._wire_load_factor(info, scale))
+
+    def _wire_load_factor(self, info: AgentInfo, scale) -> float:
+        """The load factor this agent's `selection_main` applies to a cost of `scale`, so a wire
+        answer matches the proposal it would make. Overridden by `LlmAgent`, whose selection
+        matrix applies `_projected_load_factor` to every entry whatever its plane."""
+        if scale == CostScale.ANALYTIC:
+            return self._selection_load_factor(info)
+        return self._projected_load_factor(info)
+
+    def counter_proposal_cost(self, object_id: str):
+        """The price at which this agent would counter a peer's PBFT proposal, or None not to.
+
+        Only a hierarchical coordinator under `coordinator_cost_matrix: self` answers — there every
+        coordinator is a candidate for every job but proposes only itself, so a peer's proposal
+        says nothing about whether this coordinator is cheaper. At level 0, and under `peers`, an
+        agent proposes only when it computed itself as the cheapest assignee, so a peer's proposal
+        already reflects that comparison. Off with `consensus.pbft.counter_propose: false`.
+        The number is `wire_cost_for_job`'s — the unit `selection_main` proposes in — and None
+        for a job this agent does not hold, so the engine falls back to preparing.
+        """
+        if not getattr(self, "pbft_counter_propose", True):
+            return None
+        if int(getattr(self.topology, "level", 0) or 0) == 0:
+            return None
+        if getattr(self, "coordinator_cost_matrix", "self") != "self":
+            return None
+        if isinstance(getattr(self, "engine", None), GossipConsensusEngine):
+            return None
+        return self.wire_cost_for_job(object_id)
+
+    def proposal_cost(self, job: Job, native_cost: float) -> float:
+        """Cost to advertise for a proposal this agent is making.
+
+        No conversion: both decision planes already emit 0..100 (`compute_job_cost` ends in
+        `* 100`; the LLM plane returns `100 - score`), so peers can compare the raw values.
+        See `swarm/agents/cost_scale.py` for the measurement behind that, and for why the
+        per-plane rescaling that used to happen here was worse than the problem it addressed.
+        """
+        return round(float(native_cost), 2)
 
     @staticmethod
     def _projected_load_factor(agent: AgentInfo) -> float:
@@ -2666,6 +5378,31 @@ class ResourceAgent(Agent):
             self.logger.debug(f"Failed to look up agent by endpoint {host}:{port}: {e}")
         return None
 
+    def _fresh_heartbeats(self) -> dict:
+        """Each peer's latest heartbeat stamp in Redis, for this detection round ONLY. Never the
+        full `_refresh_neighbors`: that also EVICTS a peer whose record is gone or past its
+        expiry, so after a long enough stall it would remove a genuinely dead peer before the
+        detector judged it — no failure recorded, its jobs stranded (the 2026-09-15 recovery
+        defect; stop-time review). Nor written into `neighbor_map`: the full refresh decides a
+        record is fresher by its stamp, and a stamp bumped here would read as unchanged there
+        and freeze the context-age column. A peer absent from Redis gets no stamp and is judged
+        on its old one."""
+        records = self.repository.get_all_objects(
+            key_prefix=Repository.KEY_AGENT, level=self.topology.level, group=self.topology.group)
+        latest = {}
+        for rec in records or []:
+            try:
+                aid = int(rec.get("agent_id"))
+                latest[aid] = float(rec.get("last_updated") or 0.0)
+            except (TypeError, ValueError, AttributeError):
+                continue
+        return latest
+
+    def _fd_view_max_age_s(self) -> float:
+        """How old this agent's neighbour view may be before the failure detector refreshes it
+        first: twice the full-refresh period, never under 10 s."""
+        return max(10.0, 2.0 * self._neighbor_refresh_full_s())
+
     def _detect_failed_agents(self, current_time: float) -> list[int]:
         """
         Identify agents that have failed based on missing heartbeats.
@@ -2681,6 +5418,25 @@ class ResourceAgent(Agent):
             return []
 
         failed_this_round = []
+
+        # Never judge a peer from a view this agent did not keep fresh. The detector compares a
+        # peer's last heartbeat with now, but the peer's record is only as new as this agent's
+        # last neighbour refresh — and both run on this thread, the refresh AFTER the detector.
+        # After a stall of this thread every peer looks exactly as old as the stall: agent 43
+        # (Hier-90 PBFT, e669e79c) resumed after ~70 s, declared all 8 live group peers FAILED at
+        # once, reassigned their in-flight jobs, and 47-77 jobs per run executed twice. So a stale
+        # view is refreshed first, and if that fails the round is skipped.
+        fresh_stamps: dict = {}
+        refreshed = self.__dict__.get("_neighbors_refreshed_mono")
+        if refreshed is not None and time.monotonic() - refreshed > self._fd_view_max_age_s():
+            try:
+                fresh_stamps = self._fresh_heartbeats()
+            except Exception as exc:
+                self.logger.warning(f"[FD_STALE_VIEW] heartbeat read failed ({exc}); "
+                                    f"skipping failure detection this round")
+                self.fd_skipped_stale_view = getattr(self, "fd_skipped_stale_view", 0) + 1
+                return []
+            self.fd_refreshed_stale_view = getattr(self, "fd_refreshed_stale_view", 0) + 1
 
         # Add ±10% jitter to threshold to prevent synchronized failure detection
         jitter = random.uniform(0.9, 1.1) if len(self.neighbor_map) > 5 else 1.0
@@ -2699,7 +5455,9 @@ class ResourceAgent(Agent):
                 continue
 
             # Check if agent hasn't updated in Redis beyond threshold
-            time_since_update = current_time - agent_info.last_updated
+            last_seen = max(float(agent_info.last_updated or 0.0),
+                            fresh_stamps.get(int(agent_id), 0.0))
+            time_since_update = current_time - last_seen
 
             if time_since_update > threshold:
                 # Check if already marked as failed
@@ -2709,6 +5467,7 @@ class ResourceAgent(Agent):
                         f"(no update for {time_since_update:.1f}s, threshold: {threshold:.1f}s)"
                     )
                     self.failed_agents.set(agent_id, current_time)
+                    self._note_failed_last_seen(agent_id, agent_info)
                     failed_this_round.append(agent_id)
 
                     # Increment agent version to invalidate cost cache entries
@@ -2722,7 +5481,7 @@ class ResourceAgent(Agent):
                     self.metrics.agent_failures[agent_id] = {
                         'detected_at': current_time,
                         'detected_by': "redis",
-                        'last_seen': agent_info.last_updated,
+                        'last_seen': last_seen,
                         'downtime': time_since_update,
                         'version_at_failure': agent_info.version
                     }
@@ -2920,54 +5679,6 @@ class ResourceAgent(Agent):
         if restored_count > 0:
             self.logger.info(f"Restored {restored_count} infeasible jobs to PENDING for retry")
 
-    def _reset_orphaned_jobs(self) -> None:
-        """
-        Reset orphaned jobs back to PENDING state.
-
-        Orphaned jobs are those stuck in consensus states (PRE_PREPARE, PREPARE, COMMIT)
-        but have no active proposals in engine.incoming or engine.outgoing.
-        This can happen when:
-        - An agent fails mid-consensus and proposals are cleared
-        - Consensus clearing happens but job states aren't reset
-        - Network partitions cause proposal loss
-
-        This method periodically scans for such jobs and resets them to PENDING
-        so they can go through selection again.
-        """
-        orphaned_states = [ObjectState.PRE_PREPARE, ObjectState.PREPARE, ObjectState.COMMIT]
-        reset_count = 0
-
-        # Get all jobs in consensus states
-        for state in orphaned_states:
-            jobs_in_state = self.queues.pending_queue.gets(
-                states=[state],
-                count=100  # Check up to 100 jobs per state per iteration
-            )
-
-            for job in jobs_in_state:
-                job_id = job.job_id
-                if job_id in self.completed_jobs_set:
-                    continue
-
-                # Check if job has active proposals
-                has_incoming = self.engine.incoming.contains(object_id=job_id) and len(self.engine.incoming.get_proposals_by_object_id(job_id)) > 0
-                has_outgoing = self.engine.outgoing.contains(object_id=job_id) and len(self.engine.outgoing.get_proposals_by_object_id(job_id)) > 0
-
-                if not has_incoming and not has_outgoing:
-                    # Job is orphaned - no active proposals
-                    old_state = job.state
-                    job.state = ObjectState.PENDING
-                    self.queues.pending_queue.update(job)
-                    reset_count += 1
-
-                    self.logger.warning(
-                        f"Reset orphaned job {job_id} from {old_state} to PENDING "
-                        f"(no active proposals found in consensus engine)"
-                    )
-
-        if reset_count > 0:
-            self.logger.info(f"Reset {reset_count} orphaned jobs to PENDING state")
-
     def invalidate_agent_cache(self, agent_id: int) -> bool:
         """
         Manually invalidate cost/feasibility cache for a specific agent.
@@ -2991,76 +5702,251 @@ class ResourceAgent(Agent):
             self.logger.warning(f"Cannot invalidate cache for agent {agent_id}: not found in neighbor_map")
             return False
 
-    def _reassign_jobs_from_failed_agent(self, failed_agent_id: int) -> None:
+    # How often the stranded-job sweep re-reads the in-flight indexes while any peer is in
+    # the failed set. The reassignment claim (`try_claim_reassignment`) lives 300 s, so a
+    # retry can only win after that anyway; 30 s keeps the sweep off the WAN hot path.
+    _REASSIGN_RESWEEP_S = 30.0
+
+    def _resweep_failed_agent_jobs(self, current_time: float) -> None:
+        """Retry reassignment for every peer still FAILED, until nothing of theirs is left.
+
+        `_reassign_jobs_from_failed_agent` ran exactly once, when the detector first removed
+        the peer. The per-(job, failure) claim has a 300 s TTL so a reassigner that dies does
+        not strand the job — but nobody ever came back after it expired, so a reassigner that
+        died, or whose release/save raised, left the job READY/RUNNING under a corpse for the
+        rest of the run (code review 2026-10-05 §18). This sweep re-reads the in-flight
+        records on a slow cadence while the failed set is non-empty; a job already returned to
+        the pool is PENDING and no longer a candidate, so the sweep converges to a no-op on its
+        own. Readmission (`_readmit_if_heartbeat_resumed`) empties the failed set, so a peer
+        that came back is never swept.
+
+        The Snow variant is swept too: a leader that died between winning the CAS and
+        persisting READY left a PENDING record whose claim named it, which reassignment (READY
+        and RUNNING only) never saw and which no finalize could overwrite. A claim naming a
+        FAILED peer on a PENDING record is released, compare-and-delete, so two sweepers
+        reading one stale claim cannot delete the live claim the first release let a peer win.
         """
-        Reassign jobs that were assigned to a failed agent.
+        if self.shutdown or not self.job_reassignment_enabled:
+            return
+        failed = [int(a) for a in self.failed_agents.keys()]
+        if not failed:
+            return
+        last = getattr(self, "_last_reassign_resweep", 0.0)
+        if current_time - last < self._REASSIGN_RESWEEP_S:
+            return
+        self._last_reassign_resweep = current_time
 
-        This implements the TODO at resource_agent.py:277.
+        level, group = self.topology.level, self.topology.group
+        try:
+            state_map = self.repository.get_all_ids_multi(
+                key_prefix=Repository.KEY_JOB, level=level, group=group,
+                states=[ObjectState.PENDING.value, ObjectState.READY.value,
+                        ObjectState.RUNNING.value])
+            in_flight = (state_map.get(ObjectState.READY.value, [])
+                         + state_map.get(ObjectState.RUNNING.value, []))
+            records = self.repository.get_many(
+                in_flight, key_prefix=Repository.KEY_JOB,
+                level=level, group=group) if in_flight else {}
+            pending = state_map.get(ObjectState.PENDING.value, [])
+            claims = self.repository.get_assignments(pending, level=level, group=group) \
+                if pending else {}
+        except Exception as e:
+            self.logger.warning(f"Stranded-job sweep skipped, Redis unreadable: {e}")
+            return
 
-        Jobs are reset to PENDING state and cleared from consensus containers,
-        allowing them to go through the selection process again with remaining agents.
+        failed_set = set(failed)
+        for failed_agent_id in failed:
+            held = [jid for jid, rec in records.items()
+                    if rec and rec.get("leader_id") is not None
+                    and int(rec["leader_id"]) == failed_agent_id]
+            if held:
+                self.logger.info(
+                    f"[REASSIGN] Sweep: {len(held)} job(s) still held by failed agent "
+                    f"{failed_agent_id}; retrying reassignment")
+                self._reassign_jobs_from_failed_agent(failed_agent_id, records=records)
+
+        for job_id, assignee in claims.items():
+            if assignee not in failed_set:
+                continue
+            try:
+                if self.repository.release_assignment_if_held_by(
+                        job_id, assignee, level=level, group=group):
+                    self.metrics.reassignments.setdefault(job_id, {
+                        'failed_agent': assignee,
+                        'reassigned_at': time.time(),
+                        'reason': 'stale_claim',
+                        'old_state': ObjectState.PENDING.value,
+                    })
+                    self.logger.info(
+                        f"[REASSIGN] Released the assignment claim on PENDING job {job_id}: it "
+                        f"named failed agent {assignee}, which never persisted READY")
+            except Exception as e:
+                self.logger.error(f"Could not release the stale claim on {job_id}: {e}")
+
+    def _reassign_jobs_from_failed_agent(self, failed_agent_id: int,
+                                         records: Optional[dict] = None) -> None:
+        """Return the failed agent's in-flight jobs to the pool so someone else runs them.
+
+        Sourced from **Redis, not the local queues**. A job that won consensus is no longer in
+        any peer's pending queue — `_update_ready_jobs` takes it out — so the old version
+        looked it up locally, found nothing, logged "likely completed" and dropped it. Its
+        persisted state is READY or RUNNING rather than PENDING, so no agent re-adds it, and
+        `_restart_selection` only covers the three consensus states. The work was silently
+        stranded for the rest of the run.
+
+        P0-9 widened that window from milliseconds to the job's whole duration: a scheduled
+        job used to flip to COMPLETE at once, so a dead agent's job merely *looked* finished,
+        and now it is honestly RUNNING for its real wall time. E2b and E6 measure exactly this.
+
+        Exactly one agent reassigns each (job, failure) pair, via a `SET NX` claim: every live
+        agent detects the same failure at the same moment, and a second reset landing after
+        the first reassignment has already won a fresh election would clobber a live
+        assignment and run the job twice.
 
         :param failed_agent_id: ID of the failed agent
+        :param records: the READY/RUNNING records already read by the sweep, so one sweep
+            over several failed peers reads the indexes once; fetched here when absent
         """
-        jobs_to_reassign = []
+        level, group = self.topology.level, self.topology.group
 
-        # Find jobs assigned to the failed agent
+        # In-flight jobs are READY (selected, not yet started) or RUNNING (executing). Both
+        # are lost when their assignee dies; COMPLETE ones are done and must not be touched.
+        if records is None:
+            try:
+                state_map = self.repository.get_all_ids_multi(
+                    key_prefix=Repository.KEY_JOB, level=level, group=group,
+                    states=[ObjectState.READY.value, ObjectState.RUNNING.value])
+                in_flight = (state_map.get(ObjectState.READY.value, [])
+                             + state_map.get(ObjectState.RUNNING.value, []))
+                records = self.repository.get_many(
+                    in_flight, key_prefix=Repository.KEY_JOB,
+                    level=level, group=group) if in_flight else {}
+            except Exception as e:
+                self.logger.warning(
+                    f"Could not read in-flight jobs while reassigning from {failed_agent_id}: {e}")
+                return
+
+        # The job record's leader_id is the authority on who holds it — the local
+        # `job_assignments` map only ever sees the elections this agent witnessed.
+        candidates = [jid for jid, rec in records.items()
+                      if rec and rec.get("leader_id") is not None
+                      and int(rec["leader_id"]) == int(failed_agent_id)]
+
+        # Local bookkeeping for the same agent, whether or not it also appears above.
         for job_id, assigned_agent in list(self.job_assignments.items()):
             if assigned_agent == failed_agent_id:
-                jobs_to_reassign.append(job_id)
+                self.job_assignments.remove(job_id)
 
-        if not jobs_to_reassign:
-            self.logger.debug(f"No jobs to reassign from failed agent {failed_agent_id}")
+        if not candidates:
+            self.logger.debug(f"No in-flight jobs to reassign from failed agent {failed_agent_id}")
             return
 
         self.logger.info(
-            f"Reassigning {len(jobs_to_reassign)} jobs from failed agent {failed_agent_id}: {jobs_to_reassign}"
-        )
+            f"Found {len(candidates)} in-flight job(s) on failed agent {failed_agent_id}: {candidates}")
 
-        reassigned_count = 0
-        for job_id in jobs_to_reassign:
-            # Get job from pending queue
-            job = self.queues.pending_queue.get(job_id)
-            if not job:
-                # Job might have completed or moved to another state
-                self.logger.debug(f"Job {job_id} not in pending queue (likely completed)")
-                self.job_assignments.remove(job_id)
+        reassigned = 0
+        for job_id in candidates:
+            if not self.repository.try_claim_reassignment(
+                    job_id, failed_agent_id, level=level, group=group):
+                self.logger.debug(f"Another agent is reassigning {job_id}; skipping")
                 continue
+            try:
+                job_obj = Job()
+                job_obj.from_dict(records[job_id])
+                old_state = job_obj.state
 
-            # Only reassign if job is not already completed
-            if self.is_job_completed(job_id):
-                self.logger.debug(f"Job {job_id} already completed, skipping reassignment")
-                self.job_assignments.remove(job_id)
-                continue
+                # A job the dead coordinator DELEGATED belongs to its children now; resetting
+                # this record re-elected and re-delegated it, overwrote a running child copy
+                # with PENDING, and ran it twice (code review 2026-10-05 §13). Leave it unless
+                # no child has picked it up — then it never really left this tier.
+                if job_obj.delegated_groups and not self._take_back_unpicked_delegation(
+                        job_id, job_obj.delegated_groups):
+                    self.logger.info(
+                        f"[REASSIGN] Job {job_id} on failed coordinator {failed_agent_id} is "
+                        f"held by child groups {job_obj.delegated_groups}; leaving it with them")
+                    continue
+                job_obj.delegated_groups = []
 
-            # Reset job to PENDING for reselection
-            old_state = job.state
-            job.state = ObjectState.PENDING
+                # Release, reset and forget as one reset under the job's election lock.
+                with self._election_lock(job_id):
+                    # Release the exactly-once claim FIRST. Until it is gone a re-finalization
+                    # returns the dead agent, so the job would be "reassigned" straight back to
+                    # the corpse — the reason reassignment could not work under Snow at all.
+                    # Only while it still names the dead agent: a live agent that re-won the job
+                    # since this record was read holds a claim of its own, which must stay.
+                    self.repository.release_assignment_if_held_by(
+                        job_id, failed_agent_id, level=level, group=group)
 
-            # Clear from consensus containers
-            self.engine.outgoing.remove_object(object_id=job_id)
-            self.engine.incoming.remove_object(object_id=job_id)
-            if job.job_id in self.completed_jobs_set:
-                self.completed_jobs_set.remove(job.job_id)
+                    job_obj.state = ObjectState.PENDING
+                    job_obj.leader_id = None
+                    # The record was read before this write — by the retry sweep, up to a whole
+                    # pass earlier — and an unconditional save would put PENDING over whatever
+                    # landed in between: a peer's reset already re-won by a live agent, or a
+                    # COMPLETE from a peer heartbeat had misjudged. The write is refused under
+                    # the same WATCH unless the record still shows the state and leader read.
+                    expect_state = old_state.value if hasattr(old_state, "value") else old_state
 
-            # Remove from assignment tracking
-            self.job_assignments.remove(job_id)
+                    def _unchanged(cur, _s=expect_state, _l=int(failed_agent_id)):
+                        if not cur or cur.get("state") != _s or cur.get("leader_id") is None:
+                            return False
+                        try:
+                            return int(cur["leader_id"]) == _l
+                        except (TypeError, ValueError):
+                            return False
 
-            # Track reassignment in metrics
-            self.metrics.reassignments[job_id] = {
-                'failed_agent': failed_agent_id,
-                'reassigned_at': time.time(),
-                'reason': 'agent_failure',
-                'old_state': old_state.value if hasattr(old_state, 'value') else str(old_state)
-            }
+                    if not self.repository.save(obj=job_obj.to_dict(), key_prefix=Repository.KEY_JOB,
+                                                level=level, group=group,
+                                                precondition=_unchanged):
+                        self.logger.info(
+                            f"[REASSIGN] Job {job_id} moved on since it was read as {old_state} on "
+                            f"failed agent {failed_agent_id}; leaving it alone")
+                        continue
 
-            reassigned_count += 1
-            self.logger.info(
-                f"Job {job_id} reset to PENDING for reassignment "
-                f"(was {old_state} on failed agent {failed_agent_id})"
-            )
+                    # Local consensus state for a job that is up for election again.
+                    self.engine.outgoing.remove_object(object_id=job_id)
+                    self.engine.incoming.remove_object(object_id=job_id)
+                    with self.completed_lock:
+                        self.completed_jobs_set.discard(job_id)
+                    self._forget_decided(job_id)
 
-        self.logger.info(f"Successfully reassigned {reassigned_count}/{len(jobs_to_reassign)} jobs")
+                self.metrics.reassignments[job_id] = {
+                    'failed_agent': failed_agent_id,
+                    'reassigned_at': time.time(),
+                    'reason': 'agent_failure',
+                    'old_state': old_state.value if hasattr(old_state, 'value') else str(old_state),
+                }
+                reassigned += 1
+                self.logger.info(
+                    f"[REASSIGN] Job {job_id} reset to PENDING (was {old_state} on failed "
+                    f"agent {failed_agent_id}); assignment claim released")
+            except Exception as e:
+                self.logger.error(f"Failed to reassign {job_id} from {failed_agent_id}: {e}")
+
+        self.logger.info(
+            f"Reassigned {reassigned}/{len(candidates)} in-flight jobs from agent {failed_agent_id}")
+
+    def _take_back_unpicked_delegation(self, job_id: str, groups) -> bool:
+        """True iff no child group has picked `job_id` up, in which case their unpicked copies
+        are withdrawn so the job can be re-elected at this tier. False when any copy has moved
+        past PENDING (or the copies cannot be read): the children own the job and re-electing
+        it here would run it twice. Unreadable is treated as owned — a job left with its
+        children is at worst untracked; a job taken back from them is executed twice.
+
+        Child records live at `level - 1` under the DEAD coordinator's group ids, which a
+        peer coordinator can address because they are on the record (`delegated_groups`)."""
+        level = self.topology.level - 1
+        try:
+            copies = self.repository.get_many_grouped(
+                [(job_id, g) for g in groups], key_prefix=Repository.KEY_JOB, level=level)
+        except Exception as e:
+            self.logger.warning(f"Could not read child copies of {job_id}: {e}")
+            return False
+        for g in groups:
+            rec = copies.get((job_id, g))
+            if rec and rec.get('state', ObjectState.PENDING.value) != ObjectState.PENDING.value:
+                return False
+        # Conditional: a child may pick a copy up between the read above and the delete.
+        return not self._withdraw_child_copies(job_id, groups)
 
     def _check_failure_threshold(self) -> None:
         """
@@ -3085,6 +5971,40 @@ class ResourceAgent(Agent):
             failure_rate = failed_count / self.configured_agent_count if self.configured_agent_count > 0 else 0
             self.logger.error(f"Current failure rate: {failure_rate:.1%}")
 
+    def _note_failed_last_seen(self, agent_id: int, agent_info) -> None:
+        """Remember the peer-clock stamp of the record a failure verdict was based on."""
+        seen = getattr(self, "_failed_last_seen", None)
+        if seen is None:
+            seen = self._failed_last_seen = {}
+        seen[agent_id] = float(getattr(agent_info, "last_updated", 0.0) or 0.0)
+
+    def _readmit_if_heartbeat_resumed(self, agent) -> bool:
+        """Readmit a failed peer iff Redis holds a record it wrote after it was judged failed.
+
+        Heartbeat is the authority for both directions: `_detect_failed_agents` fails a peer
+        whose record went stale, and only a fresher record undoes that. Compared against the
+        stamp on the record that was judged — both are the peer's own wall clock, so the
+        comparison is immune to inter-host offset, unlike comparing against our detection time.
+        A peer failed with no recorded stamp is readmitted on any record with a real stamp.
+        """
+        if not self.enable_agent_recovery:
+            return False
+        last_seen = getattr(self, "_failed_last_seen", {}).get(agent.agent_id)
+        stamp = float(getattr(agent, "last_updated", 0.0) or 0.0)
+        if stamp <= 0.0 or (last_seen is not None and stamp <= last_seen):
+            return False
+        failed_at = self.failed_agents.get(agent.agent_id)
+        self.failed_agents.remove(agent.agent_id)
+        getattr(self, "_failed_last_seen", {}).pop(agent.agent_id, None)
+        self.logger.info(
+            f"Agent {agent.agent_id} recovered: heartbeat resumed after it was judged failed "
+            f"(failed at {failed_at}); rejoining the neighbor map")
+        self.metrics.agent_recoveries.append({
+            'agent_id': agent.agent_id,
+            'recovered_at': time.time(),
+        })
+        return True
+
     def on_peer_status(self, target: str, up: bool, reason: str):
         """
         Enhanced peer status handling with immediate failure detection.
@@ -3099,38 +6019,13 @@ class ResourceAgent(Agent):
         if self.shutdown:
             return
         if up:
+            # A reachable gRPC server is NOT evidence the agent is working: a process whose
+            # periodic thread has died still answers health checks. This used to remove the
+            # peer from `failed_agents` on every successful probe, which re-admitted it to the
+            # broadcast set while `neighbor_map` (the quorum denominator) still excluded it —
+            # its votes counted against a bar that did not count it. Readmission now happens
+            # only on heartbeat evidence, in the neighbor refresh (`_readmit_if_heartbeat_resumed`).
             self.logger.debug(f"Peer {target} is UP: {reason}")
-            if not self.enable_agent_recovery:
-                return
-            # Attempt to recover a previously failed agent
-            try:
-                host, port_s = target.rsplit(":", 1)
-                port = int(port_s)
-                if host == "127.0.0.1":
-                    host = "localhost"
-
-                agent_id = None
-                # Check neighbor_map first
-                for aid, agent_info in list(self.neighbor_map.items()):
-                    if agent_info.host == host and agent_info.port == port:
-                        agent_id = aid
-                        break
-                # If not in neighbor_map (removed on failure), look up from Redis
-                if agent_id is None:
-                    agent_id = self._find_agent_by_endpoint(host, port)
-
-                if agent_id and agent_id in self.failed_agents:
-                    self.logger.info(
-                        f"Agent {agent_id} ({target}) recovered — removing from failed set. "
-                        f"Will rejoin on next neighbor refresh."
-                    )
-                    self.failed_agents.remove(agent_id)
-                    self.metrics.agent_recoveries.append({
-                        'agent_id': agent_id,
-                        'recovered_at': time.time(),
-                    })
-            except Exception as e:
-                self.logger.error(f"Failed to process peer recovery for {target}: {e}")
             return
 
         self.logger.warning(f"Peer {target} is DOWN: {reason}")
@@ -3164,6 +6059,7 @@ class ResourceAgent(Agent):
                 if failed_agent_id not in self.failed_agents:
                     current_time = time.time()
                     self.failed_agents.set(failed_agent_id, current_time)
+                    self._note_failed_last_seen(failed_agent_id, failed_agent_info)
                     # Record failure in metrics
                     time_since_update = current_time - failed_agent_info.last_updated
                     self.metrics.agent_failures[failed_agent_id] = {
@@ -3185,6 +6081,12 @@ class ResourceAgent(Agent):
         With failures: quorum adjusts based on remaining live agents
 
         Logs warnings when failure rate exceeds 33%.
+
+        The population is `neighbor_map`, and `Agent.consensus_skip_set` — the peers a
+        broadcast refuses to send to — is a subset of what that map already excludes. The
+        two must stay one set: a skip set wider than this denominator makes quorum
+        unreachable by construction, which is what SWIM's failed set did here until
+        2026-09-20 (code review §6).
 
         :return: Required quorum size for consensus
         """

@@ -32,8 +32,8 @@ import numpy as np
 
 import math
 
-from swarm.rl.bandit import (BanditPolicy, EpsilonGreedyPolicy, LinTSPolicy,
-                             LinUCBPolicy, UCB1Policy)
+from swarm.rl.bandit import (BanditPolicy, DisjointLinUCBPolicy, EpsilonGreedyPolicy,
+                             LinTSPolicy, LinUCBPolicy, UCB1Policy)
 from swarm.rl.context import ContextExtractor, GroupSnapshot
 
 
@@ -75,26 +75,54 @@ class MABManager:
     def __init__(self, agent_id: int, child_groups: List[int],
                  config: dict, repository, logger: Optional[logging.Logger] = None,
                  group_snapshot_provider: Optional[Callable[[], Dict[int, GroupSnapshot]]] = None,
-                 delegation_timeout_s: float = 60.0):
+                 delegation_timeout_s: float = 60.0,
+                 outcome_horizon_s: Optional[float] = None):
         self.agent_id = agent_id
         self.child_groups = list(child_groups)
         self.config = config
         self.repository = repository
         self.logger = logger or logging.getLogger(f"mab.{agent_id}")
         self._lock = threading.Lock()
+        # The candidates the load guard left the policy for the last decision made on this
+        # thread (`pop_eligible`), so a decision record can say what the policy could choose
+        # from. Thread-local because the decision record is written on the deciding thread.
+        self._eligible_tls = threading.local()
         self._last_persist_time = 0.0
         self._persist_interval = config.get("persist_interval_s", 30.0)
         self._persist_to_redis = config.get("persist_to_redis", False)
 
         self._snapshot_provider = group_snapshot_provider
         self.delegation_timeout_s = max(delegation_timeout_s, 1e-6)
-        self._pending_ttl_s = config.get("pending_ttl_s", 2 * delegation_timeout_s)
+        # How long a decision's context waits for its outcome. It must outlast the latest an
+        # outcome can arrive — `outcome_horizon_s`, the delegation timeout plus the execution
+        # grace, after which the monitor itself gives up. It was 2 × the timeout, sized for the
+        # reward being paid at SCHEDULING time; since P0-9 it is paid at completion, so any job
+        # running past ~2 × timeout lost its context first: the model update was skipped while
+        # the arm's counters still moved, and the per-type failure window — the C1 feature —
+        # trained on short jobs only (code review 2026-10-05 §22).
+        horizon = float(outcome_horizon_s) if outcome_horizon_s else 0.0
+        # The span shaped rewards are normalised over: the whole outcome horizon when the agent
+        # supplies it. `latency_s` runs from delegation to COMPLETION (P0-9), so dividing by the
+        # selection timeout scored every successful job that ran past it as 0 — counted as a
+        # failure by ArmStats — and the arm statistics measured job length, not group quality
+        # (code review 2026-10-05 §29).
+        self._shaping_span_s = horizon if horizon > 0 else self.delegation_timeout_s
+        self._pending_ttl_s = config.get(
+            "pending_ttl_s", max(2 * delegation_timeout_s, horizon + delegation_timeout_s))
 
         reward_cfg = config.get("reward", {})
         self._reward_shaped = reward_cfg.get("shaped", False)
         self._reward_exit_failure = reward_cfg.get("exit_failure", -0.5)
         self._reward_timeout = reward_cfg.get("timeout", -1.0)
         self._reward_non_winner = reward_cfg.get("non_winner", None)
+
+        # `mab.load_slack` (see `_load_eligible`); 0, the one default, leaves every capable
+        # group eligible exactly as before.
+        self._load_slack = float(config.get("load_slack", 0) or 0)
+        if self._load_slack < 0:
+            raise ValueError(f"mab.load_slack must be >= 0, got {config.get('load_slack')!r}")
+        self.load_guard_decisions = 0
+        self.load_guard_narrowed = 0
 
         self.extractor: Optional[ContextExtractor] = None
         self.policy = self._create_policy(config)
@@ -129,8 +157,22 @@ class MABManager:
                if self.extractor else "")
         )
 
+    #: Every algorithm `_create_policy` implements. Anything else is refused: it used to fall
+    #: through to epsilon-greedy while `get_stats` reported the configured name, so a run
+    #: configured `LinUCB` (the spelling CLAUDE.md used) ran epsilon-greedy under the LinUCB
+    #: label (code review 2026-10-05 §30). Matched case-insensitively for that reason.
+    ALGORITHMS = ("epsilon_greedy", "ucb1", "linucb", "lin_ts")
+    #: `mab.linucb.model`: one ridge model shared by every arm (the original design) or one per
+    #: arm. Unknown values raise, like `algorithm`; `shared` is the one default.
+    LINUCB_MODELS = ("shared", "disjoint")
+    LINUCB_MODEL_DEFAULT = "shared"
+
     def _create_policy(self, config: dict) -> BanditPolicy:
-        algorithm = config.get("algorithm", "epsilon_greedy")
+        algorithm = str(config.get("algorithm", "epsilon_greedy")).strip().lower()
+        if algorithm not in self.ALGORITHMS:
+            raise ValueError(f"mab.algorithm {config.get('algorithm')!r} is not one of "
+                             f"{', '.join(self.ALGORITHMS)}")
+        config["algorithm"] = algorithm
         step_size = config.get("step_size", None)
         if algorithm in ("linucb", "lin_ts"):
             self.extractor = ContextExtractor(config.get("context", {}))
@@ -142,7 +184,12 @@ class MABManager:
                     dim=self.extractor.dim,
                     schema_version=self.extractor.schema_version,
                 )
-            return LinUCBPolicy(
+            model = str(linucb_cfg.get("model", self.LINUCB_MODEL_DEFAULT)).strip().lower()
+            if model not in self.LINUCB_MODELS:
+                raise ValueError(f"mab.linucb.model {linucb_cfg.get('model')!r} is not one of "
+                                 f"{', '.join(self.LINUCB_MODELS)}")
+            cls = DisjointLinUCBPolicy if model == "disjoint" else LinUCBPolicy
+            return cls(
                 alpha=linucb_cfg.get("alpha", 1.0),
                 discount=linucb_cfg.get("discount", 0.995),
                 dim=self.extractor.dim,
@@ -150,7 +197,9 @@ class MABManager:
             )
         if algorithm == "ucb1":
             return UCB1Policy(
-                exploration_weight=config.get("exploration_weight", 1.41),
+                # One default: the policy's own (√2). The manager used to fall back to 1.41.
+                exploration_weight=config.get("exploration_weight",
+                                              UCB1Policy.DEFAULT_EXPLORATION_WEIGHT),
                 step_size=step_size,
             )
         # default: epsilon-greedy
@@ -201,7 +250,7 @@ class MABManager:
             except Exception as e:
                 self.logger.warning(f"Group snapshot provider failed: {e}")
 
-        now = time.time()
+        now = time.monotonic()
         # The agent's delegated-jobs dict undercounts during reassignment
         # churn (timeout handling removes entries) — take the max with the
         # bandit's own unresolved selections (Scenario C fix).
@@ -222,6 +271,48 @@ class MABManager:
             )
         return snapshots
 
+    def snapshots_for(self, group_ids: List[int]) -> Dict[int, GroupSnapshot]:
+        """Merged per-group view: the agent's live load data plus this manager's own
+        failure/timeout history. Public because the bandit is not the only delegation policy —
+        the LLM delegator (P0-1) needs the *same* group summary the bandit would have seen, or
+        the two arms of E4 are not comparing the same information."""
+        with self._lock:
+            return self._build_snapshots(list(group_ids))
+
+    def record_external_selection(self, job, groups: List[int],
+                                  snapshots: Optional[Dict[int, GroupSnapshot]] = None) -> None:
+        """Record a selection made by something other than this policy, so its outcome still
+        lands on the right arm with the right context.
+
+        With ``delegation.policy: llm`` the coordinator delegates without calling
+        ``select_groups``, but the delegation monitor still reports outcomes to
+        ``report_outcome`` — the arm counters move either way. Without this the contextual
+        model would be updated with ``context=None`` (silently skipped) while the arm's pull
+        and reward counts kept climbing, so the bandit's own statistics would describe a run it
+        did not steer. Recording the context keeps those statistics honest and is what P0-2's
+        ``bandit_gated_llm`` mode will reward against."""
+        if not groups:
+            return
+        job_id = getattr(job, "job_id", None)
+        if job_id is None or not self.contextual:
+            return
+        now = time.monotonic()
+        with self._lock:
+            self._sweep_pending(now)
+            # Prefer the caller's snapshots: they are the state the *decision* was made on. An
+            # LLM call takes seconds, so rebuilding here would record the world as it looked
+            # after the choice, and the model would be trained on a context nobody acted from.
+            snaps = snapshots if snapshots is not None else self._build_snapshots(list(groups))
+            contexts = self.extractor.build(job, list(groups), snaps)
+            entries = self._pending.setdefault(job_id, {})
+            for g in groups:
+                self.policy.ensure_arm(g)
+                entries[g] = _PendingSelection(
+                    context=contexts.get(g),
+                    job_type=getattr(job, "job_type", None),
+                    selected_at=now,
+                )
+
     def _sweep_pending(self, now: float):
         """Drop pending selections whose reward never arrived (lost jobs,
         lost leadership) so the map cannot grow without bound."""
@@ -237,33 +328,46 @@ class MABManager:
             del self._pending[job_id]
 
     def select_groups(self, capable_groups: List[int], job=None,
-                      top_k: int = 1) -> List[int]:
+                      top_k: int = 1,
+                      snapshots: Optional[Dict[int, GroupSnapshot]] = None) -> List[int]:
         """Use the bandit policy to pick *top_k* groups from *capable_groups*.
 
         If top_k >= len(capable_groups), all capable groups are returned
         (equivalent to the pre-MAB behaviour), but selection context is still
         recorded so their outcomes train the contextual model.
+
+        *snapshots*, when given, are used instead of building a fresh view. The caller
+        instruments the age of that view at the moment of the decision (P0-4), so rebuilding
+        here would train the model on one view and report the age of another.
         """
         if not capable_groups:
             return []
 
         job_id = getattr(job, "job_id", None)
         job_type = getattr(job, "job_type", None)
-        now = time.time()
+        now = time.monotonic()
 
         with self._lock:
             self._sweep_pending(now)
 
             contexts = None
+            snaps = None
+            if (self.contextual and job is not None) or (
+                    self._load_slack > 0 and top_k < len(capable_groups)):
+                snaps = (snapshots if snapshots is not None
+                         else self._build_snapshots(capable_groups))
             if self.contextual and job is not None:
-                snapshots = self._build_snapshots(capable_groups)
-                contexts = self.extractor.build(job, capable_groups, snapshots)
+                contexts = self.extractor.build(job, capable_groups, snaps)
 
             if top_k >= len(capable_groups):
                 selected = list(capable_groups)
+                self._eligible_tls.eligible = list(capable_groups)
             else:
+                eligible = self._load_eligible(capable_groups, top_k, snaps)
+                self._eligible_tls.eligible = list(eligible)
                 selected = self.policy.select_top_k(
-                    capable_groups, top_k, context=contexts)
+                    eligible, top_k,
+                    context={g: contexts[g] for g in eligible} if contexts else None)
 
             if self.contextual and job_id is not None:
                 entries = self._pending.setdefault(job_id, {})
@@ -280,6 +384,39 @@ class MABManager:
             )
             return selected
 
+    def pop_eligible(self) -> Optional[List[int]]:
+        """The candidates the policy was allowed to choose from in the last `select` on this
+        thread, then forgotten; None if no bandit decision was made since the last pop."""
+        eligible = getattr(self._eligible_tls, "eligible", None)
+        self._eligible_tls.eligible = None
+        return eligible
+
+    def _load_eligible(self, capable_groups: List[int], top_k: int,
+                       snaps: Optional[Dict[int, GroupSnapshot]]) -> List[int]:
+        """The candidates the policy may choose from under `mab.load_slack`: groups whose
+        in-flight count is within the slack of the least-loaded candidate (0 = off, all).
+
+        A load guard outside the learner, because the reward cannot carry load in time: a
+        queued job's latency reaches the model only when it finishes, after the burst that
+        queued it has been routed. Offline (real LinUCB, 1,300-job burst over 3 equal groups)
+        it brought p95 latency from ~1,700 s (shared, binary) or ~850 s (disjoint) to ~520 s,
+        the least-loaded figure; inside the slack the policy still chooses. Relative to the
+        least-loaded group, never an absolute capacity: a "has free slots" rule stops filtering
+        once every group is past its slots, which is exactly when the herding resumes.
+        Always at least `top_k` groups, filled by load."""
+        if self._load_slack <= 0 or not snaps:
+            return list(capable_groups)
+        load = {g: (snaps[g].inflight if g in snaps else 0) for g in capable_groups}
+        floor = min(load.values())
+        eligible = [g for g in capable_groups if load[g] <= floor + self._load_slack]
+        if len(eligible) < top_k:
+            rest = sorted((g for g in capable_groups if g not in eligible), key=lambda g: load[g])
+            eligible += rest[:top_k - len(eligible)]
+        if len(eligible) < len(capable_groups):
+            self.load_guard_narrowed += 1
+        self.load_guard_decisions += 1
+        return eligible
+
     def _shape_reward(self, success: bool, latency_s: Optional[float],
                       timed_out: bool) -> float:
         if not self._reward_shaped:
@@ -287,7 +424,7 @@ class MABManager:
         if success:
             if latency_s is None:
                 return self.REWARD_SUCCESS
-            return 1.0 - min(1.0, max(0.0, latency_s) / self.delegation_timeout_s)
+            return 1.0 - min(1.0, max(0.0, latency_s) / self._shaping_span_s)
         return self._reward_timeout if timed_out else self._reward_exit_failure
 
     def report_outcome(self, group_id: int, job_id: str, success: bool,
@@ -321,7 +458,7 @@ class MABManager:
                     # Liveness signal, not job-type fit: feed the time-decayed
                     # timeout score and keep the failure windows clean
                     # (Scenario C poisoned-window fix).
-                    self._record_timeout(group_id, time.time())
+                    self._record_timeout(group_id, time.monotonic())
                 else:
                     outcome = 0.0 if success else 1.0
                     self._group_windows.setdefault(
@@ -347,7 +484,7 @@ class MABManager:
 
         # Periodic persistence
         if self._persist_to_redis:
-            now = time.time()
+            now = time.monotonic()
             if now - self._last_persist_time >= self._persist_interval:
                 self.save_state()
                 self._last_persist_time = now
@@ -391,6 +528,10 @@ class MABManager:
         with self._lock:
             stats = {
                 "algorithm": self.config.get("algorithm", "epsilon_greedy"),
+                # `mab.load_slack`: decisions the guard saw, and how many it narrowed.
+                "load_slack": self._load_slack,
+                "load_guard_decisions": self.load_guard_decisions,
+                "load_guard_narrowed": self.load_guard_narrowed,
                 "arms": {
                     arm_id: arm.to_dict()
                     for arm_id, arm in self.policy.arms.items()
@@ -414,7 +555,7 @@ class MABManager:
                         for (g, t), w in self._type_windows.items()
                     },
                     "timeout_rates": {
-                        g: self._timeout_rate(g, time.time())
+                        g: self._timeout_rate(g, time.monotonic())
                         for g in self._timeout_scores
                     },
                 }

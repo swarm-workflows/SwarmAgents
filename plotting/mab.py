@@ -28,6 +28,7 @@ import pandas as pd
 from plotting.data import (
     load_metrics_from_redis,
     load_metrics_from_file,
+    set_expected_run_id,
     load_jobs_from_csv,
     load_jobs_from_redis,
 )
@@ -576,6 +577,11 @@ def parse_args():
     parser.add_argument("--from-csv", action="store_true", help="Load from CSV/JSON files instead of Redis")
     parser.add_argument("--compare", nargs="+", metavar="RUN_DIR", help="Compare multiple run directories")
     parser.add_argument("--no-plots", action="store_true", help="Print summary only, no plots")
+    parser.add_argument("--metrics-run-id", type=str, default=None,
+                        help="Only read metrics payloads stamped with this run id (see "
+                             "<run-dir>/run_meta.json). Without it, metrics left in Redis by an "
+                             "agent that outlived an earlier run are read as this run's — and "
+                             "MAB/delegation counters are exactly what that corrupted.")
     parser.add_argument("--dump", type=str,
                         help="Offline mode: plot from a full Redis dump JSON "
                              "(see evaluation/scenario_a/extract_scenario_a.py)")
@@ -590,6 +596,23 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    run_id = args.metrics_run_id
+    if run_id is None and not args.from_csv and not args.compare:
+        # Default to the run this output dir describes. Without a run id, metrics an agent left
+        # in Redis from an earlier run are read as this run's — and MAB/delegation counters are
+        # exactly what that corrupts (§46).
+        try:
+            with open(os.path.join(args.output_dir, "run_meta.json")) as fh:
+                run_id = (json.load(fh) or {}).get("run_id")
+        except (OSError, ValueError):
+            run_id = None
+        if run_id:
+            print(f"Using --metrics-run-id {run_id} from {args.output_dir}/run_meta.json")
+        else:
+            print("WARNING: no --metrics-run-id and no run_meta.json in --output-dir: metrics "
+                  "payloads from other runs still in Redis will be read as this run's.")
+    set_expected_run_id(run_id)
 
     # Offline dump mode (contextual bandit evaluation)
     if args.dump:

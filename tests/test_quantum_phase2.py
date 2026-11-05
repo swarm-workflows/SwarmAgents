@@ -53,6 +53,26 @@ class StubLayer:
         return [(f"{start + i + 1}-0", p) for i, p in enumerate(entries)]
 
 
+_SAVED_EXEC_POLICY = None
+
+
+def setUpModule():
+    """Pin a fast execution-simulation policy for the whole module.
+
+    These tests exercise the split/streaming *mechanics*, not durations, and HYBRID_JOB carries a
+    10 s wall_time. Under the shipped policy (scale 1.0) the producer and consumer would really
+    sleep for it. Pinning here also keeps the tests independent of whatever the shipped default
+    becomes.
+    """
+    global _SAVED_EXEC_POLICY
+    _SAVED_EXEC_POLICY = (Job._WALL_TIME_SCALE, Job._WALL_TIME_MIN_S, Job._WALL_TIME_MAX_S)
+    Job.configure_execution_simulation(scale=0.02, min_s=0.0, max_s=0.2)
+
+
+def tearDownModule():
+    Job.configure_execution_simulation(*_SAVED_EXEC_POLICY)
+
+
 HYBRID_JOB = {
     "id": "7",
     "wall_time": 10.0,

@@ -46,7 +46,9 @@ Notes:
 - Use --shutdown-after-seconds for time-based test termination (bypasses bucket monitoring).
 """
 from __future__ import annotations
-import argparse, os, re, subprocess, sys, time, math, shlex, csv
+import argparse, os, re, subprocess, sys, threading, time, math, shlex, csv, json, uuid
+import hashlib
+import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -54,10 +56,19 @@ from typing import List
 
 LINE_RE = re.compile(r"^state:\d+:\d+:(\d+):\s*\{([^}]*)\}\s*$")
 
+# Set once teardown begins, so the dynamic-agent trigger thread (a daemon that is never
+# joined) cannot launch agents after the stop sweep has already run.
+_TEARDOWN = threading.Event()
+
+# The base config every per-agent file is generated from. Named once: the same path resolved
+# in two places is how `runtime.peer_expiry_seconds` came to have two different defaults.
+BASE_CONFIG = "./config_swarm_multi.yml"
+
 def log(msg: str) -> None:
     print(f"[{datetime.now():%H:%M:%S}] {msg}", flush=True)
 
-def run_blocking(cmd: list[str] | str, log_file: str | None = None, check: bool = True) -> subprocess.CompletedProcess:
+def run_blocking(cmd: list[str] | str, log_file: str | None = None, check: bool = True,
+                 stdin_text: str | None = None) -> subprocess.CompletedProcess:
     """
     Run a command to completion. If log_file is provided, write stdout/stderr there; else inherit.
     """
@@ -68,18 +79,42 @@ def run_blocking(cmd: list[str] | str, log_file: str | None = None, check: bool 
         shell = False
         printable = " ".join(shlex.quote(c) for c in cmd)
 
+    # `stdin_text` is how a secret reaches a command without appearing in its argv — and so
+    # without appearing in this log line or in `ps` (code review 2026-10-05 §70, stop-time
+    # review). It is never logged.
     log(f"$ {printable}")
     if log_file:
         with open(log_file, "w") as f:
-            return subprocess.run(cmd, shell=shell, stdout=f, stderr=subprocess.STDOUT, text=True, check=check)
+            return subprocess.run(cmd, shell=shell, stdout=f, stderr=subprocess.STDOUT, text=True,
+                                  check=check, input=stdin_text)
     else:
-        return subprocess.run(cmd, shell=shell, text=True, check=check)
+        return subprocess.run(cmd, shell=shell, text=True, check=check, input=stdin_text)
 
 def run_once(cmd: list[str] | str) -> str:
     p = subprocess.run(cmd, shell=isinstance(cmd, str), capture_output=True, text=True, check=False)
     return (p.stdout or "") + (p.stderr or "")
 
-def parse_bucket_set_count(text: str, bucket: int) -> int:
+#: What `dump_db.py` prints when it cannot reach Redis — it still exits 0, so the text is the
+#: only signal. A Python traceback means the same: no count was read.
+_DUMP_FAILURE_MARKERS = ("Error connecting to Redis", "Traceback (most recent call last)")
+
+#: Persisted state indices (`ObjectState` values) that mean a job is assigned but not finished.
+INFLIGHT_BUCKETS = (5, 6)    # READY, RUNNING
+#: PRE_PREPARE, PREPARE, COMMIT: offered, left PENDING, not yet decided. Neither the drain (PENDING)
+#: nor the in-flight count (READY/RUNNING) saw them, so a Hier-270 PBFT pilot (2026-11-04) stopped
+#: with 12 jobs stuck mid-election at the coordinator tier and recorded "drained", 0 in flight.
+UNDECIDED_BUCKETS = (2, 3, 4)
+
+
+def parse_bucket_set_count(text: str, bucket: int) -> int | None:
+    """Jobs in `state:*:*:<bucket>` summed over every (level, group), or None when the dump
+    could not read Redis. It used to return 0 in that case — which the drain read as "pool
+    empty": a run whose controller could not reach Redis (a misspelt --db-host, a firewall)
+    was declared finished after the stability window. The `max_misses` branch written for
+    exactly that case was dead, because nothing ever returned None (code review 2026-10-05 §48).
+    """
+    if not text.strip() or any(m in text for m in _DUMP_FAILURE_MARKERS):
+        return None
     total_count = 0
     for raw_line in text.splitlines():
         line = raw_line.strip()
@@ -111,7 +146,7 @@ def ssh(host: str, cmd: str) -> int:
         cmd
     ])
 
-def ssh_check(host: str, cmd: str) -> None:
+def ssh_check(host: str, cmd: str, stdin_text: str | None = None) -> None:
     run_blocking([
         "ssh",
         "-o", "StrictHostKeyChecking=no",
@@ -119,7 +154,7 @@ def ssh_check(host: str, cmd: str) -> None:
         "-o", "BatchMode=yes",
         host,
         cmd
-    ], check=True)
+    ], check=True, stdin_text=stdin_text)
 
 def scp_to(host: str, src: str, dst: str) -> None:
     run_blocking([
@@ -135,15 +170,133 @@ def scp_to(host: str, src: str, dst: str) -> None:
 # ------------------------------
 # Pegasus job conversion
 # ------------------------------
+# Written by generate_configs.py (--dtns) in the working directory: agent_id -> [{"name": ...}].
+AGENT_DTNS_FILE = "agent_dtns.json"
+
+
+def agent_dtn_pool(path: str = AGENT_DTNS_FILE) -> list[str]:
+    """DTN names held by at least one agent *in this file*, sorted; [] if none are assigned.
+
+    Blind to which agents this run launches, and to whether the file describes them at all —
+    it is a repo-root artefact of the last generation. Callers converting jobs want
+    `launched_dtn_pool()`, which scopes to the fleet that starts; this stays the last resort
+    for when nothing else describes a fleet.
+
+    generate_configs.assign_agent_dtns gives each agent 1-4 random picks from a 10-name pool, so
+    a small fleet routinely leaves some pool names with no holder. Feasibility requires an agent
+    to hold every DTN a job references, so a job hashed onto an unheld name can never run.
+    Derive the pool from what was actually assigned, not from the pool it was drawn from.
+    """
+    p = Path(path)
+    if not p.exists():
+        return []
+    with open(p) as f:
+        assigned = json.load(f)
+    names = set()
+    for dtns in assigned.values():
+        for d in dtns or []:
+            name = d.get("name") if isinstance(d, dict) else d
+            if name:
+                names.add(str(name))
+    return sorted(names)
+
+
+def launched_dtn_pool(args) -> tuple:
+    """(DTN names held by an agent THIS RUN LAUNCHES, reason the fleet could not be described).
+
+    Same rule as `check_fleet_fits_jobs`, for the same reason: read the per-agent configs the
+    agents actually load, and only the ids 1..(agents + dynamic). `agent_dtns.json` answers
+    neither question. When the run generates its own fleet the two agree, which is why reading
+    the file was harmless until now; under `--use-config-dir` they need not — the configs can
+    have been generated on another machine, and the file routinely lists agents beyond this
+    run's range (a 270-agent generation left behind, a 30-agent run).
+
+    Converting against the wrong pool is silent in the way this codebase keeps rediscovering:
+    a job hashed onto a DTN only an unlaunched agent holds is infeasible for every agent that
+    starts, so it is never proposed, never fails, and shows up only as still pending at the end.
+
+    An incomplete description is returned as such rather than guessed at — the caller drops to
+    `local` (no DTN requirement) and says so, which cannot strand a job.
+    """
+    fleet, incomplete = _launched_fleet(args, AGENT_PROFILES_FILE)
+    if fleet:
+        names = set()
+        for entry in fleet:
+            names |= entry[5]
+        return sorted(names), None
+    # No fleet described. Whether that is "cannot read it" or "there is nothing to read" is the
+    # difference between refusing to guess and there being nothing to refuse — so ask the disk,
+    # not the reason string.
+    described = (any(p.exists() for p in _launched_config_paths(args))
+                 or Path(AGENT_PROFILES_FILE).exists())
+    if incomplete and described:
+        return [], incomplete
+    # Nothing on disk describes a fleet at all, so scoping is impossible either way. This is
+    # the pre-existing behaviour, named as a fallback rather than silently taken.
+    names = agent_dtn_pool()
+    if names:
+        log(f"NOTE: no per-agent configs or profiles describe this fleet; taking the DTN pool "
+            f"from {AGENT_DTNS_FILE}, which may describe a different one.")
+    return names, None
+
+
 def convert_pegasus_jobs(args) -> dict:
-    """Convert Pegasus profiles into SwarmAgents job files in jobs/."""
+    """Convert Pegasus profiles into SwarmAgents job files in jobs/.
+
+    Must run AFTER the fleet exists — generated by this run, or already on disk under
+    `--use-config-dir` — because the job DTN pool is the set the LAUNCHED agents hold
+    (`launched_dtn_pool`).
+    """
     from pegasus_to_swarm_converter import convert_pegasus_profiles
 
-    log(f"Converting Pegasus profiles: {args.pegasus_profiles} ({args.pegasus_input_type}) …")
+    held, incomplete = launched_dtn_pool(args)
+    if args.pegasus_dtn_names:
+        dtn_names = [n.strip() for n in args.pegasus_dtn_names.split(",") if n.strip()]
+        if incomplete:
+            log(f"WARNING: cannot check --pegasus-dtn-names against the fleet — {incomplete}; "
+                f"jobs hashed onto a DTN no launched agent holds can never be scheduled.")
+        else:
+            unheld = sorted(set(dtn_names) - set(held))
+            if unheld:
+                log(f"WARNING: --pegasus-dtn-names includes DTNs no agent holds: {','.join(unheld)}; "
+                    f"jobs hashed onto them cannot be scheduled (fleet holds: {','.join(held) or 'none'})")
+    elif incomplete:
+        # Naming DTNs we cannot confirm anyone holds is the one outcome that strands jobs
+        # invisibly. "local" is excluded from required DTNs by ResourceAgent.is_job_feasible,
+        # so the jobs stay schedulable; the run loses the locality dimension and is told so.
+        log(f"WARNING: cannot tell which DTNs this fleet holds — {incomplete}; converting onto "
+            f"'local' instead, so the jobs carry no DTN requirement.")
+        dtn_names = ["local"]
+    elif held:
+        dtn_names = held
+    else:
+        # No agent has any DTN (e.g. hierarchical runs, which do not pass --dtns), so any DTN
+        # requirement would be unsatisfiable. "local" is excluded from required DTNs by
+        # ResourceAgent.is_job_feasible, which makes the jobs data-location-free.
+        dtn_names = ["local"]
+
+    log(f"Converting Pegasus profiles: {args.pegasus_profiles} ({args.pegasus_input_type}) "
+        f"[data-nodes={args.pegasus_data_nodes}, dtns={','.join(dtn_names)}] …")
     result = convert_pegasus_profiles(
         input_path=args.pegasus_profiles,
         input_type=args.pegasus_input_type,
         output_dir="jobs",
+        data_nodes_mode=args.pegasus_data_nodes,
+        dtn_names=dtn_names,
+        # One DTN per job: agents hold only a few DTNs and feasibility requires all of a
+        # job's DTNs, so spreading a job's files would make multi-file jobs unschedulable.
+        dtn_scope="job",
+        # Where the workflow's code actually lives on this fleet. Without it the bundler
+        # looks for the executables at the paths the SUBMIT HOST recorded, which do not
+        # exist here, and writes a bundle that converts cleanly and cannot run.
+        bundle_source_root=getattr(args, "pegasus_bundle_source_root", None),
+        # Without this a converted workflow carries no `data_predicate`, so nothing holds a
+        # job until its parents have produced what it reads: the DAG is published as a flat
+        # set and the agents schedule it in whatever order consensus lands. It is off by
+        # default in the converter, and run_test never passed it — so every workflow run
+        # through this path was unordered, which only shows up as a child failing on a file
+        # its parent had not written yet.
+        dag_gating=getattr(args, "pegasus_dag_gating", False),
     )
     log(f"Pegasus conversion: {result['jobs_written']} jobs written, "
         f"{result['warnings_count']} warnings")
@@ -223,14 +376,21 @@ def generate_configs(args, agent_hosts_list: list[str]) -> Path:
     gen_args = [
         "python3.11", "generate_configs.py",
         str(args.agents), str(args.jobs_per_proposal),
-        "./config_swarm_multi.yml", str(cfg_dir),
+        BASE_CONFIG, str(cfg_dir),
         args.topology, args.db_host, str(args.jobs),
         "--agent-hosts-file", str(hosts_file),
         "--agents-per-host", str(args.agents_per_host) if args.mode == "remote" else str(args.agents),
         "--agent-type", args.agent_type,
     ]
-    if args.topology != "hierarchical":
+    # DTNs on EVERY topology. Hierarchical fleets used to be generated without them — a
+    # leftover from the plotting consolidation, not a design choice: the generator assigns DTNs
+    # topology-blind and CLAUDE.md's own hierarchical examples pass --dtns. With a workload
+    # whose jobs name DTNs (replay-golden: 2195 of 2222), every such job was infeasible on
+    # every leaf of a hierarchical fleet. --no-dtns keeps the old DTN-less fleet on purpose.
+    if not getattr(args, "no_dtns", False):
         gen_args.append("--dtns")
+        if getattr(args, "all_dtns", False):
+            gen_args.append("--all-dtns")
     if args.groups:
         gen_args += ["--groups", str(args.groups)]
     if args.group_size:
@@ -239,6 +399,15 @@ def generate_configs(args, agent_hosts_list: list[str]) -> Path:
         gen_args += ["--hierarchical-level1-agent-type", args.hierarchical_level1_agent_type]
         if hasattr(args, 'co_parents') and args.co_parents > 1:
             gen_args += ["--co-parents", str(args.co_parents)]
+        # Forwarded whenever it was GIVEN, not only when > 1: an explicit 1 that is not
+        # forwarded lets generate_configs apply its own default (2) instead, so the
+        # launcher's idea of the fan-out and the generated fleet's would differ.
+        if getattr(args, 'groups_per_coordinator', None) is not None:
+            gen_args += ["--groups-per-coordinator", str(args.groups_per_coordinator)]
+    if getattr(args, "delegation_policy", None):
+        gen_args += ["--delegation-policy", args.delegation_policy]
+    if getattr(args, "textfile_dir", None):
+        gen_args += ["--textfile-dir", str(args.textfile_dir)]
     # Pass initial group size for dynamic agent addition
     if hasattr(args, 'initial_group_size') and args.initial_group_size is not None:
         gen_args += ["--initial-group-size", str(args.initial_group_size)]
@@ -246,6 +415,17 @@ def generate_configs(args, agent_hosts_list: list[str]) -> Path:
         gen_args += ["--fit-all"]
     if getattr(args, "agent_sites_file", None):
         gen_args += ["--agent-sites-file", str(args.agent_sites_file)]
+    if getattr(args, "seed", None) is not None:
+        gen_args += ["--seed", str(args.seed)]
+    if getattr(args, "master_fleet_size", None):
+        gen_args += ["--master-fleet-size", str(args.master_fleet_size)]
+    if getattr(args, "job_target_agents", None):
+        gen_args += ["--job-target-agents", str(args.job_target_agents)]
+    if getattr(args, "pegasus_profiles", None) or getattr(args, "pegasus_jobs_dir", None):
+        # jobs/ comes from convert_pegasus_jobs() (run right after this) or, with
+        # --pegasus-jobs-dir, from a bundle converted elsewhere. Either way a synthetic set
+        # generated here would be published alongside the workflow.
+        gen_args.append("--skip-jobs")
     if getattr(args, "quantum_agents_pct", 0.0) > 0:
         gen_args += ["--quantum-agents-pct", str(args.quantum_agents_pct)]
     if getattr(args, "quantum_fraction", 0.0) > 0:
@@ -262,15 +442,210 @@ def cleanup_between_runs(args) -> None:
     if args.db_host:
         cmd += ["--redis-host", args.db_host, "--cleanup-redis"]
     log("Cleanup between runs …")
-    run_blocking(cmd, check=False)
+    # Checked: cleanup.py exits non-zero when it cannot reach Redis to flush it (§60).
+    run_blocking(cmd, check=bool(args.db_host))
     if not args.use_config_dir:
-        cmds = [["rm", "-rf", "agent_hosts.txt"], ["rm", "-rf", "agent_profiles.json"],
-                ["rm", "-rf", "agent_dtns.json"]]
-        # Only delete jobs/ when NOT using Pegasus profiles (Pegasus will overwrite it)
-        if not getattr(args, 'pegasus_profiles', None):
+        # Deleting agent_profiles.json / agent_dtns.json is deliberate and load-bearing:
+        # generate_configs.py REUSES an existing agent_dtns.json through a different code path
+        # that consumes randomness differently, so a --seed run that starts dirty is not
+        # reproducible. Never make these conditional.
+        cmds = [["rm", "-rf", "agent_profiles.json"], ["rm", "-rf", "agent_dtns.json"]]
+        # ... but agent_hosts.txt is an INPUT when --agent-hosts-file names it. Deleting it here
+        # and then passing the same path to generate_configs.py is a FileNotFoundError, and that
+        # is the documented remote invocation for the slice.
+        hosts_arg = getattr(args, "agent_hosts_file", None)
+        if not hosts_arg or Path(hosts_arg).resolve() != Path("agent_hosts.txt").resolve():
+            cmds.insert(0, ["rm", "-rf", "agent_hosts.txt"])
+        else:
+            log(f"Keeping {hosts_arg} (it is this run's --agent-hosts-file input)")
+        # Only delete jobs/ when this run is the one that fills it: a Pegasus conversion
+        # overwrites it, and --pegasus-jobs-dir names a directory the run only READS — which
+        # is usually the bundle on the shared export, so deleting it would destroy the
+        # workflow rather than a regenerable set of synthetic jobs.
+        if not getattr(args, 'pegasus_profiles', None) and not getattr(args, 'pegasus_jobs_dir', None):
             cmds.append(["rm", "-rf", "jobs"])
         for cmd in cmds:
             run_blocking(cmd, check=False)
+
+_WILDCARD_HOSTS = {"", "0.0.0.0", "::", "[::]", "*"}
+
+
+def _resolve(host: str) -> str:
+    import socket
+    try:
+        return socket.gethostbyname(host)
+    except OSError:
+        return host
+
+
+def placement_host(agent_id: int, args, host_list: list[str]) -> str:
+    """The host `start_agents_remote` puts agent `agent_id` on — and the one generate_configs.py
+    wrote into its config: block `(id - 1) // agents_per_host` of the hosts file."""
+    return host_list[(agent_id - 1) // int(args.agents_per_host)]
+
+
+def check_launch_matches_configs(args, host_list: list[str]) -> None:
+    """Refuse to launch a fleet whose configs do not describe where it will run.
+
+    `grpc.host` is what an agent ADVERTISES and what every peer dials, and it was fixed when the
+    configs were generated. Nothing compared it with where the launcher actually places each
+    agent, so under --use-config-dir a regenerated hosts file (one node down shifts the
+    interleave) or a different --agents-per-host sent every peer to the wrong address, and a
+    config generated without --agent-hosts-file advertised the wildcard 0.0.0.0 — the defect
+    that once ran consensus single-node with nothing failing (code review 2026-10-05 §51).
+
+    Local mode: the launcher reads ./configs whatever --config-dir says (§52), so a different
+    --config-dir means the run would launch a fleet other than the one it generated.
+    """
+    from swarm.utils.yaml_strict import safe_load
+    if args.mode == "local":
+        if Path(args.config_dir).resolve() != Path("configs").resolve():
+            raise SystemExit(
+                f"--config-dir {args.config_dir} in local mode: swarm-multi-start.sh launches "
+                f"from ./configs regardless, so this run would start a different fleet from "
+                f"the one it generated. Use --config-dir configs for local runs.")
+        return
+    problems = []
+    for idx, path in enumerate(_launched_config_paths(args), start=1):
+        try:
+            with open(path) as f:
+                host = str(((safe_load(f) or {}).get("grpc") or {}).get("host") or "")
+        except OSError as e:
+            problems.append(f"agent {idx}: cannot read {path}: {e}")
+            continue
+        if host.strip() in _WILDCARD_HOSTS:
+            problems.append(f"agent {idx}: advertises wildcard {host!r} ({path}) — generate "
+                            f"configs with --agent-hosts-file")
+            continue
+        try:
+            expected = placement_host(idx, args, host_list)
+        except IndexError:
+            problems.append(f"agent {idx}: no host for it in the hosts file")
+            continue
+        if host != expected and _resolve(host) != _resolve(expected):
+            problems.append(f"agent {idx}: config advertises {host}, launcher places it on "
+                            f"{expected}")
+    if problems:
+        shown = "\n  ".join(problems[:10])
+        more = f"\n  … and {len(problems) - 10} more" if len(problems) > 10 else ""
+        raise SystemExit(f"Launch does not match the configs ({len(problems)} agent(s)):\n  "
+                         f"{shown}{more}\nRegenerate the configs with this hosts file and "
+                         f"--agents-per-host, or launch with the ones they were generated for.")
+
+
+def capture_rtt_matrix(args, host_list: list[str]) -> None:
+    """Measure the RTT matrix the fleet's consensus traffic will cross, before it is launched.
+
+    From each agent's placement host to every agent's ADVERTISED `grpc.host` — the address its
+    peers dial, read from the configs this run launches (T-2). Never fails the run: a capture
+    that cannot be taken is recorded as such in rtt_matrix.json, and the collector then emits no
+    RTT columns rather than binning by a guess.
+    """
+    out = Path(args.run_dir) / "rtt_matrix.json"
+    if args.mode != "remote" or int(getattr(args, "rtt_samples", 0) or 0) <= 0:
+        return
+    from swarm.utils.yaml_strict import safe_load
+    import rtt_matrix
+    try:
+        advertised, placement = {}, {}
+        for idx, path in enumerate(_launched_config_paths(args), start=1):
+            with open(path) as f:
+                advertised[idx] = str(((safe_load(f) or {}).get("grpc") or {}).get("host") or "")
+            placement[idx] = placement_host(idx, args, host_list)
+        log(f"Measuring the RTT matrix over {len(set(advertised.values()))} host(s) "
+            f"({args.rtt_samples} samples) …")
+        result = rtt_matrix.measure(advertised, placement, samples=int(args.rtt_samples),
+                                    interval_s=float(args.rtt_interval))
+        log(f"RTT matrix {result['status']}: {result['pairs'] - result['pairs_missing']}/"
+            f"{result['pairs']} pairs in {result['duration_s']} s")
+    except Exception as exc:
+        result = {"status": "failed", "error": str(exc)}
+        log(f"WARN: RTT matrix not captured: {exc}")
+    out.write_text(json.dumps(result, indent=2))
+
+
+def check_delegation_policy_is_honoured(args) -> None:
+    """`delegation.policy: llm` needs LLM coordinators. On resource coordinators it ran the
+    bandit with no warning while run_meta.json recorded the LLM arm (code review 2026-10-05
+    §23). The agents now refuse it at startup; this refuses before anything is launched, and
+    also refuses a tier whose type cannot be determined or is mixed."""
+    if args.topology != "hierarchical" or _effective_delegation_policy(args) != "llm":
+        return
+    coordinators = _effective_coordinator_type(args)
+    if coordinators != "llm":
+        raise SystemExit(
+            f"delegation policy is llm but the coordinator tier is "
+            f"{coordinators or 'mixed or unknown'}: only LLM coordinators can delegate by LLM, "
+            f"and anything else would run the bandit under the LLM label. Pass "
+            f"--hierarchical-level1-agent-type llm (and place coordinators on hosts with "
+            f"OPENAI_API_KEY), or use --delegation-policy bandit.")
+
+
+def launch_or_teardown(args, host_list) -> None:
+    """Start the initial agents; if that fails, stop every agent this run started first."""
+    try:
+        if args.mode == "local":
+            start_agents_local(args)
+        else:
+            start_agents_remote(args, host_list)
+    except BaseException as exc:
+        # A failed launch must not leave the agents that DID start running: the hosts that
+        # succeeded, and any survivors on a host where another agent died. They would sit in
+        # Redis and join the next run (stop-time review of §60). Stop everything this run
+        # started, then fail.
+        log(f"ERROR: agent launch failed ({exc}); stopping every agent this run started")
+        _TEARDOWN.set()
+        try:
+            stop_agents(args, host_list if args.mode == "remote" else None)
+        except Exception as stop_exc:
+            log(f"WARNING: teardown after the failed launch also failed: {stop_exc}")
+        raise
+
+
+def leftover_agents(r) -> list[tuple[str, str]]:
+    """(key, host) for every agent record in Redis."""
+    found = []
+    for key in r.scan_iter(match="agent:*", count=1000):
+        host = "?"
+        try:
+            host = (json.loads(r.get(key) or "{}") or {}).get("host") or "?"
+        except (ValueError, TypeError):
+            pass
+        found.append((str(key), str(host)))
+    return sorted(found)
+
+
+def refuse_if_agents_still_registering(args, settle_s: float = 5.0) -> None:
+    """After the flush and before launch, no agent may be writing to Redis.
+
+    The reap before the flush covers only this run's hosts file. An agent left from an earlier
+    run on a host that file no longer names — a ladder stepping from 90 hosts to 30, a crashed
+    run, a stop that could not confirm — survives the flush, re-registers within a tick, and is
+    then counted in quorum, sampled by Snow and handed jobs by the run that follows. Its metrics
+    carry the old run id, so it surfaced only as a 'foreign payloads' note and the run passed
+    (code review 2026-10-05 §50). One agent tick is well under `settle_s`; anything that
+    re-registers in that window is still alive, and the run refuses rather than measure it.
+    """
+    import redis as _redis
+    try:
+        r = _redis.StrictRedis(host=args.db_host, port=6379, decode_responses=True)
+        r.ping()
+        # Delete every agent record first, so what is found after the wait was WRITTEN after
+        # it — a live process — and not a dead agent's record still inside its TTL.
+        for key, _host in leftover_agents(r):
+            r.delete(key)
+        time.sleep(settle_s)
+        stale = leftover_agents(r)
+    except Exception as e:
+        raise SystemExit(f"Cannot reach Redis at {args.db_host} to verify the flush: {e}")
+    if stale:
+        hosts = sorted({h for _k, h in stale})
+        raise SystemExit(
+            f"{len(stale)} agent(s) re-registered in Redis after the flush — they are still "
+            f"running from an earlier run, on host(s) {hosts}. They would join this run. "
+            f"Stop them first, e.g. `./stop_agents_v2.sh` with a hosts file naming {hosts}. "
+            f"First keys: {[k for k, _h in stale[:5]]}")
+
 
 # ------------------------------
 # Agent start (local or remote)
@@ -305,13 +680,18 @@ def start_agents_local(args, agent_count: int = None, start_offset: int = 0) -> 
     if args.debug:
         start_cmd += ["--debug"]
     if start_offset > 0:
-        start_cmd += ["--start-offset", str(start_offset)]
+        # A dynamic addition must not kill the agents already running (§49).
+        start_cmd += ["--start-offset", str(start_offset), "--add"]
 
     phase = "initial" if start_offset == 0 else "dynamic"
     log_file = f"local_agents_{phase}_start.log"
     log(f"Starting {agent_count} {phase} agents locally …")
-    # Run in background via nohup so we can proceed with the rest of the test
-    run_blocking(["nohup"] + start_cmd + [">", log_file, "2>&1", "&"], check=False)
+    # The starter backgrounds the agents itself and returns. Its output goes to the log through
+    # `run_blocking(log_file=...)`: this used to append ">", the file name, "2>&1" and "&" to an
+    # argv list run without a shell, where they were passed to the script as literal arguments
+    # (and ignored), so the start log documented in CLAUDE.md was never written.
+    # Checked: the starter exits non-zero when an agent dies during startup (§60).
+    run_blocking(["nohup"] + start_cmd, log_file=log_file, check=True)
 
 def shard_ranges(total: int, per_host: int) -> list[tuple[int,int]]:
     """
@@ -340,17 +720,28 @@ def start_agents_remote(args, agent_hosts_list: list[str], agent_count: int = No
     cfg_dir = Path(args.config_dir).absolute()
     cfg_prefix = "config_swarm_multi_"
 
-    # Calculate ranges for the agents we're starting
-    base_idx = start_offset + 1
-    ranges = [(base_idx + i * args.agents_per_host,
-               min(base_idx + (i + 1) * args.agents_per_host - 1, base_idx + agent_count - 1))
-              for i in range(math.ceil(agent_count / args.agents_per_host))]
+    # Agent `id` runs on host `(id - 1) // agents_per_host` — the SAME arithmetic
+    # generate_configs.py used to write that agent's advertised grpc.host, for initial and
+    # dynamic agents alike. Dynamic agents used to restart from the top of the host list, so
+    # each one advertised the host its config named while running on another: peers dialled an
+    # address with nothing behind it, and the agent landed on an occupied host (code review
+    # 2026-10-05 §51 — found by the launch check, which compares the two).
+    ids = range(start_offset + 1, start_offset + agent_count + 1)
+    ranges = []
+    for agent_id in ids:
+        host_idx = (agent_id - 1) // args.agents_per_host
+        if ranges and ranges[-1][2] == host_idx:
+            ranges[-1][1] = agent_id
+        else:
+            ranges.append([agent_id, agent_id, host_idx])
 
-    if len(agent_hosts_list) < len(ranges):
-        raise ValueError(f"Need at least {len(ranges)} hosts for {agent_count} agents with agents_per_host={args.agents_per_host}")
+    needed = ranges[-1][2] + 1 if ranges else 0
+    if len(agent_hosts_list) < needed:
+        raise ValueError(f"Need at least {needed} hosts for agents up to "
+                         f"{start_offset + agent_count} with agents_per_host={args.agents_per_host}")
 
-    for i, (start_idx, end_idx) in enumerate(ranges):
-        host = agent_hosts_list[i]
+    def launch_one(start_idx, end_idx, host_idx):
+        host = agent_hosts_list[host_idx]
         count = end_idx - start_idx + 1
         log(f"[{host}] agents {start_idx}..{end_idx} (count={count})")
 
@@ -378,18 +769,61 @@ def start_agents_remote(args, agent_hosts_list: list[str], agent_count: int = No
             forwarded += ["--debug"]
         # Add start-offset for this host's agent range (0-based offset from 1-based start_idx)
         forwarded += ["--start-offset", str(start_idx - 1)]
+        # Every host but the first gets a non-zero offset even on the INITIAL launch, so the
+        # phase — not the per-host offset — decides whether running agents may be killed.
+        # A dynamic addition that wraps onto an occupied host must leave its agents alone (§49).
+        if start_offset > 0:
+            forwarded += ["--add"]
 
-        start_cmd = (
+        # The run id has to cross the ssh boundary explicitly: a remote agent is not a child
+        # of this process, so it inherits nothing, and an unstamped payload is indistinguishable
+        # from an older run's leftover.
+        run_id = os.environ.get("SWARM_RUN_ID", "")
+        # The staging token crosses the ssh boundary over STDIN, never in the command: a command
+        # line is logged by run_blocking and visible in `ps` on both hosts (stop-time review of
+        # §70). The read runs in the FOREGROUND, before the backgrounded chain — a background job
+        # in a non-interactive shell has /dev/null for stdin — and the variable it sets is
+        # inherited by the commands after it. Without a local token the remote ~/.profile is the
+        # only source.
+        token = os.environ.get("SWARM_STAGING_TOKEN", "")
+        token_read = "IFS= read -r _SWARM_TOK; " if token else ""
+        token_export = 'export SWARM_STAGING_TOKEN="$_SWARM_TOK" && ' if token else ""
+        start_cmd = token_read + (
             #f"source ~/.bash_profile && "
             f"source ~/.profile && "
+            f"export SWARM_RUN_ID={shlex.quote(run_id)} && "
+            f"{token_export}"
             f"cd {shlex.quote(args.remote_repo_dir)} && "
             f"nohup bash {shlex.quote(starter)} "
             f"{shlex.quote(args.agent_type)} {count} {shlex.quote(args.topology)} {args.jobs} "
             f"{shlex.quote(args.db_host)} {args.jobs_per_proposal} "
             f"--use-config-dir " + " ".join(shlex.quote(x) for x in forwarded) +
-            f" > agent_{start_idx}_start.log 2>&1 &"
+            # FOREGROUND, stdin from /dev/null. Ending the command with `&` backgrounded the whole
+            # `&&` chain, so ssh returned 0 before the profile, the `cd` or the starter had run,
+            # and a host that failed to start anything was found at the metrics gate after the
+            # full runtime (code review 2026-10-05 §60). The starter backgrounds the agents
+            # itself, checks they survived startup, and exits non-zero if not; /dev/null stdin
+            # keeps ssh from waiting on descriptors the agents would otherwise inherit.
+            f" > agent_{start_idx}_start.log 2>&1 < /dev/null"
         )
-        ssh_check(host, start_cmd)
+        ssh_check(host, start_cmd, stdin_text=(token + "\n") if token else None)
+
+
+    # Hosts in parallel: each start now waits for the starter's survival check (~3 s), which
+    # serially would be minutes across a 90-host slice. Every failure is collected and the
+    # launch refused as a whole, naming the hosts.
+    from concurrent.futures import ThreadPoolExecutor
+    failures = []
+    with ThreadPoolExecutor(max_workers=min(32, max(1, len(ranges)))) as pool:
+        futures = {pool.submit(launch_one, a, b, h): agent_hosts_list[h] for a, b, h in ranges}
+        for fut, host in futures.items():
+            try:
+                fut.result()
+            except Exception as exc:
+                failures.append(f"{host}: {exc}")
+    if failures:
+        raise SystemExit(f"Agent start failed on {len(failures)} host(s) — see each host's "
+                         f"agent_<id>_start.log:\n  " + "\n  ".join(failures))
 
     phase = "initial" if start_offset == 0 else "dynamic"
     log(f"Launched {agent_count} {phase} '{args.agent_type}' agents across {len(ranges)} remote host(s).")
@@ -445,16 +879,633 @@ def wait_for_dynamic_trigger(args) -> None:
 # ------------------------------
 # Test flow: jobs, monitoring, stop, parse, plot
 # ------------------------------
+def jobs_dir(args) -> str:
+    """Where the job records this run publishes live.
+
+    `jobs/` by default — written by generate_configs.py (synthetic) or by
+    convert_pegasus_jobs() (Pegasus profiles converted here). `--pegasus-jobs-dir` names a
+    bundle converted somewhere else, typically the copy on the shared export; that directory
+    is only ever READ, never generated into and never cleaned between runs.
+    """
+    return str(getattr(args, "pegasus_jobs_dir", None) or "jobs")
+
+
+CFG_PREFIX = "config_swarm_multi_"          # what generate_configs.py writes, and what
+                                            # swarm-multi-start.sh globs for
+
+
+AGENT_PROFILES_FILE = "agent_profiles.json"
+
+
+def _launched_config_paths(args) -> list:
+    """The per-agent config files the agents of THIS run will read, in id order.
+
+    Two things this must not get wrong, both learned the hard way:
+
+    * **Which directory.** `swarm-multi-start.sh` globs `configs/` literally, so a local run
+      launches from `./configs` whatever `--config-dir` says; a remote run launches from each
+      host's own `configs/`, filled by copying `--config-dir` across.
+    * **Which ids.** Only 1..(agents + dynamic agents). A config directory outlives the run that
+      generated it — reusing one is what `--use-config-dir` is for — so it routinely describes a
+      larger fleet than this run starts, and an agent nobody launches must not answer for it.
+    """
+    cfg_dir = (Path("configs") if getattr(args, "mode", None) == "local"
+               else Path(getattr(args, "config_dir", "configs")))
+    launched = (int(getattr(args, "agents", 0) or 0)
+                + int(getattr(args, "dynamic_agents", 0) or 0))
+    if launched > 0:
+        return [cfg_dir / f"{CFG_PREFIX}{i}.yml" for i in range(1, launched + 1)]
+    # No fleet size (a caller that is not the runner): read whatever is there.
+    return sorted(cfg_dir.glob(f"{CFG_PREFIX}*.yml"))
+
+
+def check_jobs_dir_matches(args) -> None:
+    """Under --use-config-dir the synthetic jobs/ is neither regenerated nor cleaned, so it is
+    whatever the last generation left: a previous run's 600 jobs published into a run that
+    declares 200, or an empty directory feeding the drain nothing (code review 2026-10-05 §54).
+    A Pegasus run is validated elsewhere (`validate_pegasus_jobs_dir`)."""
+    if not getattr(args, "use_config_dir", False):
+        return
+    if getattr(args, "pegasus_profiles", None) or getattr(args, "pegasus_jobs_dir", None):
+        return
+    found = count_job_records(Path(jobs_dir(args)))
+    if found != int(args.jobs):
+        raise SystemExit(
+            f"--use-config-dir: {jobs_dir(args)}/ holds {found} job record(s) but --jobs is "
+            f"{args.jobs}. It is not regenerated under --use-config-dir; regenerate it "
+            f"(generate_configs.py, or a run without --use-config-dir) or pass --jobs {found}.")
+
+
+def count_job_records(path: Path) -> int:
+    """How many jobs a directory would publish: `job_*.json` and nothing else, which is exactly
+    what `job_distributor.py` picks up."""
+    if not path.is_dir():
+        return 0
+    return sum(1 for p in path.iterdir()
+               if p.is_file() and p.name.startswith("job_") and p.name.endswith(".json"))
+
+
+def _fleet_from_profiles(args, profiles_path: str) -> list:
+    """The launched agents as `agent_profiles.json` describes them, or []."""
+    profiles = _read_json(Path(profiles_path))
+    if not profiles:
+        return []
+    launched = (int(getattr(args, "agents", 0) or 0)
+                + int(getattr(args, "dynamic_agents", 0) or 0))
+    fleet = []
+    for aid, prof in sorted(profiles.items(), key=lambda kv: str(kv[0])):
+        # The file lists every agent ever generated. A 270-agent generation left behind by an
+        # earlier run satisfied this check for a 30-agent run, which then stalled.
+        if launched > 0 and not (str(aid).isdigit() and 1 <= int(aid) <= launched):
+            continue
+        fleet.append((
+            str(aid),
+            float(prof.get("core", 0) or 0), float(prof.get("ram", 0) or 0),
+            float(prof.get("disk", 0) or 0), float(prof.get("gpu", 0) or 0),
+            {str(d.get("name")) for d in (prof.get("dtns") or []) if d.get("name")},
+        ))
+    return fleet
+
+
+def _absent_config_is_fatal(args) -> bool:
+    """Whether a missing per-agent config stops this run.
+
+    It depends on the mode, because the two start paths do different things with one. A LOCAL
+    run launches through `swarm-multi-start.sh`, which iterates the configs that exist and
+    skips ids outside its range: the agent simply never starts and the rest of the run is fine.
+    A REMOTE run copies each id's config to its host and `start_agents_remote` raises
+    `FileNotFoundError` on the first one missing, so the run does not start at all.
+
+    So the same absence is "one fewer agent" locally and "this run is not going to happen"
+    remotely, and a reader that picks either answer for both is wrong half the time.
+    """
+    return getattr(args, "mode", None) != "local"
+
+
+def _launched_fleet(args, profiles_path: str):
+    """What the agents this run STARTS will have: [(id, core, ram, disk, gpu, {dtns})].
+
+    Read from the per-agent configs, because those are what each agent actually loads.
+    `agent_profiles.json` is a local artefact of the last generation: under `--use-config-dir`
+    it need not describe these configs at all, and either way it lists every agent ever
+    generated rather than the ones being started.
+
+    Returns (fleet, reason_it_is_incomplete). Absent and unparseable are different, and what
+    the starter does with each decides which is which:
+
+    * a config that is **absent** means that agent never starts — `swarm-multi-start.sh`
+      iterates the configs that exist and skips ids outside its range — so it is not part of
+      this fleet, and not a reason to stop describing the rest. Falling back to
+      `agent_profiles.json` here was worse than useless: that file can describe an older
+      generation, so one missing config swapped every agent's real capacities for a stale
+      guess;
+    * a config that is **present and unparseable** means the fleet cannot be described, and a
+      partial fleet is not partially usable — the agent that did not parse may be the only one
+      that fits, so refusing and passing would both be guesses;
+    * the profiles file is consulted only when no config described any agent at all.
+    """
+    from swarm.utils.yaml_strict import safe_load
+
+    fleet, unreadable, absent = [], [], []
+    for path in _launched_config_paths(args):
+        try:
+            with open(path) as fh:
+                cfg = safe_load(fh) or {}
+        except FileNotFoundError:
+            if _absent_config_is_fatal(args):
+                # Remote: start_agents_remote raises on this, so there is no fleet to describe
+                # and any verdict about job sizes would be about agents that never exist.
+                unreadable.append(f"{path} (missing; a remote run cannot start without it)")
+            else:
+                absent.append(str(path))
+            continue
+        except Exception as e:
+            unreadable.append(f"{path} ({e})")
+            continue
+        caps = cfg.get("capacities") or {}
+        fleet.append((
+            path.stem,
+            float(caps.get("core", 0) or 0), float(caps.get("ram", 0) or 0),
+            float(caps.get("disk", 0) or 0), float(caps.get("gpu", 0) or 0),
+            {str(d.get("name")) for d in (cfg.get("dtns") or []) if d.get("name")},
+        ))
+    if unreadable:
+        return [], f"{len(unreadable)} launched config(s) could not be read: {unreadable[0]}"
+    if fleet:
+        if absent:
+            log(f"NOTE: {len(absent)} config(s) in the launched range do not exist (e.g. "
+                f"{absent[0]}); those agents will not start and are not counted as fleet.")
+        return fleet, None
+    # No config described any agent — nothing has been generated into this directory.
+    from_profiles = _fleet_from_profiles(args, profiles_path)
+    if from_profiles:
+        return from_profiles, None
+    return [], f"no per-agent configs and no readable {profiles_path}"
+
+
+def _effective_coordinator_type(args):
+    """What the coordinators of THIS run actually are — the value `run_meta.json` records.
+
+    `--hierarchical-level1-agent-type` decides the coordinator tier only when this run
+    generates the fleet. Under `--use-config-dir` it is inert: the configs were written by an
+    earlier generation, possibly with the other type, and the flag's value is a claim about a
+    fleet this run did not build. Since 2026-09-18 that default is `resource`, so the inert
+    claim is also the *quiet* one — `evaluation/collect.py` reads this field to decide which
+    agents were expected to run the LLM plane, and recording `resource` over a reused fleet of
+    LLM coordinators drops the whole tier from the coverage denominator. A tier that went
+    entirely dark would then read as a fully measured run.
+
+    So under `--use-config-dir` the answer comes from the launched per-agent configs, and
+    `None` (unknown) when they cannot answer — which `expected_llm_agent_ids` already handles
+    by refusing to attribute roles rather than guessing in either direction.
+    """
+    declared = getattr(args, "hierarchical_level1_agent_type", None)
+    if not getattr(args, "use_config_dir", False):
+        return declared
+    from swarm.utils.yaml_strict import safe_load
+    found = set()
+    for path in _launched_config_paths(args):
+        try:
+            with open(path) as fh:
+                cfg = safe_load(fh) or {}
+        except FileNotFoundError:
+            continue
+        except Exception:
+            return None                      # a config that will not parse: do not guess
+        if (cfg.get("topology") or {}).get("level") == 1:
+            # A config with no `agent_type` launches as `resource`, and that is not a guess:
+            # `swarm-multi-start.sh` reads the key with `'resource'` as its fallback, and
+            # `main.py` does the same (its CLI value only wins when it is `llm`). Reading the
+            # absence as "unknown" instead would block a verdict in collect.py over a tier
+            # whose role is perfectly well defined.
+            found.add(cfg.get("agent_type") or "resource")
+    if len(found) != 1:
+        # None found (not hierarchical, or no level-1 config) or the tier is mixed, which no
+        # single value describes.
+        return None if found else declared
+    observed = found.pop()
+    if observed != declared:
+        log(f"NOTE: --hierarchical-level1-agent-type={declared} is inert under "
+            f"--use-config-dir; the launched configs have {observed} coordinators, and that "
+            f"is what run_meta.json records.")
+    return observed
+
+
+def _observed_groups_per_coordinator(args):
+    """Child groups per coordinator, read from the configs — or None if they cannot say.
+
+    A Level-1 config's `topology.children` holds GROUP ids, so its length is that
+    coordinator's fan-out. Worth reading rather than echoing the flag, because the flag is not
+    the last word: the generator caps it at the group count, and on a three-level hierarchy the
+    *default* steps down to 1 (an explicit request is refused instead). Recording the request
+    over a fleet that was built differently is the same defect as recording an inert
+    coordinator type — `mab.top_k`/`delegation.top_k` are read against this number when
+    deciding whether a delegation could ever have chosen.
+
+    The maximum across coordinators, since an indivisible group count leaves the last one
+    short (5 groups at 2 gives 2, 2, 1).
+    """
+    from swarm.utils.yaml_strict import safe_load
+    widths = []
+    for path in _launched_config_paths(args):
+        try:
+            with open(path) as fh:
+                cfg = safe_load(fh) or {}
+        except FileNotFoundError:
+            continue
+        except Exception:
+            return None
+        topo = cfg.get("topology") or {}
+        if topo.get("level") == 1:
+            widths.append(len(topo.get("children") or []))
+    return max(widths) if widths else None
+
+
+def archive_fleet_profiles(args) -> None:
+    """Keep this run's `agent_profiles.json` in the run dir.
+
+    An external baseline (E7: `baselines/run_baseline_remote.py`, `baselines/run_sparrow.py`)
+    must run on exactly the fleet a SWARM cell ran on, and takes it as `--use-profiles`. The
+    repo-root file is deleted by the next run's cleanup, so without a copy here a cell's fleet
+    could only be recovered by regenerating it. Only a fleet generated by THIS run is copied:
+    under `--use-config-dir` the root file can describe an older generation, and a wrong
+    archive is worse than none.
+    """
+    if getattr(args, "use_config_dir", None):
+        return
+    src = Path(AGENT_PROFILES_FILE)
+    if not src.is_file():
+        log(f"WARNING: {src} not found after generation; the run dir has no fleet profiles.")
+        return
+    try:
+        shutil.copy2(src, Path(args.run_dir) / AGENT_PROFILES_FILE)
+    except OSError as e:
+        log(f"WARNING: could not archive {src} into the run dir ({e}).")
+
+
+def _record_observed_fleet(args) -> None:
+    """Rewrite the run_meta fields that describe the fleet, now that the fleet exists.
+
+    `run_meta.json` is written before generation (it records the run id and argv, which the
+    rest of the run needs), so the coordinator type and the fan-out in it are requests. Both
+    can differ from what was built — an inert flag under `--use-config-dir`, a default fan-out
+    stepped down on a three-level hierarchy, a request capped at the group count — and
+    `evaluation/collect.py` reads both as facts about the fleet.
+
+    A field the configs cannot answer keeps its requested value; a file that cannot be read or
+    written is reported and skipped, since a run is not worth failing over its own metadata.
+    """
+    meta_path = Path(args.run_dir) / "run_meta.json"
+    try:
+        meta = json.loads(meta_path.read_text())
+    except Exception as e:
+        log(f"WARNING: could not re-read {meta_path} to record the observed fleet ({e}).")
+        return
+    observed = {
+        "hierarchical_level1_agent_type": _effective_coordinator_type(args),
+        "groups_per_coordinator": _observed_groups_per_coordinator(args),
+    }
+    for key, value in observed.items():
+        if value is not None and meta.get(key) != value:
+            log(f"run_meta: {key} = {value} (requested {meta.get(key)!r})")
+        if value is not None:
+            meta[key] = value
+    try:
+        meta_path.write_text(json.dumps(meta, indent=2))
+    except Exception as e:
+        log(f"WARNING: could not update {meta_path} ({e}).")
+
+
+def check_fleet_fits_jobs(args, profiles_path: str = AGENT_PROFILES_FILE) -> None:
+    """Refuse a fleet that cannot run the jobs it is about to be given.
+
+    A converted workflow carries the resource requirements the jobs really had on Pegasus, and
+    the names of the DTNs their data sits on. The fleet is sized independently — by
+    `generate_configs.py`, from its own flavour pool — and with `--pegasus-jobs-dir` the
+    conversion happened on another machine entirely, which knew nothing about this fleet. When
+    the two do not meet, `is_job_feasible` returns False for every agent and the job is simply
+    never selected: no error, no failure, just a run that ends with jobs still pending. That is
+    indistinguishable from a scheduling problem, which is the wrong thing to go looking at.
+
+    Two ways they fail to meet, and both are checked here because both are silent:
+
+    * **Capacity.** One agent has to satisfy every dimension at once, so this compares whole
+      profiles rather than per-dimension maxima — a fleet with a big-CPU agent and a big-RAM
+      agent still cannot run a job needing both.
+    * **DTNs.** Feasibility requires an agent holding *every* DTN a job references (`local` is
+      excluded — it means the local filesystem). A bundle converted with `--dtn-names dtn1,…`
+      against a fleet holding different names can never place a single job.
+    """
+    agents, incomplete = _launched_fleet(args, profiles_path)
+    if incomplete or not agents:
+        log(f"WARNING: cannot tell whether the jobs fit the agents — "
+            f"{incomplete or 'no fleet to check against'}.")
+        return
+
+    # Distinct requirement SHAPES, not jobs: a workflow has a handful of them and a run has
+    # tens of thousands of jobs, so this stays cheap however big the set is.
+    shapes: dict = {}
+    directory = Path(jobs_dir(args))
+    for job_file in sorted(directory.glob("job_*.json")):
+        job = _read_json(job_file)
+        if not job:
+            continue
+        cap = job.get("capacities") or {}
+        dtns = {str(dn.get("name")) for dn in
+                (job.get("data_in") or []) + (job.get("data_out") or [])
+                if dn.get("name")} - {"local"}
+        key = (float(cap.get("core", 0) or 0), float(cap.get("ram", 0) or 0),
+               float(cap.get("disk", 0) or 0), float(cap.get("gpu", 0) or 0),
+               tuple(sorted(dtns)))
+        shapes.setdefault(key, [0, job.get("id")])[0] += 1
+    if not shapes:
+        return
+
+    unfittable = []
+    for (core, ram, disk, gpu, dtns), (count, example) in sorted(shapes.items()):
+        need = set(dtns)
+        if not any(a_core >= core and a_ram >= ram and a_disk >= disk and a_gpu >= gpu
+                   and need <= a_dtns
+                   for _aid, a_core, a_ram, a_disk, a_gpu, a_dtns in agents):
+            unfittable.append((core, ram, disk, gpu, need, count, example))
+    if not unfittable:
+        return
+
+    core, ram, disk, gpu, need, count, example = unfittable[0]
+    held = sorted({d for agent in agents for d in agent[5]})
+    biggest = max(agents, key=lambda a: (a[1], a[2], a[3], a[4]))
+    missing_dtns = sorted(need - set(held))
+    raise SystemExit(
+        f"No agent in this fleet can run {sum(u[5] for u in unfittable)} of the jobs "
+        f"({len(unfittable)} distinct requirement shape(s)). Example: job {example!r} needs "
+        f"core={core} ram={ram} disk={disk} gpu={gpu}"
+        + (f" and DTN(s) {', '.join(sorted(need))}" if need else "")
+        + f"; the largest of the {len(agents)} agent(s) this run starts has core={biggest[1]} "
+        f"ram={biggest[2]} disk={biggest[3]} gpu={biggest[4]}"
+        + (f", and no agent holds {', '.join(missing_dtns)} (fleet holds: "
+           f"{', '.join(held) or 'none'})" if missing_dtns else "")
+        + ". Those jobs would never be selected and the run would end with them still pending. "
+        "Size the fleet to the workflow — pegasus_to_swarm_converter.py "
+        "--generate-agent-configs sizes every agent to the largest job and gives it every DTN "
+        "the jobs name — or convert with --dtn-names matching this fleet.")
+
+
+def _run_execution_mode(args) -> str:
+    """"simulate" / "real" / "unknown" — what this run's agents will do with a job that carries
+    an execution block.
+
+    **Every** config the run will use is read, not the first one: `--use-config-dir` means the
+    files are used as they are on disk, so they need not agree, and one agent configured `real`
+    makes the run one that executes. Reading only the first answered for a fleet rather than
+    about it.
+
+    Three states, and the middle one is why this is not a one-liner:
+
+    * an **absent** `runtime.execution.mode` is `simulate` (`runner.resolve_mode` owns that
+      default) — a real answer about a run that touches nothing;
+    * a config that cannot be **read** is no answer at all, and the run starts regardless under
+      `--use-config-dir`, because the agents read their own per-agent files and never this
+      process's copy. So any unreadable config leaves the answer `unknown`, which the caller
+      treats as executing;
+    * `real` anywhere wins immediately — nothing another file says can make the run not
+      execute.
+
+    Only `config_swarm_multi_*.yml` is considered, because that is what the starter launches
+    agents from. Globbing `*.yml` let an unrelated file in the directory — which has no runtime
+    block and so reads as `simulate` — answer for configs that say `real`.
+
+    And only the ones this run will actually LAUNCH, which is ids 1..(agents + dynamic agents).
+    A config directory outlives the run that generated it — `--use-config-dir` exists to reuse
+    one — so it routinely holds configs for a larger fleet than this run starts. Reading those
+    let an agent nobody launches refuse a perfectly good simulated run.
+
+    **Which directory the agents read is not the same one in both modes**, and `--config-dir`
+    does not always name it. `swarm-multi-start.sh` globs `configs/` literally, so a local run
+    launches from `./configs` whatever `--config-dir` says; a remote run launches from each
+    host's own `configs/`, which is filled by copying `--config-dir` across. Reading
+    `--config-dir` for a local run therefore answered from a directory no agent opens.
+    """
+    from swarm.execution.runner import resolve_mode
+    from swarm.utils.yaml_strict import safe_load
+
+    # Under --use-config-dir the per-agent files are the truth; otherwise they do not exist
+    # yet (this runs before generate_configs) and the base config they will be derived from is.
+    candidates = (_launched_config_paths(args) if getattr(args, "use_config_dir", False)
+                  else [Path(BASE_CONFIG)])
+
+    modes, unreadable = set(), []
+    for candidate in candidates:
+        try:
+            with open(candidate) as fh:
+                cfg = safe_load(fh) or {}
+        except FileNotFoundError:
+            # Local: that agent never starts (the starter iterates the configs that EXIST), so
+            # it says nothing about this run — counting it as "cannot tell" refused runs whose
+            # every launched agent was perfectly readable. Remote: the run aborts on it, so
+            # nothing can be concluded about a run that will not happen.
+            if _absent_config_is_fatal(args):
+                unreadable.append(f"{candidate} (missing; a remote run cannot start without it)")
+            continue
+        except Exception as e:                       # present, but unparseable
+            unreadable.append(f"{candidate} ({e})")
+            continue
+        modes.add(resolve_mode((cfg.get("runtime") or {}).get("execution")))
+    if "real" in modes:
+        return "real"
+    if unreadable:
+        log(f"WARNING: could not read {len(unreadable)} config(s): "
+            f"{'; '.join(unreadable[:3])}")
+        return "unknown"
+    if modes:
+        return "simulate"
+    log(f"WARNING: no {CFG_PREFIX}*.yml found to read runtime.execution.mode from "
+        f"({'--use-config-dir ' + str(getattr(args, 'config_dir', 'configs')) if getattr(args, 'use_config_dir', False) else BASE_CONFIG}).")
+    return "unknown"
+
+
+def _read_json(path: Path):
+    """The JSON at *path*, or None when it is absent or unreadable (which is reported by the
+    caller as a check that could not run, never as a check that passed)."""
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def validate_pegasus_jobs_dir(args) -> None:
+    """Refuse a --pegasus-jobs-dir that cannot produce this run's jobs."""
+    path = Path(args.pegasus_jobs_dir)
+    if not path.is_dir():
+        raise SystemExit(f"--pegasus-jobs-dir {path} is not a directory")
+    count = count_job_records(path)
+    if count == 0:
+        # job_distributor.py publishes job_*.json and nothing else, so an otherwise
+        # plausible-looking directory (a bundle's code/, a run dir) would start the whole
+        # fleet with nothing to schedule and look like a scheduling failure.
+        raise SystemExit(
+            f"--pegasus-jobs-dir {path} holds no job_*.json records; the fleet would start "
+            "with nothing to schedule.")
+    # A bundle is COPIED here, and a copy does not sweep. The converter replaces its own
+    # output directory (a 4-job workflow written over a 400-job one leaves 4 files, not 406),
+    # but `rsync -a` without --delete restages the new conversion INTO the old one, and every
+    # leftover job_*.json is published alongside — an earlier workflow's jobs running in this
+    # run, with nothing in the results saying so. The conversion says how many records it
+    # wrote, so the two can simply be compared.
+    summary = _read_json(path / "conversion_summary.json")
+    if summary is None:
+        log(f"WARNING: {path} has no readable conversion_summary.json — it was not written by "
+            "pegasus_to_swarm_converter.py, so neither stale records nor file-name collisions "
+            "can be checked.")
+    declared = (summary or {}).get("total_jobs_written")
+    if isinstance(declared, int) and declared != count:
+        raise SystemExit(
+            f"--pegasus-jobs-dir {path} holds {count} job_*.json records but its conversion "
+            f"wrote {declared}. The surplus is left over from an earlier conversion and would "
+            "be published as part of this run. Re-copy the bundle with `rsync -a --delete` "
+            "(or delete the directory first), then re-run.")
+
+    # Logical file names are the one thing a bundle does NOT namespace, and three things key
+    # on them: the DAG producer map, the run's readiness registry, and the shared working
+    # directory. Converting several workflows together (or several runs of one workflow) is
+    # where they collide, and every consequence is silent — a job gated on an unrelated
+    # workflow, or reading its file and succeeding. Refused here rather than left in
+    # conversion_summary.json for someone to notice.
+    dag = (summary or {}).get("dag") or {}
+    manifest = _read_json(path / "manifest.json")
+    if manifest is None:
+        log(f"WARNING: {path} has no readable manifest.json — converted with --no-bundle, so "
+            "its jobs only DESCRIBE their code by submit-host path. Real execution refuses "
+            "them unless those exact paths exist on every agent.")
+
+    # Whether this run acts on file names at all, which is what decides between refusing a
+    # bundle and merely reporting it. Two independent ways it can:
+    #
+    #   * GATING consults a producer map keyed by name, so a name decides scheduling order.
+    #   * EXECUTION reads and writes those names in one shared working directory.
+    #
+    # Neither is true of an ungated simulated replay — the shipped multi-workflow profile —
+    # whose names are inert, and refusing that would break the ordinary replay path. Execution
+    # takes BOTH halves: the run's configured mode (a bundle cannot know it) and whether these
+    # jobs carry anything to execute (a `real` run of synthetic jobs still simulates).
+    gated = bool(dag.get("gating"))
+    # Three states, and the middle one is the whole point. `simulate` (the default for an
+    # absent key) is a real answer: that run touches nothing, and refusing it would block
+    # ordinary replays. `unknown` means the config could not be read, which is not an answer —
+    # and under --use-config-dir such a run still starts — so the checks apply as if it
+    # executes rather than being skipped for a run that does.
+    mode = _run_execution_mode(args)
+    has_executables = bool(dag.get("execution_jobs") or (manifest or {}).get("code"))
+    executes = has_executables and mode != "simulate"
+    if has_executables and mode == "unknown":
+        log("WARNING: this run's execution mode could not be read, so the file-name checks "
+            "below are applied as if the jobs will execute.")
+    names_are_live = gated or executes
+
+    def _refuse_or_warn(problem: str, detail: str, live: bool) -> None:
+        if live:
+            raise SystemExit(f"--pegasus-jobs-dir {path}: {problem} {detail}")
+        log(f"WARNING: {problem} Inert in this run (no gating, nothing executes), but any run "
+            f"that gates or executes would be wrong.")
+
+    # A bundle converted before these checks existed cannot be validated. Saying nothing would
+    # read as "checked and clean", which is the one thing it is not.
+    if summary is not None and "cross_workflow_edges" not in dag:
+        _refuse_or_warn(
+            f"{path} was converted before the file-name checks existed, so its names have "
+            "never been checked.",
+            "Re-convert it with the current pegasus_to_swarm_converter.py.", names_are_live)
+
+    # One workflow produces a name, another reads it. Two workflows have no data relationship,
+    # so this is never a real dependency — but gating makes it an edge, and a shared working
+    # directory makes it the reader's input. The general case; the rest are narrower shapes.
+    foreign = dag.get("cross_workflow_edges") or {}
+    if foreign:
+        name, entry = sorted(foreign.items())[0]
+        _refuse_or_warn(
+            f"{len(foreign)} file name(s) are produced by one workflow and read by another.",
+            f"e.g. {name!r}, produced by {', '.join(entry.get('produced_by', [])[:2])} and read "
+            f"by {', '.join(entry.get('read_by', [])[:2])}. The reader would take the other "
+            "workflow's file (and under gating, wait for it). Convert and run these workflows "
+            "separately — one bundle and one run each.", names_are_live)
+
+    collisions = dag.get("colliding_outputs") or {}
+    if collisions:
+        _refuse_or_warn(
+            f"{len(collisions)} output file name(s) are produced by more than one job.",
+            f"({', '.join(sorted(collisions)[:3])}…) The working directory is flat, so they "
+            "are one file written twice; under gating the producer map keeps only the last of "
+            "them. Convert and run these workflows separately.", names_are_live)
+
+    # A name a job expects to be STAGED that another job also produces. Within one workflow
+    # this can be deliberate (a pre-seeded intermediate standing in for a job that cannot run
+    # here); across workflows it is two workflows that picked the same name.
+    conflicts = dag.get("replica_conflicts") or {}
+    crossing = {k: v for k, v in conflicts.items() if v.get("cross_workflow")}
+    if crossing:
+        name, entry = sorted(crossing.items())[0]
+        _refuse_or_warn(
+            f"{len(crossing)} staged input name(s) are also produced by a job in another "
+            "workflow.",
+            f"e.g. {name!r}, expected by {', '.join(entry.get('expected_by', [])[:2])} and "
+            f"produced by {', '.join(entry.get('produced_by', [])[:2])}. Convert and run these "
+            "workflows separately.", names_are_live)
+    if conflicts and not crossing:
+        log(f"WARNING: {len(conflicts)} staged input name(s) are also produced by a job in the "
+            "same workflow. Whichever runs first wins: stage_inputs never overwrites, and a "
+            "producer writes directly.")
+
+    # A replica or image whose basename collided was NOT bundled — but the job that lost still
+    # names the file, and the runner resolves a bare name under roots.inputs, so it would be
+    # staged the other workflow's bytes and succeed on the wrong data. Only staging acts on
+    # this, so it is executing — not gating — that makes it matter.
+    clashes = [m for m in (manifest or {}).get("missing", []) if m.get("collision")]
+    if clashes:
+        first = clashes[0]
+        _refuse_or_warn(
+            f"{len(clashes)} bundled file(s) collide by basename.",
+            f"e.g. {first.get('kind')} {first.get('lfn') or first.get('name')!r}: "
+            f"{first.get('reason')}. The job that lost would run on the other file rather than "
+            "fail. Convert and run these workflows separately.", executes)
+
+    log(f"Publishing pre-converted jobs from {path} ({count} job records)")
+    if count != args.jobs:
+        log(f"WARNING: --jobs {args.jobs} but {path} holds {count} job records. The agents' "
+            f"expected job count and the completion checks follow --jobs; set it to {count}.")
+
+
+#: Exit status of the job distributor thread, once it finishes. A non-zero value ends the wait
+#: and the run (exit 4): a run whose producer failed measured nothing, whatever drained.
+_PRODUCER_RC: dict = {}
+
+
+def producer_failed() -> bool:
+    return _PRODUCER_RC.get("rc", 0) not in (0, None)
+
+
 def produce_jobs(args) -> None:
     """
     Produce jobs according to params. You can swap this with your job generator if needed.
     """
     jobs_cmd = [
         "python3.11", "job_distributor.py",
-        "--jobs-dir", "jobs",
-        "--jobs-per-interval", str(args.jobs_per_interval),
+        "--jobs-dir", jobs_dir(args),
         "--redis-host", args.db_host,
     ]
+    if getattr(args, "run_dir", None):
+        jobs_cmd += ["--arrivals-out", str(Path(args.run_dir) / "arrivals.json")]
+    if getattr(args, "arrival", "batch") == "poisson":
+        jobs_cmd += ["--arrival", "poisson"]
+        if args.arrival_rate is not None:
+            jobs_cmd += ["--rate", str(args.arrival_rate)]
+        else:
+            jobs_cmd += ["--rate-schedule", str(Path(args.arrival_schedule).resolve())]
+        seed = args.arrival_seed if args.arrival_seed is not None else args.seed
+        if seed is not None:
+            jobs_cmd += ["--arrival-seed", str(seed)]
+    else:
+        jobs_cmd += ["--jobs-per-interval", str(args.jobs_per_interval),
+                     "--interval", str(getattr(args, "job_interval", 1.0))]
     if args.topology == "hierarchical":
         # For 3-tier hierarchies (100 or 1000 agents), jobs enter at Level 2
         # For 2-tier hierarchies (30 or 110 agents), jobs enter at Level 1
@@ -464,10 +1515,19 @@ def produce_jobs(args) -> None:
             jobs_cmd.extend(["--level", "1"])
     if getattr(args, "split_hybrid", False):
         jobs_cmd.append("--split-hybrid")
-    if args.debug:
-        jobs_cmd.append("--debug")
+    # No --debug: job_distributor.py has no such flag (it has no logging at all). Forwarding it
+    # made argparse exit 2 inside this daemon thread with check=False, so every --debug run
+    # published zero jobs, drained an empty pool and exited 0 (code review 2026-10-05 §47).
     log("Producing jobs …")
-    run_blocking(jobs_cmd, check=False)
+    _PRODUCER_RC["running"] = True
+    try:
+        proc = run_blocking(jobs_cmd, check=False)
+    finally:
+        _PRODUCER_RC["running"] = False
+    _PRODUCER_RC["rc"] = proc.returncode
+    if proc.returncode != 0:
+        log(f"ERROR: job_distributor.py exited {proc.returncode} — this run did not get its "
+            f"jobs. Stopping the wait; the run will exit non-zero.")
 
 
 def check_all_jobs_infeasible(args, bucket: int) -> bool:
@@ -497,7 +1557,7 @@ def check_all_jobs_infeasible(args, bucket: int) -> bool:
         return False  # No jobs in bucket
 
     # Load feasibility CSV
-    csv_path = Path("jobs") / "job_feasibility_mapping.csv"
+    csv_path = Path(jobs_dir(args)) / "job_feasibility_mapping.csv"
     if not csv_path.exists():
         log(f"WARN: Feasibility CSV not found at {csv_path}, skipping infeasibility check")
         return False
@@ -530,37 +1590,200 @@ def check_all_jobs_infeasible(args, bucket: int) -> bool:
     return all_infeasible
 
 def wait_runtime(args) -> None:
+    # `--runtime` is a HARD CAP on this loop, not a replacement for the drain condition: a
+    # slow-but-progressing run still exits early when the bucket drains, and a stalled one exits
+    # on the clock. It used to be parsed and never read, so the only exits were "bucket drained"
+    # and "bucket key missing" — neither of which a run that cannot place any job ever reaches.
+    # One campaign run polled a bucket stuck at 300 for 28 minutes and was only ended by a
+    # teardown running underneath it.
+    runtime_cap = int(getattr(args, "runtime", 0) or 0)
+    deadline = (time.time() + runtime_cap) if runtime_cap > 0 else None
+    if deadline is not None:
+        log(f"wait_runtime: drain condition, or hard cap of {runtime_cap}s, whichever first")
+    else:
+        log("WARNING: no --runtime cap and no --shutdown-after-seconds; a run that cannot place "
+            "jobs will poll forever. Pass one of them for unattended runs.")
+
     low_since = None
     consecutive_misses = 0
     while True:
+        if deadline is not None and time.time() >= deadline:
+            log(f"Runtime cap of {runtime_cap}s reached before the pool drained → stopping. "
+                f"This run did NOT finish on the drain condition; treat its results as a stall.")
+            _DRAIN["status"] = "cap"
+            break
+        if producer_failed():
+            _DRAIN["status"] = "producer_failed"
+            break
         out = run_once(["python3.11", "dump_db.py", "--host", args.db_host, "--type", "redis", "--key", "state"])
         size = parse_bucket_set_count(out, args.watch_bucket)
         if size is None:
             consecutive_misses += 1
-            log(f"WARN: state:*:*:{args.watch_bucket} not found (miss {consecutive_misses}/{args.max_misses})")
+            log(f"WARN: could not read the job state from Redis at {args.db_host} "
+                f"(miss {consecutive_misses}/{args.max_misses})")
             if consecutive_misses > args.max_misses:
-                log("Bucket missing too often → treating as done.")
+                # NOT "done": nothing is known about the pool. Stop, and fail the run.
+                log("ERROR: Redis unreadable too many times in a row → stopping. This run is "
+                    "NOT drained; it will exit non-zero.")
+                _DRAIN["status"] = "redis_unreadable"
                 break
         else:
-            cond = size < args.threshold
-            log(f"Bucket state:*:*:{args.watch_bucket} size={size} (thr={args.threshold}) → {'LOW' if cond else 'OK'}")
+            consecutive_misses = 0
+            # Never drained while jobs are still arriving: under a steady arrival rate the pool
+            # sits at 0-7 the whole run, so "< threshold for stable_seconds" could fire between
+            # two arrivals (the 20/s burst kept it far above the threshold until the end).
+            producing = bool(_PRODUCER_RC.get("running"))
+            cond = size < args.threshold and not producing
+            _DRAIN["pending_at_stop"] = size
+            log(f"Bucket state:*:*:{args.watch_bucket} size={size} (thr={args.threshold}) → "
+                f"{'LOW' if cond else 'OK'}{' (still producing)' if producing else ''}")
 
             # Check if all remaining jobs are infeasible
             if size > 0 and check_all_jobs_infeasible(args, args.watch_bucket):
                 log("All remaining jobs are infeasible → triggering shutdown.")
+                _DRAIN["status"] = "infeasible"
                 break
 
             if cond:
+                # An empty pool is done after `stable_seconds`. A pool with a few jobs left gets
+                # long enough for the protocol's own fallbacks to act on them — the 60 s
+                # re-election of a decision nobody persisted and the 300 s reselection timeout:
+                # a pilot (2026-10-14) stopped with 3 jobs PENDING 3 min after their
+                # re-election, before the reselection could fire, and recorded "drained".
+                need = args.stable_seconds if size == 0 else max(
+                    args.stable_seconds, getattr(args, "stranded_wait_s", 0) or 0)
                 if low_since is None:
                     low_since = time.time()
-                elif time.time() - low_since >= args.stable_seconds:
-                    log("Condition stable → proceed.")
+                elif time.time() - low_since >= need:
+                    if size == 0:
+                        log("Condition stable → proceed.")
+                        _DRAIN["status"] = "drained"
+                    else:
+                        # Not drained: these jobs were never run, and the fallbacks had their
+                        # chance. A run that loses jobs must not read as a clean one.
+                        log(f"WARNING: {size} job(s) still PENDING after {need}s → stopping. "
+                            f"This run STRANDED jobs (recorded in drain.json).")
+                        _DRAIN["status"] = "stranded"
                     break
             else:
                 low_since = None
         time.sleep(args.check_interval)
+    if _DRAIN.get("status") in ("drained", "stranded"):
+        _wait_for_inflight(args)
     log(f"Sleeping for grace_seconds: {args.grace_seconds}s …")
     time.sleep(args.grace_seconds)
+    _record_drain(args)
+
+
+#: How the wait ended, written to <run-dir>/drain.json: drained | stranded | cap | infeasible |
+#: redis_unreadable | producer_failed, plus the jobs still pending, in flight and undecided at the stop.
+#: `stranded` = 1..threshold-1 jobs never left PENDING even after --stranded-wait-s.
+_DRAIN: dict = {}
+
+
+#: One atomic snapshot of every job-state index: Redis runs a script without interleaving other
+#: commands, and the repository moves a job between state sets in one WATCH/MULTI transaction,
+#: so each job is in exactly one set here. `dump_db.py` lists the keys and THEN reads each set;
+#: a job reset from PREPARE into a PENDING key created between those two steps was in neither
+#: read, and the end-of-run wait recorded a lost job as drained (stop review 2026-11-05).
+_STATE_SNAPSHOT_LUA = """
+local out = {}
+for _, k in ipairs(redis.call('KEYS', 'state:*')) do
+  if redis.call('TYPE', k)['ok'] == 'set' then
+    out[#out + 1] = k
+    out[#out + 1] = redis.call('SCARD', k)
+  end
+end
+return out
+"""
+
+
+def _redis_client(args):
+    import redis as _redis
+    return _redis.StrictRedis(host=args.db_host, port=6379, decode_responses=True,
+                              socket_timeout=30)
+
+
+def _stop_counts(args) -> tuple[int | None, int | None, int | None]:
+    """(pending, in flight = READY+RUNNING, undecided = PRE_PREPARE+PREPARE+COMMIT) from ONE
+    atomic snapshot, all None when Redis could not be read. PENDING is re-read here because a
+    stalled election is reset to PENDING (`_restart_selection`) while this wait runs."""
+    try:
+        flat = _redis_client(args).eval(_STATE_SNAPSHOT_LUA, 0)
+    except Exception as e:
+        log(f"WARN: could not snapshot job states from Redis at {args.db_host}: {e}")
+        return None, None, None
+    per_state: dict[int, int] = {}
+    for key, n in zip(flat[0::2], flat[1::2]):
+        parts = str(key).split(":")
+        if len(parts) != 4 or not parts[3].isdigit():
+            continue
+        per_state[int(parts[3])] = per_state.get(int(parts[3]), 0) + int(n)
+
+    def total(buckets):
+        return sum(per_state.get(b, 0) for b in buckets)
+
+    return (total((getattr(args, "watch_bucket", 1),)), total(INFLIGHT_BUCKETS),
+            total(UNDECIDED_BUCKETS))
+
+
+def _wait_for_inflight(args) -> None:
+    """The drain watches PENDING only, so it fired while the last wave was still RUNNING and
+    the stop cut it off — completion % short, nothing saying so. Wait for READY/RUNNING, for
+    jobs still mid-election (PRE_PREPARE/PREPARE/COMMIT), and for any job an election reset
+    put back in PENDING, to empty too, bounded by --inflight-drain-max-s; all three counts left
+    at the bound are recorded, and jobs still PENDING there make the run `stranded`."""
+    limit = float(getattr(args, "inflight_drain_max_s", 0) or 0)
+    deadline = time.time() + limit
+    while True:
+        p, n, u = _stop_counts(args)
+        _DRAIN["pending_at_stop"] = p
+        _DRAIN["inflight_at_stop"] = n
+        _DRAIN["undecided_at_stop"] = u
+        if p == 0 and n == 0 and u == 0:
+            if _DRAIN.get("status") == "stranded":
+                # The drain gave up on a few PENDING jobs (--stranded-wait-s), and they finished
+                # during this wait: nothing was lost, so the run is drained. Recorded, because the
+                # tail is real (Hier-270 PBFT pilot, 2026-11-05: 2 jobs re-elected for ~8 min,
+                # all 5400 executed once, and the run was retried as "stranded").
+                _DRAIN["status"] = "drained"
+                _DRAIN["stranded_recovered"] = True
+            return
+        if time.time() >= deadline:
+            if p:
+                _DRAIN["status"] = "stranded"
+            log(f"WARNING: {p if p is not None else 'unknown'} job(s) PENDING, "
+                f"{n if n is not None else 'unknown'} READY/RUNNING and "
+                f"{u if u is not None else 'unknown'} undecided after {limit:.0f}s; "
+                f"stopping anyway. This run's completion is TRUNCATED (recorded in drain.json).")
+            return
+        log(f"Pending drained; waiting for {p if p is not None else '?'} pending, "
+            f"{n if n is not None else '?'} in-flight and {u if u is not None else '?'} "
+            f"undecided job(s) …")
+        time.sleep(args.check_interval)
+
+
+def _record_drain(args) -> None:
+    _DRAIN.setdefault("status", "unknown")
+    if producer_failed():
+        _DRAIN["status"] = "producer_failed"
+        _DRAIN["producer_rc"] = _PRODUCER_RC.get("rc")
+    try:
+        Path(args.run_dir).mkdir(parents=True, exist_ok=True)
+        (Path(args.run_dir) / "drain.json").write_text(json.dumps(_DRAIN, indent=2))
+    except OSError as e:
+        log(f"WARN: could not write drain.json: {e}")
+
+
+def run_failed_to_measure() -> str | None:
+    """Why this run measured nothing trustworthy, or None. Checked at exit."""
+    if producer_failed():
+        return f"job_distributor.py exited {_PRODUCER_RC.get('rc')}"
+    if _DRAIN.get("status") == "redis_unreadable":
+        return "Redis was unreadable during the drain wait"
+    if _DRAIN.get("dynamic_start_failed"):
+        return f"the dynamic agent addition failed ({_DRAIN['dynamic_start_failed']})"
+    return None
 
 def wait_with_early_exit(args) -> None:
     """
@@ -586,6 +1809,9 @@ def wait_with_early_exit(args) -> None:
         return
 
     while time.time() < deadline:
+        if producer_failed():
+            _DRAIN["status"] = "producer_failed"
+            break
         remaining = int(deadline - time.time())
         sleep_for = min(poll_interval, remaining)
         if sleep_for <= 0:
@@ -625,6 +1851,7 @@ def wait_with_early_exit(args) -> None:
                 if stable_count >= 2:
                     log(f"All {total_jobs} jobs reached terminal state — exiting early "
                         f"(saved {remaining}s)")
+                    _DRAIN["status"] = "all_terminal"
                     return
             else:
                 stable_count = 0
@@ -634,26 +1861,278 @@ def wait_with_early_exit(args) -> None:
     log("Shutdown timer expired, stopping test")
 
 
-def stop_agents(args) -> None:
+def _launched_configs(args) -> list:
+    """The per-agent configs this run launches, parsed — the same files `_launched_fleet` and
+    `_run_execution_mode` read, for the same reason: a LOCAL run launches from `./configs`
+    whatever `--config-dir` says, a REMOTE run from `--config-dir`, and only ids
+    1..(agents + dynamic). Reading `<config_dir>/*.yml` and taking the first file — what the
+    two readers below did until 2026-09-18 — answered from the wrong directory locally and
+    from one arbitrary agent everywhere, so `run_meta.json` could label an arm the agents
+    never ran. Returns [] when nothing is launched from a directory (no --use-config-dir).
+    """
+    if not getattr(args, "use_config_dir", False):
+        return []
+    from swarm.utils.yaml_strict import safe_load
+    out = []
+    for path in _launched_config_paths(args):
+        try:
+            with open(path) as f:
+                out.append(safe_load(f) or {})
+        except FileNotFoundError:
+            continue
+        except Exception:
+            out.append(None)          # present and unreadable: keep the slot, mark unknown
+    return out
+
+
+def _effective_delegation_policy(args) -> str | None:
+    """The policy this run will actually use, for run_meta.json.
+
+    Recording only the flag would write `null` for every run that takes the arm from the base
+    config, which is how the arm was selected until --delegation-policy existed. Under
+    --use-config-dir it is read from EVERY launched config, and disagreement — or a config
+    that will not parse — is recorded as None rather than as whichever agent came first:
+    `collect.py` labels the arm from this field, and a wrong label moves a result between
+    arms.
+    """
+    if getattr(args, "delegation_policy", None):
+        return args.delegation_policy
+    cfgs = _launched_configs(args)
+    if cfgs:
+        if any(c is None for c in cfgs):
+            return None
+        values = {((c.get("delegation") or {}).get("policy")) for c in cfgs}
+        return values.pop() if len(values) == 1 else None
+    try:
+        from swarm.utils.yaml_strict import safe_load
+        with open(BASE_CONFIG) as f:
+            return ((safe_load(f) or {}).get("delegation") or {}).get("policy")
+    except Exception:
+        return None
+
+
+def _effective_config(args) -> dict:
+    """The config the agents of this run will actually read.
+
+    Same resolution as `_effective_delegation_policy`: the launched per-agent configs under
+    --use-config-dir (the first readable one — callers read fleet-wide keys such as the
+    failure profile, which the generator copies unchanged into every agent), else the base
+    config the generator copies from. {} when nothing can be read; callers treat that as
+    unknown, not as defaults.
+    """
+    for cfg in _launched_configs(args):
+        if cfg is not None:
+            return cfg
+    if getattr(args, "use_config_dir", False):
+        return {}
+    try:
+        from swarm.utils.yaml_strict import safe_load
+        with open(BASE_CONFIG) as f:
+            return safe_load(f) or {}
+    except Exception:
+        return {}
+
+
+def _ground_truth(args) -> dict:
+    """The injected failure profile and reward shape, archived with the run.
+
+    Delegation regret (P1-1) is computed against these: they are what decides whether a
+    delegated job fails, so they are the only definition of a "right" routing choice. They
+    live in the base config, which is edited between arms — so a regret number computed a
+    week later from whatever the config says *then* would silently be scored against a
+    profile the run never ran under. The ground truth has to travel with the run.
+
+    Empty when failure simulation is off, which is the shipped default; the oracle then
+    reports that the run has no signal to compute regret from rather than inventing one.
+    """
+    mab = (_effective_config(args).get("mab") or {})
+    sim = mab.get("failure_simulation") or {}
+    if not sim.get("enabled"):
+        return {"enabled": False}
+    return {
+        "enabled": True,
+        "failure_probability": sim.get("failure_probability", 0.1),
+        "per_agent_failure_rates": sim.get("per_agent_failure_rates", {}),
+        "per_job_type_failure_rates": sim.get("per_job_type_failure_rates", {}),
+        "phases": sim.get("phases", []) or [],
+        # The reward the bandit was actually given, so the oracle scores on the same scale
+        # the policy was optimising rather than an assumed one.
+        "reward": mab.get("reward", {}),
+        "algorithm": mab.get("algorithm"),
+        "top_k": mab.get("top_k"),
+    }
+
+
+def _hosts_file_for_stop(args, host_list: list[str] | None) -> str:
+    """Path to a hosts file the stop script can read, writing one if needed.
+
+    `agent_hosts.txt` is deleted by cleanup_between_runs unless it is this run's
+    --agent-hosts-file, so falling back to that name gave the stop script a missing file,
+    which it reports on stderr and run_blocking(check=False) then swallows: the agents were
+    never stopped and nobody said so. The in-memory host list is the reliable source.
+    """
+    hosts_file = getattr(args, "agent_hosts_file", None)
+    if hosts_file and Path(hosts_file).exists():
+        return hosts_file
+    hosts = list(host_list or [])
+    if not hosts and getattr(args, "agent_hosts", None):
+        hosts = [h.strip() for h in args.agent_hosts.split(",") if h.strip()]
+    if not hosts and Path("agent_hosts.txt").exists():
+        return "agent_hosts.txt"
+    if not hosts:
+        raise SystemExit("Cannot stop remote agents: no host list available "
+                         "(pass --agent-hosts-file or --agent-hosts)")
+    hosts_file = os.path.join(args.run_dir, "_agent_hosts.txt")
+    with open(hosts_file, "w") as hf:
+        for h in hosts:
+            hf.write(h + "\n")
+    return hosts_file
+
+
+def stop_agents(args, host_list: list[str] | None = None) -> bool:
+    """Stop every agent and report whether the stop was confirmed on all hosts.
+
+    The return value matters: an unconfirmed stop means processes may still be running and
+    still writing to Redis, which is how one run's metrics ended up reported as the next
+    run's before payloads carried a run id.
+    """
     log("Stopping agents …")
     stop_cmd = ["bash", "stop_agents_v2.sh", "--mode", args.mode]
     if args.mode == "remote":
-        # Determine hosts file path
-        hosts_file = getattr(args, 'agent_hosts_file', None)
-        if not hosts_file:
-            # Write a temporary hosts file from --agent-hosts if provided
-            if getattr(args, 'agent_hosts', None):
-                hosts_file = os.path.join(args.run_dir, '_agent_hosts.txt')
-                with open(hosts_file, 'w') as hf:
-                    for h in args.agent_hosts.split(','):
-                        h = h.strip()
-                        if h:
-                            hf.write(h + '\n')
-            else:
-                hosts_file = "agent_hosts.txt"
-        stop_cmd += ["--agent-hosts-file", hosts_file,
+        stop_cmd += ["--agent-hosts-file", _hosts_file_for_stop(args, host_list),
                       "--remote-repo-dir", args.remote_repo_dir]
-    run_blocking(stop_cmd, check=False)
+    if args.shutdown_drain_timeout > 0:
+        stop_cmd += ["--drain-timeout", str(args.shutdown_drain_timeout)]
+    proc = run_blocking(stop_cmd, check=False)
+    if proc.returncode != 0:
+        log(f"WARNING: stop_agents_v2.sh exited {proc.returncode}; at least one agent was not "
+            f"confirmed stopped. Surviving agents cannot corrupt this run's metrics (they are "
+            f"filtered by run id) but they do keep consuming the fleet.")
+        return False
+    return True
+
+
+# ------------------------------
+# Metrics completeness
+# ------------------------------
+def _metrics_in_redis(args, run_id: str) -> tuple[set[int], dict[int, str]]:
+    """(agent ids with a payload for `run_id`, {agent id: other run id}) from Redis."""
+    import redis as _redis
+    mine: set[int] = set()
+    foreign: dict[int, str] = {}
+    try:
+        r = _redis.StrictRedis(host=args.db_host, port=6379, decode_responses=True)
+        for key in r.scan_iter("metrics:*"):
+            raw = r.get(key)
+            if not raw:
+                continue
+            try:
+                entry = json.loads(raw)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(entry, dict) or entry.get("id") is None:
+                continue
+            agent_id = int(entry["id"])
+            if entry.get("run_id") == run_id:
+                mine.add(agent_id)
+            else:
+                foreign[agent_id] = str(entry.get("run_id"))
+    except Exception as exc:
+        log(f"WARNING: could not read metrics from Redis: {exc}")
+    return mine, foreign
+
+
+def wait_for_metrics(args, expected_ids: set[int], run_id: str) -> tuple[set[int], dict[int, str]]:
+    """Block until every expected agent has written this run's metrics, or the deadline passes.
+
+    Plotting reads metrics out of Redis, so doing this before plotting is what makes
+    metrics.json a record of THIS run. Agents save metrics at the start of teardown rather
+    than after draining their job threads, so in the normal case this returns on the first
+    poll; the wait covers a slow host or a straggler that had to be SIGKILLed.
+    """
+    deadline = time.time() + max(0, args.metrics_wait_seconds)
+    last_report = 0.0
+    while True:
+        have, foreign = _metrics_in_redis(args, run_id)
+        missing = expected_ids - have
+        if not missing or time.time() >= deadline:
+            return missing, foreign
+        now = time.time()
+        if now - last_report >= 10:
+            log(f"Waiting for metrics: {len(have)}/{len(expected_ids)} agents reported, "
+                f"{int(deadline - now)}s left")
+            last_report = now
+        time.sleep(2)
+
+
+def report_metrics_completeness(args, expected_ids: set[int], run_id: str,
+                                stopped_cleanly: bool) -> bool:
+    """Log and record which agents reported metrics. True when the run is measurable."""
+    missing, foreign = wait_for_metrics(args, expected_ids, run_id)
+    allowed = max(0, args.allow_missing_metrics)
+    declared = {int(x) for x in str(args.expect_silent_agents or "").replace(" ", "").split(",")
+                if x}
+    if foreign:
+        log(f"NOTE: {len(foreign)} metrics payload(s) in Redis belong to another run and will "
+            f"be ignored: " + ", ".join(f"agent {a} (run_id={r})" for a, r in sorted(foreign.items())))
+    if not missing and not declared:
+        log(f"Metrics complete: all {len(expected_ids)} agents reported for run_id={run_id}")
+        return True
+
+    unexpected = missing - declared if declared else set()
+    # Declared silent but reported anyway: that kill did not take, so the fault this run
+    # reports never happened to that agent. This used to be accepted whenever SOME declared
+    # agent was missing — declare 3,7, only 3 dies, and the run passed as a two-failure cell —
+    # and only warned when none was (code review 2026-10-05 §53).
+    not_taken = declared - missing
+    accounted = bool(declared) and not unexpected and not not_taken
+
+    shortfall = {
+        "run_id": run_id,
+        "expected_agents": sorted(expected_ids),
+        "missing_agents": sorted(missing),
+        "foreign_payloads": {str(a): r for a, r in sorted(foreign.items())},
+        "allow_missing_metrics": allowed,
+        "expect_silent_agents": sorted(declared),
+        "unexpectedly_silent": sorted(unexpected),
+        "kills_not_taken": sorted(not_taken),
+        # Every silent agent was declared and every declared agent was silent: the per-agent
+        # aggregates cover exactly the agents the experiment meant to leave running. The
+        # collector reads this, so a correct kill run is not reported as incomplete (§44).
+        "accounted": accounted,
+        "stopped_cleanly": stopped_cleanly,
+        "waited_seconds": args.metrics_wait_seconds,
+    }
+    with open(os.path.join(args.run_dir, "metrics_shortfall.json"), "w") as f:
+        json.dump(shortfall, f, indent=2)
+
+    # With ids declared, the count is not the question: the right agents have to be the
+    # silent ones. A failure test that kills 3 and 5 but finds 7 and 9 silent measured a
+    # different fault than the one it reported.
+    if declared:
+        if accounted:
+            log(f"Metrics complete apart from the {len(missing)} agent(s) declared silent "
+                f"({sorted(missing)}) for run_id={run_id}")
+            return True
+        if not_taken:
+            log(f"ERROR: --expect-silent-agents named {sorted(not_taken)} but they reported "
+                f"metrics — those kills did not take, so this run did not inject the fault it "
+                f"declares. Wrote {args.run_dir}/metrics_shortfall.json.")
+        if unexpected:
+            log(f"ERROR: {sorted(unexpected)} reported no metrics but were not declared silent "
+                f"(declared: {sorted(declared)}). Wrote {args.run_dir}/metrics_shortfall.json.")
+        return False
+
+    level = "WARNING" if len(missing) <= allowed else "ERROR"
+    log(f"{level}: {len(missing)} of {len(expected_ids)} agents never wrote metrics for this run "
+        f"(missing: {sorted(missing)}). Wrote {args.run_dir}/metrics_shortfall.json.")
+    if len(missing) > allowed:
+        log("ERROR: per-agent metrics (load, utilisation, fairness, MAB and delegation counts) "
+            "are incomplete, so this run is not measurable. Declare the agents a failure test "
+            "SIGKILLs with --expect-silent-agents 3,7 (or, less precisely, "
+            "--allow-missing-metrics N).")
+        return False
+    return True
 
 def collect_logs(args) -> None:
     '''
@@ -666,7 +2145,7 @@ def collect_logs(args) -> None:
             p.rename(Path(args.log_dir) / p.name)
     '''
 
-def parse_and_report(args) -> None:
+def parse_and_report(args, run_id: str | None = None) -> None:
     plot_cmd = [
         "python3.11", "plot_latency_jobs.py",
         "--output_dir", args.run_dir,
@@ -674,6 +2153,8 @@ def parse_and_report(args) -> None:
         "--db_host", args.db_host,
         #"--save-csv",
     ]
+    if run_id:
+        plot_cmd += ["--metrics-run-id", run_id]
     #if not getattr(args, 'generate_plots', False):
     #    plot_cmd.append("--skip-plots")
     if args.topology == "hierarchical":
@@ -692,9 +2173,14 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--agents-per-host", type=int, default=1, help="Only for remote mode; shard size")
     ap.add_argument("--topology", required=True, choices=["mesh", "ring", "star", "hierarchical"])
     ap.add_argument("--hierarchical-level1-agent-type", type=str,
-                    choices=["llm", "resource"], default="llm",
-                    help="Agent type for level 1 (parent) agents in hierarchical topology (default: llm)")
-    ap.add_argument("--jobs", type=int, required=True)
+                    choices=["llm", "resource"], default="resource",
+                    help="Agent type for level 1 (parent) agents in hierarchical topology "
+                         "(default: resource). It does NOT follow --agent-type: an all-LLM "
+                         "hierarchy needs this set to llm as well.")
+    ap.add_argument("--jobs", type=int, default=None,
+                    help="Number of jobs this run expects. Optional with --pegasus-jobs-dir, "
+                         "which counts the bundle's job_*.json records instead — the bundle is "
+                         "the authority on how many jobs there are.")
     ap.add_argument("--db-host", required=True)
     ap.add_argument("--jobs-per-proposal", type=int, default=10)
     ap.add_argument("--groups", type=int, default=None)
@@ -703,6 +2189,18 @@ def parse_args() -> argparse.Namespace:
 
     # Starter and config
     ap.add_argument("--starter", default="./swarm-multi-start.sh", help="Path to swarm-multi-start.sh")
+    ap.add_argument("--all-dtns", action="store_true",
+                    help="Every agent holds every DTN name in the pool, capacities unchanged "
+                         "(generate_configs.py --all-dtns). The campaign fleets use it: "
+                         "replay-golden jobs name up to 8 DTNs.")
+    ap.add_argument("--no-dtns", action="store_true",
+                    help="Generate the fleet WITHOUT DTNs (any topology). Default: agents get "
+                         "1-4 DTNs from the 10-name pool, as the replay workloads require.")
+    ap.add_argument("--base-config", default=BASE_CONFIG,
+                    help="Base config the per-agent configs are generated from (default "
+                         f"{BASE_CONFIG}). Lets a campaign give each cell its own engine or "
+                         "profile without editing the shared file between cells; the path and "
+                         "its sha256 are recorded in run_meta.json.")
     ap.add_argument("--config-dir", default="configs", help="Where to write generated configs")
     ap.add_argument("--use-config-dir", action="store_true", help="Tell starters to use pre-generated configs")
 
@@ -715,15 +2213,53 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--remote-repo-dir", default="/root/SwarmAgents", help="Remote repo root")
 
     # Test control
-    ap.add_argument("--job-interval", type=float, default=0.5, help="Seconds between job bursts")
+    ap.add_argument("--job-interval", type=float, default=1.0,
+                    help="Seconds between job bursts, forwarded to job_distributor.py --interval. "
+                         "Default 1.0 = what every run has actually used: until 2026-10-06 this "
+                         "flag (then defaulting to 0.5) was never forwarded, and the "
+                         "distributor ran at its own 1.0 (code review 2026-10-05 §56).")
     ap.add_argument("--jobs-per-interval", type=int, default=20)
-    ap.add_argument("--runtime", type=int, default=90, help="Seconds to keep the test running")
+    ap.add_argument("--arrival", choices=("batch", "poisson"), default="batch",
+                    help="How jobs arrive. batch (default, and every run before 2026-10-14): "
+                         "--jobs-per-interval every --job-interval s, which at 20/s offers a "
+                         "Hier-90 fleet ~5x what it drains. poisson: one job at a time at Poisson "
+                         "arrival times, rate from --arrival-rate or --arrival-schedule")
+    ap.add_argument("--arrival-rate", type=float, default=None,
+                    help="poisson: constant arrival rate, jobs per second")
+    ap.add_argument("--arrival-schedule", default=None,
+                    help="poisson: JSON [[start_s, jobs_per_s], ...], a piecewise-constant rate "
+                         "(e.g. a compressed work day)")
+    ap.add_argument("--arrival-seed", type=int, default=None,
+                    help="poisson: seed for arrival times; defaults to --seed, so every repeat "
+                         "of a cell sees the same arrival times")
+    # Default 0, not 90: this value is now ENFORCED as a hard cap on wait_runtime(), and it was
+    # silently ignored before. Defaulting to the old 90 would have truncated every run that does
+    # not pass the flag, so opting in is explicit.
+    ap.add_argument("--runtime", type=int, default=0,
+                    help="Hard cap in seconds on waiting for the pool to drain (0 = no cap). "
+                         "The run still exits early on the drain condition; this only bounds a "
+                         "run that cannot place jobs. Strongly recommended for unattended runs.")
     ap.add_argument("--grace-seconds", type=int, default=30)
     ap.add_argument("--watch-bucket", type=int, default=1)
     ap.add_argument("--threshold", type=int, default=5)
     ap.add_argument("--stable-seconds", type=int, default=90)
+    ap.add_argument("--stranded-wait-s", type=int, default=420,
+                    help="With 1..threshold-1 jobs still PENDING, how long the pool must stay "
+                         "that low before the run is called drained: long enough for the 60 s "
+                         "re-election and the 300 s reselection timeout to act. drain.json "
+                         "records pending_at_stop either way.")
     ap.add_argument("--check-interval", type=float, default=5.0)
     ap.add_argument("--max-misses", type=int, default=10)
+    ap.add_argument("--rtt-samples", type=int, default=20,
+                    help="Remote mode: ICMP samples per host pair for the RTT matrix captured at "
+                         "run start into <run-dir>/rtt_matrix.json (T-2; E3a bins jobs by it). "
+                         "0 skips it, and the run then has no RTT columns.")
+    ap.add_argument("--rtt-interval", type=float, default=0.2,
+                    help="Seconds between ICMP samples for the RTT matrix.")
+    ap.add_argument("--inflight-drain-max-s", type=float, default=600.0,
+                    help="After PENDING drains, wait up to this long for READY/RUNNING jobs to "
+                         "finish before stopping agents (0 = do not wait). What remained is "
+                         "recorded in <run-dir>/drain.json as inflight_at_stop.")
 
     # Dynamic agent addition
     ap.add_argument("--dynamic-agents", type=int, default=0,
@@ -742,6 +2278,25 @@ def parse_args() -> argparse.Namespace:
     # Co-parent support for hierarchical topology
     ap.add_argument("--co-parents", type=int, default=1,
                     help="Number of co-parents per child group in hierarchical topology (default: 1)")
+    ap.add_argument("--groups-per-coordinator", type=int, default=None,
+                    help="Child groups each Level-1 coordinator exclusively parents (default: 2). "
+                         "At 1 a coordinator has a single candidate, so the MAB and "
+                         "delegation.policy=llm are inert and every delegation records as "
+                         "trivial. Freed coordinator slots become Level-0 agents, so the fleet "
+                         "size is unchanged. Two-level hierarchies only: a three-level fleet "
+                         "(100, 990, 1000) refuses an explicit >1 and steps the default down to 1.")
+    ap.add_argument("--delegation-policy", choices=["bandit", "llm"], default=None,
+                    help="Which plane picks the child group a coordinator delegates to "
+                         "(E4's arms). Overrides delegation.policy in the generated configs; "
+                         "default is whatever the base config says. Recorded in run_meta.json, "
+                         "so an arm is no longer selected by an unrecorded hand edit.")
+
+    ap.add_argument("--textfile-dir", default=None,
+                    help="node_exporter textfile collector directory on each agent host. "
+                         "Turns on the Prometheus export of the P0-4 counters (consensus "
+                         "messages and bytes, rounds to finalize, delegation context age, "
+                         "LLM tokens). metrics.json carries them either way, so this is for "
+                         "watching a run live rather than for the figures.")
 
     # Job generation
     ap.add_argument("--fit-all", action="store_true",
@@ -759,24 +2314,107 @@ def parse_args() -> argparse.Namespace:
 
     # Plot generation
     ap.add_argument("--generate-plots", action="store_true",
-                    help="Generate full plots after test (default: CSV-only with --skip-plots)")
+                    help="NO EFFECT: the plotting step always runs in full. Accepted so existing "
+                         "scripts keep working (code review 2026-10-05 §56).")
 
     # Test shutdown control
     ap.add_argument("--shutdown-after-seconds", type=int, default=0,
                     help="Shutdown test after N seconds (0 = use default wait_runtime behavior)")
 
+    # Teardown / measurement integrity
+    ap.add_argument("--shutdown-drain-timeout", type=int, default=0,
+                    help="Seconds the stop script waits for each agent to exit before SIGKILL "
+                         "(0 = the stop script's own default)")
+    ap.add_argument("--metrics-wait-seconds", type=int, default=120,
+                    help="How long to wait after stopping the agents for all of them to write "
+                         "this run's metrics to Redis before plotting (default: 120)")
+    ap.add_argument("--allow-missing-metrics", type=int, default=0,
+                    help="Number of agents allowed to report no metrics without failing the run. "
+                         "Set it to the number of agents killed with SIGKILL in a failure "
+                         "injection test; those cannot flush metrics by design. Prefer "
+                         "--expect-silent-agents, which also checks WHICH agents were silent.")
+    ap.add_argument("--expect-silent-agents", default="",
+                    help="Comma-separated agent ids expected to report no metrics (SIGKILLed by "
+                         "a failure injection test). Stricter than --allow-missing-metrics: a "
+                         "run still fails if some OTHER agent was the silent one, which a bare "
+                         "count cannot distinguish. SIGTERM-killed agents still flush metrics, "
+                         "so they do not belong here.")
+
     # Pegasus job integration
+    ap.add_argument(
+        "--pegasus-jobs-dir", default=None,
+        help="Publish a bundle converted ELSEWHERE (pegasus_to_swarm_converter.py --output-dir) "
+             "instead of converting here. The directory is only read: no conversion runs, no "
+             "synthetic jobs are generated, and it is never cleaned between runs. Point the "
+             "agents' runtime.execution.bundle at the same path. Excludes --pegasus-profiles.")
     ap.add_argument("--pegasus-profiles", default=None,
                     help="Path to Pegasus profiles file (text/export) or Redis host. "
                          "When set, jobs are converted from Pegasus profiles instead of generated synthetically.")
+    ap.add_argument(
+        "--pegasus-dag-gating", action=argparse.BooleanOptionalAction, default=True,
+        help="Reconstruct the workflow's dependency graph as per-job data predicates, so a "
+             "job is not selectable until its parents have produced what it reads. ON by "
+             "default since 2026-10-06 (it was off although this help called it required for "
+             "any real workflow, so a converted workflow ran every job at once): "
+             "--no-pegasus-dag-gating for independent replay. Forces --pegasus-data-nodes "
+             "per-file.")
+    ap.add_argument(
+        "--pegasus-bundle-source-root",
+        help="Where the workflow tree lives on this fleet, so the converter can copy the "
+             "executables and root inputs into the jobs directory. Either a path (anchored "
+             "on the common parent of the recorded paths) or OLD=NEW to state the mapping.")
     ap.add_argument("--pegasus-input-type", choices=["text", "redis", "export", "json"], default="text",
                     help="Format of the Pegasus profiles source (default: text)")
+    ap.add_argument("--pegasus-data-nodes", choices=["per-site", "per-file"], default="per-file",
+                    help="Granularity of job data_in/data_out nodes (default: per-file, keeps every "
+                         "file and its size)")
+    ap.add_argument("--pegasus-dtn-names", type=str, default=None,
+                    help="Comma-separated DTN pool to spread job files across. Defaults to the DTNs "
+                         "the generated fleet actually holds (agent_dtns.json), so every job lands "
+                         "on a DTN some agent has and the connectivity cost term matches.")
 
     # Output
     ap.add_argument("--run-dir", default="run_out")
-    ap.add_argument("--log-dir", default="logs")
+    ap.add_argument("--seed", type=int, default=None,
+                    help="Seed agent-profile generation so fleets are reproducible across runs")
+    ap.add_argument("--job-target-agents", type=int, default=None,
+                    help="forwarded to generate_configs.py: model jobs only on agents 1..K, all "
+                         "leaves (K = the smallest rung's leaf count for an identical workload "
+                         "across a ladder)")
+    ap.add_argument("--master-fleet-size", type=int, default=None,
+                    help="Generate per-agent flavours/backends for a fleet of this size and use "
+                         "the first --agents of them. Set it to the largest rung of the scale "
+                         "ladder (e.g. 270) so agent i is the same machine at every size; "
+                         "without it, flavours scale with fleet size and the ladder compares "
+                         "different fleets.")
+    ap.add_argument("--log-dir", default="logs",
+                    help="NO EFFECT: agent logs are written to --run-dir as agent-<id>.log. "
+                         "Accepted so existing scripts keep working (code review §56).")
 
-    return ap.parse_args()
+    args = ap.parse_args()
+    check_arrival_args(args)
+    return args
+
+
+def check_arrival_args(args) -> None:
+    """Refuse an arrival configuration that would silently run a different one."""
+    rate = getattr(args, "arrival_rate", None)
+    sched = getattr(args, "arrival_schedule", None)
+    if getattr(args, "arrival", "batch") == "batch":
+        if rate is not None or sched:
+            raise SystemExit("--arrival-rate/--arrival-schedule apply to --arrival poisson only")
+        return
+    if (rate is None) == (not sched):
+        raise SystemExit("--arrival poisson takes exactly one of --arrival-rate or "
+                         "--arrival-schedule")
+    if rate is not None and not (math.isfinite(rate) and rate > 0):
+        raise SystemExit(f"--arrival-rate must be a positive number, got {rate}")
+    if sched:
+        from job_distributor import load_rate_schedule
+        try:
+            load_rate_schedule(sched)
+        except (OSError, ValueError) as e:
+            raise SystemExit(f"--arrival-schedule {sched}: {e}")
 
 def read_hosts(args: argparse.Namespace) -> list[str]:
     hosts: list[str] = []
@@ -790,9 +2428,77 @@ def read_hosts(args: argparse.Namespace) -> list[str]:
                     hosts.append(line)
     return hosts
 
+def stage_base_config(path: str, run_dir: str) -> str:
+    """The base config, under the file name the per-agent configs are derived from.
+
+    generate_configs.py names each agent's file after the base config's own name, and every
+    launcher globs `config_swarm_multi_<id>.yml` (CFG_PREFIX, swarm-multi-start.sh). So a base
+    config called anything else produced `config_pbft_<id>.yml`, which nothing launched — the
+    launch check refused it, reading whatever stale `config_swarm_multi_*` files a previous run
+    had left. Any other name is copied into the run dir as `config_swarm_multi.yml`; the
+    original path and its hash are what run_meta.json records.
+    """
+    src = Path(path)
+    if src.name == "config_swarm_multi.yml":
+        return str(src)
+    staged = Path(run_dir) / "base_config" / "config_swarm_multi.yml"
+    staged.parent.mkdir(parents=True, exist_ok=True)
+    staged.write_bytes(src.read_bytes())
+    return str(staged)
+
+
 def main() -> None:
     args = parse_args()
     Path(args.run_dir).mkdir(parents=True, exist_ok=True)
+    # Every reader of the base config looks the module name up at call time, so rebinding it
+    # here reaches generation, the execution-mode check and the delegation/ground-truth reads.
+    global BASE_CONFIG
+    if not Path(args.base_config).is_file():
+        raise SystemExit(f"--base-config {args.base_config}: no such file")
+    args.base_config_source = str(Path(args.base_config).resolve())
+    BASE_CONFIG = stage_base_config(args.base_config, args.run_dir)
+
+    # Identity for this run. Agents stamp it on the metrics they write to Redis and the
+    # plotting step only reads payloads carrying it, so a payload written by an agent that
+    # outlived an earlier run can no longer be reported as this run's numbers.
+    # Exported (not passed): local agents are spawned as children and inherit it, and the
+    # remote starter re-exports it over ssh.
+    if args.delegation_policy and args.use_config_dir:
+        # --use-config-dir skips generate_configs entirely, so the override would never reach a
+        # config file while run_meta.json still recorded it — a run labelled with an arm it did
+        # not run is worse than one with no label.
+        raise SystemExit(
+            "--delegation-policy has no effect with --use-config-dir (the configs are used as "
+            "they are on disk). Drop --use-config-dir to generate configs for this arm, or set "
+            "delegation.policy in the config directory yourself and drop --delegation-policy.")
+
+    if args.jobs is None:
+        # The count drives the agents' expected job total and the completion checks. A bundle
+        # knows it exactly, so asking for it again only creates a way to get it wrong.
+        if not args.pegasus_jobs_dir:
+            raise SystemExit(
+                "--jobs is required, except with --pegasus-jobs-dir where it is taken from the "
+                "bundle's job_*.json records.")
+        args.jobs = count_job_records(Path(args.pegasus_jobs_dir))
+        log(f"--jobs not given; taking {args.jobs} from {args.pegasus_jobs_dir}")
+
+    if args.pegasus_jobs_dir and args.pegasus_profiles:
+        # One names a bundle to publish as it is, the other says to convert a profile into
+        # jobs/ — running both would convert over one of them and publish a set nobody asked
+        # for, with nothing in the run saying which jobs it ran.
+        raise SystemExit(
+            "--pegasus-jobs-dir and --pegasus-profiles are alternatives: the first publishes "
+            "a bundle converted elsewhere, the second converts one here into jobs/.")
+    if args.pegasus_jobs_dir:
+        validate_pegasus_jobs_dir(args)
+
+    for flag, given in (("--generate-plots", args.generate_plots),
+                        ("--log-dir", args.log_dir != "logs")):
+        if given:
+            log(f"NOTE: {flag} has no effect (agent logs are in --run-dir; plots always run).")
+    run_id = f"{Path(args.run_dir).name}-{datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}"
+    os.environ["SWARM_RUN_ID"] = run_id
+    log(f"run_id={run_id}")
 
     # Build host list up front
     host_list = read_hosts(args) if args.mode == "remote" else []
@@ -801,17 +2507,58 @@ def main() -> None:
     if args.mode == "remote" and host_list:
         preflight_check(args, host_list)
 
+    # Reap anything still running from a previous run BEFORE Redis is flushed. An agent that
+    # is killed after the flush writes its (old) metrics into the fresh keyspace, which is
+    # exactly how smoke-g2-llm's metrics.json came to hold 15 agents from smoke-g2-bandit.
+    log("Reaping agents left over from any previous run …")
+    if not stop_agents(args, host_list):
+        raise SystemExit(
+            "Refusing to start: agents from a previous run could not be confirmed stopped. "
+            "They would keep writing jobs, agent records and MAB state into the keyspace this "
+            "run is about to flush — unlike metrics, none of that is stamped with a run id, so "
+            "the contamination would be invisible. Fix the unreachable host(s) or stop them by "
+            "hand, then re-run.")
+
+    with open(os.path.join(args.run_dir, "run_meta.json"), "w") as f:
+        json.dump({
+            "run_id": run_id,
+            "started_at": time.time(),
+            "started_at_iso": datetime.now().isoformat(),
+            "mode": args.mode,
+            "agent_type": args.agent_type,
+            # Recorded because "this agent has no LLM block" is otherwise ambiguous after the
+            # fact: in a mixed-role run the coordinators are analytic BY DESIGN, and without
+            # this the collector cannot tell them from agents whose instrumentation is simply
+            # missing — so it either blocks a verdict on a supported run or draws one over a
+            # fleet it did not measure.
+            # Observed from the launched configs under --use-config-dir, where the flag is
+            # inert — see _effective_coordinator_type.
+            "hierarchical_level1_agent_type": _effective_coordinator_type(args),
+            "agents": args.agents,
+            "dynamic_agents": args.dynamic_agents,
+            "topology": args.topology,
+            "jobs": args.jobs,
+            "delegation_policy": _effective_delegation_policy(args),
+            # The REQUEST (None = default). Both this and the coordinator type are rewritten
+            # from the generated configs by _record_observed_fleet() below, because this file
+            # is written before the fleet exists and neither request is the last word.
+            "groups_per_coordinator": getattr(args, "groups_per_coordinator", None),
+            # What made a delegated job fail, and what the bandit was rewarded with. The
+            # oracle (P1-1) scores routing choices against exactly this.
+            "ground_truth": _ground_truth(args),
+            "base_config": getattr(args, "base_config_source", str(Path(BASE_CONFIG).resolve())),
+            "base_config_sha256": hashlib.sha256(Path(BASE_CONFIG).read_bytes()).hexdigest(),
+            "argv": sys.argv,
+        }, f, indent=2)
+
     # Calculate total agents (initial + dynamic)
     total_agents = args.agents + args.dynamic_agents
     original_agents = args.agents
 
     # Generate configs for ALL agents (initial + dynamic) up front
     cleanup_between_runs(args)
+    refuse_if_agents_still_registering(args)
     if not args.use_config_dir:
-        # Convert Pegasus profiles if requested (writes to jobs/)
-        if args.pegasus_profiles:
-            convert_pegasus_jobs(args)
-
         if args.mode == "remote" and not host_list:
             raise SystemExit("Remote mode requires --agent-hosts or --agent-hosts-file")
         # Compute per-host count for writing agent_hosts.txt (if needed)
@@ -831,16 +2578,39 @@ def main() -> None:
         generate_configs(args, host_list if args.mode == "remote" else ["localhost"])
         args.agents = original_agents  # Restore to initial agent count
 
+    # Convert Pegasus profiles if requested (writes to jobs/). After the fleet exists — freshly
+    # generated above, or already on disk under --use-config-dir — because the job DTN pool is
+    # read from agent_dtns.json, which describes whichever fleet this run will launch (see
+    # convert_pegasus_jobs). This is deliberately OUTSIDE the generation branch: inside it,
+    # --use-config-dir skipped the conversion altogether and the run published whatever jobs/
+    # already held — a stale set from an earlier run, or nothing — while reporting nothing
+    # unusual, which is the one failure mode a converted workflow cannot survive.
+    if args.pegasus_profiles:
+        convert_pegasus_jobs(args)
+
+    # The fleet now exists either way, so replace the two run_meta fields that are requests
+    # rather than facts with what the configs say. collect.py reads both.
+    _record_observed_fleet(args)
+    archive_fleet_profiles(args)
+    check_jobs_dir_matches(args)
+
+    # After the fleet is generated (or, with --use-config-dir, as it stands) and after any
+    # conversion, so both sides of the comparison are the ones this run will use.
+    if args.pegasus_profiles or args.pegasus_jobs_dir:
+        check_fleet_fits_jobs(args)
+
+    check_launch_matches_configs(args, host_list)
+    check_delegation_policy_is_honoured(args)
+    # After the configs are known good and before any agent runs, so the probes neither load
+    # the run nor are loaded by it.
+    capture_rtt_matrix(args, host_list)
+
     # Start initial agents
-    if args.mode == "local":
-        start_agents_local(args)
-    else:
-        if not host_list:
-            raise SystemExit("Remote mode requires --agent-hosts or --agent-hosts-file")
-        start_agents_remote(args, host_list)
+    if args.mode == "remote" and not host_list:
+        raise SystemExit("Remote mode requires --agent-hosts or --agent-hosts-file")
+    launch_or_teardown(args, host_list)
 
     # Start job production in background thread to avoid blocking dynamic trigger detection
-    import threading
     job_thread = threading.Thread(target=lambda: produce_jobs(args), daemon=True, name="JobDistributor")
     job_thread.start()
     log("Job distribution started in background thread")
@@ -850,7 +2620,19 @@ def main() -> None:
         # Start a thread to wait for the trigger and add agents
         def dynamic_addition():
             wait_for_dynamic_trigger(args)
-            add_dynamic_agents(args, host_list)
+            if _TEARDOWN.is_set():
+                # The metrics wait keeps this process alive well past the stop sweep, so a
+                # trigger that fires late would start agents nobody will ever stop.
+                log("Dynamic trigger fired after teardown began; not adding agents")
+                return
+            try:
+                add_dynamic_agents(args, host_list)
+            except BaseException as exc:
+                # The run carries on with the agents it has, but it is no longer the run it
+                # declares: it exits non-zero, and the normal teardown stops whatever the failed
+                # addition did start (§60).
+                log(f"ERROR: dynamic agent addition failed: {exc}")
+                _DRAIN["dynamic_start_failed"] = str(exc)
 
         dynamic_thread = threading.Thread(target=dynamic_addition, daemon=True, name="DynamicAgentAdder")
         dynamic_thread.start()
@@ -860,16 +2642,32 @@ def main() -> None:
     if args.shutdown_after_seconds > 0:
         log(f"Using time-based shutdown: will stop after {args.shutdown_after_seconds} seconds")
         wait_with_early_exit(args)
+        _DRAIN.setdefault("status", "timer")
+        _record_drain(args)
     else:
         wait_runtime(args)
-    stop_agents(args)
+    _TEARDOWN.set()
+    stopped_cleanly = stop_agents(args, host_list)
+
+    # Every agent id we launched is expected to report; plotting happens after they all have.
+    measurable = report_metrics_completeness(
+        args, set(range(1, total_agents + 1)), run_id, stopped_cleanly)
+
     if args.mode == "remote" and host_list:
         collect_remote_logs(args, host_list)
     collect_logs(args)
 
     # Update args.agents to total for reporting
     args.agents = total_agents
-    parse_and_report(args)
+    parse_and_report(args, run_id)
+    failed = run_failed_to_measure()
+    if failed:
+        log(f"Done, but {failed} — exiting 4 so a batch driver does not average this in.")
+        sys.exit(4)
+    if not measurable:
+        log("Done, but this run's metrics are incomplete — exiting non-zero so a batch driver "
+            "does not average it in as a good cell.")
+        sys.exit(3)
     log("Done.")
     sys.exit(0)
 
@@ -988,5 +2786,18 @@ def find_all_agents(args, pattern: str = 'main.py') -> List[dict]:
 
     return all_agents
 
+#: Exit status of a launch the runner REFUSED (a configuration problem that will repeat on
+#: every retry) — distinct from 1, an unexpected failure. A campaign driver stops on it.
+EXIT_REFUSED = 2
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit as exc:
+        # Every refusal in this file is `raise SystemExit("<why>")`; Python prints the message
+        # and exits 1, the same status as a crash. Give it its own code, so a driver can tell
+        # "this cell's configuration is wrong" from "this attempt fell over".
+        if isinstance(exc.code, str):
+            print(exc.code, file=sys.stderr)
+            sys.exit(EXIT_REFUSED)
+        raise

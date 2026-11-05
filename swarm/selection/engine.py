@@ -219,9 +219,8 @@ class SelectionEngine:
             cost_matrix: np.ndarray,
             *,
             objective: Objective = "min",
-            threshold_pct: float | None = None,
             accept_if: Callable[[float], bool] | None = None,
-            tie_break_key: Callable[[Assignee, float], Any] | None = None,
+            tie_break_key: Callable[[Assignee, float, Candidate], Any] | None = None,
     ) -> list[tuple[Assignee | None, float]]:
         """
         Select the best assignee for each candidate (column) given a cost/score matrix.
@@ -234,24 +233,38 @@ class SelectionEngine:
         :param candidates: Column sequence aligned with matrix cols.
         :param cost_matrix: 2D array [rows=assignees, cols=candidates]; use +inf for infeasible.
         :param objective: ``"min"`` to minimize cost or ``"max"`` to maximize score.
-        :param threshold_pct: Optional tolerance around the column-wise best:
-            - For ``"min"``: keep only if selected <= best * (1 + pct/100).
-            - For ``"max"``: keep only if selected >= best * (1 - pct/100).
-            Note: if the selected index is the true best, this threshold never rejects it.
+
+        There is deliberately **no relative threshold parameter** here, and passing one is a
+        ``TypeError`` rather than a no-op (code review 2026-09-18, §7). One used to exist and
+        was compared against ``per_cand_best``, which is the column's own best — the very value
+        this function just selected. ``sel_cost > best * (1 + pct/100)`` therefore asked
+        whether ``best > best``, false for every non-negative cost and every non-negative
+        percentage, so the knob selected nothing while `config_swarm_multi.yml`, both CLAUDE.md
+        files and the README all described it as *the* candidate-pool control. Worse than inert
+        at the edge: with a negative best the inequality flips and it would have rejected every
+        assignment. A tolerance around the best is only meaningful for a function that returns a
+        *pool*; this one returns one winner per column, so the parameter had no correct form
+        here. What bounds bidders per job is the caller's own rule — an agent proposes only
+        when this function names it — and for a rule-based agent that is the whole story, with
+        no knob either way. `job_selection.designate_bidder` narrows it further and is measured
+        (`bidders_per_job`, `designate_forced_share`), but `_designate_bidders` runs only in
+        `LlmAgent.selection_main`, so it is not a replacement for a `ResourceAgent` fleet.
+
         :param accept_if: Optional final predicate on the selected score (e.g., ``lambda s: s < 1e9``).
-        :param tie_break_key: Optional deterministic key for breaking exact-score ties.
-            To match your old (cost, agent_id) behavior, pass:
-            ``tie_break_key=lambda ag, s: getattr(ag, "agent_id", "")``.
+            This is the *absolute* gate and it works: it is evaluated on the selected score
+            without reference to the value it was selected by.
+        :param tie_break_key: Optional deterministic key for breaking exact-score ties,
+            called as ``tie_break_key(assignee, score, candidate)``. It takes the candidate
+            because a key over the assignee alone is a *ranking of assignees*: whichever one
+            sorts first wins every tie, everywhere. With coarse costs that is most of the
+            workload, so pass a key that varies with the candidate — see
+            ``swarm.utils.tiebreak.tiebreak_rank``.
         :returns: List of (assignee-or-None, score) with length == number of candidates.
         """
         A, C = cost_matrix.shape
         out: list[tuple[Assignee | None, float]] = []
         if A == 0 or C == 0:
             return [(None, float("inf")) for _ in range(C)]
-
-        # Column-wise best values for threshold checks (min or max).
-        # You *could* use _best on each column; vector ops are faster:
-        per_cand_best = cost_matrix.min(axis=0) if objective == "min" else cost_matrix.max(axis=0)
 
         for ci in range(C):
             col = cost_matrix[:, ci]
@@ -268,25 +281,19 @@ class SelectionEngine:
             else:
                 best_idx = int(finite_idx[np.argmax(col[finite_idx])])  # avoid +inf
 
-            # Optional tie-break when multiple indices have exactly the same best value
+            # Optional tie-break when multiple indices have exactly the same best value.
+            # Without it np.argmin/argmax silently returns the FIRST such row, which is the
+            # same positional bias by another name.
             if tie_break_key is not None:
                 best_val = col[best_idx]
                 tied = [i for i in finite_idx if col[i] == best_val]
                 if len(tied) > 1:
-                    best_idx = min(tied, key=lambda i: tie_break_key(assignees[i], float(col[i])))
+                    cand = candidates[ci] if ci < len(candidates) else None
+                    best_idx = min(tied,
+                                   key=lambda i: tie_break_key(assignees[i], float(col[i]), cand))
 
             sel_cost = float(col[best_idx])
             sel_agent = assignees[best_idx]
-
-            # Threshold relative to the per-column best (objective-aware)
-            if threshold_pct is not None and np.isfinite(sel_cost):
-                best = float(per_cand_best[ci])
-                if objective == "min":
-                    if not np.isfinite(best) or sel_cost > best * (1.0 + threshold_pct / 100.0):
-                        sel_agent, sel_cost = None, float("inf")
-                else:
-                    if not np.isfinite(best) or sel_cost < best * (1.0 - threshold_pct / 100.0):
-                        sel_agent, sel_cost = None, float("inf")
 
             # Optional absolute acceptance gate
             if accept_if is not None and sel_agent is not None:

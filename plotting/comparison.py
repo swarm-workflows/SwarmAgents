@@ -33,12 +33,18 @@ import matplotlib.pyplot as plt
 
 from plotting.data import load_jobs_csv
 from plotting.stats import jains_fairness
+from plotting.stats import boxplot as _boxplot
 
 
 # ── Helpers ────────────────────────────────────────────────────────
 
-def compute_stats(df: pd.DataFrame) -> dict:
-    """Compute summary statistics for a scheduler's job DataFrame."""
+def compute_stats(df: pd.DataFrame, fleet_ids=None) -> dict:
+    """Compute summary statistics for a scheduler's job DataFrame.
+
+    `fleet_ids`: the agents that could have executed (level 0). When given, fairness counts
+    the idle ones as zeros; over leaders alone, 10 of 30 agents sharing the work evenly read
+    1.0 (code review 2026-10-05 §39).
+    """
     lat = df["scheduling_latency"].dropna()
     completed = df[df["completed_at"] > 0]
 
@@ -49,9 +55,15 @@ def compute_stats(df: pd.DataFrame) -> dict:
 
     throughput = len(completed) / makespan if makespan > 0 else 0.0
 
-    # Load balance from leader_id distribution
-    leader_counts = df["leader_id"].value_counts().values
-    fairness = jains_fairness(leader_counts) if len(leader_counts) > 0 else 0.0
+    # Load balance over completed jobs per executing agent, idle agents as zeros when the fleet
+    # is known.
+    per_leader = completed["leader_id"].dropna().astype(int).astype(str).value_counts()
+    if fleet_ids:
+        fleet = sorted(set(map(str, fleet_ids)) | set(per_leader.index))
+        leader_counts = np.asarray([float(per_leader.get(a, 0)) for a in fleet])
+    else:
+        leader_counts = per_leader.values.astype(float)
+    fairness = jains_fairness(leader_counts) if len(leader_counts) > 0 else float("nan")
 
     return {
         "jobs_total": len(df),
@@ -64,6 +76,17 @@ def compute_stats(df: pd.DataFrame) -> dict:
         "throughput_jps": round(throughput, 2),
         "fairness_jain": round(fairness, 4),
     }
+
+
+def _level0_fleet(run_dir):
+    """Level-0 agent ids from a run's all_agents.csv, or None when the run did not write one
+    (the baselines do not) — fairness then falls back to the agents that led a job."""
+    if not run_dir:
+        return None
+    from pathlib import Path
+    from evaluation.collect import read_agent_levels
+    levels = read_agent_levels(Path(run_dir))
+    return [a for a, lvl in levels.items() if lvl == 0] or None
 
 
 # ── Plot Functions ─────────────────────────────────────────────────
@@ -102,7 +125,7 @@ def plot_latency_boxplot(data: dict[str, pd.DataFrame], output_dir: str):
             labels.append(label)
             latencies.append(lat.values)
 
-    bp = ax.boxplot(latencies, labels=labels, showfliers=False, patch_artist=True,
+    bp = _boxplot(ax, latencies, labels, showfliers=False, patch_artist=True,
                     whis=[5, 95])
     colors = ["#4C72B0", "#DD8452", "#55A868", "#C44E52"]
     for i, patch in enumerate(bp["boxes"]):
@@ -257,6 +280,7 @@ def main():
 
     # Collect all scheduler data
     data: dict[str, pd.DataFrame] = {}
+    run_dirs: dict[str, str] = {}
 
     named_dirs = [
         ("SWARM+", args.swarm_dir),
@@ -273,6 +297,7 @@ def main():
             print(f"WARNING: {csv_path} not found, skipping {label}")
             continue
         data[label] = load_jobs_csv(csv_path)
+        run_dirs[label] = run_dir
         print(f"Loaded {label}: {len(data[label])} jobs from {csv_path}")
 
     # Handle generic --dirs
@@ -287,6 +312,7 @@ def main():
                 print(f"WARNING: {csv_path} not found, skipping {label}")
                 continue
             data[label] = load_jobs_csv(csv_path)
+            run_dirs[label] = run_dir
             print(f"Loaded {label}: {len(data[label])} jobs from {csv_path}")
 
     if not data:
@@ -294,7 +320,8 @@ def main():
         sys.exit(1)
 
     # Compute statistics
-    stats = {label: compute_stats(df) for label, df in data.items()}
+    stats = {label: compute_stats(df, fleet_ids=_level0_fleet(run_dirs.get(label)))
+             for label, df in data.items()}
 
     # Generate all plots
     print(f"\nGenerating plots in {args.output_dir}/")

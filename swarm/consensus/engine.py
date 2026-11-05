@@ -22,6 +22,11 @@
 # SOFTWARE.
 #
 # Author: Komal Thareja(kthare10@renci.org)
+import threading
+from typing import Optional
+import time
+from collections import OrderedDict
+
 from swarm.consensus.messages.proposal_info import ProposalContainer, ProposalInfo
 from swarm.consensus.messages.proposal import Proposal
 from swarm.consensus.messages.prepare import Prepare
@@ -29,6 +34,18 @@ from swarm.consensus.messages.commit import Commit
 from .interfaces import ConsensusHost, ConsensusTransport, TopologyRouter
 from ..models.agent_info import AgentInfo
 from ..models.object import ObjectState
+from ..utils.instrumentation import RunningStats
+from ..utils.tiebreak import dominates
+from ..utils.utils import generate_id
+
+
+#: `consensus.pbft.counter_margin` when absent; equal to the shipped config. A coordinator counters a
+#: peer's proposal only when its own price is below the peer's by MORE than this fraction of the
+#: peer's price. With no margin, a counter undercutting by 2.9 % (5.68 against 5.85) split the
+#: commits of a 27-coordinator tier into two binding minorities (Hier-270 pilot, 2026-11-05: 4-12
+#: jobs a run never decided, 1.4-2.0 M sends dropped); with counter-proposals off it ran clean.
+#: Same idea and value as Snow's `tie_tolerance`. 0 restores the strict `dominates` rule.
+COUNTER_MARGIN_DEFAULT = 0.05
 
 
 class ConsensusEngine:
@@ -38,19 +55,171 @@ class ConsensusEngine:
     - uses host+transport callbacks for I/O and side effects
     """
     def __init__(self, agent_id: int, host: ConsensusHost, transport: ConsensusTransport,
-                 router: TopologyRouter):
+                 router: TopologyRouter, counter_margin: float = COUNTER_MARGIN_DEFAULT):
         self.agent_id = agent_id
+        margin = float(counter_margin)
+        if not (0.0 <= margin < 1.0):
+            raise ValueError(f"consensus.pbft.counter_margin must be in [0, 1), not {counter_margin!r}")
+        self.counter_margin = margin
         self.host = host
         self.transport = transport
         self.router = router
 
         # Local state
+        # Guards the quorum check and `_note_finalized` as ONE step. The engine is driven from
+        # the inbound thread, the periodic thread (replayed stashed messages) and the selection
+        # thread (`propose`), so two threads could both pass the check for one proposal and both
+        # finalize it — two `_record_finalize`, two `select_job` (code review 2026-10-05 §9).
+        # Host callbacks run outside it.
+        self._finalize_lock = threading.Lock()
         self.outgoing = ProposalContainer()  # proposals initiated by me
         self.incoming = ProposalContainer()  # proposals initiated by peers
         self.conflicts = {}
         # conflicts is diagnostic (per-job conflict counts, read by plotting); cap it so
         # long runs with high job churn can't grow it without bound.
         self._conflicts_max = 4096
+
+        # Finalization instrumentation (P0-4), measured at the PROPOSER only — the same
+        # vantage point the Snow engine measures from, so the two protocols' finalize-time
+        # distributions are comparable. A participant's clock would start when it first
+        # heard of the object, which is a different and shorter quantity.
+        #
+        # PBFT has no round count: its phase structure is fixed at proposal->prepare->commit,
+        # so what varies is how many votes a decision had to collect and how long that took.
+        # `votes_` is the analogue of Snow's `rounds_`; the mechanism figure pairs it with
+        # the per-agent message counts the transport records.
+        # (object_id, p_id) pairs this agent has already broadcast a COMMIT for. The old
+        # guard asked `self.incoming.contains(...)`, which is false for the proposer's OWN
+        # proposal (it lives in `outgoing`), so a proposer re-entered the commit branch on
+        # every PREPARE that arrived after quorum and broadcast another COMMIT each time —
+        # up to (n - quorum) redundant COMMITs per job, biasing messages-per-job *against*
+        # PBFT, which is the direction that flatters this paper's argument. Keyed by p_id
+        # rather than by object so that adopting a better proposal (which resets the object
+        # to PREPARE) still commits, and so does a re-proposal after a reselection timeout.
+        self._commits_sent: set[tuple[str, str]] = set()
+        # object_id -> the ONE p_id this agent has sent COMMIT for in the current election.
+        # A COMMIT is binding: until the election ends here (finalize) or the host resets it
+        # (`forget_decision`), this agent commits to no other proposal for the object, and its
+        # committed proposal is never dropped as "worse". Without it a voter that had committed
+        # still switched to a cheaper late proposal and committed again, its first COMMIT never
+        # withdrawn — one voter counted toward two quorums, so two proposals for one job both
+        # finalized: 8 jobs ran twice in the first E0 cells (2026-10-09), and job 1063 of Hier-90
+        # PBFT run05 (2026-10-10) finalized for 84 at agent 83 and for 83 everywhere else, so
+        # neither ran it. With every voter in at most one commit set, two commit quorums (each a
+        # majority) cannot form in a connected tier. Cost: a split with no majority left waits
+        # for the reselection timeout instead of being resolved by switching.
+        self._committed_to: dict[str, str] = {}
+        # Counter-proposals issued instead of preparing a dearer proposal (`_counter_proposal`).
+        self.counter_proposals = 0
+        # Counter-proposals NOT made because this agent was cheaper, but by no more than
+        # `counter_margin` of the incoming proposal's cost: it prepared that proposal instead.
+        self.counter_margin_yields = 0
+        self.commit_lock_holds = 0
+        # object_id -> {p_id: (ProposalInfo, voters whose COMMIT for it we know)}: every COMMIT
+        # seen for the object in this election, kept apart from the proposal containers (which
+        # drop proposals as "worse"), so a split commit can be recognised — see `_resolve_split`.
+        self._commit_ledger: dict[str, dict[str, tuple]] = {}
+        self.commit_splits_resolved = 0
+        # (object_id, p_id) pairs this agent has already FINALIZED, kept after the object
+        # leaves the containers. Finalization used to erase every trace of a decision at once
+        # (`_forget_object`), and that is exactly when the stragglers arrive: every tier wider
+        # than its quorum produces (n - quorum) late PREPAREs and COMMITs per job. A late
+        # PREPARE then found the object with empty containers and no dedupe entry, re-adopted
+        # the proposal with the SENDER's wire vote list and broadcast a second COMMIT; a late
+        # COMMIT re-adopted it with a wire `commits` list already at quorum and finalized the
+        # decision a second time — `finalized_count` and `votes_` doubled, and the proposer ran
+        # the participant branch with the straggler recorded as leader. Both bias the
+        # PBFT-versus-Snow figures against PBFT. Bounded by count, not by objects in flight,
+        # because the whole point is to remember decisions the containers have forgotten; the
+        # host tells us when an object is genuinely up for election again (`forget_decision`),
+        # and a new election carries a new p_id anyway.
+        self._finalized: "OrderedDict[tuple[str, str], float]" = OrderedDict()
+        self._finalized_max = 8192
+        # object_id -> (decided proposal, its commit voters), kept at a PARTICIPANT's finalize so
+        # the certificate can be sent to the leader if the leader never acts on it
+        # (`resend_certificate`). Bounded like `_finalized`; dropped on `forget_decision`.
+        self._certificates: "OrderedDict[str, tuple]" = OrderedDict()
+        # Finalizes made on a commit certificate for a proposal this agent no longer held (it
+        # had been replaced by a cheaper uncommitted one), and certificates resent to a leader.
+        self.certificate_finalizes = 0
+        self.certificates_resent = 0
+        # (object_id, p_id) of every proposal of an election the host RESET (`forget_decision`):
+        # a delayed message for one may not take part in the next election. Without this the
+        # certificate rule let delayed COMMITs of the old election rebuild a quorum in the
+        # cleared ledger and finalize a superseded proposal (stop-time review, 2026-10-14).
+        self._superseded: "OrderedDict[tuple[str, str], None]" = OrderedDict()
+        self.superseded_skips = 0
+        self._proposed_at: dict[str, float] = {}
+        self._proposed_at_max = 8192
+        self.time_to_finalize = RunningStats()
+        self.votes_to_finalize = RunningStats()
+        self.finalized_count = 0
+        self.reproposals = 0
+
+    def _mark_proposed(self, object_id: str, now: float) -> None:
+        """Stamp the start of a proposal attempt for *object_id*.
+
+        A re-proposal after a reselection timeout restarts the clock rather than extending
+        the first attempt's: the quantity the figure needs is how long the attempt that won
+        took, and carrying a timed-out attempt into it would report the reselection timeout
+        as consensus latency. The re-proposals are counted separately so the churn is not
+        lost — that is what `jobs_restarted` in the collector is cross-checked against.
+        """
+        if object_id in self._proposed_at:
+            self.reproposals += 1
+        elif len(self._proposed_at) >= self._proposed_at_max:
+            self._proposed_at.pop(next(iter(self._proposed_at)), None)
+        self._proposed_at[object_id] = now
+
+    def _record_finalize(self, proposal: ProposalInfo) -> None:
+        """Record one finalization, at the proposer only."""
+        if proposal.agent_id != self.agent_id:
+            return
+        started = self._proposed_at.pop(proposal.object_id, None)
+        self.finalized_count += 1
+        self.votes_to_finalize.add(len(proposal.commits))
+        if started is not None:
+            self.time_to_finalize.add(time.monotonic() - started)
+
+    def consensus_stats(self) -> dict:
+        """Per-agent finalization accounting, in the same shape the Snow engine emits.
+
+        `rounds_*` is absent by design rather than faked as a constant 3: PBFT's phase count
+        is fixed, so a column of 3s would invite a comparison of round counts across
+        protocols that means nothing. Compare `finalize_s_*` and the transport's message
+        counts instead.
+
+        `abandoned` is absent for the same reason, and used to be a hard-coded 0 (code review
+        §11). PBFT does not abandon: a stuck object is left to the reselection timeout, so
+        there is no count to report. Zero is the answer to "how many were abandoned", and PBFT
+        cannot answer it — absent, not zero, or a cross-protocol `abandoned` column reads as
+        though PBFT abandoned nothing where Snow abandoned some, which is a comparison of a
+        measurement against a constant. `finalize_lost` is absent here too; it is the Snow CAS
+        path and PBFT has no CAS.
+        """
+        stats: dict = {
+            "protocol": "pbft",
+            "finalized": self.finalized_count,
+            # PBFT counts at the winning proposer only, so every finalize it counts is a win.
+            "won": self.finalized_count,
+            "reproposals": self.reproposals,
+            "conflict_rounds": sum(self.conflicts.values()),
+            "conflict_objects": len(self.conflicts),
+            # Prepare quorums this agent declined to COMMIT because it had committed to another
+            # proposal for the object (`_committed_to`). Counted per evaluation, not per job.
+            "commit_lock_holds": self.commit_lock_holds,
+            # Commit splits with every live voter's COMMIT known and no quorum, left by moving
+            # every commit to the best committed proposal (`_resolve_split`).
+            "commit_splits_resolved": self.commit_splits_resolved,
+            "certificate_finalizes": self.certificate_finalizes,
+            "certificates_resent": self.certificates_resent,
+            "superseded_skips": self.superseded_skips,
+            "counter_proposals": self.counter_proposals,
+            "counter_margin_yields": self.counter_margin_yields,
+        }
+        stats.update(self.votes_to_finalize.summary("votes_"))
+        stats.update(self.time_to_finalize.summary("finalize_s_"))
+        return stats
 
     def _bump_conflict(self, object_id: str) -> None:
         if object_id not in self.conflicts and len(self.conflicts) >= self._conflicts_max:
@@ -80,20 +249,27 @@ class ConsensusEngine:
 
         A proposal is "worse" if:
         - It has higher cost, OR
-        - It has equal cost but lexicographically larger agent_id
+        - It has equal cost but a higher tiebreak_rank for this object
 
         This prevents accumulation of inferior proposals when messages arrive out of order.
+
+        The equal-cost arm used to compare agent ids lexicographically, which hands every tie
+        to the lowest id. That is only harmless if ties are rare; they are not (finding 10),
+        so it is now a per-object rank that no agent wins systematically.
         """
         all_proposals = container.get_proposals_by_object_id(incoming_proposal.object_id)
+        locked = self._committed_to.get(incoming_proposal.object_id)
 
         for existing in all_proposals:
             if existing.p_id == incoming_proposal.p_id:
                 continue  # Don't compare proposal to itself
+            if existing.p_id == locked:
+                continue  # Committed to it: its commits must still be counted here
 
             # Determine if existing proposal is worse
-            is_worse = (existing.cost > incoming_proposal.cost) or \
-                       (existing.cost == incoming_proposal.cost and
-                        (existing.agent_id or "") > (incoming_proposal.agent_id or ""))
+            is_worse = dominates(incoming_proposal.object_id,
+                                 incoming_proposal.cost, incoming_proposal.agent_id,
+                                 existing.cost, existing.agent_id)
 
             if is_worse:
                 self.host.log_debug(
@@ -103,33 +279,118 @@ class ConsensusEngine:
                 )
                 container.remove_proposal(p_id=existing.p_id, object_id=incoming_proposal.object_id)
 
+    def _counter_proposal(self, object, incoming: ProposalInfo) -> Optional[ProposalInfo]:
+        """A proposal of this agent's own for `object`, if it should answer `incoming` with one.
+
+        Without this, an agent that had not yet proposed a job PREPAREd the first proposal it
+        heard for it, whatever that cost, and never proposed the job itself (its selection loop
+        takes PENDING jobs only). Where every agent is a candidate — a hierarchical coordinator
+        under `coordinator_cost_matrix: self` — that made the tier a race: the first coordinator
+        to scan Redis after a batch landed won 95-99 % of it, and the cheapest coordinator often
+        won least (docs/results/e0-e1-f45d9ff1/README.md §7). Now such an agent first asks the host
+        for its own price (`counter_proposal_cost`, optional: a host that does not implement it, or
+        answers None, keeps the old behaviour) and, if that dominates the incoming proposal by the
+        rule every PBFT comparison uses (`dominates`) AND undercuts it by more than
+        `counter_margin` of its cost, proposes itself instead of preparing. Peers
+        already prefer the better of two proposals until they commit
+        (`_remove_worse_proposals_from_container`), so the cheaper one can still win the vote.
+
+        Never once this agent has committed for the object (a COMMIT is binding), nor when it
+        holds a proposal of its own for it (the ordinary comparison then applies).
+        """
+        fn = getattr(self.host, "counter_proposal_cost", None)
+        if fn is None:
+            return None
+        oid = incoming.object_id
+        if oid in self._committed_to or self.outgoing.contains(object_id=oid):
+            return None
+        try:
+            own = fn(oid)
+        except Exception as exc:
+            self.host.log_debug(f"counter_proposal_cost({oid}) failed: {exc}")
+            return None
+        if own is None or own != own or own == float("inf"):
+            return None
+        if not dominates(oid, float(own), self.agent_id, incoming.cost, incoming.agent_id):
+            return None
+        # Cheaper, but by enough? A near-tie counter gives the tier two proposals of about the
+        # same cost; peers prepare whichever they hear first, the binding COMMITs split between
+        # them, and with no quorum on either side the job waits for the reselection timeout —
+        # and splits again there, since every round brings its own near-ties (COUNTER_MARGIN_DEFAULT).
+        inc = float(incoming.cost)
+        if (self.counter_margin > 0 and inc == inc and inc != float("inf")
+                and not float(own) < inc * (1.0 - self.counter_margin)):
+            self.counter_margin_yields += 1
+            return None
+        return ProposalInfo(p_id=generate_id(), object_id=oid, agent_id=self.agent_id,
+                            cost=float(own))
+
+    def _issue_counter_proposals(self, counters: list) -> None:
+        """Propose the counter-proposals gathered from one message, as one PROPOSAL."""
+        if not counters:
+            return
+        for p in counters:
+            obj = self.host.get_object(p.object_id)
+            if obj is not None:
+                obj.state = ObjectState.PRE_PREPARE
+        self.counter_proposals += len(counters)
+        hook = getattr(self.host, "on_counter_proposals", None)
+        if hook is not None:
+            try:
+                hook(counters)
+            except Exception as exc:
+                self.host.log_debug(f"on_counter_proposals failed: {exc}")
+        self.host.log_info(
+            f"[CON_COUNTER] proposing {len(counters)} job(s) at a lower cost than the proposal "
+            f"received: {', '.join(p.object_id for p in counters[:10])}"
+            f"{' ...' if len(counters) > 10 else ''}")
+        self.propose(counters)
+
     # ---------- API exposed to the agent/framework ----------
     def propose(self, proposals: list[ProposalInfo]) -> None:
         # send PROPOSAL to peers
         msg = Proposal(source=self.agent_id,
                        agents=[AgentInfo(agent_id=self.agent_id)],
                        proposals=proposals)
+        now = time.monotonic()          # durations only, this process (§38)
         for proposal in proposals:
             # Proposer implicitly prepares its own proposal
-            if self.agent_id not in proposal.prepares:
-                proposal.prepares.append(self.agent_id)
+            self._add_vote(proposal.prepares)
             self.outgoing.add_proposal(proposal)
+            self._mark_proposed(proposal.object_id, now)
         self.transport.broadcast(payload=msg)
-        #for proposal in proposals:
-        #    self.outgoing.add_proposal(proposal)
+        # A live set of one has quorum 1, and the proposer's own PREPARE already meets it.
+        self._commit_where_prepared(proposals)
 
     def on_proposal(self, msg: Proposal) -> None:
         proposals = []
+        counters = []
+        merged = []
         for proposal in msg.proposals:
+            # Cheap, local checks FIRST. `get_object` is a synchronous Redis GET once the job
+            # has left the local queue, and every straggler (n - q per phase per job) used to
+            # pay it on the single inbound thread before being skipped — a WAN round trip
+            # charged to PBFT alone, in exactly the wide tiers where it was already losing
+            # (code review 2026-10-05 §10).
+            if self.host.is_agreement_achieved(proposal.object_id):
+                self.host.log_debug(f"Skip proposal {proposal.p_id} for {proposal.object_id} (complete)")
+                self.outgoing.remove_object(object_id=proposal.object_id)
+                self.incoming.remove_object(object_id=proposal.object_id)
+                continue
+
+            if self._superseded_skip(proposal.object_id, proposal.p_id, "proposal"):
+                continue
+
+            if self._already_finalized(proposal.object_id, proposal.p_id):
+                # A straggler (or a ring/star forward) of a proposal this agent has already
+                # finalized. Adopting it would re-run the decision from its wire vote lists.
+                self.host.log_debug(f"Skip proposal {proposal.p_id} for {proposal.object_id} (finalized)")
+                continue
+
             object = self.host.get_object(proposal.object_id)
-            if not object or self.host.is_agreement_achieved(object.object_id):
-                if not object:
-                    self.host.log_debug(f"Enqueued proposal {proposal.p_id} for {proposal.object_id} (missing)")
-                    self._set_pending_safe("proposal", msg, proposal.object_id)
-                else:
-                    self.host.log_debug(f"Skip proposal {proposal.p_id} for {proposal.object_id} (complete)")
-                    self.outgoing.remove_object(object_id=proposal.object_id)
-                    self.incoming.remove_object(object_id=proposal.object_id)
+            if not object:
+                self.host.log_debug(f"Enqueued proposal {proposal.p_id} for {proposal.object_id} (missing)")
+                self._set_pending_safe("proposal", msg, proposal.object_id)
                 continue
 
             # Basic dominance check using your existing helpers
@@ -145,38 +406,77 @@ class ConsensusEngine:
                 self.host.log_debug(f"Already accepted better proposal for Object {object.object_id} from peer {peer_better.agent_id} Cost: {peer_better.cost}")
                 self._bump_conflict(object.object_id)
             else:
+                counter = self._counter_proposal(object, proposal)
+                if counter is not None:
+                    counters.append(counter)
+                    continue
                 # Incoming proposal is better - remove ALL worse existing proposals
                 # FIX: Use helper method to remove ALL worse proposals, not just one arbitrary one
                 self._remove_worse_proposals_from_container(proposal, self.outgoing)
                 self._remove_worse_proposals_from_container(proposal, self.incoming)
 
-                proposals.append(proposal)
+                # Already adopted from a PREPARE and voted for then (`on_prepare`): merge the
+                # wire copy's votes and check commit on the merged copy, but send no second
+                # PREPARE, since this agent's vote is already out.
+                held = (self.incoming.get_proposal(p_id=proposal.p_id)
+                        if self.incoming.contains(object_id=proposal.object_id, p_id=proposal.p_id)
+                        else None)
+                voted = held is not None and self.agent_id in held.prepares
+                # Our own PREPARE counts toward the quorum we compute over a live set that
+                # includes us (code review 2026-10-05 §5).
+                self._add_vote(proposal.prepares)
                 self.incoming.add_proposal(proposal)
+                stored = self.incoming.get_proposal(p_id=proposal.p_id) or proposal
+                (merged if voted else proposals).append(stored)
                 object.state = ObjectState.PREPARE
 
         # respond with PREPARE
+        self._issue_counter_proposals(counters)
         if len(proposals):
             prepare = Prepare(source=self.agent_id,
                               agents=[AgentInfo(agent_id=self.agent_id)],
                               proposals=proposals)
             self.host.log_debug("Sending prepares")
             self.transport.broadcast(prepare)
+        # Our vote, or the merged copy's, may be the one that completes the prepare quorum.
+        if proposals or merged:
+            self._commit_where_prepared(proposals + merged)
 
         if self.router.should_forward():
             self.transport.broadcast(payload=msg)
 
     def on_prepare(self, msg: Prepare) -> None:
         proposals = []
+        counters = []
+        adopted = []
         for p in msg.proposals:
+            # Cheap, local checks FIRST. `get_object` is a synchronous Redis GET once the job
+            # has left the local queue, and every straggler (n - q per phase per job) used to
+            # pay it on the single inbound thread before being skipped — a WAN round trip
+            # charged to PBFT alone, in exactly the wide tiers where it was already losing
+            # (code review 2026-10-05 §10).
+            if self.host.is_agreement_achieved(p.object_id):
+                self.outgoing.remove_object(object_id=p.object_id)
+                self.incoming.remove_object(object_id=p.object_id)
+                self.host.log_debug(f"Skip prepare {p.p_id}/{p.object_id} (complete)")
+                continue
+
+            if self._superseded_skip(p.object_id, p.p_id, "prepare"):
+                continue
+
+            if self._already_finalized(p.object_id, p.p_id):
+                # Straggler PREPARE after our finalization. Before this check it re-adopted the
+                # proposal below with the sender's wire `prepares` (>= quorum), found no
+                # `_commits_sent` entry (forgotten at finalize) and broadcast a second COMMIT —
+                # the 2026-09-15 COMMIT-inflation defect, reintroduced by the cleanup that
+                # fixed it. Pinned by tests/test_pbft_stragglers.py.
+                self.host.log_debug(f"Skip prepare {p.p_id}/{p.object_id} (finalized)")
+                continue
+
             object = self.host.get_object(p.object_id)
-            if not object or self.host.is_agreement_achieved(object.object_id):
-                if not object:
-                    self._set_pending_safe("prepare", msg, p.object_id)
-                    self.host.log_debug(f"Enqueued prepare {p.p_id}/{p.object_id} (missing)")
-                else:
-                    self.outgoing.remove_object(object_id=p.object_id)
-                    self.incoming.remove_object(object_id=p.object_id)
-                    self.host.log_debug(f"Skip prepare {p.p_id}/{p.object_id} (complete)")
+            if not object:
+                self._set_pending_safe("prepare", msg, p.object_id)
+                self.host.log_debug(f"Enqueued prepare {p.p_id}/{p.object_id} (missing)")
                 continue
 
             # I have sent this proposal
@@ -208,17 +508,37 @@ class ConsensusEngine:
                     self._bump_conflict(object.object_id)
                     continue
                 else:
+                    counter = self._counter_proposal(object, p)
+                    if counter is not None:
+                        counters.append(counter)
+                        continue
                     # This is the best proposal we've seen so far
                     # Remove any worse proposals before adding
                     self._remove_worse_proposals_from_container(p, self.outgoing)
                     self._remove_worse_proposals_from_container(p, self.incoming)
 
-                    proposal = p
-                    self.incoming.add_proposal(proposal=proposal)
+                    self.incoming.add_proposal(proposal=p)
+                    proposal = self.incoming.get_proposal(p_id=p.p_id) or p
+                    # Vote for it, as `on_proposal` does: this agent is not countering it (it is
+                    # dearer, or cheaper by no more than `counter_margin`). Until 2026-10-30 an
+                    # agent that learned a proposal from a PREPARE adopted it SILENTLY and voted
+                    # only if the PROPOSAL itself arrived later. PBFT never retransmits, so a lost
+                    # PROPOSAL left every second-hand agent mute: in E6 a 5-agent group held 2
+                    # votes against a quorum of 3 until the 300 s reselection, 9-11 jobs per run
+                    # after a partition healed (docs/results/e6-58f3ab22/README.md §3).
+                    # b9e51bbf kept the silence where counter-proposals were live, after a
+                    # simulation with the split resolver switched off showed 7 of 400 9-coordinator
+                    # races undecided when voting. With the resolver on, as on every agent, voting
+                    # leaves 0 of 400 undecided at 0, 20 and 50 % PROPOSAL loss while silence
+                    # leaves up to 147 of 400 at 50 % — and with `counter_margin` an agent near the
+                    # proposer's price neither counters nor votes unless it votes here (stop review
+                    # 2026-11-05; tests/test_pbft_adopt_via_prepare.py).
+                    self._add_vote(proposal.prepares)
+                    adopted.append(proposal)
 
                     # FIX: If we accepted a better proposal while in COMMIT phase, reset to PREPARE
                     # This ensures we properly vote for the better proposal
-                    if object.is_commit:
+                    if object.is_commit and object.object_id not in self._committed_to:
                         self.host.log_debug(
                             f"Resetting object {object.object_id} from COMMIT to PREPARE "
                             f"for better proposal {p.p_id} (cost={p.cost})"
@@ -230,41 +550,333 @@ class ConsensusEngine:
             if msg.agents[0].agent_id not in proposal.prepares:
                 proposal.prepares.append(msg.agents[0].agent_id)
 
-            # Commit has already been triggered for THIS proposal
-            if object.is_commit and self.incoming.contains(object_id=object.object_id, p_id=proposal.p_id):
-                # Already committed to this specific proposal, don't re-commit
+            # Commit has already been broadcast for THIS proposal, by us. Asked of a set we
+            # own rather than of a container, so it holds for a proposal we proposed
+            # ourselves as well as one we adopted from a peer.
+            if (object.object_id, proposal.p_id) in self._commits_sent:
                 continue
 
-            quorum_count = self.host.calculate_quorum()
-            object.state = ObjectState.PREPARE
+            if self._committed_to.get(object.object_id) is None:
+                object.state = ObjectState.PREPARE
+            proposals.append(proposal)
 
-            if len(proposal.prepares) >= quorum_count:
-                self.host.log_debug(f"Object: {p.object_id} Agent: {self.agent_id} received quorum "
-                                  f"prepares: {p.prepares}, starting commit!")
-
-                # Increment the number of commits to count the commit being sent
-                proposals.append(proposal)
-                object.state = ObjectState.COMMIT
-
-        if len(proposals):
-            commit = Commit(source=self.agent_id, agents=[AgentInfo(agent_id=self.agent_id)], proposals=proposals)
-            self.transport.broadcast(payload=commit)
+        self._issue_counter_proposals(counters)
+        if adopted:
+            self.transport.broadcast(Prepare(source=self.agent_id,
+                                             agents=[AgentInfo(agent_id=self.agent_id)],
+                                             proposals=adopted))
+        self._commit_where_prepared(proposals)
 
         if self.router.should_forward():
             self.transport.broadcast(payload=msg)
 
+    def _forget_object(self, object_id: str) -> None:
+        """Drop per-object commit bookkeeping once the object leaves the engine.
+
+        Bounded by objects in flight, not by objects ever seen: without this the set would
+        grow for the life of the agent, which is the same slow leak `_proposed_at` caps."""
+        stale = [k for k in self._commits_sent if k[0] == object_id]
+        for k in stale:
+            self._commits_sent.discard(k)
+        self._committed_to.pop(object_id, None)
+        self._commit_ledger.pop(object_id, None)
+
+    def _note_finalized(self, object_id: str, p_id: str, now: float) -> None:
+        key = (object_id, p_id)
+        self._finalized[key] = now
+        self._finalized.move_to_end(key)
+        while len(self._finalized) > self._finalized_max:
+            self._finalized.popitem(last=False)
+
+    def _already_finalized(self, object_id: str, p_id: str) -> bool:
+        return (object_id, p_id) in self._finalized
+
+    def forget_decision(self, object_id: str) -> None:
+        """The host says *object_id* is up for election again (a reassignment after its
+        assignee died, a reselection reset). Drop the memory of its PAST decisions.
+
+        Only `_finalized` is touched. `_commits_sent` is keyed by (object, p_id) and a new
+        election carries a new p_id, so the old entries are inert and are released at the next
+        finalize anyway. Clearing it here was a defect: the host calls this from its periodic
+        pending-job scan, which also sees every job whose election is merely IN FLIGHT (the
+        record stays PENDING in Redis until the leader persists READY), so the dedupe was
+        being erased mid-election every 0.5 s and the next PREPARE past quorum broadcast a
+        fresh COMMIT — the very duplication this file exists to prevent."""
+        # Only what provably belongs to the election being reset: what this agent finalized,
+        # the certificate it holds, the proposal it committed to. Not the containers or the
+        # ledger — peers reset seconds apart, and a peer that reset first may already have
+        # proposed in the NEW election; superseding that would cancel the election we want.
+        old = {k[1] for k in self._finalized if k[0] == object_id}
+        if self._committed_to.get(object_id):
+            old.add(self._committed_to[object_id])
+        if object_id in self._certificates:
+            old.add(self._certificates[object_id][0].p_id)
+        for p_id in old:
+            self._superseded[(object_id, p_id)] = None
+            self._superseded.move_to_end((object_id, p_id))
+        while len(self._superseded) > self._finalized_max:
+            self._superseded.popitem(last=False)
+        for key in [k for k in self._finalized if k[0] == object_id]:
+            self._finalized.pop(key, None)
+        # A reset ends the election this agent committed in; the new one carries new p_ids.
+        self._committed_to.pop(object_id, None)
+        self._commit_ledger.pop(object_id, None)
+        self._certificates.pop(object_id, None)
+
+    def _superseded_skip(self, object_id: str, p_id: str, kind: str) -> bool:
+        if (object_id, p_id) not in self._superseded:
+            return False
+        self.superseded_skips += 1
+        self.host.log_debug(f"Skip {kind} {p_id}/{object_id} (election was reset)")
+        return True
+
+    def resend_certificate(self, object_id: str) -> bool:
+        """Send the commit certificate of a decision this agent took part in to its leader.
+
+        For a decision the leader never acted on: on a Hier-90 coordinator tier under steady
+        arrivals (2026-10-14), six peers finalized agent 90's proposal for each of three jobs
+        while 90 itself never did, so nobody ran them. A certificate is a quorum of commit
+        voters, so with the certificate rule in `on_commit` the leader finalizes on receipt,
+        whatever it holds now. Fire-and-forget: the host calls this from the periodic thread,
+        which also writes the heartbeat. False when there is nothing to send."""
+        cert = self._certificates.get(object_id)
+        if cert is None:
+            return False
+        prop, voters = cert
+        try:
+            leader = int(prop.agent_id)
+        except (TypeError, ValueError):
+            return False
+        if leader == self.agent_id:
+            return False
+        msg = Commit(source=self.agent_id, agents=[AgentInfo(agent_id=self.agent_id)],
+                     proposals=[ProposalInfo(p_id=prop.p_id, object_id=prop.object_id,
+                                             cost=prop.cost, agent_id=prop.agent_id,
+                                             commits=sorted(voters))])
+        send = getattr(self.transport, "send_async", None) or self.transport.send
+        send(leader, msg)
+        self.certificates_resent += 1
+        self.host.log_info(f"[CON_CERT_RESEND] Object:{object_id} to leader {leader} "
+                           f"p:{prop.p_id} voters={len(voters)}")
+        return True
+
+    # ---------- vote counting ----------
+    #
+    # A vote is counted when it is CAST, by whoever casts it: a peer's arrives in a message and
+    # is appended by the receiver; our own is appended here when we send it. Before 2026-10-06
+    # only arriving votes were appended, and `broadcast` never delivers to self, while
+    # `calculate_quorum` is a majority of `neighbor_map`, which includes self — so an agent
+    # needed q votes from its n-1 peers instead of q-1. A 2-agent group never finalized, and a
+    # 3-agent group with one peer down stalled for good (code review 2026-10-05 §5).
+    def _add_vote(self, votes: list, voter=None) -> None:
+        voter = self.agent_id if voter is None else voter
+        if voter not in votes:
+            votes.append(voter)
+
+    def _commit_where_prepared(self, proposals) -> None:
+        """Broadcast ONE COMMIT for every proposal whose prepare quorum is met and that we have
+        not committed to yet, count our own COMMIT, and finalize any whose commit quorum that
+        vote completes. The single place a COMMIT is sent, so the one-COMMIT-per-proposal rule
+        (`_commits_sent`, 2026-09-15) cannot be bypassed by a new caller."""
+        ready = []
+        quorum = self.host.calculate_quorum()
+        for proposal in proposals:
+            if (proposal.object_id, proposal.p_id) in self._commits_sent:
+                continue
+            if len(proposal.prepares) < quorum:
+                continue
+            locked = self._committed_to.get(proposal.object_id)
+            if locked is not None and locked != proposal.p_id:
+                self.commit_lock_holds += 1
+                self.host.log_debug(f"Object: {proposal.object_id} prepare quorum for "
+                                    f"{proposal.p_id}, but committed to {locked}; holding")
+                continue
+            object = self.host.get_object(proposal.object_id)
+            if object is None:
+                continue
+            # Taken HERE, not after the loop: two proposals for one object can reach prepare
+            # quorum in the same batch, and a lock recorded only after it let both commit.
+            self._committed_to[proposal.object_id] = proposal.p_id
+            self.host.log_debug(f"Object: {proposal.object_id} Agent: {self.agent_id} received "
+                                f"quorum prepares: {proposal.prepares}, starting commit!")
+            object.state = ObjectState.COMMIT
+            ready.append((object, proposal))
+        if not ready:
+            return
+        for _obj, proposal in ready:
+            self._commits_sent.add((proposal.object_id, proposal.p_id))
+            self._add_vote(proposal.commits)
+            self._ledger_note(proposal, proposal.commits)
+        commit = Commit(source=self.agent_id, agents=[AgentInfo(agent_id=self.agent_id)],
+                        proposals=[p for _o, p in ready])
+        self.transport.broadcast(payload=commit)
+        for object, proposal in ready:
+            if not self._finalize_if_quorum(object, proposal):
+                self._resolve_split(proposal.object_id)
+
+    @staticmethod
+    def _as_ids(values) -> set:
+        out = set()
+        for v in values or ():
+            try:
+                out.add(int(v))
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def _ledger_note(self, proposal: ProposalInfo, voters) -> None:
+        entry = self._commit_ledger.setdefault(proposal.object_id, {})
+        held = entry.get(proposal.p_id)
+        if held is None:
+            held = entry[proposal.p_id] = (proposal, set())
+        held[1].update(v for v in voters if v is not None)
+
+    def _resolve_split(self, object_id: str) -> None:
+        """Leave a commit split that can never finish, safely.
+
+        A COMMIT is binding (`_committed_to`), so votes locked onto different proposals with no
+        majority among them wait for the reselection timeout (300 s) — the first slice run of
+        the binding commit (355b4df8, Hier-30 PBFT) left 2 of 600 coordinator-tier jobs unrun
+        that way. Switching is what the binding forbids, because a proposal might have reached
+        quorum somewhere this agent has not heard of. That cannot be the case once this agent
+        KNOWS a COMMIT from every live voter and no proposal holds a quorum of them: each voter
+        commits once per election, so no quorum exists anywhere and nothing was finalized. Then
+        every agent that knows the same — the same set of committed proposals — moves its commit
+        to the same one, the best by the ordinary dominance rule, and it finalizes. An agent
+        missing any voter's commit does nothing; the reselection timeout stays the fallback."""
+        ids = getattr(self.host, "live_voter_ids", None)
+        live = self._as_ids(ids()) if callable(ids) else None
+        ledger = self._commit_ledger.get(object_id)
+        if not live or not ledger:
+            return
+        quorum = self.host.calculate_quorum()
+        voters = set()
+        for _prop, who in ledger.values():
+            if len(self._as_ids(who)) >= quorum:
+                return                        # a decision exists; the ordinary path finishes it
+            voters |= self._as_ids(who)
+        # Every LIVE voter by id, not a count of distinct voters: a commit from an agent outside
+        # the live set, or one id seen as both "3" and 3, made the count reach n while a live
+        # voter's COMMIT was still unknown (stop-time review).
+        if not live <= voters:
+            return
+        target = None
+        for prop, _who in ledger.values():
+            if target is None or dominates(object_id, prop.cost, prop.agent_id,
+                                           target.cost, target.agent_id):
+                target = prop
+        if self._committed_to.get(object_id) == target.p_id:
+            return
+        object = self.host.get_object(object_id)
+        if object is None:
+            return
+        if self.outgoing.contains(object_id=object_id, p_id=target.p_id):
+            local = self.outgoing.get_proposal(p_id=target.p_id)
+        elif self.incoming.contains(object_id=object_id, p_id=target.p_id):
+            local = self.incoming.get_proposal(p_id=target.p_id)
+        else:
+            local = target
+            self.incoming.add_proposal(proposal=local)
+        for v in ledger[target.p_id][1]:
+            self._add_vote(local.commits, v)
+        self.commit_splits_resolved += 1
+        self.host.log_info(f"[CON_SPLIT] Object:{object_id} commits split over "
+                           f"{len(ledger)} proposals with no quorum; moving commit to "
+                           f"{target.p_id} (agent {target.agent_id})")
+        self._committed_to[object_id] = target.p_id
+        self._commits_sent.add((object_id, target.p_id))
+        self._add_vote(local.commits)
+        self._ledger_note(local, local.commits)
+        object.state = ObjectState.COMMIT
+        self.transport.broadcast(payload=Commit(
+            source=self.agent_id, agents=[AgentInfo(agent_id=self.agent_id)], proposals=[local]))
+        self._finalize_if_quorum(object, local)
+
+    def _finalize_if_quorum(self, object, proposal) -> bool:
+        quorum = self.host.calculate_quorum()
+        self.host.log_debug(f"Is quorum? /{quorum}")
+        with self._finalize_lock:
+            if self._already_finalized(proposal.object_id, proposal.p_id):
+                return False
+            if len(proposal.commits) < quorum:
+                return False
+            # Remembered BEFORE the containers are cleared, so the stragglers that follow
+            # are recognised as such rather than re-adopted.
+            self._note_finalized(proposal.object_id, proposal.p_id, time.monotonic())
+        self.host.log_debug("Is quorum!!")
+        self._record_finalize(proposal)
+        # Leader vs participant. The leader is whoever PROPOSED — agent ids are unique, so a
+        # proposal naming us is ours whichever container it now sits in. This used to also
+        # require `outgoing.contains(...)`, and two paths remove our own proposal from
+        # `outgoing` while its election is still live (`_restart_selection`,
+        # `_clear_consensus_for_failed_agent`); late votes then finalized it on the
+        # participant branch with leader = self, so `select_job` never ran while every peer
+        # recorded us as the assignee (code review 2026-10-05 §6).
+        if proposal.agent_id == self.agent_id:
+            object.leader_id = proposal.agent_id
+            self.host.log_info(f"[CON_LEADER] Object:{proposal.object_id} Leader:{self.agent_id} p:{proposal.p_id}")
+            self.host.on_leader_elected(object, proposal.p_id)
+        else:
+            self.host.log_info(f"[CON_PART] Object:{proposal.object_id} Leader:{proposal.agent_id} p:{proposal.p_id}")
+            self._certificates[proposal.object_id] = (
+                ProposalInfo(p_id=proposal.p_id, object_id=proposal.object_id,
+                             cost=proposal.cost, agent_id=proposal.agent_id),
+                self._as_ids(proposal.commits))
+            self._certificates.move_to_end(proposal.object_id)
+            while len(self._certificates) > self._finalized_max:
+                self._certificates.popitem(last=False)
+            # The leader is the PROPOSER, not whoever's COMMIT happened to reach quorum
+            # last. `msg.agents[0]` was passed here, so every participant recorded the
+            # sender of the final COMMIT as the job's assignee in `job_assignments` —
+            # a different peer per participant, and the wrong one for all of them.
+            self.host.on_participant_commit(object, proposal.agent_id, proposal.p_id)
+        self.outgoing.remove_object(object_id=proposal.object_id)
+        self.incoming.remove_object(object_id=proposal.object_id)
+        self._forget_object(proposal.object_id)
+        return True
+
     def on_commit(self, msg: Commit) -> None:
         for p in msg.proposals:
-            object = self.host.get_object(p.object_id)
-            if not object or self.host.is_agreement_achieved(object.object_id):
-                if not object:
-                    self._set_pending_safe("commit", msg, p.object_id)
-                    self.host.log_debug(f"Enqueued commit {p.p_id}/{p.object_id} (missing)")
-                else:
-                    self.outgoing.remove_object(object_id=p.object_id)
-                    self.incoming.remove_object(object_id=p.object_id)
-                    self.host.log_debug(f"Skipped commit {p.p_id}/{p.object_id} (missing)")
+            # Cheap, local checks FIRST. `get_object` is a synchronous Redis GET once the job
+            # has left the local queue, and every straggler (n - q per phase per job) used to
+            # pay it on the single inbound thread before being skipped — a WAN round trip
+            # charged to PBFT alone, in exactly the wide tiers where it was already losing
+            # (code review 2026-10-05 §10).
+            if self.host.is_agreement_achieved(p.object_id):
+                self.outgoing.remove_object(object_id=p.object_id)
+                self.incoming.remove_object(object_id=p.object_id)
+                self._forget_object(p.object_id)
+                self.host.log_debug(f"Skipped commit {p.p_id}/{p.object_id} (complete)")
                 continue
+
+            if self._superseded_skip(p.object_id, p.p_id, "commit"):
+                continue
+
+            self._ledger_note(p, list(p.commits) + [msg.agents[0].agent_id])
+
+            if self._already_finalized(p.object_id, p.p_id):
+                # Straggler COMMIT after our finalization. It carries the sender's wire
+                # `commits` list, already at quorum, so adopting it finalized the decision a
+                # second time: `finalized_count` and `votes_` doubled, and the proposer took
+                # the participant branch with the straggler recorded as leader.
+                self.host.log_debug(f"Skip commit {p.p_id}/{p.object_id} (finalized)")
+                continue
+
+            object = self.host.get_object(p.object_id)
+            if not object:
+                self._set_pending_safe("commit", msg, p.object_id)
+                self.host.log_debug(f"Enqueued commit {p.p_id}/{p.object_id} (missing)")
+                continue
+
+            # A quorum of distinct voters committed to this proposal: it is DECIDED. Each voter
+            # commits once per election (`_committed_to`), and two quorums share a voter, so no
+            # other proposal can hold one. Dominance must not overrule a decision — a proposer
+            # whose own uncommitted proposal had been replaced by a cheaper one dropped every
+            # COMMIT for it as "worse", and `_resolve_split` stood aside because a quorum
+            # existed, so peers recorded it as leader and it never knew (2026-10-14).
+            held = self._commit_ledger.get(p.object_id, {}).get(p.p_id)
+            voters = self._as_ids(held[1]) if held is not None else set()
+            certified = len(voters) >= self.host.calculate_quorum()
 
             # I have sent this proposal
             if self.outgoing.contains(object_id=p.object_id, p_id=p.p_id):
@@ -272,6 +884,12 @@ class ConsensusEngine:
             # Received this proposal
             elif self.incoming.contains(object_id=p.object_id, p_id=p.p_id):
                 proposal = self.incoming.get_proposal(p_id=p.p_id)
+            elif certified:
+                proposal = p
+                self.incoming.add_proposal(proposal=proposal)
+                self.certificate_finalizes += 1
+                self.host.log_info(f"[CON_CERT] Object:{p.object_id} p:{p.p_id} decided by "
+                                   f"{len(voters)} commits; adopting over any cheaper proposal")
             # New proposal arriving via COMMIT (before PROPOSAL/PREPARE messages)
             else:
                 # FIX: Check dominance before blindly adding
@@ -286,6 +904,7 @@ class ConsensusEngine:
                         f"already have better proposal {better.p_id} (cost={better.cost})"
                     )
                     self._bump_conflict(object.object_id)
+                    self._resolve_split(p.object_id)
                     continue
                 else:
                     # Remove worse proposals before adding
@@ -296,24 +915,14 @@ class ConsensusEngine:
                     self.incoming.add_proposal(proposal=proposal)
                     self.host.log_debug(f"Accepted new proposal {p.p_id} via COMMIT (cost={p.cost})")
 
-            if msg.agents[0].agent_id not in proposal.commits:
-                proposal.commits.append(msg.agents[0].agent_id)
-
-            quorum = self.host.calculate_quorum()
-            self.host.log_debug(f"Is quorum? /{quorum}")
-            if len(proposal.commits) >= quorum:
-                self.host.log_debug("Is quorum!!")
-                # leader vs participant path
-                if proposal.agent_id == self.agent_id and self.outgoing.contains(object_id=proposal.object_id, p_id=proposal.p_id):
-                    # I am leader, do selection
-                    object.leader_id = proposal.agent_id
-                    self.host.log_info(f"[CON_LEADER] Object:{proposal.object_id} Leader:{self.agent_id} p:{proposal.p_id}")
-                    self.host.on_leader_elected(object, proposal.p_id)
-                else:
-                    self.host.log_info(f"[CON_PART] Object:{proposal.object_id} Leader:{proposal.agent_id} p:{proposal.p_id}")
-                    self.host.on_participant_commit(object, msg.agents[0].agent_id, proposal.p_id)
-                self.outgoing.remove_object(object_id=proposal.object_id)
-                self.incoming.remove_object(object_id=proposal.object_id)
+            self._add_vote(proposal.commits, msg.agents[0].agent_id)
+            # Every voter the commits carry, not just their sender: a decision whose sender
+            # messages did not all arrive was otherwise never counted here.
+            for v in voters:
+                if v not in self._as_ids(proposal.commits):
+                    self._add_vote(proposal.commits, v)
+            if not self._finalize_if_quorum(object, proposal):
+                self._resolve_split(p.object_id)
 
         if self.router.should_forward():
             self.transport.broadcast(payload=msg)

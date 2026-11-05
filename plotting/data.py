@@ -13,6 +13,53 @@ from swarm.database.repository import Repository
 from swarm.models.job import Job, ObjectState
 
 
+# ---------------------------------------------------------------------------
+# Run identity
+#
+# Agents write `metrics:<id>` to Redis at teardown, and an agent that outlives its run writes
+# whenever it is finally killed — which can be after the next run has flushed Redis. Those
+# leftovers are keyed by agent id, so they do not collide loudly; they just show up as that
+# agent's numbers. smoke-g2-llm's metrics.json was 15/16 leftovers from smoke-g2-bandit.
+#
+# The expected run id is process-global rather than a parameter because the loaders are called
+# from ~10 places in the plotting package, and a filter that one call site forgets to pass is
+# worse than no filter: it reports contaminated numbers on some plots and clean ones on others.
+# ---------------------------------------------------------------------------
+_EXPECTED_RUN_ID: str | None = None
+
+
+def set_expected_run_id(run_id: str | None) -> None:
+    """Restrict every subsequent Redis metrics load to payloads stamped with `run_id`."""
+    global _EXPECTED_RUN_ID
+    _EXPECTED_RUN_ID = run_id or None
+
+
+def expected_run_id() -> str | None:
+    return _EXPECTED_RUN_ID
+
+
+def _filter_by_run_id(metrics_by_agent: dict[int, dict]) -> dict[int, dict]:
+    """Drop payloads that belong to another run, reporting each one dropped."""
+    if not _EXPECTED_RUN_ID:
+        return metrics_by_agent
+    kept, dropped = {}, []
+    for agent_id, entry in metrics_by_agent.items():
+        if entry.get("run_id") == _EXPECTED_RUN_ID:
+            kept[agent_id] = entry
+        else:
+            dropped.append((agent_id, entry.get("run_id"), entry.get("saved_at")))
+    if dropped:
+        print(f"WARNING: dropped {len(dropped)} metrics payload(s) from another run "
+              f"(expected run_id={_EXPECTED_RUN_ID}):", file=sys.stderr)
+        for agent_id, run_id, saved_at in sorted(dropped):
+            stamp = ""
+            if saved_at:
+                from datetime import datetime as _dt
+                stamp = f", saved_at={_dt.fromtimestamp(saved_at):%Y-%m-%d %H:%M:%S}"
+            print(f"  agent {agent_id}: run_id={run_id!r}{stamp}", file=sys.stderr)
+    return kept
+
+
 def load_metrics_from_repo(repo: Repository) -> dict[int, dict]:
     """
     Load metrics objects from Redis and normalize their shape.
@@ -61,7 +108,7 @@ def load_metrics_from_repo(repo: Repository) -> dict[int, dict]:
         entry.setdefault("load_trace", [])
         metrics_by_agent[int(agent_id)] = entry
 
-    return metrics_by_agent
+    return _filter_by_run_id(metrics_by_agent)
 
 
 def load_metrics_from_file(path: str) -> dict[int, dict]:
@@ -83,18 +130,34 @@ def load_metrics_from_file(path: str) -> dict[int, dict]:
         return {}
 
 
-def load_jobs_csv(csv_path: str) -> pd.DataFrame:
-    """Load an all_jobs.csv file and return a DataFrame with numeric columns."""
+def load_jobs_csv(csv_path: str, dedup: bool = True) -> pd.DataFrame:
+    """Load an all_jobs.csv file: numeric columns, ONE row per job.
+
+    On a hierarchical run the export holds one record per tier, and the coordinator's copy
+    has coordinator-tier stamps only — so read raw, its shorter `scheduling_latency` entered
+    the SWARM latency CDF beside the leaf's, `jobs_total` doubled, and coordinators counted as
+    leaders: SWARM biased fast against the baselines (code review 2026-10-05 §42). Dedup uses
+    the collector's own rule, so the figure and the table pick the same record.
+    """
     df = pd.read_csv(csv_path)
     for col in ["submitted_at", "selection_started_at", "assigned_at",
-                 "started_at", "completed_at", "scheduling_latency", "reasoning_time"]:
+                 "started_at", "completed_at", "scheduling_latency", "reasoning_time",
+                 "selection_total"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
+    if dedup:
+        from evaluation.collect import dedup_jobs
+        df = dedup_jobs(df).reset_index(drop=True)
     return df
 
 
 def load_jobs_from_csv(output_dir: str) -> pd.DataFrame:
-    """Load job data from CSV file."""
+    """Load job data from a run directory: `all_jobs.csv`, which is what run_test.py writes
+    (deduplicated to one row per job), else a legacy `jobs.csv`. It read only `jobs.csv`, which
+    a current run does not produce (code review 2026-10-05 §46)."""
+    all_jobs = os.path.join(output_dir, "all_jobs.csv")
+    if os.path.exists(all_jobs):
+        return load_jobs_csv(all_jobs)
     jobs_path = os.path.join(output_dir, "jobs.csv")
     if os.path.exists(jobs_path):
         return pd.read_csv(jobs_path)
@@ -115,17 +178,17 @@ def load_jobs_from_redis(db_host: str, db_port: int = 6379) -> pd.DataFrame:
     jobs = []
 
     try:
-        # Try multiple levels for hierarchical topology
-        for level in range(3):
-            for group in range(10):
-                raw = repo.get_all_objects(
-                    key_prefix=Repository.KEY_JOB,
-                    level=level,
-                    group=group
-                )
-                for data in raw:
-                    if isinstance(data, dict):
-                        jobs.append(data)
+        # EVERY job key, whatever its level and group. This walked groups 0-9 only, and Hier-270
+        # has 27 level-0 groups, so most of its jobs were silently dropped (§46).
+        keys = list(redis_client.scan_iter(match=f"{Repository.KEY_JOB}:*", count=1000))
+        for i in range(0, len(keys), 500):
+            for raw in redis_client.mget(keys[i:i + 500]):
+                try:
+                    data = json.loads(raw) if raw else None
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(data, dict):
+                    jobs.append(data)
     except Exception as e:
         print(f"Warning: Error loading jobs from Redis: {e}")
 
@@ -157,7 +220,7 @@ def load_metrics_from_redis(db_host: str, db_port: int = 6379) -> dict[int, dict
     except Exception as e:
         print(f"Error loading from Redis: {e}")
 
-    return metrics_by_agent
+    return _filter_by_run_id(metrics_by_agent)
 
 
 def save_metrics(metrics: dict[int, dict], path: str):
@@ -184,6 +247,9 @@ def save_jobs(jobs: list[Any], path: str, level: int | None = None):
     detailed_latency = []
     pending_jobs = []
     for job_data in jobs:
+        # The group the record's Redis key named, when the caller fetched it with
+        # `Repository.get_all_objects_with_group`; blank otherwise (T-5).
+        key_group = job_data.get("_key_group", "") if isinstance(job_data, dict) else ""
         if isinstance(job_data, dict):
             job = Job()
             job.from_dict(job_data)
@@ -216,12 +282,34 @@ def save_jobs(jobs: list[Any], path: str, level: int | None = None):
             started_at = started_at_dict.get(level, started_at_dict.get(0, 0))
             completed_at = completed_at_dict.get(level, completed_at_dict.get(0, 0))
         else:
-            # Backward compatible: use last timestamps (max values)
-            submitted_at = submitted_at_dict.get(0, 0) if submitted_at_dict else 0
+            # The combined export. Timestamps are per LEVEL on a hierarchical job, and which
+            # level each column takes from decides what the derived metrics mean:
+            #
+            # * `submitted_at` is the EARLIEST stamp — the job's arrival at the top tier. It
+            #   used to be the level-0 stamp, which on a hierarchical run is set at DELEGATION
+            #   (`scheduling_main` moves the job to level-1 and calls `mark_submitted`), so
+            #   scheduling latency, job latency, makespan and throughput all silently excluded
+            #   the coordinator tier — the tier where PBFT collapses. On a flat run there is
+            #   only level 0 and nothing changes.
+            # * `selection_started_at`/`assigned_at` stay the LAST stamps: the leaf tier's
+            #   consensus, which is what `selection_*` has always reported (per-tier numbers
+            #   are in level<N>_jobs.csv). `selection_total` below is the sum over tiers.
+            # * `started_at`/`completed_at` are the last stamps: execution happens at a leaf.
+            submitted_at = min(submitted_at_dict.values()) if submitted_at_dict else 0
             selection_started_at = max(selection_started_at_dict.values()) if selection_started_at_dict else 0
             assigned_at = max(assigned_at_dict.values()) if assigned_at_dict else 0
             started_at = max(started_at_dict.values()) if started_at_dict else 0
             completed_at = max(completed_at_dict.values()) if completed_at_dict else 0
+
+        # Consensus time summed over every tier the job passed through: each level's own
+        # (assigned - selection_started), for levels that have both stamps. On a flat run this
+        # equals the leaf-tier selection time; on a hierarchical run it is the end-to-end
+        # consensus cost the leaf-tier `selection_*` column leaves out.
+        selection_total = 0.0
+        for lvl, started in selection_started_at_dict.items():
+            done = assigned_at_dict.get(lvl)
+            if started and done and done >= started:
+                selection_total += done - started
 
         # Calculate scheduling latency for this level
         scheduling_latency = assigned_at - submitted_at if assigned_at and submitted_at else 0
@@ -239,6 +327,9 @@ def save_jobs(jobs: list[Any], path: str, level: int | None = None):
             leader_id,
             reasoning_time,
             scheduling_latency,
+            selection_total,
+            key_group,
+            1 if getattr(job, "refusal_reason", None) else 0,
             ])
         else:
             detailed_latency.append([
@@ -252,6 +343,9 @@ def save_jobs(jobs: list[Any], path: str, level: int | None = None):
                 leader_id,
                 reasoning_time,
                 scheduling_latency,
+                selection_total,
+                key_group,
+                1 if getattr(job, "refusal_reason", None) else 0,
             ])
 
     file_name = f"{path}/all_jobs.csv" if level is None else f"{path}/level{level}_jobs.csv"
@@ -261,6 +355,7 @@ def save_jobs(jobs: list[Any], path: str, level: int | None = None):
         writer.writerow([
             'job_id', 'submitted_at', 'selection_started_at', 'assigned_at',
             'started_at', 'completed_at', 'exit_status', 'leader_id', 'reasoning_time', 'scheduling_latency',
+            'selection_total', 'group', 'refused',
         ])
         writer.writerows(detailed_latency)
 
@@ -269,5 +364,6 @@ def save_jobs(jobs: list[Any], path: str, level: int | None = None):
         writer.writerow([
             'job_id', 'submitted_at', 'selection_started_at', 'assigned_at',
             'started_at', 'completed_at', 'exit_status', 'leader_id', 'reasoning_time', 'scheduling_latency',
+            'selection_total', 'group', 'refused',
         ])
         writer.writerows(pending_jobs)

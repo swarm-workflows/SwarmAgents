@@ -24,6 +24,7 @@
 
 import json
 import logging
+import os
 import random
 import threading
 import time
@@ -49,14 +50,19 @@ class Repository:
     KEY_METRICS = "metrics"
     KEY_ASSIGNEE = "assignee"
 
-    def __init__(self, redis_client: redis.Redis):
+    def __init__(self, redis_client: redis.Redis, run_id: Optional[str] = None):
         """
         Initialize Repository instance.
 
         Args:
             redis_client (redis.Redis): Redis client connection object.
+            run_id (Optional[str]): Identity of the run, for keys that must not be inherited
+                by the next one. Defaults to ``SWARM_RUN_ID``, which ``run_test.py`` exports
+                to every agent (inherited locally, re-exported over ssh), so every agent in a
+                run agrees on it without being told. Resolved here and only here.
         """
         self.redis = redis_client
+        self.run_id = run_id or os.environ.get("SWARM_RUN_ID") or "norun"
         # Contention instrumentation: total WatchError retries across all save() calls.
         # A high rate at scale means hot keys are serializing writers (see SCALABILITY_REVIEW).
         self.watch_retries = 0
@@ -67,7 +73,11 @@ class Repository:
     ##########################
 
     def save(self, obj: dict, key_prefix: str = KEY_JOB, key: Optional[str] = None,
-             level: int = 0, group: int = 0, max_retries: int = 10):
+             level: int = 0, group: int = 0, max_retries: int = 10,
+             produced_data: Optional[List[str]] = None,
+             produced_locations: Optional[Dict[str, dict]] = None,
+             require_existing: bool = False,
+             precondition=None) -> bool:
         """
         Save a generic object into Redis under the given key.
 
@@ -81,6 +91,23 @@ class Repository:
             level (int): Agent level in hierarchy.
             group (int): Agent group in hierarchy at a level.
             max_retries (int): Maximum retry attempts on WatchError (default: 10).
+            produced_data (Optional[List[str]]): Output names this write makes available,
+                added to the readiness registry **inside the same MULTI**. This is what closes
+                the window between "the job is complete" and "its outputs exist": as two
+                writes, an agent dying in between left every descendant of that job gated for
+                the rest of the run, and no retry queue can cover it because the queue dies
+                with the agent. As one transaction there is no in-between — either both landed
+                or neither, and a job that is not COMPLETE is reselected by the existing
+                machinery. Pass it only on a *successful* terminal write; a failed job's
+                outputs do not exist.
+            produced_locations (Optional[Dict[str, dict]]): Where each of those names can be
+                fetched from — `{name: {agent_id, host, port, produced_at}}` — written into the
+                location registry **inside the same MULTI** as the names themselves. It rides
+                the same transaction for the same reason `produced_data` does, one step further
+                on: a descendant that can see a name as ready but cannot find out where it is
+                would be released and then refuse to stage, which looks like a staging bug and
+                is really a torn write. Either both landed or neither. Ignored when staging is
+                off, where the shared mount is the location.
         """
         if not key:
             obj_id = obj.get("id") or obj.get(f"{key_prefix}_id")
@@ -93,10 +120,31 @@ class Repository:
             try:
                 pipeline.watch(key)
                 old_data = pipeline.get(key)
+                if precondition is not None and not precondition(
+                        json.loads(old_data) if old_data else None):
+                    # The record moved on since the caller decided to write (§65): refused
+                    # under the same WATCH, so the check and the write are one decision.
+                    pipeline.unwatch()
+                    return False
+                if require_existing and not old_data:
+                    # The record was deleted — a coordinator WITHDREW this copy. Re-creating it
+                    # here would run a job its coordinator has already handed elsewhere. The
+                    # WATCH makes the check and the write one decision: a delete landing
+                    # between them aborts the EXEC and the retry sees the key gone.
+                    pipeline.unwatch()
+                    return False
                 pipeline.multi()
                 pipeline.set(key, json.dumps(obj))
                 if key_prefix == self.KEY_AGENT:
                     pipeline.sadd(self._members_key(level, group), key)
+                if produced_data:
+                    pipeline.sadd(self._data_ready_key(),
+                                  *[str(n) for n in produced_data if n])
+                if produced_locations:
+                    pipeline.hset(
+                        self._data_loc_key(),
+                        mapping={str(n): json.dumps(loc)
+                                 for n, loc in produced_locations.items() if n})
 
                 # Maintain secondary index by state
                 new_state = obj.get(self.KEY_STATE)
@@ -112,7 +160,7 @@ class Repository:
                             pipeline.srem(old_state_key, key)
                 pipeline.execute()
                 self.saves += 1
-                return  # success
+                return True  # success
             except redis.WatchError:
                 self.watch_retries += 1
                 if attempt == max_retries:
@@ -256,6 +304,37 @@ class Repository:
         return {state: [k.split(":", 3)[-1] for k in keys]
                 for state, keys in zip(states, results)}
 
+    #: Field `get_all_objects_with_group` adds to each record: the group its Redis key names.
+    #: Underscored because it is not part of the object and must never be saved back.
+    KEY_GROUP_TAG = "_key_group"
+
+    def get_all_objects_with_group(self, key_prefix: str = KEY_JOB, level: int = 0) -> List[dict]:
+        """Every object at ``level``, each tagged with the group its KEY names (T-5).
+
+        A job record does not carry its group: a delegated copy lives at
+        `job:<level>:<group>:<id>` and the group is in the key alone. `get_all_objects` returns
+        the values, so an export of a fan-out run could not say which group's copy a row was —
+        the leader's group recovers it for a copy that was picked up, and nothing recovers it
+        for one that was not. The context-error column counts copies per group, and an
+        unattributed copy is a decision it has to refuse to score.
+        """
+        keys = list(self.redis.scan_iter(f"{key_prefix}:{level}:*"))
+        if not keys:
+            return []
+        out: List[dict] = []
+        for key, raw in zip(keys, self.redis.mget(keys)):
+            if not raw:
+                continue
+            obj = json.loads(raw)
+            parts = str(key).split(":")
+            if len(parts) >= 4:
+                try:
+                    obj[self.KEY_GROUP_TAG] = int(parts[2])
+                except ValueError:
+                    pass
+            out.append(obj)
+        return out
+
     def get_all_objects(self, key_prefix: str = KEY_JOB, level: int = 0, group: int = None, state: int = None) -> List[dict]:
         """
         Retrieve all objects under given key prefix.
@@ -318,18 +397,254 @@ class Repository:
         Snow/Avalanche engine to finalize a probabilistic decision into an
         exactly-once assignment.
         """
-        key = f"{self.KEY_ASSIGNEE}:{level}:{group}:{job_id}"
+        key = self._claim_key(level, group, job_id)
         # `nx=True` returns True iff we set the key; otherwise read the existing value.
         if self.redis.set(key, str(int(agent_id)), nx=True):
             return int(agent_id)
         existing = self.redis.get(key)
         return int(existing) if existing is not None else int(agent_id)
 
+    # ---- Produced-data registry (workflow DAG gating) -------------------------------- #
+    #
+    # One Redis SET per run holding the logical file names that have actually been produced.
+    # A job whose inputs name files in this set is runnable; one whose inputs do not is a
+    # descendant whose parent has not finished. Deliberately a *set of names* rather than a
+    # graph of job ids: a Pegasus DAG's edges are file dependencies, the converter recovers
+    # them by matching one job's outputs against another's inputs, and a name is the only
+    # thing both halves agree on. It is also flat across levels and groups, because the
+    # producer and the consumer of a file are on different agents by construction.
+
+    KEY_DATA_READY = "data_ready"
+
+    def _data_ready_key(self) -> str:
+        """Run-scoped, and shaped like every other key so cleanup finds it.
+
+        Both halves are load-bearing. The shape (`prefix:a:b:c`) matters because
+        `delete_all("*")` — which `cleanup.py` runs between runs — scans `*:*`, so a *bare*
+        key survives every cleanup this project has: the next run of the same workflow would
+        find its predecessor's file names already present and release the whole DAG at once,
+        on the first tick, with nothing saying so. The run id matters because cleanup is not
+        the only path — an operator flushing by hand, or a cell that skipped it, must still
+        not inherit readiness. It is the same reason metrics payloads are run-stamped.
+        """
+        return f"{self.KEY_DATA_READY}:{self.run_id}:0:names"
+
+    #: Where each produced name can be fetched from. A HASH beside the readiness SET rather
+    #: than fields inside it, because the two are read on completely different paths: readiness
+    #: is `smismember` for every gated job on every scheduling pass and must stay one round
+    #: trip, while a location is read only when a file is actually about to be staged.
+    KEY_DATA_LOC = "data_loc"
+
+    def _data_loc_key(self) -> str:
+        """Run-scoped and `prefix:a:b:c`-shaped for the same two reasons as the readiness key:
+        `delete_all("*")` must reach it between runs, and a cell that skipped cleanup must not
+        inherit a previous run's locations — which would point a fetch at an agent that is not
+        serving that file any more, or worse, at one that is serving a stale copy."""
+        return f"{self.KEY_DATA_LOC}:{self.run_id}:0:names"
+
+    def data_locations(self, names: List[str]) -> Dict[str, List[dict]]:
+        """`{name: [location, ...]}` for the names that have one. One round trip, like readiness.
+
+        A **list, in preference order**: the peer that produced the file first, the staging site
+        last. The producer sets that order and the consumer walks it, which is what gives the
+        fast path (one hop, straight from the producer) and durability (the store, when the
+        producer has gone) without every edge paying two WAN hops.
+
+        A name present in the readiness registry but absent here means the run is staging-less
+        (the shared mount is the location) — the caller distinguishes those two cases, because
+        "nowhere to fetch from" and "no fetching needed" call for opposite responses.
+        """
+        names = [str(n) for n in names if n]
+        if not names:
+            return {}
+        raw = self.redis.hmget(self._data_loc_key(), names)
+        out: Dict[str, List[dict]] = {}
+        for name, value in zip(names, raw):
+            if not value:
+                continue
+            try:
+                parsed = json.loads(value)
+            except (ValueError, TypeError):
+                continue                    # a corrupt entry is treated as absent, never guessed
+            if isinstance(parsed, dict):
+                # A single location, which is what the first revision of staging wrote. Kept
+                # readable because a rolling deploy genuinely mixes the two: on 2026-09-21 the
+                # staging code was on 5 of 92 agents.
+                parsed = [parsed]
+            if isinstance(parsed, list) and parsed:
+                out[name] = [p for p in parsed if isinstance(p, dict)]
+        return out
+
+    def publish_data(self, names: List[str], locations: Dict[str, list]) -> None:
+        """Make *names* ready and record where they are, in ONE transaction — for an output
+        published after its job's completion (a stage-out that succeeded on retry). The same
+        rule as the completion write: a name visible without its location is a torn write."""
+        names = [str(n) for n in names if n]
+        if not names:
+            return
+        pipe = self.redis.pipeline()
+        pipe.multi()
+        pipe.sadd(self._data_ready_key(), *names)
+        if locations:
+            pipe.hset(self._data_loc_key(),
+                      mapping={str(n): json.dumps(loc) for n, loc in locations.items() if n})
+        pipe.execute()
+
+    def mark_data_available(self, names: List[str]) -> None:
+        """Record that *names* now exist. Called once a job has actually completed."""
+        names = [str(n) for n in names if n]
+        if not names:
+            return
+        self.redis.sadd(self._data_ready_key(), *names)
+
+    def data_available(self, names: List[str]) -> bool:
+        """True when every name in *names* has been produced (or the list is empty).
+
+        One round trip regardless of how many names are asked about: this is called for every
+        gated job on every scheduling pass, and a per-name GET loop would put a WAN round trip
+        per edge into the scheduling loop of every agent."""
+        names = [str(n) for n in names if n]
+        if not names:
+            return True
+        return all(self.redis.smismember(self._data_ready_key(), names))
+
+    def delete_if_state(self, obj_id: str, state, key_prefix: str = KEY_JOB,
+                        level: int = 0, group: int = 0, max_retries: int = 10) -> bool:
+        """Delete a record only while it is still in `state`. True if it was deleted or is
+        already gone; False if it has moved on.
+
+        A coordinator withdrawing a delegated copy must not delete one a child has just picked
+        up: read PENDING, child saves READY, coordinator deletes — and the job runs in a group
+        the coordinator believes it withdrew from (code review 2026-10-05 §15, found by the
+        stop-time review). WATCH makes read-and-delete one decision."""
+        key = f"{key_prefix}:{level}:{group}:{obj_id}"
+        want = state.value if hasattr(state, "value") else state
+        pipeline = self.redis.pipeline()
+        for attempt in range(1, max_retries + 1):
+            try:
+                pipeline.watch(key)
+                raw = pipeline.get(key)
+                if not raw:
+                    pipeline.unwatch()
+                    return True
+                current = json.loads(raw).get(self.KEY_STATE)
+                if current != want:
+                    pipeline.unwatch()
+                    return False
+                pipeline.multi()
+                pipeline.delete(key)
+                pipeline.srem(f"{self.KEY_STATE}:{level}:{group}:{current}", key)
+                pipeline.execute()
+                return True
+            except redis.WatchError:
+                if attempt == max_retries:
+                    raise RuntimeError(f"delete_if_state lost the race {max_retries} times "
+                                       f"for key={key}")
+                time.sleep(min(0.01 * (2 ** attempt), 0.5) + random.uniform(0, 0.01))
+        return False
+
+    def produced_names(self, names: List[str]) -> set:
+        """The subset of *names* this run has produced (in the readiness set). One round trip."""
+        names = [str(n) for n in names if n]
+        if not names:
+            return set()
+        flags = self.redis.smismember(self._data_ready_key(), names)
+        return {n for n, f in zip(names, flags) if f}
+
+    def available_data(self) -> set:
+        """Every name produced so far — for diagnostics, not for the scheduling path."""
+        return {v.decode() if isinstance(v, bytes) else v
+                for v in self.redis.smembers(self._data_ready_key())}
+
     def get_assignment(self, job_id: str, level: int = 0, group: int = 0):
         """Return the committed assignee for ``job_id``, or None if unclaimed."""
-        key = f"{self.KEY_ASSIGNEE}:{level}:{group}:{job_id}"
+        key = self._claim_key(level, group, job_id)
         v = self.redis.get(key)
         return int(v) if v is not None else None
+
+    def get_assignments(self, job_ids: List[str], level: int = 0,
+                        group: int = 0) -> Dict[str, int]:
+        """`{job_id: assignee}` for the jobs that have a committed claim. One MGET."""
+        job_ids = [str(j) for j in job_ids if j]
+        if not job_ids:
+            return {}
+        keys = [self._claim_key(level, group, j) for j in job_ids]
+        return {j: int(v) for j, v in zip(job_ids, self.redis.mget(keys)) if v is not None}
+
+    def release_assignment(self, job_id: str, level: int = 0, group: int = 0) -> bool:
+        """Drop the exactly-once claim on ``job_id`` so it can be assigned again.
+
+        The claim is what makes a Snow finalization exactly-once: `try_claim_assignment` is a
+        `SET NX`, and every later finalizer is told the first winner. Nothing released it, so a
+        job whose assignee *died* could never be re-finalized to anyone else — the CAS kept
+        returning the dead agent for the rest of the run, and reassignment was silently
+        impossible under the shipped protocol. Releasing is safe only once the job is no
+        longer running anywhere, which is exactly the failed-agent case; it must never be
+        called on a live assignment, or two agents could execute the same job.
+        """
+        return bool(self.redis.delete(self._claim_key(level, group, job_id)))
+
+    def release_assignment_if_held_by(self, job_id: str, agent_id: int, level: int = 0,
+                                      group: int = 0, max_retries: int = 10) -> bool:
+        """Drop the exactly-once claim on ``job_id`` only while it still names ``agent_id``.
+
+        The plain `release_assignment` is right when the caller has just reset the job itself
+        (code review 2026-09-15). The stranded-claim sweep (code review 2026-10-05 §18) is
+        different: several live agents read the same stale claim naming a dead leader, and a
+        plain delete from the second reader lands AFTER the first reader's release let a live
+        agent win a fresh claim — deleting the live assignment and reopening the double
+        execution the claim exists to prevent. WATCH makes read-compare-delete one decision.
+        Returns True only when this call removed the claim.
+        """
+        key = self._claim_key(level, group, job_id)
+        pipeline = self.redis.pipeline()
+        for attempt in range(1, max_retries + 1):
+            try:
+                pipeline.watch(key)
+                raw = pipeline.get(key)
+                if raw is None or int(raw) != int(agent_id):
+                    pipeline.unwatch()
+                    return False
+                pipeline.multi()
+                pipeline.delete(key)
+                pipeline.execute()
+                return True
+            except redis.WatchError:
+                if attempt == max_retries:
+                    raise RuntimeError(
+                        f"release_assignment_if_held_by lost the race {max_retries} times "
+                        f"on {key}")
+            finally:
+                try:
+                    pipeline.reset()
+                except Exception:
+                    pass
+        return False
+
+    def _claim_key(self, level, group, job_id) -> str:
+        """The exactly-once claim key, run-scoped like `data_ready` (§G). Unscoped, a run that
+        skipped the between-run flush inherited the previous run's claims: a Snow finalize of a
+        same-id job lost its CAS to an agent of the PREVIOUS run, so nobody here ran it.
+        `delete_all("*")` still reaches the key, so the ordinary cleanup is unchanged."""
+        return f"{self.KEY_ASSIGNEE}:{self.run_id}:{level}:{group}:{job_id}"
+
+    KEY_REASSIGN = "reassign"
+
+    def try_claim_reassignment(self, job_id: str, failed_agent_id: int,
+                               level: int = 0, group: int = 0, ttl_s: int = 300) -> bool:
+        """Win the right to reassign ``job_id`` away from ``failed_agent_id``. `SET NX`.
+
+        Every live agent detects the same failure at roughly the same moment and would
+        otherwise each reset the job. Resetting twice is not harmless: the second reset can
+        land *after* the first reassignment has already won a fresh election, clobbering a
+        live assignment back to PENDING and running the job twice. One winner per (job,
+        failure) removes that, using the same primitive as the assignment claim itself.
+
+        The TTL matters: if the winner dies mid-reassignment, the right has to become
+        available again, or the job is stranded by the very mechanism meant to rescue it.
+        """
+        key = f"{self.KEY_REASSIGN}:{self.run_id}:{level}:{group}:{job_id}:{int(failed_agent_id)}"
+        return bool(self.redis.set(key, "1", nx=True, ex=int(ttl_s)))
 
     def delete_all(self, key_prefix: str = KEY_JOB):
         """

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3.11
-import argparse, os, re, subprocess, sys, time
+import argparse, math, os, re, subprocess, sys, time
 import shlex
 from datetime import datetime
 from pathlib import Path
@@ -86,8 +86,10 @@ def main():
     ap.add_argument("--agents", type=int, required=True, help="Total number of agents")
     ap.add_argument("--topology", required=True, choices=["mesh", "ring", "star", "hierarchical"])
     ap.add_argument("--hierarchical-level1-agent-type", type=str,
-                    choices=["llm", "resource"], default="llm",
-                    help="Agent type for level 1 (parent) agents in hierarchical topology (default: llm)")
+                    choices=["llm", "resource"], default="resource",
+                    help="Agent type for level 1 (parent) agents in hierarchical topology "
+                         "(default: resource). It does NOT follow --agent-type: an all-LLM "
+                         "hierarchy needs this set to llm as well.")
     ap.add_argument("--jobs", type=int, required=True)
     ap.add_argument("--db-host", required=True)
 
@@ -102,8 +104,16 @@ def main():
 
     # Additional v2 options
     ap.add_argument("--jobs-per-proposal", type=int, default=10)
-    ap.add_argument("--runtime", type=int, default=30, help="Seconds to keep the test running (v2)")
-    ap.add_argument("--job-interval", type=float, default=0.5, help="Seconds between job bursts (v2)")
+    # Default 0, not 30: run_test.py now ENFORCES --runtime as a hard cap on waiting for the pool
+    # to drain (it used to be parsed and ignored). Forwarding the old 30 would have stopped every
+    # batch run after 30 seconds, long before a 500-job run drains.
+    ap.add_argument("--runtime", type=int, default=0,
+                    help="Hard cap in seconds on waiting for the pool to drain (0 = no cap). "
+                         "Runs still exit early on the drain condition; this only bounds a run "
+                         "that cannot place jobs. Set it for unattended batches.")
+    ap.add_argument("--job-interval", type=float, default=1.0,
+                    help="Seconds between job bursts, forwarded to run_test.py (1.0 = the "
+                         "cadence every run actually had; see run_test.py --job-interval)")
 
     # Dynamic agent addition (v2)
     ap.add_argument("--dynamic-agents", type=int, default=0,
@@ -122,6 +132,24 @@ def main():
     # Co-parent support for hierarchical topology
     ap.add_argument("--co-parents", type=int, default=1,
                     help="Number of co-parents per child group in hierarchical topology (default: 1)")
+    ap.add_argument("--groups-per-coordinator", type=int, default=None,
+                    help="Child groups each Level-1 coordinator exclusively parents (default: 2). "
+                         "At 1 a coordinator has a single candidate, so the MAB and "
+                         "delegation.policy=llm are inert and every delegation records as "
+                         "trivial. Freed coordinator slots become Level-0 agents, so the fleet "
+                         "size is unchanged. Two-level hierarchies only: a three-level fleet "
+                         "(100, 990, 1000) refuses an explicit >1 and steps the default down to 1.")
+
+    # Fleet reproducibility (v2) — both are required for a comparable scale ladder; see
+    # docs/FGCS_EVAL_PLAN.md section 0.2.
+    ap.add_argument("--seed", type=int, default=None,
+                    help="Seed agent-profile generation. The same seed is used for every repeat, "
+                         "so repeats share one fleet and differ only in scheduling nondeterminism.")
+    ap.add_argument("--master-fleet-size", type=int, default=None,
+                    help="Generate per-agent flavours/backends for a fleet of this size and use "
+                         "the first --agents of them, so every rung of a scale ladder is a strict "
+                         "prefix of the largest. Without it, flavours are percentages of fleet "
+                         "size and the same seed gives agent i a different machine at each size.")
 
     # Job generation (v2)
     ap.add_argument("--fit-all", action="store_true",
@@ -131,6 +159,25 @@ def main():
     # Test shutdown control (v2)
     ap.add_argument("--shutdown-after-seconds", type=int, default=0,
                     help="Shutdown test after N seconds (0 = use default wait_runtime behavior)")
+
+    ap.add_argument("--delegation-policy", choices=["bandit", "llm"], default=None,
+                    help="Delegation arm for every run in the batch (passthrough); default is "
+                         "whatever the base config says")
+
+    # Teardown / measurement integrity (passthrough to run_test.py)
+    ap.add_argument("--shutdown-drain-timeout", type=int, default=0,
+                    help="Seconds to wait for each agent to exit before SIGKILL (0 = default)")
+    ap.add_argument("--metrics-wait-seconds", type=int, default=0,
+                    help="Seconds to wait for all agents to write this run's metrics before "
+                         "plotting (0 = run_test.py default)")
+    ap.add_argument("--allow-missing-metrics", type=int, default=0,
+                    help="Agents allowed to report no metrics without failing a run; set to the "
+                         "number killed with SIGKILL in a failure injection campaign")
+    ap.add_argument("--expect-silent-agents", default="",
+                    help="Comma-separated agent ids expected to report no metrics. Stricter than "
+                         "--allow-missing-metrics, which only counts: this also checks WHICH "
+                         "agents were silent, so a kill that hit the wrong agent still fails the "
+                         "run. Prefer it whenever the ids are known before launch.")
 
     # Config / starter
     ap.add_argument("--starter", default="./swarm-multi-start.sh",
@@ -154,7 +201,20 @@ def main():
     # Pegasus job integration (passthrough to run_test.py)
     ap.add_argument("--pegasus-profiles", default=None,
                     help="Path to Pegasus profiles file (text/export) or Redis host")
-    ap.add_argument("--pegasus-input-type", choices=["text", "redis", "export"], default="text",
+    # Forwarded to run_test.py verbatim when given (code review 2026-10-05 §56: a batch could not
+    # run a converted workflow, a quantum cell or a Grafana-instrumented campaign at all).
+    ap.add_argument("--pegasus-jobs-dir", default=None)
+    ap.add_argument("--pegasus-data-nodes", choices=["per-site", "per-file"], default=None)
+    ap.add_argument("--pegasus-dtn-names", default=None)
+    ap.add_argument("--pegasus-bundle-source-root", default=None)
+    ap.add_argument("--pegasus-dag-gating", action=argparse.BooleanOptionalAction, default=None)
+    ap.add_argument("--textfile-dir", default=None)
+    ap.add_argument("--quantum-agents-pct", type=float, default=None)
+    ap.add_argument("--quantum-fraction", type=float, default=None)
+    ap.add_argument("--hybrid-fraction", type=float, default=None)
+    ap.add_argument("--split-hybrid", action="store_true")
+    ap.add_argument("--job-target-agents", type=int, default=None)
+    ap.add_argument("--pegasus-input-type", choices=["text", "redis", "export", "json"], default="text",
                     help="Format of the Pegasus profiles source (default: text)")
 
     # Logging/output structure per run
@@ -169,11 +229,16 @@ def main():
     # Auto-generate agent hosts if needed (only for remote mode)
     autogenerated_hosts = None
     if args.mode == "remote" and not args.agent_hosts and not args.agent_hosts_file:
-        # e.g., agents=30 -> "agent-1,agent-2,...,agent-30"
-        count = int (args.agents / args.agents_per_host)
+        # e.g., agents=30 -> "agent-1,agent-2,...,agent-30". Ceiling, not floor: run_test.py
+        # and generate_configs.py both size hosts with math.ceil, so a floor here hands them
+        # one host too few for any fleet that is not a multiple of agents-per-host — 270 at
+        # 4/VM needs 68 and this produced 67 — and the run dies after Redis has been flushed,
+        # which on an unattended ladder costs the night.
+        count = math.ceil(args.agents / args.agents_per_host)
         autogenerated_hosts = ",".join(f"agent-{i}" for i in range(1, count + 1))
         log(f"[defaults] Auto-generated --agent-hosts: {autogenerated_hosts}")
 
+    failed_runs: list = []
     for i in range(1, args.runs + 1):
         run_name = f"run{i:02d}"
         run_dir = base_out / run_name
@@ -214,12 +279,23 @@ def main():
             "--config-dir", args.config_dir,
         ]
 
+        if args.seed is not None:
+            cmd += ["--seed", str(args.seed)]
+        if args.master_fleet_size:
+            cmd += ["--master-fleet-size", str(args.master_fleet_size)]
         if args.use_config_dir:
             cmd.append("--use-config-dir")
         if args.topology == "hierarchical":
             cmd += ["--hierarchical-level1-agent-type", args.hierarchical_level1_agent_type]
             if hasattr(args, 'co_parents') and args.co_parents > 1:
                 cmd += ["--co-parents", str(args.co_parents)]
+            # Forwarded whenever it was GIVEN, not only when > 1: an explicit 1 that is not
+            # forwarded lets generate_configs apply its own default (2) instead, so the
+            # launcher's idea of the fan-out and the generated fleet's would differ.
+            if getattr(args, 'groups_per_coordinator', None) is not None:
+                cmd += ["--groups-per-coordinator", str(args.groups_per_coordinator)]
+        if args.delegation_policy:
+            cmd += ["--delegation-policy", args.delegation_policy]
         if args.groups is not None:
             cmd += ["--groups", str(args.groups)]
         if args.group_size is not None:
@@ -256,6 +332,15 @@ def main():
         if args.shutdown_after_seconds > 0:
             cmd += ["--shutdown-after-seconds", str(args.shutdown_after_seconds)]
 
+        if args.shutdown_drain_timeout > 0:
+            cmd += ["--shutdown-drain-timeout", str(args.shutdown_drain_timeout)]
+        if args.metrics_wait_seconds > 0:
+            cmd += ["--metrics-wait-seconds", str(args.metrics_wait_seconds)]
+        if args.allow_missing_metrics > 0:
+            cmd += ["--allow-missing-metrics", str(args.allow_missing_metrics)]
+        if args.expect_silent_agents:
+            cmd += ["--expect-silent-agents", args.expect_silent_agents]
+
         # Job generation: fit-all mode
         if args.fit_all:
             cmd.append("--fit-all")
@@ -264,6 +349,7 @@ def main():
         if args.pegasus_profiles:
             cmd += ["--pegasus-profiles", args.pegasus_profiles]
             cmd += ["--pegasus-input-type", args.pegasus_input_type]
+        cmd += forwarded_run_flags(args)
 
         log(f"[{run_name}] Starting test…")
         (logs_dir / "batch_runner.log").write_text(
@@ -274,6 +360,7 @@ def main():
         (logs_dir / "run_test.stdout.log").write_text(out)
 
         if rc != 0:
+            failed_runs.append((run_name, rc))
             log(f"[{run_name}] ERROR: {args.runner} exit code {rc}. See logs in {logs_dir}. Continuing.")
         else:
             log(f"[{run_name}] Completed successfully.")
@@ -287,6 +374,38 @@ def main():
             log(f"[{run_name}] Archived to {tar_path}")
 
     log("All runs complete.")
+    if failed_runs:
+        # Non-zero, so a campaign driver does not treat a batch of failed (exit 3/4) runs as a
+        # measured cell. It used to exit 0 however many runs failed (code review §56).
+        log(f"{len(failed_runs)} run(s) failed: " +
+            ", ".join(f"{n} (exit {rc})" for n, rc in failed_runs))
+        return 1
+
+#: batch flag -> run_test.py flag, forwarded when set. Valued flags go as "--flag value";
+#: store_true flags as "--flag".
+_FORWARD_VALUED = ("pegasus_jobs_dir", "pegasus_data_nodes", "pegasus_dtn_names",
+                   "pegasus_bundle_source_root", "textfile_dir", "quantum_agents_pct",
+                   "quantum_fraction", "hybrid_fraction", "job_target_agents")
+_FORWARD_SWITCHES = ("split_hybrid",)
+#: Tri-state: forwarded as --flag / --no-flag only when given, so run_test.py's default applies.
+_FORWARD_BOOLEANS = ("pegasus_dag_gating",)
+
+
+def forwarded_run_flags(args) -> list:
+    out = []
+    for name in _FORWARD_VALUED:
+        value = getattr(args, name, None)
+        if value is not None:
+            out += ["--" + name.replace("_", "-"), str(value)]
+    for name in _FORWARD_SWITCHES:
+        if getattr(args, name, False):
+            out.append("--" + name.replace("_", "-"))
+    for name in _FORWARD_BOOLEANS:
+        value = getattr(args, name, None)
+        if value is not None:
+            out.append(("--" if value else "--no-") + name.replace("_", "-"))
+    return out
+
 
 if __name__ == "__main__":
     sys.exit(main() or 0)

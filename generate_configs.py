@@ -1,13 +1,26 @@
 import argparse
 import copy
 import json
+import math
 import os
 import random
+import sys
 from typing import Dict, List, Optional, Tuple
 
 import yaml
 
 from job_generator import JobGenerator
+from swarm.utils.yaml_strict import safe_load as yaml_safe_load_strict
+
+
+class TopologyError(Exception):
+    """A topology that cannot be built as requested.
+
+    Raised rather than printed-and-returned: `run_test.py` and `batch_tests_v2.py` invoke this
+    script with `check=True`, so exiting 0 after refusing to write anything told the campaign
+    driver the configs were ready. It then launched agents against an empty config directory —
+    or, worse, against a previous cell's leftovers.
+    """
 
 INSTANCE_FLAVORS = [
     {"name": "small",      "core": 2,  "ram": 8,   "disk": 100,  "gpu": 0},
@@ -18,6 +31,12 @@ INSTANCE_FLAVORS = [
 ]
 
 DEFAULT_FLAVOR_PERCENTAGES = [0.4, 0.25, 0.15, 0.15, 0.05]
+
+# Child groups a Level-1 coordinator parents when nothing asks for a number. 2 rather than 1
+# because at 1 a coordinator has a single candidate, so the MAB and delegation.policy=llm are
+# both inert and every delegation records as `trivial` — the measurement the hierarchy exists
+# for cannot be taken from a fleet built with the old default.
+DEFAULT_GROUPS_PER_COORDINATOR = 2
 
 # Quantum backends assignable to agents via --quantum-agents-pct.
 # Mix of noisy simulators and hardware-like profiles across architectures
@@ -60,13 +79,28 @@ class SwarmConfigGenerator:
         agents_per_host: int = 1,
         groups: Optional[int] = None,
         group_size: Optional[int] = None,
-        hierarchical_level1_agent_type: str = "llm",
+        hierarchical_level1_agent_type: str = "resource",
         agent_type: str = "resource",
         initial_group_size: Optional[int] = None,
         co_parent_count: int = 1,
+        groups_per_coordinator: int = None,
         quantum_agents_pct: float = 0.0,
+        master_fleet_size: Optional[int] = None,
+        delegation_policy: Optional[str] = None,
+        textfile_dir: Optional[str] = None,
     ):
         self.num_agents = num_agents
+        # Fleet size the per-agent draws are made FOR, which may exceed the fleet being written.
+        # Flavours are allocated as percentages of fleet size, so with master=None agent 3 gets a
+        # 16-core flavour in a 10-agent fleet and a 2-core one in a 30-agent fleet even under the
+        # same seed — the scale ladder would then compare different fleets, not one fleet at
+        # different sizes. Setting master to the largest rung makes every smaller fleet a strict
+        # prefix of it: agent i is identical at every size.
+        self.master_fleet_size = int(master_fleet_size or num_agents)
+        if self.master_fleet_size < num_agents:
+            raise ValueError(
+                f"master_fleet_size ({self.master_fleet_size}) cannot be smaller than "
+                f"num_agents ({num_agents})")
         self.jobs_per_proposal = jobs_per_proposal
         self.base_config_path = base_config_path
         self.output_dir = output_dir
@@ -89,11 +123,37 @@ class SwarmConfigGenerator:
         # initial group size for dynamic agent addition (if different from num_agents)
         self.initial_group_size = initial_group_size
 
+        # How many child groups one Level-1 coordinator exclusively parents. 1 is the shipped
+        # 1:1 mapping, under which no coordinator has a routing decision to make.
+        # None means "the default", which resolves to DEFAULT_GROUPS_PER_COORDINATOR where the
+        # topology supports it and to 1 where it does not. Kept as None rather than resolved
+        # here because the two cases are treated differently: an explicit request that the
+        # topology cannot honour is refused, a default that it cannot honour steps down.
+        self.groups_per_coordinator = (None if groups_per_coordinator is None
+                                       else max(1, int(groups_per_coordinator)))
+
         # co-parent count for hierarchical topology shared parenting
         self.co_parent_count = co_parent_count
 
         # fraction of agents that own a quantum backend (0.0 = classical only)
         self.quantum_agents_pct = quantum_agents_pct
+
+        # Which plane picks the child group a coordinator delegates to (E4's arms). Applied to
+        # the base config every per-agent file is copied from. Before this flag the arm was
+        # switched by hand-editing config_swarm_multi.yml on the controller, so nothing in a
+        # run directory recorded which arm produced it, and the two arms of a comparison could
+        # differ by an edit nobody wrote down.
+        if delegation_policy:
+            self.base_config.setdefault("delegation", {})["policy"] = delegation_policy
+            print(f"delegation.policy = {delegation_policy} (from --delegation-policy)")
+
+        # node_exporter textfile export (P0-4). Off in the base config because the directory
+        # has to exist on the agent host; set here so a Grafana-instrumented campaign does not
+        # depend on a hand edit to the base config, which is how the delegation arm used to be
+        # chosen and why nothing in a run directory recorded it.
+        if textfile_dir:
+            self.base_config.setdefault("instrumentation", {})["textfile_dir"] = textfile_dir
+            print(f"instrumentation.textfile_dir = {textfile_dir} (from --textfile-dir)")
 
         # legacy ring helper (used when no grouping flags provided for ring)
         self.rings_default = self._create_default_rings()
@@ -107,11 +167,15 @@ class SwarmConfigGenerator:
         """
         if self.quantum_agents_pct <= 0:
             return {}
-        count = max(1, round(self.quantum_agents_pct * self.num_agents))
-        chosen = random.sample(range(1, self.num_agents + 1), min(count, self.num_agents))
+        # Drawn over the master fleet and filtered, for the same prefix-stability reason as
+        # flavours: agent i either has a backend at every fleet size or at none.
+        master = self.master_fleet_size
+        count = max(1, round(self.quantum_agents_pct * master))
+        chosen = random.sample(range(1, master + 1), min(count, master))
         return {
             agent_id: copy.deepcopy(QUANTUM_BACKEND_CATALOG[i % len(QUANTUM_BACKEND_CATALOG)])
             for i, agent_id in enumerate(sorted(chosen))
+            if agent_id <= self.num_agents
         }
 
     # -----------------------------
@@ -126,7 +190,8 @@ class SwarmConfigGenerator:
         if abs(total - 1.0) > 1e-6:
             raise ValueError("Flavor percentages must sum to 1.0")
 
-        total_agents = self.num_agents
+        # Allocate over the MASTER fleet, then keep this fleet's prefix — see master_fleet_size.
+        total_agents = self.master_fleet_size
         raw_counts = [p * total_agents for p in percentages]
         counts = [int(x) for x in raw_counts]
         assigned = sum(counts)
@@ -143,14 +208,14 @@ class SwarmConfigGenerator:
             agent_flavors.extend([INSTANCE_FLAVORS[idx]] * cnt)
 
         random.shuffle(agent_flavors)
-        return agent_flavors
+        return agent_flavors[:self.num_agents]
 
     # -----------------------------
     # Base config
     # -----------------------------
     def load_base_config(self):
         with open(self.base_config_path, "r") as file:
-            return yaml.safe_load(file)
+            return yaml_safe_load_strict(file)
 
     # -----------------------------
     # Defaults for ring (legacy)
@@ -386,10 +451,21 @@ class SwarmConfigGenerator:
     # DTN helpers
     # -----------------------------
     def _load_agent_dtns(self, path: str) -> Dict[str, List[dict]]:
+        """Reuse a previous run's DTN assignment if one is lying around.
+
+        This is a REPRODUCIBILITY TRAP and the warning is the point: reusing the file takes a
+        different code path (`adjust_scores` rather than `assign_agent_dtns`) which consumes the
+        RNG differently, so `--seed N` from a dirty directory does not reproduce `--seed N` from
+        a clean one. A reproducibility check run without deleting this file disagrees with
+        itself. `run_test.py` deletes it before every generation.
+        """
         if path and os.path.exists(path):
             with open(path, "r") as f:
                 data = json.load(f)
-                return {str(k): v for k, v in data.items()}
+            print(f"WARNING: reusing existing {path} ({len(data)} agents). DTN assignments are "
+                  f"NOT being drawn fresh, and --seed will not reproduce a clean-state run. "
+                  f"Delete {path} (and agent_profiles.json) first if that is not intended.")
+            return {str(k): v for k, v in data.items()}
         return {}
 
     @staticmethod
@@ -412,6 +488,28 @@ class SwarmConfigGenerator:
             adjusted_score = min(1.0, max(0.0, d.get("connectivity_score", 0.8) + random.uniform(-0.05, 0.05)))
             d["connectivity_score"] = round(adjusted_score, 2)
         return dtns
+
+    def _known_dtn_bases(self, dtn_pool) -> Dict[str, float]:
+        """Base connectivity score per DTN name that this fleet ALREADY has one for.
+
+        Two sources, because a generation either draws a pool or reuses a saved assignment:
+        the pool carries `base_connectivity_score` directly; a reused `agent_dtns.json` carries
+        only per-agent jittered scores, so the base is their mean over the agents holding the
+        name. Either way sizing must not invent a second base for a name the fleet has already
+        placed — one DTN, one base, jitter around it.
+        """
+        if dtn_pool:
+            return {d["name"]: float(d["base_connectivity_score"]) for d in dtn_pool}
+        seen: Dict[str, List[float]] = {}
+        for entries in (self.agent_dtns_map or {}).values():
+            for d in entries or []:
+                name = d.get("name") if isinstance(d, dict) else None
+                if name is None:
+                    continue
+                score = d.get("base_connectivity_score", d.get("connectivity_score"))
+                if score is not None:
+                    seen.setdefault(str(name), []).append(float(score))
+        return {n: round(sum(v) / len(v), 2) for n, v in seen.items()}
 
     def assign_agent_dtns(self, pool, min_dtns=1, max_dtns=4):
         count = random.randint(min_dtns, max_dtns)
@@ -441,6 +539,8 @@ class SwarmConfigGenerator:
         agent_hosts: Optional[List[str]],
         agent_sites: Optional[List[str]] = None,
         save_agent_profiles_path: str = "agent_profiles.json",
+        job_req=None,
+        all_dtns: bool = False,
     ):
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
@@ -493,8 +593,9 @@ class SwarmConfigGenerator:
 
         elif self.topology == "hierarchical":
             if self.num_agents < 30:
-                print("Minimum number of agents for hierarchical topology is 30")
-                return
+                raise TopologyError(
+                    f"Minimum number of agents for hierarchical topology is 30 "
+                    f"(got {self.num_agents})")
             agent_topo = {}
 
             # Determine hierarchy structure based on agent count
@@ -511,6 +612,33 @@ class SwarmConfigGenerator:
                 group_size = 5
                 num_super_groups = 0  # No Level 2
                 level_1_base = 51
+
+            elif self.num_agents == 80:
+                # Two-level: 72 Level-0 (8 groups of 9) + 8 Level-1 = 80.
+                # Stands in for Hier-90 while a site is out. The FABRIC slice is 92 VMs and PSC
+                # (agent-10..18) has been down since 2026-09-09, leaving 83 — and every rung
+                # above Hier-30 was sized for ~90 hosts, so Hier-90 at one agent per VM cannot
+                # start at all. 80 keeps group_size 9, the same group SHAPE as Hier-90 and
+                # Hier-270, so the ladder still scales the group COUNT (8 / 27 instead of
+                # 9 / 27) and every message still crosses the real WAN at 1 agent/VM, which is
+                # what the alternative (Hier-90 packed 2-per-VM) gives up. With
+                # --groups-per-coordinator 2 it is 4 coordinators x 2 groups, so delegation
+                # stays measurable.
+                num_groups = 8
+                group_size = 9
+                num_super_groups = 0  # No Level 2
+                level_1_base = 73
+
+            elif self.num_agents == 90:
+                # Two-level: 81 Level-0 (9 groups of 9) + 9 Level-1 = 90.
+                # The evaluation plan has named Hier-90 since it was written (E2's "9 groups"),
+                # but there was no preset for it: 90 fell into the `<= 110` branch below, which
+                # builds a 110-agent hierarchy and then had ids 91-110 dropped when configs were
+                # written — a fleet of 90 leaves with no coordinators at all.
+                num_groups = 9
+                group_size = 9
+                num_super_groups = 0  # No Level 2
+                level_1_base = 82
 
             elif self.num_agents == 100:
                 # Three-level: Level-0 80 - 16 groups of 5
@@ -545,6 +673,15 @@ class SwarmConfigGenerator:
                 num_super_groups = 0  # No Level 2
                 level_1_base = 226
 
+            elif self.num_agents == 270:
+                # Two-level: 243 Level-0 (27 groups of 9) + 27 Level-1 = 270.
+                # The top rung of the plan's 30 / 90 / 270 ladder: same group size as Hier-90
+                # with 3x the groups, so scale moves the group COUNT and not the group shape.
+                num_groups = 27
+                group_size = 9
+                num_super_groups = 0  # No Level 2
+                level_1_base = 244
+
             elif self.num_agents == 990:
                 # Three-level: Level-0 880 - 88 groups of 10
                 # Level-1: 88 (881-968) - 22 super-groups of 4
@@ -570,12 +707,131 @@ class SwarmConfigGenerator:
                 level_2_base = 991
 
             else:
-                print(f"Hierarchical topology currently supports 30, 60, 100, 110, 120, 250, 990, or 1000 agents (got {self.num_agents})")
-                return
+                raise TopologyError(
+                    f"Hierarchical topology currently supports 30, 60, 90, 100, 110, 120, 250, "
+                    f"270, 990, or 1000 agents (got {self.num_agents})")
+
+            # Preset support is decided HERE, on the G=1 shape, before any fan-out rebalancing.
+            # The `<= 110` branch above accepts a RANGE while describing a 110-agent hierarchy,
+            # and the only thing that refused 95 was the post-hoc "topology does not total the
+            # request" check at the end — which the fan-out path defeats: at G>1 the freed
+            # coordinator slots are redistributed so the fleet totals exactly `num_agents`,
+            # so once G defaulted to 2 (2026-09-18) a size with no preset built a topology of
+            # odd-sized groups and exited 0. `run_test.py` invokes this with check=True, so a
+            # campaign cell would have launched a fleet of the wrong shape and said nothing.
+            preset_total = num_groups * group_size + num_groups + num_super_groups
+            if preset_total != self.num_agents:
+                supported = "30, 60, 80, 90, 100, 110, 120, 250, 270, 990, 1000"
+                raise TopologyError(
+                    f"Hierarchical topology for {self.num_agents} agents would need "
+                    f"{preset_total} agents ({num_groups} groups of {group_size} plus "
+                    f"{num_groups} coordinator(s)"
+                    f"{' plus ' + str(num_super_groups) + ' super-coordinators' if num_super_groups > 0 else ''}"
+                    f"). Only ids 1..{self.num_agents} would be written, silently dropping the "
+                    f"rest — a fleet with no coordinators if the drop reaches Level 1. Use one "
+                    f"of the supported sizes: {supported}.")
+
+            # How many child groups one coordinator exclusively parents. G=1 is the shipped
+            # 1:1 mapping and takes the original code path untouched. G>1 is what gives a
+            # coordinator a delegation decision to make at all: with one group there is no
+            # routing choice, so the bandit returns its only arm and LLM delegation
+            # short-circuits, and --co-parents does not help (leadership goes to the lowest-ID
+            # live co-parent, concentrating groups on one coordinator rather than spreading a
+            # choice to each). See docs/FGCS_EVAL_PLAN.md section 0.6.
+            # Clamped to the groups that exist: asking for more per coordinator than there are
+            # simply means one coordinator parents them all, and reporting the requested number
+            # instead of the real one made the log line say "1 coordinator x 99 groups" for a
+            # fleet with 5.
+            explicit = self.groups_per_coordinator is not None
+            requested = (self.groups_per_coordinator if explicit
+                         else DEFAULT_GROUPS_PER_COORDINATOR)
+            G = max(1, min(int(requested), num_groups))
+            if G > 1 and num_super_groups > 0:
+                # A three-level hierarchy sizes its super-groups in Level-1 agents, so a wider
+                # fan-out would have to restructure that tier too. Asking for it explicitly is
+                # refused; arriving here on the DEFAULT must not break a fleet size that has
+                # always generated (100, 990, 1000), so it steps down and says so.
+                if not explicit:
+                    print(f"NOTE: --groups-per-coordinator defaults to "
+                          f"{DEFAULT_GROUPS_PER_COORDINATOR}, which a three-level hierarchy "
+                          f"({self.num_agents} agents) does not support; using 1. Delegation "
+                          f"is inert at 1 — each coordinator has a single candidate.")
+                    G = 1
+                else:
+                    raise TopologyError(
+                        f"--groups-per-coordinator {G} is only supported for two-level "
+                        f"hierarchies (30, 60, 90, 110, 120, 250, 270 agents); "
+                        f"{self.num_agents} agents builds a three-level hierarchy, whose "
+                        f"super-groups are sized in Level-1 agents and would need "
+                        f"restructuring too.")
+            # A wider fan-out means FEWER coordinators (num_coords = ceil(num_groups / G)),
+            # and co-parents are capped at the coordinator count. So a default fan-out can
+            # silently shrink an explicitly requested --co-parents: on Hier-30, G=2 leaves 3
+            # coordinators, so --co-parents 4 would quietly become 3. An explicit request
+            # outranks a default, so the DEFAULT gives way; two explicit values that cannot
+            # both hold are refused rather than reconciled.
+            K = max(1, int(self.co_parent_count or 1))
+            if K > 1 and G > 1 and math.ceil(num_groups / G) < K:
+                # The widest G with ceil(num_groups / G) >= K. Since ceil(n/G) >= K is
+                # exactly n > G*(K-1), that is floor((n-1)/(K-1)). `num_groups // K` is
+                # always *valid* but not always widest — 9 groups with K=3 gives 3 when 4
+                # works — so it narrowed the fan-out further than the redundancy required
+                # and named the wrong number in the refusal.
+                widest = max(1, min(num_groups, (num_groups - 1) // (K - 1)))
+                if not explicit:
+                    print(f"NOTE: --co-parents {K} needs {K} coordinators; the default "
+                          f"--groups-per-coordinator {G} leaves "
+                          f"{math.ceil(num_groups / G)}. Using "
+                          f"{widest} so the requested failover redundancy holds.")
+                    G = widest
+                else:
+                    raise TopologyError(
+                        f"--groups-per-coordinator {G} leaves "
+                        f"{math.ceil(num_groups / G)} coordinator(s) for {num_groups} groups, "
+                        f"but --co-parents {K} needs {K}. Lower one of them: "
+                        f"--groups-per-coordinator {widest} is the widest fan-out that keeps "
+                        f"{K} co-parents.")
+
+            # Both feasibility checks run BEFORE the fleet is laid out, so a step-down to 1
+            # leaves nothing computed from the wider fan-out behind.
+            if G > 1 and self.num_agents - math.ceil(num_groups / G) < num_groups:
+                short = self.num_agents - math.ceil(num_groups / G)
+                if not explicit:
+                    print(f"NOTE: --groups-per-coordinator "
+                          f"{DEFAULT_GROUPS_PER_COORDINATOR} leaves {short} Level-0 agents "
+                          f"for {num_groups} groups; using 1.")
+                    G = 1
+                else:
+                    raise TopologyError(
+                        f"--groups-per-coordinator {G} leaves {short} Level-0 agents for "
+                        f"{num_groups} groups; not enough to fill them.")
+
+            num_coords = math.ceil(num_groups / G)
+
+            # Coordinator slots freed by the larger fan-out go back to Level 0, so the fleet
+            # still has exactly num_agents agents and run_test's 1..N id range stays valid.
+            # Groups then differ in size by at most one; each agent reports its own group's
+            # size. At G=1 this is skipped entirely, so the presets are reproduced byte for
+            # byte rather than recomputed.
+            if G > 1:
+                level_0_total = self.num_agents - num_coords
+                base, remainder = divmod(level_0_total, num_groups)
+                group_sizes = [base + (1 if i < remainder else 0) for i in range(num_groups)]
+                level_1_base = level_0_total + 1
+                print(f"Hierarchical fan-out: {num_coords} coordinator(s) x {G} group(s) each, "
+                      f"{level_0_total} Level-0 agents in groups of {sorted(set(group_sizes))}")
+            else:
+                group_sizes = [group_size] * num_groups
+
+            group_starts = []
+            _next = 1
+            for size in group_sizes:
+                group_starts.append(_next)
+                _next += size
 
             # Build co-parent assignment map (circular round-robin)
             K = self.co_parent_count
-            level_1_agents = [level_1_base + g for g in range(num_groups)]
+            level_1_agents = [level_1_base + c for c in range(num_coords)]
 
             if num_super_groups > 0:
                 # Three-level: apply circular assignment within each super-group
@@ -591,19 +847,30 @@ class SwarmConfigGenerator:
                             parents.append(sg_agents[parent_idx])
                         co_parent_map[group] = sorted(parents)
             else:
-                # Two-level: circular assignment across all Level-1 agents
+                # Two-level: circular assignment across all Level-1 agents, starting from the
+                # coordinator that owns the group. At G=1 `group // G == group`, so this is the
+                # original assignment; at G>1 a coordinator's own G groups list it first and
+                # the extra co-parents walk outward from there.
                 co_parent_map = {}
                 for group in range(num_groups):
+                    owner_idx = group // G
                     parents = []
-                    for k in range(K):
-                        parent_idx = (group + k) % len(level_1_agents)
+                    if K > len(level_1_agents) and group == 0:
+                        # Pre-dates the fan-out default and is reported rather than raised,
+                        # since existing campaign scripts rely on the capped behaviour: a
+                        # group cannot have more co-parents than there are coordinators.
+                        print(f"WARNING: --co-parents {K} exceeds the {len(level_1_agents)} "
+                              f"coordinator(s) this topology has; using "
+                              f"{len(level_1_agents)}.")
+                    for k in range(min(K, len(level_1_agents))):
+                        parent_idx = (owner_idx + k) % len(level_1_agents)
                         parents.append(level_1_agents[parent_idx])
-                    co_parent_map[group] = sorted(parents)
+                    co_parent_map[group] = sorted(set(parents))
 
             # Level 0 (leaf/worker agents)
             for group in range(num_groups):
-                start = group * group_size + 1
-                end = start + group_size
+                start = group_starts[group]
+                end = start + group_sizes[group]
 
                 # Primary parent is lowest-ID co-parent (backward compat)
                 parent_id = co_parent_map[group][0]
@@ -619,7 +886,7 @@ class SwarmConfigGenerator:
                         "children": None,
                         "group": group,
                         "level": 0,
-                        "group_size": group_size,
+                        "group_size": group_sizes[group],
                         "group_count": num_groups,
                         "super_group": super_group
                     }
@@ -627,9 +894,13 @@ class SwarmConfigGenerator:
                         topo_entry["co_parents"] = co_parent_map[group]
                     agent_topo[agent_id] = topo_entry
 
-            # Level 1 (group coordinators)
-            for group in range(num_groups):
-                parent_id = level_1_base + group
+            # Level 1 (group coordinators). Iterates COORDINATORS, not groups: with
+            # --groups-per-coordinator G there are ceil(num_groups / G) of them, and each one
+            # exclusively parents groups [c*G, (c+1)*G). At G=1 the two are the same thing and
+            # `group` below is the coordinator's own single group, as before.
+            for coord_idx in range(num_coords):
+                group = coord_idx * G          # this coordinator's first (primary) group
+                parent_id = level_1_base + coord_idx
 
                 if num_super_groups > 0:
                     # Three-level hierarchy: Level-1 coordinators form groups within super-groups
@@ -642,7 +913,7 @@ class SwarmConfigGenerator:
                     level_1_parent = level_2_base + super_group
                 else:
                     # Two-level hierarchy: Level-1 coordinators form flat mesh
-                    peers = [level_1_base + i for i in range(num_groups) if i != group]
+                    peers = [level_1_base + i for i in range(num_coords) if i != coord_idx]
                     level_1_parent = None
 
                 # Level-1 group metadata should reflect the super-group (not the child group id)
@@ -650,7 +921,7 @@ class SwarmConfigGenerator:
                 l1_group = super_group if num_super_groups > 0 else 0
                 l1_group_count = num_super_groups if num_super_groups > 0 else 1
                 # Level 1 group_size should be the number of Level 1 coordinators in the peer group
-                l1_group_size = groups_per_super_group if num_super_groups > 0 else num_groups
+                l1_group_size = groups_per_super_group if num_super_groups > 0 else num_coords
 
                 # Determine which groups this agent co-parents
                 my_groups = {g: co_parent_map[g] for g in range(num_groups) if parent_id in co_parent_map[g]}
@@ -692,6 +963,24 @@ class SwarmConfigGenerator:
                         "super_group": super_group
                     }
 
+            # The presets above hardcode a fleet size each, and the `<= 110` branch accepts a
+            # RANGE while building a 110-agent hierarchy. Ask for 90 and the topology places
+            # coordinators at ids 101-110, but only ids 1..N get config files written — so a
+            # Hier-90 run came out as 90 leaf agents, ZERO coordinators, and every `parent`
+            # pointing at an agent that does not exist. No delegation happens at all, and
+            # nothing says so. Refuse instead.
+            if len(agent_topo) != self.num_agents:
+                supported = "30, 60, 80, 90, 100, 110, 120, 250, 270, 990, 1000"
+                raise TopologyError(
+                    f"Hierarchical topology for {self.num_agents} agents would need "
+                    f"{len(agent_topo)} agents ({num_groups} groups of {group_sizes[0]}"
+                    f"{'-' + str(group_sizes[-1]) if len(set(group_sizes)) > 1 else ''} plus "
+                    f"{num_coords} coordinator(s)"
+                    f"{' plus ' + str(num_super_groups) + ' super-coordinators' if num_super_groups > 0 else ''}"
+                    f"). Only ids 1..{self.num_agents} would be written, silently dropping the "
+                    f"rest — a fleet with no coordinators if the drop reaches Level 1. Use one "
+                    f"of the supported sizes: {supported}.")
+
         else:
             # default to full mesh (backward compatible)
             for i in range(1, self.num_agents + 1):
@@ -719,6 +1008,51 @@ class SwarmConfigGenerator:
             flavor_percentages = DEFAULT_FLAVOR_PERCENTAGES
         agent_flavors = self.assign_flavors(flavor_percentages)
 
+        # --size-to-jobs: raise every flavour so each agent can host the largest job, and give
+        # every agent the DTNs those jobs name. Sized in swarm/utils/fleet_sizing.py, the same
+        # place pegasus_to_swarm_converter.py --generate-agent-configs sizes from, so the two
+        # cannot disagree about what "can host this job" means.
+        required_dtn_bases = None
+        if job_req is not None and not job_req.empty:
+            from swarm.utils.fleet_sizing import dtn_base_scores, dtn_entries, fit_flavor
+            agent_flavors = [fit_flavor(f, job_req) for f in agent_flavors]
+            # Bases once, entries per agent: every agent holds every required name — so no job
+            # is infeasible anywhere and a failed agent's work can be picked up by any other —
+            # while each agent's connectivity to those names is its own. Feasibility tests
+            # names, cost tests the score, so this buys variability at no feasibility risk.
+            #
+            # A name already in the fleet's own DTN pool keeps THAT pool's base. Drawing a
+            # second one here gave a single DTN two unrelated populations — the agents that
+            # were assigned it scattered around base A, the agents that got it from sizing
+            # around base B — so its score stopped describing the DTN and started describing
+            # which way an agent happened to acquire it. Measured before the fix: dtn2 spanning
+            # 0.59-0.98 across a 20-agent fleet, against a jitter of +/-0.05.
+            required_dtn_bases = dict(self._known_dtn_bases(dtn_pool))
+            undrawn = set(job_req.dtns) - set(required_dtn_bases)
+            required_dtn_bases = {n: b for n, b in required_dtn_bases.items()
+                                  if n in job_req.dtns}
+            required_dtn_bases.update(dtn_base_scores(undrawn))
+            print(f"\nSizing the fleet to {job_req.job_count} job(s): every agent gets at least "
+                  f"core={math.ceil(job_req.core)} ram={math.ceil(job_req.ram)} "
+                  f"disk={math.ceil(job_req.disk)} gpu={math.ceil(job_req.gpu)}"
+                  + (f", plus DTN(s) {', '.join(sorted(job_req.dtns))}" if job_req.dtns else ""))
+
+        # --all-dtns: every agent holds every DTN name in the fleet's pool, capacities untouched.
+        # The design of 2026-09-18 without its capacity floor: feasibility tests DTN NAMES only,
+        # so a job naming any combination of pool DTNs is placeable on every agent with the
+        # capacity for it, while locality survives in `connectivity_score`. An agent keeps its
+        # own 1-4 drawn DTNs and their scores; the names it lacks are added around the POOL's
+        # base for each name (one DTN, one base, jitter per agent — the sizing rule), never a
+        # second, unrelated draw. replay-golden needs it: 1,253 of its 2,222 jobs name 2-8
+        # DTNs, and a 1-4 random draw from 10 left 82 of a 600-job rung unplaceable.
+        if all_dtns:
+            from swarm.utils.fleet_sizing import dtn_entries  # noqa: F811 (sizing imports it too)
+            pool_bases = self._known_dtn_bases(dtn_pool)
+            if not pool_bases:
+                raise SystemExit("--all-dtns needs --dtns: there is no DTN pool to hold.")
+            required_dtn_bases = {**pool_bases, **(required_dtn_bases or {})}
+            print(f"\nEvery agent holds all {len(pool_bases)} pool DTN(s); capacities unchanged.")
+
         # Quantum backends (subset of agents when --quantum-agents-pct > 0)
         quantum_backends = self.assign_quantum_backends()
 
@@ -731,6 +1065,8 @@ class SwarmConfigGenerator:
                     f"Not enough hosts ({host_count}) for {self.num_agents} agents "
                     f"with {self.agents_per_host} per host"
                 )
+
+        dtns_written: Dict[str, List[dict]] = {}
 
         for agent_id in range(1, self.num_agents + 1):
             config = copy.deepcopy(self.base_config)
@@ -751,10 +1087,33 @@ class SwarmConfigGenerator:
             if self.enable_dtns:
                 if dtn_pool is not None:
                     config["dtns"] = self.assign_agent_dtns(dtn_pool, min_dtns=1, max_dtns=4)
-                    self.agent_dtns_map[str(agent_id)] = config["dtns"]
                 else:
                     existing = self.agent_dtns_map.get(str(agent_id), [])
                     config["dtns"] = self.adjust_scores(existing)
+
+            # A job is feasible only for an agent holding every DTN it names, so a sized fleet
+            # gets them whether or not --dtns assigned a pool — a hierarchical fleet gets no
+            # pool at all and could otherwise run no job that names one.
+            if required_dtn_bases:
+                held = {d["name"] for d in config.get("dtns") or []}
+                missing = [n for n in required_dtn_bases if n not in held]
+                config["dtns"] = (config.get("dtns") or []) + dtn_entries(
+                    missing, base_scores=required_dtn_bases)
+
+            # Recorded AFTER sizing, because this map is what agent_dtns.json persists and what
+            # a later generation reuses. Capturing it before the sized DTNs were attached left
+            # the file describing a fleet the configs contradict: `run_test.agent_dtn_pool()`
+            # reads it to decide which DTNs jobs may be hashed onto, and a regeneration that
+            # reuses it would drop the very DTNs sizing added.
+            #
+            # Into a FRESH map, not the loaded one. The loaded map is read above so a
+            # regeneration reproduces each agent's assignment; persisting it would also carry
+            # forward agents this generation did not produce. Shrinking a fleet from 30 to 10
+            # then left agent_dtns.json advertising DTNs that only agents 11-30 held —
+            # `agent_dtn_pool()` hashes jobs onto those names and no live agent can run them,
+            # which is the silent stall the fleet checks exist to prevent.
+            if config.get("dtns"):
+                dtns_written[str(agent_id)] = config["dtns"]
 
             # Capacities from flavor
             flavor = agent_flavors[agent_id - 1]
@@ -813,6 +1172,8 @@ class SwarmConfigGenerator:
             # Profile for jobs
             dtns = config.get("dtns", [])
             agent_profiles[str(agent_id)] = {
+                # Level, so the job generator models jobs only on agents that execute them.
+                "level": int(topo.get("level", 0) or 0),
                 "core": caps['core'],
                 "ram": caps['ram'],
                 "disk": caps['disk'],
@@ -826,10 +1187,17 @@ class SwarmConfigGenerator:
                 },
             }
 
-        # Persist DTN assignments (if any)
-        if self.enable_dtns:
+        # Persist what THIS generation produced. Not gated on --dtns any more: sizing attaches
+        # DTNs to fleets that were never given a pool, and a file that omitted them would report
+        # a fleet holding nothing while every config says otherwise.
+        self.agent_dtns_map = dtns_written
+        if dtns_written:
             with open(self.AGENT_DTNS, 'w') as f:
-                json.dump(self.agent_dtns_map, f, indent=2)
+                json.dump(dtns_written, f, indent=2)
+        elif os.path.exists(self.AGENT_DTNS):
+            # This fleet holds no DTNs at all, so a file from a previous fleet would describe
+            # agents that no longer exist in a form nothing else contradicts.
+            os.remove(self.AGENT_DTNS)
 
         # Save agent profiles
         if save_agent_profiles_path:
@@ -891,8 +1259,10 @@ if __name__ == "__main__":
 
     # Hierarchical topology control
     parser.add_argument("--hierarchical-level1-agent-type", type=str,
-                        choices=["llm", "resource"], default="llm",
-                        help="Agent type for level 1 (parent) agents in hierarchical topology (default: llm)")
+                        choices=["llm", "resource"], default="resource",
+                        help="Agent type for level 1 (parent) agents in hierarchical topology "
+                             "(default: resource). It does NOT follow --agent-type: an all-LLM "
+                             "hierarchy needs this set to llm as well.")
 
     # Agent type control (for all non-hierarchical-level-1 agents)
     parser.add_argument("--agent-type", type=str,
@@ -905,6 +1275,25 @@ if __name__ == "__main__":
 
     parser.add_argument("--co-parents", type=int, default=1,
                         help="Number of co-parents per child group in hierarchical topology (default: 1)")
+    parser.add_argument("--groups-per-coordinator", type=int, default=None,
+                        help="Child groups each Level-1 coordinator exclusively parents (default: 2). "
+                             "At 1 a coordinator has a single candidate, so the MAB and "
+                             "delegation.policy=llm are inert and every delegation records as "
+                             "trivial. Freed coordinator slots become Level-0 agents, so the fleet "
+                             "size is unchanged. Two-level hierarchies only: a three-level fleet "
+                             "(100, 990, 1000) refuses an explicit >1 and steps the default down to 1.")
+
+    parser.add_argument("--delegation-policy", choices=["bandit", "llm"], default=None,
+                        help="Override delegation.policy in the generated configs (default: "
+                             "whatever the base config says). Requires "
+                             "--groups-per-coordinator > 1 to have any effect.")
+
+    parser.add_argument("--textfile-dir", default=None,
+                        help="node_exporter textfile collector directory on each agent host "
+                             "(e.g. /var/lib/node_exporter/textfile_collector). Sets "
+                             "instrumentation.textfile_dir in the generated configs; unset "
+                             "leaves the Prometheus export off. metrics.json is written "
+                             "either way.")
 
     parser.add_argument("--fit-all", action="store_true",
                         help="Size every job to fit ALL agents (min capacities). "
@@ -920,7 +1309,47 @@ if __name__ == "__main__":
     parser.add_argument("--hybrid-fraction", type=float, default=0.0,
                         help="Fraction (0.0-1.0) of generated jobs with a hybrid classical<->quantum loop")
 
+    parser.add_argument("--job-target-agents", type=int, default=None,
+                        help="model synthetic jobs only on agents 1..K, all of which must be "
+                             "leaves here (refused otherwise). With --master-fleet-size, agents "
+                             "1..K are the same machines on every rung, and coordinators are "
+                             "numbered last, so K = the smallest rung's LEAF count (27 for "
+                             "Hier-30) gives the whole ladder the identical workload (with "
+                             "--seed). Default: every executing agent of this fleet.")
+    parser.add_argument("--master-fleet-size", type=int, default=None,
+                        help="Draw per-agent flavours and quantum backends for a fleet of this "
+                             "size, then write only the first <num_agents> of them. Set it to the "
+                             "largest rung of a scale ladder (e.g. 270) so every smaller fleet is "
+                             "a strict prefix and agent i is identical at every size. Without it, "
+                             "flavours are percentages of the fleet being generated, so the same "
+                             "seed gives agent i a different machine at each size.")
+
+    parser.add_argument(
+        "--size-to-jobs", metavar="JOBS_DIR", default=None,
+        help="Size the fleet to the jobs in JOBS_DIR (a converted bundle, or any directory of "
+             "job_*.json): every agent is raised to the largest job and given every DTN the "
+             "jobs name, so none of them is infeasible everywhere. Use it when the point is to "
+             "RUN those jobs; it flattens capacity and locality heterogeneity, so a run whose "
+             "subject is the fleet should keep the standard flavour pool.")
+    parser.add_argument(
+        "--all-dtns", action="store_true",
+        help="With --dtns: every agent holds every DTN name in the pool (its own drawn DTNs keep "
+             "their scores; the rest are jittered around each name's pool-wide base), and "
+             "capacities stay on the standard flavour pool. Locality is then carried by "
+             "connectivity_score alone, and no job naming pool DTNs is unplaceable.")
+    parser.add_argument("--skip-jobs", action="store_true",
+                        help="Generate agent configs only; do not synthesize jobs/. Used when the "
+                             "job pool comes from elsewhere (e.g. Pegasus profiles converted after "
+                             "the fleet's DTN assignments are known).")
+
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Seed the RNG so agent capacities, flavors and DTN assignments are "
+                             "reproducible. Required to compare runs against each other.")
+
     args = parser.parse_args()
+
+    if args.seed is not None:
+        random.seed(args.seed)
 
     if args.agent_hosts_file:
         agent_hosts = load_agent_hosts(args.agent_hosts_file)
@@ -956,14 +1385,40 @@ if __name__ == "__main__":
         agent_type=args.agent_type,
         initial_group_size=args.initial_group_size,
         co_parent_count=args.co_parents,
+        groups_per_coordinator=args.groups_per_coordinator,
+        delegation_policy=args.delegation_policy,
+        textfile_dir=args.textfile_dir,
         quantum_agents_pct=args.quantum_agents_pct,
+        master_fleet_size=args.master_fleet_size,
     )
-    generator.generate_configs(flavor_percentages=flavor_percentages, agent_hosts=agent_hosts,
-                               agent_sites=agent_sites)
+    job_req = None
+    if args.size_to_jobs:
+        from swarm.utils.fleet_sizing import job_requirements, load_job_records
+        if not os.path.isdir(args.size_to_jobs):
+            raise SystemExit(f"--size-to-jobs {args.size_to_jobs} is not a directory")
+        job_req = job_requirements(load_job_records(args.size_to_jobs))
+        if job_req.empty:
+            # A typo'd path that silently generated an unsized fleet is the flattering
+            # failure: the run starts, and the jobs it cannot place are simply never scheduled.
+            raise SystemExit(
+                f"--size-to-jobs {args.size_to_jobs} holds no job_*.json records to size from.")
 
-    # Create jobs if not present
-    if not os.path.exists("jobs"):
+    try:
+        generator.generate_configs(flavor_percentages=flavor_percentages, agent_hosts=agent_hosts,
+                                   agent_sites=agent_sites, job_req=job_req,
+                                   all_dtns=args.all_dtns)
+    except TopologyError as e:
+        # Non-zero, so a driver running with check=True stops here instead of launching agents
+        # against an empty (or stale) config directory.
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Create jobs if not present (and not deferred to another producer)
+    if not args.skip_jobs and not os.path.exists("jobs"):
         jg = JobGenerator(job_count=args.job_cnt, agent_profile_path='agent_profiles.json',
                           quantum_fraction=args.quantum_fraction,
-                          hybrid_fraction=args.hybrid_fraction)
+                          hybrid_fraction=args.hybrid_fraction,
+                          # Its own stream, derived from --seed alone (§55).
+                          seed=(None if args.seed is None else args.seed + 1_000_003),
+                          target_agents=args.job_target_agents)
         jg.generate_job_files(output_dir="jobs", enable_dtns=args.dtns, fit_all=args.fit_all)

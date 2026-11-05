@@ -29,6 +29,7 @@ from typing import Any, List, Optional, Dict
 from swarm.models.object import Object, ObjectState
 from swarm.models.capacities import Capacities
 from swarm.models.data_node import DataNode
+from swarm.models.execution import ExecutionSpec
 from swarm.models.quantum import QuantumSpec
 
 
@@ -64,6 +65,13 @@ class Job(Object):
         self._quantum: Optional[QuantumSpec] = None
         self._quantum_time: Optional[float] = None  # simulated quantum execution seconds
 
+        # Real execution (None = simulate, which is the default and what every measurement
+        # so far used). When present it carries the executable, its arguments and the
+        # container to run them in — see swarm/models/execution.py. Carrying the spec does
+        # NOT by itself make a job execute: that is gated separately, so a workflow can be
+        # converted and scheduled long before anything is run for real.
+        self._execution: Optional[ExecutionSpec] = None
+
         # Split hybrid sub-jobs (Phase 2, docs/QUANTUM_HYBRID_DESIGN.md):
         #   sub_role      : None (whole job) | "quantum" (measurement producer)
         #                   | "classical" (stream consumer)
@@ -97,6 +105,21 @@ class Job(Object):
         self._delegation_failed = False
         self._delegation_failed_count: int = 0
         self._delegation_failed_agents: List[int] = []
+        # Child groups a coordinator delegated this job to, recorded on the COORDINATOR-tier
+        # record. Empty means not delegated. It is what lets a peer coordinator tell, after the
+        # delegating coordinator dies, whether the job belongs to that coordinator's children
+        # (leave it) or never left the tier (re-elect it) — code review 2026-10-05 §13.
+        self._delegated_groups: List[int] = []
+        # Why real execution REFUSED this job (inputs could not be staged, no runtime, an
+        # unrunnable spec), or None. A refusal is persisted with exit_status 1 like a failure,
+        # and was indistinguishable from one: the reason was logged and dropped, so a run whose
+        # jobs could not start read as a workflow whose jobs failed (code review 2026-10-05 §61).
+        self._refusal_reason: Optional[str] = None
+        # Whether the last refusal may not recur (in-process only), and how many times this
+        # job has been returned to the pool after one (persisted: the cap must hold across
+        # agents, or a job could bounce between them for ever).
+        self._refusal_transient: bool = False
+        self._refusal_retries: int = 0
 
         # Meta
         self.logger = logger if logger else logging.getLogger(self.__class__.__name__)
@@ -127,6 +150,30 @@ class Job(Object):
 
     def add_delegation_failed_agents(self, value: int):
         self._delegation_failed_agents.append(value)
+
+    @property
+    def refusal_reason(self) -> Optional[str]:
+        return self._refusal_reason
+
+    @property
+    def refusal_transient(self) -> bool:
+        return self._refusal_transient
+
+    @property
+    def refusal_retries(self) -> int:
+        return self._refusal_retries
+
+    @refusal_retries.setter
+    def refusal_retries(self, value: int):
+        self._refusal_retries = int(value or 0)
+
+    @property
+    def delegated_groups(self) -> List[int]:
+        return self._delegated_groups
+
+    @delegated_groups.setter
+    def delegated_groups(self, value):
+        self._delegated_groups = [int(g) for g in (value or [])]
 
     # ---------- Convenience/derived ----------
     @property
@@ -227,6 +274,22 @@ class Job(Object):
                 self._quantum = QuantumSpec.from_dict(spec)
             else:
                 raise ValueError("Unsupported value type for quantum spec")
+
+    # ---------- Real execution ----------
+    @property
+    def execution(self) -> Optional[ExecutionSpec]:
+        with self.lock:
+            return self._execution
+
+    @execution.setter
+    def execution(self, spec) -> None:
+        with self.lock:
+            if spec is None or isinstance(spec, ExecutionSpec):
+                self._execution = spec
+            elif isinstance(spec, dict):
+                self._execution = ExecutionSpec.from_dict(spec)
+            else:
+                raise ValueError("Unsupported value type for execution spec")
 
     @property
     def job_class(self) -> str:
@@ -433,6 +496,32 @@ class Job(Object):
         with self.lock:
             return list(self.data_out)
 
+    #: Pegasus's name for the submit host's own filesystem. It is a *site*, not a data transfer
+    #: node: a job reading a file there needs no remote transfer and no agent can "hold" it.
+    LOCAL_DATA_NODE = "local"
+
+    def required_dtns(self) -> frozenset:
+        """DTN names this job genuinely needs an agent to hold, `local` excluded.
+
+        **One definition, because there were six and one of them disagreed.** Feasibility,
+        `_job_sig`, `fleet_sizing` and the runner's shape summary all subtracted `local`; only
+        `compute_job_cost` rebuilt the set inline and kept it (code review 2026-09-18, §8). No
+        agent holds a DTN called `local`, so it scored 0.0 — the worst connectivity there is —
+        on every agent, driving `avg_conn` to 0 and the penalty to its maximum. The result was
+        that feasibility said "this is not a DTN" while cost said "this is a DTN nobody can
+        reach", and every cost in a converted-workflow run was multiplied by `1 + factor`,
+        which at the shipped factor of 1.0 is exactly doubled.
+
+        Cached on the instance: this is called per (job, agent) pair inside the cost matrix.
+        """
+        cached = getattr(self, "_required_dtns_cache", None)
+        if cached is None:
+            names = {e.name for e in (self.data_in or [])} | \
+                    {e.name for e in (self.data_out or [])}
+            cached = frozenset(names - {self.LOCAL_DATA_NODE})
+            self._required_dtns_cache = cached
+        return cached
+
     # ---------- State ----------
     def on_state_changed(self, old_state: ObjectState, new_state: ObjectState):
         self.logger.debug("Transitioning job %s from %s to %s", self.job_id, old_state, new_state)
@@ -451,6 +540,96 @@ class Job(Object):
             self.mark_completed()
 
     # ---------- Exec simulation ----------
+    # Execution-simulation policy, process-wide, set once at agent startup from
+    # `runtime.wall_time_*` (see `configure_execution_simulation`). It is class state rather
+    # than per-job config because a Job is reconstructed from Redis on every read and has no
+    # route to the agent's config.
+    #
+    # These used to not exist: `execute()` slept a flat 1 s for every job with a wall_time,
+    # with the real sleep commented out. Since the Pegasus traces carry true durations
+    # (p50 ~2 s, p99 ~40 s, max ~33 min), that made every job the same length and so made
+    # makespan, throughput and utilisation meaningless while looking perfectly healthy.
+    _WALL_TIME_SCALE: float = 1.0          # multiplier on the job's real wall_time
+    _WALL_TIME_MIN_S: float = 0.0          # floor applied after scaling (0 = none)
+    _WALL_TIME_MAX_S: float = 120.0        # cap applied after scaling (tail control)
+
+    @classmethod
+    def configure_execution_simulation(cls, scale: float = 1.0,
+                                       min_s: float = 0.0,
+                                       max_s: float = 120.0) -> None:
+        """Set the process-wide execution-simulation policy. Call once, at agent startup.
+
+        `scale <= 0` selects the legacy behaviour — a flat 1 s for any job with a non-zero
+        wall_time — which is retained only so an old result can be reproduced. Any run using it
+        must not report makespan or utilisation.
+        """
+        cls._WALL_TIME_SCALE = float(scale)
+        cls._WALL_TIME_MIN_S = float(min_s)
+        cls._WALL_TIME_MAX_S = float(max_s)
+
+    @classmethod
+    def simulated_execution_seconds(cls, wall_time: Optional[float]) -> float:
+        """Seconds `execute()` will sleep for a job of this wall_time, under current policy.
+
+        Exposed separately so a driver can price a workload (total simulated work, longest job)
+        before launching a run, and so the policy is testable without sleeping.
+        """
+        wt = float(wall_time or 0.0)
+        if wt <= 0:
+            return 0.0
+        if cls._WALL_TIME_SCALE <= 0:
+            return 1.0                      # legacy flat simulation
+        sim = wt * cls._WALL_TIME_SCALE
+        if cls._WALL_TIME_MIN_S > 0:
+            sim = max(sim, cls._WALL_TIME_MIN_S)
+        if cls._WALL_TIME_MAX_S > 0:
+            sim = min(sim, cls._WALL_TIME_MAX_S)
+        return sim
+
+    def _real_execution_applies(self) -> bool:
+        """True when this job should actually run rather than sleep.
+
+        Both halves are required: the run has to have asked for real execution *and* the job
+        has to carry an execution spec. A synthetic job in a real-execution run simulates,
+        which is what lets a workflow and a synthetic background load share one run.
+        """
+        from swarm.execution import runner
+
+        return runner.policy().enabled() and self._execution is not None
+
+    def _execute_real(self) -> int:
+        """Run the job for real and return its exit status.
+
+        A **refusal** — no container runtime, unresolvable executable, no working directory —
+        is logged at ERROR and returned as a failure rather than falling back to the sleep.
+        Falling back would be worse than useless: the run would contain a mix of executed and
+        simulated jobs with nothing in the results distinguishing them, and the comparison
+        this feature exists for would be quietly meaningless. A refusal repeats for every
+        job, so it is loud once and obvious immediately.
+        """
+        from swarm.execution import runner
+
+        # `data_in` is the job's own declaration of what it reads; the runner stages from
+        # it rather than from a second list on the execution spec.
+        result = runner.run(self._execution, self.job_id, data_in=self.data_in,
+                            data_out=self.data_out)
+        self._refusal_reason = (result.reason or "refused") if result.refused else None
+        self._refusal_transient = bool(result.refused and result.transient)
+        if result.refused:
+            self.logger.error(
+                "[EXEC] Job %s REFUSED (not run): %s. This is a configuration problem and "
+                "will repeat for every job; results from this run are not comparable.",
+                self.job_id, result.reason)
+        elif result.exit_status != 0:
+            self.logger.warning(
+                "[EXEC] Job %s exited %s after %.3fs%s (stderr: %s)",
+                self.job_id, result.exit_status, result.duration_s,
+                f" — {result.reason}" if result.reason else "", result.stderr_path)
+        else:
+            self.logger.info("[EXEC] Job %s completed in %.3fs: %s",
+                             self.job_id, result.duration_s, runner.describe(result.command))
+        return int(result.exit_status)
+
     def execute(self):
         try:
             self.logger.info("Starting execution for job: %s", self.job_id)
@@ -459,22 +638,34 @@ class Job(Object):
 
             # TODO: staged-in transfers using self.data_in if data_transfer
 
-            # Simulate execution
+            # Real execution when the run asked for it and this job carries what it takes;
+            # simulation otherwise. `real_status` stays None on the simulated path, which is
+            # what keeps the replayed `should_fail` outcome below applying to simulated jobs
+            # only — a real run's exit status is the process's own and must never be
+            # overwritten by what the job did on somebody else's cluster months ago.
+            real_status = None
             if self._quantum is not None:
                 self._execute_quantum()
+            elif self._real_execution_applies():
+                real_status = self._execute_real()
             else:
                 wt = self.wall_time or 0.0
-                self.logger.info("Sleeping for %s seconds to simulate job execution", wt)
-                if wt > 0:
-                    #time.sleep(wt)
-                    time.sleep(1)
+                sim = self.simulated_execution_seconds(wt)
+                self.logger.info(
+                    "Sleeping for %.3fs to simulate job execution (wall_time=%s, scale=%s)",
+                    sim, wt, self._WALL_TIME_SCALE)
+                if sim > 0:
+                    time.sleep(sim)
 
             # TODO: staged-out transfers using self.data_out if data_transfer
 
             self.state = ObjectState.COMPLETE
 
-            # Check pre-determined failure flag (from job generator)
-            if self._should_fail:
+            if real_status is not None:
+                self._exit_status = real_status
+            elif self._should_fail:
+                # Pre-determined failure flag (from the job generator, or replayed from the
+                # original Pegasus run). Simulated jobs only — see above.
                 self._exit_status = 1
                 self.logger.info("Job %s marked as FAILED (pre-determined)", self.job_id)
             else:
@@ -496,8 +687,10 @@ class Job(Object):
           hybrid   : `iterations` rounds of circuit execution; each round's
                      measurement data satisfies the shot predicate and triggers
                      the classical update step (e.g. variational parameter update)
-        Total simulated sleep stays ~1s to match classical job simulation;
-        the phase breakdown is recorded in quantum_time / logs.
+        Total simulated sleep matches what a classical job of the same wall_time would take
+        (`simulated_execution_seconds`), split across the phases; the breakdown is recorded in
+        quantum_time / logs. Under the legacy flat policy that budget is 1 s, which is what this
+        method always used to assume.
         """
         spec = self._quantum
         shots = spec.required_shots()
@@ -508,8 +701,9 @@ class Job(Object):
             "Job %s (%s): %d iteration(s) x %d shots on %d qubits (depth=%d)",
             self.job_id, self.job_class, iterations, shots, spec.qubits, spec.circuit_depth)
 
-        # Split the 1s simulation budget across classical and quantum phases
-        step_sleep = 1.0 / (iterations * 2 + 1)
+        # Split the simulation budget across classical and quantum phases
+        budget = self.simulated_execution_seconds(wt) or 1.0
+        step_sleep = budget / (iterations * 2 + 1)
         q_time = 0.0
 
         time.sleep(step_sleep)  # classical prep: compile circuit, prepare state
@@ -548,7 +742,11 @@ class Job(Object):
             self.mark_started()
 
             layer.announce_producer(exp, site)
-            step_sleep = 1.0 / (iterations + 1)
+            # Same budget as any other job of this wall_time — this path used to hardcode a 1s
+            # total, so a split job ignored its duration even after the classical path stopped
+            # doing so, and a workload mixing split and whole jobs had two execution models.
+            budget = self.simulated_execution_seconds(self.wall_time) or 1.0
+            step_sleep = budget / (iterations + 1)
             q_start = time.time()
             time.sleep(step_sleep)  # compile + state-prep
             for i in range(1, iterations + 1):
@@ -598,7 +796,16 @@ class Job(Object):
             processed = int(self._state_data.get("snapshots_processed", 0))
             partial = float(self._state_data.get("partial_result", 0.0))
             last_id = self._state_data.get("last_stream_id", "0-0")
-            step_sleep = min(0.2, 1.0 / (total + 1))
+            # Per-batch classical update, drawn from this job's own budget rather than a
+            # hardcoded 1s total. Responsiveness to the stream comes from the blocking read
+            # below, not from keeping this small, so there is no fixed cap any more.
+            #
+            # Divide by `total`, NOT `total + 1`: unlike the producer, which has a prep phase and
+            # so sleeps iterations+1 times, the consumer sleeps exactly once per batch. Dividing
+            # by total+1 spent only total/(total+1) of the budget — 80% for a four-snapshot job
+            # and half for a one-snapshot post-processing job, which is the common case.
+            budget = self.simulated_execution_seconds(self.wall_time) or 1.0
+            step_sleep = budget / max(1, total)
             last_data_at = time.time()
 
             while processed < total:
@@ -686,11 +893,15 @@ class Job(Object):
             snap_job_type = self._job_type
             snap_reasoning_time = self._reasoning_time
             snap_deleg_agents = list(self._delegation_failed_agents)
+            snap_deleg_groups = list(self._delegated_groups)
+            snap_refusal = self._refusal_reason
+            snap_refusal_retries = self._refusal_retries
             snap_deleg_failed = self._delegation_failed
             snap_deleg_count = self._delegation_failed_count
             snap_level = self.level
             snap_quantum = self._quantum
             snap_quantum_time = self._quantum_time
+            snap_execution = self._execution
             snap_sub_role = self._sub_role
             snap_linked = self._linked_job_id
             snap_experiment = self._experiment_id
@@ -722,11 +933,15 @@ class Job(Object):
             "job_type": snap_job_type,
             "reasoning_time": snap_reasoning_time,
             "delegation_failed_agents": snap_deleg_agents,
+            "delegated_groups": snap_deleg_groups,
+            "refusal_reason": snap_refusal,
+            "refusal_retries": snap_refusal_retries,
             "delegation_failed": snap_deleg_failed,
             "delegation_failed_count": snap_deleg_count,
             "level": snap_level,
             "quantum": snap_quantum.to_dict() if snap_quantum else None,
             "quantum_time": snap_quantum_time,
+            "execution": snap_execution.to_dict() if snap_execution else None,
             "sub_role": snap_sub_role,
             "linked_job_id": snap_linked,
             "experiment_id": snap_experiment,
@@ -816,12 +1031,18 @@ class Job(Object):
         parsed_last_transition = job_data.get("last_transition_at")
         parsed_reasoning_time = job_data.get("reasoning_time")
         parsed_deleg_agents = job_data.get("delegation_failed_agents")
+        parsed_deleg_groups = job_data.get("delegated_groups")
+        parsed_refusal = job_data.get("refusal_reason")
+        parsed_refusal_retries = job_data.get("refusal_retries")
         parsed_deleg_failed = job_data.get("delegation_failed")
         parsed_deleg_count = job_data.get("delegation_failed_count")
         parsed_quantum = (
             QuantumSpec.from_dict(job_data["quantum"]) if job_data.get("quantum") else None
         )
         parsed_quantum_time = job_data.get("quantum_time")
+        parsed_execution = (
+            ExecutionSpec.from_dict(job_data["execution"]) if job_data.get("execution") else None
+        )
         parsed_sub_role = job_data.get("sub_role")
         parsed_linked = job_data.get("linked_job_id")
         parsed_experiment = job_data.get("experiment_id")
@@ -851,9 +1072,13 @@ class Job(Object):
             self._last_transition_at = parsed_last_transition
             self._reasoning_time = float(parsed_reasoning_time) if parsed_reasoning_time is not None else None
             self._delegation_failed_agents = parsed_deleg_agents if parsed_deleg_agents is not None else []
+            self._delegated_groups = [int(g) for g in (parsed_deleg_groups or [])]
+            self._refusal_reason = str(parsed_refusal) if parsed_refusal else None
+            self._refusal_retries = int(parsed_refusal_retries or 0)
             self._delegation_failed = parsed_deleg_failed if parsed_deleg_failed is not None else False
             self._delegation_failed_count = parsed_deleg_count if parsed_deleg_count is not None else 0
             self._quantum = parsed_quantum
+            self._execution = parsed_execution
             self._quantum_time = float(parsed_quantum_time) if parsed_quantum_time is not None else None
             self._sub_role = parsed_sub_role
             self._linked_job_id = parsed_linked

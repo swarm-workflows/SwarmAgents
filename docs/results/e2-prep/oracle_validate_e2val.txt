@@ -1,0 +1,135 @@
+{
+  "decisions_scored": 1800,
+  "decisions_unscored": 0,
+  "decisions_with_a_choice": 1800,
+  "decisions_without_a_choice": 0,
+  "regret_total": 381.75,
+  "regret_mean": 0.212083,
+  "regret_mean_all_scored": 0.212083,
+  "routing_accuracy": 0.625556,
+  "regret_aggregate": "mean"
+}
+
+1800 decision(s) -> runs/pilot-e2val-c125ed8c/e2val-hier90-pbft-linucb-shared-poisson3/run01/regret.csv
+
+validation: {
+  "validated": true,
+  "jobs_compared": 1800,
+  "mean_abs_error": 0.013167,
+  "max_abs_error": 0.2,
+  "types_beyond_sampling_noise": [],
+  "per_job_type": [
+    {
+      "job_type": "cpu_bound_long_dtn_heavy",
+      "n_jobs": 150,
+      "observed_failure_rate": 0.293333,
+      "predicted_failure_rate": 0.326667,
+      "sampling_noise_2se": 0.059404,
+      "beyond_noise": false
+    },
+    {
+      "job_type": "cpu_bound_long_dtn_light",
+      "n_jobs": 2,
+      "observed_failure_rate": 0.5,
+      "predicted_failure_rate": 0.425,
+      "sampling_noise_2se": 0.455522,
+      "beyond_noise": false
+    },
+    {
+      "job_type": "cpu_bound_medium_dtn_heavy",
+      "n_jobs": 21,
+      "observed_failure_rate": 0.095238,
+      "predicted_failure_rate": 0.204762,
+      "sampling_noise_2se": 0.120844,
+      "beyond_noise": false
+    },
+    {
+      "job_type": "cpu_bound_medium_dtn_light",
+      "n_jobs": 12,
+      "observed_failure_rate": 0.333333,
+      "predicted_failure_rate": 0.216667,
+      "sampling_noise_2se": 0.203784,
+      "beyond_noise": false
+    },
+    {
+      "job_type": "cpu_bound_short_dtn_heavy",
+      "n_jobs": 430,
+      "observed_failure_rate": 0.088372,
+      "predicted_failure_rate": 0.099419,
+      "sampling_noise_2se": 0.024385,
+      "beyond_noise": false
+    },
+    {
+      "job_type": "cpu_bound_short_dtn_light",
+      "n_jobs": 11,
+      "observed_failure_rate": 0.272727,
+      "predicted_failure_rate": 0.186364,
+      "sampling_noise_2se": 0.157197,
+      "beyond_noise": false
+    },
+    {
+      "job_type": "disk_bound_long_dtn_heavy",
+      "n_jobs": 11,
+      "observed_failure_rate": 0.0,
+      "predicted_failure_rate": 0.05,
+      "sampling_noise_2se": 0.131426,
+      "beyond_noise": false
+    },
+    {
+      "job_type": "disk_bound_medium_dtn_heavy",
+      "n_jobs": 2,
+      "observed_failure_rate": 0.0,
+      "predicted_failure_rate": 0.05,
+      "sampling_noise_2se": 0.308221,
+      "beyond_noise": false
+    },
+    {
+      "job_type": "ram_bound_long_dtn_heavy",
+      "n_jobs": 102,
+      "observed_failure_rate": 0.215686,
+      "predicted_failure_rate": 0.255882,
+      "sampling_noise_2se": 0.068262,
+      "beyond_noise": false
+    },
+    {
+      "job_type": "ram_bound_long_dtn_light",
+      "n_jobs": 3,
+      "observed_failure_rate": 0.333333,
+      "predicted_failure_rate": 0.383333,
+      "sampling_noise_2se": 0.430762,
+      "beyond_noise": false
+    },
+    {
+      "job_type": "ram_bound_medium_dtn_heavy",
+      "n_jobs": 938,
+      "observed_failure_rate": 0.203625,
+      "predicted_failure_rate": 0.204851,
+      "sampling_noise_2se": 0.022372,
+      "beyond_noise": false
+    },
+    {
+      "job_type": "ram_bound_medium_dtn_light",
+      "n_jobs": 12,
+      "observed_failure_rate": 0.083333,
+      "predicted_failure_rate": 0.070833,
+      "sampling_noise_2se": 0.142644,
+      "beyond_noise": false
+    },
+    {
+      "job_type": "ram_bound_short_dtn_heavy",
+      "n_jobs": 102,
+      "observed_failure_rate": 0.215686,
+      "predicted_failure_rate": 0.194608,
+      "sampling_noise_2se": 0.062952,
+      "beyond_noise": false
+    },
+    {
+      "job_type": "ram_bound_short_dtn_light",
+      "n_jobs": 4,
+      "observed_failure_rate": 0.75,
+      "predicted_failure_rate": 0.55,
+      "sampling_noise_2se": 0.430116,
+      "beyond_noise": false
+    }
+  ]
+}

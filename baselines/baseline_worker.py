@@ -1,15 +1,23 @@
 #!/usr/bin/env python3.11
 """
-baseline_worker.py — Lightweight worker process for distributed baseline scheduling.
+baseline_worker.py — execution worker for the centralized baselines (E7).
 
-Runs on each remote VM, polls Redis for READY jobs assigned to this agent
-(leader_id == agent_id), executes them, and marks them COMPLETE.
+One per level-0 agent, on the host `run_test.py` would place that agent. The central scheduler
+(`baselines/scheduler.py`) decides placement and pushes each assigned job id onto this worker's
+run-scoped queue (`baseline:<run>:q:<agent>`); the worker runs up to `runtime.executor_workers`
+of them at once — what a SWARM agent's executor runs — through SWARM's own `Job.execute()`
+with the base config's wall-time clamp, and writes the outcome back with the same completion
+write an agent uses (outputs published only on success, in the same transaction).
 
-Usage:
-    python3.11 baselines/baseline_worker.py \
-        --agent-id 5 --db-host 10.0.0.1 \
-        [--db-port 6379] [--level 0] [--group 0] \
-        [--poll-interval 0.5] [--profiles agent_profiles.json]
+Until 2026-10-07 this ran one job at a time while the scheduler admitted several per agent by
+capacity, so the excess sat READY and inflated wait and makespan for a reason unrelated to
+centralization; it also read a hard-coded wall-time clamp and served unscoped keys.
+
+    python3.11 baselines/baseline_worker.py --agent-id 5 --db-host database --run-id R \\
+        --config config_swarm_multi.yml
+
+Runs until the run's shutdown key appears or SIGTERM; on the way out it lets running jobs
+finish and writes its stats (`executed_jobs` included) to `baseline:<run>:stats:worker:<id>`.
 """
 from __future__ import annotations
 
@@ -19,151 +27,157 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-# Ensure SwarmAgents root is on sys.path
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _SWARM_ROOT = _SCRIPT_DIR.parent
 if str(_SWARM_ROOT) not in sys.path:
     sys.path.insert(0, str(_SWARM_ROOT))
 
-import redis
+import redis  # noqa: E402
 
-from swarm.database.repository import Repository
-from swarm.models.job import Job, ObjectState
+from baselines.common import (GROUP, LEVEL, configure_execution, executor_workers,  # noqa: E402
+                              run_job, runtime_config)
+from baselines.sparrow import Keys  # noqa: E402
+from swarm.database.repository import Repository  # noqa: E402
+from swarm.models.job import Job, ObjectState  # noqa: E402
 
 logger = logging.getLogger("baseline_worker")
 
-# Graceful shutdown flag
-_shutdown = False
+READY = ObjectState.READY.value
 
 
-def _handle_signal(signum, frame):
-    global _shutdown
-    logger.info("Received signal %d, shutting down …", signum)
-    _shutdown = True
+class DispatchWorker:
+    """Serves one agent's dispatch queue with a pool of `max_concurrent` executors."""
 
+    def __init__(self, agent_id: int, repo: Repository, redis_client, keys: Keys,
+                 max_concurrent: int = 10, heartbeat_ttl_s: int = 30):
+        self.agent_id = int(agent_id)
+        self.repo, self.redis, self.keys = repo, redis_client, keys
+        self.max_concurrent = max(1, int(max_concurrent))
+        self.heartbeat_ttl_s = int(heartbeat_ttl_s)
+        self.pool = ThreadPoolExecutor(max_workers=self.max_concurrent)
+        self.executed_jobs: list[str] = []
+        self._lock = threading.Lock()
+        self.stats = {"dispatches": 0, "noops": 0, "completed": 0, "persist_refused": 0,
+                      "claim_refused": 0, "max_concurrent": self.max_concurrent}
 
-def poll_and_execute(
-    repo: Repository,
-    agent_id: int,
-    level: int,
-    group: int,
-    poll_interval: float,
-    redis_client: redis.StrictRedis,
-):
-    """Main worker loop: poll for READY jobs assigned to this agent, execute them."""
-    logger.info("Worker %d started, polling for READY jobs (level=%d, group=%d)", agent_id, level, group)
+    def heartbeat(self) -> None:
+        self.redis.set(self.keys.heartbeat(self.agent_id), "1", ex=self.heartbeat_ttl_s)
 
-    # Register heartbeat so orchestrator knows we're alive
-    heartbeat_key = f"baseline:worker:{agent_id}:heartbeat"
-    redis_client.set(heartbeat_key, "alive", ex=300)
+    def serve_one(self, block_s: float = 1.0) -> str:
+        """Take the next dispatched job id. Returns ``empty``, ``noop`` (the record is not a
+        READY job assigned here — never run something the scheduler did not give us) or
+        ``submitted``. Jobs beyond `max_concurrent` wait in the pool's queue, as in an agent."""
+        q = self.keys.queue(self.agent_id)
+        item = self.redis.blpop([q], timeout=max(1, int(block_s))) if block_s else \
+            self.redis.lpop(q)
+        if not item:
+            return "empty"
+        job_id = item[1] if isinstance(item, (list, tuple)) else item
+        self.stats["dispatches"] += 1
+        rec = self.repo.get(job_id, key_prefix=Repository.KEY_JOB, level=LEVEL, group=GROUP)
+        if not rec or rec.get("state") != READY or str(rec.get("leader_id")) != str(self.agent_id):
+            self.stats["noops"] += 1
+            return "noop"
+        job = Job()
+        job.from_dict(rec)
+        job.level = LEVEL
+        self.pool.submit(self._run, job)
+        return "submitted"
 
-    while not _shutdown:
-        # Check for shutdown signal from orchestrator
-        if redis_client.exists("baseline:shutdown"):
-            logger.info("Shutdown signal detected in Redis. Exiting.")
-            break
+    def _run(self, job: Job) -> None:
+        try:
+            outcome = run_job(self.repo, job, self.agent_id, self.executed_jobs)
+        except Exception as exc:
+            logger.error("job %s could not be persisted: %s", job.job_id, exc)
+            outcome = False
+        with self._lock:
+            # None: the READY -> RUNNING claim was refused (a duplicate dispatch, or the job
+            # already ran) and nothing executed.
+            self.stats["claim_refused" if outcome is None else
+                       "completed" if outcome else "persist_refused"] += 1
 
-        # Refresh heartbeat
-        redis_client.set(heartbeat_key, "alive", ex=300)
-
-        # Poll for READY jobs
-        ready_dicts = repo.get_all_objects(
-            key_prefix="job",
-            level=level,
-            group=group,
-            state=ObjectState.READY.value,
-        )
-
-        my_jobs = []
-        for jd in ready_dicts:
-            if isinstance(jd, str):
-                jd = json.loads(jd)
-            # Filter: only jobs assigned to this agent
-            leader = jd.get("leader_id")
-            if leader is not None and int(leader) == agent_id:
-                job = Job()
-                job.from_dict(jd)
-                job.level = level
-                my_jobs.append(job)
-
-        if not my_jobs:
-            time.sleep(poll_interval)
-            continue
-
-        for job in my_jobs:
-            logger.info("Executing job %s (wall_time=%.1fs)", job.job_id, job.wall_time or 0.0)
+    def run_forever(self, stop: threading.Event, block_s: float = 1.0,
+                    stats_every_s: float = 10.0) -> None:
+        last_stats = time.monotonic()
+        while not stop.is_set():
+            self.heartbeat()
+            if self.redis.get(self.keys.shutdown):
+                logger.info("Shutdown key set; leaving.")
+                break
             try:
-                job.execute()
-            except Exception as e:
-                logger.warning("Job %s execution failed: %s", job.job_id, e)
-                job._exit_status = 1
-                job.state = ObjectState.COMPLETE
-                job.mark_completed()
+                self.serve_one(block_s=block_s)
+            except redis.RedisError as exc:
+                logger.warning("queue read failed: %s", exc)
+                stop.wait(1.0)
+            if time.monotonic() - last_stats >= stats_every_s:
+                self.write_stats()
+                last_stats = time.monotonic()
 
-            # Save completed job back to Redis
-            repo.save(
-                obj=job.to_dict(),
-                key_prefix="job",
-                level=level,
-                group=group,
-            )
-            logger.info("Job %s completed (exit_status=%d)", job.job_id, job.exit_status)
+    def shutdown(self) -> None:
+        """Let running jobs finish and persist; drop dispatched jobs that never started (they
+        stay READY, which is what `drain.json`'s `inflight_at_stop` counts) — the run is over,
+        and running them after it would put work past the end the run reports."""
+        self.pool.shutdown(wait=True, cancel_futures=True)
 
-    # Clean up heartbeat
-    redis_client.delete(heartbeat_key)
-    logger.info("Worker %d shut down.", agent_id)
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Baseline worker for distributed scheduling")
-    parser.add_argument("--agent-id", type=int, required=True, help="This worker's agent ID")
-    parser.add_argument("--db-host", type=str, required=True, help="Redis host")
-    parser.add_argument("--db-port", type=int, default=6379, help="Redis port")
-    parser.add_argument("--level", type=int, default=0, help="Hierarchy level (default: 0)")
-    parser.add_argument("--group", type=int, default=0, help="Hierarchy group (default: 0)")
-    parser.add_argument("--poll-interval", type=float, default=0.5, help="Seconds between polls (default: 0.5)")
-    parser.add_argument("--debug", action="store_true", help="Enable DEBUG logging")
-    return parser.parse_args()
+    def write_stats(self, final: bool = False) -> None:
+        """Periodic snapshots carry ``final: false``; only the one written after the pool has
+        drained carries ``final: true`` and counts as this worker's report."""
+        with self._lock:
+            payload = dict(self.stats)
+            payload["executed_jobs"] = list(self.executed_jobs)
+            payload["final"] = bool(final)
+        self.redis.set(self.keys.stats("worker", self.agent_id), json.dumps(payload))
 
 
-def main():
-    args = parse_args()
+def parse_args(argv=None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Execution worker for the centralized baselines")
+    p.add_argument("--agent-id", type=int, required=True, help="This worker's agent ID")
+    p.add_argument("--db-host", type=str, required=True, help="Redis host")
+    p.add_argument("--db-port", type=int, default=6379, help="Redis port")
+    p.add_argument("--run-id", required=True,
+                   help="The orchestrator's run id; every key this worker touches is scoped by it")
+    p.add_argument("--config", default=str(_SWARM_ROOT / "config_swarm_multi.yml"),
+                   help="Base config for runtime.wall_time_* and runtime.executor_workers — the "
+                        "one the SWARM arm ran with")
+    p.add_argument("--max-concurrent", type=int, default=None,
+                   help="Concurrent jobs (default runtime.executor_workers, as SWARM)")
+    p.add_argument("--debug", action="store_true", help="Enable DEBUG logging")
+    return p.parse_args(argv)
 
-    # Logging
-    log_level = logging.DEBUG if args.debug else logging.INFO
-    logging.basicConfig(
-        level=log_level,
-        format="%(asctime)s [worker-%(name)s] %(levelname)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
 
-    # Signal handlers for graceful shutdown
-    signal.signal(signal.SIGTERM, _handle_signal)
-    signal.signal(signal.SIGINT, _handle_signal)
-
-    # Change to SwarmAgents root
+def main(argv=None) -> int:
+    args = parse_args(argv)
+    logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO,
+                        format="%(asctime)s [worker-%(name)s] %(levelname)s: %(message)s",
+                        datefmt="%H:%M:%S")
     os.chdir(_SWARM_ROOT)
+    os.environ["SWARM_RUN_ID"] = args.run_id
 
-    # Connect to Redis
-    redis_client = redis.StrictRedis(
-        host=args.db_host, port=args.db_port, decode_responses=True
-    )
-    repo = Repository(redis_client=redis_client)
+    runtime = runtime_config(args.config)
+    configure_execution(runtime)
+    client = redis.StrictRedis(host=args.db_host, port=args.db_port, decode_responses=True)
+    repo = Repository(client, run_id=args.run_id)
+    worker = DispatchWorker(args.agent_id, repo, client, Keys(args.run_id, prefix="baseline"),
+                            max_concurrent=args.max_concurrent or executor_workers(runtime))
 
-    logger.info("Baseline worker %d connecting to Redis at %s:%d", args.agent_id, args.db_host, args.db_port)
-
-    poll_and_execute(
-        repo=repo,
-        agent_id=args.agent_id,
-        level=args.level,
-        group=args.group,
-        poll_interval=args.poll_interval,
-        redis_client=redis_client,
-    )
+    stop = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    signal.signal(signal.SIGINT, lambda *_: stop.set())
+    logger.info("Worker %d up: %d concurrent, run %s", args.agent_id, worker.max_concurrent,
+                args.run_id)
+    try:
+        worker.run_forever(stop)
+    finally:
+        worker.shutdown()
+        worker.write_stats(final=True)
+    logger.info("Worker %d done: %s", args.agent_id, worker.stats)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

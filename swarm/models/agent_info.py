@@ -41,6 +41,12 @@ class AgentInfo(JSONField):
         self.proposed_load = 0.0
         self._capacities = Capacities()
         self._capacity_allocations = Capacities()
+        # Work this agent has won but not yet scheduled (a leaf's selected queue; a coordinator's
+        # own undelegated jobs, its delegated-but-unpicked jobs and its children's backlogs).
+        # `capacity_allocations` counts only scheduled work, and the scheduler holds a job in the
+        # selected queue until capacity frees, so a busy agent's queue was invisible to every
+        # peer pricing it. Read by the `utilization` cost model (job_selection.cost_model).
+        self._capacity_backlog = Capacities()
         self._max_child_capacity = None  # For hierarchical agents: max capacity of any single child
         self.last_updated = 0.0
         self._version = 0  # Incremented when agent state changes (e.g., failure detection) to invalidate caches
@@ -106,14 +112,25 @@ class AgentInfo(JSONField):
 
     @dtns.setter
     def dtns(self, value: dict):
+        # Every value stored is a DataNode, whatever shape arrived. The list branch used to store
+        # the raw dicts, which is the shape an agent's YAML config has: its OWN AgentInfo then
+        # held dicts while every peer's (round-tripped through Redis's dict branch) held
+        # DataNodes, `compute_job_cost` raised on `dtn.name`, and `native_cost_for_job` turned
+        # that into "no opinion" — so under Snow every peer yielded on every job that needed a
+        # DTN (code review 2026-10-05 §2).
+        if value is None:
+            return
         if isinstance(value, list):
-            for dtn_info in value:
-                self.dtns[dtn_info.get('name')] = dtn_info
+            items = ((None, dtn_info) for dtn_info in value)
         elif isinstance(value, dict):
-            for key, dtn_info in value.items():
-                self.dtns[key] = DataNode.from_dict(dtn_info)
+            items = value.items()
         else:
             raise ValueError("Unsupported value type for dtns")
+        for key, dtn_info in items:
+            node = dtn_info if isinstance(dtn_info, DataNode) else DataNode.from_dict(dtn_info)
+            if node is None:
+                continue
+            self.dtns[key if key is not None else node.name] = node
 
     @property
     def quantum_backend(self) -> QuantumBackend:
@@ -153,6 +170,21 @@ class AgentInfo(JSONField):
             self._capacity_allocations = Capacities.from_dict(value)
         else:
             raise ValueError("Unsupported value type for capacity_allocations")
+
+    @property
+    def capacity_backlog(self) -> Capacities:
+        return self._capacity_backlog
+
+    @capacity_backlog.setter
+    def capacity_backlog(self, value: Capacities):
+        if value is None:
+            self._capacity_backlog = Capacities()
+        elif isinstance(value, Capacities):
+            self._capacity_backlog = value
+        elif isinstance(value, dict):
+            self._capacity_backlog = Capacities.from_dict(value)
+        else:
+            raise ValueError("Unsupported value type for capacity_backlog")
 
     @property
     def max_child_capacity(self) -> Capacities:

@@ -92,6 +92,10 @@ echo "=============================================="
 # ---- Build common run_test.py args ----
 build_cmd() {
     local run_dir="$1"
+    # Agent ids this run SIGKILLs, if any. A SIGKILLed agent never flushes its metrics, and
+    # run_test.py fails a run whose per-agent metrics are incomplete — so the failure run has
+    # to name the coordinator it kills on purpose.
+    local silent_ids="${2:-}"
     local cmd="python3.11 run_test.py"
     cmd+=" --mode ${MODE}"
     cmd+=" --agent-type resource"
@@ -110,6 +114,9 @@ build_cmd() {
     cmd+=" --run-dir ${run_dir}"
     cmd+=" --log-dir ${run_dir}/logs"
     cmd+=" --config-dir ${CONFIG_DIR}"
+    if [[ -n "${silent_ids}" ]]; then
+        cmd+=" --expect-silent-agents ${silent_ids}"
+    fi
 
     if [[ "${MODE}" == "remote" ]]; then
         cmd+=" --agents-per-host ${AGENTS_PER_HOST}"
@@ -191,7 +198,7 @@ run_failover_test() {
 
     # Start test in background
     local cmd
-    cmd=$(build_cmd "${run_dir}")
+    cmd=$(build_cmd "${run_dir}" "${KILL_AGENT_ID}")
     cd "${BASE_DIR}"
     eval "${cmd}" > "${run_dir}/test_output.log" 2>&1 &
 

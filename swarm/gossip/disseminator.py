@@ -86,7 +86,13 @@ class GossipStateDisseminator:
 
         self._lock = threading.RLock()
         self._cache: Dict[int, _CachedEntry] = {}
-        self._self_version: int = 0
+        # agent_id -> version evicted as stale; refuses a relayed copy that is no newer.
+        self._evicted_version: Dict[int, int] = {}
+        # Versions start from a wall-clock epoch (ms), not 0, so a RESTARTED agent's first entry
+        # is newer than everything it published before: peers order by version alone, and a
+        # counter restarting at 0 was refused as stale by every peer still holding (or
+        # tombstoning) the old incarnation's higher version until it counted past it.
+        self._self_version: int = int(time.time() * 1000)
 
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -112,11 +118,14 @@ class GossipStateDisseminator:
 
     def publish_local(self, *, cpu_util: float = 0.0, ram_util: float = 0.0,
                       disk_util: float = 0.0, gpu_util: float = 0.0,
-                      load: float = 0.0) -> AgentStateEntry:
+                      load: float = 0.0, cpu_backlog: float = 0.0, ram_backlog: float = 0.0,
+                      disk_backlog: float = 0.0, gpu_backlog: float = 0.0) -> AgentStateEntry:
         """Register or refresh this agent's own entry. Bumps the version so
         peers' merge logic accepts the update."""
         with self._lock:
-            self._self_version += 1
+            # Never behind the wall-clock millisecond, so a later incarnation always outranks
+            # an earlier one however fast either published (see `_self_version`'s init).
+            self._self_version = max(self._self_version + 1, int(time.time() * 1000))
             entry = AgentStateEntry(
                 agent_id=int(self.host.agent_id),
                 cpu_util=cpu_util,
@@ -124,6 +133,10 @@ class GossipStateDisseminator:
                 disk_util=disk_util,
                 gpu_util=gpu_util,
                 load=load,
+                cpu_backlog=cpu_backlog,
+                ram_backlog=ram_backlog,
+                disk_backlog=disk_backlog,
+                gpu_backlog=gpu_backlog,
                 version=self._self_version,
             )
             self._cache[int(self.host.agent_id)] = _CachedEntry(
@@ -158,7 +171,20 @@ class GossipStateDisseminator:
     def _merge_entry(self, entry: AgentStateEntry) -> None:
         with self._lock:
             existing = self._cache.get(int(entry.agent_id))
+            # An entry evicted here as stale must not come back on a peer's copy of the SAME
+            # (or an older) version — that copy is no fresher, only relayed later, and accepting
+            # it restarted the TTL of a dead agent's last state (§G). Only a newer version, which
+            # the subject alone can mint, readmits it.
+            tomb = self._evicted_version.get(int(entry.agent_id))
+            # Permanent, deliberately: peers keep relaying the dead copy and each relay re-stamps
+            # its receipt time, so a tombstone that expired let it back in on the next relay,
+            # indefinitely. Permanence cannot keep a live agent out, because versions follow the
+            # wall-clock millisecond (`publish_local`) and a restart is therefore always newer.
+            # One int per agent ever seen.
+            if existing is None and tomb is not None and entry.version <= tomb:
+                return
             if existing is None or entry.version > existing.entry.version:
+                self._evicted_version.pop(int(entry.agent_id), None)
                 # Don't accept stale snapshots about ourselves (we own that record).
                 if int(entry.agent_id) == int(self.host.agent_id):
                     if entry.version <= self._self_version:
@@ -192,6 +218,7 @@ class GossipStateDisseminator:
                 and (now - c.received_at) > self.state_ttl_s
             ]
             for aid in stale:
+                self._evicted_version[aid] = int(self._cache[aid].entry.version)
                 del self._cache[aid]
         if stale:
             self.host.log_debug(f"[gossip] evicted stale entries: {stale}")
