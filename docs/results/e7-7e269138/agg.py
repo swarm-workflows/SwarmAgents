@@ -5,6 +5,8 @@ same code path:
     <collect>/e7/runs_wide.csv              runs/campaign-e7-7e269138 (40 runs)
     <collect>/swarm-burst/runs_wide.csv     c125ed8c e0-hier90-pbft-analytic (--label cell=...)
     <collect>/swarm-poisson3/runs_wide.csv  c125ed8c e0-hier90-pbft-analytic-poisson3
+    <collect>/swarm-{snow,hybrid}-{burst,poisson3}/runs_wide.csv
+                                            c125ed8c e1-hier90-{snow,hybrid}-analytic{,-poisson3}
 
     python3.11 agg.py /root/collect-e7-7e269138 > tables.md   (also writes cells_agg.csv)
 
@@ -31,7 +33,7 @@ METRICS = [
     ("fairness_jain", "Jain (fleet)", 3),
     ("active_leaders", "agents that ran a job", 1),
 ]
-ORDER = ["swarm-pbft", "greedy", "round-robin", "random", "sparrow"]
+ORDER = ["swarm-pbft", "swarm-snow", "swarm-hybrid", "greedy", "round-robin", "random", "sparrow"]
 
 
 def cell_of(row):
@@ -42,7 +44,9 @@ def cell_of(row):
 
 def load(root):
     rows = []
-    for sub in ("e7", "swarm-burst", "swarm-poisson3"):
+    subs = ["e7", "swarm-burst", "swarm-poisson3"] + [
+        f"swarm-{e}-{l}" for e in ("snow", "hybrid") for l in ("burst", "poisson3")]
+    for sub in subs:
         with open(Path(root) / sub / "runs_wide.csv") as f:
             for r in csv.DictReader(f):
                 if ".attempt" in r["run_dir"]:
