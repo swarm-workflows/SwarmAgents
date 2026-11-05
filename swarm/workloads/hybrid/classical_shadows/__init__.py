@@ -44,7 +44,7 @@ from .workflow import build_classical_shadows_workflow
 # Import the batch execution adapter
 from .worker import execute_shadow_batch
 # Import the result aggregation function
-from .aggregation import aggregate_shadow_result
+from .aggregation import aggregate_shadow_results
 
 # Define the public API of the package
 __all__ = [
