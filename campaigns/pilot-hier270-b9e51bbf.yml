@@ -1,0 +1,64 @@
+# Hier-270 pilot before E1′ Hier-270 (conference plan §4.2 E0 gate 2, §4.3): one burst run each of
+# PBFT × analytic and Snow × analytic on the current code (cost model utilization, PBFT counter-
+# proposals and vote-on-adoption b9e51bbf, Snow tie tolerance), which no Hier-270 run has used yet.
+# The only earlier Hier-270 run is runs/pilots-2026-10-07/p4-hier270-pbft (1825 s, pre-fix code).
+#
+# Layout: 243 leaves (27 groups of 9) + 27 coordinators, 3 agents per VM on the 90 hosts of
+# agent_hosts.txt (interleaved), G=1 as the Hier-90 analytic cells. jobs_5400 = 20 jobs per agent,
+# as Hier-90's 1800. Burst arrivals (20 jobs/s), the E0/eScience saturation point.
+#
+# What it is for: (1) every run clean — drained, 0 in flight, 0 twice, 0 false verdicts;
+# (2) minutes per run for the §4.3 budget; (3) the drain rate (throughput) at Hier-270, which sets
+# the steady-load Poisson rate for the E1′ Hier-270 cells (Hier-90 used ~70 % of its drain rate);
+# (4) a first read of the F1 gate from the PBFT cell — not the gate itself, which needs the 5 repeats.
+#
+#   tmux new -s h270p 'python3.11 campaign.py campaigns/pilot-hier270-b9e51bbf.yml --python python3.11 2>&1 | tee /root/pilot-hier270.out'
+out: runs/pilot-hier270-b9e51bbf
+
+defaults:
+  runner: run_test.py
+  repeats: 1
+  retries: 1
+  timeout_s: 10800
+  args:
+    mode: remote
+    agent-type: resource
+    db-host: database
+    agent-hosts-file: agent_hosts.txt
+    agents-per-host: 3
+    agents: 270
+    jobs: 5400
+    pegasus-jobs-dir: /root/workloads/jobs_5400
+    runtime: 5400
+    master-fleet-size: 270
+    seed: 42
+    rtt-samples: 20
+    all-dtns: true
+    topology: hierarchical
+    hierarchical-level1-agent-type: resource
+    groups-per-coordinator: 1
+    inflight-drain-max-s: 1800
+
+gate:
+  redis: {host: database, port: 6379}
+  clock_check: ./fix_slice_clocks.sh --check
+  retries: 3
+  wait_s: 300
+
+cells:
+  - name: p-hier270-pbft-analytic
+    args: {base-config: campaigns/config_pbft.yml}
+  - name: p-hier270-snow-analytic
+    args: {base-config: config_swarm_multi.yml}
+  # Added 2026-11-05: p-hier270-pbft-analytic dropped 1.97M coordinator sends at the 64 / 2048
+  # fan-out pool, restarted 487 jobs and left 12 undecided (recorded `ok`; the drain did not count
+  # PRE_PREPARE/PREPARE/COMMIT until 2026-11-05). Same cell with the pool at 256 / 8192: if PBFT
+  # still lags Snow with ~0 drops, that is the scaling result; if not, the pool goes into the
+  # Hier-270 PBFT config.
+  - name: p-hier270-pbft-analytic-fanout256
+    args: {base-config: campaigns/config_pbft_h270.yml}
+  # Added 2026-11-05: the 256/8192 cell stranded 4-6 jobs in both attempts and still dropped
+  # 1.4-1.6M sends. Same cell with PBFT coordinator counter-proposals off: does the message volume,
+  # the drops and the stranding come from counter-proposals at 27 coordinators?
+  - name: p-hier270-pbft-analytic-fanout256-nocounter
+    args: {base-config: campaigns/config_pbft_h270_nocounter.yml}
