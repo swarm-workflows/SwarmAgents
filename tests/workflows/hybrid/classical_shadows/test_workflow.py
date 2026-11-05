@@ -1,5 +1,6 @@
 """
 Tests for classical-shadow workflow construction.
+Author: Vincenzo De Maio (v.demaio@leicester.ac.uk)
 
 These tests verify that the workflow builder creates the correct
 collection of jobs and describes their dependency relationships.
