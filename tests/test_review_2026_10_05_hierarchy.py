@@ -250,10 +250,10 @@ def test_pulling_back_a_delegated_job_releases_the_claim():
 
 class TestPurge:
     def _scan(self, leaf):
+        from swarm.agents.resource_agent import SCAN_STATES
         state_map = leaf.repository.get_all_ids_multi(
             key_prefix=Repository.KEY_JOB, level=CHILD_LEVEL, group=leaf.topology.group,
-            states=[ObjectState.PENDING.value, ObjectState.READY.value,
-                    ObjectState.RUNNING.value, ObjectState.COMPLETE.value])
+            states=list(SCAN_STATES))
         leaf._purge_vanished_jobs(present={j for ids in state_map.values() for j in ids})
 
     def test_a_withdrawn_job_is_dropped_after_two_scans(self):
@@ -270,6 +270,25 @@ class TestPurge:
         self._scan(leaf)
         assert "j1" not in leaf.queues.pending_queue    # absent twice: dropped
         leaf.engine.incoming.remove_object.assert_called_with(object_id="j1")
+
+    @pytest.mark.parametrize("state", [ObjectState.PRE_PREPARE, ObjectState.PREPARE,
+                                       ObjectState.COMMIT])
+    def test_a_job_mid_election_is_not_withdrawn(self, state):
+        """Hier-270 pilot, 2026-11-05: job 2646's record sat in COMMIT, then PRE_PREPARE, across
+        two scans; the scan read only PENDING/READY/RUNNING/COMPLETE, so all 27 coordinators
+        purged it as withdrawn and it was never decided. A record in any state is present."""
+        repo = Repository(_FakeRedis(), run_id="t")
+        leaf = _leaf(repo, group=1)
+        job = _job("j1", state)
+        repo.save(job.to_dict(), key_prefix=Repository.KEY_JOB, level=CHILD_LEVEL, group=1)
+        leaf.queues.pending_queue.add(job)
+        for _ in range(3):
+            self._scan(leaf)
+        assert "j1" in leaf.queues.pending_queue
+
+    def test_every_state_index_is_scanned(self):
+        from swarm.agents.resource_agent import SCAN_STATES
+        assert set(SCAN_STATES) == {s.value for s in ObjectState}
 
     def test_a_job_seen_again_is_not_dropped(self):
         """Index reads are not transactional; one absent scan must not drop a live job."""

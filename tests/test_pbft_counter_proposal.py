@@ -46,6 +46,11 @@ class _CostHost(_Host):
     def counter_proposal_cost(self, oid):
         return self.cost
 
+    def live_voter_ids(self):
+        # As `ResourceAgent`'s host adapter: the split resolver (`_resolve_split`) runs. Without
+        # it a no-loss three-way commit split stays undecided here, which no agent ever sees.
+        return set(self.live)
+
     def on_counter_proposals(self, proposals):
         self.countered.extend(p.object_id for p in proposals)
 
@@ -243,12 +248,17 @@ def test_one_decision_per_job_under_random_races(n):
                 assert recorded <= {leaders[0]}, f"trial {trial} {oid}: {leaders} vs {recorded}"
 
 
-@pytest.mark.parametrize("n,cheaper_min,optimal_min", [(3, 0.70, 0.65), (9, 0.85, 0.85)])
+@pytest.mark.parametrize("n,cheaper_min,optimal_min", [(3, 0.70, 0.65), (9, 0.85, 0.80)])
 def test_cost_now_orders_the_outcome(n, cheaper_min, optimal_min):
     """The point of the change, measured over random races (200 per size). The winner is never
     dearer than the first proposer, is strictly cheaper in most races where a cheaper
-    coordinator exists, and is the cheapest coordinator in most races. Measured when written:
-    3 coordinators 101/128 cheaper, 153/200 cheapest; 9 coordinators 179/185 and 184/200.
+    coordinator exists, and is the cheapest coordinator in most races. Measured when written
+    (2026-10-19, strict counters, silent adoption): 3 coordinators 101/128 cheaper, 153/200
+    cheapest; 9 coordinators 179/185 and 184/200. Since 2026-11-05 (counter_margin 0.05, and a
+    non-countering adopter votes): 3 coordinators 95/128 and 149/200; 9 coordinators 172/185 and
+    168/200, 178/200 within 5 % of the cheapest — voting on adoption alone gives 173/200, the
+    margin 5 more. The trade: under 50 % PROPOSAL loss silent adoption left 139-147 of 400
+    races undecided and voting leaves none (tests/test_pbft_adopt_via_prepare.py).
     Without counter-proposals both rates of improvement are 0 and the cheapest wins 72/200 and
     15/200, only when it happens to be the first proposer."""
     rng = random.Random(77 + n)
@@ -308,3 +318,115 @@ class TestWhoCounters:
         assert resolve_pbft_counter_propose({"pbft": {"counter_propose": False}}) is False
         with pytest.raises(ValueError):
             resolve_pbft_counter_propose({"pbft": {"counter_propose": "yes"}})
+
+
+# --------------------------------------------------------------------------- #
+# the margin (2026-11-05): counter only when cheaper by more than counter_margin
+# --------------------------------------------------------------------------- #
+# Hier-270 pilot: coordinator 253 countered 251's 5.85 with 5.68 (2.9 % cheaper); the 27-member
+# tier's binding COMMITs split ~10/13 against a quorum of 14, and every reselection round brought
+# new near-ties. 4-12 jobs a run were never decided. With counter-proposals off it ran clean.
+
+def _counter(margin, own, incoming_cost):
+    from swarm.consensus.engine import ConsensusEngine as _CE
+    h = _CostHost(2, [1, 2, 3], own)
+    h.add("j1")
+    eng = _CE(2, h, _DelayBus(lambda a, b: 0.0).transport_for(2), router=_Router(),
+              counter_margin=margin)
+    inc = ProposalInfo(p_id="p1", object_id="j1", cost=incoming_cost, agent_id=1)
+    return eng, eng._counter_proposal(h.objects["j1"], inc)
+
+
+class TestCounterMargin:
+    def test_the_hier270_near_tie_is_not_countered(self):
+        eng, out = _counter(0.05, 5.68, 5.85)
+        assert out is None
+        assert eng.counter_margin_yields == 1
+        assert eng.consensus_stats()["counter_margin_yields"] == 1
+
+    def test_a_clear_undercut_is_countered(self):
+        eng, out = _counter(0.05, 5.0, 5.85)          # 14.5 % cheaper
+        assert out is not None and out.cost == 5.0 and out.agent_id == 2
+        assert eng.counter_margin_yields == 0
+
+    def test_exactly_at_the_margin_is_not_enough(self):
+        eng, out = _counter(0.05, 9.5, 10.0)          # 5 % cheaper: needs MORE than 5 %
+        assert out is None
+
+    def test_margin_zero_is_the_strict_rule(self):
+        eng, out = _counter(0.0, 5.68, 5.85)
+        assert out is not None
+        assert eng.counter_margin_yields == 0
+
+    def test_a_dearer_agent_is_not_a_margin_yield(self):
+        eng, out = _counter(0.05, 6.0, 5.85)
+        assert out is None and eng.counter_margin_yields == 0
+
+    @pytest.mark.parametrize("bad", [-0.1, 1.0, 2])
+    def test_the_engine_refuses_a_margin_outside_0_1(self, bad):
+        with pytest.raises(ValueError):
+            _counter(bad, 1.0, 2.0)
+
+    def test_the_slice_race_still_counters(self):
+        """The case counter-proposals exist for (README §7: 14-32 % gaps) is unaffected."""
+        bus, hosts = _cluster(SLICE_COSTS, _slice_delay)
+        assert all(e.counter_margin == 0.05 for e in bus.engines.values())
+        _propose(bus, 90, SLICE_COSTS[90])
+        bus.run()
+        assert _outcome(hosts) == ([88], {88})
+
+
+def test_a_27_coordinator_tier_of_near_ties_makes_one_proposal_and_one_decision():
+    """27 coordinators priced within 5 % of each other (the pilot's 5.68-5.85 band): nobody
+    counters, so there is one proposal, one decision, and nothing for the commits to split on.
+    Under the strict rule the same tier issues counter-proposals."""
+    rng = random.Random(270)
+    costs = {aid: round(rng.uniform(5.60, 5.85), 2) for aid in range(244, 271)}
+    delay = (lambda a, b: 0.002 + ((a * 31 + b * 17) % 40) / 1000.0)
+    bus, hosts = _cluster(costs, delay)
+    _propose(bus, 251, 5.85)
+    bus.run()
+    assert _outcome(hosts) == ([251], {251})
+    assert sum(e.counter_proposals for e in bus.engines.values()) == 0
+    assert sum(e.counter_margin_yields for e in bus.engines.values()) > 0
+
+    strict_bus, strict_hosts = _cluster(costs, delay)
+    for e in strict_bus.engines.values():
+        e.counter_margin = 0.0
+    _propose(strict_bus, 251, 5.85)
+    strict_bus.run()
+    assert sum(e.counter_proposals for e in strict_bus.engines.values()) > 0
+
+
+class TestCounterMarginKey:
+    def test_one_default_shipped_and_in_the_engine(self):
+        import yaml
+        from swarm.agents.resource_agent import resolve_pbft_counter_margin
+        from swarm.consensus.engine import COUNTER_MARGIN_DEFAULT
+        with open(os.path.join(REPO, "config_swarm_multi.yml")) as f:
+            shipped = yaml.safe_load(f)["consensus"]["pbft"]["counter_margin"]
+        assert shipped == COUNTER_MARGIN_DEFAULT == resolve_pbft_counter_margin({}) == 0.05
+
+    def test_the_resolver_reads_and_refuses(self):
+        from swarm.agents.resource_agent import resolve_pbft_counter_margin
+        assert resolve_pbft_counter_margin({"pbft": {"counter_margin": 0}}) == 0.0
+        assert resolve_pbft_counter_margin({"pbft": {"counter_margin": 0.1}}) == 0.1
+        for bad in (True, "0.05", -0.01, 1.0, None):
+            with pytest.raises(ValueError):
+                resolve_pbft_counter_margin({"pbft": {"counter_margin": bad}})
+
+
+def test_the_collector_sums_counters_and_margin_yields_and_keeps_absent_absent():
+    from evaluation.collect import instrumentation_metrics
+    row = instrumentation_metrics({
+        "1": {"instrumentation": {"consensus": {"protocol": "pbft", "finalized": 4,
+                                                "counter_proposals": 3, "counter_margin_yields": 5}}},
+        "2": {"instrumentation": {"consensus": {"protocol": "pbft", "finalized": 2,
+                                                "counter_proposals": 0, "counter_margin_yields": 1}}},
+    })
+    assert (row["consensus_counter_proposals"], row["consensus_counter_margin_yields"]) == (3, 6)
+    old = instrumentation_metrics(        # payloads from before 2026-11-05
+        {"1": {"instrumentation": {"consensus": {"protocol": "pbft", "finalized": 4,
+                                                 "counter_proposals": 2}}}})
+    assert old["consensus_counter_proposals"] == 2
+    assert old["consensus_counter_margin_yields"] is None

@@ -39,6 +39,15 @@ from ..utils.tiebreak import dominates
 from ..utils.utils import generate_id
 
 
+#: `consensus.pbft.counter_margin` when absent; equal to the shipped config. A coordinator counters a
+#: peer's proposal only when its own price is below the peer's by MORE than this fraction of the
+#: peer's price. With no margin, a counter undercutting by 2.9 % (5.68 against 5.85) split the
+#: commits of a 27-coordinator tier into two binding minorities (Hier-270 pilot, 2026-11-05: 4-12
+#: jobs a run never decided, 1.4-2.0 M sends dropped); with counter-proposals off it ran clean.
+#: Same idea and value as Snow's `tie_tolerance`. 0 restores the strict `dominates` rule.
+COUNTER_MARGIN_DEFAULT = 0.05
+
+
 class ConsensusEngine:
     """
     Generic PBFT-like quorum engine.
@@ -46,8 +55,12 @@ class ConsensusEngine:
     - uses host+transport callbacks for I/O and side effects
     """
     def __init__(self, agent_id: int, host: ConsensusHost, transport: ConsensusTransport,
-                 router: TopologyRouter):
+                 router: TopologyRouter, counter_margin: float = COUNTER_MARGIN_DEFAULT):
         self.agent_id = agent_id
+        margin = float(counter_margin)
+        if not (0.0 <= margin < 1.0):
+            raise ValueError(f"consensus.pbft.counter_margin must be in [0, 1), not {counter_margin!r}")
+        self.counter_margin = margin
         self.host = host
         self.transport = transport
         self.router = router
@@ -98,6 +111,9 @@ class ConsensusEngine:
         self._committed_to: dict[str, str] = {}
         # Counter-proposals issued instead of preparing a dearer proposal (`_counter_proposal`).
         self.counter_proposals = 0
+        # Counter-proposals NOT made because this agent was cheaper, but by no more than
+        # `counter_margin` of the incoming proposal's cost: it prepared that proposal instead.
+        self.counter_margin_yields = 0
         self.commit_lock_holds = 0
         # object_id -> {p_id: (ProposalInfo, voters whose COMMIT for it we know)}: every COMMIT
         # seen for the object in this election, kept apart from the proposal containers (which
@@ -199,6 +215,7 @@ class ConsensusEngine:
             "certificates_resent": self.certificates_resent,
             "superseded_skips": self.superseded_skips,
             "counter_proposals": self.counter_proposals,
+            "counter_margin_yields": self.counter_margin_yields,
         }
         stats.update(self.votes_to_finalize.summary("votes_"))
         stats.update(self.time_to_finalize.summary("finalize_s_"))
@@ -262,19 +279,6 @@ class ConsensusEngine:
                 )
                 container.remove_proposal(p_id=existing.p_id, object_id=incoming_proposal.object_id)
 
-    def _counters_active(self, oid: str) -> bool:
-        """Whether this agent would price `oid` for a counter-proposal at all, whatever the
-        comparison: the host implements `counter_proposal_cost` and answers a number for it.
-        False at every leaf and wherever counter-proposals are off."""
-        fn = getattr(self.host, "counter_proposal_cost", None)
-        if fn is None:
-            return False
-        try:
-            own = fn(oid)
-        except Exception:
-            return False
-        return own is not None and own == own and own != float("inf")
-
     def _counter_proposal(self, object, incoming: ProposalInfo) -> Optional[ProposalInfo]:
         """A proposal of this agent's own for `object`, if it should answer `incoming` with one.
 
@@ -286,7 +290,8 @@ class ConsensusEngine:
         won least (docs/results/e0-e1-f45d9ff1/README.md §7). Now such an agent first asks the host
         for its own price (`counter_proposal_cost`, optional: a host that does not implement it, or
         answers None, keeps the old behaviour) and, if that dominates the incoming proposal by the
-        rule every PBFT comparison uses (`dominates`), proposes itself instead of preparing. Peers
+        rule every PBFT comparison uses (`dominates`) AND undercuts it by more than
+        `counter_margin` of its cost, proposes itself instead of preparing. Peers
         already prefer the better of two proposals until they commit
         (`_remove_worse_proposals_from_container`), so the cheaper one can still win the vote.
 
@@ -307,6 +312,15 @@ class ConsensusEngine:
         if own is None or own != own or own == float("inf"):
             return None
         if not dominates(oid, float(own), self.agent_id, incoming.cost, incoming.agent_id):
+            return None
+        # Cheaper, but by enough? A near-tie counter gives the tier two proposals of about the
+        # same cost; peers prepare whichever they hear first, the binding COMMITs split between
+        # them, and with no quorum on either side the job waits for the reselection timeout —
+        # and splits again there, since every round brings its own near-ties (COUNTER_MARGIN_DEFAULT).
+        inc = float(incoming.cost)
+        if (self.counter_margin > 0 and inc == inc and inc != float("inf")
+                and not float(own) < inc * (1.0 - self.counter_margin)):
+            self.counter_margin_yields += 1
             return None
         return ProposalInfo(p_id=generate_id(), object_id=oid, agent_id=self.agent_id,
                             cost=float(own))
@@ -505,21 +519,22 @@ class ConsensusEngine:
 
                     self.incoming.add_proposal(proposal=p)
                     proposal = self.incoming.get_proposal(p_id=p.p_id) or p
-                    # Vote for it, as `on_proposal` does, where this agent never counter-proposes
-                    # (every leaf; a coordinator under `peers` or with counter_propose off). Until
-                    # 2026-10-30 an agent that learned a proposal from a PREPARE adopted it
-                    # SILENTLY and voted only if the PROPOSAL itself arrived later. PBFT never
-                    # retransmits, so a lost PROPOSAL left every second-hand agent mute: in E6 a
-                    # 5-agent group held 2 votes against a quorum of 3 until the 300 s
-                    # reselection, 9-11 jobs per run after a partition healed
-                    # (docs/results/e6-58f3ab22/README.md §3). Where counter-proposals are live
-                    # the silence is kept: voting at once lets a dearer first proposal reach its
-                    # prepare quorum before a cheaper counter does, and commits then lock onto
-                    # different proposals with no quorum anywhere (7 of 400 undecided at 9
-                    # coordinators with no loss, against 0; tests/test_pbft_adopt_via_prepare.py).
-                    if not self._counters_active(p.object_id):
-                        self._add_vote(proposal.prepares)
-                        adopted.append(proposal)
+                    # Vote for it, as `on_proposal` does: this agent is not countering it (it is
+                    # dearer, or cheaper by no more than `counter_margin`). Until 2026-10-30 an
+                    # agent that learned a proposal from a PREPARE adopted it SILENTLY and voted
+                    # only if the PROPOSAL itself arrived later. PBFT never retransmits, so a lost
+                    # PROPOSAL left every second-hand agent mute: in E6 a 5-agent group held 2
+                    # votes against a quorum of 3 until the 300 s reselection, 9-11 jobs per run
+                    # after a partition healed (docs/results/e6-58f3ab22/README.md §3).
+                    # b9e51bbf kept the silence where counter-proposals were live, after a
+                    # simulation with the split resolver switched off showed 7 of 400 9-coordinator
+                    # races undecided when voting. With the resolver on, as on every agent, voting
+                    # leaves 0 of 400 undecided at 0, 20 and 50 % PROPOSAL loss while silence
+                    # leaves up to 147 of 400 at 50 % — and with `counter_margin` an agent near the
+                    # proposer's price neither counters nor votes unless it votes here (stop review
+                    # 2026-11-05; tests/test_pbft_adopt_via_prepare.py).
+                    self._add_vote(proposal.prepares)
+                    adopted.append(proposal)
 
                     # FIX: If we accepted a better proposal while in COMMIT phase, reset to PREPARE
                     # This ensures we properly vote for the better proposal

@@ -30,7 +30,7 @@ import traceback
 from concurrent.futures.thread import ThreadPoolExecutor
 from typing import Optional
 
-from swarm.consensus.engine import ConsensusEngine
+from swarm.consensus.engine import COUNTER_MARGIN_DEFAULT, ConsensusEngine
 from swarm.consensus.gossip_engine import SNOW_DEFAULTS, GossipConsensusEngine
 from swarm.consensus.interfaces import ConsensusHost, ConsensusTransport, TopologyRouter
 from swarm.consensus.messages.message import MessageType
@@ -110,6 +110,16 @@ COST_MODELS = ("utilization", "capacity")
 COST_MODEL_DEFAULT = "utilization"
 
 
+#: The state indices the periodic scan reads at this agent's tier, in ONE pipelined (MULTI)
+#: read. PENDING / READY / COMPLETE (and RUNNING) drive the local queues; EVERY index feeds the
+#: withdrawn-job purge, because withdrawal deletes the record and so removes it from all of them.
+#: Until 2026-11-05 only those four were read: a coordinator-tier job whose record sat in
+#: PRE_PREPARE / PREPARE / COMMIT for two scans — any election slow enough to reach the
+#: reselection timeout — read as withdrawn, every coordinator dropped it, and nobody ever
+#: re-elected it (Hier-270 pilot, runs/pilot-counter-margin2, job 2646).
+SCAN_STATES = tuple(s.value for s in ObjectState)
+
+
 def resolve_pbft_counter_propose(consensus_cfg: dict) -> bool:
     """Resolve `consensus.pbft.counter_propose` (default true), refusing a non-boolean.
 
@@ -123,6 +133,20 @@ def resolve_pbft_counter_propose(consensus_cfg: dict) -> bool:
     if not isinstance(value, bool):
         raise ValueError(f"consensus.pbft.counter_propose must be true or false, not {value!r}")
     return value
+
+
+def resolve_pbft_counter_margin(consensus_cfg: dict) -> float:
+    """Resolve `consensus.pbft.counter_margin` (default `COUNTER_MARGIN_DEFAULT`, 0.05), refusing
+    anything but a number in [0, 1).
+
+    A coordinator counters a peer's PBFT proposal only when it is cheaper by more than this
+    fraction of the peer's cost (`ConsensusEngine._counter_proposal`). 0 = the strict rule of
+    2026-10-19..2026-11-05, under which near-tie counters deadlocked a 27-coordinator tier.
+    """
+    value = ((consensus_cfg or {}).get("pbft") or {}).get("counter_margin", COUNTER_MARGIN_DEFAULT)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not (0.0 <= value < 1.0):
+        raise ValueError(f"consensus.pbft.counter_margin must be a number in [0, 1), not {value!r}")
+    return float(value)
 
 
 def resolve_cost_model(job_cfg: dict) -> str:
@@ -550,7 +574,8 @@ class ResourceAgent(Agent):
                     max_inflight=int(snow_get("max_inflight")),
                     tie_tolerance=float(snow_get("tie_tolerance")),
                 )
-            return ConsensusEngine(agent_id, host, transport, router=router)
+            return ConsensusEngine(agent_id, host, transport, router=router,
+                                   counter_margin=resolve_pbft_counter_margin(consensus_cfg))
 
         # Phase 4 hybrid: PBFT within small level-0 worker groups; Snow across the
         # (potentially large) coordinator tiers where flat PBFT hits O(g^2). Engine is
@@ -1485,7 +1510,8 @@ class ResourceAgent(Agent):
         winner's `select_job` re-created the record and ran the job while the coordinator had
         already re-delegated it elsewhere (code review 2026-10-05 §15).
 
-        `present` is every id in this tier's PENDING/READY/RUNNING/COMPLETE indices. A job must
+        `present` is every id in ANY of this tier's state indices (`SCAN_STATES`; a record mid-
+        election is in PRE_PREPARE/PREPARE/COMMIT, not withdrawn). A job must
         be absent from two consecutive scans before it is dropped: the index sets are read
         without a transaction, so one scan can catch a job between two of them, and dropping a
         job mid-election on that would abort an election for nothing. (A wrong drop would still
@@ -2784,8 +2810,7 @@ class ResourceAgent(Agent):
         group = self.topology.group
         state_map = self.repository.get_all_ids_multi(
             key_prefix=Repository.KEY_JOB, level=self.topology.level,
-            group=group, states=[ObjectState.PENDING.value, ObjectState.READY.value,
-                                 ObjectState.RUNNING.value, ObjectState.COMPLETE.value])
+            group=group, states=list(SCAN_STATES))
         self._update_pending_jobs(jobs=state_map.get(ObjectState.PENDING.value, []))
         self._update_ready_jobs(jobs=state_map.get(ObjectState.READY.value, []))
         self._purge_vanished_jobs(present={j for ids in state_map.values() for j in ids})

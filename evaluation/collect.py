@@ -552,11 +552,13 @@ def instrumentation_metrics(agents: dict[str, dict], meta: dict | None = None,
     have_usage_unknown = False
     finalize_p95: list[float] = []
     finalized = abandoned = lost = cancelled = lock_holds = splits = 0
+    counters = margin_yields = 0
     # `abandoned` and `finalize_lost` are Snow-only: PBFT does not abandon (a stuck object goes
     # to the reselection timeout) and has no CAS to lose one on. Reported only if some agent
     # actually reported them, so a pure-PBFT cell reads absent rather than a confident 0 next
     # to Snow's measured count (code review §11).
     have_abandoned = have_lost = have_cancelled = have_lock_holds = have_splits = False
+    have_counters = have_margin_yields = False
     protocols: set[str] = set()
     llm_calls = llm_failures = llm_in = llm_out = 0
     bid_jobs = bid_calls = designated = forced = claimed_jobs = 0
@@ -648,6 +650,12 @@ def instrumentation_metrics(agents: dict[str, dict], meta: dict | None = None,
             if consensus.get("commit_splits_resolved") is not None:
                 have_splits = True
                 splits += int(consensus.get("commit_splits_resolved") or 0)
+            if consensus.get("counter_proposals") is not None:
+                have_counters = True
+                counters += int(consensus.get("counter_proposals") or 0)
+            if consensus.get("counter_margin_yields") is not None:
+                have_margin_yields = True
+                margin_yields += int(consensus.get("counter_margin_yields") or 0)
             if consensus.get("finalize_lost") is not None:
                 have_lost = True
                 lost += int(consensus.get("finalize_lost") or 0)
@@ -742,6 +750,11 @@ def instrumentation_metrics(agents: dict[str, dict], meta: dict | None = None,
         # PBFT only: agent-level moves out of a commit split nobody could finish (one per agent
         # per split, so a resolved 3-way split at a 3-coordinator tier reads 2-3).
         out["consensus_commit_splits_resolved"] = splits if have_splits else None
+        # PBFT only: proposals a coordinator made to undercut a peer's (since 2026-10-19), and
+        # those it held back because it was cheaper by no more than `counter_margin` (since
+        # 2026-11-05; absent before). Read beside commit_lock_holds: near-tie counters split commits.
+        out["consensus_counter_proposals"] = counters if have_counters else None
+        out["consensus_counter_margin_yields"] = margin_yields if have_margin_yields else None
         # A decision whose CAS won but whose object could not be read: no leader elected, no
         # participant commit, no assignment. Non-zero means work was lost, so it belongs on the
         # row beside `finalized` rather than in a log.

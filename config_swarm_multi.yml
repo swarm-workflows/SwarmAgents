@@ -238,6 +238,10 @@ consensus:
     # since 2026-10-19). false = every earlier PBFT run, where the coordinator nearest the
     # database won 55-73 % of jobs (docs/results/e0-e1-f45d9ff1/README.md §7).
     counter_propose: true
+    # ...but only when cheaper by MORE than this fraction of the received proposal's cost (since
+    # 2026-11-05; 0 = the strict rule before it). Near-tie counters split the binding COMMITs of a
+    # 27-coordinator tier and left jobs undecided (Hier-270 pilot); same idea as snow.tie_tolerance.
+    counter_margin: 0.05
   hybrid:
     level0: pbft            # engine for level-0 worker groups (small, <=10 agents)
     coordinator: snow       # engine for level >= 1 coordinator tiers (large pools)

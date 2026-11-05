@@ -91,10 +91,9 @@ def test_a_cheaper_proposal_still_wins_over_one_adopted_from_a_prepare():
     assert len(leaders) <= 1, leaders
 
 
-def test_where_counter_proposals_are_live_adoption_stays_silent():
-    """Coordinators under `coordinator_cost_matrix: self` keep the old behaviour: voting at once
-    there let a dearer first proposal lock commits before a cheaper counter arrived (a three-way
-    commit split, no quorum; 7 of 400 random 9-coordinator races undecided with no loss)."""
+def test_where_counter_proposals_are_live_a_non_countering_adopter_votes_too():
+    """Coordinators under `coordinator_cost_matrix: self` used to adopt silently (b9e51bbf).
+    None of 6, 8, 10 undercuts agent 7, so each votes on adoption and the job is decided."""
     from test_pbft_counter_proposal import _cluster as _cost_cluster
     costs = {i: (2.0 if i == 7 else 3.0) for i in IDS}   # all price it; none undercuts agent 7
     bus0, hosts = _cost_cluster(costs, lambda a, b: 0.01)
@@ -104,6 +103,52 @@ def test_where_counter_proposals_are_live_adoption_stays_silent():
         eng.transport = bus.transport_for(aid)
     _propose(bus, 7, cost=2.0)
     bus.run()
-    # 6, 8 and 10 heard of it only from 9's PREPARE and, counters being live, did not vote.
-    assert set(bus.prepares_sent) == {9}, bus.prepares_sent
-    assert _outcome(hosts)[0] == []
+    assert set(bus.prepares_sent) == {6, 8, 9, 10}, bus.prepares_sent
+    assert _outcome(hosts) == ([7], {7})
+
+
+def test_near_tied_coordinators_that_lost_the_proposal_still_decide():
+    """Stop review 2026-11-05: nine coordinators within `counter_margin` of the proposer and six
+    of its PROPOSAL deliveries dropped. The margin stops the second-hand agents countering; if
+    adoption were still silent they would neither counter nor vote and nothing is decided."""
+    from test_pbft_counter_proposal import _cluster as _cost_cluster
+    ids = list(range(1, 10))
+    costs = {i: 5.60 + 0.03 * i for i in ids}            # 5.63 .. 5.87, all within 5 %
+    bus0, hosts = _cost_cluster(costs, lambda a, b: 0.01)
+    bus = _LossyBus(lambda a, b: 0.01, {(9, d, Proposal) for d in (1, 2, 3, 4, 5, 6)})
+    bus.engines = bus0.engines
+    for aid, eng in bus.engines.items():
+        eng.transport = bus.transport_for(aid)
+        assert eng.counter_margin == 0.05
+    _propose(bus, 9, cost=costs[9])
+    bus.run()
+    assert _outcome(hosts) == ([9], {9})
+    assert sum(e.counter_proposals for e in bus.engines.values()) == 0
+
+
+def test_random_lossy_races_with_the_resolver_on_are_all_decided_once():
+    """The measurement behind voting on adoption, smaller: 9 coordinators, 1-3 simultaneous
+    proposers, random RTTs, 50 % of PROPOSAL deliveries lost, split resolver on (`live_voter_ids`,
+    as every agent has). Measured at 400 races: voting 0 undecided, silence 139-147."""
+    import random
+    from test_pbft_counter_proposal import _cluster as _cost_cluster
+    rng = random.Random(1105)
+    for trial in range(80):
+        ids = list(range(1, 10))
+        costs = {a: round(rng.uniform(0.5, 3.0), 2) for a in ids}
+        rtt = {(a, b): rng.uniform(0.2, 90.0) for a in ids for b in ids if a < b}
+        delay = (lambda a, b, rtt=rtt: rtt[(min(a, b), max(a, b))] / 2000.0)
+        bus0, hosts = _cost_cluster(costs, delay)
+        for h in hosts.values():
+            h.live_voter_ids = (lambda ids=ids: list(ids))
+        drop = {(a, b, Proposal) for a in ids for b in ids if a != b and rng.random() < 0.5}
+        bus = _LossyBus(delay, drop)
+        bus.engines = bus0.engines
+        for aid, eng in bus.engines.items():
+            eng.transport = bus.transport_for(aid)
+        for aid in rng.sample(ids, rng.randint(1, 3)):
+            _propose(bus, aid, costs[aid], at=rng.uniform(0.0, 0.05))
+        bus.run()
+        leaders, recorded = _outcome(hosts)
+        assert len(leaders) == 1, (trial, leaders)
+        assert recorded == {leaders[0]}, (trial, leaders, recorded)
