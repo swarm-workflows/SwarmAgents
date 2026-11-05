@@ -100,6 +100,10 @@ _DUMP_FAILURE_MARKERS = ("Error connecting to Redis", "Traceback (most recent ca
 
 #: Persisted state indices (`ObjectState` values) that mean a job is assigned but not finished.
 INFLIGHT_BUCKETS = (5, 6)    # READY, RUNNING
+#: PRE_PREPARE, PREPARE, COMMIT: offered, left PENDING, not yet decided. Neither the drain (PENDING)
+#: nor the in-flight count (READY/RUNNING) saw them, so a Hier-270 PBFT pilot (2026-11-04) stopped
+#: with 12 jobs stuck mid-election at the coordinator tier and recorded "drained", 0 in flight.
+UNDECIDED_BUCKETS = (2, 3, 4)
 
 
 def parse_bucket_set_count(text: str, bucket: int) -> int | None:
@@ -1672,35 +1676,90 @@ def wait_runtime(args) -> None:
 
 
 #: How the wait ended, written to <run-dir>/drain.json: drained | stranded | cap | infeasible |
-#: redis_unreadable | producer_failed, plus the jobs still pending and in flight at the stop.
+#: redis_unreadable | producer_failed, plus the jobs still pending, in flight and undecided at the stop.
 #: `stranded` = 1..threshold-1 jobs never left PENDING even after --stranded-wait-s.
 _DRAIN: dict = {}
 
 
-def _inflight_count(args) -> int | None:
-    out = run_once(["python3.11", "dump_db.py", "--host", args.db_host, "--type", "redis",
-                    "--key", "state"])
-    counts = [parse_bucket_set_count(out, b) for b in INFLIGHT_BUCKETS]
-    return None if any(c is None for c in counts) else sum(counts)
+#: One atomic snapshot of every job-state index: Redis runs a script without interleaving other
+#: commands, and the repository moves a job between state sets in one WATCH/MULTI transaction,
+#: so each job is in exactly one set here. `dump_db.py` lists the keys and THEN reads each set;
+#: a job reset from PREPARE into a PENDING key created between those two steps was in neither
+#: read, and the end-of-run wait recorded a lost job as drained (stop review 2026-11-05).
+_STATE_SNAPSHOT_LUA = """
+local out = {}
+for _, k in ipairs(redis.call('KEYS', 'state:*')) do
+  if redis.call('TYPE', k)['ok'] == 'set' then
+    out[#out + 1] = k
+    out[#out + 1] = redis.call('SCARD', k)
+  end
+end
+return out
+"""
+
+
+def _redis_client(args):
+    import redis as _redis
+    return _redis.StrictRedis(host=args.db_host, port=6379, decode_responses=True,
+                              socket_timeout=30)
+
+
+def _stop_counts(args) -> tuple[int | None, int | None, int | None]:
+    """(pending, in flight = READY+RUNNING, undecided = PRE_PREPARE+PREPARE+COMMIT) from ONE
+    atomic snapshot, all None when Redis could not be read. PENDING is re-read here because a
+    stalled election is reset to PENDING (`_restart_selection`) while this wait runs."""
+    try:
+        flat = _redis_client(args).eval(_STATE_SNAPSHOT_LUA, 0)
+    except Exception as e:
+        log(f"WARN: could not snapshot job states from Redis at {args.db_host}: {e}")
+        return None, None, None
+    per_state: dict[int, int] = {}
+    for key, n in zip(flat[0::2], flat[1::2]):
+        parts = str(key).split(":")
+        if len(parts) != 4 or not parts[3].isdigit():
+            continue
+        per_state[int(parts[3])] = per_state.get(int(parts[3]), 0) + int(n)
+
+    def total(buckets):
+        return sum(per_state.get(b, 0) for b in buckets)
+
+    return (total((getattr(args, "watch_bucket", 1),)), total(INFLIGHT_BUCKETS),
+            total(UNDECIDED_BUCKETS))
 
 
 def _wait_for_inflight(args) -> None:
     """The drain watches PENDING only, so it fired while the last wave was still RUNNING and
-    the stop cut it off — completion % short, nothing saying so. Wait for READY/RUNNING to empty
-    too, bounded by --inflight-drain-max-s; the count left at the bound is recorded."""
+    the stop cut it off — completion % short, nothing saying so. Wait for READY/RUNNING, for
+    jobs still mid-election (PRE_PREPARE/PREPARE/COMMIT), and for any job an election reset
+    put back in PENDING, to empty too, bounded by --inflight-drain-max-s; all three counts left
+    at the bound are recorded, and jobs still PENDING there make the run `stranded`."""
     limit = float(getattr(args, "inflight_drain_max_s", 0) or 0)
     deadline = time.time() + limit
     while True:
-        n = _inflight_count(args)
+        p, n, u = _stop_counts(args)
+        _DRAIN["pending_at_stop"] = p
         _DRAIN["inflight_at_stop"] = n
-        if n == 0:
+        _DRAIN["undecided_at_stop"] = u
+        if p == 0 and n == 0 and u == 0:
+            if _DRAIN.get("status") == "stranded":
+                # The drain gave up on a few PENDING jobs (--stranded-wait-s), and they finished
+                # during this wait: nothing was lost, so the run is drained. Recorded, because the
+                # tail is real (Hier-270 PBFT pilot, 2026-11-05: 2 jobs re-elected for ~8 min,
+                # all 5400 executed once, and the run was retried as "stranded").
+                _DRAIN["status"] = "drained"
+                _DRAIN["stranded_recovered"] = True
             return
         if time.time() >= deadline:
-            log(f"WARNING: {n if n is not None else 'unknown'} job(s) still READY/RUNNING after "
-                f"{limit:.0f}s; stopping anyway. This run's completion is TRUNCATED "
-                f"(recorded in drain.json).")
+            if p:
+                _DRAIN["status"] = "stranded"
+            log(f"WARNING: {p if p is not None else 'unknown'} job(s) PENDING, "
+                f"{n if n is not None else 'unknown'} READY/RUNNING and "
+                f"{u if u is not None else 'unknown'} undecided after {limit:.0f}s; "
+                f"stopping anyway. This run's completion is TRUNCATED (recorded in drain.json).")
             return
-        log(f"Pending drained; waiting for {n if n is not None else '?'} in-flight job(s) …")
+        log(f"Pending drained; waiting for {p if p is not None else '?'} pending, "
+            f"{n if n is not None else '?'} in-flight and {u if u is not None else '?'} "
+            f"undecided job(s) …")
         time.sleep(args.check_interval)
 
 

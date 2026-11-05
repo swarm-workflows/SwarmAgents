@@ -113,16 +113,110 @@ class TestDrain:
         assert (Path(args.run_dir) / "drain.json").exists()
 
     def test_inflight_jobs_are_waited_for_and_a_truncation_recorded(self, tmp_path, monkeypatch):
-        counts = iter([3, 1, 0])
-        monkeypatch.setattr(run_test, "_inflight_count", lambda a: next(counts))
+        counts = iter([(0, 3, 0), (0, 1, 0), (0, 0, 0)])
+        monkeypatch.setattr(run_test, "_stop_counts", lambda a: next(counts))
         monkeypatch.setattr(run_test.time, "sleep", lambda s: None)
         run_test._wait_for_inflight(_args(tmp_path, inflight_drain_max_s=60))
         assert run_test._DRAIN["inflight_at_stop"] == 0
 
         run_test._DRAIN.clear()
-        monkeypatch.setattr(run_test, "_inflight_count", lambda a: 4)
+        monkeypatch.setattr(run_test, "_stop_counts", lambda a: (0, 4, 0))
         run_test._wait_for_inflight(_args(tmp_path, inflight_drain_max_s=0))
         assert run_test._DRAIN["inflight_at_stop"] == 4
+
+    def test_jobs_mid_election_are_waited_for_and_recorded(self, tmp_path, monkeypatch):
+        # Hier-270 PBFT pilot, 2026-11-04: 12 jobs stuck in PREPARE at the coordinator tier,
+        # 0 READY/RUNNING — the old wait returned at once and drain.json read "drained", 0.
+        seen = []
+        counts = iter([(0, 0, 12), (0, 0, 3), (0, 0, 0)])
+        monkeypatch.setattr(run_test, "_stop_counts", lambda a: seen.append(1) or next(counts))
+        monkeypatch.setattr(run_test.time, "sleep", lambda s: None)
+        run_test._wait_for_inflight(_args(tmp_path, inflight_drain_max_s=60))
+        assert len(seen) == 3
+        assert run_test._DRAIN["undecided_at_stop"] == 0
+
+        run_test._DRAIN.clear()
+        monkeypatch.setattr(run_test, "_stop_counts", lambda a: (0, 0, 12))
+        run_test._wait_for_inflight(_args(tmp_path, inflight_drain_max_s=0))
+        assert run_test._DRAIN["inflight_at_stop"] == 0
+        assert run_test._DRAIN["undecided_at_stop"] == 12
+
+    def test_an_election_reset_to_pending_during_the_wait_is_not_clean(self, tmp_path, monkeypatch):
+        # _restart_selection puts a stalled election back in PENDING while this wait runs; with
+        # only READY/RUNNING/undecided watched, the wait returned clean (stop review 2026-11-05).
+        counts = iter([(0, 0, 2), (2, 0, 0), (0, 0, 1), (0, 0, 0)])
+        monkeypatch.setattr(run_test, "_stop_counts", lambda a: next(counts))
+        monkeypatch.setattr(run_test.time, "sleep", lambda s: None)
+        run_test._DRAIN.clear(); run_test._DRAIN["status"] = "drained"
+        run_test._wait_for_inflight(_args(tmp_path, inflight_drain_max_s=60))
+        assert run_test._DRAIN["pending_at_stop"] == 0
+        assert run_test._DRAIN["status"] == "drained"
+
+        # Still PENDING at the bound: the run lost jobs, so it is stranded, not drained.
+        run_test._DRAIN.clear(); run_test._DRAIN["status"] = "drained"
+        monkeypatch.setattr(run_test, "_stop_counts", lambda a: (2, 0, 0))
+        run_test._wait_for_inflight(_args(tmp_path, inflight_drain_max_s=0))
+        assert run_test._DRAIN["pending_at_stop"] == 2
+        assert run_test._DRAIN["status"] == "stranded"
+
+    def test_stranded_jobs_that_finish_during_the_wait_leave_the_run_drained(self, tmp_path, monkeypatch):
+        counts = iter([(2, 0, 0), (1, 0, 1), (0, 0, 0)])
+        monkeypatch.setattr(run_test, "_stop_counts", lambda a: next(counts))
+        monkeypatch.setattr(run_test.time, "sleep", lambda s: None)
+        run_test._DRAIN.clear(); run_test._DRAIN["status"] = "stranded"
+        run_test._wait_for_inflight(_args(tmp_path, inflight_drain_max_s=60))
+        assert run_test._DRAIN["status"] == "drained"
+        assert run_test._DRAIN["stranded_recovered"] is True
+
+        # Still pending at the bound: stays stranded, and is not marked recovered.
+        run_test._DRAIN.clear(); run_test._DRAIN["status"] = "stranded"
+        monkeypatch.setattr(run_test, "_stop_counts", lambda a: (2, 0, 0))
+        run_test._wait_for_inflight(_args(tmp_path, inflight_drain_max_s=0))
+        assert run_test._DRAIN["status"] == "stranded"
+        assert "stranded_recovered" not in run_test._DRAIN
+
+    def test_stop_counts_sums_every_level_and_group_per_state(self, tmp_path, monkeypatch):
+        class Snap:
+            def eval(self, script, numkeys):
+                return ["state:1:0:3", 3, "state:1:2:2", 1, "state:1:0:4", 2, "state:0:4:5", 1,
+                        "state:0:4:6", 2, "state:0:1:1", 1, "state:0:1:8", 2, "state:bogus", 9]
+        monkeypatch.setattr(run_test, "_redis_client", lambda a: Snap())
+        assert run_test._stop_counts(_args(tmp_path)) == (1, 3, 6)
+
+    def test_stop_counts_is_one_atomic_read_not_keys_then_sets(self, tmp_path, monkeypatch):
+        # A job moves PREPARE -> PENDING (an election reset) while the counts are read. Read as
+        # "list keys, then read each set" — what dump_db.py does — it is in neither: the old
+        # PREPARE set is gone and the new PENDING key did not exist when the keys were listed.
+        # The snapshot must come from the single atomic call, which sees it in PENDING.
+        class Resetting:
+            def __init__(self):
+                self.calls = []
+                self.sets = {"state:1:0:3": {"job:7"}}
+            def keys(self, pattern):
+                self.calls.append("keys"); listed = list(self.sets)
+                self.sets = {"state:1:0:1": {"job:7"}}          # the reset lands mid-read
+                return listed
+            def smembers(self, key):
+                self.calls.append("smembers"); return self.sets.get(key, set())
+            def eval(self, script, numkeys):
+                self.calls.append("eval")
+                return [x for k, v in self.sets.items() for x in (k, len(v))]
+        fake = Resetting()
+        monkeypatch.setattr(run_test, "_redis_client", lambda a: fake)
+        # Demonstrate the race on the non-atomic path ...
+        listed = fake.keys("state:*")
+        assert sum(len(fake.smembers(k)) for k in listed) == 0
+        # ... and that _stop_counts never takes it: one eval, and the job is counted.
+        fake.calls.clear()
+        assert run_test._stop_counts(_args(tmp_path)) == (1, 0, 0)
+        assert fake.calls == ["eval"]
+
+    def test_stop_counts_unreadable_redis_is_none_not_zero(self, tmp_path, monkeypatch):
+        class Down:
+            def eval(self, *a):
+                raise ConnectionError("Error connecting to Redis")
+        monkeypatch.setattr(run_test, "_redis_client", lambda a: Down())
+        assert run_test._stop_counts(_args(tmp_path)) == (None, None, None)
 
 
 # --------------------------------------------------------------------------- §49

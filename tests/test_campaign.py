@@ -519,6 +519,33 @@ def test_an_unknown_in_flight_count_is_unverified_not_clean(tmp_path):
     assert classify(0, tmp_path, False) == "ok_unverified"
 
 
+def test_jobs_left_mid_election_strand_a_drained_run(tmp_path):
+    # 2026-11-04 Hier-270 PBFT pilot: 12 jobs undecided at the coordinator tier, 0 in flight,
+    # "drained" — classified ok. They were lost, not cut off: stranded, and retried.
+    (tmp_path / "drain.json").write_text(json.dumps(
+        {"status": "drained", "inflight_at_stop": 0, "undecided_at_stop": 12}))
+    assert classify(0, tmp_path, False) == "stranded"
+    assert "stranded" in campaign.RETRY
+
+
+def test_undecided_outranks_in_flight(tmp_path):
+    (tmp_path / "drain.json").write_text(json.dumps(
+        {"status": "drained", "inflight_at_stop": 5, "undecided_at_stop": 2}))
+    assert classify(0, tmp_path, False) == "stranded"
+
+
+def test_an_unknown_undecided_count_is_unverified_not_clean(tmp_path):
+    (tmp_path / "drain.json").write_text(json.dumps(
+        {"status": "drained", "inflight_at_stop": 0, "undecided_at_stop": None}))
+    assert classify(0, tmp_path, False) == "ok_unverified"
+
+
+def test_a_drain_written_before_the_undecided_count_still_reads_clean(tmp_path):
+    # Older drain.json files and the baselines carry no undecided_at_stop.
+    _drained(tmp_path)
+    assert classify(0, tmp_path, False) == "ok"
+
+
 def test_a_job_started_twice_is_flagged_done_not_retried(tmp_path):
     _drained(tmp_path, agents={"1": {"executed_jobs": ["a", "b"]}, "2": {"executed_jobs": ["b"]}})
     assert classify(0, tmp_path, False) == "ok_duplicated"

@@ -61,7 +61,7 @@ the repeat is recorded `gate_failed` and skipped, rather than burning a night on
 | `ok_unverified` | exit 0, no `drain.json` | done, flagged |
 | `refused` | exit 2: the runner refused the launch (a configuration error) | **campaign stops**; it would repeat on every retry |
 | `metrics_shortfall` | exit 3 | retried |
-| `stranded` | exit 0, but jobs never left PENDING (`drain.json` `pending_at_stop`) | retried; the attempt is kept — jobs were lost |
+| `stranded` | exit 0, but jobs never left PENDING (`drain.json` `pending_at_stop`), or were still mid-election at the stop (`undecided_at_stop`) | retried; the attempt is kept — jobs were lost |
 | `truncated` | exit 0, drained, but jobs still READY/RUNNING at the in-flight bound (`inflight_at_stop`) | retried; the attempt is kept |
 | `ok_duplicated` | exit 0, drained, but `metrics.json` shows a job started more than once | done, flagged — never retried: in a fault cell it may be the measurement, and a retry would bias it toward 0 |
 | `false_verdicts` | exit 0, drained, but agents declared peers failed in a cell with no companion or `expect-silent-agents` | retried; the attempt is kept |
@@ -284,11 +284,19 @@ def classify(rc: Optional[int], run_dir: Path, timed_out: bool, injected: bool =
         # The drain watches PENDING only; jobs still READY/RUNNING when the in-flight wait
         # hit its bound were cut off, and completion reads short with "drained" beside it.
         try:
-            inflight = json.loads((run_dir / "drain.json").read_text()).get("inflight_at_stop", 0)
+            drain = json.loads((run_dir / "drain.json").read_text())
         except (OSError, ValueError):
-            inflight = 0
-        if inflight is None:
+            drain = {}
+        inflight = drain.get("inflight_at_stop", 0)
+        # Jobs left mid-election (PRE_PREPARE/PREPARE/COMMIT) were never decided: as `stranded`,
+        # not `truncated` — nothing was cut off, the jobs were lost. Absent in drain.json files
+        # written before 2026-11-05 and by the baselines, which have no election; their own
+        # completion accounting (`all_terminal`) covers it.
+        undecided = drain.get("undecided_at_stop", 0)
+        if inflight is None or undecided is None:
             return "ok_unverified"
+        if undecided:
+            return "stranded"
         if inflight:
             return "truncated"
         return integrity(run_dir, injected) or "ok"
