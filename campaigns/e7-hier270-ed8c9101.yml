@@ -7,9 +7,9 @@
 # agents per VM), with that cell's archived agent_profiles.json (identical md5 across its cells),
 # the same 5,400 jobs, the same base config keys a baseline reads (wall-time clamp,
 # executor_workers, cost weights) and the same arrivals:
-#   burst    — , 20 jobs per 1 s (beside e0/e1-hier270-*-analytic)
+#   burst    — `--arrival batch`, 20 jobs per 1 s (beside e0/e1-hier270-*-analytic)
 #   poisson7 — Poisson 7 jobs/s, seed 42 (beside the -poisson7 cells; arrivals.json matches)
-# Sparrow's probes and claims go through Redis on  (state it beside the table).
+# Sparrow's probes and claims go through Redis on `database` (state it beside the table).
 # Same runners and arguments as campaigns/e7-hier90-7e269138.yml.
 #
 #   tmux new -s e7h270 'python3.11 campaign.py campaigns/e7-hier270-ed8c9101.yml --python python3.11 2>&1 | tee /root/campaign-e7-hier270.out'
