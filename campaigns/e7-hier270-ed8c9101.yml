@@ -1,0 +1,73 @@
+# E7 at Hier-270 (conference plan §4.2 E7, the second scale point): the four external baselines
+# beside the E1' Hier-270 analytic cells (campaign e1-hier270-ed8c9101, code ed8c9101), at both of
+# that campaign's loads, 5 repeats each: 8 cells, 40 runs.
+#
+# Every baseline runs on the SWARM cell's level-0 fleet (243 workers; the 27 coordinators have no
+# counterpart), placed host for host as run_test.py places agents (agent_hosts.txt, 90 hosts, 3
+# agents per VM), with that cell's archived agent_profiles.json (identical md5 across its cells),
+# the same 5,400 jobs, the same base config keys a baseline reads (wall-time clamp,
+# executor_workers, cost weights) and the same arrivals:
+#   burst    — , 20 jobs per 1 s (beside e0/e1-hier270-*-analytic)
+#   poisson7 — Poisson 7 jobs/s, seed 42 (beside the -poisson7 cells; arrivals.json matches)
+# Sparrow's probes and claims go through Redis on  (state it beside the table).
+# Same runners and arguments as campaigns/e7-hier90-7e269138.yml.
+#
+#   tmux new -s e7h270 'python3.11 campaign.py campaigns/e7-hier270-ed8c9101.yml --python python3.11 2>&1 | tee /root/campaign-e7-hier270.out'
+out: runs/campaign-e7-hier270-ed8c9101
+
+defaults:
+  repeats: 5
+  retries: 1
+  timeout_s: 7200
+  args:
+    mode: remote
+    db-host: database
+    agent-hosts-file: agent_hosts.txt
+    agents-per-host: 3
+    agents: 270
+    jobs: 5400
+    use-jobs-dir: /root/workloads/jobs_5400
+    config: campaigns/config_pbft.yml
+    timeout: 3600
+
+gate:
+  redis: {host: database, port: 6379}
+  clock_check: ./fix_slice_clocks.sh --check
+  retries: 3
+  wait_s: 300
+
+cells:
+  # ---- burst ----------------------------------------------------------------------
+  - name: e7-hier270-greedy-burst
+    runner: baselines/run_baseline_remote.py
+    args: {scheduler: greedy, arrival: batch, jobs-per-interval: 20, interval: 1.0,
+           use-profiles: runs/campaign-e1-hier270-ed8c9101/e0-hier270-pbft-analytic/run01/agent_profiles.json}
+  - name: e7-hier270-round-robin-burst
+    runner: baselines/run_baseline_remote.py
+    args: {scheduler: round-robin, arrival: batch, jobs-per-interval: 20, interval: 1.0,
+           use-profiles: runs/campaign-e1-hier270-ed8c9101/e0-hier270-pbft-analytic/run01/agent_profiles.json}
+  - name: e7-hier270-random-burst
+    runner: baselines/run_baseline_remote.py
+    args: {scheduler: random, arrival: batch, jobs-per-interval: 20, interval: 1.0,
+           use-profiles: runs/campaign-e1-hier270-ed8c9101/e0-hier270-pbft-analytic/run01/agent_profiles.json}
+  - name: e7-hier270-sparrow-burst
+    runner: baselines/run_sparrow.py
+    args: {seed: 42, arrival: batch, jobs-per-interval: 20, interval: 1.0,
+           use-profiles: runs/campaign-e1-hier270-ed8c9101/e0-hier270-pbft-analytic/run01/agent_profiles.json}
+  # ---- poisson7 ----------------------------------------------------------------------
+  - name: e7-hier270-greedy-poisson7
+    runner: baselines/run_baseline_remote.py
+    args: {scheduler: greedy, arrival: poisson, arrival-rate: 7.0, arrival-seed: 42,
+           use-profiles: runs/campaign-e1-hier270-ed8c9101/e0-hier270-pbft-analytic-poisson7/run01/agent_profiles.json}
+  - name: e7-hier270-round-robin-poisson7
+    runner: baselines/run_baseline_remote.py
+    args: {scheduler: round-robin, arrival: poisson, arrival-rate: 7.0, arrival-seed: 42,
+           use-profiles: runs/campaign-e1-hier270-ed8c9101/e0-hier270-pbft-analytic-poisson7/run01/agent_profiles.json}
+  - name: e7-hier270-random-poisson7
+    runner: baselines/run_baseline_remote.py
+    args: {scheduler: random, arrival: poisson, arrival-rate: 7.0, arrival-seed: 42,
+           use-profiles: runs/campaign-e1-hier270-ed8c9101/e0-hier270-pbft-analytic-poisson7/run01/agent_profiles.json}
+  - name: e7-hier270-sparrow-poisson7
+    runner: baselines/run_sparrow.py
+    args: {seed: 42, arrival: poisson, arrival-rate: 7.0, arrival-seed: 42,
+           use-profiles: runs/campaign-e1-hier270-ed8c9101/e0-hier270-pbft-analytic-poisson7/run01/agent_profiles.json}
