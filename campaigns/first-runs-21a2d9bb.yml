@@ -2,10 +2,10 @@
 # at all"): E1' flat Mesh ladder and E5. Agent code = 9260a044 (the stash fix); if the freeze tags
 # this code, these runs ARE frozen-campaign runs and are not repeated.
 #
-#   E1' Mesh-180   PBFT, Snow, Hybrid x analytic, 2 agents/VM on 90 hosts, 3600 jobs, x5 (plan §3.3, §4.2)
-#                  NOTE: Hybrid chooses its engine by tier (PBFT at level 0, Snow among coordinators);
-#                  a flat mesh is all level 0, so Mesh-180 Hybrid runs PBFT. Kept because the plan
-#                  lists it; it is ordered last in the rung so it can be dropped before it starts.
+#   E1' Mesh-180   PBFT, Snow x analytic, 2 agents/VM on 90 hosts, 3600 jobs, x5 (plan §3.3, §4.2)
+#                  Hybrid DROPPED (author, 2026-11-09): Hybrid chooses its engine by tier (PBFT at
+#                  level 0, Snow among coordinators); a flat mesh is all level 0, so Mesh-180 Hybrid
+#                  would have re-measured PBFT.
 #   E1' Mesh-90    PBFT, Snow, 1/VM, 1800 jobs, x5  (conditional rungs: the F1 gate found no
 #   E1' Mesh-120   PBFT, Snow, 2/VM on 60 hosts, 2400 jobs, x5   hierarchical collapse at Hier-270)
 #   E5             gossip off (Hier-90, PBFT + Snow) and coordinator_cost_matrix: peers (Hier-90 and
@@ -49,8 +49,6 @@ cells:
     args: {topology: mesh, agents: 180, agents-per-host: 2, jobs: 3600, pegasus-jobs-dir: /root/workloads/jobs_3600, base-config: campaigns/config_pbft.yml}
   - name: e1-mesh180-snow-analytic
     args: {topology: mesh, agents: 180, agents-per-host: 2, jobs: 3600, pegasus-jobs-dir: /root/workloads/jobs_3600, base-config: config_swarm_multi.yml}
-  - name: e1-mesh180-hybrid-analytic
-    args: {topology: mesh, agents: 180, agents-per-host: 2, jobs: 3600, pegasus-jobs-dir: /root/workloads/jobs_3600, base-config: campaigns/config_hybrid.yml}
   - name: e1-mesh90-pbft-analytic
     args: {topology: mesh, agents: 90, agents-per-host: 1, jobs: 1800, pegasus-jobs-dir: /root/workloads/jobs_1800, base-config: campaigns/config_pbft.yml}
   - name: e1-mesh90-snow-analytic
