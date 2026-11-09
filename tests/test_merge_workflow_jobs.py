@@ -199,3 +199,14 @@ def test_the_same_bundle_twice_is_refused(tmp_path):
     syn, bun = _fixture(tmp_path)
     with pytest.raises(SystemExit, match="twice"):
         mw.merge(syn, [bun, bun], tmp_path / "mixed")
+
+
+def test_bundles_alone_for_the_standalone_pilot(tmp_path, monkeypatch):
+    a = _bundle(tmp_path, "a", "cper", [([], ["x.csv"]), (["x.csv"], ["y.csv"])], code="code/ca/ca.py")
+    b = _bundle(tmp_path, "b", "eht", [([], ["u.fits"])], image="i2", code="code/eb/eb.py")
+    out = tmp_path / "wf_only"
+    s = mw.merge(None, [a, b], out)
+    assert [p.name for p in mw._job_files(out)] == ["job_1.json", "job_2.json", "job_3.json"]
+    assert s["merged"]["synthetic_jobs"] == 0 and s["merged"]["synthetic"] is None
+    monkeypatch.setattr(run_test, "_run_execution_mode", lambda a: "real")
+    run_test.validate_pegasus_jobs_dir(argparse.Namespace(pegasus_jobs_dir=str(out), jobs=3))

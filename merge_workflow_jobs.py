@@ -84,8 +84,9 @@ def _merge_manifests(manifests):
     return out
 
 
-def merge(synthetic: Path, bundles, out: Path) -> dict:
-    """Merge one or more converted bundles into the simulated set `synthetic`, writing `out`."""
+def merge(synthetic, bundles, out: Path) -> dict:
+    """Merge one or more converted bundles into the simulated set `synthetic`, writing `out`.
+    `synthetic` None merges the bundles alone (the §10 standalone pilot: real jobs only)."""
     bundles = [Path(b) for b in (bundles if isinstance(bundles, (list, tuple)) else [bundles])]
     if out.exists():
         raise SystemExit(f"{out} exists; refusing to merge into it (delete it first)")
@@ -95,8 +96,8 @@ def merge(synthetic: Path, bundles, out: Path) -> dict:
         for need in ("manifest.json", "conversion_summary.json"):
             if not (bundle / need).is_file():
                 raise SystemExit(f"{bundle} has no {need}; it is not a converted bundle")
-    syn_files = _job_files(synthetic)
-    if not syn_files:
+    syn_files = _job_files(Path(synthetic)) if synthetic is not None else []
+    if synthetic is not None and not syn_files:
         raise SystemExit(f"no job_*.json in {synthetic}")
     per_bundle = []
     for bundle in bundles:
@@ -171,7 +172,8 @@ def merge(synthetic: Path, bundles, out: Path) -> dict:
         summary.update({
             "total_jobs_written": len(merged),
             "dag": dag,
-            "merged": {"tool": "merge_workflow_jobs.py", "synthetic": str(synthetic),
+            "merged": {"tool": "merge_workflow_jobs.py",
+                       "synthetic": str(synthetic) if synthetic is not None else None,
                        "synthetic_jobs": len(syn), "bundles": [str(b) for b in bundles],
                        "real_jobs": written_real,
                        "renamed": "simulated jobs' file names -> replay<id>__<basename>"},
@@ -185,7 +187,8 @@ def merge(synthetic: Path, bundles, out: Path) -> dict:
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--synthetic", required=True, type=Path)
+    ap.add_argument("--synthetic", type=Path, default=None,
+                    help="the simulated job set; omit to merge the bundles alone")
     ap.add_argument("--bundle", required=True, type=Path, action="append",
                     help="a converted bundle; repeat for several workflows")
     ap.add_argument("--out", required=True, type=Path)
