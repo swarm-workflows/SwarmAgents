@@ -1,0 +1,80 @@
+# First runs of the cells never run before (author, 2026-11-09: "lets run the ones we haven't run
+# at all"): E1' flat Mesh ladder and E5. Agent code = 9260a044 (the stash fix); if the freeze tags
+# this code, these runs ARE frozen-campaign runs and are not repeated.
+#
+#   E1' Mesh-180   PBFT, Snow, Hybrid x analytic, 2 agents/VM on 90 hosts, 3600 jobs, x5 (plan §3.3, §4.2)
+#                  NOTE: Hybrid chooses its engine by tier (PBFT at level 0, Snow among coordinators);
+#                  a flat mesh is all level 0, so Mesh-180 Hybrid runs PBFT. Kept because the plan
+#                  lists it; it is ordered last in the rung so it can be dropped before it starts.
+#   E1' Mesh-90    PBFT, Snow, 1/VM, 1800 jobs, x5  (conditional rungs: the F1 gate found no
+#   E1' Mesh-120   PBFT, Snow, 2/VM on 60 hosts, 2400 jobs, x5   hierarchical collapse at Hier-270)
+#   E5             gossip off (Hier-90, PBFT + Snow) and coordinator_cost_matrix: peers (Hier-90 and
+#                  Hier-270, PBFT + Snow), analytic G=1, x3; configs from campaigns/make_e5_configs.py
+#
+# Arm configs: PBFT campaigns/config_pbft.yml (Hier-270: config_pbft_hier270.yml), Snow
+# config_swarm_multi.yml, Hybrid campaigns/config_hybrid.yml — the E1' analytic arms. Loads: the
+# burst (20 jobs/s, --arrival batch), as E0. Workloads: replay-golden duplicated
+# (/root/workloads/jobs_<N>, 20 jobs per agent).
+#
+#   tmux new -s first 'python3.11 campaign.py campaigns/first-runs-21a2d9bb.yml --python python3.11 2>&1 | tee /root/campaign-first-runs.out'
+out: runs/campaign-first-runs-21a2d9bb
+
+defaults:
+  runner: run_test.py
+  repeats: 5
+  retries: 1
+  timeout_s: 9000
+  args:
+    mode: remote
+    agent-type: resource
+    db-host: database
+    agent-hosts-file: agent_hosts.txt
+    master-fleet-size: 270
+    seed: 42
+    rtt-samples: 20
+    all-dtns: true
+    hierarchical-level1-agent-type: resource
+    inflight-drain-max-s: 1800
+    runtime: 3600
+
+gate:
+  redis: {host: database, port: 6379}
+  clock_check: ./fix_slice_clocks.sh --check
+  retries: 3
+  wait_s: 300
+
+cells:
+  # ---- E1' flat Mesh ladder ------------------------------------------------------------
+  - name: e1-mesh180-pbft-analytic
+    args: {topology: mesh, agents: 180, agents-per-host: 2, jobs: 3600, pegasus-jobs-dir: /root/workloads/jobs_3600, base-config: campaigns/config_pbft.yml}
+  - name: e1-mesh180-snow-analytic
+    args: {topology: mesh, agents: 180, agents-per-host: 2, jobs: 3600, pegasus-jobs-dir: /root/workloads/jobs_3600, base-config: config_swarm_multi.yml}
+  - name: e1-mesh180-hybrid-analytic
+    args: {topology: mesh, agents: 180, agents-per-host: 2, jobs: 3600, pegasus-jobs-dir: /root/workloads/jobs_3600, base-config: campaigns/config_hybrid.yml}
+  - name: e1-mesh90-pbft-analytic
+    args: {topology: mesh, agents: 90, agents-per-host: 1, jobs: 1800, pegasus-jobs-dir: /root/workloads/jobs_1800, base-config: campaigns/config_pbft.yml}
+  - name: e1-mesh90-snow-analytic
+    args: {topology: mesh, agents: 90, agents-per-host: 1, jobs: 1800, pegasus-jobs-dir: /root/workloads/jobs_1800, base-config: config_swarm_multi.yml}
+  - name: e1-mesh120-pbft-analytic
+    args: {topology: mesh, agents: 120, agents-per-host: 2, jobs: 2400, pegasus-jobs-dir: /root/workloads/jobs_2400, base-config: campaigns/config_pbft.yml}
+  - name: e1-mesh120-snow-analytic
+    args: {topology: mesh, agents: 120, agents-per-host: 2, jobs: 2400, pegasus-jobs-dir: /root/workloads/jobs_2400, base-config: config_swarm_multi.yml}
+  # ---- E5 ------------------------------------------------------------------------------
+  - name: e5-hier90-pbft-gossipoff
+    repeats: 3
+    args: {topology: hierarchical, agents: 90, agents-per-host: 1, jobs: 1800, pegasus-jobs-dir: /root/workloads/jobs_1800, groups-per-coordinator: 1, base-config: campaigns/config_e5_pbft_gossipoff.yml}
+  - name: e5-hier90-snow-gossipoff
+    repeats: 3
+    args: {topology: hierarchical, agents: 90, agents-per-host: 1, jobs: 1800, pegasus-jobs-dir: /root/workloads/jobs_1800, groups-per-coordinator: 1, base-config: campaigns/config_e5_snow_gossipoff.yml}
+  - name: e5-hier90-pbft-peers
+    repeats: 3
+    args: {topology: hierarchical, agents: 90, agents-per-host: 1, jobs: 1800, pegasus-jobs-dir: /root/workloads/jobs_1800, groups-per-coordinator: 1, base-config: campaigns/config_e5_pbft_peers.yml}
+  - name: e5-hier90-snow-peers
+    repeats: 3
+    args: {topology: hierarchical, agents: 90, agents-per-host: 1, jobs: 1800, pegasus-jobs-dir: /root/workloads/jobs_1800, groups-per-coordinator: 1, base-config: campaigns/config_e5_snow_peers.yml}
+  - name: e5-hier270-pbft-peers
+    repeats: 3
+    args: {topology: hierarchical, agents: 270, agents-per-host: 3, jobs: 5400, pegasus-jobs-dir: /root/workloads/jobs_5400, groups-per-coordinator: 1, base-config: campaigns/config_e5_pbft_hier270_peers.yml}
+  - name: e5-hier270-snow-peers
+    repeats: 3
+    args: {topology: hierarchical, agents: 270, agents-per-host: 3, jobs: 5400, pegasus-jobs-dir: /root/workloads/jobs_5400, groups-per-coordinator: 1, base-config: campaigns/config_e5_snow_peers.yml}
