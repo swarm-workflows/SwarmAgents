@@ -243,7 +243,16 @@ class _HostAdapter(ConsensusHost):
     # for replay when the job shows up (see _replay_pending_consensus) instead of losing
     # the vote. Bounded so a burst can't grow memory without limit.
     _PENDING_MAX_OBJECTS = 2048
+    #: The per-job floor, and the whole cap in a tier of 4 or fewer voters.
     _PENDING_MAX_PER_OBJECT = 32
+    #: Stashed messages allowed per voter in this agent's tier: a PREPARE and a COMMIT on each of
+    #: up to four competing proposals. A flat 32 was sized for tiers of 3-9; at Hier-270's 27
+    #: coordinators one job draws well over 100 votes, and the coordinators on the host farthest
+    #: from Redis (which learn of a job last) overflowed and dropped ~17,000 votes a run. Those
+    #: coordinators then never committed, so a commit split could not be resolved (the resolver
+    #: needs every live voter's COMMIT) and 1-7 jobs a run waited out the 300 s reselection
+    #: (runs/campaign-e1-hier270-ed8c9101, PBFT analytic at 7 jobs/s).
+    _PENDING_PER_VOTER = 8
 
     @staticmethod
     def _only_object(msg, object_id: str):
@@ -280,13 +289,26 @@ class _HostAdapter(ConsensusHost):
                 return
             stashed_at.setdefault(object_id, time.monotonic())
             bucket = store.setdefault(object_id, [])
-            if len(bucket) >= self._PENDING_MAX_PER_OBJECT:
+            if len(bucket) >= self._per_object_cap():
                 self.agent.pending_consensus_dropped += 1
                 return
             bucket.append(self._only_object(msg, object_id))
         # After the stash, never before: the fetcher replays what is stashed, so a request made
         # first could fetch and replay before this message was in it.
         agent._request_job_fetch(object_id)
+
+    def _per_object_cap(self) -> int:
+        """Messages stashed per job: `_PENDING_PER_VOTER` per voter in this agent's tier, never
+        below `_PENDING_MAX_PER_OBJECT`. The tier is the larger of the live neighbour map and the
+        configured group size, so the cap does not shrink while peers are still registering or
+        after one is declared failed."""
+        agent = self.agent
+        try:
+            voters = max(int(getattr(agent, "live_agent_count", 0) or 0),
+                         int(getattr(agent, "configured_agent_count", 0) or 0))
+        except Exception:
+            voters = 0
+        return max(self._PENDING_MAX_PER_OBJECT, self._PENDING_PER_VOTER * voters)
 
     #: How long a stashed message waits for its job (§G). Only a job id appearing in the PENDING
     #: scan drained the stash, so messages for a job that never becomes PENDING here (a child
