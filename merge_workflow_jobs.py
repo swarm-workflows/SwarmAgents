@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""Merge a converted workflow bundle into a simulated job set: the E1′ mixed rung (T-6).
+"""Merge converted workflow bundles into a simulated job set: the E1′ mixed rung (T-6).
 
     python3.11 merge_workflow_jobs.py --synthetic /root/workloads/jobs_1800 \
-        --bundle /export/swarm-wf/jobs2 --out /export/swarm-wf/mixed_1800_soil
+        --bundle cper_bundle --bundle eht_bundle --out /export/swarm-wf/mixed_1800_wf
+
+Several bundles may be merged (one per workflow): their real jobs follow the simulated ones in
+the order given, their code/inputs/manifests are unioned, and any name two workflows share —
+a produced-and-read file, a code or input path, an image — is refused unless it is the same file.
 
 The output is ONE directory that `run_test.py --pegasus-jobs-dir` publishes, and that the mixed
 cells' `runtime.execution.bundle` points at: the simulated jobs, then the bundle's real jobs,
@@ -54,23 +58,61 @@ def _rename(entries, job_id):
     return out
 
 
-def merge(synthetic: Path, bundle: Path, out: Path) -> dict:
+def _merge_manifests(manifests):
+    """Union the bundles' manifests. A code path, input name or image name that two bundles
+    both declare is allowed only when it is the same file (same sha256); anything else would
+    be two workflows reading one name, which the flat working directory cannot keep apart."""
+    out = {"code": {}, "inputs": {}, "images": {}, "missing": []}
+    for b, m in manifests:
+        for kind in ("code", "inputs", "images"):
+            section = m.get(kind) or {}
+            if isinstance(section, list):            # older manifests list bundled paths only
+                section = {str(x): {"bundled": str(x)} for x in section}
+            for key, entry in section.items():
+                prev = out[kind].get(key)
+                if prev is not None and prev.get("sha256") != entry.get("sha256"):
+                    raise SystemExit(f"{kind} {key!r} is declared by two bundles with different "
+                                     f"content (one of them {b}); refusing to merge")
+                out[kind][key] = entry
+        out["missing"].extend(m.get("missing") or [])
+    bundled = {}
+    for kind in ("code", "inputs"):
+        for key, entry in out[kind].items():
+            rel = entry.get("bundled")
+            if rel and bundled.setdefault(rel, entry.get("sha256")) != entry.get("sha256"):
+                raise SystemExit(f"two bundles place different files at {rel}; refusing to merge")
+    return out
+
+
+def merge(synthetic: Path, bundles, out: Path) -> dict:
+    """Merge one or more converted bundles into the simulated set `synthetic`, writing `out`."""
+    bundles = [Path(b) for b in (bundles if isinstance(bundles, (list, tuple)) else [bundles])]
     if out.exists():
         raise SystemExit(f"{out} exists; refusing to merge into it (delete it first)")
-    for need in ("manifest.json", "conversion_summary.json"):
-        if not (bundle / need).is_file():
-            raise SystemExit(f"{bundle} has no {need}; it is not a converted bundle")
+    if len({b.resolve() for b in bundles}) != len(bundles):
+        raise SystemExit("the same bundle is given twice")
+    for bundle in bundles:
+        for need in ("manifest.json", "conversion_summary.json"):
+            if not (bundle / need).is_file():
+                raise SystemExit(f"{bundle} has no {need}; it is not a converted bundle")
     syn_files = _job_files(synthetic)
-    real_files = _job_files(bundle)
-    if not syn_files or not real_files:
-        raise SystemExit(f"no job_*.json in {synthetic if not syn_files else bundle}")
-    bsum = json.loads((bundle / "conversion_summary.json").read_text())
+    if not syn_files:
+        raise SystemExit(f"no job_*.json in {synthetic}")
+    per_bundle = []
+    for bundle in bundles:
+        files = _job_files(bundle)
+        if not files:
+            raise SystemExit(f"no job_*.json in {bundle}")
+        per_bundle.append((bundle, files, [json.loads(p.read_text()) for p in files],
+                           json.loads((bundle / "conversion_summary.json").read_text()),
+                           json.loads((bundle / "manifest.json").read_text())))
 
     syn = [json.loads(p.read_text()) for p in syn_files]
-    real = [json.loads(p.read_text()) for p in real_files]
-    clash = {str(j["id"]) for j in syn} & {str(j["id"]) for j in real}
-    if clash:
-        raise SystemExit(f"job ids in both sets: {sorted(clash)[:5]}")
+    real = [j for _, _, jobs, _, _ in per_bundle for j in jobs]
+    ids = [str(j["id"]) for j in syn] + [str(j["id"]) for j in real]
+    if len(set(ids)) != len(ids):
+        dup = sorted({i for i in ids if ids.count(i) > 1})
+        raise SystemExit(f"job ids appear more than once: {dup[:5]}")
     for j in syn:
         j["data_in"] = _rename(j.get("data_in"), j["id"])
         j["data_out"] = _rename(j.get("data_out"), j["id"])
@@ -85,33 +127,52 @@ def merge(synthetic: Path, bundle: Path, out: Path) -> dict:
         raise SystemExit(f"merged set is not clean: {len(collisions)} colliding outputs, "
                          f"{len(foreign)} cross-workflow names, e.g. "
                          f"{sorted(collisions or foreign)[:3]}")
+    manifest = _merge_manifests([(b, m) for b, _, _, _, m in per_bundle])
 
     out.mkdir(parents=True)
     try:
         for p, j in zip(syn_files, syn):
             (out / p.name).write_text(json.dumps(j))
-        base = len(syn_files)
+        n = len(syn_files)
         written_real = []
-        for i, (p, j) in enumerate(zip(real_files, real), start=1):
-            name = f"job_{base + i}.json"
-            shutil.copyfile(p, out / name)
-            written_real.append({"file": name, "from": p.name, "id": j["id"]})
-        for d in ("code", "inputs"):
-            if (bundle / d).is_dir():
-                shutil.copytree(bundle / d, out / d, symlinks=True)
-        for f in ("manifest.json", "pegasus_baseline.json"):
-            if (bundle / f).is_file():
-                shutil.copyfile(bundle / f, out / f)
-        dag = dict(bsum.get("dag") or {})
-        dag.update({"colliding_outputs": collisions, "cross_workflow_edges": foreign,
-                    "replica_conflicts": (bsum.get("dag") or {}).get("replica_conflicts") or {},
-                    "execution_jobs": sum(1 for j in merged if j.get("execution"))})
-        summary = dict(bsum)
+        for bundle, files, jobs, _, _ in per_bundle:
+            for p, j in zip(files, jobs):
+                n += 1
+                name = f"job_{n}.json"
+                shutil.copyfile(p, out / name)
+                written_real.append({"file": name, "bundle": str(bundle), "from": p.name,
+                                     "id": j["id"], "workflow": j.get("workflow")})
+            for d in ("code", "inputs"):
+                if (bundle / d).is_dir():
+                    shutil.copytree(bundle / d, out / d, symlinks=True, dirs_exist_ok=True)
+        (out / "manifest.json").write_text(json.dumps(manifest, indent=2))
+        runs = {}
+        for bundle, *_ in per_bundle:
+            f = bundle / "pegasus_baseline.json"
+            if f.is_file():
+                runs.update(json.loads(f.read_text()).get("runs") or {})
+        (out / "pegasus_baseline.json").write_text(json.dumps(
+            {"metadata": {"merged_from": [str(b) for b in bundles], "total_runs": len(runs)},
+             "runs": runs}, indent=2))
+
+        sums = [s for _, _, _, s, _ in per_bundle]
+        dag = dict(sums[0].get("dag") or {})
+        replica_conflicts = {}
+        for s in sums:
+            replica_conflicts.update((s.get("dag") or {}).get("replica_conflicts") or {})
+        dag.update({
+            "gating": any((s.get("dag") or {}).get("gating") for s in sums),
+            "edges": sum(int((s.get("dag") or {}).get("edges") or 0) for s in sums),
+            "roots": [r for s in sums for r in ((s.get("dag") or {}).get("roots") or [])],
+            "colliding_outputs": collisions, "cross_workflow_edges": foreign,
+            "replica_conflicts": replica_conflicts,
+            "execution_jobs": sum(1 for j in merged if j.get("execution"))})
+        summary = dict(sums[0])
         summary.update({
             "total_jobs_written": len(merged),
             "dag": dag,
             "merged": {"tool": "merge_workflow_jobs.py", "synthetic": str(synthetic),
-                       "synthetic_jobs": len(syn), "bundle": str(bundle),
+                       "synthetic_jobs": len(syn), "bundles": [str(b) for b in bundles],
                        "real_jobs": written_real,
                        "renamed": "simulated jobs' file names -> replay<id>__<basename>"},
         })
@@ -125,13 +186,18 @@ def merge(synthetic: Path, bundle: Path, out: Path) -> dict:
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--synthetic", required=True, type=Path)
-    ap.add_argument("--bundle", required=True, type=Path)
+    ap.add_argument("--bundle", required=True, type=Path, action="append",
+                    help="a converted bundle; repeat for several workflows")
     ap.add_argument("--out", required=True, type=Path)
     a = ap.parse_args(argv)
     s = merge(a.synthetic, a.bundle, a.out)
     m = s["merged"]
-    print(f"{a.out}: {m['synthetic_jobs']} simulated + {len(m['real_jobs'])} real "
-          f"({', '.join(r['file'] for r in m['real_jobs'])}); names clean")
+    per = {}
+    for r in m["real_jobs"]:
+        per.setdefault(r.get("workflow") or r["bundle"], []).append(r["file"])
+    print(f"{a.out}: {m['synthetic_jobs']} simulated + {len(m['real_jobs'])} real; names clean")
+    for wf, files in per.items():
+        print(f"  {wf}: {len(files)} jobs ({files[0]} .. {files[-1]})")
 
 
 if __name__ == "__main__":

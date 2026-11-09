@@ -134,3 +134,68 @@ def test_refusals(tmp_path):
     (bun / "manifest.json").unlink()
     with pytest.raises(SystemExit):
         mw.merge(syn, bun, tmp_path / "other")        # not a converted bundle
+
+
+# --------------------------------------------------------------------------- several workflows
+def _bundle(tmp_path, name, wf, files, image="img", code="code/a.py"):
+    b = tmp_path / name
+    jobs = []
+    for i, (fin, fout) in enumerate(files, start=1):
+        j = {"id": f"{wf}_{i}", "workflow": wf, "execution": {"transformation": f"t{i}"},
+             "data_in": [_dn(f) for f in fin], "data_out": [_dn(f) for f in fout]}
+        _write(b, f"job_{i}.json", j)
+        jobs.append(j)
+    (b / Path(code).parent).mkdir(parents=True, exist_ok=True)
+    (b / code).write_text(f"# {wf}\n")
+    _write(b, "manifest.json", {"code": {f"/src/{wf}/{code}": {"bundled": code, "sha256": wf}},
+                                "inputs": {}, "images": {image: {"sha256": image}}, "missing": []})
+    _write(b, "conversion_summary.json", {"total_jobs_written": len(jobs), "dag": {
+        "gating": True, "edges": 1, "roots": [jobs[0]["id"]], "colliding_outputs": {},
+        "cross_workflow_edges": {}, "replica_conflicts": {}, "execution_jobs": len(jobs)}})
+    _write(b, "pegasus_baseline.json", {"metadata": {}, "runs": {f"{wf}_run1": {"makespan_sec": 1}}})
+    return b
+
+
+from pathlib import Path  # noqa: E402
+
+
+def test_two_workflows_merge_in_order_with_unioned_bundles(tmp_path, monkeypatch):
+    syn, _ = _fixture(tmp_path)
+    a = _bundle(tmp_path, "a", "cper", [([], ["x.csv"]), (["x.csv"], ["y.csv"])],
+                image="cper_img", code="code/ca/ca.py")
+    b = _bundle(tmp_path, "b", "eht", [([], ["u.fits"])], image="eht_img", code="code/eb/eb.py")
+    out = tmp_path / "mixed"
+    s = mw.merge(syn, [a, b], out)
+    files = [r["file"] for r in s["merged"]["real_jobs"]]
+    assert files == ["job_4.json", "job_5.json", "job_6.json"]
+    assert [r["workflow"] for r in s["merged"]["real_jobs"]] == ["cper", "cper", "eht"]
+    m = json.loads((out / "manifest.json").read_text())
+    assert set(m["images"]) == {"cper_img", "eht_img"} and len(m["code"]) == 2
+    assert (out / "code/ca/ca.py").is_file() and (out / "code/eb/eb.py").is_file()
+    assert set(json.loads((out / "pegasus_baseline.json").read_text())["runs"]) == {"cper_run1", "eht_run1"}
+    assert s["dag"]["edges"] == 2 and s["dag"]["execution_jobs"] == 3
+    monkeypatch.setattr(run_test, "_run_execution_mode", lambda a: "real")
+    run_test.validate_pegasus_jobs_dir(argparse.Namespace(pegasus_jobs_dir=str(out), jobs=6))
+
+
+def test_a_name_one_workflow_produces_and_another_reads_is_refused(tmp_path):
+    syn, _ = _fixture(tmp_path)
+    a = _bundle(tmp_path, "a", "cper", [([], ["shared.csv"])], code="code/ca/ca.py")
+    b = _bundle(tmp_path, "b", "eht", [(["shared.csv"], ["u.fits"])], image="i2", code="code/eb/eb.py")
+    with pytest.raises(SystemExit, match="not clean"):
+        mw.merge(syn, [a, b], tmp_path / "mixed")
+    assert not (tmp_path / "mixed").exists()
+
+
+def test_two_bundles_placing_different_code_at_one_path_are_refused(tmp_path):
+    syn, _ = _fixture(tmp_path)
+    a = _bundle(tmp_path, "a", "cper", [([], ["x.csv"])], code="code/run/run.py")
+    b = _bundle(tmp_path, "b", "eht", [([], ["u.fits"])], image="i2", code="code/run/run.py")
+    with pytest.raises(SystemExit, match="different"):
+        mw.merge(syn, [a, b], tmp_path / "mixed")
+
+
+def test_the_same_bundle_twice_is_refused(tmp_path):
+    syn, bun = _fixture(tmp_path)
+    with pytest.raises(SystemExit, match="twice"):
+        mw.merge(syn, [bun, bun], tmp_path / "mixed")
