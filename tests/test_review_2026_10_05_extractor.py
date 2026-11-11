@@ -35,6 +35,30 @@ class TestArguments:
     def test_a_cluster_is_unknown(self):
         assert resolve_arguments(True, ["-i"], True, "", []) == (None, "")
 
+    def test_a_command_line_passed_as_one_argument_is_split_as_pegasus_runs_it(self):
+        """tnseq passes `add_args(f"--input {a} --output {b}")`: one declared argument that
+        Pegasus writes unquoted into a shell line. Kept as one argv entry, every tnseq job
+        failed on its usage message."""
+        argv, raw = resolve_arguments(
+            False, ["--input mapped/WT1_count.txt --operation sum"], True, "", [])
+        assert argv == ["--input", "mapped/WT1_count.txt", "--operation", "sum"]
+        assert raw == "--input mapped/WT1_count.txt --operation sum"
+
+    def test_separately_declared_arguments_are_joined_then_split(self):
+        assert resolve_arguments(False, ["--day", "6", "--a b"], True, "", [])[0] == \
+            ["--day", "6", "--a", "b"]
+
+    def test_quotes_group_as_the_shell_would(self):
+        assert resolve_arguments(False, ["--name 'a b'"], True, "", [])[0] == ["--name", "a b"]
+
+    def test_a_line_the_shell_would_expand_is_unknown_not_literal(self):
+        """A variable, glob or redirection makes the real argv unknowable from the line."""
+        for arg in ("--in $HOME/x", "--in *.fq", "--out a > b", "--url http://h/?a=1&b=2"):
+            assert resolve_arguments(False, [arg], True, "", [])[0] is None, arg
+
+    def test_an_unbalanced_quote_is_unknown(self):
+        assert resolve_arguments(False, ["--name 'a"], True, "", [])[0] is None
+
 
 class TestCatalog:
     TRANSFORMATIONS = {"t": {

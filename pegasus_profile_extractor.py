@@ -255,6 +255,26 @@ def load_transformation_catalog(run_dir: str) -> Tuple[Dict[str, dict], Dict[str
     return transformations, containers
 
 
+#: Characters the job's shell would act on beyond splitting words: expansion, globbing,
+#: redirection, command separators. A line containing one cannot be reproduced without a shell.
+_SHELL_ACTIVE = set("$`*?[]~;|&<>(){}!\\")
+
+
+def pegasus_argv(line: str) -> Optional[List[str]]:
+    """The argv the job's shell built from Pegasus's joined argument line, or None (unknown).
+
+    Splitting on whitespace and honouring quotes is all `shlex.split` reproduces. If the line
+    contains anything the shell would also EXPAND (a variable, a glob, a redirection), the argv
+    the job really received is not knowable from the line, so the answer is unknown and the
+    job is refused rather than run with the characters taken literally."""
+    if any(ch in _SHELL_ACTIVE for ch in line):
+        return None
+    try:
+        return shlex.split(line)
+    except ValueError:
+        return None
+
+
 def resolve_arguments(clustered: bool, declared: List[str], resolved: bool,
                       argv_raw: str, argv_list):
     """(argument list, raw string) for one job. `None` means UNKNOWN and is refused at execution;
@@ -267,11 +287,20 @@ def resolve_arguments(clustered: bool, declared: List[str], resolved: bool,
       id is not in it: unknown, not "none". `[]` is runnable and would run the job with no
       arguments, the substitution the None/[] rule exists to prevent (code review §57).
     * Otherwise the recorded argv as parsed (None when it could not be parsed).
+
+    A declared list is split the way Pegasus runs it, not taken element by element. Pegasus
+    joins the arguments with spaces and writes the line, unquoted, into the job's shell script
+    (`pegasus-kickstart ... ./run_smili --input X --day 6`), so the shell splits it again.
+    A workflow may therefore pass a whole command line as ONE argument
+    (`add_args(f"--input {a} --output {b}")`, every tnseq job), which under Pegasus is
+    several. Kept as one element it became a single argv entry and every such job failed on
+    its own usage message. See `pegasus_argv`.
     """
     if clustered:
         return None, ""
     if declared:
-        return list(declared), " ".join(declared)
+        line = " ".join(declared)
+        return pegasus_argv(line), line
     if not resolved and not (argv_raw or "").strip():
         return None, argv_raw or ""
     return argv_list, argv_raw
