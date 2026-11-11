@@ -31,6 +31,7 @@ explicit prefix map rather than a basename search because two workflows can have
 """
 import hashlib
 import logging
+import math
 import re
 import os
 import shlex
@@ -80,6 +81,37 @@ _URL_CREDENTIALS = re.compile(r"://[^/@\s:]+:[^/@\s]+@")
 #: Agent-internal variables that are not secrets but mean nothing to a job and would be
 #: actively misleading inside one.
 _AGENT_ONLY_VARS = ("SWARM_RUN_ID", "LLM_BASE_URL")
+
+
+#: The thread-count variables a job's limit is written to. HTCondor, which every Pegasus
+#: reference in this repo ran on, sets these to the job's `request_cpus` (its
+#: STARTER_NUM_THREADS_ENV_VARS); SWARM set none, so a numerical job started one thread per
+#: host core whatever it had been granted. Three SMILI jobs sharing a 16-core agent then ran
+#: 1100-2000 s each against 75 s alone (T-6 pilot, 11 Nov 2026); limited to 1 thread, three
+#: concurrent copies ran 64 s each.
+THREAD_LIMIT_VARS = (
+    "OMP_NUM_THREADS", "OMP_THREAD_LIMIT", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "GOMAXPROCS", "JULIA_NUM_THREADS",
+    "TF_NUM_THREADS",
+)
+
+
+def thread_limit_env(cores) -> Dict[str, str]:
+    """The thread-limit variables for a job granted `cores` cores, as HTCondor sets them.
+
+    A fractional request rounds UP (0.5 core is one thread, never zero, and a 1.5-core job is
+    allowed two). An unknown, zero or unparseable request sets nothing: inventing a limit for a
+    job that declared none would throttle it without any record of why, and every real job
+    the converter emits carries its request.
+    """
+    try:
+        c = float(cores)
+    except (TypeError, ValueError):
+        return {}
+    if not c > 0 or c != c:
+        return {}
+    n = str(max(1, math.ceil(c)))
+    return {name: n for name in THREAD_LIMIT_VARS}
 
 
 def job_environment(base: Optional[Dict[str, str]] = None) -> Dict[str, str]:
@@ -373,8 +405,14 @@ def _available_runtime(kind: str, pol: ExecutionPolicy) -> Optional[str]:
 
 
 def build_command(spec: ExecutionSpec, work_dir: str,
-                  pol: Optional[ExecutionPolicy] = None) -> Tuple[List[str], str]:
+                  pol: Optional[ExecutionPolicy] = None,
+                  job_env: Optional[Dict[str, str]] = None) -> Tuple[List[str], str]:
     """Build the argv to run, or return ([], reason) explaining the refusal.
+
+    `job_env` (the thread limits, `thread_limit_env`) must reach the process INSIDE the
+    container, and neither runtime passes the launcher's environment through: apptainer's
+    `--containall` starts from a clean one and docker never inherits. So it is written into
+    the argv (`--env` / `-e`). A bare executable gets it from `run()`'s process environment.
 
     Three shapes, and the bind mount in the container cases is the interesting part. A
     `stageable` transformation's code is *not* in the image — Pegasus stages it in at run
@@ -454,6 +492,8 @@ def build_command(spec: ExecutionSpec, work_dir: str,
                         f"set runtime.execution.image_overrides[{container.name!r}] to a "
                         f"docker image.")
         cmd = ["docker", "run", "--rm", "-v", f"{work_dir}:{work_dir}", "-w", work_dir]
+        for name, value in sorted((job_env or {}).items()):
+            cmd += ["-e", f"{name}={value}"]
         for host, inside in binds:
             cmd += ["-v", f"{host}:{inside}:ro"]
         # --entrypoint, because the image's own entrypoint would otherwise swallow the
@@ -496,6 +536,8 @@ def build_command(spec: ExecutionSpec, work_dir: str,
     if pol.apptainer_containall:
         cmd.append("--containall")
     cmd += ["--bind", f"{work_dir}:{work_dir}", "--pwd", work_dir]
+    for name, value in sorted((job_env or {}).items()):
+        cmd += ["--env", f"{name}={value}"]
     for host, inside in binds:
         # Read-only, as under docker: the staged code bundle is shared by every agent of the
         # run, and a job must not be able to change the code the next job runs (§69).
@@ -749,8 +791,11 @@ def run(spec: ExecutionSpec, job_id: str,
         pol: Optional[ExecutionPolicy] = None,
         data_in=None,
         locator=None, run_id: str = "", requester: str = "",
-        data_out=None) -> ExecutionResult:
+        data_out=None, cores=None) -> ExecutionResult:
     """Execute one job and return its real outcome.
+
+    `cores` is the job's requested core count; the job runs with its thread-count variables
+    set to it (`thread_limit_env`), as under HTCondor.
 
     Never raises: a refusal and a crash are both reported as an `ExecutionResult`, because
     the caller is `Job.execute()`, whose own exception handler would otherwise record a
@@ -785,7 +830,8 @@ def run(spec: ExecutionSpec, job_id: str,
         return ExecutionResult(exit_status=1, refused=True, reason=str(staging_refusal),
                                transient=isinstance(staging_refusal, TransientRefusal))
 
-    cmd, refusal = build_command(spec, work_dir, pol)
+    limits = thread_limit_env(cores)
+    cmd, refusal = build_command(spec, work_dir, pol, job_env=limits)
     if not cmd:
         return ExecutionResult(exit_status=1, refused=True, reason=refusal)
 
@@ -842,7 +888,7 @@ def run(spec: ExecutionSpec, job_id: str,
         # the job's resources held for the rest of the run.
         proc = subprocess.Popen(cmd, cwd=work_dir, stdout=stdout, stderr=stderr,
                                 stdin=subprocess.DEVNULL, start_new_session=True,
-                                env=job_environment())
+                                env={**job_environment(), **limits})
         _register(proc, container)
         rc = proc.wait(timeout=timeout_s if timeout_s is not None else pol.timeout_s)
         return ExecutionResult(exit_status=int(rc), duration_s=time.monotonic() - started,
@@ -910,13 +956,13 @@ def _name_container(cmd: List[str], job_id: str, run_id: str) -> Tuple[List[str]
 
 def _apptainer_image_index(cmd: List[str]) -> Optional[int]:
     """Index of the image in an `apptainer exec` argv built by `build_command`: the first
-    argument after the flags (`--containall`, `--bind X`, `--pwd X`)."""
+    argument after the flags (`--containall`, `--bind X`, `--pwd X`, `--env X`)."""
     if len(cmd) < 3 or os.path.basename(cmd[0]) not in ("apptainer", "singularity") \
             or cmd[1] != "exec":
         return None
     i = 2
     while i < len(cmd):
-        if cmd[i] in ("--bind", "--pwd"):
+        if cmd[i] in ("--bind", "--pwd", "--env"):
             i += 2
         elif cmd[i].startswith("--"):
             i += 1

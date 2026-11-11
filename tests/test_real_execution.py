@@ -497,6 +497,78 @@ class TestEnvironmentIsScrubbed(PolicyTestCase):
             self.assertEqual(Path(result.stdout_path).read_text().strip(), "ABSENT")
 
 
+class TestThreadLimits(PolicyTestCase):
+    """A job's threads are limited to the cores it requested, as HTCondor limits them.
+
+    Without it, a 1-core numerical job started one thread per HOST core: in the T-6 pilot
+    (11 Nov 2026) three EHT SMILI jobs sharing a 16-core agent ran 1100-2000 s each against
+    75 s alone, and the Pegasus reference they were compared with ran under HTCondor's limit.
+    The limit must reach the process INSIDE the container, which neither runtime inherits.
+    """
+
+    def _spec(self, kind="singularity", image="/img/x.sif"):
+        return ExecutionSpec.from_dict({
+            "path": "/srv/x", "arguments": ["a"], "pfn_type": "installed",
+            "container": {"name": "c", "kind": kind, "image": image}})
+
+    def test_the_limit_is_the_request_rounded_up_never_zero(self):
+        self.assertEqual(runner.thread_limit_env(1.0)["OMP_NUM_THREADS"], "1")
+        self.assertEqual(runner.thread_limit_env(0.5)["OMP_NUM_THREADS"], "1")
+        self.assertEqual(runner.thread_limit_env(1.5)["OPENBLAS_NUM_THREADS"], "2")
+        self.assertEqual(runner.thread_limit_env(4)["MKL_NUM_THREADS"], "4")
+        self.assertEqual(set(runner.thread_limit_env(2)), set(runner.THREAD_LIMIT_VARS))
+
+    def test_no_request_invents_no_limit(self):
+        for cores in (None, 0, -1, "x", float("nan")):
+            self.assertEqual(runner.thread_limit_env(cores), {}, cores)
+
+    def test_apptainer_passes_it_through_containall(self):
+        """`--containall` starts the container from a clean environment, so the limit has
+        to be in the argv, and the image must still be found after the new flags."""
+        runner.configure(container_runtime="apptainer")
+        with patch("shutil.which", return_value="/usr/bin/apptainer"):
+            cmd, reason = runner.build_command(self._spec(), "/w",
+                                               job_env=runner.thread_limit_env(1))
+        self.assertEqual(reason, "")
+        self.assertIn("--containall", cmd)
+        i = cmd.index("OMP_NUM_THREADS=1")
+        self.assertEqual(cmd[i - 1], "--env")
+        self.assertEqual(cmd[runner._apptainer_image_index(cmd)], "/img/x.sif")
+        self.assertEqual(cmd[-2:], ["/srv/x", "a"])
+
+    def test_docker_passes_it_with_e(self):
+        runner.configure(container_runtime="docker")
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            cmd, reason = runner.build_command(self._spec("docker", "docker://img:1"), "/w",
+                                               job_env={"OMP_NUM_THREADS": "2"})
+        self.assertEqual(reason, "")
+        self.assertEqual(cmd[cmd.index("OMP_NUM_THREADS=2") - 1], "-e")
+        self.assertLess(cmd.index("-e"), cmd.index("img:1"))
+
+    def test_a_bare_job_really_runs_with_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = script(tmp, "t.sh", 'echo "${OMP_NUM_THREADS:-UNSET}"')
+            runner.configure(mode="real", work_dir=os.path.join(tmp, "work"))
+            spec = ExecutionSpec.from_dict({"path": "/u", "pfn": path, "arguments": []})
+            with patch.dict(os.environ, {"OMP_NUM_THREADS": "64"}):
+                limited = runner.run(spec, "lim", cores=1)
+                unlimited = runner.run(spec, "unlim")
+            self.assertEqual(Path(limited.stdout_path).read_text().strip(), "1")
+            # No request: the job keeps whatever the agent's environment says.
+            self.assertEqual(Path(unlimited.stdout_path).read_text().strip(), "64")
+
+    def test_the_job_hands_its_request_to_the_runner(self):
+        from swarm.models.capacities import Capacities
+        job = Job()
+        job.job_id = "j"
+        job.capacities = Capacities(core=1)
+        job.execution = {"path": "/u", "pfn": TRUE_BIN, "arguments": []}
+        with patch.object(runner, "run",
+                          return_value=runner.ExecutionResult(exit_status=0)) as run:
+            job._execute_real()
+        self.assertEqual(run.call_args.kwargs["cores"], 1)
+
+
 # --------------------------------------------------------------------------------------
 # Roots: naming code, inputs and images without absolute paths.
 # --------------------------------------------------------------------------------------

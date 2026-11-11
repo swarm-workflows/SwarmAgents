@@ -611,8 +611,12 @@ class Job(Object):
 
         # `data_in` is the job's own declaration of what it reads; the runner stages from
         # it rather than from a second list on the execution spec.
+        # The request rides with the job so the runner can limit its threads to it, as
+        # HTCondor does; without it a 1-core numerical job started one thread per host core.
+        cap = self.capacities
         result = runner.run(self._execution, self.job_id, data_in=self.data_in,
-                            data_out=self.data_out)
+                            data_out=self.data_out,
+                            cores=cap.core if cap is not None else None)
         self._refusal_reason = (result.reason or "refused") if result.refused else None
         self._refusal_transient = bool(result.refused and result.transient)
         if result.refused:
