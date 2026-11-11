@@ -1,9 +1,10 @@
 # E1' mixed rung (T-6, plan §10): the Hier-90 analytic cells with the real workflows merged into
-# the simulated set — 1800 simulated + 22 cper-soilmoisture + 30 eht-m87 real jobs
+# the simulated set — 1800 simulated + 22 cper-soilmoisture + 30 eht-m87 + 35 tnseq real jobs
 # (/export/swarm-wf/mixed_1800_wf, merge_workflow_jobs.py; simulated jobs' file names renamed,
 # nothing else). PBFT and Snow, 3 repeats, burst arrivals as E0. Real jobs arrive after the
-# simulated ones (job_1801..1852). Real rows are split out in every figure; their wall time is
-# uncapped. Run only after the §10 standalone pilot (campaigns/t6-wfpilot.yml) passes.
+# simulated ones (job_1801..1887; tnseq is job_1853..1887, merged 11 Nov 2026). Real rows are split out in every figure; their wall time is
+# uncapped. Run only after the §10 standalone pilots (campaigns/t6-wfpilot.yml, t6-tnpilot.yml) pass.
+# The 1852-job set without tnseq is kept as /export/swarm-wf/mixed_1800_wf.pre-tnseq.
 #
 #   tmux new -s mixed 'python3.11 campaign.py campaigns/t6-mixed-hier90.yml --python python3.11 2>&1 | tee /root/campaign-t6-mixed.out'
 out: runs/campaign-t6-mixed-hier90
@@ -33,9 +34,9 @@ gate:
 cells:
   - name: e1-hier90-pbft-mixed
     repeats: 3
-    args: {topology: hierarchical, agents: 90, agents-per-host: 1, jobs: 1852, groups-per-coordinator: 1,
+    args: {topology: hierarchical, agents: 90, agents-per-host: 1, jobs: 1887, groups-per-coordinator: 1,
            pegasus-jobs-dir: /export/swarm-wf/mixed_1800_wf, base-config: campaigns/config_mixed_pbft.yml}
   - name: e1-hier90-snow-mixed
     repeats: 3
-    args: {topology: hierarchical, agents: 90, agents-per-host: 1, jobs: 1852, groups-per-coordinator: 1,
+    args: {topology: hierarchical, agents: 90, agents-per-host: 1, jobs: 1887, groups-per-coordinator: 1,
            pegasus-jobs-dir: /export/swarm-wf/mixed_1800_wf, base-config: campaigns/config_mixed_snow.yml}
