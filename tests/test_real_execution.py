@@ -152,6 +152,31 @@ class TestRunsForReal(PolicyTestCase):
             kept = os.listdir(os.path.join(work, runner.JOB_DIRS))
             self.assertEqual(len(kept), 1)
 
+    def test_a_failed_output_handoff_fails_the_job_and_keeps_the_results(self):
+        """Stop-time review: a rename that failed was only logged, then the job directory,
+        results included, was deleted and the job reported exit 0."""
+        with tempfile.TemporaryDirectory() as tmp:
+            work = os.path.join(tmp, "work")
+            good = script(tmp, "g.sh", "echo result > out.txt")
+            runner.configure(mode="real", work_dir=work)
+            real_replace = os.replace
+
+            def failing_replace(src, dst):
+                if os.path.basename(dst) == "out.txt":
+                    raise OSError(28, "No space left on device")
+                return real_replace(src, dst)
+
+            with patch.object(runner.os, "replace", side_effect=failing_replace):
+                result = runner.run(ExecutionSpec.from_dict(
+                    {"path": "/u", "pfn": good, "arguments": []}), "g",
+                    data_out=[_Node("out.txt")])
+            self.assertNotEqual(result.exit_status, 0)
+            self.assertIn("out.txt", result.reason)
+            kept = os.listdir(os.path.join(work, runner.JOB_DIRS))
+            self.assertEqual(len(kept), 1)
+            self.assertEqual(
+                Path(work, runner.JOB_DIRS, kept[0], "out.txt").read_text().strip(), "result")
+
     def test_a_declared_input_missing_from_the_run_directory_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             work = os.path.join(tmp, "work")

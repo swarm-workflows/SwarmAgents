@@ -907,7 +907,16 @@ def run(spec: ExecutionSpec, job_id: str,
         if rc == 0:
             # Only a successful job's outputs come back, as Pegasus stages out only on
             # success; a failed job's directory is kept for inspection.
-            _return_outputs(job_dir, work_dir, data_out, job_id)
+            unreturned = _return_outputs(job_dir, work_dir, data_out, job_id)
+            if unreturned:
+                # The results exist but are not where descendants and publication look. Keep
+                # the directory that still holds them and fail the job, as a Pegasus
+                # stage-out failure fails it; never report success over a missing handoff.
+                return ExecutionResult(
+                    exit_status=1, duration_s=duration,
+                    reason=(f"exited 0 but its outputs could not be returned to {work_dir} "
+                            f"({'; '.join(unreturned)}); kept in {job_dir}"),
+                    stdout_path=out_path, stderr_path=err_path, command=cmd)
             shutil.rmtree(job_dir, ignore_errors=True)
         else:
             logger.warning("[EXEC] %s: exited %s; its directory is kept at %s",
@@ -1114,12 +1123,17 @@ def _private_job_dir(work_dir: str, job_id: str, data_in) -> Tuple[str, str]:
     return job_dir, ""
 
 
-def _return_outputs(job_dir: str, work_dir: str, data_out, job_id: str) -> None:
+def _return_outputs(job_dir: str, work_dir: str, data_out, job_id: str) -> List[str]:
     """Move a successful job's declared outputs into the shared directory, each atomically.
 
+    Returns the outputs that could NOT be moved, each with its error. The caller must then
+    keep the job directory, which still holds them, and fail the job: deleting the directory
+    would destroy valid results while reporting success.
+
     A declared output the job did not write is left missing, which publication reports as
-    "exited 0 but did not write it" (§67), the same as before.
+    "exited 0 but did not write it" (§67), the same as before; it is not a handoff failure.
     """
+    failed: List[str] = []
     for rel in _declared_relpaths(data_out):
         src = os.path.join(job_dir, rel)
         if not os.path.exists(src):
@@ -1133,6 +1147,8 @@ def _return_outputs(job_dir: str, work_dir: str, data_out, job_id: str) -> None:
             os.replace(src, dst)
         except OSError as exc:
             logger.error("[EXEC] %s: could not return output %s (%s)", job_id, rel, exc)
+            failed.append(f"{rel}: {exc}")
+    return failed
 
 
 def _clear_declared_outputs(data_out, work_dir: str, job_id: str) -> None:
