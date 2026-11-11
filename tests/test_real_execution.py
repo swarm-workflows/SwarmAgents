@@ -82,28 +82,88 @@ class TestRunsForReal(PolicyTestCase):
         self.assertEqual(result.exit_status, 3)
         self.assertFalse(result.refused)
 
-    def test_the_job_runs_in_the_shared_working_directory(self):
-        """Bare logical file names only resolve between jobs of a DAG if they share a cwd."""
+    def test_the_job_runs_in_a_private_directory_under_the_run_directory(self):
+        """Each job gets its own cwd, as each Pegasus job gets its own HTCondor scratch
+        directory, and it is cleaned up after a successful job."""
         with tempfile.TemporaryDirectory() as tmp:
             work = os.path.join(tmp, "work")
             path = script(tmp, "w.sh", "pwd > where.txt")
             runner.configure(mode="real", work_dir=work)
             spec = ExecutionSpec.from_dict({"path": "/unused", "pfn": path, "arguments": []})
-            runner.run(spec, "job-3")
-            self.assertEqual(Path(work, "where.txt").read_text().strip(),
-                             os.path.realpath(work))
+            result = runner.run(spec, "job-3", data_out=[_Node("where.txt")])
+            self.assertEqual(result.exit_status, 0)
+            where = Path(work, "where.txt").read_text().strip()
+            self.assertTrue(where.startswith(os.path.join(os.path.realpath(work),
+                                                          runner.JOB_DIRS)), where)
+            self.assertFalse(os.path.exists(where), "a successful job's directory is removed")
 
-    def test_one_jobs_output_is_visible_to_the_next(self):
+    def test_one_jobs_declared_output_is_visible_to_the_next(self):
         with tempfile.TemporaryDirectory() as tmp:
             work = os.path.join(tmp, "work")
             producer = script(tmp, "p.sh", "echo payload > shared.txt")
-            consumer = script(tmp, "c.sh", "test -f shared.txt")
+            consumer = script(tmp, "c.sh", "grep -q payload shared.txt")
             runner.configure(mode="real", work_dir=work)
             runner.run(ExecutionSpec.from_dict(
-                {"path": "/u", "pfn": producer, "arguments": []}), "p")
+                {"path": "/u", "pfn": producer, "arguments": []}), "p",
+                data_out=[_Node("shared.txt")])
             result = runner.run(ExecutionSpec.from_dict(
-                {"path": "/u", "pfn": consumer, "arguments": []}), "c")
+                {"path": "/u", "pfn": consumer, "arguments": []}), "c",
+                data_in=[_Node("shared.txt")])
         self.assertEqual(result.exit_status, 0)
+
+    def test_a_jobs_scratch_files_are_its_own(self):
+        """T-6 pilot, 11 Nov 2026: two SMILI jobs on one agent wrote the same fixed-name
+        scratch script in a shared cwd, and one ran the other's half-prepared copy. An
+        undeclared file never leaves the job's directory, and a job starts without one."""
+        with tempfile.TemporaryDirectory() as tmp:
+            work = os.path.join(tmp, "work")
+            first = script(tmp, "a.sh", "echo mine > scratch.py")
+            second = script(tmp, "b.sh", "test ! -e scratch.py")
+            runner.configure(mode="real", work_dir=work)
+            runner.run(ExecutionSpec.from_dict(
+                {"path": "/u", "pfn": first, "arguments": []}), "a")
+            self.assertFalse(os.path.exists(os.path.join(work, "scratch.py")))
+            result = runner.run(ExecutionSpec.from_dict(
+                {"path": "/u", "pfn": second, "arguments": []}), "b")
+        self.assertEqual(result.exit_status, 0)
+
+    def test_a_job_cannot_change_the_input_its_siblings_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = os.path.join(tmp, "work")
+            os.makedirs(work)
+            Path(work, "in.txt").write_text("original")
+            vandal = script(tmp, "v.sh", "echo changed > in.txt")
+            runner.configure(mode="real", work_dir=work)
+            runner.run(ExecutionSpec.from_dict(
+                {"path": "/u", "pfn": vandal, "arguments": []}), "v",
+                data_in=[_Node("in.txt")])
+            self.assertEqual(Path(work, "in.txt").read_text(), "original")
+
+    def test_a_failed_jobs_outputs_do_not_come_back_and_its_directory_is_kept(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = os.path.join(tmp, "work")
+            bad = script(tmp, "f.sh", "echo partial > out.txt; exit 2")
+            runner.configure(mode="real", work_dir=work)
+            result = runner.run(ExecutionSpec.from_dict(
+                {"path": "/u", "pfn": bad, "arguments": []}), "f",
+                data_out=[_Node("out.txt")])
+            self.assertEqual(result.exit_status, 2)
+            self.assertFalse(os.path.exists(os.path.join(work, "out.txt")))
+            kept = os.listdir(os.path.join(work, runner.JOB_DIRS))
+            self.assertEqual(len(kept), 1)
+
+    def test_a_declared_input_missing_from_the_run_directory_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = os.path.join(tmp, "work")
+            os.makedirs(work)
+            ok = script(tmp, "o.sh", "exit 0")
+            runner.configure(mode="real", work_dir=work)
+            with patch.object(runner, "stage_inputs", return_value=([], None)):
+                result = runner.run(ExecutionSpec.from_dict(
+                    {"path": "/u", "pfn": ok, "arguments": []}), "m",
+                    data_in=[_Node("absent.txt")])
+        self.assertTrue(result.refused)
+        self.assertIn("absent.txt", result.reason)
 
     def test_arguments_are_passed(self):
         with tempfile.TemporaryDirectory() as tmp:

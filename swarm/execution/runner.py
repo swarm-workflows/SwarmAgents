@@ -830,12 +830,24 @@ def run(spec: ExecutionSpec, job_id: str,
         return ExecutionResult(exit_status=1, refused=True, reason=str(staging_refusal),
                                transient=isinstance(staging_refusal, TransientRefusal))
 
-    limits = thread_limit_env(cores)
-    cmd, refusal = build_command(spec, work_dir, pol, job_env=limits)
-    if not cmd:
-        return ExecutionResult(exit_status=1, refused=True, reason=refusal)
-
     _clear_declared_outputs(data_out, work_dir, job_id)
+
+    # The job runs in a directory of its own, as every Pegasus job does in its HTCondor
+    # scratch directory: its declared inputs are copied in from the run's shared directory,
+    # and only its declared outputs come back. A file the job writes for itself stays
+    # private. Before this every job of a run on an agent shared one cwd, and two EHT SMILI
+    # jobs started together overwrote each other's fixed-name scratch script: one ran the
+    # unconverted Python 2 copy and failed (T-6 pilot, 11 Nov 2026).
+    job_dir, setup_refusal = _private_job_dir(work_dir, job_id, data_in)
+    if setup_refusal:
+        return ExecutionResult(exit_status=1, refused=True, transient=True,
+                               reason=setup_refusal)
+
+    limits = thread_limit_env(cores)
+    cmd, refusal = build_command(spec, job_dir, pol, job_env=limits)
+    if not cmd:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        return ExecutionResult(exit_status=1, refused=True, reason=refusal)
 
     # Output goes to files, never to pipes. A chatty job piped into memory would grow without
     # bound in the agent's own process, and the executor runs several jobs at once.
@@ -886,12 +898,21 @@ def run(spec: ExecutionSpec, job_id: str,
         # New process group, so a timeout can kill the whole tree. A container launcher is a
         # parent of the real work: killing only the child leaves the container running and
         # the job's resources held for the rest of the run.
-        proc = subprocess.Popen(cmd, cwd=work_dir, stdout=stdout, stderr=stderr,
+        proc = subprocess.Popen(cmd, cwd=job_dir, stdout=stdout, stderr=stderr,
                                 stdin=subprocess.DEVNULL, start_new_session=True,
                                 env={**job_environment(), **limits})
         _register(proc, container)
         rc = proc.wait(timeout=timeout_s if timeout_s is not None else pol.timeout_s)
-        return ExecutionResult(exit_status=int(rc), duration_s=time.monotonic() - started,
+        duration = time.monotonic() - started
+        if rc == 0:
+            # Only a successful job's outputs come back, as Pegasus stages out only on
+            # success; a failed job's directory is kept for inspection.
+            _return_outputs(job_dir, work_dir, data_out, job_id)
+            shutil.rmtree(job_dir, ignore_errors=True)
+        else:
+            logger.warning("[EXEC] %s: exited %s; its directory is kept at %s",
+                           job_id, rc, job_dir)
+        return ExecutionResult(exit_status=int(rc), duration_s=duration,
                                stdout_path=out_path, stderr_path=err_path, command=cmd)
     except subprocess.TimeoutExpired:
         _kill_group(proc, container)
@@ -1042,6 +1063,76 @@ def terminate_all() -> int:
     for proc, container in live:
         _kill_group(proc, container)
     return len(live)
+
+
+#: Where each job's private directory is made, under the run's shared working directory, so
+#: an output moves back with one atomic rename on the same filesystem.
+JOB_DIRS = ".swarm-jobs"
+
+
+def _declared_relpaths(nodes) -> List[str]:
+    """The contained relative paths of a job's declared files (`..`/absolute skipped)."""
+    from swarm.execution import staging as _st
+    out = []
+    for node in nodes or []:
+        name = getattr(node, "file", None)
+        if name is None and isinstance(node, dict):
+            name = node.get("file")
+        local = _st.safe_relpath(name) if name else None
+        if local:
+            out.append(local)
+    return out
+
+
+def _private_job_dir(work_dir: str, job_id: str, data_in) -> Tuple[str, str]:
+    """Make the job's own directory and copy its declared inputs into it.
+
+    Copies, never links: a job that opens an input for writing must not change the copy its
+    siblings read. Returns (path, "") or ("", reason). An input `stage_inputs` placed in the
+    shared directory and that is now missing is a refusal: the job would otherwise start
+    without a file it declared.
+    """
+    safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in str(job_id))[:80]
+    tag = f"{hashlib.sha1(str(job_id).encode()).hexdigest()[:8]}-{time.time_ns()}"
+    job_dir = os.path.join(work_dir, JOB_DIRS, f"{safe}-{tag}")
+    try:
+        os.makedirs(job_dir)
+        for rel in _declared_relpaths(data_in):
+            src = os.path.join(work_dir, rel)
+            dst = os.path.join(job_dir, rel)
+            if os.path.isdir(src):
+                shutil.copytree(src, dst)
+                continue
+            if not os.path.isfile(src):
+                shutil.rmtree(job_dir, ignore_errors=True)
+                return "", f"declared input {rel} is not in the working directory {work_dir}"
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(src, dst)
+    except OSError as exc:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        return "", f"could not prepare the job directory {job_dir}: {exc}"
+    return job_dir, ""
+
+
+def _return_outputs(job_dir: str, work_dir: str, data_out, job_id: str) -> None:
+    """Move a successful job's declared outputs into the shared directory, each atomically.
+
+    A declared output the job did not write is left missing, which publication reports as
+    "exited 0 but did not write it" (§67), the same as before.
+    """
+    for rel in _declared_relpaths(data_out):
+        src = os.path.join(job_dir, rel)
+        if not os.path.exists(src):
+            logger.warning("[EXEC] %s: declared output %s was not written", job_id, rel)
+            continue
+        dst = os.path.join(work_dir, rel)
+        try:
+            os.makedirs(os.path.dirname(dst) or work_dir, exist_ok=True)
+            if os.path.isdir(dst) and not os.path.islink(dst):
+                shutil.rmtree(dst)
+            os.replace(src, dst)
+        except OSError as exc:
+            logger.error("[EXEC] %s: could not return output %s (%s)", job_id, rel, exc)
 
 
 def _clear_declared_outputs(data_out, work_dir: str, job_id: str) -> None:
