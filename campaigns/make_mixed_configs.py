@@ -27,10 +27,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 MIXED = "/export/swarm-wf/mixed_1800_wf"       # 1800 simulated + cper-soilmoisture + eht-m87
 PILOT = "/export/swarm-wf/wf_only"             # the real jobs alone (§10 standalone pilot)
+TNPILOT = "/export/swarm-wf/tnseq_only"        # tnseq alone (35 jobs), its own standalone pilot
 IMAGES = "/export/images"                      # each agent's local image store
 # Where each bundle's manifest says its images live on the Pegasus host (file:// references).
 IMAGE_DIRS = ("/home/ubuntu/cper-soilmoisture-workflow/Apptainer",
-              "/home/ubuntu/eht-workflow/Apptainer")
+              "/home/ubuntu/eht-workflow/Apptainer",
+              "/home/ubuntu/tnseq-workflow/Apptainer")
 
 
 def edits(bundle):
@@ -57,6 +59,7 @@ OUTPUTS = {
     "config_mixed_pbft.yml": ("campaigns/config_pbft.yml", MIXED),
     "config_mixed_snow.yml": ("config_swarm_multi.yml", MIXED),
     "config_wfpilot_snow.yml": ("config_swarm_multi.yml", PILOT),
+    "config_tnpilot_snow.yml": ("config_swarm_multi.yml", TNPILOT),
 }
 
 

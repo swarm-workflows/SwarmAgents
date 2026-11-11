@@ -118,6 +118,8 @@ runtime:
         to:   /export/images
       - from: /home/ubuntu/eht-workflow/Apptainer
         to:   /export/images
+      - from: /home/ubuntu/tnseq-workflow/Apptainer
+        to:   /export/images
     #   - from: /home/ubuntu/soilmoisture-workflow
     #     to:   /export/swarm-wf/soilmoisture
     # Where the three kinds of thing a job needs live, for jobs that name them RELATIVELY.
