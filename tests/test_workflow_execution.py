@@ -429,6 +429,24 @@ class TestBundling(unittest.TestCase):
             self.assertTrue(os.path.isfile(os.path.join(out, "inputs", "seed.json")))
             self.assertEqual(manifest["missing"], [])
 
+    def test_a_bundled_executable_is_executable_as_pegasus_would_stage_it(self):
+        """cper-soilmoisture keeps six scripts as 0644 in git; Pegasus runs them because it
+        sets the mode on staging. A bundled copy without the bit died in the T-6 pilot with
+        apptainer's `FATAL: permission denied` (2026-11-11)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            src, pairs = self._fixture(tmp)
+            os.chmod(os.path.join(src, "bin", "analyze.py"), 0o644)
+            os.chmod(os.path.join(src, "bin", "train.py"), 0o755)
+            out = os.path.join(tmp, "out"); os.makedirs(out)
+            manifest = bundle_payload(pairs, out)
+            for name in ("analyze", "train"):
+                mode = os.stat(os.path.join(out, "code", name, f"{name}.py")).st_mode
+                self.assertTrue(mode & 0o111 == 0o111, oct(mode))
+            made = {e["transformation"]: e["made_executable"] for e in manifest["code"].values()}
+            self.assertEqual(made, {"analyze": True, "train": False})
+            self.assertEqual(os.stat(os.path.join(src, "bin", "analyze.py")).st_mode & 0o777,
+                             0o644)                  # the source is never touched
+
     def test_the_job_points_at_the_code_root_not_the_bundle(self):
         """`roots.code` already names code/, so a bundle-relative pfn puts it in the path
         twice and every job refuses. Caught end to end, not by construction."""
