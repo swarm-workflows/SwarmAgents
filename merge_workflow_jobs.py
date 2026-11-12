@@ -84,9 +84,14 @@ def _merge_manifests(manifests):
     return out
 
 
-def merge(synthetic, bundles, out: Path) -> dict:
+def merge(synthetic, bundles, out: Path, real_after=None) -> dict:
     """Merge one or more converted bundles into the simulated set `synthetic`, writing `out`.
-    `synthetic` None merges the bundles alone (the §10 standalone pilot: real jobs only)."""
+    `synthetic` None merges the bundles alone (the §10 standalone pilot: real jobs only).
+
+    `real_after` N places the real jobs after the first N simulated jobs instead of after all of
+    them. File order is distribution order, so this sets WHEN the workflows arrive: E6 on the
+    mixed workload needs them in flight during its cut (60-240 s at 2 jobs/s), not after it. Job
+    ids are unchanged; only the job_<n>.json positions move."""
     bundles = [Path(b) for b in (bundles if isinstance(bundles, (list, tuple)) else [bundles])]
     if out.exists():
         raise SystemExit(f"{out} exists; refusing to merge into it (delete it first)")
@@ -99,6 +104,10 @@ def merge(synthetic, bundles, out: Path) -> dict:
     syn_files = _job_files(Path(synthetic)) if synthetic is not None else []
     if synthetic is not None and not syn_files:
         raise SystemExit(f"no job_*.json in {synthetic}")
+    if real_after is not None and not 0 <= real_after <= len(syn_files):
+        raise SystemExit(f"--real-after {real_after} is outside 0..{len(syn_files)} "
+                         f"(the simulated set has {len(syn_files)} jobs)")
+    split = len(syn_files) if real_after is None else real_after
     per_bundle = []
     for bundle in bundles:
         files = _job_files(bundle)
@@ -132,9 +141,15 @@ def merge(synthetic, bundles, out: Path) -> dict:
 
     out.mkdir(parents=True)
     try:
-        for p, j in zip(syn_files, syn):
-            (out / p.name).write_text(json.dumps(j))
-        n = len(syn_files)
+        if real_after is None:
+            # Default: every simulated job keeps its own file name; the real jobs follow.
+            for p, j in zip(syn_files, syn):
+                (out / p.name).write_text(json.dumps(j))
+            n = len(syn_files)
+        else:
+            for k, j in enumerate(syn[:split], start=1):
+                (out / f"job_{k}.json").write_text(json.dumps(j))
+            n = split
         written_real = []
         for bundle, files, jobs, _, _ in per_bundle:
             for p, j in zip(files, jobs):
@@ -146,6 +161,9 @@ def merge(synthetic, bundles, out: Path) -> dict:
             for d in ("code", "inputs"):
                 if (bundle / d).is_dir():
                     shutil.copytree(bundle / d, out / d, symlinks=True, dirs_exist_ok=True)
+        for j in (syn[split:] if real_after is not None else []):
+            n += 1
+            (out / f"job_{n}.json").write_text(json.dumps(j))
         (out / "manifest.json").write_text(json.dumps(manifest, indent=2))
         runs = {}
         for bundle, *_ in per_bundle:
@@ -175,6 +193,7 @@ def merge(synthetic, bundles, out: Path) -> dict:
             "merged": {"tool": "merge_workflow_jobs.py",
                        "synthetic": str(synthetic) if synthetic is not None else None,
                        "synthetic_jobs": len(syn), "bundles": [str(b) for b in bundles],
+                       "real_after": split if synthetic is not None else None,
                        "real_jobs": written_real,
                        "renamed": "simulated jobs' file names -> replay<id>__<basename>"},
         })
@@ -192,8 +211,11 @@ def main(argv=None):
     ap.add_argument("--bundle", required=True, type=Path, action="append",
                     help="a converted bundle; repeat for several workflows")
     ap.add_argument("--out", required=True, type=Path)
+    ap.add_argument("--real-after", type=int, default=None,
+                    help="place the real jobs after the first N simulated jobs (distribution "
+                         "order) instead of after all of them; simulated files are renumbered")
     a = ap.parse_args(argv)
-    s = merge(a.synthetic, a.bundle, a.out)
+    s = merge(a.synthetic, a.bundle, a.out, real_after=a.real_after)
     m = s["merged"]
     per = {}
     for r in m["real_jobs"]:

@@ -210,3 +210,36 @@ def test_bundles_alone_for_the_standalone_pilot(tmp_path, monkeypatch):
     assert s["merged"]["synthetic_jobs"] == 0 and s["merged"]["synthetic"] is None
     monkeypatch.setattr(run_test, "_run_execution_mode", lambda a: "real")
     run_test.validate_pegasus_jobs_dir(argparse.Namespace(pegasus_jobs_dir=str(out), jobs=3))
+
+
+def test_real_after_places_the_workflows_inside_the_simulated_stream(tmp_path):
+    """E6 on the mixed workload: the workflows must arrive during the cut, so they are placed
+    after the first N simulated jobs. Ids and contents are unchanged; only positions move."""
+    syn, bun = _fixture(tmp_path)
+    out = tmp_path / "mixed"
+    s = mw.merge(syn, bun, out, real_after=1)
+    order = [json.loads(p.read_text())["id"] for p in mw._job_files(out)]
+    assert order == [1, "soil_run1_analyze", "soil_run1_predict", 2, 3]
+    assert s["merged"]["real_after"] == 1
+    assert [r["file"] for r in s["merged"]["real_jobs"]] == ["job_2.json", "job_3.json"]
+    assert json.loads((out / "job_2.json").read_text()) == json.loads((bun / "job_1.json").read_text())
+    # the simulated job moved to job_4 is the same record the default merge writes
+    default = tmp_path / "default"
+    mw.merge(syn, bun, default)
+    assert json.loads((out / "job_4.json").read_text()) == json.loads((default / "job_2.json").read_text())
+
+
+def test_real_after_the_whole_set_is_the_default_order(tmp_path):
+    syn, bun = _fixture(tmp_path)
+    a, b = tmp_path / "a", tmp_path / "b"
+    mw.merge(syn, bun, a, real_after=3)
+    mw.merge(syn, bun, b)
+    for p in mw._job_files(b):
+        assert (a / p.name).read_text() == p.read_text()
+
+
+def test_real_after_out_of_range_is_refused(tmp_path):
+    syn, bun = _fixture(tmp_path)
+    with pytest.raises(SystemExit, match="outside 0..3"):
+        mw.merge(syn, bun, tmp_path / "m", real_after=4)
+    assert not (tmp_path / "m").exists()

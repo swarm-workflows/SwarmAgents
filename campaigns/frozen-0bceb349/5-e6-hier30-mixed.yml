@@ -1,0 +1,64 @@
+# FROZEN RE-RUN at isc27-freeze (0bceb349): E6 on the mixed workload (conference plan §4.2 E6,
+# T-6), 2 cells x 3 = 6 runs. The same partition, fleet, arrivals and companion as
+# 4-e6-hier30.yml, with the three real workflows merged into its 600 simulated jobs:
+#
+#   python3.11 merge_workflow_jobs.py --synthetic /root/workloads/jobs_600 --real-after 120 \
+#     --bundle /export/swarm-wf/bundles/cper_bundle --bundle /export/swarm-wf/bundles/eht_bundle \
+#     --bundle /export/swarm-wf/bundles/tnseq_bundle --out /export/swarm-wf/mixed_600_wf
+#
+# --real-after 120: at 2 jobs/s the real jobs arrive ~60-104 s into distribution, as the cut
+# starts (60-240 s), so all three workflows run DURING the partition. Appended after the
+# simulated jobs they would arrive at ~300-345 s, after the heal, and test nothing.
+# What this cell adds to E6: real jobs execute and stage files while the network is split.
+# A consumer whose producer is on the other side fetches from the staging site on `database`
+# (reachable from both sides, as Redis is). Read jobs_executed_twice, the real jobs' exit codes,
+# and evaluation/t6_compare.py beside the plain E6 cells.
+# Configs from campaigns/make_mixed_configs.py (config_e6mixed_{pbft,snow}.yml: E6's own base
+# configs plus real execution, staging on and the bundle). 19 of the 30 agents fit the 4-core
+# tnseq jobs and every agent fits the rest.
+# Needs SWARM_STAGING_TOKEN in the driver's environment and staging_site.py running on
+# `database`; launched by /root/frozen-extra.sh after the four simulated files finish.
+#
+out: runs/frozen-0bceb349/e6-hier30-mixed
+
+defaults:
+  runner: run_test.py
+  repeats: 3
+  retries: 1
+  timeout_s: 5400
+  args:
+    mode: remote
+    agent-type: resource
+    db-host: database
+    agent-hosts-file: agent_hosts.txt
+    agents-per-host: 1
+    master-fleet-size: 270
+    seed: 42
+    rtt-samples: 20
+    all-dtns: true
+    agents: 30
+    jobs: 687
+    topology: hierarchical
+    groups-per-coordinator: 1
+    hierarchical-level1-agent-type: resource
+    pegasus-jobs-dir: /export/swarm-wf/mixed_600_wf
+    runtime: 2400
+    arrival: poisson
+    arrival-rate: 2.0
+    inflight-drain-max-s: 1800
+  companion: >-
+    python3.11 partition.py run --hosts-file agent_hosts.txt --sites-file agent_sites.txt
+    --agents 30 --start-after-log {run_dir}.log --delay 60 --duration 180
+    --out {run_dir}.partition.json
+
+gate:
+  redis: {host: database, port: 6379}
+  clock_check: ./fix_slice_clocks.sh --check
+  retries: 3
+  wait_s: 300
+
+cells:
+  - name: e6-hier30-pbft-mixed
+    args: {base-config: campaigns/config_e6mixed_pbft.yml}
+  - name: e6-hier30-snow-mixed
+    args: {base-config: campaigns/config_e6mixed_snow.yml}

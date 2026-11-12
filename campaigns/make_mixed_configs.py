@@ -28,6 +28,7 @@ ROOT = Path(__file__).resolve().parent.parent
 MIXED = "/export/swarm-wf/mixed_1800_wf"       # 1800 simulated + cper-soilmoisture + eht-m87
 PILOT = "/export/swarm-wf/wf_only"             # the real jobs alone (§10 standalone pilot)
 TNPILOT = "/export/swarm-wf/tnseq_only"        # tnseq alone (35 jobs), its own standalone pilot
+E6MIXED = "/export/swarm-wf/mixed_600_wf"   # E6 on the mixed workload: jobs_600 + the three workflows
 IMAGES = "/export/images"                      # each agent's local image store
 # Where each bundle's manifest says its images live on the Pegasus host (file:// references).
 IMAGE_DIRS = ("/home/ubuntu/cper-soilmoisture-workflow/Apptainer",
@@ -60,6 +61,8 @@ OUTPUTS = {
     "config_mixed_snow.yml": ("config_swarm_multi.yml", MIXED),
     "config_wfpilot_snow.yml": ("config_swarm_multi.yml", PILOT),
     "config_tnpilot_snow.yml": ("config_swarm_multi.yml", TNPILOT),
+    "config_e6mixed_pbft.yml": ("campaigns/config_pbft.yml", E6MIXED),
+    "config_e6mixed_snow.yml": ("config_swarm_multi.yml", E6MIXED),
 }
 
 
