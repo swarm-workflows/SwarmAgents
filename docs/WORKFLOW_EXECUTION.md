@@ -887,6 +887,34 @@ directory on every run. A copy taken while a later run was in progress mixed two
 and that is what made Pegasus look deterministic for a while. Archive outputs per run
 (`run_iterations.sh` does this), or check run timestamps before comparing.
 
+**How timing is compared (`evaluation/t6_compare.py`).** Execution time leaves staging out on
+*both* sides; end-to-end time keeps it in on both sides and breaks it down. SWARM stages too:
+it fetches inputs from peers or the staging site, copies them into the job directory, hands
+outputs back and pushes them to the staging site before publishing. So leaving staging out
+of only one side would hide the difference being measured.
+
+* **Per job.** Pegasus kickstart's `remote_duration` is compared with the runner's
+  `duration_s` (`[EXEC] Job … completed in …s`). `started_at → completed_at` in `all_jobs.csv`
+  also covers the input fetch, the copy and the output handoff, so it is reported separately as
+  in-job overhead and never used as execution time.
+* **Container startup.** PegasusLite runs kickstart *inside* the container (its
+  `<job>-cont.sh` is run by `singularity exec`), so `remote_duration` leaves container startup
+  out. SWARM times `apptainer exec` and includes it: about 0.17 s per job on the slice. This
+  matters for sub-second jobs: for tnseq's median per-job ratio it is the difference between
+  1.48 and 1.05. `--container-startup-s` adds an adjusted column beside the raw one.
+* **Per workflow.** For each side the script reports the critical path of execution times,
+  the end-to-end time, and the difference between the two (that side's time not spent
+  computing). Pegasus's breakdown is its HTCondor queue time and stage-in/out times, from
+  `pegasus_baseline.json`. SWARM's is its in-job overhead, stage-out and wait.
+* **Mixed cells measure something else.** There, real jobs queue behind 1,800 simulated ones,
+  so their end-to-end time is scheduling under load. Workflow-to-workflow end-to-end numbers
+  come from the standalone pilots.
+
+First mixed run (PBFT run01): all 87 jobs exit 0. The median per-job execution ratio
+(SWARM/Pegasus) is 0.95 for cper, 0.96 for EHT and 1.05 for tnseq (startup-adjusted). The
+execution critical path is 38.8 vs 38.6 s for cper, 150 vs 170 s for EHT and 9.5 vs 7.6 s for
+tnseq (raw).
+
 ### 3.2 What the pilots found missing, and the fix for each
 
 Each fix makes SWARM do what HTCondor/Pegasus does. None of them makes SWARM better than the
