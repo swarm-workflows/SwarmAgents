@@ -146,3 +146,19 @@ def test_t6_table_keeps_engines_apart(tmp_path):
     assert len(rows) == 2
     pbft = next(l for l in rows if "pbft-mixed" in l)
     assert "| 2 | 6/6 |" in pbft and "30" not in pbft
+
+
+def test_completion_note_is_run_level_and_never_rounds_into_a_claim():
+    pd = build.pd
+    cells = pd.DataFrame({"cell": ["a", "b"], "source": ["s", "s"]})
+    def runs(rows):
+        return pd.DataFrame([{"cell": c, "source": "s", "jobs_completed": d, "planned_jobs": p}
+                             for c, d, p in rows])
+    assert build.completion_note(runs([("a", 600, 600), ("b", 1800, 1800)]), cells) == " (all 2 runs complete)"
+    # 99.6 % must not print as "all 100 %"; a mean of 101 and 99 must not read 100
+    n = build.completion_note(runs([("a", 1793, 1800), ("b", 1800, 1800)]), cells)
+    assert "all" not in n and "99.6" in n
+    n = build.completion_note(runs([("a", 606, 600), ("a", 594, 600), ("b", 1800, 1800)]), cells)
+    assert "all" not in n and "99.0" in n and "101.0" in n
+    n = build.completion_note(runs([("a", 600, 600), ("b", 1800, float("nan"))]), cells)
+    assert n == " (all 1 runs complete, 1 unknown)"

@@ -237,6 +237,29 @@ def _ladder(ax, cells, metric, ylabel, engines, label_last=False):
     return drawn
 
 
+def completion_note(runs: pd.DataFrame, cells: pd.DataFrame) -> str:
+    """Completion of every RUN in these cells, for a panel title. Run level, never cell means
+    (a mean of 101 and 99 reads 100), and never rounded into a claim: "all complete" only when
+    every run finished exactly its planned jobs; a run with no planned count is named as unknown."""
+    if cells.empty:
+        return ""
+    r = runs[runs.cell.isin(set(cells.cell)) & runs.source.isin(set(cells.source))]
+    done = pd.to_numeric(r.get("jobs_completed"), errors="coerce")
+    plan = pd.to_numeric(r.get("planned_jobs"), errors="coerce")
+    known = done.notna() & plan.notna() & (plan > 0)
+    unknown = int((~known).sum())
+    if not known.any():
+        return f" (completion unknown for {unknown} runs)"
+    pct = 100 * done[known] / plan[known]
+    if (done[known] == plan[known]).all():
+        note = f"all {int(known.sum())} runs complete"
+    else:
+        note = f"completion {pct.min():.1f}–{pct.max():.1f}% over {int(known.sum())} runs"
+    if unknown:
+        note += f", {unknown} unknown"
+    return f" ({note})"
+
+
 def figures(runs, cells, manifest, base, out) -> list[str]:
     plt = _plt()
     written = []
@@ -254,10 +277,7 @@ def figures(runs, cells, manifest, base, out) -> list[str]:
         axes[0].set_title("flat mesh: completion", fontsize=8)
         axes[0].set_ylim(0, 105)
         _ladder(axes[1], hier, "sched_latency_p95", "arrival→assigned p95 (s)", ["pbft", "snow", "hybrid"])
-        comp = pd.to_numeric(hier.get("completion_pct"), errors="coerce").dropna()
-        done = "" if comp.empty else (f" (all {comp.min():.0f}% complete)" if comp.min() == comp.max()
-                                      else f" (completion {comp.min():.1f}–{comp.max():.1f}%)")
-        axes[1].set_title(f"hierarchy: scheduling latency{done}", fontsize=8)
+        axes[1].set_title(f"hierarchy: scheduling latency{completion_note(runs, hier)}", fontsize=8)
         axes[1].set_ylim(bottom=0)
         _fig_legend(fig, axes)
         _save(fig, out, "F1_completion", written)
