@@ -1,0 +1,52 @@
+# The paper's numbers: the frozen re-run at isc27-freeze 0bceb349, plus the cells that count as
+# frozen without a repeat (the flat-mesh ladder and E5 from first-runs-21a2d9bb, the T-6 mixed
+# rung, and the no-failure E7 cells, whose baseline code path is unchanged by a874d2d2).
+#
+# On the database node:  bash evaluation/paper/collect_frozen.sh        -> /root/collect-frozen.tgz
+# Here:                  scp swarm:/root/collect-frozen.tgz runs/ && tar xzf runs/collect-frozen.tgz -C runs
+#                        .venv/bin/python evaluation/paper/build.py --manifest evaluation/paper/manifest_frozen.yml
+out: ../../runs/paper-frozen
+sources:
+  - name: e1-hier270
+    runs_wide: ../../runs/collect-frozen/e1-hier270/runs_wide.csv
+    campaign: ../../campaigns/frozen-0bceb349/1-e1-hier270.yml
+  - name: e0-e1-hier30-hier90
+    runs_wide: ../../runs/collect-frozen/e0-e1-hier30-hier90/runs_wide.csv
+    campaign: ../../campaigns/frozen-0bceb349/2-e0-e1-hier30-hier90.yml
+  - name: e2-hier90
+    runs_wide: ../../runs/collect-frozen/e2-hier90/runs_wide.csv
+    campaign: ../../campaigns/frozen-0bceb349/3-e2-hier90.yml
+  - name: e6-hier30
+    runs_wide: ../../runs/collect-frozen/e6-hier30/runs_wide.csv
+    campaign: ../../campaigns/frozen-0bceb349/4-e6-hier30.yml
+  - name: e6-hier30-mixed
+    runs_wide: ../../runs/collect-frozen/e6-hier30-mixed/runs_wide.csv
+    campaign: ../../campaigns/frozen-0bceb349/5-e6-hier30-mixed.yml
+  - name: e7-hier90-failure-swarm
+    runs_wide: ../../runs/collect-frozen/e7-hier90-failure-swarm/runs_wide.csv
+    campaign: ../../campaigns/frozen-0bceb349/6-e7-hier90-failure-swarm.yml
+  - name: e7-hier90-failure-baselines
+    runs_wide: ../../runs/collect-frozen/e7-hier90-failure-baselines/runs_wide.csv
+    campaign: ../../campaigns/frozen-0bceb349/7-e7-hier90-failure-baselines.yml
+  # counted as frozen, not repeated
+  - name: first-runs-21a2d9bb
+    runs_wide: ../../docs/results/first-runs-21a2d9bb/runs_wide.csv
+    campaign: ../../campaigns/first-runs-21a2d9bb.yml
+  - name: t6-mixed-0bceb349
+    runs_wide: ../../docs/results/t6-mixed-0bceb349/runs_wide.csv
+    campaign: ../../campaigns/t6-mixed-hier90.yml
+  - name: e7-7e269138
+    runs_wide: ../../docs/results/e7-7e269138/runs_wide_e7.csv
+    campaign: ../../campaigns/e7-hier90-7e269138.yml
+e2_events: ../../runs/collect-frozen/e2-hier90/events.csv
+e3a_cells:
+  - ../../runs/collect-frozen/e3a-e0-e1-hier30-hier90/cells.csv
+  - ../../runs/collect-frozen/e3a-e1-hier270/cells.csv
+t6_per_workflow:
+  - ../../docs/results/t6-mixed-0bceb349/t6_per_workflow.csv
+  - ../../runs/collect-frozen/e6-hier30-mixed/t6_per_workflow.csv
+events_summary:
+  - ../../runs/collect-frozen/e6-hier30/events_summary.csv
+  - ../../runs/collect-frozen/e6-hier30-mixed/events_summary.csv
+  - ../../runs/collect-frozen/e7-hier90-failure-swarm/events_summary.csv
+  - ../../runs/collect-frozen/e7-hier90-failure-baselines/events_summary.csv
