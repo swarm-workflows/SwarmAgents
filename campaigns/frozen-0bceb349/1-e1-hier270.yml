@@ -1,0 +1,84 @@
+# FROZEN RE-RUN at isc27-freeze (0bceb349), conference plan §8 (re-derived 2026-11-09): E1' Hier-270, 12 cells x 5 = 60 runs.
+# Copied unchanged from campaigns/e1-hier270-ed8c9101.yml except `out:`; the cells, arguments, configs and workloads are the
+# ones the earlier campaign ran, so the two are comparable cell for cell. Agent code fingerprint
+# 6593ed84586e (104 files) verified identical on the db node and all 92 agents, 12 Nov 2026.
+# Launched by /root/frozen.sh with the other files in this directory, in order.
+#
+# E1' at Hier-270 (conference plan §4.2 E1', approved 2026-11-05): {PBFT, Snow, Hybrid} x
+# {analytic G=1, LinUCB-shared G=3}, each at burst (20 jobs/s, `--arrival batch`) and at Poisson
+# 7 jobs/s, 5 repeats: 12 cells, 60 runs. Code ed8c9101.
+#
+# Hier-270 = 243 leaves in 27 groups of 9 + 27 coordinators at G=1; at G=3, 9 coordinators over 27
+# groups (261 leaves). 3 agents per VM on the 90 hosts of agent_hosts.txt (interleaved).
+#
+# PBFT counter-proposals by coordinator-tier size (decided 2026-11-05, report beside every PBFT
+# number): OFF at 27 coordinators (analytic: campaigns/config_pbft_hier270.yml, which also raises
+# the transport fan-out pool to 256/8192), ON at 9 (LinUCB). Snow and Hybrid keep the shipped
+# 64/2048 pool (Snow dropped no sends at Hier-270). Pilots: runs/pilot-hier270-b9e51bbf,
+# runs/pilot-counter-margin3, runs/pilot-hier270-linucb-ed8c9101.
+#
+# Poisson 7 jobs/s ~ 70 % of the slower engine's measured Hier-270 burst drain rate (Snow 10.3
+# jobs/s; PBFT counters-off 13.7), the rule Hier-90's 3 jobs/s followed. Seeded (--seed 42), so
+# every engine and repeat sees the same arrival times (arrivals.json per run).
+# LinUCB: the shared-model configs of the Hier-90 E1' column, unchanged (shared and per-group tied
+# at Hier-90). No failure profile is injected (E1' prices cost; routing quality is E2).
+#
+#   tmux new -s e1h270 'python3.11 campaign.py campaigns/e1-hier270-ed8c9101.yml --python python3.11 2>&1 | tee /root/campaign-e1-hier270-ed8c9101.out'
+out: runs/frozen-0bceb349/e1-hier270
+
+defaults:
+  runner: run_test.py
+  repeats: 5
+  retries: 1
+  timeout_s: 10800
+  args:
+    mode: remote
+    agent-type: resource
+    db-host: database
+    agent-hosts-file: agent_hosts.txt
+    agents-per-host: 3
+    agents: 270
+    jobs: 5400
+    pegasus-jobs-dir: /root/workloads/jobs_5400
+    runtime: 5400
+    master-fleet-size: 270
+    seed: 42                   # also seeds the Poisson arrivals: every engine sees the same times
+    rtt-samples: 20
+    all-dtns: true
+    topology: hierarchical
+    hierarchical-level1-agent-type: resource
+    inflight-drain-max-s: 1800
+
+gate:
+  redis: {host: database, port: 6379}
+  clock_check: ./fix_slice_clocks.sh --check
+  retries: 3
+  wait_s: 300
+
+cells:
+  # ---- burst, 20 jobs/s ------------------------------------------------------------
+  - name: e0-hier270-pbft-analytic
+    args: {groups-per-coordinator: 1, base-config: campaigns/config_pbft_hier270.yml}
+  - name: e1-hier270-snow-analytic
+    args: {groups-per-coordinator: 1, base-config: config_swarm_multi.yml}
+  - name: e1-hier270-hybrid-analytic
+    args: {groups-per-coordinator: 1, base-config: campaigns/config_hybrid.yml}
+  - name: e1-hier270-pbft-linucb-shared
+    args: {groups-per-coordinator: 3, delegation-policy: bandit, base-config: campaigns/config_pbft_linucb_shared.yml}
+  - name: e1-hier270-snow-linucb-shared
+    args: {groups-per-coordinator: 3, delegation-policy: bandit, base-config: campaigns/config_snow_linucb_shared.yml}
+  - name: e1-hier270-hybrid-linucb-shared
+    args: {groups-per-coordinator: 3, delegation-policy: bandit, base-config: campaigns/config_hybrid_linucb_shared.yml}
+  # ---- Poisson 7 jobs/s ------------------------------------------------------------
+  - name: e0-hier270-pbft-analytic-poisson7
+    args: {groups-per-coordinator: 1, base-config: campaigns/config_pbft_hier270.yml, arrival: poisson, arrival-rate: 7.0}
+  - name: e1-hier270-snow-analytic-poisson7
+    args: {groups-per-coordinator: 1, base-config: config_swarm_multi.yml, arrival: poisson, arrival-rate: 7.0}
+  - name: e1-hier270-hybrid-analytic-poisson7
+    args: {groups-per-coordinator: 1, base-config: campaigns/config_hybrid.yml, arrival: poisson, arrival-rate: 7.0}
+  - name: e1-hier270-pbft-linucb-shared-poisson7
+    args: {groups-per-coordinator: 3, delegation-policy: bandit, base-config: campaigns/config_pbft_linucb_shared.yml, arrival: poisson, arrival-rate: 7.0}
+  - name: e1-hier270-snow-linucb-shared-poisson7
+    args: {groups-per-coordinator: 3, delegation-policy: bandit, base-config: campaigns/config_snow_linucb_shared.yml, arrival: poisson, arrival-rate: 7.0}
+  - name: e1-hier270-hybrid-linucb-shared-poisson7
+    args: {groups-per-coordinator: 3, delegation-policy: bandit, base-config: campaigns/config_hybrid_linucb_shared.yml, arrival: poisson, arrival-rate: 7.0}
