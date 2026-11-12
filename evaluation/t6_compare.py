@@ -162,7 +162,8 @@ def _r(x, n=3):
 def compare_run(run_dir, jobs, peg_runs, parents, startup_s=None):
     exec_by_job, attempts, stage_out = _parse_logs(run_dir)
     timing = _parse_all_jobs(run_dir, set(jobs))
-    run = os.path.basename(os.path.normpath(run_dir))
+    # cell/run: run names repeat across a campaign's cells.
+    run = "/".join(os.path.normpath(run_dir).split(os.sep)[-2:])
     rows, by_wf = [], defaultdict(list)
     for jid, j in sorted(jobs.items()):
         wf = j.get("workflow")
