@@ -244,14 +244,21 @@ def figures(runs, cells, manifest, base, out) -> list[str]:
     flat = burst[(burst.topo == "mesh") & burst.plane.isin(["analytic"])]
     hier = burst[(burst.topo == "hier") & (burst.plane == "analytic") & burst.exp.isin(["e0", "e1"])]
 
-    # F1 — completion: flat ladder and the hierarchy, same y-scale
+    # F1 — collapse and repair on the flat ladder (completion), and what the hierarchy that never
+    # collapses costs instead (arrival→assigned p95, the latency the livelock and "bounded latency
+    # price" definitions use). Two panels, each with its own y-axis — never one dual-axis plot.
+    # The hierarchy's completion is printed in the panel title so the 100 % is not lost.
     if not flat.empty or not hier.empty:
-        fig, axes = plt.subplots(1, 2, figsize=(7, 2.6), sharey=True, layout="constrained")
+        fig, axes = plt.subplots(1, 2, figsize=(7, 2.6), layout="constrained")
         _ladder(axes[0], flat, "completion_pct", "jobs completed (%)", ["pbft", "snow"])
-        axes[0].set_title("flat mesh", fontsize=8)
-        _ladder(axes[1], hier, "completion_pct", "", ["pbft", "snow", "hybrid"])
-        axes[1].set_title("hierarchy (analytic, burst)", fontsize=8)
+        axes[0].set_title("flat mesh: completion", fontsize=8)
         axes[0].set_ylim(0, 105)
+        _ladder(axes[1], hier, "sched_latency_p95", "arrival→assigned p95 (s)", ["pbft", "snow", "hybrid"])
+        comp = pd.to_numeric(hier.get("completion_pct"), errors="coerce").dropna()
+        done = "" if comp.empty else (f" (all {comp.min():.0f}% complete)" if comp.min() == comp.max()
+                                      else f" (completion {comp.min():.1f}–{comp.max():.1f}%)")
+        axes[1].set_title(f"hierarchy: scheduling latency{done}", fontsize=8)
+        axes[1].set_ylim(bottom=0)
         _fig_legend(fig, axes)
         _save(fig, out, "F1_completion", written)
         plt.close(fig)
