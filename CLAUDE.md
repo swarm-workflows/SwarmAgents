@@ -64,7 +64,7 @@ python run_test.py --mode remote --agents 40 --agents-per-host 1 --topology ring
 python generate_configs.py <num_agents> <jobs_per_proposal> <base_config> <output_dir> <topology> <database> <job_cnt>
 # Comparable fleets: --seed pins the draw, --master-fleet-size makes every smaller fleet a prefix of the largest.
 python generate_configs.py 30 10 ./config_swarm_multi.yml configs mesh localhost 600 --dtns --seed 42 --master-fleet-size 270
-# Identical workload across a ladder: --job-target-agents K, K = the smallest rung's LEAF count (Hier-30: 27).
+# Identical workload across a ladder: --job-target-agents K, K = the smallest rung's LEAF count at the fan-out you run (Hier-30: 27 at the default G=2, 25 at G=1, which is how every campaign runs it).
 python generate_configs.py 90 10 ./config_swarm_multi.yml configs hierarchical localhost 600 --dtns --seed 42 --master-fleet-size 270 --job-target-agents 27
 # Hosts file for a remote run; its ORDER is the placement. Default interleaved (--order sequential clusters groups by site).
 python make_agent_hosts.py --count 80 --out agent_hosts.txt --sites-out agent_sites.txt

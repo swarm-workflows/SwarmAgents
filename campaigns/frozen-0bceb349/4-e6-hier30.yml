@@ -14,6 +14,11 @@
 # the only partition the system can survive. Cut 60 s after job distribution starts, held 180 s,
 # healed; partition.json records sides, timestamps, probe verdicts and held_s.
 #
+# NOTE 12 Nov 2026 (comments only, no run setting changed): two statements below are superseded.
+# (a) PBFT: E6 at 58f3ab22/b9e51bbf measured 0 double finalizations; its quorum is a majority of
+#     neighbor_map, which Redis keeps whole, so only each group's majority side decides
+#     (ENGINEERING_NOTES 2026-10-30). (b) The mixed real-workflow E6 cell now exists:
+#     5-e6-hier30-mixed.yml.
 # Expected: Snow 0 double executions (the claim CAS is live on both sides — the safety statement);
 # PBFT has no CAS, both sides can finalize, and since 2026-10-09 the second persist steps aside
 # ("finalizes twice, executes once"): read jobs_executed_twice beside lost_leader_races. A PBFT
