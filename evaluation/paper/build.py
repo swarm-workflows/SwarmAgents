@@ -421,14 +421,18 @@ def tables_md(runs, cells, manifest, base) -> str:
     if t6:
         t = pd.concat([pd.read_csv(_path(base, p)).assign(set=Path(p).parent.name) for p in t6],
                       ignore_index=True)
+        # one row per CELL: PBFT and Snow runs are different engines, never repeats of one another.
+        # t6_compare labels a run "cell/run"; the E6 concat carries an explicit cell column.
+        lab = t["run"].astype(str).str.split("/").str[0]
+        t["cell"] = t["cell"].fillna(lab) if "cell" in t else lab
         L.append("\n## Real workflows against Pegasus (execution excludes staging on both sides)\n")
-        L.append("| set | workflow | runs | jobs exit 0 | Pegasus exec critical path (s) | SWARM exec critical path (s) "
+        L.append("| set | cell | workflow | runs | jobs exit 0 | Pegasus exec critical path (s) | SWARM exec critical path (s) "
                  "| median exec ratio, adjusted |")
-        L.append("|---|---|---|---|---|---|---|")
-        for (st, wf), g in t.groupby(["set", "workflow"], sort=False):
+        L.append("|---|---|---|---|---|---|---|---|")
+        for (st, cell, wf), g in t.groupby(["set", "cell", "workflow"], sort=False):
             cp = pd.to_numeric(g.swarm_exec_critical_path_s, errors="coerce").dropna()
             ra = pd.to_numeric(g.get("exec_ratio_adj_median"), errors="coerce").dropna()
-            L.append(f"| {st} | {wf} | {len(g)} | {int(g.swarm_exit0.sum())}/{int(g.jobs.sum())} "
+            L.append(f"| {st} | {cell} | {wf} | {len(g)} | {int(g.swarm_exit0.sum())}/{int(g.jobs.sum())} "
                      f"| {g.peg_exec_critical_path_s.iloc[0]} | {fmt(cp.mean(), ci95(cp), 1)} "
                      f"| {fmt(ra.mean(), ci95(ra), 2)} |")
     return "\n".join(L) + "\n"

@@ -129,3 +129,20 @@ def test_build_completion_uses_the_plan_and_flags_bad_runs(tmp_path):
     v = (tmp_path / "o" / "validity.md").read_text()
     assert "a job ran twice (1)" in v and "completed 90.0 %" in v and "sends dropped (5)" in v
     assert "run01 | a job ran twice" not in v
+
+
+def test_t6_table_keeps_engines_apart(tmp_path):
+    cols = ["run", "workflow", "jobs", "swarm_exit0", "peg_exec_critical_path_s",
+            "swarm_exec_critical_path_s", "exec_ratio_adj_median"]
+    with open(tmp_path / "t6.csv", "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(cols)
+        w.writerow(["e1-hier90-pbft-mixed/run01", "wf", 3, 3, 10, 11, 1.0])
+        w.writerow(["e1-hier90-pbft-mixed/run02", "wf", 3, 3, 10, 13, 1.1])
+        w.writerow(["e1-hier90-snow-mixed/run01", "wf", 3, 3, 10, 30, 2.0])
+    md = build.tables_md(None, build.pd.DataFrame(columns=["source", "exp"]),
+                         {"t6_per_workflow": "t6.csv"}, tmp_path)
+    rows = [l for l in md.splitlines() if l.startswith("| ") and "| wf |" in l]
+    assert len(rows) == 2
+    pbft = next(l for l in rows if "pbft-mixed" in l)
+    assert "| 2 | 6/6 |" in pbft and "30" not in pbft
