@@ -1,0 +1,61 @@
+cell,metric,n,mean,std
+PBFT mixed,completion_pct,3,100.0,0.0
+Snow mixed,completion_pct,3,100.0,0.0
+PBFT sim-only (c125ed8c),completion_pct,0,,
+Snow sim-only (c125ed8c),completion_pct,0,,
+PBFT mixed,jobs_executed_twice,3,0.0,0.0
+Snow mixed,jobs_executed_twice,3,0.0,0.0
+PBFT sim-only (c125ed8c),jobs_executed_twice,5,0.0,0.0
+Snow sim-only (c125ed8c),jobs_executed_twice,5,0.0,0.0
+PBFT mixed,l0_selection_p50,3,0.08870100975036621,0.0017328029420008557
+Snow mixed,l0_selection_p50,3,1.1989045937856038,0.0013005745800629036
+PBFT sim-only (c125ed8c),l0_selection_p50,5,0.08708300590515136,0.002952639409194688
+Snow sim-only (c125ed8c),l0_selection_p50,5,1.1982316732406617,0.001228105222242133
+PBFT mixed,l1_selection_p50,3,0.6023499170939127,0.028804035617413504
+Snow mixed,l1_selection_p50,3,1.111894687016805,0.013766929260777305
+PBFT sim-only (c125ed8c),l1_selection_p50,5,0.6406645774841309,0.0254883184699974
+Snow sim-only (c125ed8c),l1_selection_p50,5,1.2263046979904175,0.08768637052189904
+PBFT mixed,l1_selection_p95,3,2.3350543896357214,0.3931876187930344
+Snow mixed,l1_selection_p95,3,1.9690537929534908,0.23334008615294619
+PBFT sim-only (c125ed8c),l1_selection_p95,5,2.4098425030708306,0.23128247895752546
+Snow sim-only (c125ed8c),l1_selection_p95,5,2.0130950117111204,0.19823359930005252
+PBFT mixed,sched_latency_p95,3,15.225892424583382,6.489997685859838
+Snow mixed,sched_latency_p95,3,12.770081265767406,0.45138083603159307
+PBFT sim-only (c125ed8c),sched_latency_p95,5,9.281486506462093,0.4756390976001481
+Snow sim-only (c125ed8c),sched_latency_p95,5,10.548467414379118,1.207154575635339
+PBFT mixed,job_latency_p50,3,16.768845478693645,0.49623853017859987
+Snow mixed,job_latency_p50,3,18.03127145767212,0.24052424831733193
+PBFT sim-only (c125ed8c),job_latency_p50,5,16.2144074678421,0.38751095985755607
+Snow sim-only (c125ed8c),job_latency_p50,5,17.70301446914673,0.3046565323919818
+PBFT mixed,job_latency_p95,3,61.715381296475705,8.965952119919779
+Snow mixed,job_latency_p95,3,69.85918005307497,1.776090983018132
+PBFT sim-only (c125ed8c),job_latency_p95,5,54.01602831125257,3.296052553431777
+Snow sim-only (c125ed8c),job_latency_p95,5,54.38318962335585,2.9966065437314207
+PBFT mixed,makespan_s,3,269.85273333333333,12.788801352094463
+Snow mixed,makespan_s,3,303.6807,23.623853365401665
+PBFT sim-only (c125ed8c),makespan_s,5,231.92032,30.89182282655071
+Snow sim-only (c125ed8c),makespan_s,5,223.81112,18.141549111004828
+PBFT mixed,throughput_jobs_per_s,3,7.003466666666667,0.34017922237158066
+Snow mixed,throughput_jobs_per_s,3,6.239866666666666,0.5035968857462616
+PBFT sim-only (c125ed8c),throughput_jobs_per_s,5,7.86876,1.0094631013563593
+Snow sim-only (c125ed8c),throughput_jobs_per_s,5,8.08494,0.6554968596416005
+PBFT mixed,fairness_jain,3,0.5228666666666667,0.006689045771508322
+Snow mixed,fairness_jain,3,0.5271,0.02990000000000001
+PBFT sim-only (c125ed8c),fairness_jain,5,0.51652,0.011054501345605774
+Snow sim-only (c125ed8c),fairness_jain,5,0.54182,0.007072269791233913
+PBFT mixed,consensus_msgs_per_job,3,341.27327333333335,5.250819621651687
+Snow mixed,consensus_msgs_per_job,3,273.51934266666666,4.709905456827897
+PBFT sim-only (c125ed8c),consensus_msgs_per_job,5,348.1287776,4.834024439001556
+Snow sim-only (c125ed8c),consensus_msgs_per_job,5,262.425222,3.053997637134582
+PBFT mixed,msgs_dropped,3,0.0,0.0
+Snow mixed,msgs_dropped,3,0.0,0.0
+PBFT sim-only (c125ed8c),msgs_dropped,5,0.0,0.0
+Snow sim-only (c125ed8c),msgs_dropped,5,0.0,0.0
+PBFT mixed,jobs_restarted,3,0.0,0.0
+Snow mixed,jobs_restarted,3,0.0,0.0
+PBFT sim-only (c125ed8c),jobs_restarted,5,0.0,0.0
+Snow sim-only (c125ed8c),jobs_restarted,5,0.0,0.0
+PBFT mixed,duplicate_leader_refusals,3,0.0,0.0
+Snow mixed,duplicate_leader_refusals,3,144.33333333333334,26.025628394590846
+PBFT sim-only (c125ed8c),duplicate_leader_refusals,5,0.0,0.0
+Snow sim-only (c125ed8c),duplicate_leader_refusals,5,123.2,25.193253065056922
