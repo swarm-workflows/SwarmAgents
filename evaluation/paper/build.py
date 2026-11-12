@@ -12,7 +12,7 @@ run tree someone listed. Keys (all paths relative to the manifest's directory un
         runs_wide: <path>/runs_wide.csv
         campaign: <campaign .yml>    planned jobs per cell come from its `args.jobs`
     e2_events: <timecourse.py events.csv>        (F5)
-    e3a_cells: <e3a.py cells.csv>               (F3; a list is allowed)
+    e3a_cells: <e3a.py cells.csv>               (F3; its sibling per_run.csv is read; a list is allowed)
     t6_per_workflow: <t6_compare.py csv>        (T-6 table; a list is allowed)
     events_summary: [<failure_summary.py csv>, ...]   (E7 under failure, E6)
 
@@ -21,7 +21,8 @@ Rules, the same as every docs/results/*/agg.py:
   campaign re-ran);
 - completion is jobs_completed / the cell's PLANNED jobs from its campaign file, never the jobs a
   run happened to see; a cell with no planned count gets no completion, not a guessed one;
-- mean and a 95 % t-interval over repeats; n is printed beside every cell;
+- mean ± sample standard deviation over repeats (the plan's §5 protocol: "mean ± std
+  everywhere"; Welch tests and Cohen's d are for the text, not these tables); n beside every cell;
 - validity is checked per run and printed first (validity.md): run twice, missing metrics,
   barrier-short agents, dropped sends, stranded jobs. A figure is drawn from every run anyway
   and the validity table says which to distrust; nothing is silently filtered.
@@ -151,12 +152,10 @@ def load_runs(manifest: dict, base: Path) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------- statistics
-def ci95(x: pd.Series) -> float:
+def sd(x: pd.Series) -> float:
+    """Sample standard deviation over repeats; 0 for a single run."""
     x = pd.to_numeric(x, errors="coerce").dropna()
-    if len(x) < 2:
-        return 0.0
-    from scipy import stats  # local: scipy only needed here
-    return float(stats.t.ppf(0.975, len(x) - 1) * x.std(ddof=1) / math.sqrt(len(x)))
+    return float(x.std(ddof=1)) if len(x) > 1 else 0.0
 
 
 def cells_table(runs: pd.DataFrame) -> pd.DataFrame:
@@ -169,7 +168,7 @@ def cells_table(runs: pd.DataFrame) -> pd.DataFrame:
             if col in g:
                 v = pd.to_numeric(g[col], errors="coerce").dropna()
                 r[col] = v.mean() if len(v) else np.nan
-                r[col + "_ci"] = ci95(v) if len(v) else np.nan
+                r[col + "_sd"] = sd(v) if len(v) else np.nan
                 r[col + "_n"] = len(v)
         rows.append(r)
     return pd.DataFrame(rows)
@@ -218,7 +217,7 @@ def _save(fig, out: Path, name: str, written: list):
 
 
 def _ladder(ax, cells, metric, ylabel, engines, label_last=False):
-    """One line per engine over agent count, mean ± 95 % CI, direct label at the right end."""
+    """One line per engine over agent count, mean ± sd, optional direct label at the right end."""
     drawn = False
     for e in engines:
         d = cells[cells.engine == e].sort_values("agents")
@@ -226,7 +225,7 @@ def _ladder(ax, cells, metric, ylabel, engines, label_last=False):
         if d.empty:
             continue
         color, marker, label = ENTITY_STYLE[e]
-        ax.errorbar(d.agents, d[metric], yerr=d.get(metric + "_ci"), color=color, marker=marker,
+        ax.errorbar(d.agents, d[metric], yerr=d.get(metric + "_sd"), color=color, marker=marker,
                     capsize=2, label=label)
         if label_last:
             ax.annotate(label, (d.agents.iloc[-1], d[metric].iloc[-1]), xytext=(4, 0),
@@ -302,7 +301,11 @@ def figures(runs, cells, manifest, base, out) -> list[str]:
     # F3 — coordinator decision time by measured RTT bin (E3a), Hier-90 analytic burst
     e3 = [p for p in _as_list(manifest.get("e3a_cells")) if _path(base, p).exists()]
     if e3:
-        c = pd.concat([pd.read_csv(_path(base, p)) for p in e3], ignore_index=True)
+        # mean ± sd over runs, from e3a.py's per_run.csv beside each cells.csv (its cells.csv
+        # carries a 95 % t-interval, not the sd every other figure shows)
+        pr = pd.concat([pd.read_csv(_path(base, p).parent / "per_run.csv") for p in e3], ignore_index=True)
+        c = (pr.groupby(["cell", "bin"])["l1_p50"].agg(l1_p50="mean", l1_p50_sd=lambda v: sd(v))
+             .reset_index())
         m = c["cell"].map(parse_cell).apply(pd.Series)
         c = pd.concat([c.drop(columns=[x for x in m.columns if x in c]), m], axis=1)
         c = c[(c.plane == "analytic") & (c.arrival == "burst")]
@@ -318,9 +321,9 @@ def figures(runs, cells, manifest, base, out) -> list[str]:
                 for i, e in enumerate(engines):
                     de = d[d.engine == e].set_index("bin").reindex(bins)
                     color, _, label = ENTITY_STYLE[e]
-                    lo = np.minimum(de["l1_p50_ci"], de["l1_p50"])   # an interval never crosses 0
+                    lo = np.minimum(de["l1_p50_sd"], de["l1_p50"])   # a bar never extends below 0
                     ax.bar(np.arange(len(bins)) + i * width, de["l1_p50"], width * 0.92,
-                           yerr=[lo, de["l1_p50_ci"]], color=color, label=label, capsize=2)
+                           yerr=[lo, de["l1_p50_sd"]], color=color, label=label, capsize=2)
                 ax.set_xticks(np.arange(len(bins)) + width * (len(engines) - 1) / 2,
                               ["LAN", "regional", "contin.", "transatl."], fontsize=7)
                 ax.set_ylim(bottom=0)
@@ -342,7 +345,7 @@ def figures(runs, cells, manifest, base, out) -> list[str]:
             d = e2[e2.engine == e].set_index("plane").reindex(pols)
             color, _, label = ENTITY_STYLE[e]
             ax.bar(np.arange(len(pols)) + i * width, d.regret_mean, width * 0.92,
-                   yerr=d.regret_mean_ci, color=color, label=label, capsize=2)
+                   yerr=d.regret_mean_sd, color=color, label=label, capsize=2)
         ax.set_xticks(np.arange(len(pols)) + width * (len(engines) - 1) / 2,
                       [POLICY_LABEL.get(p, p) for p in pols], rotation=25, ha="right", fontsize=7)
         ax.set_ylabel("regret vs oracle (mean)")
@@ -426,7 +429,7 @@ def tables_md(runs, cells, manifest, base) -> str:
         L.append("| cell | n | " + " | ".join(lbl for c, lbl, _ in METRICS if c in g) + " |")
         L.append("|---" * (2 + sum(1 for c, _, _ in METRICS if c in g)) + "|")
         for _, r in g.iterrows():
-            vals = [fmt(r.get(c), r.get(c + "_ci"), nd) for c, _, nd in METRICS if c in g]
+            vals = [fmt(r.get(c), r.get(c + "_sd"), nd) for c, _, nd in METRICS if c in g]
             L.append(f"| {r['cell']} | {r['n']} | " + " | ".join(vals) + " |")
 
     es = [p for p in _as_list(manifest.get("events_summary")) if _path(base, p).exists()]
@@ -441,7 +444,7 @@ def tables_md(runs, cells, manifest, base) -> str:
             vals = []
             for c in num:
                 v = pd.to_numeric(g[c], errors="coerce").dropna()
-                vals.append("–" if v.empty else fmt(v.mean(), ci95(v), 1))
+                vals.append("–" if v.empty else fmt(v.mean(), sd(v), 1))
             L.append(f"| {cell} | {len(g)} | {g.event.iloc[0]} | {oc or '–'} | " + " | ".join(vals) + " |")
 
     t6 = [p for p in _as_list(manifest.get("t6_per_workflow")) if _path(base, p).exists()]
@@ -460,8 +463,8 @@ def tables_md(runs, cells, manifest, base) -> str:
             cp = pd.to_numeric(g.swarm_exec_critical_path_s, errors="coerce").dropna()
             ra = pd.to_numeric(g.get("exec_ratio_adj_median"), errors="coerce").dropna()
             L.append(f"| {st} | {cell} | {wf} | {len(g)} | {int(g.swarm_exit0.sum())}/{int(g.jobs.sum())} "
-                     f"| {g.peg_exec_critical_path_s.iloc[0]} | {fmt(cp.mean(), ci95(cp), 1)} "
-                     f"| {fmt(ra.mean(), ci95(ra), 2)} |")
+                     f"| {g.peg_exec_critical_path_s.iloc[0]} | {fmt(cp.mean(), sd(cp), 1)} "
+                     f"| {fmt(ra.mean(), sd(ra), 2)} |")
     return "\n".join(L) + "\n"
 
 
