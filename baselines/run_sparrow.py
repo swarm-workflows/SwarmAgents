@@ -47,7 +47,8 @@ if str(_ROOT) not in sys.path:
 
 import redis  # noqa: E402
 
-from baselines.common import (add_arrival_args, arrival_kwargs, keyed_metrics,  # noqa: E402
+from baselines.common import (add_arrival_args, arrival_kwargs, failure_window_s,  # noqa: E402
+                              keyed_metrics,
                               load_level0_fleet, read_reports, runtime_config, safe_write_drain,
                               stage_config, wait_for_final_reports)
 from baselines.sparrow import Keys, publish_fleet  # noqa: E402
@@ -105,6 +106,8 @@ class Nodes:
         self.args, self.run_id, self.run_dir = args, run_id, run_dir
         self.local: list[subprocess.Popen] = []
         self.placement: dict[str, str] = {}
+        # host and launch command per node, for the outage companion's restart
+        self.launched: dict[str, dict] = {}
 
     def _node_args(self, role: str, extra: list[str]) -> list[str]:
         a = self.args
@@ -128,6 +131,7 @@ class Nodes:
                + " ".join(shlex.quote(x) for x in argv[1:]))
         pid = ssh_output(host, cmd)
         self.placement[f"{role}-{node_id}"] = host
+        self.launched[f"{role}-{node_id}"] = {"host": host, "cmd": cmd}
         log(f"  {role} {node_id} on {host} (pid {pid})")
 
     def stop(self, hosts: list[str]) -> None:
@@ -195,6 +199,11 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="Independent schedulers (default: one per 10 agents, at least 1).")
     p.add_argument("--probe-ratio", type=int, default=2, help="Probes per job (Sparrow's d).")
     p.add_argument("--reprobe-s", type=float, default=30.0)
+    p.add_argument("--requeue-dead-workers", action="store_true",
+                   help="E7 under failure: each scheduler requeues the claimed jobs, in its own "
+                        "partition, of a worker whose heartbeat is missing for SWARM's detector "
+                        "window (runtime.failure_threshold_seconds x 1.1 + 1). Off: every "
+                        "Sparrow run before 2026-11-12")
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--use-profiles", required=True, help="agent_profiles.json of the SWARM arm")
     p.add_argument("--use-jobs-dir", required=True, help="jobs directory of the SWARM arm")
@@ -296,7 +305,14 @@ def main(argv=None) -> int:
                      "--probe-ratio", str(args.probe_ratio), "--reprobe-s", str(args.reprobe_s)]
             if args.seed is not None:
                 extra += ["--seed", str(args.seed)]
+            if args.requeue_dead_workers:
+                extra += ["--failure-window-s",
+                          str(failure_window_s(runtime_config(args.config)))]
             nodes.start("scheduler", i, host_of(sched_hosts[i]), extra)
+        (run_dir / "worker_launch.json").write_text(json.dumps(
+            {"run_id": run_id, "role": "sparrow",
+             "workers": {k.split("-", 1)[1]: v for k, v in nodes.launched.items()
+                         if k.startswith("worker-")}}, indent=2))
 
         missing_w, missing_s = wait_registered(client, keys, worker_ids, args.schedulers,
                                                args.startup_timeout)
@@ -316,7 +332,7 @@ def main(argv=None) -> int:
                                      interval=args.interval, level=0, group=0, **arrival)
         distributor.daemon = True
         distributor.start()
-        log(f"Distributing {total} jobs; probe ratio {args.probe_ratio}")
+        log(f"Job distribution started: {total} jobs; probe ratio {args.probe_ratio}")
 
         deadline = started + args.timeout
         unreadable_since = None

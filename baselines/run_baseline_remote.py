@@ -43,7 +43,8 @@ if str(_SWARM_ROOT) not in sys.path:
 import redis
 
 from baselines.common import (add_arrival_args, arrival_kwargs, configure_execution,
-                              cost_params, executor_workers, host_of, load_config,
+                              cost_params, executor_workers, failure_window_s, host_of,
+                              load_config,
                               stage_config, wait_for_final_reports)
 from baselines.scheduler import SCHEDULER_MAP
 
@@ -138,6 +139,11 @@ def preflight_check(hosts: list[str], remote_repo_dir: str) -> None:
     log("Preflight checks passed.")
 
 
+# Each worker's host and launch command, written to <run_dir>/worker_launch.json so the outage
+# companion (group_outage.py --target baseline) restarts a killed worker exactly as it started.
+LAUNCHED: dict[int, dict] = {}
+
+
 def start_workers(agents: list, args, run_id: str) -> tuple[dict[int, str], list[int]]:
     """Start one worker per agent on its host. Returns ({agent_id: host}, [failed ids])."""
     placement, failed = {}, []
@@ -150,6 +156,7 @@ def start_workers(agents: list, args, run_id: str) -> tuple[dict[int, str], list
         try:
             pid = ssh_output(agent.host, cmd)
             placement[agent.agent_id] = agent.host
+            LAUNCHED[agent.agent_id] = {"host": agent.host, "cmd": cmd}
             log(f"  worker {agent.agent_id} on {agent.host} (pid {pid})")
         except subprocess.CalledProcessError as e:
             log(f"  FAILED to start worker {agent.agent_id} on {agent.host}: {e}")
@@ -295,6 +302,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--stats-wait-s", type=float, default=None,
                    help="Drain deadline for workers' final reports after the run ends "
                         "(default: the config's wall_time_max_s + 60, so a capped job finishes)")
+    p.add_argument("--requeue-dead-workers", action="store_true",
+                   help="E7 under failure: requeue the READY/RUNNING jobs of a worker whose "
+                        "heartbeat is missing for SWARM's own detector window "
+                        "(runtime.failure_threshold_seconds x 1.1 + 1). Off: the behaviour of "
+                        "every E7 run before 2026-11-12")
     p.add_argument("--debug", action="store_true")
 
     args = p.parse_args(argv)
@@ -392,7 +404,9 @@ def main(argv=None) -> int:
         jobs_dir=jobs_dir, jobs_per_interval=args.jobs_per_interval, run_dir=str(run_dir),
         total_jobs=total, interval=args.interval,
         executor_workers=executor_workers(runtime), timeout=args.timeout, remote=True,
-        run_id=run_id, agents=args.agents, arrival=arrival, **cost)
+        run_id=run_id, agents=args.agents, arrival=arrival,
+        failure_window_s=failure_window_s(runtime) if args.requeue_dead_workers else None,
+        **cost)
     try:
         scheduler.load_agents()
     except SystemExit as exc:          # a profile set for a smaller fleet: a refusal, not a crash
@@ -422,6 +436,9 @@ def main(argv=None) -> int:
                 return 2
             log(f"Base config staged to {len(worker_hosts)} host(s) as {args.remote_config}")
         placement, failed = start_workers(scheduler.agents, args, run_id)
+        (run_dir / "worker_launch.json").write_text(json.dumps(
+            {"run_id": run_id, "role": "baseline",
+             "workers": {str(a): v for a, v in LAUNCHED.items()}}, indent=2))
         missing = wait_for_workers(redis_client, keys, agent_ids, args.worker_timeout)
         if failed or missing:
             log(f"REFUSED: workers not running — failed to start {failed[:10]}, "
@@ -434,6 +451,7 @@ def main(argv=None) -> int:
         # 5. Schedule.
         log(f"Starting {args.scheduler} (remote) over {len(agent_ids)} level-0 workers of "
             f"{args.agents} agents, {total} jobs, {scheduler.executor_workers} concurrent each")
+        log("Job distribution started (the scheduler starts the distributor)")
         scheduler.run()
     finally:
         try:

@@ -66,7 +66,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Dict, Iterable, List, Optional
 
 from baselines.agent_sim import SimulatedAgent
-from baselines.common import data_ready, run_job
+from baselines.common import WorkerLiveness, data_ready, requeue_jobs_of, run_job
 from swarm.database.repository import Repository
 from swarm.models.capacities import Capacities
 from swarm.models.job import Job, ObjectState
@@ -159,7 +159,8 @@ class SparrowScheduler:
     def __init__(self, index: int, n_schedulers: int, repo: Repository, redis_client,
                  keys: Keys, fleet: List[SimulatedAgent], probe_ratio: int = 2,
                  reprobe_s: float = 30.0, heartbeat_ttl_s: int = 30,
-                 seed: Optional[int] = None, clock: Callable[[], float] = time.time):
+                 seed: Optional[int] = None, clock: Callable[[], float] = time.time,
+                 failure_window_s: Optional[float] = None):
         self.index, self.n = int(index), int(n_schedulers)
         self.repo, self.redis, self.keys = repo, redis_client, keys
         self.fleet = list(fleet)
@@ -171,6 +172,11 @@ class SparrowScheduler:
         self.probed: Dict[str, dict] = {}       # job_id -> {"at": t, "rounds": n}
         self.stats = {"jobs_probed": 0, "probes_sent": 0, "reprobes": 0,
                       "no_feasible_worker": 0, "no_live_worker": 0, "gated": 0}
+        # E7 under failure: a worker whose heartbeat is missing for `failure_window_s` is dead
+        # and the jobs it claimed IN THIS SCHEDULER'S PARTITION go back to PENDING, to be
+        # probed again. None = off, every Sparrow run before 2026-11-12.
+        self.liveness = (WorkerLiveness([a.agent_id for a in self.fleet], failure_window_s,
+                                        clock=self.clock) if failure_window_s else None)
 
     def live_workers(self) -> set:
         ids = [a.agent_id for a in self.fleet]
@@ -183,6 +189,16 @@ class SparrowScheduler:
         """One pass over this scheduler's pending jobs. Returns the probes sent."""
         self.redis.set(self.keys.scheduler_heartbeat(self.index), "1",
                        ex=self.heartbeat_ttl_s)
+        if self.liveness is not None:
+            dead, back = self.liveness.observe(self.live_workers())
+            if dead:
+                requeued = requeue_jobs_of(self.repo, dead,
+                                           owns=lambda j: owner_of(j, self.n) == self.index)
+                self.stats["workers_failed"] = self.stats.get("workers_failed", 0) + len(dead)
+                self.stats["jobs_requeued"] = self.stats.get("jobs_requeued", 0) + len(requeued)
+            if back:
+                self.stats["workers_readmitted"] = (self.stats.get("workers_readmitted", 0)
+                                                    + len(back))
         state_map = self.repo.get_all_ids_multi(key_prefix=Repository.KEY_JOB, level=LEVEL,
                                                 group=GROUP, states=[PENDING])
         pending = [j for j in state_map.get(PENDING, []) if owner_of(j, self.n) == self.index]
@@ -217,7 +233,8 @@ class SparrowScheduler:
                 self.stats["no_live_worker"] += 1
                 continue
             first = job_id not in self.probed
-            if first:
+            # A requeued job (E7 under failure) keeps its original selection start.
+            if first and not job.selection_started_at_dict:
                 # Stamped once, before any reservation exists, so no worker can have claimed
                 # the job yet; the precondition still refuses a record that moved.
                 job.mark_selection_started()

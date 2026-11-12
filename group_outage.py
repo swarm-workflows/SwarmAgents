@@ -39,6 +39,14 @@ record), or the run's completeness gate fails it.
 **not** restart anyone. A restart after the run has stopped its agents would leave a stray agent
 running into the next cell. It records what happened and exits 3.
 
+**Baselines (E7 under failure).** `--target baseline` (centralized workers) or `--target sparrow`
+(Sparrow workers) takes down the same agent ids' WORKER processes instead of SWARM agents.
+Members come from `--members 28,29,...` (the SWARM cell's group, so both sides lose the same
+machines); hosts from the hosts file as above. The restart replays each worker's own launch
+command from `<run-dir>/worker_launch.json`, written by its runner, so it rejoins the same run
+with the same config. The schedulers requeue a dead worker's jobs only when the runner was given
+`--requeue-dead-workers`.
+
 **Exit status:** 0 the group went down on every host, was verified down, held for the full duration
 and (unless `--no-rejoin`) came back verified on every host; 1 a host failed to kill or restart, or a
 verification disagreed; 2 the run never started; 3 the outage never happened, or was held for less
@@ -115,8 +123,16 @@ def _pattern(aid: int) -> str:
     return f"^(\\S*/)?python3(\\.[0-9]+)? main\\.py {aid}( |$)"
 
 
-def kill_script(aid: int) -> str:
-    p = shlex.quote(_pattern(aid))
+def _baseline_pattern(aid: int, target: str) -> str:
+    """A baseline worker's process, anchored on the interpreter as `_pattern` is: the remote
+    shell that runs our own script also carries the worker's arguments."""
+    if target == "baseline":
+        return f"^(\\S*/)?python3(\\.[0-9]+)? baselines/baseline_worker\\.py --agent-id {aid}( |$)"
+    return f"^(\\S*/)?python3(\\.[0-9]+)? baselines/sparrow_node\\.py worker .* --agent-id {aid}( |$)"
+
+
+def kill_script(aid: int, target: str = "swarm") -> str:
+    p = shlex.quote(_pattern(aid) if target == "swarm" else _baseline_pattern(aid, target))
     return f"pkill -9 -f {p}; sleep 1; if pgrep -f {p} >/dev/null; then echo ALIVE; else echo GONE; fi"
 
 
@@ -131,6 +147,14 @@ def restart_script(aid: int, agent_type: str, run_id: str) -> str:
               f">> agent_{aid}_rejoin.log 2>&1 < /dev/null &)")
     return (f"if pgrep -f {p} >/dev/null; then echo ALREADY; else "
             f"{launch}; sleep 5; if pgrep -f {p} >/dev/null; then echo UP; else echo DOWN; fi; fi")
+
+
+def baseline_restart_script(aid: int, target: str, launch_cmd: str) -> str:
+    """Replay the worker's own launch command, unless a process for it is already running."""
+    p = shlex.quote(_baseline_pattern(aid, target))
+    return (f"if pgrep -f {p} >/dev/null; then echo ALREADY; else "
+            f"({launch_cmd}) >/dev/null 2>&1; sleep 5; "
+            f"if pgrep -f {p} >/dev/null; then echo UP; else echo DOWN; fi; fi")
 
 
 def wait_for_log(path: str, marker: str, timeout_s: float) -> bool:
@@ -156,11 +180,16 @@ class _Stop(Exception):
 
 def cmd_run(args) -> int:
     hosts = read_lines(args.hosts_file)
-    members = group_members(args.config_dir, args.group)
+    if args.members:
+        members = {int(x): "resource" for x in args.members.split(",") if x.strip()}
+    elif args.target != "swarm":
+        raise SystemExit("--target baseline/sparrow needs --members (the SWARM cell's group ids)")
+    else:
+        members = group_members(args.config_dir, args.group)
     if any(aid > args.agents for aid in members):
         raise SystemExit(f"group {args.group} has members beyond --agents {args.agents}: {list(members)}")
     placed = place(members, hosts, args.agents_per_host)
-    record = {"group": args.group, "members": list(members), "hosts": {str(a): h for a, h in placed.items()},
+    record = {"group": args.group, "target": args.target, "members": list(members), "hosts": {str(a): h for a, h in placed.items()},
               "duration_s": args.duration, "rejoin": not args.no_rejoin,
               "expect_silent_agents": ",".join(str(a) for a in members) if args.no_rejoin else ""}
     out = Path(args.out)
@@ -190,6 +219,31 @@ def cmd_run(args) -> int:
             meta = Path(args.run_dir) / "run_meta.json"
             if meta.exists():
                 run_id = json.loads(meta.read_text()).get("run_id", "")
+        launch = {}
+        if args.target != "swarm":
+            # The runner writes worker_launch.json right after starting its workers, before
+            # it logs the start marker; wait briefly in case the file system is behind.
+            lj = Path(args.run_dir) / "worker_launch.json" if args.run_dir else None
+            for _ in range(30):
+                if lj is not None and lj.exists():
+                    break
+                time.sleep(1.0)
+            if lj is None or not lj.exists():
+                record["outcome"] = "no_worker_launch_record"
+                log("no <run-dir>/worker_launch.json: cannot restart the workers as they started")
+                write()
+                return 3
+            doc = json.loads(lj.read_text())
+            launch = doc.get("workers") or {}
+            run_id = run_id or doc.get("run_id", "")
+            absent = [a for a in members if str(a) not in launch]
+            if absent:
+                record["outcome"] = "members_not_launched"
+                log(f"members {absent} have no worker in this run")
+                write()
+                return 3
+            placed = {a: launch[str(a)]["host"] for a in members}
+            record["hosts"] = {str(a): h for a, h in placed.items()}
         record["run_id"] = run_id
         if not args.no_rejoin and not run_id:
             record["outcome"] = "no_run_id"
@@ -203,7 +257,8 @@ def cmd_run(args) -> int:
         log(f"killing group {args.group}: agents {list(members)} on {sorted(set(placed.values()))}")
         killed = True
         record["killed_at"] = time.time()
-        results = _fanout(lambda a: (a, ssh_run(placed[a], kill_script(a))), list(members))
+        results = _fanout(lambda a: (a, ssh_run(placed[a], kill_script(a, args.target))),
+                          list(members))
         record["kill"] = {str(a): {"rc": rc, "verdict": outp.splitlines()[-1] if outp else ""}
                           for a, (rc, outp) in results}
         down = all(v["verdict"] == "GONE" for v in record["kill"].values())
@@ -224,8 +279,12 @@ def cmd_run(args) -> int:
                 log(f"not restarting {skipped}: their kill was not verified")
             log(f"restarting group {args.group}: {dead}")
             record["rejoined_at"] = time.time()
-            results = _fanout(lambda a: (a, ssh_run(placed[a], restart_script(a, members[a], run_id))),
-                              dead)
+            if args.target == "swarm":
+                results = _fanout(lambda a: (a, ssh_run(placed[a],
+                                                        restart_script(a, members[a], run_id))), dead)
+            else:
+                results = _fanout(lambda a: (a, ssh_run(placed[a], baseline_restart_script(
+                    a, args.target, launch[str(a)]["cmd"]))), dead)
             record["rejoin_check"] = {str(a): {"rc": rc, "verdict": outp.splitlines()[-1] if outp else ""}
                                       for a, (rc, outp) in results}
             if skipped or not all(v["verdict"] == "UP" for v in record["rejoin_check"].values()):
@@ -265,6 +324,12 @@ def main(argv=None) -> int:
     r.add_argument("--agents", type=int, required=True)
     r.add_argument("--agents-per-host", type=int, default=1)
     r.add_argument("--group", type=int, required=True, help="level-0 group index to take down")
+    r.add_argument("--target", choices=["swarm", "baseline", "sparrow"], default="swarm",
+                   help="whose processes: SWARM agents, centralized-baseline workers or Sparrow "
+                        "workers (E7 under failure)")
+    r.add_argument("--members", default="",
+                   help="comma-separated agent ids to take down instead of reading --group from "
+                        "the configs; required for baseline/sparrow")
     r.add_argument("--config-dir", default="configs", help="the run's generated configs")
     r.add_argument("--duration", type=float, default=180.0, help="seconds the group stays down")
     r.add_argument("--no-rejoin", action="store_true", help="leave the group down for the rest of the run")

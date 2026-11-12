@@ -58,6 +58,85 @@ def executor_workers(runtime: dict) -> int:
     return max(1, int(runtime.get("executor_workers", 10)))
 
 
+def failure_window_s(runtime: dict) -> float:
+    """How long a worker's heartbeat must be missing before its jobs are requeued: SWARM's own
+    detector window, `failure_threshold_seconds × 1.1 + 1` (`ResourceAgent`, 67 s shipped), so
+    E7 under failure compares recovery, not how quickly each side is allowed to notice."""
+    return float(runtime.get("failure_threshold_seconds", 60)) * 1.1 + 1.0
+
+
+class WorkerLiveness:
+    """Which workers are dead, judged from their heartbeat keys on the observer's monotonic clock.
+
+    A worker is dead once its heartbeat has been missing for more than `window_s` since it was
+    last seen (every worker counts as seen at construction, i.e. at run start), and alive again
+    the first time its heartbeat is back — a restarted worker rejoins with no capacity in use.
+    `observe()` returns (newly dead, readmitted)."""
+
+    def __init__(self, ids, window_s: float, clock=None):
+        import time as _t
+        self.clock = clock or _t.monotonic
+        self.window_s = float(window_s)
+        now = self.clock()
+        self.last_seen = {int(i): now for i in ids}
+        self.dead: set = set()
+
+    def observe(self, alive) -> tuple:
+        now = self.clock()
+        alive = {int(a) for a in alive}
+        newly_dead, back = [], []
+        for wid in self.last_seen:
+            if wid in alive:
+                self.last_seen[wid] = now
+                if wid in self.dead:
+                    self.dead.discard(wid)
+                    back.append(wid)
+            elif wid not in self.dead and now - self.last_seen[wid] > self.window_s:
+                self.dead.add(wid)
+                newly_dead.append(wid)
+        return newly_dead, back
+
+
+def requeue_jobs_of(repo: Repository, dead, owns=None) -> List[str]:
+    """Return every READY or RUNNING job held by a worker in `dead` to PENDING, unassigned, so
+    the scheduler places it again — what HTCondor does with a lost slot's jobs. Each reset is a
+    compare-and-set on the record still being that worker's job in that state, so a job that
+    completed (or moved) meanwhile is left alone. `owns(job_id)` limits it to one scheduler's
+    partition (Sparrow). Returns the ids requeued.
+
+    The killed attempt's own `started_at` stays on the record until the new attempt overwrites it;
+    a job that was really still running somewhere (a stale heartbeat, not a dead worker) can then
+    complete late, and its write is refused — it shows as executed twice, which is measured."""
+    dead = {str(d) for d in dead}
+    if not dead:
+        return []
+    states = [ObjectState.READY.value, ObjectState.RUNNING.value]
+    ids_by_state = repo.get_all_ids_multi(key_prefix=Repository.KEY_JOB, level=LEVEL,
+                                          group=GROUP, states=states)
+    ids = [j for st in states for j in ids_by_state.get(st, [])
+           if owns is None or owns(j)]
+    if not ids:
+        return []
+    requeued = []
+    for jid, rec in repo.get_many(ids, key_prefix=Repository.KEY_JOB, level=LEVEL,
+                                  group=GROUP).items():
+        leader, state = str(rec.get("leader_id")), rec.get("state")
+        if leader not in dead or state not in states:
+            continue
+        job = Job()
+        job.from_dict(rec)
+        job.level = LEVEL
+        job.state = ObjectState.PENDING
+        job.leader_id = None
+        if repo.save(obj=job.to_dict(), key_prefix=Repository.KEY_JOB, level=LEVEL, group=GROUP,
+                     precondition=lambda cur, l=leader, s=state: bool(cur)
+                     and str(cur.get("leader_id")) == l and cur.get("state") == s):
+            requeued.append(str(jid))
+    if requeued:
+        logger.warning("requeued %d job(s) of dead worker(s) %s", len(requeued), sorted(dead))
+    return requeued
+
+
 def cost_params(config: dict) -> dict:
     """`job_selection` cost parameters with ResourceAgent's fallbacks."""
     js = config.get("job_selection") or {}

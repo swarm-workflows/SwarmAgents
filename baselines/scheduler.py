@@ -35,8 +35,8 @@ from swarm.database.repository import Repository
 from swarm.models.job import Job, ObjectState
 from swarm.models.capacities import Capacities
 from baselines.agent_sim import SimulatedAgent
-from baselines.common import (GROUP, LEVEL, data_ready, keyed_metrics, load_level0_fleet,
-                              read_reports, run_job)
+from baselines.common import (GROUP, LEVEL, WorkerLiveness, data_ready, keyed_metrics,
+                              load_level0_fleet, read_reports, requeue_jobs_of, run_job)
 from baselines.sparrow import Keys
 
 logger = logging.getLogger(__name__)
@@ -80,6 +80,7 @@ class BaselineScheduler(ABC):
         agents: int | None = None,
         redis_client=None,
         arrival: dict | None = None,
+        failure_window_s: float | None = None,
     ):
         self.db_host = db_host
         self.db_port = db_port
@@ -99,6 +100,11 @@ class BaselineScheduler(ABC):
         self.run_id = run_id or os.environ.get("SWARM_RUN_ID") or ""
         self.fleet_size = agents
         self.keys = Keys(self.run_id, prefix="baseline")
+        # E7 under failure (remote only): a worker whose heartbeat is missing for this long is
+        # declared dead and its READY/RUNNING jobs are requeued (`baselines.common`). None = off,
+        # the behaviour of every E7 run before 2026-11-12.
+        self.failure_window_s = failure_window_s
+        self.failure_events: list[dict] = []
 
         # Cost function parameters (match ResourceAgent defaults)
         cw = cost_weights or {}
@@ -152,7 +158,9 @@ class BaselineScheduler(ABC):
 
     @staticmethod
     def is_feasible(job: Job, agent: SimulatedAgent) -> bool:
-        """Check if job can run on agent: capacity check + DTN connectivity."""
+        """Check if job can run on agent: liveness, capacity check + DTN connectivity."""
+        if not getattr(agent, "alive", True):      # declared dead (E7 under failure)
+            return False
         # Capacity check against available resources
         if not agent.can_fit(job.capacities):
             return False
@@ -325,6 +333,47 @@ class BaselineScheduler(ABC):
                     agent.release(Capacities.from_dict(caps))
         return len(ids)
 
+    # ── Worker failure (E7 under failure, remote mode) ─────────────
+
+    def _check_liveness(self, liveness: WorkerLiveness, seen: set) -> None:
+        """Declare workers dead or back from their heartbeats; requeue a dead worker's jobs.
+
+        A dead worker is excluded from placement, its capacity bookkeeping is reset (whatever it
+        held died with it), its queue and any dispatch still owed to it are dropped (the records
+        are READY under it and are requeued instead). A worker whose heartbeat returns is placed
+        again from empty."""
+        ids = [a.agent_id for a in self.agents]
+        vals = self.redis_client.mget([self.keys.heartbeat(a) for a in ids]) if ids else []
+        dead, back = liveness.observe({a for a, v in zip(ids, vals) if v})
+        if not dead and not back:
+            return
+        amap = {a.agent_id: a for a in self.agents}
+        now = time.time()
+        for wid in dead:
+            agent = amap[wid]
+            agent.alive = False
+            agent.current_alloc = Capacities()
+            for jid, aid in list(self._undispatched.items()):
+                if aid == wid:
+                    del self._undispatched[jid]
+            self.redis_client.delete(self.keys.queue(wid))
+            self.stats["workers_failed"] = self.stats.get("workers_failed", 0) + 1
+        requeued = requeue_jobs_of(self.repo, dead) if dead else []
+        for jid in requeued:
+            seen.discard(jid)
+        # Each requeued job is assigned again, so it must not count twice as in flight.
+        self.assigned_count -= len(requeued)
+        self.stats["jobs_requeued"] = self.stats.get("jobs_requeued", 0) + len(requeued)
+        for wid in back:
+            agent = amap[wid]
+            agent.alive = True
+            agent.current_alloc = Capacities()
+            self.stats["workers_readmitted"] = self.stats.get("workers_readmitted", 0) + 1
+        self.failure_events.append({"at": now, "dead": sorted(dead), "readmitted": sorted(back),
+                                    "requeued": len(requeued)})
+        logger.warning("liveness: dead %s, back %s, %d job(s) requeued",
+                       sorted(dead), sorted(back), len(requeued))
+
     # ── Main Run Loop ──────────────────────────────────────────────
 
     def _fetch_new_pending(self, waiting: dict, seen: set) -> None:
@@ -486,6 +535,9 @@ class BaselineScheduler(ABC):
                     self.executor_workers, self.timeout)
 
         unreadable_since = None
+        liveness = (WorkerLiveness([a.agent_id for a in self.agents], self.failure_window_s)
+                    if self.remote and self.failure_window_s else None)
+        last_liveness = 0.0
         try:
             while True:
                 if time.time() - self.start_time > self.timeout:
@@ -499,6 +551,9 @@ class BaselineScheduler(ABC):
                         self.drain = {"status": "all_terminal"}
                         break
                     self._reconcile(waiting, seen, executors)
+                    if liveness is not None and time.monotonic() - last_liveness >= 2.0:
+                        last_liveness = time.monotonic()
+                        self._check_liveness(liveness, seen)
                     self._flush_dispatches()
                     self._fetch_new_pending(waiting, seen)
                     unreadable_since = None
@@ -651,6 +706,8 @@ class BaselineScheduler(ABC):
             "makespan_seconds": round(ended - self.start_time, 2) if self.start_time else None,
             "completed_jobs": self.completed_count, "assigned_jobs": self.assigned_count,
             "scheduler_stats": dict(self.stats),
+            "failure_window_s": self.failure_window_s,
+            "failure_events": list(self.failure_events),
         }
         meta.update(extra_meta or {})
         (run_dir / "run_meta.json").write_text(json.dumps(meta, indent=2, default=str))
