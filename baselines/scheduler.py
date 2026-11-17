@@ -42,6 +42,8 @@ from baselines.sparrow import Keys
 logger = logging.getLogger(__name__)
 
 PENDING = ObjectState.PENDING.value
+READY = ObjectState.READY.value
+RUNNING = ObjectState.RUNNING.value
 COMPLETE = ObjectState.COMPLETE.value
 
 # A store unreadable for this long ends the run (exit 4), as for SWARM and Sparrow.
@@ -81,6 +83,7 @@ class BaselineScheduler(ABC):
         redis_client=None,
         arrival: dict | None = None,
         failure_window_s: float | None = None,
+        outage: dict | None = None,
     ):
         self.db_host = db_host
         self.db_port = db_port
@@ -105,6 +108,13 @@ class BaselineScheduler(ABC):
         # the behaviour of every E7 run before 2026-11-12.
         self.failure_window_s = failure_window_s
         self.failure_events: list[dict] = []
+        # E7c (remote only): {"at_s", "duration_s"} — the scheduler itself goes down `at_s` after
+        # distribution starts, for `duration_s`, and restarts from the store (`_scheduler_outage`).
+        # None = off, every run before 2026-11-17.
+        if outage is not None and not remote:
+            raise ValueError("a scheduler outage needs remote mode: local jobs run in its process")
+        self.outage = dict(outage) if outage else None
+        self.outage_record: dict | None = None
 
         # Cost function parameters (match ResourceAgent defaults)
         cw = cost_weights or {}
@@ -493,6 +503,105 @@ class BaselineScheduler(ABC):
                 agent.release(job.capacities, completed=False)
                 self.stats["assign_refused"] += 1
 
+    # ── Scheduler outage (E7c, remote mode) ────────────────────────
+
+    def _reset_strategy(self) -> None:
+        """Forget the placement strategy's own memory (a restarted process starts from zero)."""
+
+    def _outage_due(self) -> bool:
+        return (self.outage is not None and self.outage_record is None
+                and time.time() - self.start_time >= float(self.outage["at_s"]))
+
+    def _write_outage(self) -> None:
+        Path(self.run_dir, "outage.json").write_text(json.dumps(self.outage_record, indent=2))
+
+    def _scheduler_outage(self, waiting: dict, seen: set) -> bool:
+        """The scheduler goes down for `duration_s` and comes back knowing only the store.
+
+        Emulated inside the runner process, because that process also starts and stops the
+        workers and writes the results. While down, nothing places, dispatches, polls or checks
+        liveness; the distributor thread keeps submitting (users keep submitting to a queue
+        whose matchmaker is down) and the workers keep running what they hold. On restart every
+        in-memory structure is discarded and rebuilt from the store (`_restart_from_store`).
+
+        It goes down between two passes, never inside one, so no assignment is half-written:
+        a real SIGKILL could also lose one in flight. The emulation therefore favours the
+        baseline, and the paper says so. Returns False when the run's timeout fell inside the
+        outage (`held_short`)."""
+        dur = float(self.outage["duration_s"])
+        rec = {"target": "central-scheduler", "group": None, "members": [], "duration_s": dur,
+               "rejoin": True, "killed_at": time.time(), "at_s": float(self.outage["at_s"])}
+        self.outage_record = rec
+        self._write_outage()
+        logger.warning("SCHEDULER OUTAGE: down for %.0f s (%d waiting, %d owed dispatches "
+                       "and %d unconfirmed assignments lost with the process)",
+                       dur, len(waiting), len(self._undispatched), len(self._unconfirmed))
+        end = rec["killed_at"] + dur
+        while time.time() < end and time.time() - self.start_time <= self.timeout:
+            time.sleep(max(0.0, min(0.5, end - time.time())))
+        rec["held_s"] = round(time.time() - rec["killed_at"], 1)
+        if rec["held_s"] + 1.0 < dur:
+            rec["outcome"] = "held_short"
+            self._write_outage()
+            return False
+        rec["rejoined_at"] = time.time()
+        rec["rebuilt"] = self._restart_from_store(waiting, seen)
+        rec["outcome"] = "ok"
+        self._write_outage()
+        self.stats["scheduler_outages"] = self.stats.get("scheduler_outages", 0) + 1
+        logger.warning("SCHEDULER RESTARTED from the store: %s", rec["rebuilt"])
+        return True
+
+    def _restart_from_store(self, waiting: dict, seen: set) -> dict:
+        """Rebuild every in-memory structure from the store, as a restarted process must.
+
+        * capacity: each worker's reservation is the sum of its READY and RUNNING jobs;
+        * completions: every COMPLETE job is already released (none of it is reserved);
+        * dispatch: every READY job is pushed to its worker again. A copy the worker already
+          has is harmless: the worker claims READY -> RUNNING under its own id with a
+          compare-and-set (`common.run_job`), so a second delivery is refused, never run;
+        * the waiting set is re-read from PENDING on the next pass, and the strategy's own
+          memory (round-robin's pointer) restarts from zero."""
+        waiting.clear()
+        seen.clear()
+        self._unconfirmed.clear()
+        self._undispatched.clear()
+        for a in self.agents:
+            a.current_alloc = Capacities()
+            a.alive = True
+        self._reset_strategy()
+        sm = self.repo.get_all_ids_multi(key_prefix=Repository.KEY_JOB, level=self.level,
+                                         group=self.group,
+                                         states=[PENDING, READY, RUNNING, COMPLETE])
+        held = sm.get(READY, []) + sm.get(RUNNING, [])
+        complete = set(sm.get(COMPLETE, []))
+        recs = self.repo.get_many(held, key_prefix=Repository.KEY_JOB, level=self.level,
+                                  group=self.group) if held else {}
+        amap = {a.agent_id: a for a in self.agents}
+        for jid, rec in recs.items():
+            state = (rec or {}).get("state")
+            if state == COMPLETE:
+                complete.add(jid)           # finished since the index read: nothing reserved
+                continue
+            if state not in (READY, RUNNING):
+                continue
+            leader, caps = rec.get("leader_id"), rec.get("capacities")
+            agent = amap.get(int(leader)) if leader is not None else None
+            if agent is None:
+                continue
+            if caps:
+                agent.allocate(Capacities.from_dict(caps))
+            if state == READY:
+                self._undispatched[jid] = agent.agent_id
+        self._released = set(complete)
+        seen.update(held)
+        seen.update(complete)
+        self.assigned_count = len(held) + len(complete)
+        self.stats["redispatched"] = self.stats.get("redispatched", 0) + len(self._undispatched)
+        return {"pending": len(sm.get(PENDING, [])), "ready": len(sm.get(READY, [])),
+                "running": len(sm.get(RUNNING, [])), "complete": len(complete),
+                "redispatched": len(self._undispatched)}
+
     # ── Main Run Loop ──────────────────────────────────────────────
 
     def run(self, start_distributor: bool = True):
@@ -544,6 +653,14 @@ class BaselineScheduler(ABC):
                     logger.warning("Timeout reached (%.0fs). Stopping.", self.timeout)
                     self.drain = {"status": "timer"}
                     break
+                if self._outage_due():
+                    if not self._scheduler_outage(waiting, seen):
+                        self.drain = {"status": "timer"}
+                        break
+                    if liveness is not None:      # its observations died with the process
+                        liveness = WorkerLiveness([a.agent_id for a in self.agents],
+                                                  self.failure_window_s)
+                    continue
                 try:
                     if self.remote:
                         self.completed_count = self._poll_completions()
@@ -628,6 +745,8 @@ class BaselineScheduler(ABC):
             self.drain["unconfirmed_at_stop"] = len(self._unconfirmed)
             self.exit_code = self.exit_code or 4
             logger.error("%d job(s) never reached a worker (store errors)", owed)
+        if self.outage_record is not None:
+            self.drain["scheduler_outage"] = self.outage_record.get("outcome")
         self.drain["completed_at_stop"] = self.completed_count
         self.drain["inflight_at_stop"] = max(0, self.assigned_count - self.completed_count)
         self.drain["jobs"] = self.total_jobs
@@ -750,6 +869,9 @@ class RoundRobinScheduler(BaselineScheduler):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._rr_index = 0
+
+    def _reset_strategy(self) -> None:
         self._rr_index = 0
 
     def assign_jobs(self, jobs: list[Job]) -> list[tuple[Job, SimulatedAgent]]:

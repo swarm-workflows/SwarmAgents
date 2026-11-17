@@ -307,9 +307,16 @@ def parse_args(argv=None) -> argparse.Namespace:
                         "heartbeat is missing for SWARM's own detector window "
                         "(runtime.failure_threshold_seconds x 1.1 + 1). Off: the behaviour of "
                         "every E7 run before 2026-11-12")
+    p.add_argument("--scheduler-outage-at", type=float, default=None,
+                   help="E7c: seconds after distribution starts at which the scheduler goes "
+                        "down; it restarts from the store after --scheduler-outage-duration. "
+                        "The record is <run-dir>/outage.json (target central-scheduler)")
+    p.add_argument("--scheduler-outage-duration", type=float, default=None)
     p.add_argument("--debug", action="store_true")
 
     args = p.parse_args(argv)
+    if (args.scheduler_outage_at is None) != (args.scheduler_outage_duration is None):
+        p.error("--scheduler-outage-at and --scheduler-outage-duration go together")
     # --remote-config unset = copy --config to every worker host at launch (common.stage_config).
     if args.stats_wait_s is None:
         from baselines.run_sparrow import drain_deadline
@@ -406,6 +413,9 @@ def main(argv=None) -> int:
         executor_workers=executor_workers(runtime), timeout=args.timeout, remote=True,
         run_id=run_id, agents=args.agents, arrival=arrival,
         failure_window_s=failure_window_s(runtime) if args.requeue_dead_workers else None,
+        outage=({"at_s": args.scheduler_outage_at,
+                 "duration_s": args.scheduler_outage_duration}
+                if args.scheduler_outage_at is not None else None),
         **cost)
     try:
         scheduler.load_agents()
@@ -472,6 +482,12 @@ def main(argv=None) -> int:
         "agents_per_host": args.agents_per_host, "config": args.config,
         "cost": cost, "argv": sys.argv,
         "placement": {str(a): h for a, h in sorted(placement.items())}})
+    if args.scheduler_outage_at is not None:
+        outcome = (scheduler.outage_record or {}).get("outcome", "not_applied")
+        if outcome != "ok":
+            # The cell's event did not happen as planned: never an `ok` run (campaign.py).
+            log(f"scheduler outage {outcome}: exit 3")
+            exit_code = exit_code or 3
 
     print("\n" + "=" * 60)
     print(f"  Scheduler:      {args.scheduler} (REMOTE)")

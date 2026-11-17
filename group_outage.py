@@ -47,6 +47,19 @@ command from `<run-dir>/worker_launch.json`, written by its runner, so it rejoin
 with the same config. The schedulers requeue a dead worker's jobs only when the runner was given
 `--requeue-dead-workers`.
 
+**Sparrow scheduler (E7c).** `--target sparrow-scheduler` takes down Sparrow SCHEDULER processes
+instead of workers: `--members` names scheduler indices (`--index` of `sparrow_node.py scheduler`),
+and the restart replays each one's launch command from the `schedulers` map of
+`<run-dir>/worker_launch.json`. A Sparrow scheduler keeps no state outside the store, so the
+restarted one re-reads its partition's PENDING jobs and probes them again. Its first life's stats
+are lost with it, as a SIGKILLed agent's are.
+
+**Members are read after the run starts.** Without `--members`, the group is read from the
+configs only once the start marker is in the log. The companion starts with the attempt, before
+`run_test.py` regenerates `configs/`, and reading then took the PREVIOUS cell's topology: the
+first E7-under-failure PBFT run (frozen 0bceb349, 16 Nov) killed 15 agents of a Hier-30 layout
+instead of group 3's 9. The record carries `members_read_at`.
+
 **Exit status:** 0 the group went down on every host, was verified down, held for the full duration
 and (unless `--no-rejoin`) came back verified on every host; 1 a host failed to kill or restart, or a
 verification disagreed; 2 the run never started; 3 the outage never happened, or was held for less
@@ -124,8 +137,12 @@ def _pattern(aid: int) -> str:
 
 
 def _baseline_pattern(aid: int, target: str) -> str:
-    """A baseline worker's process, anchored on the interpreter as `_pattern` is: the remote
-    shell that runs our own script also carries the worker's arguments."""
+    """A baseline worker's process (or, for `sparrow-scheduler`, a Sparrow scheduler's, by its
+    `--index`), anchored on the interpreter as `_pattern` is: the remote shell that runs our own
+    script also carries the node's arguments."""
+    if target == "sparrow-scheduler":
+        return (f"^(\\S*/)?python3(\\.[0-9]+)? baselines/sparrow_node\\.py scheduler "
+                f".* --index {aid}( |$)")
     if target == "baseline":
         return f"^(\\S*/)?python3(\\.[0-9]+)? baselines/baseline_worker\\.py --agent-id {aid}( |$)"
     return f"^(\\S*/)?python3(\\.[0-9]+)? baselines/sparrow_node\\.py worker .* --agent-id {aid}( |$)"
@@ -183,15 +200,26 @@ def cmd_run(args) -> int:
     if args.members:
         members = {int(x): "resource" for x in args.members.split(",") if x.strip()}
     elif args.target != "swarm":
-        raise SystemExit("--target baseline/sparrow needs --members (the SWARM cell's group ids)")
+        raise SystemExit(f"--target {args.target} needs --members (agent ids, or scheduler "
+                         f"indices for sparrow-scheduler)")
     else:
-        members = group_members(args.config_dir, args.group)
-    if any(aid > args.agents for aid in members):
-        raise SystemExit(f"group {args.group} has members beyond --agents {args.agents}: {list(members)}")
-    placed = place(members, hosts, args.agents_per_host)
-    record = {"group": args.group, "target": args.target, "members": list(members), "hosts": {str(a): h for a, h in placed.items()},
+        members = None          # read once the run has started; see "Members are read after"
+
+    def _check_and_place(members):
+        if args.target == "sparrow-scheduler":
+            return {}           # scheduler hosts come from the launch record
+        if any(aid > args.agents for aid in members):
+            raise SystemExit(f"group {args.group} has members beyond --agents {args.agents}: "
+                             f"{list(members)}")
+        return place(members, hosts, args.agents_per_host)
+
+    placed = _check_and_place(members) if members is not None else {}
+    record = {"group": args.group, "target": args.target,
+              "members": list(members) if members is not None else [],
+              "hosts": {str(a): h for a, h in placed.items()},
               "duration_s": args.duration, "rejoin": not args.no_rejoin,
-              "expect_silent_agents": ",".join(str(a) for a in members) if args.no_rejoin else ""}
+              "expect_silent_agents": (",".join(str(a) for a in members)
+                                       if args.no_rejoin and members is not None else "")}
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
 
@@ -213,6 +241,14 @@ def cmd_run(args) -> int:
                 record["outcome"] = "run_never_started"
                 write()
                 return 2
+        if members is None:
+            members = group_members(args.config_dir, args.group)
+            placed = _check_and_place(members)
+            record["members"] = list(members)
+            record["hosts"] = {str(a): h for a, h in placed.items()}
+            record["members_read_at"] = time.time()
+            if args.no_rejoin:
+                record["expect_silent_agents"] = ",".join(str(a) for a in members)
         # Read after the run has started: run_test.py writes run_meta.json at launch, which can be
         # after this companion was started.
         if not run_id and args.run_dir:
@@ -234,12 +270,13 @@ def cmd_run(args) -> int:
                 write()
                 return 3
             doc = json.loads(lj.read_text())
-            launch = doc.get("workers") or {}
+            launch = doc.get("schedulers" if args.target == "sparrow-scheduler"
+                             else "workers") or {}
             run_id = run_id or doc.get("run_id", "")
             absent = [a for a in members if str(a) not in launch]
             if absent:
                 record["outcome"] = "members_not_launched"
-                log(f"members {absent} have no worker in this run")
+                log(f"members {absent} have no {args.target} process in this run")
                 write()
                 return 3
             placed = {a: launch[str(a)]["host"] for a in members}
@@ -324,9 +361,10 @@ def main(argv=None) -> int:
     r.add_argument("--agents", type=int, required=True)
     r.add_argument("--agents-per-host", type=int, default=1)
     r.add_argument("--group", type=int, required=True, help="level-0 group index to take down")
-    r.add_argument("--target", choices=["swarm", "baseline", "sparrow"], default="swarm",
+    r.add_argument("--target", choices=["swarm", "baseline", "sparrow", "sparrow-scheduler"],
+                   default="swarm",
                    help="whose processes: SWARM agents, centralized-baseline workers or Sparrow "
-                        "workers (E7 under failure)")
+                        "workers (E7 under failure), or Sparrow schedulers (E7c)")
     r.add_argument("--members", default="",
                    help="comma-separated agent ids to take down instead of reading --group from "
                         "the configs; required for baseline/sparrow")

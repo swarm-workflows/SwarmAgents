@@ -1,0 +1,48 @@
+# Rehearsal of E7c (scheduler outage) on the slice, 17 Nov: one run each of the three new kill
+# paths before the 30 runs of frozen-0bceb349/{8,9}-e7c-*.yml. Pass criteria, read from each run:
+# outage.json outcome ok (held 180 s, restarted); the run completes 1800/1800 and drains
+# (SWARM drain.json `drained`, pending/inflight/undecided 0; baselines `all_terminal`); campaign
+# status ok. The PBFT cell is the open question: whether a restarted coordinator resumes
+# tracking the jobs it delegated before it died (agent code is frozen; a defect is reported).
+out: runs/e7c-rehearsal
+defaults:
+  repeats: 1
+  retries: 0
+  timeout_s: 7200
+  args:
+    mode: remote
+    db-host: database
+    agent-hosts-file: agent_hosts.txt
+    agents-per-host: 1
+    agents: 90
+    jobs: 1800
+gate:
+  redis: {host: database, port: 6379}
+  clock_check: ./fix_slice_clocks.sh --check
+  retries: 3
+  wait_s: 300
+cells:
+  - name: e7c-rehearsal-pbft-coordinator
+    runner: run_test.py
+    args: {agent-type: resource, master-fleet-size: 270, seed: 42, rtt-samples: 20, all-dtns: true,
+           topology: hierarchical, hierarchical-level1-agent-type: resource,
+           inflight-drain-max-s: 1800, pegasus-jobs-dir: /root/workloads/jobs_1800, runtime: 3600,
+           groups-per-coordinator: 1, base-config: campaigns/config_pbft.yml,
+           arrival: poisson, arrival-rate: 3.0}
+    companion: python3.11 group_outage.py run --members 85 --hosts-file agent_hosts.txt --agents 90
+      --group 3 --duration 180 --delay 120 --start-after-log {run_dir}.log --run-dir {run_dir}
+      --out {run_dir}/outage.json
+  - name: e7c-rehearsal-greedy
+    runner: baselines/run_baseline_remote.py
+    args: {scheduler: greedy, use-jobs-dir: /root/workloads/jobs_1800, config: campaigns/config_pbft.yml,
+           timeout: 3600, arrival: poisson, arrival-rate: 3.0, arrival-seed: 42, requeue-dead-workers: true,
+           scheduler-outage-at: 120, scheduler-outage-duration: 180,
+           use-profiles: runs/campaign-e0-e1-c125ed8c/e0-hier90-pbft-analytic-poisson3/run01/agent_profiles.json}
+  - name: e7c-rehearsal-sparrow
+    runner: baselines/run_sparrow.py
+    args: {seed: 42, use-jobs-dir: /root/workloads/jobs_1800, config: campaigns/config_pbft.yml,
+           timeout: 3600, arrival: poisson, arrival-rate: 3.0, arrival-seed: 42, requeue-dead-workers: true,
+           use-profiles: runs/campaign-e0-e1-c125ed8c/e0-hier90-pbft-analytic-poisson3/run01/agent_profiles.json}
+    companion: python3.11 group_outage.py run --target sparrow-scheduler --members 3
+      --hosts-file agent_hosts.txt --agents 90 --group 3 --duration 180 --delay 120
+      --start-after-log {run_dir}.log --run-dir {run_dir} --out {run_dir}/outage.json

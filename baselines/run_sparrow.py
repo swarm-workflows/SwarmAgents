@@ -312,7 +312,10 @@ def main(argv=None) -> int:
         (run_dir / "worker_launch.json").write_text(json.dumps(
             {"run_id": run_id, "role": "sparrow",
              "workers": {k.split("-", 1)[1]: v for k, v in nodes.launched.items()
-                         if k.startswith("worker-")}}, indent=2))
+                         if k.startswith("worker-")},
+             # E7c: group_outage.py --target sparrow-scheduler restarts a scheduler from here
+             "schedulers": {k.split("-", 1)[1]: v for k, v in nodes.launched.items()
+                            if k.startswith("scheduler-")}}, indent=2))
 
         missing_w, missing_s = wait_registered(client, keys, worker_ids, args.schedulers,
                                                args.startup_timeout)
