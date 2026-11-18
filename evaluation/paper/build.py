@@ -11,6 +11,9 @@ run tree someone listed. Keys (all paths relative to the manifest's directory un
       - name: e1-hier270
         runs_wide: <path>/runs_wide.csv
         campaign: <campaign .yml>    planned jobs per cell come from its `args.jobs`
+        exclude_runs:                optional; one named run withdrawn, with its reason
+          - {cell: <cell>, run: runNN, why: <text>}
+        as: <source name>            optional; pool these runs with that source's cells (a redo)
     e2_events: <timecourse.py events.csv>        (F5)
     e3a_cells: <e3a.py cells.csv>               (F3; its sibling per_run.csv is read; a list is allowed)
     t6_per_workflow: <t6_compare.py csv>        (T-6 table; a list is allowed)
@@ -93,6 +96,10 @@ VALIDITY = [  # (column, rule, why) — a run breaking any rule is listed in val
 
 
 # ---------------------------------------------------------------- loading
+#: Runs withdrawn by a manifest `exclude_runs` entry, as validity.md rows (filled by load_runs).
+EXCLUDED: list[str] = []
+
+
 def _path(base: Path, p) -> Path:
     p = Path(p)
     return p if p.is_absolute() else (base / p)
@@ -135,7 +142,17 @@ def load_runs(manifest: dict, base: Path) -> pd.DataFrame:
         parts = w["run_dir"].astype(str).str.rstrip("/").str.split("/")
         w["cell"], w["run"] = parts.str[-2], parts.str[-1]
         w = w[~w["run"].str.contains("attempt")].copy()
-        w["source"] = src["name"]
+        # A run the manifest withdraws by name, with its reason (a tool fault, replaced by a
+        # redo listed as its own source). Never a pattern, and validity.md prints every one.
+        for ex in src.get("exclude_runs") or []:
+            hit = (w["cell"] == ex["cell"]) & (w["run"] == ex["run"])
+            if not hit.any():
+                raise SystemExit(f"source {src['name']}: exclude_runs names {ex['cell']}/{ex['run']}, "
+                                 f"which is not in {p}")
+            EXCLUDED.append(f"| {src['name']} | {ex['cell']} | {ex['run']} | {ex['why']} |")
+            w = w[~hit].copy()
+        # `as`: file these runs under another source's name, so a redo pools with its cell
+        w["source"] = src.get("as", src["name"])
         plan = planned_jobs(_path(base, src["campaign"])) if src.get("campaign") else {}
         w["planned_jobs"] = w["cell"].map(plan).astype(float)
         done = pd.to_numeric(w.get("jobs_completed"), errors="coerce")
@@ -434,7 +451,18 @@ def tables_md(runs, cells, manifest, base) -> str:
 
     es = [p for p in _as_list(manifest.get("events_summary")) if _path(base, p).exists()]
     if es:
-        e = pd.concat([pd.read_csv(_path(base, p)) for p in es], ignore_index=True)
+        # A run withdrawn from its source (`exclude_runs`) is withdrawn here too: an events file
+        # belongs to the source whose collect directory it sits in.
+        withdrawn = {src["name"]: {(x["cell"], x["run"]) for x in src.get("exclude_runs") or []}
+                     for src in manifest.get("sources") or []}
+        parts = []
+        for p in es:
+            f = pd.read_csv(_path(base, p))
+            gone = withdrawn.get(_path(base, p).parent.name) or set()
+            if gone:
+                f = f[[(c, r) not in gone for c, r in zip(f["cell"], f["run"])]]
+            parts.append(f)
+        e = pd.concat(parts, ignore_index=True)
         L.append("\n## Injected events (outage / partition) and the response\n")
         num = ["held_s", "workers_failed", "jobs_requeued", "workers_readmitted", "first_requeue_after_kill_s"]
         L.append("| cell | runs | event | outcomes | " + " | ".join(num) + " |")
@@ -485,7 +513,10 @@ def main(argv=None):
     (out / "validity.md").write_text(
         "# Validity, per run (any listed run needs reading before its cell is quoted)\n\n"
         f"{len(runs)} runs in {cells.shape[0]} cells; {len(bad)} runs flagged.\n\n"
-        "| source | cell | run | flags |\n|---|---|---|---|\n" + "\n".join(bad) + "\n")
+        "| source | cell | run | flags |\n|---|---|---|---|\n" + "\n".join(bad) + "\n"
+        + ("\n## Runs withdrawn by the manifest (in no table or figure)\n\n"
+           "| source | cell | run | why |\n|---|---|---|---|\n" + "\n".join(EXCLUDED) + "\n"
+           if EXCLUDED else ""))
     (out / "tables.md").write_text(tables_md(runs, cells, manifest, base))
     written = [] if a.no_figures else figures(runs, cells, manifest, base, out)
     unplanned = sorted(set(runs.loc[runs.planned_jobs.isna(), "cell"]))

@@ -1807,6 +1807,68 @@ class ResourceAgent(Agent):
             return []
         return [g for g in self.topology.children if self._is_leader_for_group(g)]
 
+    def _recover_own_delegations(self) -> None:
+        """Once per process: track again the jobs an earlier incarnation of this coordinator
+        delegated and never closed.
+
+        `delegated_jobs` lives in memory, and only `_monitor_delegated_jobs` marks this tier's
+        record COMPLETE. A coordinator killed while a delegated job was still running lost the
+        map; its peers leave such a job with the children (`_reassign_jobs_from_failed_agent`,
+        §13), and the restarted process tracked nothing. The job ran once at the leaf, but the
+        tier record stayed READY for the rest of the run, so the runner's in-flight wait ran to
+        its bound (frozen E7c Snow, 2026-11-17: 6 of 8 attempts recorded 1-2 READY records
+        after every job had completed).
+
+        The record is the authority: READY/RUNNING at this tier, led by this agent, naming the
+        child groups it went to. A fresh process has none, so this costs one index read. A read
+        failure leaves the flag unset and the next tick tries again. Recovered entries carry no
+        bandit decision (the model that made it died with the process), so they are closed to
+        the bandit from the start.
+        """
+        if getattr(self, "_own_delegations_recovered", False) or not self.topology.children:
+            return
+        level, group = self.topology.level, self.topology.group
+        try:
+            state_map = self.repository.get_all_ids_multi(
+                key_prefix=Repository.KEY_JOB, level=level, group=group,
+                states=[ObjectState.READY.value, ObjectState.RUNNING.value])
+            in_flight = (state_map.get(ObjectState.READY.value, [])
+                         + state_map.get(ObjectState.RUNNING.value, []))
+            records = self.repository.get_many(
+                in_flight, key_prefix=Repository.KEY_JOB,
+                level=level, group=group) if in_flight else {}
+        except Exception as e:
+            self.logger.warning(f"Could not read this tier's in-flight jobs to recover "
+                                f"delegations; retrying next tick: {e}")
+            return
+        self._own_delegations_recovered = True
+
+        recovered = []
+        for job_id, rec in records.items():
+            if not rec or rec.get("leader_id") is None:
+                continue
+            try:
+                if int(rec["leader_id"]) != int(self.agent_id):
+                    continue
+            except (TypeError, ValueError):
+                continue
+            groups = list(rec.get("delegated_groups") or [])
+            if not groups or self.delegated_jobs.get(job_id) is not None:
+                continue
+            self.delegated_jobs.set(job_id, {
+                'delegated_at': time.time(),
+                'delegated_mono': time.monotonic(),
+                'groups': groups,
+                'capacities': rec.get("capacities") or {},
+                'recovered': True,
+                'bandit_closed': True,
+            })
+            recovered.append(job_id)
+        if recovered:
+            self.logger.info(
+                f"[DELEGATION] Recovered {len(recovered)} delegation(s) left open by an "
+                f"earlier incarnation of this coordinator: {recovered}")
+
     def _monitor_delegated_jobs(self):
         """
         Monitor jobs delegated to children and re-add them to parent queue if not selected in time.
@@ -2009,8 +2071,9 @@ class ResourceAgent(Agent):
         # Process reassignments
         for job_id, delegation_info, time_since_delegation in jobs_to_reassign:
             # Report timeout failure to MAB for every group the job was
-            # delegated to — none of them completed it
-            if mab_active:
+            # delegated to — none of them completed it. Not for a delegation recovered after a
+            # restart: this process's bandit never made that decision.
+            if mab_active and not delegation_info.get('recovered'):
                 for delegated_group in delegation_info.get('groups', []):
                     reward = self.mab_manager.report_outcome(
                         delegated_group, job_id, success=False, timed_out=True)
@@ -2796,6 +2859,7 @@ class ResourceAgent(Agent):
         self._retry_stage_out()
         self._retry_unpersisted_completions()
         self._restart_selection()
+        self._recover_own_delegations()
         self._monitor_delegated_jobs()
         current_time = int(time.time())
         self._refresh_children(int(current_time))
