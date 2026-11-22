@@ -37,7 +37,7 @@ named explicitly, is `evaluation/paper/manifest_frozen.yml`.
 ## The review ablations (20–22 Nov 2026)
 
 Config-only changes on tag `isc27-freeze-15` (d3755e2b). No file under `swarm/`, `main.py`, `run_test.py` or
-`config_swarm_multi.yml` differs from `isc27-freeze`. 3 repeats per cell, 60 runs, all `ok`, every job
+`config_swarm_multi.yml` differs from `isc27-freeze`. 3 repeats per cell, 63 runs, all `ok`, every job
 completed, none executed twice.
 
 | File | Campaign | Cells |
@@ -47,17 +47,18 @@ completed, none executed twice.
 | `ablation/poolB_runs_wide.csv` | `review-ablations` (revB) | PBFT Mesh-180 with `runtime.fanout_workers/fanout_queue` 256/8192 |
 | `ablation/sweepC_runs_wide.csv` | `review-ablations` (revC) | Hier-270 analytic, PBFT and Snow (limit 16), Poisson 9/11/13/16 jobs/s |
 | `ablation/sweepC_limit64_runs_wide.csv` | `campaigns/review-sweep64-d3755e2b.yml` | Snow with limit 64 at the same four rates |
+| `ablation/sweepC_limit64_poisson7_runs_wide.csv` | `campaigns/review-sweep64p7-d3755e2b.yml` | Snow with limit 64 at the main campaign's 7 jobs/s |
 
 Configs: `campaigns/config_rev_*.yml`, each derived from the frozen cell's config with one key changed
 (stated in its first line).
 
 Headline results (p95 scheduling latency, s):
 
-| Hier-270 analytic | 9/s | 11/s | 13/s | 16/s | burst 20/s |
-|---|---|---|---|---|---|
-| PBFT | 3.4 | 4.1 | 5.2 | 8.3 ± 0.3 | 10.5 ± 0.8 (frozen) |
-| Snow, limit 16 | 4.9 | 5.2 | 5.8 | 58.8 ± 14.1 | 130.3 ± 3.8 (frozen), 139.6 ± 2.4 (control) |
-| Snow, limit 64 | 4.8 | 5.1 | 5.3 | 5.6 ± 0.1 | 7.9 ± 0.1 |
+| Hier-270 analytic | 7/s | 9/s | 11/s | 13/s | 16/s | burst 20/s |
+|---|---|---|---|---|---|---|
+| PBFT | 2.8 (frozen) | 3.4 | 4.1 | 5.2 | 8.3 ± 0.3 | 10.5 ± 0.8 (frozen) |
+| Snow, limit 16 | 4.5 (frozen) | 4.9 | 5.2 | 5.8 | 58.8 ± 14.1 | 130.3 ± 3.8 (frozen), 139.6 ± 2.4 (control) |
+| Snow, limit 64 | 4.5 | 4.8 | 5.1 | 5.3 | 5.6 ± 0.1 | 7.9 ± 0.1 |
 
 - Mesh-180 PBFT with the larger pool: 100 % complete (was 84.2 %), 1.20 jobs/s (0.83), p95 2,749 s (3,366).
 - The limit does not explain the peers regime (192 / 188 s against 191 s) nor the Hier-90 G=3 tail
