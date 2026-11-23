@@ -25,9 +25,25 @@ sources:
   - name: e7-hier90-failure-swarm
     runs_wide: ../../runs/collect-frozen/e7-hier90-failure-swarm/runs_wide.csv
     campaign: ../../campaigns/frozen-0bceb349/6-e7-hier90-failure-swarm.yml
+    exclude_runs:
+      - cell: e7f-hier90-pbft-analytic-poisson3
+        run: run01
+        why: "outage tool read the previous cell's configs and killed 15 wrong agents; redone as e7f-pbft-run01-redo"
+  # the redo of that run, pooled with runs 02-05 of its cell
+  - name: e7f-pbft-run01-redo
+    as: e7-hier90-failure-swarm
+    runs_wide: ../../runs/collect-frozen/e7f-pbft-run01-redo/runs_wide.csv
+    campaign: ../../campaigns/frozen-0bceb349/6b-e7f-pbft-run01-redo.yml
   - name: e7-hier90-failure-baselines
     runs_wide: ../../runs/collect-frozen/e7-hier90-failure-baselines/runs_wide.csv
     campaign: ../../campaigns/frozen-0bceb349/7-e7-hier90-failure-baselines.yml
+  # E7c, 17-18 Nov: the scheduler goes down (one coordinator / the central scheduler / 1 of 9 Sparrow schedulers)
+  - name: e7c-hier90-scheduler-outage-swarm
+    runs_wide: ../../runs/collect-frozen/e7c-hier90-scheduler-outage-swarm/runs_wide.csv
+    campaign: ../../campaigns/frozen-0bceb349/8-e7c-hier90-scheduler-outage-swarm.yml
+  - name: e7c-hier90-scheduler-outage-baselines
+    runs_wide: ../../runs/collect-frozen/e7c-hier90-scheduler-outage-baselines/runs_wide.csv
+    campaign: ../../campaigns/frozen-0bceb349/9-e7c-hier90-scheduler-outage-baselines.yml
   # counted as frozen, not repeated
   - name: first-runs-21a2d9bb
     runs_wide: ../../docs/results/first-runs-21a2d9bb/runs_wide.csv
@@ -49,4 +65,7 @@ events_summary:
   - ../../runs/collect-frozen/e6-hier30/events_summary.csv
   - ../../runs/collect-frozen/e6-hier30-mixed/events_summary.csv
   - ../../runs/collect-frozen/e7-hier90-failure-swarm/events_summary.csv
+  - ../../runs/collect-frozen/e7f-pbft-run01-redo/events_summary.csv
   - ../../runs/collect-frozen/e7-hier90-failure-baselines/events_summary.csv
+  - ../../runs/collect-frozen/e7c-hier90-scheduler-outage-swarm/events_summary.csv
+  - ../../runs/collect-frozen/e7c-hier90-scheduler-outage-baselines/events_summary.csv

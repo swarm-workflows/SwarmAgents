@@ -226,6 +226,8 @@ Every key below has a long history entry in `docs/ENGINEERING_NOTES.md` §7; the
 - **Review-pass fixes (2026-09-15)**: one COMMIT per proposal (`_commits_sent`), Snow stats under `_stats_lock` with `finalize_errors`, unknown protocol names raise, `batch_tests_v2.py` sizes hosts with `ceil`.
 - **Failed-agent job recovery (2026-09-15, retried since 2026-10-06)**: candidates come from Redis (`leader_id`), the Snow claim is released, one reassigner per (job, failure) via `try_claim_reassignment`, peers forget the job; `_resweep_failed_agent_jobs` retries every 30 s with compare-and-delete and WATCHed resets. Coordinator records carry `delegated_groups`; `collect.py` reports `jobs_executed_twice`. No hierarchical failure-injection number before 2026-10-06 is citable.
 
+- **Restarted coordinator closes its delegations (2026-11-18, after the isc27 freeze)**: `delegated_jobs` is in memory, so a coordinator killed mid-delegation left its tier record READY after the leaf finished (frozen E7c Snow: 3 of 5 runs "truncated", every job run once). `_recover_own_delegations` re-tracks its own READY/RUNNING records naming `delegated_groups` on the first tick, closed to the bandit. A coordinator that never returns still leaves them open. `tests/test_delegation_recovery.py`.
+
 **Debugging consensus (PBFT):**
 1. Set `log-level: DEBUG` in config
 2. Check `engine.outgoing`/`engine.incoming` proposal containers and `engine.conflicts`
