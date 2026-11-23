@@ -1,4 +1,4 @@
-"""First runs at isc27-freeze: the E1' flat-mesh ladder and the E5 ablations, aggregated by cell.
+"""First runs at eval-freeze: the E1' flat-mesh ladder and the E5 ablations, aggregated by cell.
 
     python3 agg.py > tables.md        (also writes cells_agg.csv)
 

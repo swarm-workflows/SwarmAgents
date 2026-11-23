@@ -1,4 +1,4 @@
-# Conference paper data: the frozen campaign (isc27-freeze, 0bceb349) and the review ablations (d3755e2b)
+# Conference paper data: the frozen campaign (eval-freeze, 0bceb349) and the review ablations (d3755e2b)
 
 Everything a number, table or figure in the conference paper (gossip consensus + contextual bandit
 delegation) is derived from, at the level of one row per run. The per-job and per-decision tables and the
@@ -21,8 +21,8 @@ raw run trees are too large for this repository; see "What is not here".
 Rebuild the paper figures from this directory alone:
 
 ```bash
-.venv/bin/python evaluation/paper/fig_ablation.py   docs/results/isc27-frozen-0bceb349 /tmp/out
-.venv/bin/python evaluation/paper/fig_f3_compact.py docs/results/isc27-frozen-0bceb349 /tmp/out
+.venv/bin/python evaluation/paper/fig_ablation.py   docs/results/frozen-0bceb349 /tmp/out
+.venv/bin/python evaluation/paper/fig_f3_compact.py docs/results/frozen-0bceb349 /tmp/out
 ```
 
 Rebuilding `cells.csv` itself needs the full collection unpacked at `runs/collect-frozen` (see below).
@@ -36,8 +36,8 @@ named explicitly, is `evaluation/paper/manifest_frozen.yml`.
 
 ## The review ablations (20–22 Nov 2026)
 
-Config-only changes on tag `isc27-freeze-15` (d3755e2b). No file under `swarm/`, `main.py`, `run_test.py` or
-`config_swarm_multi.yml` differs from `isc27-freeze`. 3 repeats per cell, 63 runs, all `ok`, every job
+Config-only changes on tag `eval-freeze-15` (d3755e2b). No file under `swarm/`, `main.py`, `run_test.py` or
+`config_swarm_multi.yml` differs from `eval-freeze`. 3 repeats per cell, 63 runs, all `ok`, every job
 completed, none executed twice.
 
 | File | Campaign | Cells |
@@ -69,6 +69,6 @@ Headline results (p95 scheduling latency, s):
 ## What is not here
 
 - **Per-job and per-decision tables** (`decisions.csv`, `job_rtt.csv`, `runs_tidy.csv`, about 0.9 GB unpacked):
-  `collect-frozen.tgz` in the evaluation-data repository, directory `isc27-gossip-bandit/`.
+  `collect-frozen.tgz` in the evaluation-data repository, directory `gossip-bandit/`.
 - **Raw run trees** (agent logs, per-level job CSVs, `run_meta.json`, `rtt_matrix.json` per run): on the
   database node under `/root/SwarmAgents/runs/frozen-0bceb349/` and `runs/campaign-review-*-d3755e2b/`.

@@ -857,7 +857,7 @@ Two things this does *not* yet say:
   out). A SWARM makespan will look dramatically better for reasons that have nothing to do
   with scheduling quality until staging exists on both sides.
 
-### 3.1 The three T-6 workflows against Pegasus (11 Nov 2026, isc27-freeze 0bceb349)
+### 3.1 The three T-6 workflows against Pegasus (11 Nov 2026, eval-freeze 0bceb349)
 
 The T-6 pilots ran cper-soilmoisture (22 jobs), EHT M87 (30) and tnseq (35) on SWARM with
 staging on. Each output was compared with the Pegasus reference runs on the Pegasus host. The

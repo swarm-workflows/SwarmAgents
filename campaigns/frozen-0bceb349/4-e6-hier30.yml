@@ -1,4 +1,4 @@
-# FROZEN RE-RUN at isc27-freeze (0bceb349), conference plan §8 (re-derived 2026-11-09): E6 site partition at Hier-30, 2 cells x 3 = 6 runs.
+# FROZEN RE-RUN at eval-freeze (0bceb349), conference plan §8 (re-derived 2026-11-09): E6 site partition at Hier-30, 2 cells x 3 = 6 runs.
 # Copied unchanged from campaigns/e6-hier30-b9e51bbf.yml except `out:`; the cells, arguments, configs and workloads are the
 # ones the earlier campaign ran, so the two are comparable cell for cell. Agent code fingerprint
 # 6593ed84586e (104 files) verified identical on the db node and all 92 agents, 12 Nov 2026.

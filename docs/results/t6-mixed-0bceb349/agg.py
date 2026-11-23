@@ -1,4 +1,4 @@
-"""T-6 mixed Hier-90 at isc27-freeze 0bceb349, aggregated by cell.
+"""T-6 mixed Hier-90 at eval-freeze 0bceb349, aggregated by cell.
 
     python3 agg.py > tables.md        (also writes cells_agg.csv)
 

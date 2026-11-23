@@ -1,4 +1,4 @@
-# FROZEN RE-RUN at isc27-freeze (0bceb349): E7 under failure, the SWARM side (conference plan §4.2
+# FROZEN RE-RUN at eval-freeze (0bceb349): E7 under failure, the SWARM side (conference plan §4.2
 # E7: "behavior under the same failure injection"). 2 cells x 5 = 10 runs, ~16 min each.
 #
 # The E0/E1' Hier-90 analytic Poisson-3 cells (PBFT, Snow), unchanged, plus E2b's outage:

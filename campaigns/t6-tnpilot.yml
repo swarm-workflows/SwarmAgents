@@ -1,6 +1,6 @@
 # T-6 tnseq standalone pilot: pegasus-isi/tnseq-workflow run0001 on the Pegasus host (35 jobs, 2
 # samples, 42 DAG edges), rebuilt 11 Nov 2026 after renaming its per-sample tables so the mid and
-# full tables no longer share a basename. Mesh-30 under Snow, like t6-wfpilot. Code: isc27-freeze;
+# full tables no longer share a basename. Mesh-30 under Snow, like t6-wfpilot. Code: eval-freeze;
 # config campaigns/config_tnpilot_snow.yml (campaigns/make_mixed_configs.py); job set
 # /export/swarm-wf/tnseq_only (merge_workflow_jobs.py --bundle tnseq_bundle, no --synthetic).
 # Pass: every real job exits 0, in DAG order; the four merged TSVs byte-identical to the Pegasus

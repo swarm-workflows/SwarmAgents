@@ -1,6 +1,6 @@
 # §10 standalone pilot (T-6): the real workflows alone — cper-soilmoisture run0002 (22 jobs) and
 # eht-m87 run0001 (30 jobs, fetch_data replaced by its checksum-verified dataset) — at Mesh-30
-# under Snow, before they ride inside a 90-agent cell. Code: isc27-freeze; config
+# under Snow, before they ride inside a 90-agent cell. Code: eval-freeze; config
 # campaigns/config_wfpilot_snow.yml (campaigns/make_mixed_configs.py); bundle
 # /export/swarm-wf/wf_only (merge_workflow_jobs.py with no --synthetic).
 # Pass: every real job exits 0, in DAG order; outputs match the Pegasus reference runs
