@@ -1,0 +1,55 @@
+# FROZEN RE-RUN at isc27-freeze (0bceb349): E7 under failure, the SWARM side (conference plan §4.2
+# E7: "behavior under the same failure injection"). 2 cells x 5 = 10 runs, ~16 min each.
+#
+# The E0/E1' Hier-90 analytic Poisson-3 cells (PBFT, Snow), unchanged, plus E2b's outage:
+# group_outage.py SIGKILLs level-0 group 3 (agents 28-36 at G=1) 120 s after distribution starts,
+# holds it 180 s and restarts it into the same run. The baselines in
+# 7-e7-hier90-failure-baselines.yml lose the same nine worker ids at the same moment.
+# Chosen 2026-11-12 (author): beside the analytic cells, so E7 compares like with like across its
+# tables, rather than beside the E2b LinUCB cells, whose failure profile the baselines lack.
+#
+# Read jobs_executed_twice (a lower bound for the killed agents, see group_outage.py),
+# completion, job latency for jobs arriving during the outage, and outage.json's held_s.
+out: runs/frozen-0bceb349/e7-hier90-failure-swarm
+
+defaults:
+  runner: run_test.py
+  repeats: 5
+  retries: 1
+  args:
+    mode: remote
+    agent-type: resource
+    db-host: database
+    agent-hosts-file: agent_hosts.txt
+    agents-per-host: 1
+    master-fleet-size: 270
+    seed: 42
+    rtt-samples: 20
+    all-dtns: true
+    topology: hierarchical
+    hierarchical-level1-agent-type: resource
+    inflight-drain-max-s: 1800
+
+gate:
+  redis: {host: database, port: 6379}
+  clock_check: ./fix_slice_clocks.sh --check
+  retries: 3
+  wait_s: 300
+
+cells:
+  - name: e7f-hier90-pbft-analytic-poisson3
+    timeout_s: 7200
+    args: {agents: 90, jobs: 1800, pegasus-jobs-dir: /root/workloads/jobs_1800, runtime: 3600,
+           groups-per-coordinator: 1, base-config: campaigns/config_pbft.yml,
+           arrival: poisson, arrival-rate: 3.0}
+    companion: python3.11 group_outage.py run --hosts-file agent_hosts.txt --agents 90 --group 3
+      --duration 180 --delay 120 --start-after-log {run_dir}.log --run-dir {run_dir}
+      --out {run_dir}/outage.json
+  - name: e7f-hier90-snow-analytic-poisson3
+    timeout_s: 7200
+    args: {agents: 90, jobs: 1800, pegasus-jobs-dir: /root/workloads/jobs_1800, runtime: 3600,
+           groups-per-coordinator: 1, base-config: config_swarm_multi.yml,
+           arrival: poisson, arrival-rate: 3.0}
+    companion: python3.11 group_outage.py run --hosts-file agent_hosts.txt --agents 90 --group 3
+      --duration 180 --delay 120 --start-after-log {run_dir}.log --run-dir {run_dir}
+      --out {run_dir}/outage.json

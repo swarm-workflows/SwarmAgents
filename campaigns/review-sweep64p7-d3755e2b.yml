@@ -1,0 +1,42 @@
+# Review ablations, 2026-11-20 (paper review pass; config-only, agent code = isc27-freeze: no file under
+# swarm/, main.py, run_test.py or config_swarm_multi.yml differs between the tag and d3755e2b).
+#
+#   A  Snow in-flight cap: consensus.snow.max_inflight 64 and 256 (frozen cells ran 16) on the three
+#      cells where Snow is slow under burst: Hier-270 analytic (27 coordinators), Hier-90 peers
+#      (one proposer per job), Hier-90 LinUCB G=3 (3 coordinators). x3.
+#      Controls at 16: e1-hier270-snow-analytic, e5-hier90-snow-peers, e1-hier90-snow-linucb-shared.
+#   B  PBFT Mesh-180 with the larger send pool (fanout 256/8192; the frozen Mesh cells ran 64/2048). x3.
+#      Control: e1-mesh180-pbft-analytic.
+#   C  Arrival-rate sweep at Hier-270, analytic G=1, PBFT and Snow, Poisson 9/11/13/16 jobs/s. x3.
+#      Controls: the poisson7 cells and the 20 jobs/s burst cells.
+#
+#   tmux new -s review 'python3.11 campaign.py campaigns/review-ablations-d3755e2b.yml --python python3.11 2>&1 | tee /root/campaign-review-ablations.out'
+out: runs/campaign-review-sweep64p7-d3755e2b
+
+defaults:
+  runner: run_test.py
+  repeats: 3
+  retries: 1
+  timeout_s: 10800
+  args:
+    mode: remote
+    agent-type: resource
+    db-host: database
+    agent-hosts-file: agent_hosts.txt
+    master-fleet-size: 270
+    seed: 42
+    rtt-samples: 20
+    all-dtns: true
+    hierarchical-level1-agent-type: resource
+    inflight-drain-max-s: 1800
+
+gate:
+  redis: {host: database, port: 6379}
+  clock_check: ./fix_slice_clocks.sh --check
+  retries: 3
+  wait_s: 300
+
+cells:
+  # cap 64 at the main campaign Poisson rate (7 jobs/s), added 2026-11-22
+  - name: revC-hier270-snow-analytic-mi64-poisson7
+    args: {topology: hierarchical, agents: 270, agents-per-host: 3, jobs: 5400, pegasus-jobs-dir: /root/workloads/jobs_5400, runtime: 5400, groups-per-coordinator: 1, base-config: campaigns/config_rev_snow_mi64.yml, arrival: poisson, arrival-rate: 7.0}

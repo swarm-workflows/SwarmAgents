@@ -255,6 +255,26 @@ def load_transformation_catalog(run_dir: str) -> Tuple[Dict[str, dict], Dict[str
     return transformations, containers
 
 
+#: Characters the job's shell would act on beyond splitting words: expansion, globbing,
+#: redirection, command separators. A line containing one cannot be reproduced without a shell.
+_SHELL_ACTIVE = set("$`*?[]~;|&<>(){}!\\")
+
+
+def pegasus_argv(line: str) -> Optional[List[str]]:
+    """The argv the job's shell built from Pegasus's joined argument line, or None (unknown).
+
+    Splitting on whitespace and honouring quotes is all `shlex.split` reproduces. If the line
+    contains anything the shell would also EXPAND (a variable, a glob, a redirection), the argv
+    the job really received is not knowable from the line, so the answer is unknown and the
+    job is refused rather than run with the characters taken literally."""
+    if any(ch in _SHELL_ACTIVE for ch in line):
+        return None
+    try:
+        return shlex.split(line)
+    except ValueError:
+        return None
+
+
 def resolve_arguments(clustered: bool, declared: List[str], resolved: bool,
                       argv_raw: str, argv_list):
     """(argument list, raw string) for one job. `None` means UNKNOWN and is refused at execution;
@@ -267,11 +287,20 @@ def resolve_arguments(clustered: bool, declared: List[str], resolved: bool,
       id is not in it: unknown, not "none". `[]` is runnable and would run the job with no
       arguments, the substitution the None/[] rule exists to prevent (code review §57).
     * Otherwise the recorded argv as parsed (None when it could not be parsed).
+
+    A declared list is split the way Pegasus runs it, not taken element by element. Pegasus
+    joins the arguments with spaces and writes the line, unquoted, into the job's shell script
+    (`pegasus-kickstart ... ./run_smili --input X --day 6`), so the shell splits it again.
+    A workflow may therefore pass a whole command line as ONE argument
+    (`add_args(f"--input {a} --output {b}")`, every tnseq job), which under Pegasus is
+    several. Kept as one element it became a single argv entry and every such job failed on
+    its own usage message. See `pegasus_argv`.
     """
     if clustered:
         return None, ""
     if declared:
-        return list(declared), " ".join(declared)
+        line = " ".join(declared)
+        return pegasus_argv(line), line
     if not resolved and not (argv_raw or "").strip():
         return None, argv_raw or ""
     return argv_list, argv_raw
@@ -362,23 +391,67 @@ def load_cache_sites(run_dir: str) -> Dict[str, str]:
     return sites
 
 
+#: HTCondor's default unit for each request when the value carries none: memory in MB,
+#: disk in KB. Values are returned in these units.
+_SUB_DEFAULT_UNIT = {"memory": "MB", "disk": "KB", "cpus": "", "gpus": ""}
+_UNIT_KB = {"K": 1, "KB": 1, "M": 1024, "MB": 1024, "G": 1024 ** 2, "GB": 1024 ** 2,
+            "T": 1024 ** 3, "TB": 1024 ** 3}
+_MACRO = re.compile(r"\$\(([A-Za-z0-9_.]+)\)")
+
+
+def _resolve_macros(value: str, assigns: Dict[str, str], depth: int = 0) -> str:
+    """Expand `$(name)` against the file's own assignments (case-insensitive, as Condor)."""
+    if depth > 10:
+        return value
+    out = _MACRO.sub(lambda m: assigns.get(m.group(1).lower(), m.group(0)), value)
+    return out if out == value else _resolve_macros(out, assigns, depth + 1)
+
+
+def _parse_request(kind: str, raw: str):
+    """A resolved request value ("2", "6144 MB", "5120MB") -> float in the kind's default
+    unit, or None when it is still not a number (an unresolved macro or an expression)."""
+    m = re.fullmatch(r"\s*([0-9.]+)\s*([A-Za-z]*)\s*", raw)
+    if not m:
+        return None
+    val, unit = float(m.group(1)), m.group(2).upper()
+    if kind in ("memory", "disk") and unit:
+        if unit not in _UNIT_KB:
+            return None
+        kb = val * _UNIT_KB[unit]
+        return kb / 1024.0 if kind == "memory" else kb
+    return val
+
+
 def load_sub_requests(run_dir: str) -> Dict[str, dict]:
-    """Parse Condor submit files -> {exec_job_id: {cpus, memory_mb, gpus, disk_kb}}."""
+    """Parse Condor submit files -> {exec_job_id: {cpus, memory (MB), gpus, disk (KB)}}.
+
+    Pegasus writes `request_cpus = $(pegasus_cores)` and defines `pegasus_cores = 2` further
+    down the same file. Only literal numbers used to be read, so every Pegasus-planned job
+    recorded 0 cores and no memory request, and the converter gave each job 1 core: the EHT
+    SMILI jobs had asked HTCondor for 2 (T-6 pilot, 11 Nov 2026). Macros are now expanded
+    from the file's own assignments, and units (`MB`, `GB`, ...) are honoured.
+    """
     requests: Dict[str, dict] = {}
-    pattern = re.compile(
-        r"^\s*request_(cpus|memory|gpus|disk)\s*=\s*([0-9.]+)", re.IGNORECASE
-    )
+    assign = re.compile(r"^\s*([A-Za-z0-9_.+]+)\s*=\s*(.*?)\s*$")
     for path in glob.glob(os.path.join(run_dir, "**", "*.sub"), recursive=True):
         exec_job_id = os.path.basename(path)[:-len(".sub")]
-        vals = {}
+        assigns: Dict[str, str] = {}
         try:
             with open(path) as fh:
                 for line in fh:
-                    m = pattern.match(line)
+                    m = assign.match(line)
                     if m:
-                        vals[m.group(1).lower()] = float(m.group(2))
+                        assigns[m.group(1).lower()] = m.group(2)
         except OSError:
             continue
+        vals = {}
+        for kind in ("cpus", "memory", "gpus", "disk"):
+            raw = assigns.get(f"request_{kind}")
+            if raw is None:
+                continue
+            v = _parse_request(kind, _resolve_macros(raw, assigns))
+            if v is not None:
+                vals[kind] = v
         if vals:
             requests[exec_job_id] = vals
     return requests

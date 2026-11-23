@@ -1,0 +1,43 @@
+# Pilot of the tier-sized vote stash (9260a044): the E1' Hier-270 PBFT x analytic cell at Poisson
+# 7 jobs/s, where 1-7 jobs a run waited exactly one 300 s reselection because the three
+# coordinators on the far host (265-267) dropped ~17,000 stashed votes each and never committed.
+# Same arguments as campaigns/e1-hier270-ed8c9101.yml's e0-hier270-pbft-analytic-poisson7.
+# Pass: 0 jobs waiting >= 300 s, pending_consensus_dropped at 265-267 near the other
+# coordinators', makespan near 867 s, every run clean.
+#
+#   tmux new -s stash 'python3.11 campaign.py campaigns/pilot-stash-cap.yml --python python3.11 2>&1 | tee /root/pilot-stash-cap.out'
+out: runs/pilot-stash-cap-9260a044
+
+defaults:
+  runner: run_test.py
+  repeats: 2
+  retries: 1
+  timeout_s: 10800
+  args:
+    mode: remote
+    agent-type: resource
+    db-host: database
+    agent-hosts-file: agent_hosts.txt
+    agents-per-host: 3
+    agents: 270
+    jobs: 5400
+    pegasus-jobs-dir: /root/workloads/jobs_5400
+    runtime: 5400
+    master-fleet-size: 270
+    seed: 42
+    rtt-samples: 20
+    all-dtns: true
+    topology: hierarchical
+    hierarchical-level1-agent-type: resource
+    inflight-drain-max-s: 1800
+
+gate:
+  redis: {host: database, port: 6379}
+  clock_check: ./fix_slice_clocks.sh --check
+  retries: 3
+  wait_s: 300
+
+cells:
+  - name: p-hier270-pbft-analytic-poisson7-stashcap
+    args: {groups-per-coordinator: 1, base-config: campaigns/config_pbft_hier270.yml,
+           arrival: poisson, arrival-rate: 7.0}

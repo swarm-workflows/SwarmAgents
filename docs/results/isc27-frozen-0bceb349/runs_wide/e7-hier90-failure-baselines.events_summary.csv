@@ -1,0 +1,21 @@
+cell,run,event,outcome,held_s,event_at_s,end_event_at_s,members,workers_failed,jobs_requeued,workers_readmitted,first_requeue_after_kill_s
+e7f-hier90-greedy-poisson3,run01,outage,ok,180.0,121.2,303.7,28 29 30 31 32 33 34 35 36,9,6,9,96.9
+e7f-hier90-greedy-poisson3,run02,outage,ok,180.0,121.2,303.7,28 29 30 31 32 33 34 35 36,9,4,9,96.7
+e7f-hier90-greedy-poisson3,run03,outage,ok,180.0,121.6,304.1,28 29 30 31 32 33 34 35 36,9,6,9,96.3
+e7f-hier90-greedy-poisson3,run04,outage,ok,180.0,121.2,303.7,28 29 30 31 32 33 34 35 36,9,5,9,96.8
+e7f-hier90-greedy-poisson3,run05,outage,ok,180.0,121.4,303.9,28 29 30 31 32 33 34 35 36,9,5,9,96.6
+e7f-hier90-random-poisson3,run01,outage,ok,180.0,121.5,304.0,28 29 30 31 32 33 34 35 36,9,24,9,96.2
+e7f-hier90-random-poisson3,run02,outage,ok,180.0,121.3,303.8,28 29 30 31 32 33 34 35 36,9,29,9,96.5
+e7f-hier90-random-poisson3,run03,outage,ok,180.0,121.6,304.1,28 29 30 31 32 33 34 35 36,9,26,9,96.2
+e7f-hier90-random-poisson3,run04,outage,ok,180.0,121.9,304.4,28 29 30 31 32 33 34 35 36,9,27,9,97.9
+e7f-hier90-random-poisson3,run05,outage,ok,180.0,122.0,304.5,28 29 30 31 32 33 34 35 36,9,26,9,97.8
+e7f-hier90-round-robin-poisson3,run01,outage,ok,180.0,121.9,304.4,28 29 30 31 32 33 34 35 36,9,25,9,97.5
+e7f-hier90-round-robin-poisson3,run02,outage,ok,180.0,121.8,304.3,28 29 30 31 32 33 34 35 36,9,25,9,97.5
+e7f-hier90-round-robin-poisson3,run03,outage,ok,180.0,121.0,303.5,28 29 30 31 32 33 34 35 36,9,27,9,96.3
+e7f-hier90-round-robin-poisson3,run04,outage,ok,180.0,121.6,304.1,28 29 30 31 32 33 34 35 36,9,25,9,97.8
+e7f-hier90-round-robin-poisson3,run05,outage,ok,180.0,121.1,303.6,28 29 30 31 32 33 34 35 36,9,27,9,96.3
+e7f-hier90-sparrow-poisson3,run01,outage,ok,180.0,183.9,366.4,28 29 30 31 32 33 34 35 36,9,0,9,
+e7f-hier90-sparrow-poisson3,run02,outage,ok,180.0,183.9,366.4,28 29 30 31 32 33 34 35 36,9,0,9,
+e7f-hier90-sparrow-poisson3,run03,outage,ok,180.0,185.9,368.4,28 29 30 31 32 33 34 35 36,9,0,9,
+e7f-hier90-sparrow-poisson3,run04,outage,ok,180.0,183.9,366.4,28 29 30 31 32 33 34 35 36,9,0,9,
+e7f-hier90-sparrow-poisson3,run05,outage,ok,180.0,183.9,366.4,28 29 30 31 32 33 34 35 36,9,1,9,

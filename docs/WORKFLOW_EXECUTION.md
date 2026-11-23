@@ -857,6 +857,108 @@ Two things this does *not* yet say:
   out). A SWARM makespan will look dramatically better for reasons that have nothing to do
   with scheduling quality until staging exists on both sides.
 
+### 3.1 The three T-6 workflows against Pegasus (11 Nov 2026, isc27-freeze 0bceb349)
+
+The T-6 pilots ran cper-soilmoisture (22 jobs), EHT M87 (30) and tnseq (35) on SWARM with
+staging on. Each output was compared with the Pegasus reference runs on the Pegasus host. The
+pilots only passed after the six fixes in §3.2.
+
+| workflow | result |
+|---|---|
+| cper-soilmoisture | Every GeoTIFF is pixel-identical; only the GDAL `built_utc` metadata differs. The geojson and `station_characterization.png` are byte-identical. `soil_moisture_map.png` differs only in its footer build date. The HTML differs only in random ids, timestamps and its embedded copy of that PNG. |
+| EHT difmap | Identical on every host. |
+| EHT ehtim | Byte-identical on the CPU model Pegasus ran on (EPYC 7543). Other models (EPYC 7532, Chameleon) each give their own, internally consistent, result. |
+| EHT SMILI | **Nondeterministic under Pegasus itself.** Pegasus runs run0001/2/3 stopped the first optimisation at 419, 416 and 430 iterations. Against 7 Pegasus runs (run0002, run0003, Chameleon iter1-5), SWARM put 11/16 and 14/16 ring values inside the Pegasus range, where ~12/16 is expected. Panel PNGs differ from Pegasus in 2-7 % of pixels, the same as two Pegasus runs differ from each other. |
+| tnseq | 20/22 outputs byte-identical (BAMs, BigWigs, every count table). The two dedup metrics files differ only in their `# Started on:` line. |
+
+**Why SMILI varies.** Its optimiser is 2-thread OpenMP Fortran. Hand tests on `smili_096_hi` used
+the same image, inputs, wrapper and pipeline script Pegasus used, byte for byte. With 2 threads
+the output varies run to run under HTCondor (Pegasus-lite's container setup), plain apptainer
+with or without `--containall`, and SWARM. With 1 thread it is deterministic, but it does not
+match any 2-thread run, so pinning 1 thread would trade a varying match for a fixed mismatch.
+Report SMILI as a distribution, never as a byte match.
+
+**EHT and CPU models.** ehtim's floating-point results depend on the CPU model, so an EHT
+comparison is only byte-exact on the reference host's model. State the agents' CPU models when
+quoting EHT parity.
+
+**A trap when copying a Pegasus reference.** Pegasus overwrites the workflow's output
+directory on every run. A copy taken while a later run was in progress mixed two runs' files,
+and that is what made Pegasus look deterministic for a while. Archive outputs per run
+(`run_iterations.sh` does this), or check run timestamps before comparing.
+
+**How timing is compared (`evaluation/t6_compare.py`).** Execution time leaves staging out on
+*both* sides; end-to-end time keeps it in on both sides and breaks it down. SWARM stages too:
+it fetches inputs from peers or the staging site, copies them into the job directory, hands
+outputs back and pushes them to the staging site before publishing. So leaving staging out
+of only one side would hide the difference being measured.
+
+* **Per job.** Pegasus kickstart's `remote_duration` is compared with the runner's
+  `duration_s` (`[EXEC] Job … completed in …s`). `started_at → completed_at` in `all_jobs.csv`
+  also covers the input fetch, the copy and the output handoff, so it is reported separately as
+  in-job overhead and never used as execution time.
+* **Container startup.** PegasusLite runs kickstart *inside* the container (its
+  `<job>-cont.sh` is run by `singularity exec`), so `remote_duration` leaves container startup
+  out. SWARM times `apptainer exec` and includes it: about 0.17 s per job on the slice. This
+  matters for sub-second jobs: for tnseq's median per-job ratio it is the difference between
+  1.48 and 1.05. `--container-startup-s` adds an adjusted column beside the raw one.
+* **Per workflow.** For each side the script reports the critical path of execution times,
+  the end-to-end time, and the difference between the two (that side's time not spent
+  computing). Pegasus's breakdown is its HTCondor queue time and stage-in/out times, from
+  `pegasus_baseline.json`. SWARM's is its in-job overhead, stage-out and wait.
+* **Mixed cells measure something else.** There, real jobs queue behind 1,800 simulated ones,
+  so their end-to-end time is scheduling under load. Workflow-to-workflow end-to-end numbers
+  come from the standalone pilots.
+
+First mixed run (PBFT run01): all 87 jobs exit 0. The median per-job execution ratio
+(SWARM/Pegasus) is 0.95 for cper, 0.96 for EHT and 1.05 for tnseq (startup-adjusted). The
+execution critical path is 38.8 vs 38.6 s for cper, 150 vs 170 s for EHT and 9.5 vs 7.6 s for
+tnseq (raw).
+
+### 3.2 What the pilots found missing, and the fix for each
+
+Each fix makes SWARM do what HTCondor/Pegasus does. None of them makes SWARM better than the
+reference. Before changing an environment difference, read the reference job's own log
+(`submit/.../run000N/00/00/*.out.000`) and change only what differs from it.
+
+* **Thread limits (2ae704e2).** HTCondor sets `OMP_NUM_THREADS` and the BLAS, numexpr and
+  similar variables to `request_cpus`. SWARM set none of them. Three SMILI jobs sharing a 16-core
+  agent ran 1100-2000 s each, against 75 s alone. `runner.thread_limit_env(cores)` now sets them.
+  The values are written into the argv (`--env` for apptainer, `-e` for docker), so they appear
+  in every logged command.
+* **Private job directories (ffa3128c, 8092aad1).** Jobs used to share one working directory
+  per run per agent. Two SMILI wrappers wrote the same fixed scratch name, and one job failed.
+  Each job now runs in `<work_dir>/.swarm-jobs/<job>-…`:
+  - its declared inputs are copied in;
+  - on exit 0 its declared outputs are moved back atomically;
+  - undeclared files stay private.
+
+  A failed output move fails the job and keeps the directory, as a Pegasus stage-out failure
+  would.
+* **Core and memory requests (2bf8ab7f).** Pegasus writes `request_cpus = $(pegasus_cores)`.
+  The extractor read only literal numbers, so every job recorded 1 core. SMILI is really 2 cores
+  and 6 GB. Macros are now expanded from the `.sub` file's own assignments, with units, and a
+  request that still isn't a number is left absent.
+* **Execute bit (2c609fa1).** Pegasus sets +x when it stages an executable. Six cper scripts are
+  mode 100644 in their repository, so apptainer refused them until the converter set the bit as
+  well. The manifest records each changed entry (`made_executable`).
+* **Arguments as one string (d6a0de63).** tnseq declares a whole command line as *one*
+  argument (`add_args(f"--input {a} --output {b}")`). Pegasus writes it unquoted into a shell
+  line, so the shell splits it. `pegasus_argv` joins the declared arguments and `shlex.split`s
+  them. It returns `None`, which the runner refuses, when the line has a variable, glob,
+  redirection or unbalanced quote, because the real argv can't be known from the line alone.
+  All 35 tnseq jobs now match kickstart's `argument_vector`, and the EHT and cper argv are
+  unchanged.
+* **IERS download: left alone on purpose.** EHT SMILI jobs fail to download
+  `finals2000A.all` and fall back to IERS-B in *both* systems, because the Pegasus host can't
+  reach datacenter.iers.org either. Pre-seeding the file would make SWARM faster than the
+  reference and numerically different from it.
+
+tnseq also needed a change in the workflow itself. Its full and mid branches wrote four
+identical per-sample basenames, and SWARM keys files by basename (§2.8). The per-sample tables
+are now `<sample>.<map_type>.tab`. `concat.R` takes the sample name from before the first `.`,
+and the merged TSVs are byte-identical to those from before the rename.
+
 ---
 
 ## 4. Known limits

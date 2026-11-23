@@ -1,0 +1,3 @@
+run,workflow,jobs,swarm_exit0,swarm_exec_missing,swarm_rerun_jobs,peg_exec_sum_s,swarm_exec_sum_s,exec_ratio_median,swarm_exec_adj_sum_s,exec_ratio_adj_median,peg_exec_critical_path_s,swarm_exec_critical_path_s,critical_path_refused,peg_end_to_end_s,swarm_end_to_end_s,peg_non_compute_s,swarm_non_compute_s,peg_queue_sum_s,peg_stage_in_sum_s,peg_stage_out_sum_s,swarm_in_job_overhead_sum_s,swarm_stage_out_sum_s,swarm_wait_sum_s
+t6-tnpilot-mesh30-snow/run01,tnseq_workflow_run0001,35,35,0,0,23.066,31.569,1.542,25.789,1.09,7.563,10.34,,357,64.543,349.437,54.203,362,140,0,42.164,9.538,1275.015
+t6-tnpilot-mesh30-snow/run02,tnseq_workflow_run0001,35,35,0,0,23.066,32.333,1.591,26.553,1.19,7.563,10.535,,357,61.158,349.437,50.623,362,140,0,25.737,10.36,1189.98

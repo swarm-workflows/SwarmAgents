@@ -82,28 +82,113 @@ class TestRunsForReal(PolicyTestCase):
         self.assertEqual(result.exit_status, 3)
         self.assertFalse(result.refused)
 
-    def test_the_job_runs_in_the_shared_working_directory(self):
-        """Bare logical file names only resolve between jobs of a DAG if they share a cwd."""
+    def test_the_job_runs_in_a_private_directory_under_the_run_directory(self):
+        """Each job gets its own cwd, as each Pegasus job gets its own HTCondor scratch
+        directory, and it is cleaned up after a successful job."""
         with tempfile.TemporaryDirectory() as tmp:
             work = os.path.join(tmp, "work")
             path = script(tmp, "w.sh", "pwd > where.txt")
             runner.configure(mode="real", work_dir=work)
             spec = ExecutionSpec.from_dict({"path": "/unused", "pfn": path, "arguments": []})
-            runner.run(spec, "job-3")
-            self.assertEqual(Path(work, "where.txt").read_text().strip(),
-                             os.path.realpath(work))
+            result = runner.run(spec, "job-3", data_out=[_Node("where.txt")])
+            self.assertEqual(result.exit_status, 0)
+            where = Path(work, "where.txt").read_text().strip()
+            self.assertTrue(where.startswith(os.path.join(os.path.realpath(work),
+                                                          runner.JOB_DIRS)), where)
+            self.assertFalse(os.path.exists(where), "a successful job's directory is removed")
 
-    def test_one_jobs_output_is_visible_to_the_next(self):
+    def test_one_jobs_declared_output_is_visible_to_the_next(self):
         with tempfile.TemporaryDirectory() as tmp:
             work = os.path.join(tmp, "work")
             producer = script(tmp, "p.sh", "echo payload > shared.txt")
-            consumer = script(tmp, "c.sh", "test -f shared.txt")
+            consumer = script(tmp, "c.sh", "grep -q payload shared.txt")
             runner.configure(mode="real", work_dir=work)
             runner.run(ExecutionSpec.from_dict(
-                {"path": "/u", "pfn": producer, "arguments": []}), "p")
+                {"path": "/u", "pfn": producer, "arguments": []}), "p",
+                data_out=[_Node("shared.txt")])
             result = runner.run(ExecutionSpec.from_dict(
-                {"path": "/u", "pfn": consumer, "arguments": []}), "c")
+                {"path": "/u", "pfn": consumer, "arguments": []}), "c",
+                data_in=[_Node("shared.txt")])
         self.assertEqual(result.exit_status, 0)
+
+    def test_a_jobs_scratch_files_are_its_own(self):
+        """T-6 pilot, 11 Nov 2026: two SMILI jobs on one agent wrote the same fixed-name
+        scratch script in a shared cwd, and one ran the other's half-prepared copy. An
+        undeclared file never leaves the job's directory, and a job starts without one."""
+        with tempfile.TemporaryDirectory() as tmp:
+            work = os.path.join(tmp, "work")
+            first = script(tmp, "a.sh", "echo mine > scratch.py")
+            second = script(tmp, "b.sh", "test ! -e scratch.py")
+            runner.configure(mode="real", work_dir=work)
+            runner.run(ExecutionSpec.from_dict(
+                {"path": "/u", "pfn": first, "arguments": []}), "a")
+            self.assertFalse(os.path.exists(os.path.join(work, "scratch.py")))
+            result = runner.run(ExecutionSpec.from_dict(
+                {"path": "/u", "pfn": second, "arguments": []}), "b")
+        self.assertEqual(result.exit_status, 0)
+
+    def test_a_job_cannot_change_the_input_its_siblings_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = os.path.join(tmp, "work")
+            os.makedirs(work)
+            Path(work, "in.txt").write_text("original")
+            vandal = script(tmp, "v.sh", "echo changed > in.txt")
+            runner.configure(mode="real", work_dir=work)
+            runner.run(ExecutionSpec.from_dict(
+                {"path": "/u", "pfn": vandal, "arguments": []}), "v",
+                data_in=[_Node("in.txt")])
+            self.assertEqual(Path(work, "in.txt").read_text(), "original")
+
+    def test_a_failed_jobs_outputs_do_not_come_back_and_its_directory_is_kept(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = os.path.join(tmp, "work")
+            bad = script(tmp, "f.sh", "echo partial > out.txt; exit 2")
+            runner.configure(mode="real", work_dir=work)
+            result = runner.run(ExecutionSpec.from_dict(
+                {"path": "/u", "pfn": bad, "arguments": []}), "f",
+                data_out=[_Node("out.txt")])
+            self.assertEqual(result.exit_status, 2)
+            self.assertFalse(os.path.exists(os.path.join(work, "out.txt")))
+            kept = os.listdir(os.path.join(work, runner.JOB_DIRS))
+            self.assertEqual(len(kept), 1)
+
+    def test_a_failed_output_handoff_fails_the_job_and_keeps_the_results(self):
+        """Stop-time review: a rename that failed was only logged, then the job directory,
+        results included, was deleted and the job reported exit 0."""
+        with tempfile.TemporaryDirectory() as tmp:
+            work = os.path.join(tmp, "work")
+            good = script(tmp, "g.sh", "echo result > out.txt")
+            runner.configure(mode="real", work_dir=work)
+            real_replace = os.replace
+
+            def failing_replace(src, dst):
+                if os.path.basename(dst) == "out.txt":
+                    raise OSError(28, "No space left on device")
+                return real_replace(src, dst)
+
+            with patch.object(runner.os, "replace", side_effect=failing_replace):
+                result = runner.run(ExecutionSpec.from_dict(
+                    {"path": "/u", "pfn": good, "arguments": []}), "g",
+                    data_out=[_Node("out.txt")])
+            self.assertNotEqual(result.exit_status, 0)
+            self.assertIn("out.txt", result.reason)
+            kept = os.listdir(os.path.join(work, runner.JOB_DIRS))
+            self.assertEqual(len(kept), 1)
+            self.assertEqual(
+                Path(work, runner.JOB_DIRS, kept[0], "out.txt").read_text().strip(), "result")
+
+    def test_a_declared_input_missing_from_the_run_directory_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = os.path.join(tmp, "work")
+            os.makedirs(work)
+            ok = script(tmp, "o.sh", "exit 0")
+            runner.configure(mode="real", work_dir=work)
+            with patch.object(runner, "stage_inputs", return_value=([], None)):
+                result = runner.run(ExecutionSpec.from_dict(
+                    {"path": "/u", "pfn": ok, "arguments": []}), "m",
+                    data_in=[_Node("absent.txt")])
+        self.assertTrue(result.refused)
+        self.assertIn("absent.txt", result.reason)
 
     def test_arguments_are_passed(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -495,6 +580,78 @@ class TestEnvironmentIsScrubbed(PolicyTestCase):
                 result = runner.run(ExecutionSpec.from_dict(
                     {"path": "/u", "pfn": path, "arguments": []}), "env")
             self.assertEqual(Path(result.stdout_path).read_text().strip(), "ABSENT")
+
+
+class TestThreadLimits(PolicyTestCase):
+    """A job's threads are limited to the cores it requested, as HTCondor limits them.
+
+    Without it, a 1-core numerical job started one thread per HOST core: in the T-6 pilot
+    (11 Nov 2026) three EHT SMILI jobs sharing a 16-core agent ran 1100-2000 s each against
+    75 s alone, and the Pegasus reference they were compared with ran under HTCondor's limit.
+    The limit must reach the process INSIDE the container, which neither runtime inherits.
+    """
+
+    def _spec(self, kind="singularity", image="/img/x.sif"):
+        return ExecutionSpec.from_dict({
+            "path": "/srv/x", "arguments": ["a"], "pfn_type": "installed",
+            "container": {"name": "c", "kind": kind, "image": image}})
+
+    def test_the_limit_is_the_request_rounded_up_never_zero(self):
+        self.assertEqual(runner.thread_limit_env(1.0)["OMP_NUM_THREADS"], "1")
+        self.assertEqual(runner.thread_limit_env(0.5)["OMP_NUM_THREADS"], "1")
+        self.assertEqual(runner.thread_limit_env(1.5)["OPENBLAS_NUM_THREADS"], "2")
+        self.assertEqual(runner.thread_limit_env(4)["MKL_NUM_THREADS"], "4")
+        self.assertEqual(set(runner.thread_limit_env(2)), set(runner.THREAD_LIMIT_VARS))
+
+    def test_no_request_invents_no_limit(self):
+        for cores in (None, 0, -1, "x", float("nan")):
+            self.assertEqual(runner.thread_limit_env(cores), {}, cores)
+
+    def test_apptainer_passes_it_through_containall(self):
+        """`--containall` starts the container from a clean environment, so the limit has
+        to be in the argv, and the image must still be found after the new flags."""
+        runner.configure(container_runtime="apptainer")
+        with patch("shutil.which", return_value="/usr/bin/apptainer"):
+            cmd, reason = runner.build_command(self._spec(), "/w",
+                                               job_env=runner.thread_limit_env(1))
+        self.assertEqual(reason, "")
+        self.assertIn("--containall", cmd)
+        i = cmd.index("OMP_NUM_THREADS=1")
+        self.assertEqual(cmd[i - 1], "--env")
+        self.assertEqual(cmd[runner._apptainer_image_index(cmd)], "/img/x.sif")
+        self.assertEqual(cmd[-2:], ["/srv/x", "a"])
+
+    def test_docker_passes_it_with_e(self):
+        runner.configure(container_runtime="docker")
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            cmd, reason = runner.build_command(self._spec("docker", "docker://img:1"), "/w",
+                                               job_env={"OMP_NUM_THREADS": "2"})
+        self.assertEqual(reason, "")
+        self.assertEqual(cmd[cmd.index("OMP_NUM_THREADS=2") - 1], "-e")
+        self.assertLess(cmd.index("-e"), cmd.index("img:1"))
+
+    def test_a_bare_job_really_runs_with_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = script(tmp, "t.sh", 'echo "${OMP_NUM_THREADS:-UNSET}"')
+            runner.configure(mode="real", work_dir=os.path.join(tmp, "work"))
+            spec = ExecutionSpec.from_dict({"path": "/u", "pfn": path, "arguments": []})
+            with patch.dict(os.environ, {"OMP_NUM_THREADS": "64"}):
+                limited = runner.run(spec, "lim", cores=1)
+                unlimited = runner.run(spec, "unlim")
+            self.assertEqual(Path(limited.stdout_path).read_text().strip(), "1")
+            # No request: the job keeps whatever the agent's environment says.
+            self.assertEqual(Path(unlimited.stdout_path).read_text().strip(), "64")
+
+    def test_the_job_hands_its_request_to_the_runner(self):
+        from swarm.models.capacities import Capacities
+        job = Job()
+        job.job_id = "j"
+        job.capacities = Capacities(core=1)
+        job.execution = {"path": "/u", "pfn": TRUE_BIN, "arguments": []}
+        with patch.object(runner, "run",
+                          return_value=runner.ExecutionResult(exit_status=0)) as run:
+            job._execute_real()
+        self.assertEqual(run.call_args.kwargs["cores"], 1)
 
 
 # --------------------------------------------------------------------------------------

@@ -27,6 +27,7 @@ import hashlib
 import json
 import math
 import shutil
+import stat
 import os
 import random
 import re
@@ -1375,6 +1376,14 @@ def bundle_payload(jobs_and_profiles, output_dir: str, source_root: Optional[str
             os.makedirs(dest_dir, exist_ok=True)
             dest = os.path.join(dest_dir, os.path.basename(src) or "executable")
             shutil.copy2(src, dest)
+            # Pegasus makes every staged executable executable (pegasus-transfer sets the mode
+            # bits), so a workflow may ship its scripts as 0644 and still run under Pegasus:
+            # cper-soilmoisture keeps six of its ten in git that way. The runner executes the
+            # bundled file in place from a read-only bind, so the bit has to be set here or the
+            # job dies with apptainer's `FATAL: permission denied` (exit 255).
+            mode = os.stat(dest).st_mode
+            made_executable = not mode & stat.S_IXUSR
+            os.chmod(dest, mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
             manifest["code"][pfn] = {
                 # Two forms on purpose. `bundled` is relative to the BUNDLE and is what a
                 # reader (or a checksum audit) wants. `root_relative` is relative to the CODE
@@ -1385,6 +1394,7 @@ def bundle_payload(jobs_and_profiles, output_dir: str, source_root: Optional[str
                 "transformation": base,
                 "source": pfn,
                 "sha256": _sha256(dest),
+                "made_executable": made_executable,
             }
 
     # --- root inputs -----------------------------------------------------------------

@@ -147,6 +147,51 @@ class TestStashExpires:
         assert a.pending_consensus_dropped == 1 and a.pending_consensus_expired == 0
 
 
+class TestStashScalesWithTheTier:
+    """The per-job stash cap grows with the tier (2026-11-09). At Hier-270's 27 coordinators the
+    flat cap of 32 dropped ~17,000 votes a run at the three coordinators on the host farthest from
+    Redis; they never committed, and commit splits waited out the 300 s reselection."""
+
+    def _adapter(self, live, configured):
+        import types
+        from swarm.topology.topology import TopologyType
+        a, h = TestStashExpires()._adapter()
+        a.neighbor_map = {i: None for i in range(live)}
+        a.topology = types.SimpleNamespace(type=TopologyType.Hierarchical, group_size=configured)
+        a.runtime_config = {}
+        h.agent = a
+        return a, h
+
+    def test_the_cap_is_eight_per_voter_never_below_32(self):
+        _, h = self._adapter(live=3, configured=3)
+        assert h._per_object_cap() == 32
+        _, h = self._adapter(live=27, configured=27)
+        assert h._per_object_cap() == 216
+
+    def test_a_tier_still_registering_uses_its_configured_size(self):
+        _, h = self._adapter(live=5, configured=27)
+        assert h._per_object_cap() == 216
+
+    def test_an_unknown_tier_falls_back_to_the_floor(self):
+        a, h = TestStashExpires()._adapter()
+        h.agent = a                                # no neighbour map, no topology
+        assert h._per_object_cap() == _HostAdapter._PENDING_MAX_PER_OBJECT
+
+    def test_a_27_coordinator_vote_burst_for_an_unknown_job_is_kept(self, monkeypatch):
+        # 27 voters x (PREPARE + COMMIT) on two competing proposals = 108 messages, all before the
+        # job arrives — what the far host saw. The flat cap kept 32 and dropped 76.
+        a, h = self._adapter(live=27, configured=27)
+        for _ in range(108):
+            h.set_pending_prepare(object(), "j1")
+        assert len(a.pending_prepares["j1"]) == 108 and a.pending_consensus_dropped == 0
+
+        monkeypatch.setattr(_HostAdapter, "_PENDING_PER_VOTER", 0)      # the old flat cap
+        a, h = self._adapter(live=27, configured=27)
+        for _ in range(108):
+            h.set_pending_prepare(object(), "j1")
+        assert len(a.pending_prepares["j1"]) == 32 and a.pending_consensus_dropped == 76
+
+
 # --------------------------------------------------------------------------- gossip
 def test_an_evicted_gossip_entry_is_not_resurrected_by_a_relayed_copy():
     from swarm.gossip.disseminator import GossipStateDisseminator

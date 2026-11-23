@@ -1,0 +1,41 @@
+# §10 standalone pilot (T-6): the real workflows alone — cper-soilmoisture run0002 (22 jobs) and
+# eht-m87 run0001 (30 jobs, fetch_data replaced by its checksum-verified dataset) — at Mesh-30
+# under Snow, before they ride inside a 90-agent cell. Code: isc27-freeze; config
+# campaigns/config_wfpilot_snow.yml (campaigns/make_mixed_configs.py); bundle
+# /export/swarm-wf/wf_only (merge_workflow_jobs.py with no --synthetic).
+# Pass: every real job exits 0, in DAG order; outputs match the Pegasus reference runs
+# (computational outputs byte-identical; plots may differ by font bytes); staging fetches and
+# stage-outs logged; 0 jobs twice.
+# Prerequisites on every host (set up after campaign-first-runs ends): /export/swarm-wf mounted,
+# the five .sif images in /export/images, staging_site.py on database, SWARM_STAGING_TOKEN set.
+#
+#   tmux new -s wfpilot 'python3.11 campaign.py campaigns/t6-wfpilot.yml --python python3.11 2>&1 | tee /root/campaign-t6-wfpilot.out'
+out: runs/campaign-t6-wfpilot
+defaults:
+  runner: run_test.py
+  retries: 1
+  timeout_s: 9000
+  args:
+    mode: remote
+    agent-type: resource
+    db-host: database
+    agent-hosts-file: agent_hosts.txt
+    master-fleet-size: 270
+    seed: 42
+    rtt-samples: 20
+    all-dtns: true
+    hierarchical-level1-agent-type: resource
+    inflight-drain-max-s: 1800
+    runtime: 3600
+
+gate:
+  redis: {host: database, port: 6379}
+  clock_check: ./fix_slice_clocks.sh --check
+  retries: 3
+  wait_s: 300
+
+cells:
+  - name: t6-wfpilot-mesh30-snow
+    repeats: 2
+    args: {topology: mesh, agents: 30, agents-per-host: 1, jobs: 52,
+           pegasus-jobs-dir: /export/swarm-wf/wf_only, base-config: campaigns/config_wfpilot_snow.yml}

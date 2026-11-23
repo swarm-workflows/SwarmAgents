@@ -1,0 +1,39 @@
+# T-6 tnseq standalone pilot: pegasus-isi/tnseq-workflow run0001 on the Pegasus host (35 jobs, 2
+# samples, 42 DAG edges), rebuilt 11 Nov 2026 after renaming its per-sample tables so the mid and
+# full tables no longer share a basename. Mesh-30 under Snow, like t6-wfpilot. Code: isc27-freeze;
+# config campaigns/config_tnpilot_snow.yml (campaigns/make_mixed_configs.py); job set
+# /export/swarm-wf/tnseq_only (merge_workflow_jobs.py --bundle tnseq_bundle, no --synthetic).
+# Pass: every real job exits 0, in DAG order; the four merged TSVs byte-identical to the Pegasus
+# reference (/home/ubuntu/tnseq-workflow/reference_run0001 on the Pegasus host); 0 jobs twice.
+# Prerequisite beyond t6-wfpilot's: Tnseq_Container.sif in every agent's /export/images.
+#
+#   tmux new -s tnpilot 'python3.11 campaign.py campaigns/t6-tnpilot.yml --python python3.11 2>&1 | tee /root/campaign-t6-tnpilot.out'
+out: runs/campaign-t6-tnpilot-8092aad1
+defaults:
+  runner: run_test.py
+  retries: 1
+  timeout_s: 9000
+  args:
+    mode: remote
+    agent-type: resource
+    db-host: database
+    agent-hosts-file: agent_hosts.txt
+    master-fleet-size: 270
+    seed: 42
+    rtt-samples: 20
+    all-dtns: true
+    hierarchical-level1-agent-type: resource
+    inflight-drain-max-s: 1800
+    runtime: 3600
+
+gate:
+  redis: {host: database, port: 6379}
+  clock_check: ./fix_slice_clocks.sh --check
+  retries: 3
+  wait_s: 300
+
+cells:
+  - name: t6-tnpilot-mesh30-snow
+    repeats: 2
+    args: {topology: mesh, agents: 30, agents-per-host: 1, jobs: 35,
+           pegasus-jobs-dir: /export/swarm-wf/tnseq_only, base-config: campaigns/config_tnpilot_snow.yml}

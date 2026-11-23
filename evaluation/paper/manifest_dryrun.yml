@@ -1,0 +1,22 @@
+# Dry run of build.py on the results collected BEFORE the frozen re-run (older revisions).
+# It exercises the pipeline only: no number it produces is citable (see each source's README).
+out: ../../runs/paper-dryrun   # gitignored runs/ tree
+sources:
+  - name: e1-hier270-ed8c9101
+    runs_wide: ../../docs/results/e1-hier270-ed8c9101/runs_wide.csv
+    campaign: ../../campaigns/frozen-0bceb349/1-e1-hier270.yml
+  - name: e0-e1-c125ed8c
+    runs_wide: ../../docs/results/e0-e1-c125ed8c/runs_wide.csv
+    campaign: ../../campaigns/frozen-0bceb349/2-e0-e1-hier30-hier90.yml
+  - name: first-runs-21a2d9bb
+    runs_wide: ../../docs/results/first-runs-21a2d9bb/runs_wide.csv
+    campaign: ../../campaigns/first-runs-21a2d9bb.yml
+  - name: e2-c9c980b8
+    runs_wide: ../../docs/results/e2-c9c980b8/runs_wide.csv
+    campaign: ../../campaigns/frozen-0bceb349/3-e2-hier90.yml
+  - name: e7-7e269138
+    runs_wide: ../../docs/results/e7-7e269138/runs_wide_e7.csv
+    campaign: ../../campaigns/e7-hier90-7e269138.yml
+e2_events: ../../docs/results/e2b-58f3ab22/events.csv
+e3a_cells: ../../docs/results/e3a-c125ed8c/cells.csv
+t6_per_workflow: ../../docs/results/t6-mixed-0bceb349/t6_per_workflow.csv

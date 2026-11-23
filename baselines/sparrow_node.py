@@ -56,6 +56,9 @@ def main() -> int:
     ap.add_argument("--reprobe-s", type=float, default=30.0)
     ap.add_argument("--tick-s", type=float, default=0.5)
     ap.add_argument("--seed", type=int, default=None)
+    ap.add_argument("--failure-window-s", type=float, default=None,
+                    help="scheduler: requeue the jobs of a worker whose heartbeat is missing "
+                         "this long (E7 under failure); unset = off")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO,
@@ -95,7 +98,7 @@ def main() -> int:
         ap.error("scheduler needs --index and --of")
     node = SparrowScheduler(args.index, args.of, repo, client, keys, fleet,
                             probe_ratio=args.probe_ratio, reprobe_s=args.reprobe_s,
-                            seed=args.seed)
+                            seed=args.seed, failure_window_s=args.failure_window_s)
     log.info("scheduler %d/%d up: probe ratio %d, re-probe after %.0fs",
              args.index, args.of, args.probe_ratio, args.reprobe_s)
     last_stats = time.monotonic()
