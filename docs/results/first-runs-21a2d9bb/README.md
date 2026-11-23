@@ -1,11 +1,11 @@
-# First runs at isc27-freeze: the E1′ flat-mesh ladder and the E5 ablations
+# First runs at eval-freeze: the E1′ flat-mesh ladder and the E5 ablations
 
 These are the cells of the conference plan that had never been run: E1′ Mesh-90/120/180 and E5,
 covering gossip off and `coordinator_cost_matrix: peers`. The tables are in `tables.md`.
 
 - **Campaign:** `campaigns/first-runs-21a2d9bb.yml` (ba0b629f; Mesh-180 Hybrid dropped in
   7c09fe9d). Output went to `runs/campaign-first-runs-21a2d9bb` on the database node.
-  - **Agent code:** the `isc27-freeze` tag.
+  - **Agent code:** the `eval-freeze` tag.
   - **When:** 9 Nov 2026 16:37 UTC – 10 Nov 23:44 UTC.
   - **Result:** **48/48 done**: 43 `ok`, plus the 5 Mesh-180 PBFT runs as `ok_on_cap`.
 - **Collection:**
@@ -85,7 +85,7 @@ Means over 5 runs, ± std:
 **Read this first: the references are older code.**
 - The Hier-90 references come from the E1′ campaign at c125ed8c (`../e0-e1-c125ed8c`).
 - The Hier-270 references come from ed8c9101 (`../e1-hier270-ed8c9101`).
-- The E5 arms ran at isc27-freeze.
+- The E5 arms ran at eval-freeze.
 - Code that changed in between: the PBFT counter margin, voting on adoption, `SCAN_STATES`, and
   the tier-sized vote stash.
 

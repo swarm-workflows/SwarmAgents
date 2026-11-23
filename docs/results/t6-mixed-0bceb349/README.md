@@ -1,4 +1,4 @@
-# T-6 mixed Hier-90 at isc27-freeze 0bceb349: three real workflows inside the simulated load
+# T-6 mixed Hier-90 at eval-freeze 0bceb349: three real workflows inside the simulated load
 
 This is the conference plan's §4.2 E1′ mixed rung (T-6, plan §10). The workload is the Hier-90
 analytic burst cell's 1,800 simulated jobs with three Pegasus workflows merged in and run for
@@ -16,7 +16,7 @@ The three workflows have 198 file edges between them; the set is
 - **Campaign:** `campaigns/t6-mixed-hier90.yml`, PBFT and Snow, 3 repeats each. Output is in
   `runs/campaign-t6-mixed-hier90` on the database node. It ran on 11 Nov 2026, 22:41–23:43 UTC.
   **All 6 runs were `ok` on the first attempt**, each taking 514–593 s.
-- **Code:** the `isc27-freeze` tag, 0bceb349, on every agent.
+- **Code:** the `eval-freeze` tag, 0bceb349, on every agent.
 - **Configs:** `campaigns/config_mixed_{pbft,snow}.yml`. These run in real execution mode, with
   staging on, the bundle on the NFS export and images on each host's local disk.
 - **Collection:**

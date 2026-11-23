@@ -1,4 +1,4 @@
-# FROZEN RE-RUN at isc27-freeze (0bceb349), added 17 Nov: E7c, the SCHEDULER goes down. Baselines,
+# FROZEN RE-RUN at eval-freeze (0bceb349), added 17 Nov: E7c, the SCHEDULER goes down. Baselines,
 # 4 cells x 5 = 20 runs, ~16 min each, beside 8-e7c-hier90-scheduler-outage-swarm.yml.
 #
 # Centralized (greedy, round-robin, random): the ONE scheduler goes down 120 s after distribution

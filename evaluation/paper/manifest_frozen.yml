@@ -1,4 +1,4 @@
-# The paper's numbers: the frozen re-run at isc27-freeze 0bceb349, plus the cells that count as
+# The paper's numbers: the frozen re-run at eval-freeze 0bceb349, plus the cells that count as
 # frozen without a repeat (the flat-mesh ladder and E5 from first-runs-21a2d9bb, the T-6 mixed
 # rung, and the no-failure E7 cells, whose baseline code path is unchanged by a874d2d2).
 #

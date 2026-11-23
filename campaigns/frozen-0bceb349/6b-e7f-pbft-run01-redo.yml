@@ -1,4 +1,4 @@
-# FROZEN RE-RUN at isc27-freeze (0bceb349), added 17 Nov: one run to replace
+# FROZEN RE-RUN at eval-freeze (0bceb349), added 17 Nov: one run to replace
 # e7-hier90-failure-swarm/e7f-hier90-pbft-analytic-poisson3/run01, which killed the WRONG agents:
 # its companion read configs/ before run_test.py regenerated it and took the previous cell's
 # (Hier-30) group 3, 15 agents (16-20, 31-40), instead of Hier-90 G=1 group 3 (28-36). Every other

@@ -1,4 +1,4 @@
-# Review ablations, 2026-11-20 (paper review pass; config-only, agent code = isc27-freeze: no file under
+# Review ablations, 2026-11-20 (paper review pass; config-only, agent code = eval-freeze: no file under
 # swarm/, main.py, run_test.py or config_swarm_multi.yml differs between the tag and d3755e2b).
 #
 #   A  Snow in-flight cap: consensus.snow.max_inflight 64 and 256 (frozen cells ran 16) on the three

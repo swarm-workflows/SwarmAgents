@@ -1,4 +1,4 @@
-# FROZEN RE-RUN at isc27-freeze (0bceb349): E6 on the mixed workload (conference plan §4.2 E6,
+# FROZEN RE-RUN at eval-freeze (0bceb349): E6 on the mixed workload (conference plan §4.2 E6,
 # T-6), 2 cells x 3 = 6 runs. The same partition, fleet, arrivals and companion as
 # 4-e6-hier30.yml, with the three real workflows merged into its 600 simulated jobs:
 #

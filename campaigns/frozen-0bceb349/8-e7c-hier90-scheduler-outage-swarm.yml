@@ -1,4 +1,4 @@
-# FROZEN RE-RUN at isc27-freeze (0bceb349), added 17 Nov: E7c, the SCHEDULER goes down. SWARM side,
+# FROZEN RE-RUN at eval-freeze (0bceb349), added 17 Nov: E7c, the SCHEDULER goes down. SWARM side,
 # 2 cells x 5 = 10 runs, ~16 min each, beside 9-e7c-hier90-scheduler-outage-baselines.yml.
 #
 # E7 under failure (files 6/7) killed workers; every scheduler recovered and the comparison said

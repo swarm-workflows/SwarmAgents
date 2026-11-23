@@ -1,4 +1,4 @@
-# FROZEN RE-RUN at isc27-freeze (0bceb349): E7 under failure, the baselines. 4 cells x 5 = 20
+# FROZEN RE-RUN at eval-freeze (0bceb349): E7 under failure, the baselines. 4 cells x 5 = 20
 # runs, ~16 min each, beside 6-e7-hier90-failure-swarm.yml.
 #
 # The four E7 Hier-90 Poisson-3 baselines (campaigns/e7-hier90-7e269138.yml) with the same outage:

@@ -1,4 +1,4 @@
-# FROZEN RE-RUN at isc27-freeze (0bceb349), conference plan §8 (re-derived 2026-11-09): E2, E2a, E2b and E2c at Hier-90, 40 cells x 5 = 200 runs.
+# FROZEN RE-RUN at eval-freeze (0bceb349), conference plan §8 (re-derived 2026-11-09): E2, E2a, E2b and E2c at Hier-90, 40 cells x 5 = 200 runs.
 # Copied unchanged from campaigns/e2-hier90.yml except `out:`; the cells, arguments, configs and workloads are the
 # ones the earlier campaign ran, so the two are comparable cell for cell. Agent code fingerprint
 # 6593ed84586e (104 files) verified identical on the db node and all 92 agents, 12 Nov 2026.

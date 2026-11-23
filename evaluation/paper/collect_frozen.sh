@@ -1,5 +1,5 @@
 #!/bin/bash
-# Collect the frozen re-run (isc27-freeze 0bceb349) into one tree, on the database node, as root.
+# Collect the frozen re-run (eval-freeze 0bceb349) into one tree, on the database node, as root.
 #
 #   cd /root/SwarmAgents && bash evaluation/paper/collect_frozen.sh [runs-root] [out]
 #
